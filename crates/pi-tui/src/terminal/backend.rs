@@ -273,14 +273,23 @@ fn count_seq(haystack: &[u8], needle: &[u8]) -> usize {
 /// Wrap composed payload in DEC synchronized output when enabled.
 #[must_use]
 pub fn wrap_synchronized(payload: &[u8], enabled: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    wrap_synchronized_into(&mut out, payload, enabled);
+    out
+}
+
+/// Wrap composed payload in DEC synchronized output into a reused buffer
+/// (PERF-T11 terminal-paint Design A): the writer's pooled frame buffer
+/// carries its capacity across stage-3 writes.
+pub fn wrap_synchronized_into(out: &mut Vec<u8>, payload: &[u8], enabled: bool) {
+    out.clear();
     if !enabled || payload.is_empty() {
-        return payload.to_vec();
+        out.extend_from_slice(payload);
+        return;
     }
-    let mut out = Vec::with_capacity(payload.len() + 20);
     out.extend_from_slice(b"\x1b[?2026h");
     out.extend_from_slice(payload);
     out.extend_from_slice(b"\x1b[?2026l");
-    out
 }
 
 #[cfg(test)]

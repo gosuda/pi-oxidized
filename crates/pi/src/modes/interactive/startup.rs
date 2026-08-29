@@ -10,7 +10,7 @@ use pi_tui::components::{Markdown, Spacer, Text};
 
 use super::messages::CONTENT_INDENT;
 use super::state::{LoadedResource, ShortcutHint, StartupDiagnostics};
-use super::theme::{self, MarkdownOptions, MarkdownTheme, ResolvedTheme, ThemeColor};
+use super::theme::{self, MarkdownTheme, ResolvedTheme, ThemeColor, user_markdown_options};
 use crate::core::settings::ThemeMode;
 
 // ---------------------------------------------------------------------------
@@ -121,7 +121,10 @@ pub fn build_first_time_setup_with_selection(
 ) -> Box<dyn Component> {
     let mut stack = super::messages::ColumnStack::new();
     stack.push(Box::new(Text::with_padding(
-        theme::bold(&th.fg(ThemeColor::Accent, "Welcome to pi")),
+        theme::bold(&th.fg(
+            ThemeColor::Accent,
+            "Welcome to pi, the minimal coding agent.",
+        )),
         CONTENT_INDENT,
         0,
     )));
@@ -129,7 +132,7 @@ pub fn build_first_time_setup_with_selection(
         FIRST_RUN_STEP_FAMILY => "Choose a theme family.\nHighlight previews live; Enter confirms.",
         FIRST_RUN_STEP_MODE => "Choose a theme mode.\nAuto matches the terminal background.",
         FIRST_RUN_STEP_ANALYTICS => {
-            "Enable anonymous usage analytics?\n(you can change this in settings)"
+            "Opt-in to anonymous usage data sharing?\nOpting in stores a tracking identifier in settings.json and enables anonymous\nusage analytics. This helps us to better debug, reproduce, and resolve issues\nand bugs within Pi. You can observe what is shared using /privacy and make\nchanges anytime in settings.json."
         }
         _ => "Setup complete. Type a message to begin.",
     };
@@ -139,7 +142,7 @@ pub fn build_first_time_setup_with_selection(
         0,
         md_theme,
         theme::default_text_style(),
-        MarkdownOptions::default(),
+        user_markdown_options(),
     )));
 
     let options: Vec<String> = match step {
@@ -211,7 +214,16 @@ pub fn build_shortcut_overlay(
             CONTENT_INDENT,
             0,
         )));
-        push_shortcut_hints(&mut stack, extension_hints, th);
+        // Extension rows carry raw key strings; render them display-formatted
+        // like the reference extension hotkeys table (interactive-mode.ts:6347).
+        let display_hints: Vec<ShortcutHint> = extension_hints
+            .iter()
+            .map(|hint| ShortcutHint {
+                key: pi_tui::keybindings::format_key_text(&hint.key, true),
+                action: hint.action.clone(),
+            })
+            .collect();
+        push_shortcut_hints(&mut stack, &display_hints, th);
     }
     Box::new(stack)
 }
@@ -232,29 +244,41 @@ fn push_shortcut_hints(
 }
 
 /// Default shortcut hint rows (ports the reference keybinding table).
+///
+/// Every key column resolves from the process-global keybinding registry so
+/// rebound users see their own chords; slash-command rows stay raw.
 #[must_use]
 pub fn default_shortcut_hints() -> Vec<ShortcutHint> {
-    use super::state::ShortcutHint;
+    use pi_tui::keybindings::key_display_text;
+
+    let cycle_models = [
+        key_display_text("app.model.cycleForward"),
+        key_display_text("app.model.cycleBackward"),
+    ]
+    .join(" / ");
     [
-        ("Esc", "Interrupt / abort"),
-        ("Ctrl+C", "Clear editor (×2 to exit)"),
-        ("Ctrl+D", "Exit"),
-        ("Shift+Tab", "Cycle thinking"),
-        ("Ctrl+L", "Model selector"),
-        ("Ctrl+P", "Cycle models"),
-        ("Ctrl+O", "Toggle tool output"),
-        ("Ctrl+T", "Toggle thinking"),
-        ("Ctrl+G", "External editor"),
-        ("Ctrl+X", "Copy last assistant"),
-        ("Alt+Enter", "Queue follow-up"),
-        ("Alt+Up", "Restore follow-up"),
-        ("Ctrl+V", "Paste image/text"),
-        ("/help", "Slash commands"),
-        ("? , /hotkeys", "This overlay"),
+        (key_display_text("app.interrupt"), "Interrupt / abort"),
+        (key_display_text("app.clear"), "Clear editor (×2 to exit)"),
+        (key_display_text("app.exit"), "Exit"),
+        (key_display_text("app.thinking.cycle"), "Cycle thinking"),
+        (key_display_text("app.model.select"), "Model selector"),
+        (cycle_models, "Cycle models"),
+        (key_display_text("app.tools.expand"), "Toggle tool output"),
+        (key_display_text("app.thinking.toggle"), "Toggle thinking"),
+        (key_display_text("app.editor.external"), "External editor"),
+        (key_display_text("app.message.copy"), "Copy last assistant"),
+        (key_display_text("app.message.followUp"), "Queue follow-up"),
+        (key_display_text("app.message.dequeue"), "Restore follow-up"),
+        (
+            key_display_text("app.clipboard.pasteImage"),
+            "Paste image/text",
+        ),
+        ("/help".to_owned(), "Slash commands"),
+        ("/hotkeys".to_owned(), "This overlay"),
     ]
     .into_iter()
     .map(|(key, action)| ShortcutHint {
-        key: key.to_owned(),
+        key,
         action: action.to_owned(),
     })
     .collect()
@@ -278,7 +302,7 @@ pub fn build_changelog(
         0,
         md_theme,
         theme::default_text_style(),
-        MarkdownOptions::default(),
+        user_markdown_options(),
     )));
     Box::new(stack)
 }

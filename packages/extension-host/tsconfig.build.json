@@ -6,7 +6,6 @@
 		"lib": ["ES2024"],
 		"declaration": false,
 		"sourceMap": false,
-		"outDir": "dist",
 		"strict": true,
 		"skipLibCheck": true,
 		"forceConsistentCasingInFileNames": true,
@@ -15,7 +14,6 @@
 		"allowImportingTsExtensions": true,
 		"noEmit": true,
 		"types": [],
-		"baseUrl": ".",
 		"paths": {
 			"@earendil-works/pi-tui-protocol": ["../pi-tui-protocol/src/index.ts"],
 			"@earendil-works/pi-tui-protocol/*": ["../pi-tui-protocol/src/*"],

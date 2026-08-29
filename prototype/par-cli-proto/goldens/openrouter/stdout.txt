@@ -1,0 +1,8 @@
+Listening for OpenRouter OAuth callback on http://127.0.0.1:34209/oauth/callback/9c0d1e1f-c69d-477f-ae33-4129ccc3f57c
+
+Open this URL in your browser:
+https://openrouter.ai/auth?callback_url=http%3A%2F%2F127.0.0.1%3A34209%2Foauth%2Fcallback%2F9c0d1e1f-c69d-477f-ae33-4129ccc3f57c&code_challenge=3cxMt-v7cbljGHSswVdyVTioPxeVYH3DrQKWcfF-Avg&code_challenge_method=S256
+Complete sign-in in your browser. If the browser is on another machine, paste the final redirect URL here.
+Complete sign-in in your browser, or paste the authorization code / redirect URL here: (http://127.0.0.1:34209/oauth/callback/9c0d1e1f-c69d-477f-ae33-4129ccc3f57c): Exchanging authorization code for an API key...
+
+Credentials saved to auth.json

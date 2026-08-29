@@ -209,7 +209,7 @@ mod tests {
     fn env_wins_when_file_exists() -> R {
         let dir = tempdir()?;
         let env_host = dir.path().join("from-env");
-        fs::write(&env_host, b"#!bin\n")?;
+        write_exec(&env_host, b"#!bin\n")?;
         let asset = dir.path().join("pi-extension-host");
         fs::write(&asset, b"#!bin\n")?;
         let spec = resolve_with(env_host.to_str(), Some(asset.as_path()))?;
@@ -316,5 +316,160 @@ mod tests {
             ))
             .into()),
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ───────────────────────────────────────────────────────────────────
+    // XC-9 / M19: host-resolution witness — never search PATH.
+    //
+    // A PATH-search mutation reads `PATH` at resolution time, so the witness
+    // plants a stray `pi-extension-host` executable on the child's `PATH`
+    // via a re-executed test process (in-process env mutation is unavailable:
+    // the workspace sets `unsafe_code = "forbid"`). The child asserts the
+    // resolver still reports `NotConfigured` / honors the env override.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Marker env var switching the test binary into M19 child mode.
+    const M19_CHILD_MODE: &str = "XC9_M19_CHILD_MODE";
+    /// Env var carrying the env-override host path into child mode.
+    const M19_ENV_HOST: &str = "XC9_M19_ENV_HOST";
+
+    fn m19_child_exit() -> ! {
+        let mode = env::var(M19_CHILD_MODE).unwrap_or_default();
+        let ok = match mode.as_str() {
+            "notconfigured" => {
+                matches!(
+                    resolve_with_fallback(None, None, None, None),
+                    Err(HostError::NotConfigured { .. })
+                )
+            }
+            "envwins" => match env::var(M19_ENV_HOST) {
+                Ok(host) => match resolve_with_fallback(Some(host.as_str()), None, None, None) {
+                    Ok(spec) => matches!(spec.source, HostSource::Env(_)),
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            },
+            _ => false,
+        };
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
+    /// Re-runs only `test_name` in a child process with `dir` prepended to
+    /// `PATH`. Returns whether the child exited successfully.
+    fn m19_rerun_with_path(
+        dir: &Path,
+        test_name: &str,
+        mode: &str,
+        extra_env: &[(&str, &str)],
+    ) -> bool {
+        let Ok(exe) = env::current_exe() else {
+            return false;
+        };
+        let joined = match env::var_os("PATH") {
+            Some(existing) => match std::env::join_paths(
+                std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&existing)),
+            ) {
+                Ok(joined) => joined,
+                Err(_) => return false,
+            },
+            None => dir.to_path_buf().into_os_string(),
+        };
+        let mut command = std::process::Command::new(exe);
+        command
+            .arg("--exact")
+            .arg(format!("host::tests::{test_name}"))
+            .arg("--test-threads=1")
+            .env(M19_CHILD_MODE, mode)
+            .env("PATH", joined);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        command
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// Writes `bytes` and marks the file executable so a PATH-search
+    /// mutation requiring the executable bit is also killed.
+    fn write_exec(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        fs::write(path, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(())
+    }
+
+    fn m19_guard() {
+        if env::var_os(M19_CHILD_MODE).is_some() {
+            m19_child_exit();
+        }
+    }
+
+    #[test]
+    fn m19_no_path_fallback_when_file_exists_on_disk() -> R {
+        m19_guard();
+        let dir = tempdir()?;
+        let stray = dir
+            .path()
+            .join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
+        write_exec(&stray, b"#!bin\n")?;
+        assert!(
+            m19_rerun_with_path(
+                dir.path(),
+                "m19_no_path_fallback_when_file_exists_on_disk",
+                "notconfigured",
+                &[]
+            ),
+            "resolver must stay NotConfigured even with a stray host binary on PATH"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn m19_explicit_none_params_never_discover_stray_executable() -> R {
+        m19_guard();
+        let dir = tempdir()?;
+        let stray = dir
+            .path()
+            .join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
+        write_exec(&stray, b"#!bin\n")?;
+        fs::write(dir.path().join(DEFAULT_HOST_BUNDLE_NAME), b"bundle")?;
+        assert!(
+            m19_rerun_with_path(
+                dir.path(),
+                "m19_explicit_none_params_never_discover_stray_executable",
+                "notconfigured",
+                &[]
+            ),
+            "resolver must stay NotConfigured even with stray host + bundle on PATH"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn m19_env_overrides_never_fall_through_to_path() -> R {
+        m19_guard();
+        let dir = tempdir()?;
+        let env_host = dir.path().join("explicit-host");
+        write_exec(&env_host, b"#!bin\n")?;
+        let stray = dir
+            .path()
+            .join(format!("{DEFAULT_HOST_NAME}{HOST_EXE_SUFFIX}"));
+        write_exec(&stray, b"#!bin\n")?;
+        let host_str = env_host.to_string_lossy().into_owned();
+        assert!(
+            m19_rerun_with_path(
+                dir.path(),
+                "m19_env_overrides_never_fall_through_to_path",
+                "envwins",
+                &[(M19_ENV_HOST, host_str.as_str())],
+            ),
+            "env override must win over any PATH discovery"
+        );
+        Ok(())
     }
 }

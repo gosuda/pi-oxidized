@@ -30,6 +30,7 @@ export const VERIFICATION_DIALOG_COMMAND = "verification-dialogs";
 export const VERIFICATION_CUSTOM_UI_COMMAND = "verification-custom-ui";
 export const VERIFICATION_FLAG_COMMAND = "verification-observe-flag";
 export const VERIFICATION_SESSION_REPLACEMENT_COMMAND = "verification-session-replacement";
+export const VERIFICATION_OVERLAY_STACK_COMMAND = "verification-overlay-stack";
 
 const COMPATIBILITY_INSTANCE = `${process.pid}:${Date.now()}`;
 let compatibilitySequence = 0;
@@ -363,6 +364,47 @@ pi.registerCommand(VERIFICATION_FLAG_COMMAND, {
 				};
 			});
 			recordCompatibility("custom.command.after", { state: result });
+		},
+	});
+
+	pi.registerCommand(VERIFICATION_OVERLAY_STACK_COMMAND, {
+		description:
+			"Exercise overlay-over-overlay stacking: focusable custom overlay with a pending select dialog that timeout auto-cancels",
+		handler: async (_args, ctx) => {
+			recordCompatibility("overlay-stack.command.before", {});
+			const customPromise = ctx.ui.custom<string>((_tui, _theme, _keybindings, done) => {
+				let completed = false;
+				return {
+					focused: false,
+					invalidate() {},
+					render(): string[] {
+						return ["Verification overlay-stack state=pending"];
+					},
+					handleInput(data: string): void {
+						if (completed || data !== "x") return;
+						completed = true;
+						recordCompatibility("overlay-stack.overlay.input", { input: data });
+						done("completed");
+					},
+					dispose(): void {
+						recordCompatibility("overlay-stack.overlay.dispose", { completed });
+					},
+				};
+			});
+			// Let the overlay slot mount before stacking the dialog on top of it.
+			const { promise: overlayMounted, resolve: markOverlayMounted } = Promise.withResolvers<void>();
+			setTimeout(markOverlayMounted, 300);
+			await overlayMounted;
+			recordCompatibility("overlay-stack.select.before", { timeout: 6000 });
+			const select = await ctx.ui.select("Verification stacked select", ["one", "two"], {
+				timeout: 6000,
+			});
+			recordCompatibility("overlay-stack.select.resolved", { value: select ?? null });
+			const overlay = await customPromise;
+			recordCompatibility("overlay-stack.command.after", {
+				overlay,
+				select: select ?? null,
+			});
 		},
 	});
 

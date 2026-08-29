@@ -3077,4 +3077,117 @@ mod bridge_tests {
         );
         Ok(())
     }
+
+    /// Witness manifest (XC-2): the single (method, kind) lockstep check
+    /// that consumes `witness-manifest.json` by name — parity does not
+    /// create a second check.  Deleting any fixture line or mutating a
+    /// modifier-combo key event kind breaks this test on the Rust side,
+    /// mirroring the TypeScript `witness manifest lockstep` describe block.
+    const WITNESS_MANIFEST: &str =
+        include_str!("../../../packages/pi-tui-protocol/tests/fixtures/witness-manifest.json");
+
+    #[test]
+    fn witness_manifest_lockstep() -> TestResult {
+        let manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST)?;
+        let expected_count = manifest["totalLines"]
+            .as_u64()
+            .ok_or("manifest missing totalLines")?;
+        let expected_pairs = manifest["methodKindPairs"]
+            .as_array()
+            .ok_or("manifest missing methodKindPairs")?;
+        let expected_key_events = manifest["modifierComboKeyEvents"]
+            .as_array()
+            .ok_or("manifest missing modifierComboKeyEvents")?;
+
+        // 1. Total non-blank line count must match.
+        let mut count = 0usize;
+        let mut seen: std::collections::HashSet<(String, FrameKind)> =
+            std::collections::HashSet::new();
+        let mut key_events: Vec<serde_json::Value> = Vec::new();
+        for line in FIXTURES.lines() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let frame = decode_frame_str(line)?;
+            seen.insert((frame.method.clone(), frame.kind));
+            count += 1;
+
+            // Collect key events with modifiers for the modifier-combo check.
+            if frame.method == Method::UiEvent.as_str() && frame.kind == FrameKind::Req {
+                if let Some(event) = frame.payload.get("event") {
+                    if event.get("type").and_then(|v| v.as_str()) == Some("key") {
+                        let code = event.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                        let modifiers = event
+                            .get("modifiers")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({}));
+                        let kind = event
+                            .get("kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("press");
+                        key_events.push(serde_json::json!({
+                            "code": code,
+                            "modifiers": modifiers,
+                            "kind": kind,
+                        }));
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            count, expected_count as usize,
+            "fixture line count drifted from manifest"
+        );
+
+        // 2. Every manifest (method, kind) pair must be witnessed.
+        for pair in expected_pairs {
+            let method = pair[0].as_str().ok_or("manifest pair missing method")?;
+            let kind_str = pair[1].as_str().ok_or("manifest pair missing kind")?;
+            let kind = match kind_str {
+                "req" => FrameKind::Req,
+                "res" => FrameKind::Res,
+                "event" => FrameKind::Event,
+                "error" => FrameKind::Error,
+                _ => panic!("unknown frame kind in manifest: {kind_str}"),
+            };
+            assert!(
+                seen.contains(&(method.to_owned(), kind)),
+                "fixture missing {method} {kind_str} frame"
+            );
+        }
+
+        // Every seen pair must also be in the manifest (no untracked fixtures).
+        for (method, kind) in &seen {
+            let kind_str = match kind {
+                FrameKind::Req => "req",
+                FrameKind::Res => "res",
+                FrameKind::Event => "event",
+                FrameKind::Error => "error",
+            };
+            let found = expected_pairs
+                .iter()
+                .any(|p| p[0].as_str() == Some(method.as_str()) && p[1].as_str() == Some(kind_str));
+            assert!(
+                found,
+                "fixture contains untracked {method} {kind_str} pair not in manifest"
+            );
+        }
+
+        // 3. Modifier-combo key events must match the manifest exactly.
+        assert_eq!(
+            key_events.len(),
+            expected_key_events.len(),
+            "key event count drifted from manifest"
+        );
+        for (i, (actual, expected)) in key_events
+            .iter()
+            .zip(expected_key_events.iter())
+            .enumerate()
+        {
+            assert_eq!(actual, expected, "key event {i} drifted from manifest");
+        }
+
+        Ok(())
+    }
 }

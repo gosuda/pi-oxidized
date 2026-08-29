@@ -1,5 +1,7 @@
 //! Observable agent lifecycle and tool-execution events.
 
+use std::sync::Arc;
+
 use pi_ai::{AssistantMessageEvent, ToolResultMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -38,7 +40,7 @@ pub enum AgentEvent {
     /// An assistant message was updated during streaming.
     MessageUpdate {
         /// Latest assistant message snapshot.
-        message: AgentMessage,
+        message: Arc<AgentMessage>,
         /// Underlying provider stream event.
         #[serde(rename = "assistantMessageEvent")]
         assistant_message_event: Box<AssistantMessageEvent>,
@@ -184,9 +186,9 @@ mod tests {
         let assistant = AssistantMessage::new("api", "provider", "model", 2);
         assert_wire(
             &AgentEvent::MessageUpdate {
-                message: assistant_message(),
+                message: Arc::new(assistant_message()),
                 assistant_message_event: Box::new(AssistantMessageEvent::Start {
-                    partial: assistant,
+                    partial: Arc::new(assistant),
                 }),
             },
             json!({

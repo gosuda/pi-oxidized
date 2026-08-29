@@ -1,0 +1,6 @@
+
+Open this URL in your browser:
+https://auth.x.ai/device?user_code=XAI-MOCK
+Enter code: XAI-MOCK
+
+Credentials saved to auth.json

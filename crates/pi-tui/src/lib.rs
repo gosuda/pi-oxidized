@@ -14,3 +14,6 @@ pub mod link;
 pub mod overlay;
 pub mod terminal;
 pub mod text;
+
+#[cfg(feature = "testkit")]
+pub mod testkit;

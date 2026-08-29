@@ -74,9 +74,50 @@ export class HostBuildError extends Error {
 	}
 }
 
+/** Relative workspace path used for every shipping host build. */
+export const HOST_PACKAGE_DIR = "packages/extension-host";
+
+/** Shipping `bun build` argument vectors used by the release host path. */
+export interface HostBundleCommands {
+	readonly compiled: readonly string[];
+	readonly runtimeBundle: readonly string[];
+}
+
+/**
+ * Single authority for both shipping host bundle commands: the compiled
+ * sidecar argv and the runtime-bundle fallback argv.
+ */
+export function hostBundleCommands(plan: TargetPlan, outDir: string): HostBundleCommands {
+	const compiledOut = join(outDir, plan.hostBinaryName);
+	const bundleOut = join(outDir, plan.hostBundleName);
+	return {
+		compiled: [
+			"build",
+			"./src/main.ts",
+			"--compile",
+			"--minify",
+			"--compile-autoload-tsconfig",
+			"--compile-autoload-package-json",
+			"--target",
+			plan.bunTarget,
+			"--outfile",
+			compiledOut,
+		],
+		runtimeBundle: [
+			"build",
+			"./src/main.ts",
+			"--target",
+			"bun",
+			"--minify",
+			"--outfile",
+			bundleOut,
+		],
+	};
+}
+
 /** Absolute path to the host package directory inside the workspace. */
 function hostPackageDir(repoRoot: string): string {
-	return resolve(repoRoot, "packages/extension-host");
+	return resolve(repoRoot, HOST_PACKAGE_DIR);
 }
 
 /** Absolute path to a per-target staging subdirectory. */
@@ -121,6 +162,49 @@ export async function buildHost(options: BuildHostOptions): Promise<HostArtifact
 	);
 }
 
+/** Inputs for building only the runtime-bundle fallback script. */
+export interface BuildFallbackBundleOptions {
+	/** Absolute path to the workspace root (contains `packages/extension-host`). */
+	readonly repoRoot: string;
+	/** Working directory under which artifacts are emitted (a `host/` subdir is created). */
+	readonly stagingRoot: string;
+	/** Resolved release target. */
+	readonly plan: TargetPlan;
+	/** Command runner. Defaults to {@link SpawnRunner}. */
+	readonly runner?: CommandRunner;
+}
+
+/**
+ * Build only the runtime-bundle fallback JavaScript (`pi-extension-host.js`)
+ * for archives that ship the compiled sidecar AND the fallback beside it
+ * (musl rows: the release smoke drives both `hello` protocols from one
+ * unpacked archive). Provisioning the pinned `bun` runtime stays the
+ * caller's job, exactly as for the runtime-bundle host kind.
+ */
+export async function buildFallbackBundle(
+	options: BuildFallbackBundleOptions,
+): Promise<{ readonly scriptPath: string }> {
+	const runner = options.runner ?? new SpawnRunner();
+	const hostDir = hostPackageDir(options.repoRoot);
+	const outDir = targetStagingDir(options.stagingRoot, options.plan);
+	await mkdir(outDir, { recursive: true });
+	const scriptPath = join(outDir, options.plan.hostBundleName);
+	if (existsSync(scriptPath)) await rm(scriptPath, { force: true });
+	const { runtimeBundle } = hostBundleCommands(options.plan, outDir);
+	const res = await runner.run("bun", [...runtimeBundle], {
+		cwd: hostDir,
+		rejectOnError: false,
+		timeoutMs: HOST_BUILD_TIMEOUT_MS,
+	});
+	if (res.exitCode !== 0 || !existsSync(scriptPath)) {
+		throw new HostBuildError(
+			options.plan.rustTarget,
+			`runtime-bundle fallback build failed (exit ${res.exitCode}). stderr=${res.stderr.slice(-500)}`,
+		);
+	}
+	return { scriptPath };
+}
+
 /** Install host dependencies with the locked file. */
 async function installHostDeps(hostDir: string, runner: CommandRunner): Promise<void> {
 	const res = await runner.run("bun", ["install", "--frozen-lockfile"], {
@@ -158,22 +242,12 @@ async function compileSidecar(
 	plan: TargetPlan,
 	runner: CommandRunner,
 ): Promise<RunResult> {
-	return runner.run(
-		"bun",
-		[
-			"build",
-			"./src/main.ts",
-			"--compile",
-			"--minify",
-			"--compile-autoload-tsconfig",
-			"--compile-autoload-package-json",
-			"--target",
-			plan.bunTarget,
-			"--outfile",
-			outPath,
-		],
-		{ cwd: hostDir, rejectOnError: false, timeoutMs: HOST_BUILD_TIMEOUT_MS },
-	);
+	const { compiled } = hostBundleCommands(plan, dirname(outPath));
+	return runner.run("bun", [...compiled], {
+		cwd: hostDir,
+		rejectOnError: false,
+		timeoutMs: HOST_BUILD_TIMEOUT_MS,
+	});
 }
 
 /**
@@ -337,19 +411,12 @@ async function tryRuntimeBundlePath(
 ): Promise<HostArtifact | undefined> {
 	const scriptPath = join(outDir, options.plan.hostBundleName);
 	if (existsSync(scriptPath)) await rm(scriptPath, { force: true });
-	const res = await runner.run(
-		"bun",
-		[
-			"build",
-			"./src/main.ts",
-			"--target",
-			"bun",
-			"--minify",
-			"--outfile",
-			scriptPath,
-		],
-		{ cwd: hostDir, rejectOnError: false, timeoutMs: HOST_BUILD_TIMEOUT_MS },
-	);
+	const { runtimeBundle } = hostBundleCommands(options.plan, outDir);
+	const res = await runner.run("bun", [...runtimeBundle], {
+		cwd: hostDir,
+		rejectOnError: false,
+		timeoutMs: HOST_BUILD_TIMEOUT_MS,
+	});
 	if (res.exitCode !== 0 || !existsSync(scriptPath)) return undefined;
 	const runtimePath = join(outDir, options.plan.bunRuntimeName);
 	// Caller is responsible for populating `runtimePath` (from the official

@@ -52,15 +52,18 @@ impl AgentOptions {
             thinking_level: pi_ai::ModelThinkingLevel::Off,
             tools: Vec::new(),
             messages: Vec::new(),
-            config: default_base_config(),
+            config: default_base_config(crate::state::default_model()),
             provider,
         }
     }
 }
 
-fn default_base_config() -> AgentLoopConfig {
+/// Single construction owner for a base [`AgentLoopConfig`] (pinned
+/// arbitration site). `AgentLoopConfig::base` in `config.rs` delegates here
+/// so callers outside the five pinned sites never construct the literal.
+pub(crate) fn default_base_config(model: Model) -> AgentLoopConfig {
     AgentLoopConfig {
-        model: crate::state::default_model(),
+        model,
         reasoning: None,
         temperature: None,
         max_tokens: None,
@@ -85,6 +88,7 @@ fn default_base_config() -> AgentLoopConfig {
         after_tool_call: None,
         on_payload: None,
         on_response: None,
+        telemetry: crate::telemetry::noop_context(),
     }
 }
 
@@ -298,6 +302,12 @@ impl Agent {
     pub fn clear_queues(&self) {
         lock(&self.inner.steering).clear();
         lock(&self.inner.follow_up).clear();
+    }
+
+    /// Returns the telemetry context from the base config.
+    #[must_use]
+    pub fn telemetry(&self) -> Arc<dyn crate::telemetry::TelemetryContext> {
+        Arc::clone(&self.inner.base_config.telemetry)
     }
 
     /// Returns true when either queue still contains pending messages.
@@ -726,9 +736,7 @@ mod tests {
     }
 
     fn base_test_config() -> AgentLoopConfig {
-        let mut config = default_base_config();
-        config.model = test_model();
-        config
+        default_base_config(test_model())
     }
 
     fn agent_options(provider: Arc<dyn Provider>) -> AgentOptions {
@@ -753,7 +761,12 @@ mod tests {
 
     fn start_event() -> AssistantMessageEvent {
         AssistantMessageEvent::Start {
-            partial: AssistantMessage::new("test-api", "test-provider", "m", now_millis()),
+            partial: Arc::new(AssistantMessage::new(
+                "test-api",
+                "test-provider",
+                "m",
+                now_millis(),
+            )),
         }
     }
 
@@ -761,7 +774,7 @@ mod tests {
         AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: text.to_owned(),
-            partial: assistant(text),
+            partial: Arc::new(assistant(text)),
         }
     }
 
@@ -769,7 +782,7 @@ mod tests {
         AssistantMessageEvent::TextEnd {
             content_index: 0,
             content: text.to_owned(),
-            partial: assistant(text),
+            partial: Arc::new(assistant(text)),
         }
     }
 

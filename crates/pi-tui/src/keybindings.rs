@@ -269,6 +269,57 @@ fn normalize_keys(keys: impl IntoIterator<Item = KeyId>) -> Vec<KeyId> {
     result
 }
 
+// ---------------------------------------------------------------------------
+// Display formatting (ports `keybinding-hints.ts`)
+// ---------------------------------------------------------------------------
+
+/// Format one `+`-separated part of a key chord for display (TS
+/// `formatKeyPart`): on macOS the `alt` modifier renders as `option`.
+fn format_key_part(part: &str, capitalize: bool) -> String {
+    let display = if cfg!(target_os = "macos") && part.eq_ignore_ascii_case("alt") {
+        "option"
+    } else {
+        part
+    };
+    if !capitalize {
+        return display.to_owned();
+    }
+    let mut chars = display.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Format a raw key string for display (TS `formatKeyText`).
+///
+/// `/` separates key alternatives and `+` separates modifier chord parts;
+/// each part renders independently, optionally capitalized
+/// (`ctrl+o` → `Ctrl+O`, `escape/ctrl+c` → `Escape/Ctrl+C`).
+#[must_use]
+pub fn format_key_text(key: &str, capitalize: bool) -> String {
+    key.split('/')
+        .map(|alternative| {
+            alternative
+                .split('+')
+                .map(|part| format_key_part(part, capitalize))
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Render resolved keys through [`format_key_text`] (TS `formatKeys`); an
+/// empty key list renders as an empty string.
+fn format_keys(keys: &[KeyId], capitalize: bool) -> String {
+    if keys.is_empty() {
+        return String::new();
+    }
+    let joined = keys.iter().map(KeyId::as_str).collect::<Vec<_>>().join("/");
+    format_key_text(&joined, capitalize)
+}
+
 /// Resolves keybinding ids to key lists and reports user-binding conflicts.
 ///
 /// Conflicts are computed only among **user** bindings that share a `KeyId`.
@@ -353,6 +404,24 @@ impl KeybindingsManager {
         self.keys_by_id.get(keybinding).cloned().unwrap_or_default()
     }
 
+    /// Uncapitalized display text for an action's keys (TS `keyText`).
+    ///
+    /// Key alternatives join with `/` (`escape/ctrl+c`); an unknown or
+    /// unbound id renders as an empty string.
+    #[must_use]
+    pub fn key_text(&self, keybinding: &str) -> String {
+        format_keys(&self.get_keys(keybinding), false)
+    }
+
+    /// Capitalized display text for an action's keys (TS `keyDisplayText`).
+    ///
+    /// Same as [`key_text`](Self::key_text) with every chord part capitalized
+    /// (`ctrl+o` → `Ctrl+O`).
+    #[must_use]
+    pub fn key_display_text(&self, keybinding: &str) -> String {
+        format_keys(&self.get_keys(keybinding), true)
+    }
+
     /// Definition for an action, if known.
     #[must_use]
     pub fn get_definition(&self, keybinding: &str) -> Option<&KeybindingDefinition> {
@@ -426,6 +495,20 @@ pub fn update_global_keybindings(f: impl FnOnce(&mut KeybindingsManager)) {
         Ok(mut guard) => f(&mut guard),
         Err(poisoned) => f(&mut poisoned.into_inner()),
     }
+}
+
+/// Uncapitalized display text for the process-global binding of `keybinding`
+/// (TS `keyText`).
+#[must_use]
+pub fn key_text(keybinding: &str) -> String {
+    get_keybindings().key_text(keybinding)
+}
+
+/// Capitalized display text for the process-global binding of `keybinding`
+/// (TS `keyDisplayText`).
+#[must_use]
+pub fn key_display_text(keybinding: &str) -> String {
+    get_keybindings().key_display_text(keybinding)
 }
 
 #[cfg(test)]
@@ -598,5 +681,43 @@ mod tests {
         assert!(!manager.matches(&ctrl_c, "tui.input.copy"));
         // select.cancel still has ctrl+c by default.
         assert!(manager.matches(&ctrl_c, "tui.select.cancel"));
+    }
+
+    #[test]
+    fn format_key_text_capitalizes_each_chord_part() {
+        assert_eq!(format_key_text("ctrl+o", true), "Ctrl+O");
+        assert_eq!(format_key_text("shift+tab", true), "Shift+Tab");
+        assert_eq!(format_key_text("escape", true), "Escape");
+        assert_eq!(format_key_text("escape/ctrl+c", true), "Escape/Ctrl+C");
+        assert_eq!(format_key_text("escape/ctrl+c", false), "escape/ctrl+c");
+        assert_eq!(format_key_text("", true), "");
+        let alt_enter = format_key_text("alt+enter", true);
+        if cfg!(target_os = "macos") {
+            assert_eq!(alt_enter, "Option+Enter");
+        } else {
+            assert_eq!(alt_enter, "Alt+Enter");
+        }
+    }
+
+    #[test]
+    fn manager_key_text_joins_resolved_alternatives() {
+        let manager = KeybindingsManager::with_tui_defaults();
+        assert_eq!(manager.key_text("tui.select.cancel"), "escape/ctrl+c");
+        assert_eq!(
+            manager.key_display_text("tui.select.cancel"),
+            "Escape/Ctrl+C"
+        );
+        // Unknown ids resolve to no keys → blank display text.
+        assert_eq!(manager.key_text("tui.input.missing"), "");
+        assert_eq!(manager.key_display_text("tui.input.missing"), "");
+    }
+
+    #[test]
+    fn key_display_text_follows_rebinds() {
+        let mut user = KeybindingsConfig::new();
+        user.insert("tui.input.copy".to_owned(), vec![KeyId::from_raw("ctrl+m")]);
+        let manager = KeybindingsManager::new(tui_keybindings(), user);
+        assert_eq!(manager.key_text("tui.input.copy"), "ctrl+m");
+        assert_eq!(manager.key_display_text("tui.input.copy"), "Ctrl+M");
     }
 }

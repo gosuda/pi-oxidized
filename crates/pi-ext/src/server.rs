@@ -29,12 +29,15 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures::FutureExt;
+use futures::{
+    FutureExt,
+    stream::{FuturesUnordered, StreamExt},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -46,6 +49,80 @@ use crate::protocol::{
     FrameKind, Hello, HelloAck, Method, PROTOCOL_VERSION, SHORTCUT_EXECUTE_METHOD,
     TerminalInputResult, ThemeUpdate, ToolUpdate, encode_frame, from_payload, to_payload,
 };
+
+/// Test-only timing instrumentation for the extension RPC dispatch bench
+/// lane. Compiled only when the `bench-seam` Cargo feature is enabled;
+/// zero overhead in production builds. Stores per-frame-id decode-start,
+/// task-start, and encode-complete timestamps in a global map, drained by
+/// the ignored release test after each measurement round.
+#[cfg(feature = "bench-seam")]
+pub mod bench_seam {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::Instant;
+
+    /// Per-request timing triple: when the decoded frame entered dispatch,
+    /// when the spawned task first executed, and when the terminal response
+    /// frame was about to be sent.
+    static TIMESTAMPS: LazyLock<Mutex<HashMap<u64, (Instant, Option<Instant>, Option<Instant>)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Record the decode-start timestamp for `id` (frame just decoded,
+    /// about to enter `dispatch_ready`).
+    pub fn record_decode(id: u64) {
+        let mut map = TIMESTAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(id, (Instant::now(), None, None));
+    }
+
+    /// Record the task-start timestamp for `id` (spawned task first
+    /// executing, before panic guard / handler dispatch).
+    pub fn record_task_start(id: u64) {
+        let mut map = TIMESTAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = map.get_mut(&id) {
+            entry.1 = Some(Instant::now());
+        }
+    }
+
+    /// Record the encode-complete timestamp for `id` (terminal frame
+    /// constructed, about to be sent via `out_tx`).
+    pub fn record_encode(id: u64) {
+        let mut map = TIMESTAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = map.get_mut(&id) {
+            entry.2 = Some(Instant::now());
+        }
+    }
+
+    /// Drain all completed timing entries. Returns `(id, decode_start,
+    /// task_start, encode_complete)` for entries where all three timestamps
+    /// were captured. Incomplete entries are dropped.
+    pub fn take_completed() -> Vec<(u64, Instant, Instant, Instant)> {
+        let mut map = TIMESTAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.drain()
+            .filter_map(|(id, (decode_start, task_start, encode_complete))| {
+                match (task_start, encode_complete) {
+                    (Some(ts), Some(ec)) => Some((id, decode_start, ts, ec)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Clear all stored timestamps.
+    pub fn clear() {
+        let mut map = TIMESTAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.clear();
+    }
+}
 
 /// Wire method for the registry snapshot request.
 pub const EXTENSIONS_LOAD_METHOD: &str = "extensions.load";
@@ -1067,7 +1144,22 @@ where
         })
     };
 
-    let run_result = drive(reader, &runtime, &writer_dead, &rejection_tx, &mut tasks).await;
+    // Request worker: one long-lived supervised task owning a
+    // FuturesUnordered of request futures, replacing per-request
+    // JoinSet::spawn. The bounded channel capacity equals the semaphore
+    // bound so the semaphore remains the single concurrency bound.
+    let (job_tx, job_rx) = mpsc::channel::<RequestJob>(runtime.max_in_flight);
+    let worker_handle = tokio::spawn(run_request_worker(Arc::clone(&runtime), job_rx));
+
+    let run_result = drive(
+        reader,
+        &runtime,
+        &writer_dead,
+        &rejection_tx,
+        &mut tasks,
+        &job_tx,
+    )
+    .await;
 
     if run_result.is_err() {
         // Fatal read/dispatch errors must not wait on a peer that already
@@ -1076,16 +1168,21 @@ where
         writer_task.abort();
     }
 
-    // Teardown: cancel cooperative executions, stop request tasks, drop the
-    // runtime, then signal the writer. The explicit shutdown signal lets the
-    // writer drain buffered frames and stop regardless of retained
-    // event-sink sender clones held by detached background work.
+    // Teardown: close the job channel, cancel cooperative executions,
+    // abort the request worker (dropping pending FuturesUnordered futures,
+    // releasing permits/claims), reap the worker, then abort theme tasks
+    // and preserve writer/rejection teardown ordering. The current code
+    // aborts requests (no graceful drain), so the worker is aborted, not
+    // drained.
+    drop(job_tx);
     runtime
         .in_flight
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .values()
         .for_each(|entry| entry.token.cancel());
+    worker_handle.abort();
+    let _ = worker_handle.await;
     tasks.abort_all();
     while let Some(joined) = tasks.join_next().await {
         let _ = joined;
@@ -1266,6 +1363,10 @@ struct ServerRuntime<E: NativeExtension> {
     /// the spawn boundary into the request task. Unregistered keys are
     /// never tracked.
     shortcut_in_flight: Arc<Mutex<HashSet<String>>>,
+    /// Configured bound on concurrently handled requests, stored for the
+    /// request-worker channel capacity so the semaphore remains the single
+    /// concurrency bound.
+    max_in_flight: usize,
 }
 
 impl<E: NativeExtension> ServerRuntime<E> {
@@ -1287,6 +1388,7 @@ impl<E: NativeExtension> ServerRuntime<E> {
                 out_tx,
                 update_capacity: config.update_capacity,
                 lifecycle_deadline: config.lifecycle_deadline,
+                max_in_flight: config.max_in_flight.max(1),
                 theme: Arc::new(ThemeDispatch::default()),
                 shortcut_in_flight: Arc::new(Mutex::new(HashSet::new())),
             },
@@ -1311,6 +1413,7 @@ async fn drive<R, E>(
     writer_dead: &CancellationToken,
     rejection_tx: &mpsc::Sender<Frame>,
     tasks: &mut JoinSet<()>,
+    job_tx: &mpsc::Sender<RequestJob>,
 ) -> Result<(), ServerError>
 where
     R: AsyncRead + Unpin + Send,
@@ -1356,7 +1459,9 @@ where
                     state = ServerState::Ready;
                 }
                 ServerState::Ready => {
-                    dispatch_ready(frame, runtime, rejection_tx, tasks)?;
+                    #[cfg(feature = "bench-seam")]
+                    bench_seam::record_decode(frame.id);
+                    dispatch_ready(frame, runtime, rejection_tx, tasks, job_tx)?;
                 }
             }
         }
@@ -1547,11 +1652,61 @@ fn send_deferred_frame(
     }
 }
 
+/// Owned request admitted by `dispatch_request`, handed off to the
+/// long-lived request worker via a bounded channel. The permit, shortcut
+/// claim, and cancellation token live until the request future ends.
+struct RequestJob {
+    frame: Frame,
+    permit: OwnedSemaphorePermit,
+    shortcut_claim: Option<ShortcutClaim>,
+    token: Option<CancellationToken>,
+}
+
+/// One long-lived supervised task owning a `FuturesUnordered` of request
+/// futures, replacing per-request `JoinSet::spawn`. Receives admitted jobs
+/// from the bounded channel and polls them concurrently. Responses remain
+/// completion-order; max overlap remains `max_in_flight` (semaphore bound).
+///
+/// The worker is aborted on teardown — pending futures are dropped,
+/// releasing permits/claims — matching the current `abort_all` behavior.
+async fn run_request_worker<E: NativeExtension>(
+    runtime: Arc<ServerRuntime<E>>,
+    mut job_rx: mpsc::Receiver<RequestJob>,
+) {
+    let mut pending: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send>>> =
+        FuturesUnordered::new();
+
+    loop {
+        tokio::select! {
+            job = job_rx.recv() => {
+                let Some(job) = job else {
+                    return;
+                };
+                let RequestJob {
+                    frame,
+                    permit,
+                    shortcut_claim,
+                    token,
+                } = job;
+                let runtime = Arc::clone(&runtime);
+                pending.push(Box::pin(async move {
+                    let _permit = permit;
+                    let _claim = shortcut_claim;
+                    handle_request(runtime, frame, token).await;
+                }));
+            }
+            _ = pending.next(), if !pending.is_empty() => {
+                // Future completed; permit/claim released by RAII drop.
+            }
+        }
+    }
+}
+
 fn dispatch_request<E: NativeExtension>(
     frame: Frame,
     runtime: &Arc<ServerRuntime<E>>,
     rejection_tx: &mpsc::Sender<Frame>,
-    tasks: &mut JoinSet<()>,
+    job_tx: &mpsc::Sender<RequestJob>,
 ) -> Result<(), ServerError> {
     let Ok(permit) = runtime.semaphore.clone().try_acquire_owned() else {
         let response = if shortcut_is_in_flight(runtime, &frame) {
@@ -1578,7 +1733,7 @@ fn dispatch_request<E: NativeExtension>(
         }
     };
 
-    // Register cancellation before spawning so the next frame can find it.
+    // Register cancellation before handoff so the next frame can find it.
     let kind = match frame.method.as_str() {
         methods::TOOL_EXECUTE => Some(InFlightKind::Tool),
         methods::PROVIDER_STREAM => Some(InFlightKind::Provider),
@@ -1599,14 +1754,54 @@ fn dispatch_request<E: NativeExtension>(
             );
         token
     });
-    let runtime = Arc::clone(runtime);
-    tasks.spawn(async move {
-        let _permit = permit;
-        let _claim = shortcut_claim;
-        handle_request(runtime, frame, token).await;
-    });
-    while tasks.try_join_next().is_some() {}
-    Ok(())
+
+    // Hand off to the long-lived request worker via a bounded channel.
+    // The permit, shortcut claim, and cancellation token live until the
+    // request future ends (owned by the job, then by the future). On
+    // full/closed, undo registration and emit exactly one correlated
+    // error or fail the connection.
+    let job = RequestJob {
+        frame,
+        permit,
+        shortcut_claim,
+        token,
+    };
+    match job_tx.try_send(job) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(job)) => {
+            let RequestJob {
+                frame,
+                permit: _,
+                shortcut_claim: _,
+                token,
+            } = job;
+            if token.is_some() {
+                remove_in_flight(runtime, frame.id);
+            }
+            let response = error_frame(
+                frame.id,
+                &frame.method,
+                "overloaded",
+                "too many in-flight requests",
+                true,
+            );
+            send_deferred_frame(rejection_tx, response)
+        }
+        Err(mpsc::error::TrySendError::Closed(job)) => {
+            let RequestJob {
+                frame,
+                permit: _,
+                shortcut_claim: _,
+                token,
+            } = job;
+            if token.is_some() {
+                remove_in_flight(runtime, frame.id);
+            }
+            Err(ServerError::Io(std::io::Error::other(
+                "request worker closed",
+            )))
+        }
+    }
 }
 
 /// Dispatch one post-handshake frame.
@@ -1615,9 +1810,10 @@ fn dispatch_ready<E: NativeExtension>(
     runtime: &Arc<ServerRuntime<E>>,
     rejection_tx: &mpsc::Sender<Frame>,
     tasks: &mut JoinSet<()>,
+    job_tx: &mpsc::Sender<RequestJob>,
 ) -> Result<(), ServerError> {
     match frame.kind {
-        FrameKind::Req => dispatch_request(frame, runtime, rejection_tx, tasks)?,
+        FrameKind::Req => dispatch_request(frame, runtime, rejection_tx, job_tx)?,
         FrameKind::Event => match frame.method.as_str() {
             methods::TOOL_CANCEL | methods::PROVIDER_CANCEL => {
                 let kind = if frame.method == methods::TOOL_CANCEL {
@@ -1664,6 +1860,8 @@ async fn handle_request<E: NativeExtension>(
     token: Option<CancellationToken>,
 ) {
     let id = frame.id;
+    #[cfg(feature = "bench-seam")]
+    bench_seam::record_task_start(id);
     let method = frame.method.clone();
     let result =
         std::panic::AssertUnwindSafe(handle_request_dispatch(Arc::clone(&runtime), frame, token))
@@ -1744,6 +1942,8 @@ async fn handle_request_dispatch<E: NativeExtension>(
             }
         }
     };
+    #[cfg(feature = "bench-seam")]
+    bench_seam::record_encode(id);
     let _ = runtime.out_tx.send(terminal.into()).await;
 }
 
@@ -2678,7 +2878,7 @@ mod tests {
         AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: delta.to_owned(),
-            partial: AssistantMessage::new("test-api", "test-provider", "m", 0),
+            partial: Arc::new(AssistantMessage::new("test-api", "test-provider", "m", 0)),
         }
     }
 
@@ -6263,8 +6463,9 @@ mod tests {
             .try_send(Frame::event(0, Method::Notify, json!({})))
             .map_err(|error| format!("fill deferred queue: {error}"))?;
         let mut tasks = JoinSet::new();
+        let (job_tx, _job_rx) = mpsc::channel::<RequestJob>(1);
 
-        dispatch_ready(theme_frame(9), &runtime, &rejection_tx, &mut tasks)?;
+        dispatch_ready(theme_frame(9), &runtime, &rejection_tx, &mut tasks, &job_tx)?;
         let joined = tokio::time::timeout(TIMEOUT, tasks.join_next())
             .await?
             .ok_or("missing theme supervisor")?;

@@ -53,7 +53,9 @@ use pi_tui::keys::{
 };
 use pi_tui::terminal::caps::TerminalCapabilities;
 use pi_tui::terminal::input::TerminalInput;
-use pi_tui::terminal::probe::{TerminalTheme, detect_terminal_theme, probe_terminal};
+use pi_tui::terminal::probe::{
+    TerminalTheme, detect_terminal_theme, probe_collect_replies_with_yield, probe_write_batch,
+};
 use pi_tui::terminal::writer::{ReanchorCause, SettledBlock, Tui, Txn};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -88,7 +90,7 @@ use super::state::{
     PendingMessage, SessionStatus, StartupDiagnostic, StatusKind, ViewAction, ViewState,
     WidgetSlot,
 };
-use super::theme::ResolvedTheme;
+use super::theme::{ResolvedTheme, ThemeColor};
 use super::view::{ComposedSection, compose};
 
 /// Maximum time the runtime will wait for one [`Tui::commit`] before declaring
@@ -119,6 +121,15 @@ const OSC0_SET_TITLE_PREFIX: &[u8] = b"\x1b]0;";
 
 /// BEL terminates an OSC sequence.
 const OSC_BEL: u8 = 0x07;
+
+/// Minimum viewport width for readable rendering (TUI-G8 floor policy).
+///
+/// When a live resize reports `width < VIEWPORT_WIDTH_FLOOR`, the runtime
+/// accepts the event (updates the size cache and [`ViewState`]) but blanks
+/// the render area instead of wrapping content into an unreadable viewport.
+/// Rendering resumes immediately when width returns to ≥ floor. Matches the
+/// initial-size clamp in [`initial_terminal_size`].
+pub const VIEWPORT_WIDTH_FLOOR: u16 = 20;
 
 /// Sanitize extension-supplied terminal title text for OSC 0 emission.
 ///
@@ -448,13 +459,33 @@ pub trait SessionHost: Send + Sync + 'static {
         &self,
     ) -> BoxFuture<'_, Result<Vec<super::state::ModelSelectorEntry>, String>>;
 
+    /// Current session file path for the active-session delete guard.
+    ///
+    /// Implementations must await the session manager lock (never `try_lock`
+    /// and disable the guard on contention). Callers canonicalize the result
+    /// when building the session selector.
+    fn current_session_file(&self) -> BoxFuture<'_, Option<String>> {
+        Box::pin(async { None })
+    }
+
+    /// Delete a session file, confirming via the session selector's inline
+    /// delete confirmation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when the file cannot be removed.
+    fn delete_session(&self, path: &str) -> BoxFuture<'_, Result<(), String>>;
+
     /// Fetch the recent sessions for the session picker.
     fn get_session_entries(
         &self,
     ) -> BoxFuture<'_, Result<Vec<super::state::SessionPickerEntry>, String>>;
 
     /// Fetch the session tree (entries with depth) for the tree selector.
-    fn get_tree_entries(&self) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>>;
+    fn get_tree_entries(
+        &self,
+        filter: super::selectors::TreeFilterMode,
+    ) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>>;
 
     /// Fetch the user-message fork list (tree entries, only user messages).
     fn get_fork_entries(&self) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>>;
@@ -608,6 +639,11 @@ pub struct InteractiveRuntimeOptions {
     pub double_escape: DoubleEscapeAction,
     /// Show hardware cursor (debug / accessibility).
     pub hardware_cursor: bool,
+    /// Override spinner indicator frames for reduced-motion (TUI-T11).
+    /// `None` uses the default 10-frame braille animation; `Some` with a
+    /// single frame renders a static indicator. No env/setting gate —
+    /// callers supply this programmatically per TUI-G1 decision (option b).
+    pub indicator_frames: Option<Vec<String>>,
     pending_ui_events: Vec<UiEvent>,
 }
 
@@ -706,6 +742,7 @@ impl Default for InteractiveRuntimeOptions {
             quiet: false,
             double_escape: DoubleEscapeAction::None,
             hardware_cursor: false,
+            indicator_frames: None,
             pending_ui_events: Vec::new(),
         }
     }
@@ -916,7 +953,9 @@ fn render_bottom_clipped(
 
     let source_area = Rect::new(0, 0, area.width, measured_height);
     let mut source = Buffer::empty(source_area);
-    component.render(source_area, &mut source);
+    // Scratch render: claims made at scratch coordinates would poison the
+    // frame's damage table, so recording is suspended.
+    pi_tui::frame::suspend_row_claims(|| component.render(source_area, &mut source));
     for row in 0..area.height {
         for column in 0..area.width {
             let source_position = (column, skipped_rows + row);
@@ -927,11 +966,19 @@ fn render_bottom_clipped(
                 *target_cell = source_cell.clone();
             }
         }
+        // Direct cell writer (scratch-buffer copy): claim the copied rows so
+        // damage scoping accounts for them (PERF-T11 Design B).
     }
+    pi_tui::frame::claim_opaque_span(area);
 }
 
 impl Component for InteractiveRoot {
     fn measure(&mut self, width: u16) -> u16 {
+        // TUI-G8 floor policy: below 20 columns the render is blanked,
+        // so the measured height is zero — no content cells are emitted.
+        if width < VIEWPORT_WIDTH_FLOOR {
+            return 0;
+        }
         let pre_height = self.pre_editor.iter_mut().fold(0_u16, |height, section| {
             height.saturating_add(section.component.measure(width))
         });
@@ -954,6 +1001,13 @@ impl Component for InteractiveRoot {
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        // TUI-G8 floor policy: refuse to render below 20 columns. The resize
+        // event is still accepted (size cache and ViewState updated in
+        // `handle_resize`); only the render is suppressed so the viewport
+        // blanks instead of wrapping into an unreadable state.
+        if area.width < VIEWPORT_WIDTH_FLOOR {
+            return;
+        }
         let pre_heights = self
             .pre_editor
             .iter_mut()
@@ -1176,6 +1230,10 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     spinner_started: Option<tokio::time::Instant>,
     /// Braille spinner frame counter, advanced every [`SPINNER_TICK`].
     spinner_frame: usize,
+    /// Number of frames in the current indicator (1 for static, 10 for
+    /// default braille). Drives tick repaint-suppression: when ≤ 1, only
+    /// elapsed-second boundary crossings trigger a repaint (TUI-T11).
+    spinner_frame_count: usize,
     /// Persisted next-tick deadline for the spinner `select!` arm.
     ///
     /// WHY: `tokio::select!` drops the losing future each loop turn, so a
@@ -1204,6 +1262,9 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     last_error: Option<String>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
     terminal_theme: TerminalTheme,
+    /// Terminal truecolor capability: drives `ColorMode` selection on every
+    /// theme load path (reference parity with `createTheme` at theme.ts:630).
+    true_color: bool,
     /// Runtime theme generation: bumped on every theme switch so extension
     /// slots re-measure/re-render (flows to the host via `theme.update` and
     /// back on measure/render requests).
@@ -1244,6 +1305,22 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     /// Pending selector cancels.
     cancel_rx: mpsc::UnboundedReceiver<()>,
     cancel_tx: mpsc::UnboundedSender<()>,
+    /// Active tree-selector filter mode (toggled by `app.tree.filter.*`).
+    tree_filter: super::selectors::TreeFilterMode,
+    /// Pending session-delete confirmations (paths to remove).
+    session_delete_rx: mpsc::UnboundedReceiver<String>,
+    session_delete_tx: mpsc::UnboundedSender<String>,
+    /// Errors emitted by the inline session-delete confirmation (e.g. active
+    /// session blocked).
+    session_selector_error_rx: mpsc::UnboundedReceiver<String>,
+    session_selector_error_tx: mpsc::UnboundedSender<String>,
+    /// Confirm-hint placeholder updates from the session selector
+    /// (`Some(path)` when armed, `None` when cleared).
+    session_confirm_rx: mpsc::UnboundedReceiver<Option<String>>,
+    session_confirm_tx: mpsc::UnboundedSender<Option<String>>,
+    /// Editor placeholder saved while delete confirmation shows its hint;
+    /// restored when cleared or the selector closes.
+    session_delete_hint_restore: Option<String>,
     /// Pending settings-row changes emitted by the live settings list.
     settings_change_rx: mpsc::UnboundedReceiver<(String, String)>,
     settings_change_tx: mpsc::UnboundedSender<(String, String)>,
@@ -1355,7 +1432,9 @@ fn build_initial_editor(
     submit_tx: mpsc::UnboundedSender<String>,
 ) -> Editor {
     let mut editor = Editor::new(
-        &pi_tui::components::editor::EditorTheme::default(),
+        &pi_tui::components::editor::EditorTheme {
+            border_color: editor_border_color(EditorBorder::Muted),
+        },
         &EditorOptions {
             padding_x: 1,
             autocomplete_max_visible: 5,
@@ -1366,6 +1445,26 @@ fn build_initial_editor(
         let _ = submit_tx.send(text);
     }));
     editor
+}
+
+/// Map a semantic editor border to its themed border painter.
+///
+/// The `fn` pointer resolves [`super::theme::current`] at call time, so live
+/// theme switches and previews repaint without reassignment.
+fn editor_border_color(border: EditorBorder) -> fn(&str) -> String {
+    match border {
+        EditorBorder::Muted => super::theme::make_fg(ThemeColor::BorderMuted),
+        EditorBorder::Bash => super::theme::make_fg(ThemeColor::BashMode),
+        EditorBorder::Thinking(level) => super::theme::make_fg(match level {
+            pi_ai::ModelThinkingLevel::Off => ThemeColor::ThinkingOff,
+            pi_ai::ModelThinkingLevel::Minimal => ThemeColor::ThinkingMinimal,
+            pi_ai::ModelThinkingLevel::Low => ThemeColor::ThinkingLow,
+            pi_ai::ModelThinkingLevel::Medium => ThemeColor::ThinkingMedium,
+            pi_ai::ModelThinkingLevel::High => ThemeColor::ThinkingHigh,
+            pi_ai::ModelThinkingLevel::Xhigh => ThemeColor::ThinkingXhigh,
+            pi_ai::ModelThinkingLevel::Max => ThemeColor::ThinkingMax,
+        }),
+    }
 }
 
 impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
@@ -1416,6 +1515,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let (select_tx, select_rx) =
             mpsc::unbounded_channel::<(super::state::SelectorKind, String)>();
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<()>();
+        let (session_delete_tx, session_delete_rx) = mpsc::unbounded_channel::<String>();
+        let (session_selector_error_tx, session_selector_error_rx) =
+            mpsc::unbounded_channel::<String>();
+        let (session_confirm_tx, session_confirm_rx) = mpsc::unbounded_channel::<Option<String>>();
         let (settings_change_tx, settings_change_rx) =
             mpsc::unbounded_channel::<(String, String)>();
         let (theme_preview_tx, theme_preview_rx) = mpsc::unbounded_channel::<String>();
@@ -1448,6 +1551,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             spinner_started: None,
             pending_reanchor: None,
             spinner_frame: 0,
+            spinner_frame_count: options
+                .indicator_frames
+                .as_ref()
+                .map_or(pi_tui::components::DEFAULT_LOADER_FRAMES.len(), Vec::len),
             spinner_deadline: None,
             spinner_kind: None,
             pending_settle: None,
@@ -1457,6 +1564,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             last_error: None,
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             terminal_theme: options.terminal_theme,
+            true_color: options.caps.true_color,
             theme_generation: 0,
             pending_ui_reinject: options.pending_ui_events.iter().rev().cloned().collect(),
             extension_runner,
@@ -1487,6 +1595,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             select_tx,
             cancel_rx,
             cancel_tx,
+            tree_filter: super::selectors::TreeFilterMode::default(),
+            session_delete_rx,
+            session_delete_tx,
+            session_selector_error_rx,
+            session_selector_error_tx,
+            session_confirm_rx,
+            session_confirm_tx,
+            session_delete_hint_restore: None,
             settings_change_rx,
             settings_change_tx,
             theme_preview_rx,
@@ -1515,10 +1631,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         view.width = options.size.0;
         view.height = options.size.1;
         view.quiet = options.quiet;
+        view.hyperlinks = options.caps.hyperlinks;
+        view.indicator_frames = options.indicator_frames.clone();
         view.resize(options.size.0, options.size.1);
         view
     }
-
     // ----- Public accessors (driver seam) -----
 
     /// Borrow the view state (tests / driver seam).
@@ -1569,6 +1686,27 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.tui.capabilities().dark_background,
             colorfgbg.as_deref(),
         );
+    }
+
+    /// Merge late startup-probe capability refinements: replace the Tui
+    /// capability set, refresh the cached true-color flag, re-detect the
+    /// polarity, and re-resolve the theme (no-op when it did not change).
+    /// Returns whether the capability set changed; the caller repaints.
+    fn adopt_probe_caps(&mut self, caps: TerminalCapabilities) -> bool {
+        if *self.tui.capabilities() == caps {
+            return false;
+        }
+        *self.tui.capabilities_mut() = caps;
+        self.true_color = self.tui.capabilities().true_color;
+        self.requery_terminal_theme();
+        self.apply_theme_from_settings();
+        true
+    }
+
+    /// Queue events preserved by the startup probe for re-injection ahead of
+    /// live input (the reader starts after the probe join).
+    fn queue_pending_events(&mut self, events: Vec<UiEvent>) {
+        self.pending_ui_reinject.extend(events.into_iter().rev());
     }
 
     /// Signal the runtime to exit at the next loop turn (signal handler hook).
@@ -1655,7 +1793,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     // into methods would hide the loop's shape without removing any behaviour.
     #[allow(clippy::too_many_lines)]
     pub async fn run(&mut self) -> io::Result<InteractiveExit> {
-        if !self.initialize_run().await {
+        self.run_with_startup(true).await
+    }
+
+    /// [`InteractiveRuntime::run`] with the startup sequence (theme push +
+    /// first paint) conditional: the speculative-first-paint startup paints
+    /// that frame itself, inside the probe window.
+    async fn run_with_startup(&mut self, startup: bool) -> io::Result<InteractiveExit> {
+        if startup && !self.initialize_run().await {
             return Ok(self.exit_kind);
         }
 
@@ -1951,23 +2096,116 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.handle_settings_change(&id, &value).await;
             settings_mutated = true;
         }
-        while let Ok(selection) = self.theme_preview_rx.try_recv() {
-            self.preview_theme_selection(&selection);
-            settings_mutated = true;
+        // Drain inline session-delete confirmations and confirm-hint updates
+        // from the live `SessionSelector`.
+        let mut session_mutated = false;
+        while let Ok(path) = self.session_delete_rx.try_recv() {
+            match self.session.delete_session(&path).await {
+                Ok(()) => {
+                    // Refresh the session picker in place, keeping the selector
+                    // focused on the updated row list.
+                    if let Ok(component) = self
+                        .load_selector_component(super::state::SelectorKind::Session)
+                        .await
+                    {
+                        self.active_selector = Some(component);
+                        self.active_selector_kind = Some(super::state::SelectorKind::Session);
+                        self.view.focus = FocusArea::Selector;
+                    }
+                    self.push_notice("session", format!("Deleted session {path}"));
+                }
+                Err(error) => {
+                    self.last_error = Some(error.clone());
+                    self.push_notice("session", format!("Failed to delete session: {error}"));
+                }
+            }
+            session_mutated = true;
+        }
+        while let Ok(error) = self.session_selector_error_rx.try_recv() {
+            self.last_error = Some(error);
+            session_mutated = true;
+        }
+        while let Ok(confirm) = self.session_confirm_rx.try_recv() {
+            match confirm {
+                Some(_) if self.session_delete_hint_restore.is_none() => {
+                    // First arm: save the real placeholder, show the delete hint.
+                    self.session_delete_hint_restore = Some(self.view.editor.placeholder.clone());
+                    self.view.editor.placeholder =
+                        "Delete session? <enter> confirm \u{b7} <esc> cancel".to_owned();
+                }
+                None => {
+                    if let Some(placeholder) = self.session_delete_hint_restore.take() {
+                        self.view.editor.placeholder = placeholder;
+                    }
+                }
+                _ => {}
+            }
+            session_mutated = true;
+        }
+
+        // Tree-filter chords (ctrl+d / ctrl+t / ctrl+u / ctrl+l) while the tree
+        // selector is focused: retarget the filter and reload, treated as
+        // handled so the mapper never turns them into an Exit or app action.
+        let mut tree_filter_handled = false;
+        if self.active_selector_kind == Some(super::state::SelectorKind::Tree)
+            && !editor_result.is_handled()
+            && let UiEvent::Key(key_event) = &event
+        {
+            let keybindings = self.mapper.keybindings();
+            for binding in [
+                "app.tree.filter.default",
+                "app.tree.filter.noTools",
+                "app.tree.filter.userOnly",
+                "app.tree.filter.labeledOnly",
+            ] {
+                if keybindings.matches(key_event, binding) {
+                    if let Some(next) = self.tree_filter.apply_binding(binding) {
+                        self.tree_filter = next;
+                    }
+                    if let Ok(component) = self
+                        .load_selector_component(super::state::SelectorKind::Tree)
+                        .await
+                    {
+                        self.active_selector = Some(component);
+                        self.active_selector_kind = Some(super::state::SelectorKind::Tree);
+                        self.view.focus = FocusArea::Selector;
+                    }
+                    tree_filter_handled = true;
+                    break;
+                }
+            }
         }
 
         // Map app-level keys (skipped when the focused component already
         // handled the event — including selector confirm/cancel).
-        actions.extend(self.mapper.map(
-            &event,
-            &self.view,
-            &live_text,
-            &expanded_text,
-            &mut self.input_state,
-            editor_result.is_handled(),
-        ));
+        if !tree_filter_handled {
+            actions.extend(self.mapper.map(
+                &event,
+                &self.view,
+                &live_text,
+                &expanded_text,
+                &mut self.input_state,
+                editor_result.is_handled(),
+            ));
+        }
 
-        let mut needs_immediate_repaint = editor_result.needs_render() || settings_mutated;
+        // A pending extension *input* dialog owns the live editor; strip only
+        // named `app.exit` (AppExit / Ctrl+D). Unconditional Exit from double
+        // Ctrl+C or `/quit` must still shut down.
+        if matches!(
+            self.pending_extension_dialog
+                .as_ref()
+                .map(|dialog| &dialog.request),
+            Some(HostUiRequest::Input { .. })
+        ) {
+            actions.retain(|action| !matches!(action, ViewAction::AppExit));
+        }
+
+        let mut needs_immediate_repaint = editor_result.needs_render()
+            || settings_mutated
+            || session_mutated
+            || tree_filter_handled;
+
         for action in actions {
             let outcome = self.dispatch_action(action).await;
             if matches!(outcome, ActionOutcome::Repaint) {
@@ -2090,7 +2328,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             } => self.dispatch_bash(&command, exclude_from_context).await,
             ViewAction::Interrupt => self.dispatch_interrupt().await,
             ViewAction::ClearEditor => self.clear_editor(),
-            ViewAction::Exit => ActionOutcome::Exit,
+            ViewAction::Exit | ViewAction::AppExit => ActionOutcome::Exit,
             ViewAction::Suspend => ActionOutcome::Suspend,
             ViewAction::CycleThinking { .. } => {
                 self.record_err(self.session.cycle_thinking_level().await);
@@ -2328,12 +2566,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             );
             return ActionOutcome::Repaint;
         }
-        let items = options
-            .iter()
-            .map(|option| {
-                pi_tui::components::SelectItem::new(option.id.clone(), option.name.clone())
-            })
-            .collect();
+        // Selection values are internal list indices — never provider IDs —
+        // so Cancel (0) cannot collide with any credential namespace.
+        // Index 0 = Cancel; indices 1..=N map into `logout_options[0..N)`.
+        let mut items = vec![pi_tui::components::SelectItem::new("0", "Cancel")];
+        items.extend(options.iter().enumerate().map(|(idx, option)| {
+            pi_tui::components::SelectItem::new((idx + 1).to_string(), option.name.clone())
+        }));
         self.logout_options = options;
         self.install_confirm_selector(
             super::state::SelectorKind::Logout,
@@ -2345,12 +2584,23 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     /// Apply a `/logout` selection: remove the chosen credential and report
     /// (message wording per credential kind, ports the OAuth-selector callback).
-    async fn handle_logout_confirm(&mut self, provider_id: &str) -> ActionOutcome {
-        let option = self
-            .logout_options
-            .iter()
-            .find(|option| option.id == provider_id)
-            .cloned();
+    ///
+    /// `value` is an internal selection index (`"0"` = Cancel, `"1..N"` =
+    /// `logout_options[N-1]`). Invalid / non-numeric values fail closed.
+    async fn handle_logout_confirm(&mut self, value: &str) -> ActionOutcome {
+        let Ok(index) = value.parse::<usize>() else {
+            self.logout_options.clear();
+            self.close_selector();
+            return ActionOutcome::Repaint;
+        };
+        if index == 0 {
+            self.logout_options.clear();
+            self.close_selector();
+            return ActionOutcome::Repaint;
+        }
+        let option = index
+            .checked_sub(1)
+            .and_then(|i| self.logout_options.get(i).cloned());
         self.logout_options.clear();
         self.close_selector();
         let Some(option) = option else {
@@ -2384,7 +2634,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.install_confirm_selector(
             super::state::SelectorKind::ImportConfirm,
             &prompt,
-            Self::confirm_items(),
+            Self::confirm_items("Yes, replace current session", "No, keep current session"),
         );
         ActionOutcome::Repaint
     }
@@ -2443,7 +2693,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.install_confirm_selector(
                     super::state::SelectorKind::ImportCwdConfirm,
                     &prompt,
-                    Self::confirm_items(),
+                    Self::confirm_items("Yes, continue in current cwd", "No, cancel import"),
                 );
             }
             Err(error) => {
@@ -2478,10 +2728,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     /// Yes/No items for a built-in confirm selector (`"true"`/`"false"` values).
-    fn confirm_items() -> Vec<pi_tui::components::SelectItem> {
+    fn confirm_items(yes_label: &str, no_label: &str) -> Vec<pi_tui::components::SelectItem> {
         vec![
-            pi_tui::components::SelectItem::new("true", "Yes"),
-            pi_tui::components::SelectItem::new("false", "No"),
+            pi_tui::components::SelectItem::new("true", yes_label),
+            pi_tui::components::SelectItem::new("false", no_label),
         ]
     }
 
@@ -2614,10 +2864,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .enqueue_bash(command.to_owned(), exclude_from_context)
             .await
         {
-            self.last_error = Some("a bash command is already running".to_owned());
+            self.last_error =
+                Some("A bash command is already running. Press Esc to cancel it first.".to_owned());
             return ActionOutcome::Repaint;
         }
         self.view.editor.border = EditorBorder::Bash;
+        self.sync_editor_border();
         ActionOutcome::Repaint
     }
 
@@ -3046,9 +3298,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     fn close_selector(&mut self) {
+        if let Some(placeholder) = self.session_delete_hint_restore.take() {
+            self.view.editor.placeholder = placeholder;
+        }
         if let Some(placeholder) = self.confirm_saved_placeholder.take() {
             self.view.editor.placeholder = placeholder;
         }
+        self.logout_options.clear();
         self.view.overlay = None;
         self.view.extension_overlay_slot = None;
         self.active_selector = None;
@@ -3103,6 +3359,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     async fn open_selector(&mut self, kind: super::state::SelectorKind) -> ActionOutcome {
+        if kind == super::state::SelectorKind::Tree {
+            self.tree_filter = super::selectors::TreeFilterMode::default();
+        }
+        // Opening a selector supersedes any in-flight delete confirm hint.
+        if let Some(placeholder) = self.session_delete_hint_restore.take() {
+            self.view.editor.placeholder = placeholder;
+        }
         match self.load_selector_component(kind).await {
             Ok(component) => {
                 self.active_selector = Some(component);
@@ -3139,17 +3402,18 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             }
             super::state::SelectorKind::Session => {
                 let entries = self.session.get_session_entries().await?;
-                let items = entries
-                    .into_iter()
-                    .map(|entry| {
-                        SelectItem::new(entry.value, entry.label)
-                            .with_description(entry.description.unwrap_or_default())
-                    })
-                    .collect();
-                Ok(self.build_select_list(kind, items))
+                // Await the live session path (lock contention waits) and
+                // canonicalize so symlink aliases still hit the delete guard.
+                let current = self.session.current_session_file().await.map(|path| {
+                    std::fs::canonicalize(&path)
+                        .ok()
+                        .map(|canon| canon.to_string_lossy().into_owned())
+                        .unwrap_or(path)
+                });
+                Ok(self.build_session_selector(&entries, current))
             }
             super::state::SelectorKind::Tree => {
-                let entries = self.session.get_tree_entries().await?;
+                let entries = self.session.get_tree_entries(self.tree_filter).await?;
                 Ok(self.build_tree_select_list(kind, entries))
             }
             super::state::SelectorKind::Fork => {
@@ -3201,10 +3465,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     .into_iter()
                     .map(|value| SelectItem::new(value.clone(), value))
                     .collect();
-                let mut list = pi_tui::components::SelectList::new(
-                    items,
-                    super::selectors::SELECTOR_MAX_VISIBLE,
-                    super::theme::select_list_theme(),
+                let mut list = super::selectors::apply_select_list_copy(
+                    pi_tui::components::SelectList::new(
+                        items,
+                        super::selectors::SELECTOR_MAX_VISIBLE,
+                        super::theme::select_list_theme(),
+                    ),
+                    super::selectors::selector_empty_copy(kind),
                 );
                 list.set_selected_index(0);
                 let select_tx = self.select_tx.clone();
@@ -3234,10 +3501,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         kind: super::state::SelectorKind,
         items: Vec<pi_tui::components::SelectItem>,
     ) -> Box<dyn Component> {
-        let mut list = pi_tui::components::SelectList::new(
-            items,
-            super::selectors::SELECTOR_MAX_VISIBLE,
-            super::theme::select_list_theme(),
+        let mut list = super::selectors::apply_select_list_copy(
+            pi_tui::components::SelectList::new(
+                items,
+                super::selectors::SELECTOR_MAX_VISIBLE,
+                super::theme::select_list_theme(),
+            ),
+            super::selectors::selector_empty_copy(kind),
         );
         list.set_selected_index(0);
         let select_tx = self.select_tx.clone();
@@ -3266,9 +3536,42 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.build_select_list(kind, items)
     }
 
+    /// Build the session selector with inline delete confirmation, wiring its
+    /// callbacks to the runtime channels (select / cancel / delete / error /
+    /// confirm-hint).
+    fn build_session_selector(
+        &self,
+        entries: &[super::state::SessionPickerEntry],
+        current_session_path: Option<String>,
+    ) -> Box<dyn Component> {
+        let select_tx = self.select_tx.clone();
+        let cancel_tx = self.cancel_tx.clone();
+        let delete_tx = self.session_delete_tx.clone();
+        let error_tx = self.session_selector_error_tx.clone();
+        let confirm_tx = self.session_confirm_tx.clone();
+        let mut selector =
+            super::selectors::build_session_selector_component(entries, 0, current_session_path);
+        selector.on_select = Some(Box::new(move |item| {
+            let _ = select_tx.send((super::state::SelectorKind::Session, item.value.clone()));
+        }));
+        selector.on_cancel = Some(Box::new(move || {
+            let _ = cancel_tx.send(());
+        }));
+        selector.on_delete = Some(Box::new(move |path| {
+            let _ = delete_tx.send(path);
+        }));
+        selector.on_error = Some(Box::new(move |error| {
+            let _ = error_tx.send(error);
+        }));
+        selector.on_confirm_change = Some(Box::new(move |state| {
+            let _ = confirm_tx.send(state);
+        }));
+        Box::new(selector)
+    }
+
     fn build_settings_list(
         &self,
-        _kind: super::state::SelectorKind,
+        kind: super::state::SelectorKind,
         rows: Vec<super::state::SettingsRow>,
     ) -> Box<dyn Component> {
         let items = rows
@@ -3284,17 +3587,20 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .collect();
         let change_tx = self.settings_change_tx.clone();
         let cancel_tx = self.cancel_tx.clone();
-        Box::new(pi_tui::components::SettingsList::new(
-            items,
-            super::selectors::SELECTOR_MAX_VISIBLE,
-            super::theme::settings_list_theme(),
-            move |id: &str, value: &str| {
-                let _ = change_tx.send((id.to_owned(), value.to_owned()));
-            },
-            move || {
-                let _ = cancel_tx.send(());
-            },
-            &pi_tui::components::SettingsListOptions::default(),
+        Box::new(super::selectors::apply_settings_list_copy(
+            pi_tui::components::SettingsList::new(
+                items,
+                super::selectors::SELECTOR_MAX_VISIBLE,
+                super::theme::settings_list_theme(),
+                move |id: &str, value: &str| {
+                    let _ = change_tx.send((id.to_owned(), value.to_owned()));
+                },
+                move || {
+                    let _ = cancel_tx.send(());
+                },
+                &pi_tui::components::SettingsListOptions::default(),
+            ),
+            super::selectors::selector_empty_copy(kind),
         ))
     }
 
@@ -3303,10 +3609,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         title: &str,
         items: Vec<pi_tui::components::SelectItem>,
     ) -> Box<dyn Component> {
-        let mut list = pi_tui::components::SelectList::new(
-            items,
-            super::selectors::SELECTOR_MAX_VISIBLE,
-            super::theme::select_list_theme(),
+        let mut list = super::selectors::apply_select_list_copy(
+            pi_tui::components::SelectList::new(
+                items,
+                super::selectors::SELECTOR_MAX_VISIBLE,
+                super::theme::select_list_theme(),
+            ),
+            super::selectors::EXTENSION_EMPTY_COPY,
         );
         list.set_selected_index(0);
         let select_tx = self.extension_select_tx.clone();
@@ -3568,12 +3877,25 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         Arc::clone(runner).push_ui_state(&state).await;
     }
 
+    /// Render depth derived from the terminal's truecolor capability.
+    fn color_mode(&self) -> super::theme::ColorMode {
+        if self.true_color {
+            super::theme::ColorMode::Truecolor
+        } else {
+            super::theme::ColorMode::Palette256
+        }
+    }
+
     /// Re-resolve the active theme from settings + detected terminal polarity
     /// and apply it. Called on `/reload` and after settings-driven changes.
     pub(crate) fn apply_theme_from_settings(&mut self) {
         let (raw, mode) = self.session.theme_settings();
-        let resolved =
-            super::theme::resolve_active_theme(raw.as_deref(), mode, self.terminal_theme);
+        let resolved = super::theme::resolve_active_theme(
+            raw.as_deref(),
+            mode,
+            self.terminal_theme,
+            self.color_mode(),
+        );
         self.apply_theme(resolved);
     }
 
@@ -3616,9 +3938,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             if let Err(error) = self.session.persist_theme(&name, mode) {
                 self.last_error = Some(error);
             }
-            super::theme::resolve_active_theme(Some(&name), mode, self.terminal_theme)
+            super::theme::resolve_active_theme(
+                Some(&name),
+                mode,
+                self.terminal_theme,
+                self.color_mode(),
+            )
         } else {
-            super::theme::load_or_dark(&name, super::theme::ColorMode::Truecolor)
+            super::theme::load_or_dark(&name, self.color_mode())
         };
         self.apply_theme(resolved);
         self.push_theme_to_host().await;
@@ -3635,6 +3962,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             &self.view.theme,
             mode,
             self.terminal_theme,
+            self.color_mode(),
             self.theme_generation,
         );
         Arc::clone(runner).push_theme_update(&update).await;
@@ -3658,8 +3986,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     fn preview_theme_selection(&mut self, selection: &str) {
         let storage = super::theme::theme_selection_to_storage(selection);
         let (_, mode) = self.session.theme_settings();
-        let resolved =
-            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme);
+        let resolved = super::theme::resolve_active_theme(
+            Some(&storage),
+            mode,
+            self.terminal_theme,
+            self.color_mode(),
+        );
         self.apply_theme(resolved);
     }
 
@@ -3781,8 +4113,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             return;
         };
         let storage = super::theme::theme_selection_to_storage(&family);
-        let resolved =
-            super::theme::resolve_active_theme(Some(&storage), mode, self.terminal_theme);
+        let resolved = super::theme::resolve_active_theme(
+            Some(&storage),
+            mode,
+            self.terminal_theme,
+            self.color_mode(),
+        );
         self.apply_theme(resolved);
     }
 
@@ -4138,9 +4474,15 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.rebind_extension_channels().await;
     }
 
+    /// Re-apply the semantic border painter to the live editor.
+    fn sync_editor_border(&mut self) {
+        self.editor.border_color = editor_border_color(self.view.editor.border);
+    }
+
     async fn refresh_footer(&mut self) {
         let snapshot = self.session.footer_snapshot().await;
         project_footer(&mut self.view, &snapshot);
+        self.sync_editor_border();
     }
 
     /// Clear selector focus before process suspension.
@@ -4175,8 +4517,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .spinner_started
             .get_or_insert_with(tokio::time::Instant::now);
         let elapsed_secs = started.elapsed().as_secs();
-        self.spinner_frame =
-            (self.spinner_frame + 1) % pi_tui::components::DEFAULT_LOADER_FRAMES.len();
+        // TUI-T11: cycle the frame counter only for multi-frame indicators.
+        // When frame_count ≤ 1 (static/reduced-motion), the frame never
+        // changes, so repaints fire only on elapsed-second boundary crossings
+        // — tick repaint-suppression per TUI-P4 evidence.
+        if self.spinner_frame_count > 1 {
+            self.spinner_frame = (self.spinner_frame + 1) % self.spinner_frame_count;
+        }
         if status.frame == self.spinner_frame && status.elapsed_secs == elapsed_secs {
             return false;
         }
@@ -4839,9 +5186,10 @@ fn buffer_plain_lines(buffer: &Buffer, width: u16, height: u16) -> Vec<(String, 
 fn startup_theme<S: SessionHost + ?Sized>(
     session: &S,
     terminal: TerminalTheme,
+    color_mode: super::theme::ColorMode,
 ) -> Arc<ResolvedTheme> {
     let (raw_theme, theme_mode) = session.theme_settings();
-    super::theme::resolve_active_theme(raw_theme.as_deref(), theme_mode, terminal)
+    super::theme::resolve_active_theme(raw_theme.as_deref(), theme_mode, terminal, color_mode)
 }
 
 /// Polarity mode implied by a raw theme setting an extension just set:
@@ -4940,9 +5288,10 @@ fn build_theme_update(
     active: &ResolvedTheme,
     mode: ThemeMode,
     terminal: TerminalTheme,
+    color_mode: super::theme::ColorMode,
     theme_generation: u64,
 ) -> ThemeUpdate {
-    let themes = super::theme::available_themes(super::theme::ColorMode::Truecolor)
+    let themes = super::theme::available_themes(color_mode)
         .into_iter()
         .map(|(info, resolved)| {
             let path = info.path.map(|path| path.to_string_lossy().into_owned());
@@ -5669,6 +6018,22 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
+    fn current_session_file(&self) -> BoxFuture<'_, Option<String>> {
+        let session = self.read_session();
+        Box::pin(async move {
+            let manager = session.session_manager();
+            // Await the lock: contention must delay selector build, never
+            // silently disable the active-session delete guard.
+            let guard = manager.lock().await;
+            guard.get_session_file().map(str::to_owned)
+        })
+    }
+
+    fn delete_session(&self, path: &str) -> BoxFuture<'_, Result<(), String>> {
+        let path = path.to_owned();
+        Box::pin(async move { std::fs::remove_file(&path).map_err(|error| error.to_string()) })
+    }
+
     fn get_session_entries(
         &self,
     ) -> BoxFuture<'_, Result<Vec<super::state::SessionPickerEntry>, String>> {
@@ -5710,14 +6075,17 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
-    fn get_tree_entries(&self) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>> {
+    fn get_tree_entries(
+        &self,
+        filter: super::selectors::TreeFilterMode,
+    ) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>> {
         let session = self.read_session();
         Box::pin(async move {
             let manager = session.session_manager();
             let sm = manager.lock().await;
             let tree = sm.get_tree();
             let mut out = Vec::new();
-            flatten_tree_nodes(&tree, 0, &mut out);
+            flatten_tree_nodes_filtered(&tree, 0, filter, &mut out);
             Ok(out)
         })
     }
@@ -5745,7 +6113,7 @@ impl SessionHost for AgentSessionHost {
             Ok(vec![super::state::SettingsRow {
                 id: "defaultProjectTrust".to_owned(),
                 label: "Default project trust".to_owned(),
-                description: Some("Trust policy for newly discovered project dirs".to_owned()),
+                description: Some("Fallback behavior when no extension or saved trust decision decides project trust".to_owned()),
                 current_value: format!("{trust:?}").to_lowercase(),
                 values: Some(vec![
                     "ask".to_owned(),
@@ -6161,26 +6529,71 @@ fn runtime_err_to_string(err: &AgentSessionRuntimeError) -> String {
     err.to_string()
 }
 
-fn flatten_tree_nodes(
+fn flatten_tree_nodes_filtered(
     nodes: &[crate::core::sessions::SessionTreeNode],
     depth: usize,
+    filter: super::selectors::TreeFilterMode,
     out: &mut Vec<super::state::TreeEntry>,
 ) {
     for node in nodes {
-        let id = node.entry.id().unwrap_or("").to_owned();
-        let label = node
-            .label
-            .clone()
-            .unwrap_or_else(|| tree_entry_label(&node.entry));
-        if !id.is_empty() {
-            out.push(super::state::TreeEntry {
-                value: id,
-                label,
-                depth,
-            });
+        if session_entry_matches_tree_filter(&node.entry, node.label.as_deref(), filter) {
+            let id = node.entry.id().unwrap_or("").to_owned();
+            let label = node
+                .label
+                .clone()
+                .unwrap_or_else(|| tree_entry_label(&node.entry));
+            if !id.is_empty() {
+                out.push(super::state::TreeEntry {
+                    value: id,
+                    label,
+                    depth,
+                });
+            }
         }
-        flatten_tree_nodes(&node.children, depth.saturating_add(1), out);
+        flatten_tree_nodes_filtered(&node.children, depth.saturating_add(1), filter, out);
     }
+}
+
+/// Whether a tree node passes the active [`TreeFilterMode`] visibility rule.
+///
+/// - [`Default`](super::selectors::TreeFilterMode::Default): hide settings /
+///   bookkeeping entries (`label`, `model_change`, `thinking_level_change`,
+///   `session_info`, extension `custom`).
+/// - [`NoTools`](super::selectors::TreeFilterMode::NoTools): Default plus hide
+///   `toolResult` transcript messages.
+/// - [`UserOnly`](super::selectors::TreeFilterMode::UserOnly): `user` messages
+///   only.
+/// - [`LabeledOnly`](super::selectors::TreeFilterMode::LabeledOnly): nodes
+///   carrying an explicit label.
+fn session_entry_matches_tree_filter(
+    entry: &crate::core::sessions::SessionEntry,
+    label: Option<&str>,
+    filter: super::selectors::TreeFilterMode,
+) -> bool {
+    use crate::core::sessions::SessionEntry;
+    match filter {
+        super::selectors::TreeFilterMode::Default => !session_entry_is_bookkeeping(entry),
+        super::selectors::TreeFilterMode::NoTools => {
+            !session_entry_is_bookkeeping(entry) && !session_entry_is_tool_result(entry)
+        }
+        super::selectors::TreeFilterMode::UserOnly => {
+            matches!(entry, SessionEntry::Message(message) if message.message.role() == "user")
+        }
+        super::selectors::TreeFilterMode::LabeledOnly => label.is_some(),
+    }
+}
+
+/// True for settings / bookkeeping entries hidden by the default tree view.
+fn session_entry_is_bookkeeping(entry: &crate::core::sessions::SessionEntry) -> bool {
+    matches!(
+        entry.discriminant(),
+        "label" | "model_change" | "thinking_level_change" | "session_info" | "custom"
+    )
+}
+
+/// True for `toolResult` transcript messages (hidden by the NoTools filter).
+fn session_entry_is_tool_result(entry: &crate::core::sessions::SessionEntry) -> bool {
+    matches!(entry, crate::core::sessions::SessionEntry::Message(message) if message.message.role() == "toolResult")
 }
 
 fn tree_entry_label(entry: &crate::core::sessions::SessionEntry) -> String {
@@ -6224,7 +6637,10 @@ fn tree_entry_label(entry: &crate::core::sessions::SessionEntry) -> String {
 /// Returns `(80, 24)` when the size cannot be queried (non-tty stdout).
 fn initial_terminal_size() -> (u16, u16) {
     match crossterm::terminal::size() {
-        Ok((width, height)) => (width.clamp(20, 1024), height.clamp(1, 256)),
+        Ok((width, height)) => (
+            width.clamp(VIEWPORT_WIDTH_FLOOR, 1024),
+            height.clamp(1, 256),
+        ),
         Err(_) => (80, 24),
     }
 }
@@ -6251,10 +6667,16 @@ where
 /// Wires (in order):
 /// 1. `io::stdout()` handle + initial ioctl size.
 /// 2. Panic emergency-restore hook and [`TerminalGuard`] viewport/activation.
-/// 3. [`Tui<Stdout>`] construction with the cached capabilities + size.
-/// 4. [`TerminalInput::spawn`] (sole `EventStream` owner).
-/// 5. [`AgentSessionHost`] wrapping the runtime.
-/// 6. [`InteractiveRuntime::run`] to completion.
+/// 3. Startup probe batch write; reply collection offloaded to a blocking
+///    task that owns stdin during first-frame construction.
+/// 4. [`Tui<Stdout>`] construction with the default capabilities + size, and
+///    a deferred [`TerminalInput`] (no stdin reader yet).
+/// 5. [`AgentSessionHost`] wrapping the runtime, then the speculative first
+///    frame painted inside the probe window.
+/// 6. Probe replies joined; capability/theme refinements merged with a
+///    repaint when they changed the first frame's basis; the input reader
+///    starts (sole `EventStream` owner from here on).
+/// 7. [`InteractiveRuntime::run`] to completion.
 ///
 /// On exit the runtime is dropped, then the guard (which writes the restore
 /// bytes via its `Drop` impl). Returns the process exit code.
@@ -6284,12 +6706,26 @@ pub async fn run_interactive_mode(
         .activate(enable_kitty)
         .map_err(|e| format!("terminal activation failed: {e}"))?;
 
-    options.pending_ui_events = probe_terminal(guard.writer_mut(), &mut options.caps)
+    // Startup probe: write the query batch, then collect replies on a
+    // blocking task while this task constructs the UI. The collector owns
+    // stdin until it is joined; the TerminalInput reader starts only after
+    // the join, so there is never more than one stdin reader. The collector
+    // honors the yield flag (polled on its wait loop) so the runtime can
+    // take stdin back promptly when the first frame is due.
+    let probe_written = probe_write_batch(guard.writer_mut())
         .map_err(|error| format!("terminal probe failed: {error}"))?;
+    let probe_yield = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe_task = probe_written.then(|| {
+        let mut probe_caps = options.caps.clone();
+        let yield_now = Arc::clone(&probe_yield);
+        tokio::task::spawn_blocking(move || {
+            probe_collect_replies_with_yield(&mut probe_caps, &yield_now)
+                .map(|pending| (probe_caps, pending))
+        })
+    });
     let colorfgbg = std::env::var("COLORFGBG").ok();
     options.terminal_theme =
         detect_terminal_theme(options.caps.dark_background, colorfgbg.as_deref());
-    set_kitty_protocol_active(options.caps.kitty_keyboard());
 
     // 2. Tui takes a separate stdout handle (Stdout is a cheap cloneable
     //    handle to the same underlying stream). No stdout clone of the
@@ -6306,8 +6742,9 @@ pub async fn run_interactive_mode(
     )
     .map_err(|e| format!("tui initialization failed: {e}"))?;
 
-    // 3. Spawn the sole TerminalInput task.
-    let input = TerminalInput::spawn();
+    // 3. Deferred input handle: no stdin reader yet — the probe collector
+    //    still owns stdin. The reader starts after the join.
+    let input = TerminalInput::deferred();
 
     // 4. Wire the host and runtime. Session replacement rebinds the host's
     //    cached session Arc; InteractiveRuntime also rebinds events/partial
@@ -6326,9 +6763,19 @@ pub async fn run_interactive_mode(
         })
         .await;
 
-    // Resolve the startup theme from settings + the just-probed terminal
-    // polarity (replaces the static dark default).
-    options.theme = startup_theme(host_arc.as_ref(), options.terminal_theme);
+    // Resolve the startup theme from settings + the current polarity guess
+    // (replaces the static dark default; refined after the probe join); the
+    // render depth follows the truecolor capability (256-color-only
+    // terminals get downsampled SGR).
+    options.theme = startup_theme(
+        host_arc.as_ref(),
+        options.terminal_theme,
+        if options.caps.true_color {
+            super::theme::ColorMode::Truecolor
+        } else {
+            super::theme::ColorMode::Palette256
+        },
+    );
     let mut rt = InteractiveRuntime::new(tui, input, host_arc, &options);
     // Bridge replacements dispose the old session from a task outside this
     // loop. Mark that closure before teardown, then rebind after the host
@@ -6370,10 +6817,49 @@ pub async fn run_interactive_mode(
         })));
     }
 
-    // 5. Drive the loop. Suspend restores the terminal, raises SIGTSTP on
+    // Arm the collector yield and take stdin back BEFORE the first frame
+    // paints. The collector is the sole stdin reader until it joins; painting
+    // the frame while it still owned stdin made input written at first-paint
+    // time land in the byte-level collector and get re-injected through the
+    // lossy startup mapper — bracketed pastes and escape sequences were
+    // corrupted (an early paste could even clear the editor via the ESC in
+    // its 201~ marker). The collector honors the arm within its poll slice
+    // (only after replies started flowing; a silent terminal still ends at
+    // its 25 ms first-byte window), so the join adds at most a few
+    // milliseconds over host binding, which dominates startup. Input
+    // observed from the first frame onward always reaches the production
+    // EventStream parser.
+    probe_yield.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (probe_caps, pending_events) = match probe_task {
+        Some(handle) => match handle.await {
+            Ok(Ok(joined)) => joined,
+            Ok(Err(error)) => return Err(format!("terminal probe failed: {error}")),
+            Err(error) => return Err(format!("terminal probe task failed: {error}")),
+        },
+        None => (options.caps.clone(), Vec::new()),
+    };
+    // Merge capability/theme refinements before painting: the first frame
+    // already uses the final capabilities, so no post-paint repaint is
+    // needed. Then queue probe-window keystrokes and hand stdin to the
+    // EventStream reader; from here on crossterm owns input parsing.
+    rt.adopt_probe_caps(probe_caps);
+    set_kitty_protocol_active(rt.tui.capabilities().kitty_keyboard());
+    rt.queue_pending_events(pending_events);
+    rt.input_mut().start();
+
+    // 5. First frame: run the startup sequence (theme push + first paint)
+    //    with the final capabilities, after stdin ownership returned to the
+    //    EventStream reader.
+    let mut startup_already_painted = rt.initialize_run().await;
+
+    // 6. Drive the loop. Suspend restores the terminal, raises SIGTSTP on
     //    Unix, then resumes/resizes and re-enters run() without exiting.
     let exit = loop {
-        let exit = rt.run().await;
+        // The first pass skips the startup sequence when the speculative
+        // paint above already ran it; later entries (Suspend, external
+        // editor) re-run it to restore the frame, as before.
+        let exit = rt.run_with_startup(!startup_already_painted).await;
+        startup_already_painted = true;
         // Resize events update the runtime view while the guard remains owned
         // here. Synchronize before every path that can restore terminal modes.
         guard.set_viewport_bottom_row(rt.viewport_bottom_row());
@@ -6413,12 +6899,12 @@ pub async fn run_interactive_mode(
         }
     };
 
-    // 6. Drop runtime first so any final paint commits before guard restore.
+    // 7. Drop runtime first so any final paint commits before guard restore.
     drop(rt);
     runtime.set_rebind_session(None);
     runtime.set_before_session_invalidate(None);
     runtime.set_before_session_replacement(None);
-    // 7. Guard restores on Drop. Convert exit kind to a process exit code.
+    // 8. Guard restores on Drop. Convert exit kind to a process exit code.
     let code = match exit {
         InteractiveExit::Clean
         | InteractiveExit::SessionEnded
@@ -6768,6 +7254,7 @@ mod tests {
     use super::*;
     use crate::core::agent_session::events::AgentSessionEvent;
     use crate::modes::interactive::state::SelectorKind;
+    use crate::modes::interactive::view::render_view;
 
     type TestResult = Result<(), String>;
 
@@ -6811,6 +7298,7 @@ mod tests {
         themes: std::sync::Mutex<Vec<(String, ThemeMode)>>,
         settings_changes: std::sync::Mutex<Vec<(String, String)>>,
         first_runs: std::sync::Mutex<Vec<crate::core::platform::first_run::FirstRunSelection>>,
+        deleted_sessions: Mutex<Vec<String>>,
     }
 
     struct FakeHost {
@@ -6827,6 +7315,11 @@ mod tests {
         fork_selected_text: Arc<std::sync::Mutex<Option<String>>>,
         reload_diagnostics: Arc<std::sync::Mutex<Vec<String>>>,
         extension_runner: Option<Arc<ExtensionRuntimeSet>>,
+        import_missing_cwd: Arc<std::sync::atomic::AtomicBool>,
+        current_session_path: Arc<std::sync::Mutex<Option<String>>>,
+        /// Held by tests to simulate session-manager lock contention.
+        session_file_gate: Arc<tokio::sync::Mutex<()>>,
+        session_entries: Arc<std::sync::Mutex<Vec<super::state::SessionPickerEntry>>>,
     }
 
     impl FakeHost {
@@ -6847,6 +7340,10 @@ mod tests {
                 fork_selected_text: Arc::new(std::sync::Mutex::new(None)),
                 reload_diagnostics: Arc::new(std::sync::Mutex::new(Vec::new())),
                 extension_runner: None,
+                import_missing_cwd: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                current_session_path: Arc::new(std::sync::Mutex::new(None)),
+                session_file_gate: Arc::new(tokio::sync::Mutex::new(())),
+                session_entries: Arc::new(std::sync::Mutex::new(Vec::new())),
             };
             (host, log)
         }
@@ -6860,6 +7357,10 @@ mod tests {
                 .logout_options
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = options;
+        }
+
+        fn set_import_missing_cwd(&self, missing: bool) {
+            self.import_missing_cwd.store(missing, Ordering::SeqCst);
         }
 
         fn set_clone_nothing(&self, nothing: bool) {
@@ -6890,6 +7391,24 @@ mod tests {
                 .reload_diagnostics
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = diagnostics;
+        }
+
+        fn session_file_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+            Arc::clone(&self.session_file_gate)
+        }
+
+        fn set_current_session_path(&self, path: Option<String>) {
+            *self
+                .current_session_path
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+        }
+
+        fn set_session_entries(&self, entries: Vec<super::state::SessionPickerEntry>) {
+            *self
+                .session_entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = entries;
         }
     }
 
@@ -7158,7 +7677,13 @@ mod tests {
         ) -> BoxFuture<'_, Result<bool, ImportError>> {
             let log = Arc::clone(&self.log);
             let owned = path.to_owned();
+            let missing = self.import_missing_cwd.load(Ordering::SeqCst);
             Box::pin(async move {
+                if missing {
+                    return Err(ImportError::MissingCwd {
+                        fallback_cwd: "/tmp/fallback".to_owned(),
+                    });
+                }
                 log.imports.lock().await.push(owned);
                 Ok(true)
             })
@@ -7235,19 +7760,55 @@ mod tests {
             })
         }
 
-        fn get_session_entries(
-            &self,
-        ) -> BoxFuture<'_, Result<Vec<super::state::SessionPickerEntry>, String>> {
-            Box::pin(async {
-                Ok(vec![super::state::SessionPickerEntry {
-                    value: "/tmp/sess.jsonl".to_owned(),
-                    label: "fixture session".to_owned(),
-                    description: None,
-                }])
+        fn current_session_file(&self) -> BoxFuture<'_, Option<String>> {
+            let path = Arc::clone(&self.current_session_path);
+            let gate = Arc::clone(&self.session_file_gate);
+            Box::pin(async move {
+                let _gate = gate.lock().await;
+                path.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
             })
         }
 
-        fn get_tree_entries(&self) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>> {
+        fn delete_session(&self, path: &str) -> BoxFuture<'_, Result<(), String>> {
+            let log = Arc::clone(&self.log);
+            let session_entries = Arc::clone(&self.session_entries);
+            let owned = path.to_owned();
+            Box::pin(async move {
+                log.deleted_sessions.lock().await.push(owned.clone());
+                session_entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|entry| entry.value != owned);
+                Ok(())
+            })
+        }
+
+        fn get_session_entries(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<super::state::SessionPickerEntry>, String>> {
+            let session_entries = Arc::clone(&self.session_entries);
+            Box::pin(async move {
+                let entries = session_entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if entries.is_empty() {
+                    return Ok(vec![super::state::SessionPickerEntry {
+                        value: "/tmp/sess.jsonl".to_owned(),
+                        label: "fixture session".to_owned(),
+                        description: None,
+                    }]);
+                }
+                Ok(entries)
+            })
+        }
+
+        fn get_tree_entries(
+            &self,
+            _filter: crate::modes::interactive::selectors::TreeFilterMode,
+        ) -> BoxFuture<'_, Result<Vec<super::state::TreeEntry>, String>> {
             Box::pin(async {
                 Ok(vec![super::state::TreeEntry {
                     value: "root".to_owned(),
@@ -7382,6 +7943,22 @@ mod tests {
         Ok((rt, log))
     }
 
+    /// Runtime under the shared app-keybinding lock (T-G7 chord tests).
+    fn try_make_g7_runtime() -> Result<
+        (
+            crate::core::keybindings::GlobalAppKeybindingsGuard,
+            InteractiveRuntime<SharedWriter, FakeHost>,
+            Arc<ActionLog>,
+        ),
+        String,
+    > {
+        let guard = crate::core::keybindings::lock_global_app_keybindings();
+        let (mut rt, log) = try_make_runtime()?;
+        rt.mapper
+            .set_keybindings(crate::core::keybindings::app_keybindings_defaults());
+        Ok((guard, rt, log))
+    }
+
     #[tokio::test]
     async fn bash_stays_interruptible_and_rejects_overlap() -> Result<(), String> {
         let (mut rt, log) = try_make_runtime()?;
@@ -7389,7 +7966,7 @@ mod tests {
         let _ = rt.dispatch_bash("second", false).await;
         assert_eq!(
             rt.last_error.as_deref(),
-            Some("a bash command is already running")
+            Some("A bash command is already running. Press Esc to cancel it first.")
         );
         tokio::time::timeout(Duration::from_secs(1), log.bash_started.notified())
             .await
@@ -7701,6 +8278,110 @@ mod tests {
             view.editor.border,
             EditorBorder::Thinking(pi_ai::ModelThinkingLevel::High)
         );
+    }
+
+    #[test]
+    fn editor_border_color_maps_semantic_states_to_existing_tokens() {
+        super::super::theme::set_current(super::super::theme::dark());
+        const PROBE: &str = "─";
+        let expect = |color: ThemeColor| super::super::theme::make_fg(color)(PROBE);
+
+        assert_eq!(
+            editor_border_color(EditorBorder::Muted)(PROBE),
+            expect(ThemeColor::BorderMuted)
+        );
+        assert_eq!(
+            editor_border_color(EditorBorder::Bash)(PROBE),
+            expect(ThemeColor::BashMode)
+        );
+        for (level, token) in [
+            (pi_ai::ModelThinkingLevel::Off, ThemeColor::ThinkingOff),
+            (
+                pi_ai::ModelThinkingLevel::Minimal,
+                ThemeColor::ThinkingMinimal,
+            ),
+            (pi_ai::ModelThinkingLevel::Low, ThemeColor::ThinkingLow),
+            (
+                pi_ai::ModelThinkingLevel::Medium,
+                ThemeColor::ThinkingMedium,
+            ),
+            (pi_ai::ModelThinkingLevel::High, ThemeColor::ThinkingHigh),
+            (pi_ai::ModelThinkingLevel::Xhigh, ThemeColor::ThinkingXhigh),
+            (pi_ai::ModelThinkingLevel::Max, ThemeColor::ThinkingMax),
+        ] {
+            assert_eq!(
+                editor_border_color(EditorBorder::Thinking(level))(PROBE),
+                expect(token)
+            );
+        }
+
+        // The three semantic states must be visibly distinct (dark theme:
+        // borderMuted ≠ bashMode ≠ thinkingHigh — bashMode and thinkingMedium
+        // intentionally share a teal in this theme, so probe thinkingHigh).
+        assert_ne!(
+            expect(ThemeColor::BorderMuted),
+            expect(ThemeColor::BashMode)
+        );
+        assert_ne!(
+            expect(ThemeColor::BorderMuted),
+            expect(ThemeColor::ThinkingHigh)
+        );
+        assert_ne!(
+            expect(ThemeColor::BashMode),
+            expect(ThemeColor::ThinkingHigh)
+        );
+    }
+
+    #[tokio::test]
+    async fn live_editor_border_painter_tracks_footer_and_bash_transitions() -> Result<(), String> {
+        let (mut rt, _log) = make_runtime();
+        let themed = |color: ThemeColor| super::super::theme::make_fg(color)("─");
+
+        assert_eq!(
+            (rt.editor().border_color)("─"),
+            themed(ThemeColor::BorderMuted),
+            "initial live border must paint through BorderMuted"
+        );
+
+        let mut footer = SessionFooterSnapshot {
+            thinking_level: pi_ai::ModelThinkingLevel::High,
+            ..SessionFooterSnapshot::default()
+        };
+        project_footer(&mut rt.view, &footer);
+        rt.sync_editor_border();
+        assert_eq!(
+            rt.view.editor.border,
+            EditorBorder::Thinking(pi_ai::ModelThinkingLevel::High)
+        );
+        assert_eq!(
+            (rt.editor().border_color)("─"),
+            themed(ThemeColor::ThinkingHigh)
+        );
+
+        footer.bash_running = true;
+        project_footer(&mut rt.view, &footer);
+        rt.sync_editor_border();
+        assert_eq!(rt.view.editor.border, EditorBorder::Bash);
+        assert_eq!(
+            (rt.editor().border_color)("─"),
+            themed(ThemeColor::BashMode)
+        );
+
+        // The mapping reaches painted cells: the full top border row carries the
+        // token's RGB, not a hardcoded color.
+        let area = Rect::new(0, 0, 12, 3);
+        let mut buffer = Buffer::empty(area);
+        rt.editor_mut().render(area, &mut buffer);
+        let super::super::theme::Rgb(r, g, b) =
+            super::super::theme::current().fg_rgb(ThemeColor::BashMode);
+        for x in 0..area.width {
+            let cell = buffer
+                .cell((x, 0))
+                .ok_or_else(|| format!("missing border cell ({x}, 0)"))?;
+            assert_eq!(cell.symbol(), "─");
+            assert_eq!(cell.fg, ratatui::style::Color::Rgb(r, g, b));
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -8444,6 +9125,74 @@ mod tests {
         Ok(())
     }
 
+    /// TUI-T11: with a single-frame (static/reduced-motion) indicator,
+    /// `tick_status_indicator` must not cycle the frame counter and must
+    /// suppress repaints on sub-second ticks — only elapsed-second boundary
+    /// crossings trigger a repaint. This is the tick repaint-suppression
+    /// invariant proven by TUI-P4, implemented here via `spinner_frame_count`.
+    #[tokio::test(start_paused = true)]
+    async fn static_indicator_suppresses_subsecond_repaints() -> Result<(), String> {
+        let writer = SharedWriter::new();
+        let caps = TerminalCapabilities::default();
+        let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps)
+            .map_err(|e| format!("tui: {e}"))?;
+        let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(rx);
+        let (host, _log) = FakeHost::new();
+        let options = InteractiveRuntimeOptions {
+            size: (80, 24),
+            indicator_frames: Some(vec!["●".to_owned()]),
+            ..InteractiveRuntimeOptions::default()
+        };
+        let mut rt = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
+        let _ = rt.paint_now();
+
+        assert_eq!(
+            rt.spinner_frame_count, 1,
+            "static indicator must set frame_count to 1"
+        );
+
+        rt.view.status = Some(SessionStatus {
+            kind: StatusKind::Working,
+            frame: 0,
+            elapsed_secs: 0,
+            message: "Working…".to_owned(),
+        });
+        // 13 sub-second ticks (13 × 80 ms = 1.04 s, but started is set on
+        // the first tick at t=80ms, so elapsed at tick 13 = 12 × 80 = 0.96s).
+        for i in 1..=13_usize {
+            tokio::time::advance(SPINNER_TICK).await;
+            assert!(
+                !rt.tick_status_indicator(),
+                "sub-second tick {i} must not repaint for static indicator"
+            );
+        }
+        assert_eq!(
+            rt.spinner_frame, 0,
+            "frame counter must not advance for static indicator"
+        );
+
+        // 14th tick crosses the 1-second boundary (elapsed = 13 × 80 = 1.04s).
+        tokio::time::advance(SPINNER_TICK).await;
+        assert!(
+            rt.tick_status_indicator(),
+            "elapsed-second boundary must trigger a repaint"
+        );
+        let status = rt.view.status.as_ref().ok_or("status vanished")?;
+        assert_eq!(status.elapsed_secs, 1);
+        assert_eq!(status.frame, 0, "frame stays at 0 for static indicator");
+        // Next 11 ticks are again sub-second — no repaints (11 × 80 = 0.88s,
+        // total elapsed = 1.04 + 0.88 = 1.92s, still within second 1).
+        for i in 1..=11_usize {
+            tokio::time::advance(SPINNER_TICK).await;
+            assert!(
+                !rt.tick_status_indicator(),
+                "sub-second tick after boundary {i} must not repaint"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn plain_enter_submits_via_on_submit_channel() -> Result<(), String> {
         let (mut rt, log) = try_make_runtime()?;
@@ -8584,6 +9333,119 @@ mod tests {
                 .iter()
                 .any(|message| matches!(message, MessageView::Tool(view) if view.state.expanded))
         );
+    }
+
+    /// TUI-T8 presentation check: one real `ctrl+o` key through `step_ui`
+    /// (existing dispatch only) expands every tool and bash message
+    /// (per-message) and each block's rendered tail recovers in full
+    /// (per-block), with the collapse hint disappearing.
+    #[tokio::test]
+    async fn ctrl_o_expansion_recovers_full_content_per_block_and_per_message() -> TestResult {
+        use crate::modes::interactive::messages::BashMessageView;
+        use crate::modes::interactive::tool_renderer::{
+            ToolCallView, ToolPhase, ToolResultView, ToolState,
+        };
+        use crate::modes::interactive::view::{render_view, snapshot_buffer_plain};
+
+        fn tool_view(id: &str) -> MessageView {
+            MessageView::Tool(crate::modes::interactive::messages::ToolMessageView {
+                renderer: "read".to_owned(),
+                state: ToolState {
+                    call: ToolCallView {
+                        name: "read".to_owned(),
+                        id: id.to_owned(),
+                        args_summary: format!("path: {id}.rs"),
+                        raw_args: serde_json::json!({ "path": format!("{id}.rs") }),
+                    },
+                    result: Some(ToolResultView {
+                        text: (1..=15_usize)
+                            .map(|i| format!("{id} line {i}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        truncated: false,
+                        full_output_path: None,
+                        images: Vec::new(),
+                        error: None,
+                    }),
+                    expanded: false,
+                    phase: ToolPhase::Success,
+                },
+            })
+        }
+
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.view.messages.push(tool_view("alpha"));
+        rt.view.messages.push(MessageView::Bash(BashMessageView {
+            command: "printf probe".to_owned(),
+            output: (1..=15_usize)
+                .map(|i| format!("bash line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            expanded: false,
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+        }));
+        rt.view.messages.push(tool_view("beta"));
+
+        let plain = |rt: &InteractiveRuntime<SharedWriter, FakeHost>| {
+            let buf = render_view(&rt.view, 100, 200);
+            snapshot_buffer_plain(&buf, 100, 200).join("\n")
+        };
+
+        // Collapsed previews stop at TOOL_PREVIEW_LINES (12) with a hint.
+        let before = plain(&rt);
+        assert!(
+            before.matches("more lines").count() == 2,
+            "each tool block must mark its 3 hidden lines: {before}"
+        );
+        for tail in ["alpha line 13", "beta line 13", "bash line 13"] {
+            assert!(
+                !before.contains(tail),
+                "collapsed preview must stop before line 13: {tail}"
+            );
+        }
+
+        // Existing dispatch only: the real key event through the input path.
+        rt.step_ui(key(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("ctrl+o step failed: {error}"))?;
+
+        // Per-message: every tool and bash view flipped.
+        for message in &rt.view.messages {
+            match message {
+                MessageView::Tool(view) => assert!(
+                    view.state.expanded,
+                    "every tool view must expand after ctrl+o"
+                ),
+                MessageView::Bash(view) => {
+                    assert!(view.expanded, "bash view must expand after ctrl+o")
+                }
+                _ => {}
+            }
+        }
+
+        // Per-block: hidden tails render in full and the hints are gone.
+        let after = plain(&rt);
+        for tail in [
+            "alpha line 13",
+            "alpha line 15",
+            "beta line 13",
+            "beta line 15",
+            "bash line 13",
+            "bash line 15",
+        ] {
+            assert!(
+                after.contains(tail),
+                "expanded block must recover its tail: {tail}"
+            );
+        }
+        assert!(
+            !after.contains("more lines"),
+            "collapse hint must disappear once expanded: {after}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -9789,6 +10651,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_confirm_shows_consequence_labels_and_defaults_to_yes() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        let _ = rt
+            .submit_text("/import session.jsonl".to_owned(), false)
+            .await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::ImportConfirm));
+        let editor = std::mem::replace(&mut rt.editor, Editor::with_defaults());
+        let selector = rt.active_selector.take();
+        let mut root = rt.build_root(editor, selector);
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        root.render(area, &mut buffer);
+        let visible = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            visible.contains("Yes, replace current session"),
+            "missing yes label: {visible}"
+        );
+        assert!(
+            visible.contains("No, keep current session"),
+            "missing no label: {visible}"
+        );
+        assert!(
+            visible.contains("→ Yes, replace current session")
+                || visible.contains("→Yes, replace current session"),
+            "default selection must remain Yes/true at index 0: {visible}"
+        );
+        assert!(visible.contains("esc to cancel"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_cwd_confirm_shows_consequence_labels_and_false_cancels() -> TestResult {
+        let (mut rt, log) = try_make_runtime()?;
+        rt.session.set_import_missing_cwd(true);
+        let _ = rt
+            .submit_text("/import session.jsonl".to_owned(), false)
+            .await;
+        // Accept replace confirm so run_import hits MissingCwd.
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::ImportConfirm,
+                value: "true".to_owned(),
+            })
+            .await;
+        assert_eq!(
+            rt.active_selector_kind,
+            Some(SelectorKind::ImportCwdConfirm)
+        );
+        let mut sel = rt.active_selector.take().expect("cwd confirm selector");
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buffer = Buffer::empty(area);
+        sel.render(area, &mut buffer);
+        let visible = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            visible.contains("Yes, continue in current cwd"),
+            "missing yes label: {visible}"
+        );
+        assert!(
+            visible.contains("No, cancel import"),
+            "missing no label: {visible}"
+        );
+        assert!(
+            visible.contains("→ Yes, continue in current cwd")
+                || visible.contains("→Yes, continue in current cwd"),
+            "default selection must remain Yes/true at index 0: {visible}"
+        );
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::ImportCwdConfirm,
+                value: "false".to_owned(),
+            })
+            .await;
+        assert!(log.imports.lock().await.is_empty());
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "import" && custom.text.contains("Import cancelled")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn logout_lists_credentials_and_removes_selected() -> TestResult {
         let (mut rt, log) = try_make_runtime()?;
         rt.session.set_logout_options(vec![
@@ -9805,10 +10757,11 @@ mod tests {
         ]);
         let _ = rt.dispatch_action(ViewAction::Logout).await;
         assert_eq!(rt.active_selector_kind, Some(SelectorKind::Logout));
+        // Index 1 = first credential (Cancel is 0).
         let _ = rt
             .dispatch_action(ViewAction::SelectConfirmed {
                 selector: SelectorKind::Logout,
-                value: "anthropic".to_owned(),
+                value: "1".to_owned(),
             })
             .await;
         assert_eq!(
@@ -9822,10 +10775,11 @@ mod tests {
         ));
         // Second round exercises the API-key wording.
         let _ = rt.dispatch_action(ViewAction::Logout).await;
+        // Index 2 = second credential while FakeHost keeps both options.
         let _ = rt
             .dispatch_action(ViewAction::SelectConfirmed {
                 selector: SelectorKind::Logout,
-                value: "openai".to_owned(),
+                value: "2".to_owned(),
             })
             .await;
         assert!(matches!(
@@ -9848,6 +10802,455 @@ mod tests {
             Some(MessageView::Custom(custom))
                 if custom.custom_type == "logout" && custom.text.contains("No stored credentials")
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_cancel_sentinel_enter_is_silent_no_removal() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        rt.session
+            .set_logout_options(vec![super::state::LogoutOption {
+                id: "anthropic".to_owned(),
+                name: "Anthropic".to_owned(),
+                is_oauth: true,
+            }]);
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Logout));
+
+        // Cancel is index 0; Enter confirms the sentinel.
+        let message_count_before = rt.view.messages.len();
+        rt.step_ui(key(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("logout cancel enter failed: {error}"))?;
+        assert!(rt.active_selector_kind.is_none());
+        assert!(log.logout_ids.lock().await.is_empty());
+        assert_eq!(rt.view.messages.len(), message_count_before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_cancel_esc_is_silent_no_removal() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        rt.session
+            .set_logout_options(vec![super::state::LogoutOption {
+                id: "anthropic".to_owned(),
+                name: "Anthropic".to_owned(),
+                is_oauth: true,
+            }]);
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        let message_count_before = rt.view.messages.len();
+        rt.step_ui(key(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("logout cancel esc failed: {error}"))?;
+        assert!(rt.active_selector_kind.is_none());
+        assert!(log.logout_ids.lock().await.is_empty());
+        assert_eq!(rt.view.messages.len(), message_count_before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_removes_provider_even_when_id_collides_with_old_sentinel_string() -> TestResult
+    {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        let colliding = "__pi.internal.logout.cancel__".to_owned();
+        rt.session
+            .set_logout_options(vec![super::state::LogoutOption {
+                id: colliding.clone(),
+                name: "Colliding Provider".to_owned(),
+                is_oauth: false,
+            }]);
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Logout));
+        // Index 1 is the credential row; Cancel remains index 0.
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Logout,
+                value: "1".to_owned(),
+            })
+            .await;
+        assert_eq!(log.logout_ids.lock().await.as_slice(), &[colliding]);
+        assert!(matches!(
+            rt.view.messages.last(),
+            Some(MessageView::Custom(custom))
+                if custom.custom_type == "logout"
+                    && custom.text.contains("Removed stored API key for Colliding Provider")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_invalid_index_fails_closed_without_removal() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        rt.session
+            .set_logout_options(vec![super::state::LogoutOption {
+                id: "anthropic".to_owned(),
+                name: "Anthropic".to_owned(),
+                is_oauth: true,
+            }]);
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        let message_count_before = rt.view.messages.len();
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Logout,
+                value: "99".to_owned(),
+            })
+            .await;
+        assert!(rt.active_selector_kind.is_none());
+        assert!(log.logout_ids.lock().await.is_empty());
+        assert_eq!(rt.view.messages.len(), message_count_before);
+
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        let message_count_before = rt.view.messages.len();
+        let _ = rt
+            .dispatch_action(ViewAction::SelectConfirmed {
+                selector: SelectorKind::Logout,
+                value: "anthropic".to_owned(),
+            })
+            .await;
+        assert!(rt.active_selector_kind.is_none());
+        assert!(log.logout_ids.lock().await.is_empty());
+        assert_eq!(rt.view.messages.len(), message_count_before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logout_defaults_to_cancel_sentinel_row() -> TestResult {
+        let (_kb_guard, mut rt, _log) = try_make_g7_runtime()?;
+        rt.session
+            .set_logout_options(vec![super::state::LogoutOption {
+                id: "anthropic".to_owned(),
+                name: "Anthropic".to_owned(),
+                is_oauth: true,
+            }]);
+        let _ = rt.dispatch_action(ViewAction::Logout).await;
+        let editor = std::mem::replace(&mut rt.editor, Editor::with_defaults());
+        let selector = rt.active_selector.take();
+        let mut root = rt.build_root(editor, selector);
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        root.render(area, &mut buffer);
+        let visible = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(visible.contains("Cancel"), "missing Cancel row: {visible}");
+        assert!(
+            visible.contains("→ Cancel") || visible.contains("→Cancel"),
+            "Cancel must be the default landing row: {visible}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_selector_ctrl_d_arms_enter_deletes_and_esc_hierarchy() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        rt.session
+            .set_current_session_path(Some("/tmp/active.jsonl".to_owned()));
+        rt.session.set_session_entries(vec![
+            super::state::SessionPickerEntry {
+                value: "/tmp/active.jsonl".to_owned(),
+                label: "active".to_owned(),
+                description: None,
+            },
+            super::state::SessionPickerEntry {
+                value: "/tmp/other.jsonl".to_owned(),
+                label: "other".to_owned(),
+                description: None,
+            },
+        ]);
+        let _ = rt.open_selector(SelectorKind::Session).await;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Session));
+        assert!(!rt.exited);
+
+        // Move off the active session so Ctrl+D can arm delete.
+        rt.step_ui(key(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("session down failed: {error}"))?;
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("session ctrl+d failed: {error}"))?;
+        assert!(!rt.exited);
+        assert!(
+            rt.view.editor.placeholder.contains("Delete session?"),
+            "expected delete hint, got {}",
+            rt.view.editor.placeholder
+        );
+
+        // First Esc clears only the confirmation.
+        let saved_placeholder = rt.view.editor.placeholder.clone();
+        rt.step_ui(key(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("session first esc failed: {error}"))?;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Session));
+        assert_ne!(rt.view.editor.placeholder, saved_placeholder);
+        assert!(!rt.view.editor.placeholder.contains("Delete session?"));
+
+        // Re-arm and confirm deletion.
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("session re-arm failed: {error}"))?;
+        rt.step_ui(key(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("session delete enter failed: {error}"))?;
+        assert_eq!(
+            log.deleted_sessions.lock().await.as_slice(),
+            &["/tmp/other.jsonl".to_owned()]
+        );
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Session));
+
+        // Fresh selector: Esc closes the picker.
+        rt.step_ui(key(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("session close esc failed: {error}"))?;
+        assert!(rt.active_selector_kind.is_none());
+        assert_eq!(rt.view.focus, FocusArea::Editor);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_selector_blocks_active_delete_via_runtime() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        rt.session
+            .set_current_session_path(Some("/tmp/active.jsonl".to_owned()));
+        rt.session
+            .set_session_entries(vec![super::state::SessionPickerEntry {
+                value: "/tmp/active.jsonl".to_owned(),
+                label: "active".to_owned(),
+                description: None,
+            }]);
+        let _ = rt.open_selector(SelectorKind::Session).await;
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("active delete ctrl+d failed: {error}"))?;
+        assert!(!rt.exited);
+        assert!(log.deleted_sessions.lock().await.is_empty());
+        assert_eq!(
+            rt.last_error.as_deref(),
+            Some("Cannot delete the currently active session")
+        );
+        assert!(!rt.view.editor.placeholder.contains("Delete session?"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_selector_waits_on_held_session_file_gate_then_guards() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let active = tmp.path().join("active.jsonl");
+        std::fs::write(&active, "{}").map_err(|e| e.to_string())?;
+        let active_s = active.to_string_lossy().into_owned();
+        rt.session.set_current_session_path(Some(active_s.clone()));
+        rt.session
+            .set_session_entries(vec![super::state::SessionPickerEntry {
+                value: active_s.clone(),
+                label: "active".to_owned(),
+                description: None,
+            }]);
+
+        let gate = rt.session.session_file_gate();
+        let held = gate.lock().await;
+        let open = {
+            // Open selector while gate held — must await, not skip the guard.
+            let fut = rt.open_selector(SelectorKind::Session);
+            tokio::pin!(fut);
+            // Poll once so it parks on the gate.
+            let poll = futures::future::poll_fn(|cx| match fut.as_mut().poll(cx) {
+                std::task::Poll::Ready(v) => std::task::Poll::Ready(Some(v)),
+                std::task::Poll::Pending => std::task::Poll::Ready(None),
+            })
+            .await;
+            assert!(
+                poll.is_none(),
+                "open_selector must wait while session file gate is held"
+            );
+            drop(held);
+            fut.await
+        };
+        let _ = open;
+        assert_eq!(rt.active_selector_kind, Some(SelectorKind::Session));
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("gated active delete failed: {error}"))?;
+        assert!(log.deleted_sessions.lock().await.is_empty());
+        assert_eq!(
+            rt.last_error.as_deref(),
+            Some("Cannot delete the currently active session")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_selector_blocks_active_delete_via_symlink_path() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let real = tmp.path().join("real-active.jsonl");
+        std::fs::write(&real, "{}").map_err(|e| e.to_string())?;
+        let link = tmp.path().join("link-active.jsonl");
+        std::os::unix::fs::symlink(&real, &link).map_err(|e| e.to_string())?;
+        let real_s = real.to_string_lossy().into_owned();
+        let link_s = link.to_string_lossy().into_owned();
+        // Active path recorded as the real file; selector lists the symlink.
+        rt.session.set_current_session_path(Some(real_s));
+        rt.session
+            .set_session_entries(vec![super::state::SessionPickerEntry {
+                value: link_s,
+                label: "active-link".to_owned(),
+                description: None,
+            }]);
+        let _ = rt.open_selector(SelectorKind::Session).await;
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("symlink active delete failed: {error}"))?;
+        assert!(log.deleted_sessions.lock().await.is_empty());
+        assert_eq!(
+            rt.last_error.as_deref(),
+            Some("Cannot delete the currently active session")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_selector_still_deletes_non_active_session() -> TestResult {
+        let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let active = tmp.path().join("active.jsonl");
+        let other = tmp.path().join("other.jsonl");
+        std::fs::write(&active, "{}").map_err(|e| e.to_string())?;
+        std::fs::write(&other, "{}").map_err(|e| e.to_string())?;
+        let active_s = active.to_string_lossy().into_owned();
+        let other_s = other.to_string_lossy().into_owned();
+        rt.session.set_current_session_path(Some(active_s.clone()));
+        rt.session.set_session_entries(vec![
+            super::state::SessionPickerEntry {
+                value: active_s,
+                label: "active".to_owned(),
+                description: None,
+            },
+            super::state::SessionPickerEntry {
+                value: other_s.clone(),
+                label: "other".to_owned(),
+                description: None,
+            },
+        ]);
+        let _ = rt.open_selector(SelectorKind::Session).await;
+        // Move to the non-active row.
+        rt.step_ui(key(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("move to other failed: {error}"))?;
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("arm other delete failed: {error}"))?;
+        rt.step_ui(key(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("confirm other delete failed: {error}"))?;
+        assert_eq!(log.deleted_sessions.lock().await.as_slice(), &[other_s]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tree_filter_chords_update_mode_without_exiting() -> TestResult {
+        let (_kb_guard, mut rt, _log) = try_make_g7_runtime()?;
+        let _ = rt.open_selector(SelectorKind::Tree).await;
+        assert_eq!(
+            rt.tree_filter,
+            crate::modes::interactive::selectors::TreeFilterMode::Default
+        );
+
+        for (chord, expected) in [
+            (
+                't',
+                crate::modes::interactive::selectors::TreeFilterMode::NoTools,
+            ),
+            (
+                'u',
+                crate::modes::interactive::selectors::TreeFilterMode::UserOnly,
+            ),
+            (
+                'l',
+                crate::modes::interactive::selectors::TreeFilterMode::LabeledOnly,
+            ),
+            (
+                'd',
+                crate::modes::interactive::selectors::TreeFilterMode::Default,
+            ),
+        ] {
+            rt.step_ui(key(KeyCode::Char(chord), KeyModifiers::CONTROL))
+                .await
+                .map_err(|error| format!("tree filter ctrl+{chord} failed: {error}"))?;
+            assert!(!rt.exited, "ctrl+{chord} must not exit while tree is open");
+            assert_eq!(rt.tree_filter, expected);
+            assert_eq!(rt.active_selector_kind, Some(SelectorKind::Tree));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_input_ctrl_d_does_not_exit() -> TestResult {
+        let (_kb_guard, mut rt, _log) = try_make_g7_runtime()?;
+        rt.begin_extension_dialog(HostUiRequest::Input {
+            id: 42,
+            request: pi_ext::protocol::InputRequest {
+                title: "Extension input".to_owned(),
+                placeholder: Some("value".to_owned()),
+                options_meta: pi_ext::protocol::DialogOptions::default(),
+            },
+        })
+        .await;
+        assert!(rt.editor.get_text().is_empty());
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("extension input ctrl+d failed: {error}"))?;
+        assert!(!rt.exited);
+        assert!(rt.pending_extension_dialog.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_input_second_ctrl_c_still_exits() -> TestResult {
+        let (_kb_guard, mut rt, _log) = try_make_g7_runtime()?;
+        rt.begin_extension_dialog(HostUiRequest::Input {
+            id: 44,
+            request: pi_ext::protocol::InputRequest {
+                title: "Extension input".to_owned(),
+                placeholder: Some("value".to_owned()),
+                options_meta: pi_ext::protocol::DialogOptions::default(),
+            },
+        })
+        .await;
+        // First Ctrl+C clears/interrupts; second within the double-tap window exits.
+        rt.step_ui(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("extension input first ctrl+c failed: {error}"))?;
+        assert!(!rt.exited);
+        rt.step_ui(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("extension input second ctrl+c failed: {error}"))?;
+        assert!(
+            rt.exited,
+            "double Ctrl+C must exit even during extension Input"
+        );
+        assert_eq!(rt.exit_kind, InteractiveExit::Clean);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_extension_editor_ctrl_d_exits() -> TestResult {
+        let (_kb_guard, mut rt, _log) = try_make_g7_runtime()?;
+        rt.begin_extension_dialog(HostUiRequest::Editor {
+            id: 43,
+            request: pi_ext::protocol::EditorRequest {
+                title: "Extension editor".to_owned(),
+                prefill: None,
+            },
+        })
+        .await;
+        assert!(rt.editor.get_text().is_empty());
+        rt.step_ui(key(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .map_err(|error| format!("extension editor ctrl+d failed: {error}"))?;
+        assert!(rt.exited);
+        assert_eq!(rt.exit_kind, InteractiveExit::Clean);
         Ok(())
     }
 
@@ -10276,6 +11679,514 @@ mod tests {
             written,
             encode_osc0_set_title("safe\x07\x1b]1;evil\x07\u{009b}ok")
         );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // TUI-T9: narrow-width viewport floor policy (TUI-G8)
+    // -----------------------------------------------------------------------
+
+    /// Helper: true when every cell in `buf` is a blank (space or empty).
+    fn buffer_is_blank(buf: &Buffer) -> bool {
+        buf.content()
+            .iter()
+            .all(|cell| cell.symbol() == " " || cell.symbol() == "")
+    }
+
+    /// A live resize to width < 20 blanks the render area (no content cells).
+    #[tokio::test]
+    async fn floor_blanks_render_below_20() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        // Normal render at 80 has content.
+        let buf = render_view(&rt.view, 80, 24);
+        assert!(!buffer_is_blank(&buf), "80-column render must have content");
+        // Resize below floor.
+        rt.step_ui(UiEvent::Resize {
+            width: 10,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize to 10 failed: {e}"))?;
+        // render_view must blank below floor.
+        let buf = render_view(&rt.view, 10, 24);
+        assert!(
+            buffer_is_blank(&buf),
+            "10-column render must be blank (floor policy)"
+        );
+        Ok(())
+    }
+
+    /// A subsequent resize to width ≥ 20 resumes normal rendering immediately.
+    #[tokio::test]
+    async fn floor_resumes_at_20() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        // Shrink below floor then restore.
+        rt.step_ui(UiEvent::Resize {
+            width: 10,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize to 10 failed: {e}"))?;
+        rt.step_ui(UiEvent::Resize {
+            width: 80,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize back to 80 failed: {e}"))?;
+        let buf = render_view(&rt.view, 80, 24);
+        assert!(
+            !buffer_is_blank(&buf),
+            "80-column render after restore must have content"
+        );
+        Ok(())
+    }
+
+    /// The Tui size cache and ViewState dimensions track the raw reported size
+    /// at all times — the floor is a render-time gate, not a stored clamp.
+    #[tokio::test]
+    async fn floor_tracks_raw_dimensions() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.step_ui(UiEvent::Resize {
+            width: 8,
+            height: 3,
+        })
+        .await
+        .map_err(|e| format!("resize to 8×3 failed: {e}"))?;
+        assert_eq!(rt.tui.size(), Size::new(8, 3), "Tui size cache must be raw");
+        assert_eq!(rt.view.width, 8, "ViewState width must be raw");
+        assert_eq!(rt.view.height, 3, "ViewState height must be raw");
+        Ok(())
+    }
+
+    /// The floor blanks the render even when a selector is open.
+    #[tokio::test]
+    async fn floor_blanks_with_selector_open() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        // Open a confirm selector (no async session call needed).
+        rt.install_confirm_selector(
+            SelectorKind::Logout,
+            "Select a credential to remove",
+            vec![
+                pi_tui::components::SelectItem::new("cancel", "Cancel"),
+                pi_tui::components::SelectItem::new("1", "anthropic"),
+            ],
+        );
+        assert!(rt.active_selector.is_some(), "selector must be open");
+        // Resize below floor.
+        rt.step_ui(UiEvent::Resize {
+            width: 12,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize to 12 failed: {e}"))?;
+        // Build root and render at 12 columns — must be blank.
+        let editor = std::mem::replace(&mut rt.editor, Editor::with_defaults());
+        let selector = rt.active_selector.take();
+        let mut root = rt.build_root(editor, selector);
+        let area = Rect::new(0, 0, 12, 24);
+        let mut buffer = Buffer::empty(area);
+        root.render(area, &mut buffer);
+        assert!(
+            buffer_is_blank(&buffer),
+            "selector render at 12 columns must be blank (floor policy)"
+        );
+        Ok(())
+    }
+
+    /// The floor blanks the render even when an overlay (dialog) is open.
+    #[tokio::test]
+    async fn floor_blanks_with_overlay_open() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.open_overlay(OverlayKind::Login);
+        assert!(rt.view.overlay.is_some(), "overlay must be open");
+        // Resize below floor.
+        rt.step_ui(UiEvent::Resize {
+            width: 15,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize to 15 failed: {e}"))?;
+        // render_view must blank below floor even with overlay.
+        let buf = render_view(&rt.view, 15, 24);
+        assert!(
+            buffer_is_blank(&buf),
+            "overlay render at 15 columns must be blank (floor policy)"
+        );
+        Ok(())
+    }
+
+    /// Resize-storm coalescing down to 1×1: multiple sub-floor resizes
+    /// coalesce into one reanchor, the final state is blank, and raw
+    /// dimensions are tracked at 1×1.
+    #[tokio::test]
+    async fn floor_storm_coalescing_to_1x1() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        // Feed a storm of resize events by calling handle_resize directly
+        // (step_ui processes one at a time; handle_resize drains the queue).
+        // First resize enters handle_resize which drains queued events.
+        let (tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        rt.input = TerminalInput::mock(rx);
+        // Queue the storm: 20→10→5→1.
+        tx.send(UiEvent::Resize {
+            width: 10,
+            height: 10,
+        })
+        .map_err(|e| format!("send resize 10 failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 5,
+            height: 5,
+        })
+        .map_err(|e| format!("send resize 5 failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 1,
+            height: 1,
+        })
+        .map_err(|e| format!("send resize 1 failed: {e}"))?;
+        // Process the first resize — handle_resize drains and coalesces.
+        rt.step_ui(UiEvent::Resize {
+            width: 10,
+            height: 10,
+        })
+        .await
+        .map_err(|e| format!("storm first resize failed: {e}"))?;
+        // After coalescing, the final dimensions must be 1×1 (raw).
+        assert_eq!(rt.tui.size(), Size::new(1, 1), "storm must coalesce to 1×1");
+        assert_eq!(rt.view.width, 1, "ViewState width must be 1 after storm");
+        assert_eq!(rt.view.height, 1, "ViewState height must be 1 after storm");
+        // Render at 1 column must be blank.
+        let buf = render_view(&rt.view, 1, 1);
+        assert!(
+            buffer_is_blank(&buf),
+            "1×1 render must be blank (floor policy)"
+        );
+        Ok(())
+    }
+
+    /// InteractiveRoot::measure returns 0 below the floor — no content height
+    /// is allocated, so the commit path writes zero rows.
+    #[tokio::test]
+    async fn floor_measure_returns_zero_below_20() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        let editor = std::mem::replace(&mut rt.editor, Editor::with_defaults());
+        let selector = rt.active_selector.take();
+        let mut root = rt.build_root(editor, selector);
+        // Above floor: measure > 0.
+        let h = root.measure(80);
+        assert!(h > 0, "measure at 80 must be > 0, got {h}");
+        // Below floor: measure == 0.
+        let h = root.measure(10);
+        assert_eq!(h, 0, "measure at 10 must be 0 (floor policy)");
+        let h = root.measure(1);
+        assert_eq!(h, 0, "measure at 1 must be 0 (floor policy)");
+        Ok(())
+    }
+
+    /// The boundary: width exactly 20 renders content (floor is < 20, not ≤ 20).
+    #[tokio::test]
+    async fn floor_boundary_20_renders_content() -> TestResult {
+        let (mut rt, _log) = try_make_runtime()?;
+        let buf = render_view(&rt.view, 20, 24);
+        assert!(
+            !buffer_is_blank(&buf),
+            "20-column render must have content (floor is < 20)"
+        );
+        // 19 must be blank.
+        let buf = render_view(&rt.view, 19, 24);
+        assert!(
+            buffer_is_blank(&buf),
+            "19-column render must be blank (floor is < 20)"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // TUI-V4: Resize storm, settle, and progressive-disclosure integrity
+    // -----------------------------------------------------------------------
+
+    /// Build a runtime with a live input sender so tests can pre-load
+    /// events into the channel before calling `step_ui`.
+    fn try_make_runtime_with_channel() -> Result<
+        (
+            InteractiveRuntime<SharedWriter, FakeHost>,
+            Arc<ActionLog>,
+            mpsc::UnboundedSender<UiEvent>,
+            SharedWriter,
+        ),
+        String,
+    > {
+        let writer = SharedWriter::new();
+        let sink = writer.clone();
+        let caps = TerminalCapabilities::default();
+        let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps)
+            .map_err(|error| format!("tui construction: {error}"))?;
+        let (tx, rx) = mpsc::unbounded_channel::<UiEvent>();
+        let input = TerminalInput::mock(rx);
+        let (host, log) = FakeHost::new();
+        let options = InteractiveRuntimeOptions {
+            size: (80, 24),
+            ..InteractiveRuntimeOptions::default()
+        };
+        let mut rt = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
+        let _ = rt.paint_now();
+        Ok((rt, log, tx, sink))
+    }
+
+    /// V4-1: a rapid 20→160→30 resize storm coalesces into exactly one
+    /// reanchor commit with zero banned clear bytes (no CSI 2J / 3J).
+    #[tokio::test]
+    async fn resize_storm_coalesces_to_one_reanchor_with_zero_clear_bytes() -> TestResult {
+        use pi_tui::terminal::backend::audit_bytes;
+
+        let (mut rt, _log, tx, sink) = try_make_runtime_with_channel()?;
+        let baseline = sink.snapshot().len();
+
+        // Pre-load the storm: 20→160→30. The first step_ui enters
+        // handle_resize which drains the channel and coalesces all three
+        // into one reanchor.
+        tx.send(UiEvent::Resize {
+            width: 160,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 30,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
+
+        rt.step_ui(UiEvent::Resize {
+            width: 20,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize step failed: {e}"))?;
+
+        // Final size must be the last event (30×24), not the first.
+        assert_eq!(rt.tui.size(), Size::new(30, 24));
+        assert_eq!(rt.view.width, 30);
+        assert_eq!(rt.view.height, 24);
+
+        let written = &sink.snapshot()[baseline..];
+        assert!(
+            !written.is_empty(),
+            "storm reanchor must commit bytes to the sink"
+        );
+        assert!(!rt.exited, "reanchor must not silently enter IoFailure");
+        let report = audit_bytes(written);
+        assert_eq!(report.clear_2j, 0, "resize reanchor must not emit CSI 2J");
+        assert_eq!(report.clear_3j, 0, "resize reanchor must not emit CSI 3J");
+        assert!(
+            report.sync_begin == report.sync_end,
+            "synchronized-output markers must balance"
+        );
+        Ok(())
+    }
+
+    /// V4-2: a sub-20 resize storm (20→15→10→8) coalesces to one reanchor
+    /// with zero clear bytes; the viewport size tracks the final width.
+    #[tokio::test]
+    async fn sub20_resize_storm_coalesces_with_zero_clear_bytes() -> TestResult {
+        use pi_tui::terminal::backend::audit_bytes;
+
+        let (mut rt, _log, tx, sink) = try_make_runtime_with_channel()?;
+        let baseline = sink.snapshot().len();
+
+        tx.send(UiEvent::Resize {
+            width: 15,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 10,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 8,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
+
+        rt.step_ui(UiEvent::Resize {
+            width: 20,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize step failed: {e}"))?;
+
+        assert_eq!(rt.tui.size(), Size::new(8, 24));
+        let written = &sink.snapshot()[baseline..];
+        assert!(
+            !written.is_empty(),
+            "sub-20 storm reanchor must commit bytes to the sink"
+        );
+        assert!(!rt.exited, "reanchor must not silently enter IoFailure");
+        let report = audit_bytes(written);
+        assert_eq!(report.clear_2j, 0, "sub-20 storm must not emit CSI 2J");
+        assert_eq!(report.clear_3j, 0, "sub-20 storm must not emit CSI 3J");
+        Ok(())
+    }
+
+    /// V4-3: progressive-disclosure cues (… N more lines · ctrl+o) remain
+    /// fully visible at 40 columns on canonical content.
+    #[tokio::test]
+    async fn progressive_disclosure_cues_visible_at_40_columns() -> TestResult {
+        use crate::modes::interactive::tool_renderer::{
+            ToolCallView, ToolPhase, ToolResultView, ToolState,
+        };
+        use crate::modes::interactive::view::{render_view, snapshot_buffer_plain};
+
+        let (mut rt, _log) = try_make_runtime()?;
+
+        rt.view.messages.push(MessageView::Tool(
+            crate::modes::interactive::messages::ToolMessageView {
+                renderer: "read".to_owned(),
+                state: ToolState {
+                    call: ToolCallView {
+                        name: "read".to_owned(),
+                        id: "test1".to_owned(),
+                        args_summary: "path: test.rs".to_owned(),
+                        raw_args: serde_json::json!({ "path": "test.rs" }),
+                    },
+                    result: Some(ToolResultView {
+                        text: (1..=15_usize)
+                            .map(|i| format!("line {i}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        truncated: false,
+                        full_output_path: None,
+                        images: Vec::new(),
+                        error: None,
+                    }),
+                    expanded: false,
+                    phase: ToolPhase::Success,
+                },
+            },
+        ));
+        let plain = crate::core::keybindings::with_global_app_keybindings(|| {
+            let buf = render_view(&rt.view, 40, 200);
+            snapshot_buffer_plain(&buf, 40, 200).join("\n")
+        });
+
+        assert!(
+            plain.contains("more lines"),
+            "collapse hint must be visible at 40 columns: {plain}"
+        );
+        assert!(
+            plain.contains("ctrl+o"),
+            "expand key cue must be visible at 40 columns: {plain}"
+        );
+        Ok(())
+    }
+
+    /// V4-4: progressive-disclosure cues remain visible at 20 columns.
+    #[tokio::test]
+    async fn progressive_disclosure_cues_visible_at_20_columns() -> TestResult {
+        use crate::modes::interactive::tool_renderer::{
+            ToolCallView, ToolPhase, ToolResultView, ToolState,
+        };
+        use crate::modes::interactive::view::{render_view, snapshot_buffer_plain};
+
+        let (mut rt, _log) = try_make_runtime()?;
+
+        rt.view.messages.push(MessageView::Tool(
+            crate::modes::interactive::messages::ToolMessageView {
+                renderer: "read".to_owned(),
+                state: ToolState {
+                    call: ToolCallView {
+                        name: "read".to_owned(),
+                        id: "test2".to_owned(),
+                        args_summary: "path: test.rs".to_owned(),
+                        raw_args: serde_json::json!({ "path": "test.rs" }),
+                    },
+                    result: Some(ToolResultView {
+                        text: (1..=15_usize)
+                            .map(|i| format!("line {i}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        truncated: false,
+                        full_output_path: None,
+                        images: Vec::new(),
+                        error: None,
+                    }),
+                    expanded: false,
+                    phase: ToolPhase::Success,
+                },
+            },
+        ));
+
+        let plain = crate::core::keybindings::with_global_app_keybindings(|| {
+            let buf = render_view(&rt.view, 20, 200);
+            snapshot_buffer_plain(&buf, 20, 200).join("\n")
+        });
+
+        assert!(
+            plain.contains("more lines"),
+            "collapse hint must be visible at 20 columns: {plain}"
+        );
+        assert!(
+            plain.contains("ctrl+o"),
+            "expand key cue must be visible at 20 columns: {plain}"
+        );
+        Ok(())
+    }
+
+    /// V4-5: resize to the same dimensions produces a reanchor with zero
+    /// banned clear bytes (viewport stays anchored).
+    #[tokio::test]
+    async fn resize_to_same_dimensions_stays_anchored() -> TestResult {
+        let (mut rt, _log, _tx, sink) = try_make_runtime_with_channel()?;
+        let baseline = sink.snapshot().len();
+
+        rt.step_ui(UiEvent::Resize {
+            width: 80,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize step failed: {e}"))?;
+
+        let written = &sink.snapshot()[baseline..];
+        assert!(
+            !written.is_empty(),
+            "same-size resize must still commit a reanchor"
+        );
+        assert!(
+            !written.windows(4).any(|w| w == b"\x1b[2J"),
+            "same-size reanchor must not emit CSI 2J"
+        );
+        Ok(())
+    }
+
+    /// V4-6: a 160→30→160 storm settles to the final size with the viewport
+    /// anchored at the bottom (viewport_top = height - viewport_height).
+    #[tokio::test]
+    async fn resize_storm_settles_with_bottom_anchored_viewport() -> TestResult {
+        let (mut rt, _log, tx, _sink) = try_make_runtime_with_channel()?;
+
+        tx.send(UiEvent::Resize {
+            width: 30,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
+        tx.send(UiEvent::Resize {
+            width: 160,
+            height: 24,
+        })
+        .map_err(|e| format!("send failed: {e}"))?;
+
+        rt.step_ui(UiEvent::Resize {
+            width: 160,
+            height: 24,
+        })
+        .await
+        .map_err(|e| format!("resize step failed: {e}"))?;
+
+        assert_eq!(rt.tui.size(), Size::new(160, 24));
+        // Viewport height is preserved from the initial 8-row inline
+        // viewport (note_resize only shrinks, never grows). The reanchor
+        // commits with viewport_height = min(8, 24) = 8, bottom-anchored
+        // at row 24-8=16. This is the correct anchored behavior.
+        assert_eq!(rt.tui.viewport_height(), 8);
         Ok(())
     }
 }

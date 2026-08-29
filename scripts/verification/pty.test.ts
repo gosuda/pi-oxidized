@@ -67,4 +67,46 @@ describe.skipIf(isWindows)("PTY driver", () => {
 			await process.terminate();
 		}
 	}, 15_000);
+
+	test("writeKeys returns a receipt that excludes prior chunks, starts immediately before the write, and precedes the resulting output", async () => {
+		const root = temporaryDirectory("pi pty ' $() ");
+		const process = spawnPty({
+			argv: [
+				"/bin/sh",
+				"-c",
+				`stty echo; printf READY; IFS= read -r a; printf 'GOT:%s\\n' "$a"; IFS= read -r b; printf 'GOT2:%s\\n' "$b"`,
+			],
+			cwd: root,
+		});
+		try {
+			await process.waitFor(/READY/, { deadlineMs: 5_000, source: "raw" });
+			const first = process.writeKeys("first", PTY_KEYS.enter);
+			await process.waitFor(/GOT:first/, { deadlineMs: 5_000 });
+			const afterFirst = process.snapshot();
+			expect(afterFirst.rawText.slice(0, first.outputOffset)).not.toContain("GOT:first");
+			expect(afterFirst.rawText.slice(first.outputOffset)).toContain("GOT:first");
+
+			const hostile = "sec\"'\\$(`)ond";
+			const beforeSecond = process.snapshot();
+			const second = process.writeKeys(hostile, PTY_KEYS.enter);
+			expect(second.outputOffset).toBeGreaterThan(first.outputOffset);
+			expect(second.outputOffset).toBe(beforeSecond.rawText.length);
+			expect(second.startedElapsedMs).toBeGreaterThanOrEqual(beforeSecond.elapsedMs);
+			await process.waitFor(/GOT2:/, { deadlineMs: 5_000 });
+			const afterSecond = process.snapshot();
+			expect(afterSecond.rawText.slice(second.outputOffset)).toContain(`GOT2:${hostile}`);
+			const postWriteChunkElapsed: number[] = [];
+			let consumed = 0;
+			for (const chunk of afterSecond.chunks) {
+				if (chunk.stream !== "pty") continue;
+				consumed += chunk.text.length;
+				if (consumed > second.outputOffset) postWriteChunkElapsed.push(chunk.elapsedMs);
+			}
+			expect(postWriteChunkElapsed.length).toBeGreaterThan(0);
+			expect(postWriteChunkElapsed.every((elapsedMs) => elapsedMs >= second.startedElapsedMs)).toBe(true);
+			expect(await process.waitForExit(5_000)).toBe(0);
+		} finally {
+			await process.terminate();
+		}
+	}, 15_000);
 });

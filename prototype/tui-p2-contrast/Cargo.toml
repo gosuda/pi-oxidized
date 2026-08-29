@@ -1,0 +1,15 @@
+# TUI-P2 throwaway prototype (issue #58): deterministic contrast measurement.
+# Standalone — the empty [workspace] table keeps this crate out of the repo
+# workspace so the shipped crate graph and deny.toml surface are untouched.
+# Not published, not wired into CI.
+[workspace]
+
+[package]
+name = "tui-p2-contrast"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.0"
+publish = false
+
+[dependencies]
+sonic-rs = "=0.5.8"

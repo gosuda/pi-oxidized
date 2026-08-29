@@ -65,8 +65,12 @@ impl TextRenderer {
         match event {
             AgentSessionEvent::TurnEnd { message, .. }
             | AgentSessionEvent::MessageStart { message }
-            | AgentSessionEvent::MessageUpdate { message, .. }
             | AgentSessionEvent::MessageEnd { message } => {
+                self.record_assistant(message);
+            }
+            AgentSessionEvent::MessageUpdate { message, .. } => {
+                // `message` is `&Arc<AgentMessage>` here; deref coercion
+                // yields `&AgentMessage` for `record_assistant`.
                 self.record_assistant(message);
             }
             AgentSessionEvent::AgentEnd { messages, .. } => {

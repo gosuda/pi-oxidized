@@ -446,11 +446,11 @@ mod tests {
         let timestamp = i64::try_from(n).unwrap_or(i64::MAX);
         let assistant = pi_ai::AssistantMessage::new("api", "provider", format!("m{n}"), timestamp);
         AgentEvent::MessageUpdate {
-            message: crate::message::AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(
-                assistant.clone(),
+            message: Arc::new(crate::message::AgentMessage::Llm(Box::new(
+                pi_ai::Message::Assistant(assistant.clone()),
             ))),
             assistant_message_event: Box::new(pi_ai::AssistantMessageEvent::Start {
-                partial: assistant,
+                partial: Arc::new(assistant),
             }),
         }
     }
@@ -496,7 +496,7 @@ mod tests {
                 guard
                     .streaming_message
                     .as_ref()
-                    .map(crate::message::AgentMessage::role),
+                    .map(|message| message.role()),
                 Some("user")
             );
         }

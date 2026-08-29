@@ -204,6 +204,9 @@ impl Component for Loader {
         if area.height == 0 {
             return;
         }
+        // The leading row is blank (never painted): claim it via an empty
+        // line so in-place rendering blanks and accounts for the row.
+        crate::components::util::paint_line(area.x, area.y, usize::from(area.width), buf, "");
         // First row blank; remaining rows from Text.
         let text_area = Rect {
             x: area.x,

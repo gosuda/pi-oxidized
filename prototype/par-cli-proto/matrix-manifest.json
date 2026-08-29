@@ -1,0 +1,157 @@
+{
+  "$schema": "par-cli-proto/matrix-manifest",
+  "generated_from": "upstream builtinProviders() at 8fa7eebd2 (packages/ai/src/providers/all.ts:89-132)",
+  "generated_at": "2026-08-27",
+  "description": "OAuth-capable provider matrix extracted from upstream pi-ai at commit 8fa7eeb. Each provider has auth.oauth != null. The harness replays each provider's OAuth login flow hermetically via a fetch-interceptor shim that redirects hardcoded endpoint URLs to pinned fixture responses.",
+  "providers": [
+    {
+      "id": "anthropic",
+      "name": "Anthropic",
+      "oauth_name": "Anthropic (Claude Pro/Max)",
+      "flow_type": "browser_pkce",
+      "is_subscription": false,
+      "endpoints": {
+        "authorize": "https://claude.ai/oauth/authorize",
+        "token": "https://platform.claude.com/v1/oauth/token"
+      },
+      "callback": {
+        "host": "127.0.0.1",
+        "port": 53692,
+        "path": "/callback"
+      },
+      "stdin_script": "stdin/anthropic.txt",
+      "fixture": "fixtures/anthropic.json",
+      "golden_dir": "goldens/anthropic",
+      "replay_capability": "hermetic",
+      "notes": "PKCE browser flow with manual_code prompt. Stdin provides callback URL with fake auth code (no state needed — state defaults to verifier when omitted). Token exchange intercepted by fetch shim."
+    },
+    {
+      "id": "github-copilot",
+      "name": "GitHub Copilot",
+      "oauth_name": "GitHub Copilot",
+      "flow_type": "device_code",
+      "is_subscription": true,
+      "endpoints": {
+        "device_code": "https://github.com/login/device/code",
+        "access_token": "https://github.com/login/oauth/access_token",
+        "copilot_token": "https://api.github.com/copilot_internal/v2/token",
+        "models": "https://api.individual.githubcopilot.com/models"
+      },
+      "stdin_script": "stdin/github-copilot.txt",
+      "fixture": "fixtures/github-copilot.json",
+      "golden_dir": "goldens/github-copilot",
+      "replay_capability": "hermetic",
+      "notes": "RFC 8628 device code flow. Stdin provides empty enterprise domain (defaults to github.com). Mock returns empty models list to skip model-enablement step. Copilot token includes proxy-ep for model API base URL."
+    },
+    {
+      "id": "kimi-coding",
+      "name": "Kimi For Coding",
+      "oauth_name": "Kimi Code (subscription)",
+      "flow_type": "device_code",
+      "is_subscription": false,
+      "endpoints": {
+        "device_authorization": "https://auth.kimi.com/api/oauth/device_authorization",
+        "token": "https://auth.kimi.com/api/oauth/token"
+      },
+      "env_overrides": {
+        "KIMI_CODE_OAUTH_HOST": "redirected via fetch shim to auth.kimi.com"
+      },
+      "stdin_script": "stdin/kimi-coding.txt",
+      "fixture": "fixtures/kimi-coding.json",
+      "golden_dir": "goldens/kimi-coding",
+      "replay_capability": "hermetic",
+      "notes": "RFC 8628 device code flow against auth.kimi.com. Env var KIMI_CODE_OAUTH_HOST exists but is not needed — fetch shim intercepts auth.kimi.com directly."
+    },
+    {
+      "id": "openai-codex",
+      "name": "OpenAI Codex",
+      "oauth_name": "OpenAI (ChatGPT Plus/Pro)",
+      "flow_type": "dual",
+      "is_subscription": true,
+      "endpoints": {
+        "authorize": "https://auth.openai.com/oauth/authorize",
+        "token": "https://auth.openai.com/oauth/token",
+        "device_usercode": "https://auth.openai.com/api/accounts/deviceauth/usercode",
+        "device_token": "https://auth.openai.com/api/accounts/deviceauth/token"
+      },
+      "callback": {
+        "host": "127.0.0.1",
+        "port": 1455,
+        "path": "/auth/callback"
+      },
+      "stdin_script": "stdin/openai-codex.txt",
+      "fixture": "fixtures/openai-codex.json",
+      "golden_dir": "goldens/openai-codex",
+      "replay_capability": "hermetic",
+      "notes": "Dual-mode: browser PKCE and device code. Stdin selects 'device_code' login method (headless). Device flow polls deviceauth/token (403 pending → 200 with auth code), then exchanges at oauth/token."
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "oauth_name": "OpenRouter OAuth",
+      "flow_type": "browser_pkce",
+      "is_subscription": false,
+      "endpoints": {
+        "authorize": "https://openrouter.ai/auth",
+        "token": "https://openrouter.ai/api/v1/auth/keys"
+      },
+      "callback": {
+        "host": "127.0.0.1",
+        "port": "ephemeral",
+        "path": "/oauth/callback/<random-uuid>"
+      },
+      "stdin_script": "stdin/openrouter.txt",
+      "fixture": "fixtures/openrouter.json",
+      "golden_dir": "goldens/openrouter",
+      "replay_capability": "hermetic",
+      "notes": "PKCE browser flow with manual_code prompt. Returns a permanent API key (not access/refresh pair). Callback path includes random UUID — stdin provides a URL with code param, parseAuthorizationInput extracts code regardless of path."
+    },
+    {
+      "id": "radius",
+      "name": "Radius",
+      "oauth_name": "Radius",
+      "flow_type": "dual",
+      "is_subscription": false,
+      "endpoints": {
+        "discovery": "https://radius.pi.dev/v1/oauth",
+        "authorize": "<discovered from gateway>",
+        "token": "https://radius.pi.dev/v1/oauth/token",
+        "device": "https://radius.pi.dev/v1/oauth/device"
+      },
+      "callback": {
+        "host": "127.0.0.1",
+        "port": 1456,
+        "path": "/oauth/callback"
+      },
+      "stdin_script": "stdin/radius.txt",
+      "fixture": "fixtures/radius.json",
+      "golden_dir": "goldens/radius",
+      "replay_capability": "hermetic",
+      "notes": "Dual-mode: browser PKCE and device code. Discovery-based — gateway URL defaults to https://radius.pi.dev. Stdin selects 'device-code' login method (headless) to avoid callback completion complexity. Browser flow has no manual_code prompt; device flow is fully hermetic."
+    },
+    {
+      "id": "xai",
+      "name": "xAI",
+      "oauth_name": "xAI (Grok/X subscription)",
+      "flow_type": "device_code",
+      "is_subscription": false,
+      "endpoints": {
+        "device_code": "https://auth.x.ai/oauth2/device/code",
+        "token": "https://auth.x.ai/oauth2/token"
+      },
+      "stdin_script": "stdin/xai.txt",
+      "fixture": "fixtures/xai.json",
+      "golden_dir": "goldens/xai",
+      "replay_capability": "hermetic",
+      "notes": "RFC 8628 device code flow. No stdin input needed — flow is fully automatic after login command. First token poll returns authorization_pending, second returns credentials."
+    }
+  ],
+  "credential_gated_tier": {
+    "description": "All 7 OAuth flows are faithfully replayed hermetically via the fetch-interceptor shim. No provider requires a credential-gated tier for flow-mechanics verification. The credential-gated live CI tier is reserved for testing against real provider endpoints (actual OAuth servers, real token exchange, real model availability) — these require real user credentials/subscriptions and are non-hermetic by definition.",
+    "providers_requiring_live_credentials": [],
+    "rationale": "The fetch shim intercepts all hardcoded OAuth endpoint URLs and returns pinned fixture responses. Device code flows (github-copilot, kimi-coding, xai, openai-codex device, radius device) are fully hermetic. Browser PKCE flows (anthropic, openrouter, openai-codex browser) use the manual_code stdin prompt to inject the authorization code, bypassing the callback server. Radius browser flow would require callback completion but is tested via the device-code path instead. The hermetic matrix is merge-blocking; the credential-gated tier is informational only."
+  },
+  "upstream_commit": "8fa7eebd2",
+  "upstream_cli": "packages/ai/dist/cli.js",
+  "total_oauth_providers": 7
+}

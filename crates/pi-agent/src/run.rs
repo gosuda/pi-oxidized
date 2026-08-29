@@ -314,7 +314,7 @@ async fn consume_drain_items(
         match item {
             DrainItem::Event(event) => match *event {
                 AssistantMessageEvent::Start { partial } => {
-                    let message = assistant_agent_message(partial);
+                    let message = assistant_agent_message(Arc::unwrap_or_clone(partial));
                     context.messages.push(message.clone());
                     added_partial = true;
                     io.sink.emit(AgentEvent::MessageStart { message });
@@ -341,7 +341,10 @@ async fn consume_drain_items(
                         | AssistantMessageEvent::Error { .. } => unreachable!(),
                     };
                     if added_partial {
-                        let message = assistant_agent_message(partial.clone());
+                        // One owned assistant-message copy plus one Arc per
+                        // frame: the partial Arc stays shared with the boxed
+                        // provider event forwarded below.
+                        let message = Arc::new(assistant_agent_message(partial.as_ref().clone()));
                         io.sink.emit(AgentEvent::MessageUpdate {
                             message,
                             assistant_message_event: Box::new(event),
@@ -858,6 +861,7 @@ mod tests {
             after_tool_call: None,
             on_payload: None,
             on_response: None,
+            telemetry: crate::telemetry::noop_context(),
         }
     }
 
@@ -873,7 +877,7 @@ mod tests {
 
     fn start(text: &str) -> AssistantMessageEvent {
         AssistantMessageEvent::Start {
-            partial: assistant(text),
+            partial: Arc::new(assistant(text)),
         }
     }
 
@@ -881,7 +885,7 @@ mod tests {
         AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: delta.into(),
-            partial: assistant(text),
+            partial: Arc::new(assistant(text)),
         }
     }
 

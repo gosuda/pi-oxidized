@@ -491,11 +491,15 @@ function normalizeLines(rawLines: string[], opts: NormalizeOpts): string[] {
 		if (typeof o.fromId === "string" && o.fromId !== "root") {
 			const mapped = idMap.get(o.fromId);
 			if (mapped === undefined) {
-				fail(
-					`normalize: fromId ${o.fromId} does not reference a known entry`,
-				);
+				// Dangling fromId: the referenced entry was on an abandoned
+				// path and is not present after createBranchedSession's
+				// path-only copy. Reset to "root" — fromId is metadata, not
+				// used for tree construction, and "root" is the canonical
+				// fallback for a branch origin absent from the file.
+				o.fromId = "root";
+			} else {
+				o.fromId = mapped;
 			}
-			o.fromId = mapped;
 		}
 
 		if (o.type === "message") {

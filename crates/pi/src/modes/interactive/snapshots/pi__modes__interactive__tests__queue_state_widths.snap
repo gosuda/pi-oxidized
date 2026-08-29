@@ -18,8 +18,8 @@ expression: triple_plain(&state)
   send after this   
   turn              
                     
-  ⠋ Working… · esc  
-  to cancel         
+  ⠋ Working… ·      
+  escape to cancel  
 ❯ Type a message…   
 ~/projects/pi (main)
 • refactor          
@@ -71,7 +71,7 @@ medium
   → queued: then commit                                                         
   all queued follow-ups will send after this turn                               
                                                                                 
-  ⠋ Working… · esc to cancel                                                    
+  ⠋ Working… · escape to cancel                                                 
 ❯ Type a message…                                                               
 ~/projects/pi (main) • refactor                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium
@@ -133,7 +133,7 @@ medium
   → queued: then commit                                                                                                                                         
   all queued follow-ups will send after this turn                                                                                                               
                                                                                                                                                                 
-  ⠋ Working… · esc to cancel                                                                                                                                    
+  ⠋ Working… · escape to cancel                                                                                                                                 
 ❯ Type a message…                                                                                                                                               
 ~/projects/pi (main) • refactor                                                                                                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium

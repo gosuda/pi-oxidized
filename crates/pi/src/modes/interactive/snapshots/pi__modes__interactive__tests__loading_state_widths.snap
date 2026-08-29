@@ -6,17 +6,21 @@ expression: triple_plain(&state)
   pi v0.1.0  •      
   type a message    
   to begin          
-  Type a message,   
-  or / for          
-  commands.         
-  ? shortcuts ·     
+  Pi can explain    
+  its own features  
+  and look up its   
+  docs. Ask it how  
+  to use or extend  
+  Pi.               
+  /hotkeys          
+  shortcuts ·       
   ctrl+o expand     
   tools ·           
   shift+tab         
   thinking          
                     
-  ⠋ Working… · esc  
-  to cancel         
+  ⠋ Working… ·      
+  escape to cancel  
 ❯ Type a message…   
 ~/projects/pi (main)
 • refactor          
@@ -59,17 +63,14 @@ medium
                     
                     
                     
-                    
-                    
-                    
-                    
 
 ===== width 80 =====
   pi v0.1.0  •  type a message to begin                                         
-  Type a message, or / for commands.                                            
-  ? shortcuts · ctrl+o expand tools · shift+tab thinking                        
+  Pi can explain its own features and look up its docs. Ask it how to use or    
+  extend Pi.                                                                    
+  /hotkeys shortcuts · ctrl+o expand tools · shift+tab thinking                 
                                                                                 
-  ⠋ Working… · esc to cancel                                                    
+  ⠋ Working… · escape to cancel                                                 
 ❯ Type a message…                                                               
 ~/projects/pi (main) • refactor                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium
@@ -124,14 +125,13 @@ medium
                                                                                 
                                                                                 
                                                                                 
-                                                                                
 
 ===== width 160 =====
   pi v0.1.0  •  type a message to begin                                                                                                                         
-  Type a message, or / for commands.                                                                                                                            
-  ? shortcuts · ctrl+o expand tools · shift+tab thinking                                                                                                        
+  Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.                                                                         
+  /hotkeys shortcuts · ctrl+o expand tools · shift+tab thinking                                                                                                 
                                                                                                                                                                 
-  ⠋ Working… · esc to cancel                                                                                                                                    
+  ⠋ Working… · escape to cancel                                                                                                                                 
 ❯ Type a message…                                                                                                                                               
 ~/projects/pi (main) • refactor                                                                                                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium

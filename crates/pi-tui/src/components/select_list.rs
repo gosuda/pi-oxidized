@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 
 use crate::component::{Component, EventResult, UiEvent};
 use crate::keybindings::get_keybindings;
-use crate::text::{truncate_to_width, visible_width};
+use crate::text::{truncate_with_marker, visible_width};
 
 use super::util::paint_lines;
 
@@ -110,6 +110,9 @@ pub struct SelectList {
     max_visible: usize,
     theme: SelectListTheme,
     layout: SelectListLayoutOptions,
+    empty_text: Option<String>,
+    no_match_text: Option<String>,
+    hint: Option<String>,
     /// Called when the user confirms a selection.
     pub on_select: Option<SelectItemCallback>,
     /// Called when the user cancels.
@@ -131,6 +134,9 @@ impl SelectList {
             max_visible: max_visible.max(1),
             theme,
             layout: SelectListLayoutOptions::default(),
+            empty_text: None,
+            no_match_text: None,
+            hint: None,
             on_select: None,
             on_cancel: None,
             on_selection_change: None,
@@ -142,6 +148,27 @@ impl SelectList {
     #[must_use]
     pub fn with_layout(mut self, layout: SelectListLayoutOptions) -> Self {
         self.layout = layout;
+        self
+    }
+
+    /// Override the message shown when the list has no items.
+    #[must_use]
+    pub fn with_empty_text(mut self, text: impl Into<String>) -> Self {
+        self.empty_text = Some(text.into());
+        self
+    }
+
+    /// Override the message shown when filtering produces no matches.
+    #[must_use]
+    pub fn with_no_match_text(mut self, text: impl Into<String>) -> Self {
+        self.no_match_text = Some(text.into());
+        self
+    }
+
+    /// Append a persistent hint row.
+    #[must_use]
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
         self
     }
 
@@ -231,9 +258,9 @@ impl SelectList {
                 is_selected,
             })
         } else {
-            truncate_to_width(display, max_width, "", false)
+            truncate_with_marker(display, max_width, false)
         };
-        truncate_to_width(&truncated, max_width, "", false)
+        truncate_with_marker(&truncated, max_width, false)
     }
 
     fn normalize_single_line(text: &str) -> String {
@@ -269,7 +296,7 @@ impl SelectList {
             let description_start = prefix_width + truncated_value_width + spacing_len;
             let remaining = width.saturating_sub(description_start).saturating_sub(2);
             if remaining > MIN_DESCRIPTION_WIDTH {
-                let truncated_desc = truncate_to_width(desc, remaining, "", false);
+                let truncated_desc = truncate_with_marker(desc, remaining, false);
                 if is_selected {
                     let full = format!("{prefix}{truncated_value}{spacing}{truncated_desc}");
                     return (self.theme.selected_text)(&full);
@@ -291,7 +318,17 @@ impl SelectList {
     fn render_lines(&self, width: u16) -> Vec<String> {
         let width = usize::from(width);
         if self.filtered.is_empty() {
-            return vec![(self.theme.no_match)("  No matching commands")];
+            let text = if self.items.is_empty() {
+                self.empty_text.as_deref()
+            } else {
+                self.no_match_text.as_deref().or(self.empty_text.as_deref())
+            }
+            .unwrap_or("  No matching commands");
+            let mut lines = vec![(self.theme.no_match)(text)];
+            if let Some(hint) = &self.hint {
+                lines.push((self.theme.no_match)(hint));
+            }
+            return lines;
         }
 
         let primary_column_width = self.primary_column_width();
@@ -319,8 +356,12 @@ impl SelectList {
 
         if start > 0 || end < len {
             let scroll = format!("  ({}/{})", self.selected_index + 1, len);
-            let truncated = truncate_to_width(&scroll, width.saturating_sub(2), "", false);
+            let truncated = truncate_with_marker(&scroll, width.saturating_sub(2), false);
             lines.push((self.theme.scroll_info)(&truncated));
+        }
+
+        if let Some(hint) = &self.hint {
+            lines.push((self.theme.no_match)(hint));
         }
         lines
     }
@@ -460,5 +501,133 @@ mod tests {
         let mut list = SelectList::new(items(), 5, SelectListTheme::default());
         list.set_filter("cmd1");
         assert!(list.filtered.iter().all(|i| i.value.starts_with("cmd1")));
+    }
+
+    #[test]
+    fn empty_text_renders_for_zero_items() {
+        let mut list = SelectList::new(vec![], 5, SelectListTheme::default())
+            .with_empty_text("  No matching models");
+        let snap = render_snapshot(&mut list, 60);
+        assert!(strip_ansi(&snap[0]).contains("No matching models"));
+        assert!(!strip_ansi(&snap[0]).contains("No matching commands"));
+    }
+
+    #[test]
+    fn no_match_text_used_when_filter_empties_list() {
+        let mut list = SelectList::new(items(), 5, SelectListTheme::default())
+            .with_empty_text("  No matching models")
+            .with_no_match_text("  No matching providers");
+        list.set_filter("zzz");
+        let snap = render_snapshot(&mut list, 60);
+        let line = strip_ansi(&snap[0]);
+        assert!(line.contains("No matching providers"), "{line}");
+        assert!(!line.contains("No matching models"), "{line}");
+    }
+
+    #[test]
+    fn library_fallback_still_shows_no_matching_commands() {
+        let mut list = SelectList::new(vec![], 5, SelectListTheme::default());
+        let snap = render_snapshot(&mut list, 60);
+        assert!(strip_ansi(&snap[0]).contains("No matching commands"));
+    }
+
+    #[test]
+    fn hint_appends_once_in_empty_and_nonempty_and_grows_height() {
+        let mut with_hint = SelectList::new(vec![], 5, SelectListTheme::default())
+            .with_empty_text("  No matching models")
+            .with_hint("  esc to cancel");
+        let empty_snap = render_snapshot(&mut with_hint, 60);
+        assert_eq!(empty_snap.len(), 2);
+        assert!(strip_ansi(&empty_snap[1]).contains("esc to cancel"));
+        let empty_h = with_hint.measure(60);
+
+        let mut without_hint = SelectList::new(vec![], 5, SelectListTheme::default())
+            .with_empty_text("  No matching models");
+        let without_h = without_hint.measure(60);
+        assert_eq!(empty_h, without_h + 1);
+
+        let mut nonempty =
+            SelectList::new(items(), 5, SelectListTheme::default()).with_hint("  esc to cancel");
+        let nonempty_h = nonempty.measure(60);
+        let mut nonempty_plain = SelectList::new(items(), 5, SelectListTheme::default());
+        let plain_h = nonempty_plain.measure(60);
+        assert_eq!(nonempty_h, plain_h + 1);
+        let snap = render_snapshot(&mut nonempty, 60);
+        assert!(strip_ansi(snap.last().expect("hint row")).contains("esc to cancel"));
+    }
+
+    #[test]
+    fn escape_still_cancels_with_hint_set() {
+        use std::sync::{Arc, Mutex};
+        let cancelled = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&cancelled);
+        let mut list =
+            SelectList::new(items(), 5, SelectListTheme::default()).with_hint("  esc to cancel");
+        list.on_cancel = Some(Box::new(move || {
+            *flag.lock().expect("lock") = true;
+        }));
+        let esc = UiEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(list.handle_event(&esc), EventResult::Consumed);
+        assert!(*cancelled.lock().expect("lock"));
+    }
+
+    #[test]
+    fn truncation_marks_omission_and_exact_fit_stays_clean() {
+        use crate::text::{TRUNCATION_MARKER, truncate_with_marker, visible_width};
+
+        let long = "abcdefghij";
+        let truncated = truncate_with_marker(long, 6, false);
+        assert!(truncated.contains(TRUNCATION_MARKER), "{truncated}");
+        assert!(visible_width(&truncated) <= 6, "{truncated}");
+        assert_ne!(strip_ansi(&truncated), long);
+
+        let exact = truncate_with_marker("abcdef", 6, false);
+        assert_eq!(exact, "abcdef");
+        assert!(!exact.contains(TRUNCATION_MARKER));
+
+        assert_eq!(truncate_with_marker("abcdef", 0, false), "");
+        let one = truncate_with_marker("abcdef", 1, false);
+        assert_eq!(strip_ansi(&one), TRUNCATION_MARKER);
+        assert_eq!(visible_width(&one), 1);
+    }
+
+    #[test]
+    fn rendered_rows_mark_cjk_emoji_and_combining_truncation() {
+        use crate::text::{TRUNCATION_MARKER, visible_width};
+
+        let items = vec![
+            SelectItem::new("cjk", "命令命令命令命令命令命令")
+                .with_description("説明説明説明説明説明"),
+            SelectItem::new("emoji", "👍👍👍👍👍👍👍👍").with_description("⚡️⚡️⚡️⚡️⚡️"),
+            SelectItem::new(
+                "combining",
+                "e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}",
+            )
+            .with_description("a\u{0308}a\u{0308}a\u{0308}a\u{0308}"),
+        ];
+        let mut list = SelectList::new(items, 5, SelectListTheme::default());
+        for width in [10_u16, 12, 16] {
+            let snap = render_snapshot(&mut list, width);
+            for row in &snap {
+                let plain = strip_ansi(row);
+                assert!(
+                    visible_width(&plain) <= usize::from(width),
+                    "width={width} row={plain:?}"
+                );
+            }
+            let joined = snap
+                .iter()
+                .map(|s| strip_ansi(s))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                joined.contains(TRUNCATION_MARKER),
+                "expected truncation marker at width {width}: {joined}"
+            );
+            assert!(
+                !joined.contains("..."),
+                "ascii ellipsis must not appear: {joined}"
+            );
+        }
     }
 }

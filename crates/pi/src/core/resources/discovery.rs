@@ -2690,4 +2690,71 @@ mod tests {
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // XC-9 / M20: discovery precedence witness —
+    // pi-extension.json > package.json > auto-scan
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn m20_pi_extension_json_wins_over_package_json() -> TestResult {
+        let root = temp_root("m20-manifest-vs-pkg")?;
+        let ext = root.join("precedence-ext");
+        fs::create_dir_all(&ext)?;
+        fs::write(
+            ext.join("pi-extension.json"),
+            r#"{"runtime":"native","entry":"native-entry"}"#,
+        )?;
+        fs::write(ext.join("legacy.ts"), "export default {}")?;
+        fs::write(
+            ext.join("package.json"),
+            r#"{"pi":{"extensions":["legacy.ts"]}}"#,
+        )?;
+        let entries = collect_auto_extension_entries(&root);
+        assert_eq!(
+            entries,
+            vec![path_to_string(&ext)],
+            "pi-extension.json must take precedence over package.json"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn m20_package_json_wins_over_auto_scan_index() -> TestResult {
+        let root = temp_root("m20-pkg-vs-index")?;
+        let ext = root.join("pkg-ext");
+        fs::create_dir_all(&ext)?;
+        fs::write(ext.join("index.ts"), "export default {}")?;
+        fs::write(ext.join("custom.ts"), "export default {}")?;
+        fs::write(
+            ext.join("package.json"),
+            r#"{"pi":{"extensions":["custom.ts"]}}"#,
+        )?;
+        let entries = collect_auto_extension_entries(&root);
+        assert_eq!(
+            entries,
+            vec![path_to_string(&ext.join("custom.ts"))],
+            "package.json extensions must take precedence over index.ts"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn m20_index_ts_wins_over_index_js() -> TestResult {
+        let root = temp_root("m20-index-ts-vs-js")?;
+        let ext = root.join("index-ext");
+        fs::create_dir_all(&ext)?;
+        fs::write(ext.join("index.ts"), "export default {}")?;
+        fs::write(ext.join("index.js"), "export default {}")?;
+        let entries = collect_auto_extension_entries(&root);
+        assert_eq!(
+            entries,
+            vec![path_to_string(&ext.join("index.ts"))],
+            "index.ts must take precedence over index.js"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
 }

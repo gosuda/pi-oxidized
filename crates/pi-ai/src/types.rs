@@ -1,6 +1,7 @@
 //! Wire-compatible model, message, tool, and streaming event contracts.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
@@ -682,7 +683,7 @@ pub enum AssistantMessageEvent {
     #[serde(rename = "start")]
     Start {
         /// Current assistant message snapshot.
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     /// Begins a text block.
     #[serde(rename = "text_start")]
@@ -691,7 +692,7 @@ pub enum AssistantMessageEvent {
         #[serde(rename = "contentIndex")]
         content_index: u64,
         /// Current assistant message snapshot.
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     /// Appends text to a text block.
     #[serde(rename = "text_delta")]
@@ -702,7 +703,7 @@ pub enum AssistantMessageEvent {
         /// Newly emitted text.
         delta: String,
         /// Current assistant message snapshot.
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     /// Completes a text block.
     #[serde(rename = "text_end")]
@@ -713,7 +714,7 @@ pub enum AssistantMessageEvent {
         /// Complete text content.
         content: String,
         /// Current assistant message snapshot.
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     /// Begins a reasoning block.
     #[serde(rename = "thinking_start")]
@@ -722,7 +723,7 @@ pub enum AssistantMessageEvent {
         #[serde(rename = "contentIndex")]
         content_index: u64,
         /// Current assistant message snapshot.
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     /// Appends text to a reasoning block.
     #[serde(rename = "thinking_delta")]
@@ -733,7 +734,7 @@ pub enum AssistantMessageEvent {
         /// Newly emitted reasoning text.
         delta: String,
         /// Current assistant message snapshot.
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     /// Completes a reasoning block.
     #[serde(rename = "thinking_end")]
@@ -744,7 +745,7 @@ pub enum AssistantMessageEvent {
         /// Complete reasoning text.
         content: String,
         /// Current assistant message snapshot.
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     /// Begins a tool call block.
     #[serde(rename = "toolcall_start")]
@@ -753,7 +754,7 @@ pub enum AssistantMessageEvent {
         #[serde(rename = "contentIndex")]
         content_index: u64,
         /// Current assistant message snapshot.
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     /// Appends serialized arguments to a tool call block.
     #[serde(rename = "toolcall_delta")]
@@ -764,7 +765,7 @@ pub enum AssistantMessageEvent {
         /// Newly emitted serialized argument fragment.
         delta: String,
         /// Current assistant message snapshot.
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     /// Completes a tool call block.
     #[serde(rename = "toolcall_end")]
@@ -776,7 +777,7 @@ pub enum AssistantMessageEvent {
         #[serde(rename = "toolCall")]
         tool_call: ToolCall,
         /// Current assistant message snapshot.
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     /// Completes a successful response stream.
     #[serde(rename = "done")]
@@ -872,49 +873,49 @@ mod tests {
     fn events_use_exact_tags_fields_and_tool_use() -> Result<(), Box<dyn std::error::Error>> {
         let events = [
             AssistantMessageEvent::Start {
-                partial: assistant(),
+                partial: Arc::new(assistant()),
             },
             AssistantMessageEvent::TextStart {
                 content_index: 0,
-                partial: assistant(),
+                partial: Arc::new(assistant()),
             },
             AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "x".into(),
-                partial: assistant(),
+                partial: Arc::new(assistant()),
             },
             AssistantMessageEvent::TextEnd {
                 content_index: 0,
                 content: "x".into(),
-                partial: assistant(),
+                partial: Arc::new(assistant()),
             },
             AssistantMessageEvent::ThinkingStart {
                 content_index: 1,
-                partial: assistant(),
+                partial: Arc::new(assistant()),
             },
             AssistantMessageEvent::ThinkingDelta {
                 content_index: 1,
                 delta: "x".into(),
-                partial: assistant(),
+                partial: Arc::new(assistant()),
             },
             AssistantMessageEvent::ThinkingEnd {
                 content_index: 1,
                 content: "x".into(),
-                partial: assistant(),
+                partial: Arc::new(assistant()),
             },
             AssistantMessageEvent::ToolCallStart {
                 content_index: 2,
-                partial: assistant(),
+                partial: Arc::new(assistant()),
             },
             AssistantMessageEvent::ToolCallDelta {
                 content_index: 2,
                 delta: "{}".into(),
-                partial: assistant(),
+                partial: Arc::new(assistant()),
             },
             AssistantMessageEvent::ToolCallEnd {
                 content_index: 2,
                 tool_call: ToolCall::new("call-1", "read", Map::new()),
-                partial: assistant(),
+                partial: Arc::new(assistant()),
             },
             AssistantMessageEvent::Done {
                 reason: DoneReason::ToolUse,

@@ -36,7 +36,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 /** Whether this module runs from a compiled Bun binary (`/$bunfs` vfs). */
 const COMPILED = __dirname.startsWith("/$bunfs") || __dirname === "/";
 /** Bundled module instances served to extensions in compiled mode. */
-function getVirtualModules(): Record<string, unknown> {
+export function getVirtualModules(): Record<string, unknown> {
 	const modules: Record<string, unknown> = {
 		typebox: _bundledTypebox,
 		"typebox/compile": _bundledTypeboxCompile,

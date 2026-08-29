@@ -4,6 +4,7 @@
 //! construction policy. Those differences remain in the owning adapters.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 
@@ -930,7 +931,7 @@ impl ResponsesStreamProcessor {
                 match self.finalize_response(response, event_type) {
                     Ok(reason) => {
                         self.sender
-                            .done(reason, self.state.snapshot())
+                            .done(reason, Arc::unwrap_or_clone(self.state.snapshot()))
                             .await
                             .map_err(|error| ResponsesError::new(error.to_string()))?;
                     }
@@ -985,7 +986,7 @@ impl ResponsesStreamProcessor {
 
     /// Clone the current canonical assistant message.
     pub(crate) fn message(&self) -> AssistantMessage {
-        self.state.snapshot()
+        Arc::unwrap_or_clone(self.state.snapshot())
     }
 
     async fn create_slot(&mut self, event: &Value) -> Result<(), ResponsesError> {
@@ -1242,8 +1243,7 @@ impl ResponsesStreamProcessor {
             return Err(failure);
         }
         let reason = done_reason(stop_reason);
-        let final_message = self.state.finish(reason);
-        self.state = AssistantState::new(final_message);
+        self.state.finish(reason);
         Ok(reason)
     }
 
@@ -1313,21 +1313,23 @@ impl ResponsesStreamProcessor {
     ) -> Result<(), ResponsesError> {
         let index = usize::try_from(content_index)
             .map_err(|_| ResponsesError::new("response content index overflow"))?;
-        let mut message = self.state.snapshot();
-        let block = message.content.get_mut(index).ok_or_else(|| {
-            ResponsesError::new(format!(
-                "response content block {content_index} does not exist"
-            ))
-        })?;
-        update(block);
-        self.state = AssistantState::new(message);
-        Ok(())
+        self.state.message_mut(|message| {
+            message.content.get_mut(index).map_or_else(
+                || {
+                    Err(ResponsesError::new(format!(
+                        "response content block {content_index} does not exist"
+                    )))
+                },
+                |block| {
+                    update(block);
+                    Ok(())
+                },
+            )
+        })
     }
 
     fn update_message(&mut self, update: impl FnOnce(&mut AssistantMessage)) {
-        let mut message = self.state.snapshot();
-        update(&mut message);
-        self.state = AssistantState::new(message);
+        self.state.message_mut(update);
     }
 }
 

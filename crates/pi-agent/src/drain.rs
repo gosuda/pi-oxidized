@@ -138,9 +138,11 @@ async fn run_drain(
             Ok(event) => {
                 let terminal = is_terminal_event(&event);
                 if terminal {
-                    publish_snapshot(&partial_tx, terminal_message(&event));
+                    if let Some(message) = terminal_message(&event) {
+                        publish_terminal(&partial_tx, message);
+                    }
                 } else if let Some(partial) = event_partial(&event) {
-                    publish_snapshot(&partial_tx, Some(partial));
+                    publish_partial(&partial_tx, partial);
                 }
 
                 if !send_item(&event_tx, &cancel, DrainItem::Event(Box::new(event))).await {
@@ -184,7 +186,7 @@ fn is_terminal_event(event: &AssistantMessageEvent) -> bool {
     )
 }
 
-fn event_partial(event: &AssistantMessageEvent) -> Option<&AssistantMessage> {
+fn event_partial(event: &AssistantMessageEvent) -> Option<&Arc<AssistantMessage>> {
     match event {
         AssistantMessageEvent::Start { partial }
         | AssistantMessageEvent::TextStart { partial, .. }
@@ -217,14 +219,27 @@ fn terminal_message(event: &AssistantMessageEvent) -> Option<&AssistantMessage> 
     }
 }
 
-fn publish_snapshot(
+/// Publishes a streaming partial snapshot to the watch channel.
+///
+/// Refcount-only: the partial already arrives shared as an [`Arc`] on the
+/// provider event, so publication clones the pointer and never the message.
+fn publish_partial(
     partial_tx: &watch::Sender<Option<Arc<AssistantMessage>>>,
-    message: Option<&AssistantMessage>,
+    partial: &Arc<AssistantMessage>,
 ) {
-    let Some(message) = message else {
-        return;
-    };
     // watch::send never blocks; lagging UI receivers observe the latest value.
+    let _ = partial_tx.send(Some(Arc::clone(partial)));
+}
+
+/// Publishes the terminal assistant message to the watch channel.
+///
+/// The terminal event keeps ownership of the canonical final message (it is
+/// still forwarded to the agent loop), so this materializes exactly one owned
+/// copy for the UI watch — the only message clone the drain performs.
+fn publish_terminal(
+    partial_tx: &watch::Sender<Option<Arc<AssistantMessage>>>,
+    message: &AssistantMessage,
+) {
     let _ = partial_tx.send(Some(Arc::new(message.clone())));
 }
 
@@ -333,7 +348,7 @@ mod tests {
 
     fn start(text: &str) -> AssistantMessageEvent {
         AssistantMessageEvent::Start {
-            partial: assistant(text),
+            partial: Arc::new(assistant(text)),
         }
     }
 
@@ -341,7 +356,7 @@ mod tests {
         AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: delta.into(),
-            partial: assistant(text),
+            partial: Arc::new(assistant(text)),
         }
     }
 
@@ -349,7 +364,7 @@ mod tests {
         AssistantMessageEvent::TextEnd {
             content_index: 0,
             content: text.into(),
-            partial: assistant(text),
+            partial: Arc::new(assistant(text)),
         }
     }
 
@@ -375,7 +390,7 @@ mod tests {
     fn thinking_start() -> AssistantMessageEvent {
         AssistantMessageEvent::ThinkingStart {
             content_index: 1,
-            partial: assistant(""),
+            partial: Arc::new(assistant("")),
         }
     }
 
@@ -383,7 +398,7 @@ mod tests {
         AssistantMessageEvent::ThinkingDelta {
             content_index: 1,
             delta: delta.into(),
-            partial: assistant(""),
+            partial: Arc::new(assistant("")),
         }
     }
 
@@ -391,14 +406,14 @@ mod tests {
         AssistantMessageEvent::ThinkingEnd {
             content_index: 1,
             content: content.into(),
-            partial: assistant(""),
+            partial: Arc::new(assistant("")),
         }
     }
 
     fn tool_call_start() -> AssistantMessageEvent {
         AssistantMessageEvent::ToolCallStart {
             content_index: 2,
-            partial: assistant(""),
+            partial: Arc::new(assistant("")),
         }
     }
 
@@ -406,7 +421,7 @@ mod tests {
         AssistantMessageEvent::ToolCallDelta {
             content_index: 2,
             delta: delta.into(),
-            partial: assistant(""),
+            partial: Arc::new(assistant("")),
         }
     }
 
@@ -414,14 +429,14 @@ mod tests {
         AssistantMessageEvent::ToolCallEnd {
             content_index: 2,
             tool_call: ToolCall::new("call-1", "read", Map::new()),
-            partial: assistant(""),
+            partial: Arc::new(assistant("")),
         }
     }
 
     fn text_start(text: &str) -> AssistantMessageEvent {
         AssistantMessageEvent::TextStart {
             content_index: 0,
-            partial: assistant(text),
+            partial: Arc::new(assistant(text)),
         }
     }
 

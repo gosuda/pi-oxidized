@@ -1529,7 +1529,7 @@ impl StreamAssembly {
         }
     }
 
-    fn snapshot(&self) -> AssistantMessage {
+    fn snapshot(&self) -> Arc<AssistantMessage> {
         self.state.snapshot()
     }
 

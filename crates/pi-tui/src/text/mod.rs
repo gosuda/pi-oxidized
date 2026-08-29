@@ -4,6 +4,7 @@
 //! (plus `compositeLineAt` / `CURSOR_MARKER` helpers from `tui.ts`).
 
 mod ansi;
+mod latex;
 mod slice;
 mod width;
 mod wrap;
@@ -12,10 +13,12 @@ pub use ansi::{
     ActiveHyperlink, AnsiCodeTracker, ExtractedAnsi, Osc8Terminator, extract_ansi_code,
     format_osc8_close, format_osc8_hyperlink, parse_osc8_hyperlink,
 };
+pub use latex::render_latex;
 pub use slice::{
-    CURSOR_MARKER, ExtractedSegments, SEGMENT_RESET, SliceWithWidth, composite_line_at,
-    extract_cursor_marker, extract_segments, find_cursor_marker, is_image_line, slice_by_column,
-    slice_with_width, strip_cursor_marker, truncate_to_width,
+    CURSOR_MARKER, ExtractedSegments, SEGMENT_RESET, SliceWithWidth, TRUNCATION_MARKER,
+    composite_line_at, extract_cursor_marker, extract_segments, find_cursor_marker, is_image_line,
+    slice_by_column, slice_with_width, strip_cursor_marker, truncate_to_width,
+    truncate_with_marker,
 };
 pub use width::{
     PUNCTUATION, apply_background_to_line, cjk_break_grapheme, grapheme_width, is_punctuation_char,

@@ -1,0 +1,10 @@
+
+Select OpenAI Codex login method:
+  1. Browser login (default)
+  2. Device code login (headless)
+Enter number (1-2): 
+Open this URL in your browser:
+https://auth.openai.com/codex/device
+Enter code: OPENAI-MOCK
+
+Credentials saved to auth.json

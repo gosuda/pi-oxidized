@@ -1,6 +1,7 @@
 //! Shared Google `GenerateContent` conversion and streaming state.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -755,7 +756,7 @@ async fn append_text_part(
             sender
                 .event(AssistantMessageEvent::ThinkingStart {
                     content_index: index,
-                    partial: output.clone(),
+                    partial: Arc::new(output.clone()),
                 })
                 .await
                 .map_err(|error| GoogleFailure::error(error.to_string()))?;
@@ -767,7 +768,7 @@ async fn append_text_part(
             sender
                 .event(AssistantMessageEvent::TextStart {
                     content_index: index,
-                    partial: output.clone(),
+                    partial: Arc::new(output.clone()),
                 })
                 .await
                 .map_err(|error| GoogleFailure::error(error.to_string()))?;
@@ -784,7 +785,7 @@ async fn append_text_part(
             AssistantMessageEvent::TextDelta {
                 content_index: index,
                 delta: delta.to_owned(),
-                partial: output.clone(),
+                partial: Arc::new(output.clone()),
             }
         }
         Some(OpenBlock::Thinking(index)) => {
@@ -795,7 +796,7 @@ async fn append_text_part(
             AssistantMessageEvent::ThinkingDelta {
                 content_index: index,
                 delta: delta.to_owned(),
-                partial: output.clone(),
+                partial: Arc::new(output.clone()),
             }
         }
         None => return Err(GoogleFailure::error("missing Google content block")),
@@ -820,7 +821,7 @@ async fn finish_open_block(
             AssistantMessageEvent::TextEnd {
                 content_index: index,
                 content: content.text.clone(),
-                partial: output.clone(),
+                partial: Arc::new(output.clone()),
             }
         }
         OpenBlock::Thinking(index) => {
@@ -828,7 +829,7 @@ async fn finish_open_block(
             AssistantMessageEvent::ThinkingEnd {
                 content_index: index,
                 content: content.thinking.clone(),
-                partial: output.clone(),
+                partial: Arc::new(output.clone()),
             }
         }
     };
@@ -884,7 +885,7 @@ async fn append_tool_call(
     sender
         .event(AssistantMessageEvent::ToolCallStart {
             content_index: index,
-            partial: output.clone(),
+            partial: Arc::new(output.clone()),
         })
         .await
         .map_err(|error| GoogleFailure::error(error.to_string()))?;
@@ -892,7 +893,7 @@ async fn append_tool_call(
         .event(AssistantMessageEvent::ToolCallDelta {
             content_index: index,
             delta: Value::Object(arguments).to_string(),
-            partial: output.clone(),
+            partial: Arc::new(output.clone()),
         })
         .await
         .map_err(|error| GoogleFailure::error(error.to_string()))?;
@@ -900,7 +901,7 @@ async fn append_tool_call(
         .event(AssistantMessageEvent::ToolCallEnd {
             content_index: index,
             tool_call,
-            partial: output.clone(),
+            partial: Arc::new(output.clone()),
         })
         .await
         .map_err(|error| GoogleFailure::error(error.to_string()))
@@ -1114,7 +1115,7 @@ mod tests {
             AssistantMessage::new("google-generative-ai", "google", model.id.clone(), 1);
         let (sender, mut stream) =
             ProviderEventSender::channel(NonZeroUsize::new(16).unwrap_or(NonZeroUsize::MIN));
-        sender.start(output.clone()).await?;
+        sender.start(Arc::new(output.clone())).await?;
         let mut state = GoogleChunkState::default();
         let counter = AtomicU64::new(0);
         process_chunk(

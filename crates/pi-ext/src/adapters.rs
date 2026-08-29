@@ -32,9 +32,9 @@ use pi_ai::provider::{Provider, ProviderError, StreamOptions};
 use pi_ai::types::{AssistantMessageEvent, Context, Model};
 use pi_tui::component::{Component, EventResult, UiEvent};
 use pi_tui::focus::{FocusId, Focusable};
-use pi_tui::frame::{RawRegion, push_raw_region, set_cursor};
+use pi_tui::frame::{RawRegion, claim_opaque_span, push_raw_region, set_cursor};
 use pi_tui::link::{format_link_close, format_link_open};
-use pi_tui::text::slice_with_width;
+use pi_tui::text::{slice_with_width, visible_width};
 
 use crate::client::HostClient;
 use crate::protocol::{
@@ -611,6 +611,14 @@ impl Component for SlotComponent {
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         self.dirty = false;
+        if area.is_empty() {
+            return;
+        }
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                buf[(x, y)].reset();
+            }
+        }
         let max_rows = area.height as usize;
         for (row, line) in self.slot.lines.iter().take(max_rows).enumerate() {
             let y = area
@@ -624,32 +632,33 @@ impl Component for SlotComponent {
                 let style = wire_style_to_ratatui(&run.style);
                 let remaining = usize::from(area.right().saturating_sub(x));
                 let rendered = slice_with_width(&run.text, 0, remaining, true);
-                if rendered.width == 0 {
-                    continue;
-                }
-                buf.set_stringn(x, y, &rendered.text, remaining, style);
                 let printed = u16::try_from(rendered.width).unwrap_or(u16::MAX);
-                if let Some(link) = &run.style.link
-                    && let Some(open) = format_link_open(&link.uri, link.id.as_deref())
-                {
-                    let mut bytes = Vec::new();
-                    bytes.extend_from_slice(open.as_bytes());
-                    bytes.extend_from_slice(sgr_open(&run.style).as_bytes());
-                    bytes.extend_from_slice(rendered.text.as_bytes());
-                    bytes.extend_from_slice(b"\x1b[0m");
-                    bytes.extend_from_slice(format_link_close().as_bytes());
-                    push_raw_region(RawRegion {
-                        area: Rect::new(x, y, printed, 1),
-                        bytes,
-                        kitty_id: None,
-                    });
+                if printed > 0 {
+                    buf.set_stringn(x, y, &rendered.text, remaining, style);
+                    if let Some(link) = &run.style.link
+                        && let Some(open) = format_link_open(&link.uri, link.id.as_deref())
+                    {
+                        let mut bytes = Vec::new();
+                        bytes.extend_from_slice(open.as_bytes());
+                        bytes.extend_from_slice(sgr_open(&run.style).as_bytes());
+                        bytes.extend_from_slice(rendered.text.as_bytes());
+                        bytes.extend_from_slice(b"\x1b[0m");
+                        bytes.extend_from_slice(format_link_close().as_bytes());
+                        push_raw_region(RawRegion {
+                            area: Rect::new(x, y, printed, 1),
+                            bytes,
+                            kitty_id: None,
+                        });
+                    }
                 }
-                x = x.saturating_add(printed);
+                let run_width = u16::try_from(visible_width(&run.text)).unwrap_or(u16::MAX);
+                x = x.saturating_add(run_width);
                 if x >= area.right() {
                     break;
                 }
             }
         }
+        claim_opaque_span(area);
         if self.focused
             && area.width > 0
             && area.height > 0
@@ -1851,6 +1860,152 @@ mod tests {
         assert!(!raw.contains("evil.example"));
     }
 
+    #[test]
+    fn slot_component_commits_late_overlay_to_terminal() -> R {
+        use std::io::Cursor;
+
+        use pi_tui::components::Text;
+        use pi_tui::terminal::{TerminalCapabilities, Tui, Txn};
+        use ratatui::layout::Size;
+
+        struct Root {
+            base: Text,
+            slot: SlotComponent,
+            show_slot: bool,
+        }
+
+        impl Component for Root {
+            fn measure(&mut self, width: u16) -> u16 {
+                self.base.measure(width)
+            }
+
+            fn render(&mut self, area: Rect, buf: &mut Buffer) {
+                self.base.render(area, buf);
+                if self.show_slot {
+                    self.slot
+                        .render(Rect::new(area.x, area.y, area.width, 1), buf);
+                }
+            }
+
+            fn handle_event(&mut self, event: &UiEvent) -> EventResult {
+                self.slot.handle_event(event)
+            }
+
+            fn invalidate(&mut self) {
+                self.base.invalidate();
+                self.slot.invalidate();
+            }
+        }
+
+        let slot = crate::protocol::UiSlot {
+            key: "terminal".to_owned(),
+            generation: 1,
+            placement: SlotPlacement::AboveEditor,
+            height: 1,
+            runs: vec![vec![StyledRun {
+                text: "OVERLAY".to_owned(),
+                style: Style::default(),
+            }]],
+            focusable: false,
+            cursor: None,
+            overlay_options: None,
+        };
+        let mut root = Root {
+            base: Text::with_padding("stable base row", 0, 0),
+            slot: SlotComponent::from_ui_slot(&slot),
+            show_slot: false,
+        };
+        let caps = TerminalCapabilities {
+            sync_output: true,
+            ..TerminalCapabilities::default()
+        };
+        let outer = Cursor::new(Vec::new());
+        let mut tui = Tui::new(outer, Size::new(20, 8), Position::ORIGIN, 1, caps)?;
+
+        tui.commit(Txn::Frame, &mut root)?;
+        root.show_slot = true;
+        tui.commit(Txn::Frame, &mut root)?;
+
+        assert!(
+            tui.last_payload()
+                .windows(b"OVERLAY".len())
+                .any(|bytes| bytes == b"OVERLAY"),
+            "late slot overlay was omitted from the terminal payload: {:?}",
+            String::from_utf8_lossy(tui.last_payload()),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn slot_component_replacement_clears_owned_area() {
+        let initial = crate::protocol::UiSlot {
+            key: "replacement".to_owned(),
+            generation: 1,
+            placement: SlotPlacement::AboveEditor,
+            height: 1,
+            runs: vec![vec![StyledRun {
+                text: "LONG".to_owned(),
+                style: Style {
+                    bold: Some(true),
+                    ..Style::default()
+                },
+            }]],
+            focusable: false,
+            cursor: None,
+            overlay_options: None,
+        };
+        let replacement = crate::protocol::UiSlot {
+            generation: 2,
+            runs: vec![vec![StyledRun {
+                text: "x".to_owned(),
+                style: Style::default(),
+            }]],
+            ..initial.clone()
+        };
+        let mut component = SlotComponent::from_ui_slot(&initial);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+
+        component.render(buffer.area, &mut buffer);
+        component.set_slot(sanitize_slot(&replacement));
+        component.render(buffer.area, &mut buffer);
+
+        assert_eq!(buffer[(0, 0)].symbol(), "x");
+        assert!(buffer[(0, 0)].modifier.is_empty());
+        for x in 1..4 {
+            assert_eq!(buffer[(x, 0)].symbol(), " ");
+            assert!(buffer[(x, 0)].modifier.is_empty());
+        }
+    }
+
+    #[test]
+    fn slot_component_does_not_reflow_runs_after_wide_boundary() {
+        let slot = crate::protocol::UiSlot {
+            key: "wide-boundary".to_owned(),
+            generation: 1,
+            placement: SlotPlacement::AboveEditor,
+            height: 1,
+            runs: vec![vec![
+                StyledRun {
+                    text: "界".to_owned(),
+                    style: Style::default(),
+                },
+                StyledRun {
+                    text: "x".to_owned(),
+                    style: Style::default(),
+                },
+            ]],
+            focusable: false,
+            cursor: None,
+            overlay_options: None,
+        };
+        let mut component = SlotComponent::from_ui_slot(&slot);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+
+        component.render(buffer.area, &mut buffer);
+
+        assert_eq!(buffer[(0, 0)].symbol(), " ");
+    }
+
     fn base_model_defaults() -> Model {
         Model {
             id: String::new(),
@@ -1989,6 +2144,12 @@ mod tests {
         Ok(())
     }
 
+    /// M4 witness: tool registration is first-wins. A duplicate name returns
+    /// `false` and does not overwrite the existing entry.
+    ///
+    /// Mutation: change `register_tool` to last-wins (overwrite on duplicate)
+    /// → second call returns `true` and replaces → `tools().len()` is still 1
+    /// but the first entry's data is lost and the `!` assert fails.
     #[tokio::test]
     async fn registry_first_registration_wins() {
         let mut registry = Registry::new();
@@ -2143,7 +2304,7 @@ mod tests {
         // Build a minimal valid AssistantMessageEvent payload. The adapter
         // decodes `providerEvent` frames via `decode_provider_stream_event`,
         // which tries `AssistantMessageEvent` first.
-        let partial = AssistantMessage::new("custom", "custom", "m", 0);
+        let partial = Arc::new(AssistantMessage::new("custom", "custom", "m", 0));
         let event = AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: "x".to_owned(),
@@ -2234,7 +2395,7 @@ mod tests {
         let req = host.require_frame("provider.stream").await?;
 
         // Build a minimal valid AssistantMessageEvent payload.
-        let partial = AssistantMessage::new("custom", "custom", "m", 0);
+        let partial = Arc::new(AssistantMessage::new("custom", "custom", "m", 0));
         let event = AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: "x".to_owned(),

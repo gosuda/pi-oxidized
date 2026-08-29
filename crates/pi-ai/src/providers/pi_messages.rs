@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
@@ -634,8 +635,8 @@ impl EventConverter {
         }
     }
 
-    fn snapshot(&self) -> AssistantMessage {
-        self.partial.clone()
+    fn snapshot(&self) -> Arc<AssistantMessage> {
+        Arc::new(self.partial.clone())
     }
 
     fn apply(&mut self, event: PiMessagesEvent) -> Result<ConvertedEvent, ProtocolError> {
@@ -840,7 +841,10 @@ impl EventConverter {
                 self.partial.usage = usage;
                 self.partial.response_id = response_id;
                 append_rewrite_diagnostic(&mut self.partial, rewrite)?;
-                Ok(ConvertedEvent::Done(reason, Box::new(self.snapshot())))
+                Ok(ConvertedEvent::Done(
+                    reason,
+                    Box::new(Arc::unwrap_or_clone(self.snapshot())),
+                ))
             }
             PiMessagesEvent::Error {
                 reason,
@@ -858,7 +862,10 @@ impl EventConverter {
                 self.partial.error_message = error_message;
                 self.partial.response_id = response_id;
                 append_rewrite_diagnostic(&mut self.partial, rewrite)?;
-                Ok(ConvertedEvent::Error(reason, Box::new(self.snapshot())))
+                Ok(ConvertedEvent::Error(
+                    reason,
+                    Box::new(Arc::unwrap_or_clone(self.snapshot())),
+                ))
             }
             _ => Err(ProtocolError::WrongBlockKind(0)),
         }
@@ -882,7 +889,7 @@ impl EventConverter {
                 .get_or_insert_with(Vec::new)
                 .push(*diagnostic);
         }
-        self.snapshot()
+        Arc::unwrap_or_clone(self.snapshot())
     }
 
     fn missing_terminal(&mut self, provider: &str) -> AssistantMessageEvent {

@@ -52,7 +52,13 @@ fn collapse(lines: Vec<String>, expanded: bool, theme: &ResolvedTheme) -> Vec<St
     }
     let hidden = lines.len() - TOOL_PREVIEW_LINES;
     let mut out: Vec<String> = lines.into_iter().take(TOOL_PREVIEW_LINES).collect();
-    out.push(theme.fg(ThemeColor::Dim, &format!("… {hidden} more lines · ctrl+o")));
+    out.push(theme.fg(
+        ThemeColor::Dim,
+        &format!(
+            "… {hidden} more lines · {}",
+            pi_tui::keybindings::key_text("app.tools.expand")
+        ),
+    ));
     out
 }
 

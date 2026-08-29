@@ -361,12 +361,14 @@ declare module "@earendil-works/pi-coding-agent" {
 	export interface ToolCallEventResult {
 		block?: boolean;
 		reason?: string;
+		terminate?: boolean;
 	}
 	export interface ToolResultEventResult {
 		content?: unknown[];
 		details?: unknown;
 		isError?: boolean;
 		usage?: unknown;
+		terminate?: boolean;
 	}
 	export interface BeforeAgentStartEventResult {
 		message?: unknown;
@@ -546,6 +548,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		emitResourcesDiscover(cwd: string, reason: string): Promise<unknown>;
 		emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined>;
 		emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined>;
+		emitBeforeProviderHeaders(headers: Record<string, string | null>): Promise<Record<string, string | null>>;
 		emitBeforeAgentStart(
 			prompt: string,
 			images: unknown[] | undefined,
@@ -628,7 +631,14 @@ declare module "@earendil-works/pi-ai" {
 			total: number;
 		};
 	}
-	export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
+	export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted" | "deferred";
+
+	/** Bridge-local tool shape mirroring the pinned pi-ai Tool (name/description/parameters). */
+	export interface Tool<TParameters = unknown> {
+		name: string;
+		description: string;
+		parameters: TParameters;
+	}
 
 	/** Bridge-local message shapes mirroring the pinned pi-ai types. */
 	export interface AssistantMessage {

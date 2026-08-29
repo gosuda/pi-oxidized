@@ -1,0 +1,20 @@
+{
+  "properties": {
+    "limit": {
+      "description": "Maximum number of results (default: 1000)",
+      "type": "number"
+    },
+    "path": {
+      "description": "Directory to search in (default: current directory)",
+      "type": "string"
+    },
+    "pattern": {
+      "description": "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'",
+      "type": "string"
+    }
+  },
+  "required": [
+    "pattern"
+  ],
+  "type": "object"
+}

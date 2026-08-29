@@ -80,6 +80,14 @@ pub struct ViewState {
     /// Whether the working indicator is shown at agent start. Persisted across
     /// turns so `ui.setWorkingVisible(false)` is honored at `AgentStart`.
     pub working_visible: bool,
+    /// Whether the terminal advertises OSC 8 hyperlink support. Read by
+    /// view composition via [`super::theme::with_hyperlinks`] so every
+    /// markdown surface honors the same capability.
+    pub hyperlinks: bool,
+    /// Override spinner indicator frames. `None` uses the default 10-frame
+    /// braille animation; `Some` with a single frame renders a static
+    /// indicator (TUI-T11 reduced-motion mechanism per TUI-G1 decision).
+    pub indicator_frames: Option<Vec<String>>,
 }
 
 /// Header view-model data.
@@ -578,6 +586,8 @@ impl ViewState {
             first_run_mode: None,
             working_message: None,
             working_visible: true,
+            hyperlinks: false,
+            indicator_frames: None,
         }
     }
 
@@ -649,8 +659,12 @@ pub enum ViewAction {
     Interrupt,
     /// Clear the editor.
     ClearEditor,
-    /// Exit the application (Ctrl+D on empty editor or double Ctrl+C).
+    /// Unconditional application exit (double Ctrl+C / `/quit`).
     Exit,
+    /// Named `app.exit` (default Ctrl+D on empty editor). Distinct from
+    /// [`Exit`] so extension Input dialogs can suppress only this chord
+    /// without blocking the unconditional double-Ctrl+C shutdown.
+    AppExit,
     /// Suspend the process (Ctrl+Z).
     Suspend,
     /// Cycle the thinking level forward/backward.

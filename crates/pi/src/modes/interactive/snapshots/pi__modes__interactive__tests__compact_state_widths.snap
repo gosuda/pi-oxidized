@@ -16,8 +16,8 @@ expression: triple_plain(&state)
 │ layout.           
                     
   ⠋ Compacting      
-  context… · esc    
-  to cancel         
+  context… ·        
+  escape to cancel  
 ❯ Type a message…   
 ~/projects/pi (main)
 • refactor          
@@ -70,7 +70,7 @@ medium
 │ ⌁ Compacted context (was 180000 tokens)                                       
 │ Earlier discussion covered the theme system and footer layout.                
                                                                                 
-  ⠋ Compacting context… · esc to cancel                                         
+  ⠋ Compacting context… · escape to cancel                                      
 ❯ Type a message…                                                               
 ~/projects/pi (main) • refactor                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium
@@ -132,7 +132,7 @@ medium
 │ ⌁ Compacted context (was 180000 tokens)                                                                                                                       
 │ Earlier discussion covered the theme system and footer layout.                                                                                                
                                                                                                                                                                 
-  ⠋ Compacting context… · esc to cancel                                                                                                                         
+  ⠋ Compacting context… · escape to cancel                                                                                                                      
 ❯ Type a message…                                                                                                                                               
 ~/projects/pi (main) • refactor                                                                                                                                 
 1.2k in · 567 out · $0.012 · 42% of 200k (auto)           claude-sonnet • medium

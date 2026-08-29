@@ -1,0 +1,6 @@
+
+Open this URL in your browser:
+https://auth.kimi.com/device?user_code=KIMI-MOCK
+Enter code: KIMI-MOCK
+
+Credentials saved to auth.json

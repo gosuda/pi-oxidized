@@ -886,4 +886,29 @@ mod tests {
         assert!(result.messages.is_empty());
         assert_eq!(result.file_args, vec!["prompt.md".to_owned()]);
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // XC-9 / M21: spawn CLI flags witness — -e/--extension parsing
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn m21_extension_flag_e_and_long_form_equivalent() {
+        let short = parse_args(&args(&["-e", "./ext.ts"]));
+        let long = parse_args(&args(&["--extension", "./ext.ts"]));
+        assert_eq!(short.extensions, long.extensions);
+        assert_eq!(short.extensions, vec!["./ext.ts".to_owned()]);
+    }
+
+    #[test]
+    fn m21_multiple_e_flags_accumulate_in_order() {
+        let result = parse_args(&args(&["-e", "./a.ts", "-e", "./b.ts", "-e", "./c.ts"]));
+        assert_eq!(
+            result.extensions,
+            vec![
+                "./a.ts".to_owned(),
+                "./b.ts".to_owned(),
+                "./c.ts".to_owned()
+            ]
+        );
+    }
 }

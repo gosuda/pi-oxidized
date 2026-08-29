@@ -394,6 +394,18 @@ pub fn truncate_to_width(text: &str, max_width: usize, ellipsis: &str, pad: bool
     )
 }
 
+/// Marker used by visible text truncation throughout the TUI.
+pub const TRUNCATION_MARKER: &str = "…";
+
+/// Truncate `text` to `max_width` visible columns, marking any omitted cells.
+///
+/// The marker consumes one cell from the budget only when the input does not
+/// fit. Exact-fit text is returned unchanged.
+#[must_use]
+pub fn truncate_with_marker(text: &str, max_width: usize, pad: bool) -> String {
+    truncate_to_width(text, max_width, TRUNCATION_MARKER, pad)
+}
+
 /// Extract `length` visible columns starting at `start_col`.
 #[must_use]
 pub fn slice_by_column(line: &str, start_col: usize, length: usize, strict: bool) -> String {

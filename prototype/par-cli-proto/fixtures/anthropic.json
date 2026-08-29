@@ -1,0 +1,19 @@
+{
+  "provider": "anthropic",
+  "routes": [
+    {
+      "method": "POST",
+      "pattern": "platform.claude.com/v1/oauth/token",
+      "responses": [
+        {
+          "status": 200,
+          "body": {
+            "access_token": "mock-anthropic-access-token",
+            "refresh_token": "mock-anthropic-refresh-token",
+            "expires_in": 3600
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -352,8 +352,10 @@ mod tests {
     fn update_event(index: i64) -> AgentEvent {
         let partial = pi_ai::AssistantMessage::new("test", "test", "model", index);
         AgentEvent::MessageUpdate {
-            message: assistant_message(),
-            assistant_message_event: Box::new(AssistantMessageEvent::Start { partial }),
+            message: Arc::new(assistant_message()),
+            assistant_message_event: Box::new(AssistantMessageEvent::Start {
+                partial: Arc::new(partial),
+            }),
         }
     }
 

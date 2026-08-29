@@ -370,6 +370,38 @@ pub fn reload_app_keybindings(agent_dir: &Path) -> KeybindingsManager {
     install_app_keybindings(agent_dir)
 }
 
+/// Serialize process-global keybinding installs for interactive tests.
+///
+/// Always leaves [`app_keybindings_defaults`] installed afterward so sibling
+/// tests keep `app.session.delete` / `app.exit` / tree-filter chords.
+#[cfg(test)]
+pub(crate) struct GlobalAppKeybindingsGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for GlobalAppKeybindingsGuard {
+    fn drop(&mut self) {
+        pi_tui::keybindings::set_keybindings(app_keybindings_defaults());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_global_app_keybindings() -> GlobalAppKeybindingsGuard {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pi_tui::keybindings::set_keybindings(app_keybindings_defaults());
+    GlobalAppKeybindingsGuard { _guard: guard }
+}
+
+#[cfg(test)]
+pub(crate) fn with_global_app_keybindings<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = lock_global_app_keybindings();
+    f()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +426,53 @@ mod tests {
         assert!(mgr.get_keys("app.session.resume").is_empty());
         // No Rust-only global chords in the app table.
         assert!(mgr.get_definition("app.reload").is_none());
+    }
+
+    #[test]
+    fn app_defaults_include_session_delete_and_tree_filter_chords() {
+        let mgr = app_keybindings_defaults();
+        assert_eq!(
+            mgr.get_keys("app.session.delete")
+                .iter()
+                .map(KeyId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["ctrl+d"]
+        );
+        assert_eq!(
+            mgr.get_keys("app.session.deleteNoninvasive")
+                .iter()
+                .map(KeyId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["ctrl+backspace"]
+        );
+        assert_eq!(
+            mgr.get_keys("app.tree.filter.default")
+                .iter()
+                .map(KeyId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["ctrl+d"]
+        );
+        assert_eq!(
+            mgr.get_keys("app.tree.filter.noTools")
+                .iter()
+                .map(KeyId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["ctrl+t"]
+        );
+        assert_eq!(
+            mgr.get_keys("app.tree.filter.userOnly")
+                .iter()
+                .map(KeyId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["ctrl+u"]
+        );
+        assert_eq!(
+            mgr.get_keys("app.tree.filter.labeledOnly")
+                .iter()
+                .map(KeyId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["ctrl+l"]
+        );
     }
 
     #[test]

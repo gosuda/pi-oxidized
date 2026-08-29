@@ -1,7 +1,9 @@
 //! Process entry: `entry::run(args, io) -> ExitCode`.
 //!
-//! This is the substantive entry point that `main.rs` calls. It owns the tokio
-//! runtime construction, drives the [`bootstrap::run_bootstrap`] pipeline, and
+//! This is the substantive entry point that `main.rs` calls. It runs the
+//! synchronous argument dispatch first (`--version` prints `VERSION` and exits
+//! 0 here, before any runtime machinery exists), owns the tokio runtime
+//! construction, drives the [`bootstrap::run_bootstrap`] pipeline, and
 //! dispatches the resolved mode through [`modes::run::run_mode_default`].
 //!
 //! [`Io::real`] constructs the real production surface: a [`RuntimeFactory`]
@@ -35,7 +37,7 @@ use pi_ai::{AssistantMessageEvent, Context, Model, Provider, ProviderError, Stre
 
 use crate::cli::bootstrap::{
     BootstrapInputs, BootstrapIo, BootstrapOutcome, RuntimeFactory, RuntimeFactoryOptions,
-    RuntimeHandle, run_bootstrap,
+    RuntimeHandle, initialize_bootstrap, run_bootstrap, run_bootstrap_parsed,
 };
 use crate::cli::package_manager_cli::{ListedPackage, ListedScope, PackageHandler, PackageOutput};
 use crate::core::agent_session::model::level_str;
@@ -186,10 +188,24 @@ impl Io {
     }
 }
 
-/// Entry point. Synchronous; constructs a tokio multi-thread runtime and
-/// blocks on the bootstrap + dispatch pipeline.
+/// Entry point. Synchronous. The argument dispatch ([`initialize_bootstrap`]:
+/// package/config subcommands, diagnostics, `--version`) runs BEFORE the tokio
+/// multi-thread runtime is constructed, so flag-level exits — `--version`
+/// prints `VERSION` and exits 0 — never pay runtime construction. Everything
+/// else continues on the runtime through the bootstrap + dispatch pipeline.
 #[must_use]
 pub fn run(args: Vec<String>, io: Io) -> ExitCode {
+    let inputs = BootstrapInputs {
+        args,
+        io: io.bootstrap_io.as_ref(),
+        factory: io.factory.as_ref(),
+        package_handler: io.package_handler.as_ref(),
+        package_output: io.package_output.as_ref(),
+    };
+    let parsed = match initialize_bootstrap(&inputs) {
+        Ok(parsed) => parsed,
+        Err(exit) => return ExitCode::from(exit.code),
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -202,7 +218,9 @@ pub fn run(args: Vec<String>, io: Io) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let result = runtime.block_on(async move { run_pipeline(args, &io).await });
+    let result = runtime.block_on(async {
+        dispatch_outcome(run_bootstrap_parsed(inputs, parsed).await, &io).await
+    });
     drop(runtime);
     result
 }
@@ -219,11 +237,17 @@ pub async fn run_pipeline(args: Vec<String>, io: &Io) -> ExitCode {
     })
     .await;
 
+    dispatch_outcome(outcome, io).await
+}
+
+/// Map a bootstrap outcome onto the process exit: sync exits return their
+/// code; a resolved dispatch runs the mode runner.
+async fn dispatch_outcome(outcome: BootstrapOutcome, io: &Io) -> ExitCode {
     match outcome {
-        BootstrapOutcome::Exit { code, drain_quirk } => {
-            let _ = drain_quirk;
-            ExitCode::from(code)
-        }
+        BootstrapOutcome::Exit {
+            code,
+            drain_quirk: _,
+        } => ExitCode::from(code),
         BootstrapOutcome::Dispatch(dispatched) => {
             run_mode_default(dispatched, io.dispatcher.as_ref()).await
         }
@@ -1168,12 +1192,22 @@ impl PackageHandler for RealPackageHandler {
             project_trust_override,
             offline: self.offline(),
         };
-        // Bootstrap already owns a multi-thread runtime; park the worker while
-        // the standalone TUI drives TerminalInput / paint futures.
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
+        // Argument dispatch runs before the process runtime exists (the
+        // `--version` fast exit must not pay runtime construction), and
+        // `run_bootstrap`/`run_pipeline` may be driven on a caller-owned
+        // runtime. Build the selector's runtime on its own OS thread:
+        // `Builder::build` panics inside a runtime context, and a dedicated
+        // current-thread runtime is the shape the model-refresh worker above
+        // already uses.
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("Failed to start config selector runtime: {error}"))?
                 .block_on(crate::cli::config_selector::select_config(options))
         })
+        .join()
+        .map_err(|_| "Config selector worker panicked".to_owned())?
     }
 }
 

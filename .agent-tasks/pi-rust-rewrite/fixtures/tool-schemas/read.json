@@ -1,0 +1,20 @@
+{
+  "properties": {
+    "limit": {
+      "description": "Maximum number of lines to read",
+      "type": "number"
+    },
+    "offset": {
+      "description": "Line number to start reading from (1-indexed)",
+      "type": "number"
+    },
+    "path": {
+      "description": "Path to the file to read (relative or absolute)",
+      "type": "string"
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "type": "object"
+}

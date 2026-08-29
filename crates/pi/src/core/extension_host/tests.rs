@@ -714,6 +714,43 @@ async fn registry_first_registration_wins_for_duplicates() -> R {
     Ok(())
 }
 
+/// M5 witness: command suffix disambiguation is observable in the Rust
+/// registry. The TypeScript host's `resolveRegisteredCommands` assigns
+/// unique invocation names (`cmd:1`, `cmd:2`) to duplicate command names
+/// before serializing the snapshot. The Rust side stores these
+/// already-disambiguated names via first-wins on the *invocation name*.
+///
+/// Mutation: drop the suffix (send `cmd` twice instead of `cmd:1`/`cmd:2`)
+/// → first-wins deduplicates to one → `cmd:2` is absent → test fails.
+#[tokio::test]
+async fn command_suffix_disambiguation_observed() -> R {
+    let snapshot = json!({
+        "commands": [
+            {"name": "cmd:1", "description": "first cmd", "source": "/ext/a.ts"},
+            {"name": "cmd:2", "description": "second cmd", "source": "/ext/b.ts"}
+        ],
+        "handlers": ["tool_call"],
+    });
+    let (runner, _host) = make_runner(snapshot).await?;
+    let registry = runner.registry();
+    let commands = registry.commands();
+    assert_eq!(
+        commands.len(),
+        2,
+        "suffix-disambiguated commands must both survive first-wins dedup"
+    );
+    assert_eq!(commands[0].name, "cmd:1");
+    assert_eq!(commands[0].description.as_deref(), Some("first cmd"));
+    assert_eq!(commands[1].name, "cmd:2");
+    assert_eq!(commands[1].description.as_deref(), Some("second cmd"));
+    assert_eq!(
+        runner.get_registered_commands(),
+        vec!["cmd:1", "cmd:2"],
+        "invocation names must be observable via get_registered_commands"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn shortcut_order_and_extension_metadata_are_preserved() -> R {
     let snapshot = json!({
@@ -1352,11 +1389,12 @@ fn compact_message_updates_omit_growing_snapshot_content() {
     partial
         .content
         .push(AssistantContent::Text(TextContent::new("hello")));
+    let partial = Arc::new(partial);
 
     let delta = compact_message_update_event(&AssistantMessageEvent::TextDelta {
         content_index: 0,
         delta: "lo".to_owned(),
-        partial: partial.clone(),
+        partial: Arc::clone(&partial),
     });
     assert_eq!(delta["type"], "text_delta");
     assert_eq!(delta["delta"], "lo");
@@ -1367,7 +1405,7 @@ fn compact_message_updates_omit_growing_snapshot_content() {
     let end = compact_message_update_event(&AssistantMessageEvent::TextEnd {
         content_index: 0,
         content: "hello".to_owned(),
-        partial,
+        partial: Arc::clone(&partial),
     });
     assert_eq!(end["block"]["type"], "text");
     assert_eq!(end["block"]["text"], "hello");

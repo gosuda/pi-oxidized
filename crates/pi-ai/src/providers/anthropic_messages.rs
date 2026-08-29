@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
@@ -59,7 +60,11 @@ impl Provider for AnthropicMessages {
         let (sender, stream) = ProviderEventSender::channel(STREAM_CAPACITY);
         tokio::spawn(async move {
             let mut assembler = StreamAssembler::new(&model);
-            if sender.start(assembler.message.clone()).await.is_err() {
+            if sender
+                .start(Arc::new(assembler.message.clone()))
+                .await
+                .is_err()
+            {
                 return;
             }
             if let Err(error) = run_stream(
@@ -832,7 +837,7 @@ impl StreamAssembler {
                     .push(AssistantContent::Text(crate::types::TextContent::new("")));
                 AssistantMessageEvent::TextStart {
                     content_index: self.last_index()?,
-                    partial: self.message.clone(),
+                    partial: Arc::new(self.message.clone()),
                 }
             }
             Some("thinking") => {
@@ -841,7 +846,7 @@ impl StreamAssembler {
                     .push(AssistantContent::Thinking(ThinkingContent::new("")));
                 AssistantMessageEvent::ThinkingStart {
                     content_index: self.last_index()?,
-                    partial: self.message.clone(),
+                    partial: Arc::new(self.message.clone()),
                 }
             }
             Some("redacted_thinking") => {
@@ -854,7 +859,7 @@ impl StreamAssembler {
                     .push(AssistantContent::Thinking(thinking));
                 AssistantMessageEvent::ThinkingStart {
                     content_index: self.last_index()?,
-                    partial: self.message.clone(),
+                    partial: Arc::new(self.message.clone()),
                 }
             }
             Some("tool_use") => {
@@ -876,7 +881,7 @@ impl StreamAssembler {
                 self.partial_json.insert(provider_index, String::new());
                 AssistantMessageEvent::ToolCallStart {
                     content_index: self.last_index()?,
-                    partial: self.message.clone(),
+                    partial: Arc::new(self.message.clone()),
                 }
             }
             _ => return Ok(None),
@@ -910,7 +915,7 @@ impl StreamAssembler {
                 Ok(Some(AssistantMessageEvent::TextDelta {
                     content_index,
                     delta: text.to_owned(),
-                    partial: self.message.clone(),
+                    partial: Arc::new(self.message.clone()),
                 }))
             }
             Some("thinking_delta") => {
@@ -925,7 +930,7 @@ impl StreamAssembler {
                 Ok(Some(AssistantMessageEvent::ThinkingDelta {
                     content_index,
                     delta: text.to_owned(),
-                    partial: self.message.clone(),
+                    partial: Arc::new(self.message.clone()),
                 }))
             }
             Some("signature_delta") => {
@@ -956,7 +961,7 @@ impl StreamAssembler {
                 Ok(Some(AssistantMessageEvent::ToolCallDelta {
                     content_index,
                     delta: fragment.to_owned(),
-                    partial: self.message.clone(),
+                    partial: Arc::new(self.message.clone()),
                 }))
             }
             _ => Ok(None),
@@ -980,13 +985,13 @@ impl StreamAssembler {
             Some(AssistantContent::Text(block)) => Ok(Some(AssistantMessageEvent::TextEnd {
                 content_index,
                 content: block.text.clone(),
-                partial: self.message.clone(),
+                partial: Arc::new(self.message.clone()),
             })),
             Some(AssistantContent::Thinking(block)) => {
                 Ok(Some(AssistantMessageEvent::ThinkingEnd {
                     content_index,
                     content: block.thinking.clone(),
-                    partial: self.message.clone(),
+                    partial: Arc::new(self.message.clone()),
                 }))
             }
             Some(AssistantContent::ToolCall(_)) => {
@@ -1010,7 +1015,7 @@ impl StreamAssembler {
                 Ok(Some(AssistantMessageEvent::ToolCallEnd {
                     content_index,
                     tool_call: tool_call.clone(),
-                    partial: self.message.clone(),
+                    partial: Arc::new(self.message.clone()),
                 }))
             }
             None => Ok(None),
@@ -1346,7 +1351,7 @@ mod tests {
             .unwrap_or_default()
         {
             let (sender, mut stream) = ProviderEventSender::channel(STREAM_CAPACITY);
-            assert!(sender.start(assembler.message.clone()).await.is_ok());
+            assert!(sender.start(Arc::new(assembler.message.clone())).await.is_ok());
             assert!(assembler.apply(event, &sender).await.is_ok());
             drop(sender);
             while stream.next().await.is_some() {}

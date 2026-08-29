@@ -4,10 +4,10 @@ use proptest::prelude::*;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
-    CURSOR_MARKER, composite_line_at, extract_ansi_code, extract_segments, find_cursor_marker,
-    grapheme_width, is_partial_closing_fence_line, normalize_terminal_output, slice_by_column,
-    slice_with_width, strip_cursor_marker, strip_trailing_partial_closing_fence, truncate_to_width,
-    visible_width, wrap_text_with_ansi,
+    CURSOR_MARKER, TRUNCATION_MARKER, composite_line_at, extract_ansi_code, extract_segments,
+    find_cursor_marker, grapheme_width, is_partial_closing_fence_line, normalize_terminal_output,
+    slice_by_column, slice_with_width, strip_cursor_marker, strip_trailing_partial_closing_fence,
+    truncate_to_width, truncate_with_marker, visible_width, wrap_text_with_ansi,
 };
 
 #[test]
@@ -251,6 +251,35 @@ fn truncate_tables() {
 
     let truncated = truncate_to_width("🙂\t界 \u{1b}_abc\u{7}", 7, "…", true);
     assert_eq!(truncated, "🙂\t\u{1b}[0m…\u{1b}[0m ");
+}
+
+#[test]
+fn truncate_with_marker_reserves_marker_only_on_omission() {
+    assert_eq!(truncate_with_marker("abcdef", 6, false), "abcdef");
+    assert!(!truncate_with_marker("abcdef", 6, false).contains(TRUNCATION_MARKER));
+
+    let truncated = truncate_with_marker("abcdef", 5, false);
+    assert!(truncated.contains(TRUNCATION_MARKER));
+    assert!(visible_width(&truncated) <= 5);
+    assert_ne!(truncated.replace("\u{1b}[0m", ""), "abcdef");
+
+    assert_eq!(truncate_with_marker("abcdef", 0, false), "");
+    assert_eq!(
+        truncate_with_marker("abcdef", 1, false).replace("\u{1b}[0m", ""),
+        TRUNCATION_MARKER
+    );
+
+    let cjk = truncate_with_marker("命令命令命令", 5, false);
+    assert!(cjk.contains(TRUNCATION_MARKER));
+    assert!(visible_width(&cjk) <= 5);
+
+    let emoji = truncate_with_marker("👍👍👍👍", 3, false);
+    assert!(emoji.contains(TRUNCATION_MARKER));
+    assert!(visible_width(&emoji) <= 3);
+
+    let combining = truncate_with_marker("e\u{0301}e\u{0301}e\u{0301}e\u{0301}", 3, false);
+    assert!(combining.contains(TRUNCATION_MARKER));
+    assert!(visible_width(&combining) <= 3);
 }
 
 #[test]

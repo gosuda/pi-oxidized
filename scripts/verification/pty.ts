@@ -9,6 +9,12 @@ export const PTY_KEYS = {
 	left: "\x1b[D",
 } as const;
 
+const TERMINAL_QUERY_REPLIES = [["\x1b[c", "\x1b[?62;1;2;6;7;8;9c"]] as const;
+const MAX_TERMINAL_QUERY_LENGTH = Math.max(
+	"\x1b[6n".length,
+	...TERMINAL_QUERY_REPLIES.map(([query]) => query.length),
+);
+
 
 export interface PtyCommand {
 	argv: readonly [string, ...string[]];
@@ -48,6 +54,13 @@ type ProcessSignal = "SIGINT" | "SIGTERM" | "SIGKILL";
 interface InputWrite {
 	readonly text: string;
 	readonly outputOffset: number;
+}
+
+export interface KeyWriteReceipt {
+	/** Character offset into rawText at the moment immediately before the first write. */
+	readonly outputOffset: number;
+	/** Process-relative elapsed (ms) captured immediately before the first FileSink.write. */
+	readonly startedElapsedMs: number;
 }
 
 function shellQuote(value: string): string {
@@ -94,7 +107,7 @@ export class PtyProcess {
 	readonly #stdin: Bun.FileSink;
 	readonly #cursorPosition: { readonly row: number; readonly column: number } | false;
 	#rawText = "";
-	#cursorScanOffset = 0;
+	#queryScanOffset = 0;
 	#exitCode: number | null = null;
 	#version = 0;
 	#listeners = new Set<() => void>();
@@ -141,18 +154,26 @@ export class PtyProcess {
 	get exited(): boolean {
 		return this.#exitCode !== null;
 	}
-
-	writeKeys(...keys: readonly (string | Uint8Array)[]): void {
+	writeKeys(...keys: readonly (string | Uint8Array)[]): KeyWriteReceipt {
 		if (this.exited) throw new Error(`PTY process ${this.pid} has exited`);
-		const outputOffset = this.#rawText.length;
+		const encoded: Uint8Array[] = [];
 		let text = "";
 		for (const key of keys) {
 			const bytes = typeof key === "string" ? new TextEncoder().encode(key) : key;
 			text += new TextDecoder().decode(bytes);
-			this.#stdin.write(bytes);
+			encoded.push(bytes);
 		}
-		this.#writes.push({ text, outputOffset });
+		// The receipt is the latency start boundary: captured after encoding,
+		// immediately before the first sink write, so it excludes prior chunks
+		// and all snapshot()/echo-scan cost.
+		const receipt: KeyWriteReceipt = {
+			outputOffset: this.#rawText.length,
+			startedElapsedMs: performance.now() - this.#startedAt,
+		};
+		for (const bytes of encoded) this.#stdin.write(bytes);
+		this.#writes.push({ text, outputOffset: receipt.outputOffset });
 		this.#stdin.flush();
+		return receipt;
 	}
 
 
@@ -249,48 +270,67 @@ export class PtyProcess {
 	async #consume(stream: ReadableStream<Uint8Array>, source: PtyChunk["stream"]): Promise<void> {
 		const decoder = new TextDecoder();
 		for await (const bytes of stream) {
+			// Chunk-arrival timestamp is captured before any copy/decode work so
+			// it prices transport arrival, not harness processing.
+			const arrivalElapsedMs = performance.now() - this.#startedAt;
 			const copy = Uint8Array.from(bytes);
 			const text = decoder.decode(copy, { stream: true });
 			if (source === "pty") {
 				this.#rawText += text;
-				this.#answerCursorQueries();
+				this.#answerTerminalQueries();
 			}
 			this.#chunks.push({
 				stream: source,
 				text,
 				bytes: copy,
-				elapsedMs: performance.now() - this.#startedAt,
+				elapsedMs: arrivalElapsedMs,
 				unixMs: Date.now(),
 			});
 			this.#notify();
 		}
+		const arrivalElapsedMs = performance.now() - this.#startedAt;
 		const tail = decoder.decode();
 		if (tail) {
 			if (source === "pty") {
 				this.#rawText += tail;
-				this.#answerCursorQueries();
+				this.#answerTerminalQueries();
 			}
 			this.#chunks.push({
 				stream: source,
 				text: tail,
 				bytes: new Uint8Array(),
-				elapsedMs: performance.now() - this.#startedAt,
+				elapsedMs: arrivalElapsedMs,
 				unixMs: Date.now(),
 			});
 			this.#notify();
 		}
 	}
 
-	#answerCursorQueries(): void {
-		if (this.#cursorPosition === false) return;
-		let query = this.#rawText.indexOf("\x1b[6n", this.#cursorScanOffset);
-		while (query >= 0) {
-			this.#stdin.write(`\x1b[${this.#cursorPosition.row};${this.#cursorPosition.column}R`);
+	#answerTerminalQueries(): void {
+		while (true) {
+			let nextQuery: { index: number; query: string; reply: string } | undefined;
+			const consider = (query: string, reply: string): void => {
+				const index = this.#rawText.indexOf(query, this.#queryScanOffset);
+				if (index >= 0 && (nextQuery === undefined || index < nextQuery.index)) {
+					nextQuery = { index, query, reply };
+				}
+			};
+			for (const [query, reply] of TERMINAL_QUERY_REPLIES) consider(query, reply);
+			if (this.#cursorPosition !== false) {
+				consider(
+					"\x1b[6n",
+					`\x1b[${this.#cursorPosition.row};${this.#cursorPosition.column}R`,
+				);
+			}
+			if (nextQuery === undefined) break;
+			this.#stdin.write(nextQuery.reply);
 			this.#stdin.flush();
-			this.#cursorScanOffset = query + 4;
-			query = this.#rawText.indexOf("\x1b[6n", this.#cursorScanOffset);
+			this.#queryScanOffset = nextQuery.index + nextQuery.query.length;
 		}
-		this.#cursorScanOffset = Math.max(this.#cursorScanOffset, this.#rawText.length - 3);
+		this.#queryScanOffset = Math.max(
+			this.#queryScanOffset,
+			this.#rawText.length - (MAX_TERMINAL_QUERY_LENGTH - 1),
+		);
 	}
 
 	#notify(): void {

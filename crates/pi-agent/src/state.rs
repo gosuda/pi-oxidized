@@ -52,7 +52,10 @@ pub struct AgentState {
     /// True while the agent is processing a prompt or continuation.
     pub is_streaming: bool,
     /// Partial assistant message for the current streamed response, if any.
-    pub streaming_message: Option<AgentMessage>,
+    ///
+    /// Shared via `Arc`: streaming updates are refcounted snapshots, so the
+    /// reducer stores the event's pointer without cloning the message.
+    pub streaming_message: Option<Arc<AgentMessage>>,
     /// Tool call ids currently executing.
     pub pending_tool_calls: BTreeSet<String>,
     /// Error message from the most recent failed or aborted assistant turn.
@@ -133,8 +136,11 @@ impl AgentState {
     /// `is_streaming` is intentionally left alone; the agent wrapper owns it.
     pub fn reduce(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::MessageStart { message } | AgentEvent::MessageUpdate { message, .. } => {
-                self.streaming_message = Some(message.clone());
+            AgentEvent::MessageStart { message } => {
+                self.streaming_message = Some(Arc::new(message.clone()));
+            }
+            AgentEvent::MessageUpdate { message, .. } => {
+                self.streaming_message = Some(Arc::clone(message));
             }
             AgentEvent::MessageEnd { message } => {
                 self.streaming_message = None;
@@ -197,8 +203,9 @@ pub struct AgentStateSnapshot {
     pub messages: Vec<AgentMessage>,
     /// True while the agent is processing a prompt or continuation.
     pub is_streaming: bool,
-    /// Partial assistant message for the current streamed response, if any.
-    pub streaming_message: Option<AgentMessage>,
+    /// Partial assistant message for the current streamed response, if any
+    /// (shared via `Arc`).
+    pub streaming_message: Option<Arc<AgentMessage>>,
     /// Tool call ids currently executing.
     pub pending_tool_calls: BTreeSet<String>,
     /// Error message from the most recent failed or aborted assistant turn.
@@ -237,16 +244,16 @@ mod tests {
         state.reduce(&AgentEvent::MessageStart {
             message: start.clone(),
         });
-        assert_eq!(state.streaming_message.as_ref(), Some(&start));
+        assert_eq!(state.streaming_message.as_deref(), Some(&start));
         assert!(state.messages.is_empty());
 
         state.reduce(&AgentEvent::MessageUpdate {
-            message: start.clone(),
+            message: Arc::new(start.clone()),
             assistant_message_event: Box::new(pi_ai::AssistantMessageEvent::Start {
-                partial: AssistantMessage::new("unknown", "unknown", "unknown", 1),
+                partial: Arc::new(AssistantMessage::new("unknown", "unknown", "unknown", 1)),
             }),
         });
-        assert_eq!(state.streaming_message.as_ref(), Some(&start));
+        assert_eq!(state.streaming_message.as_deref(), Some(&start));
 
         state.reduce(&AgentEvent::MessageEnd {
             message: start.clone(),
@@ -323,7 +330,7 @@ mod tests {
     #[test]
     fn reduce_agent_end_clears_streaming_message() {
         let mut state = AgentState::new();
-        state.streaming_message = Some(user("partial"));
+        state.streaming_message = Some(Arc::new(user("partial")));
 
         state.reduce(&AgentEvent::AgentEnd {
             messages: vec![user("done")],
@@ -350,7 +357,7 @@ mod tests {
     fn finish_run_clears_runtime_fields() {
         let mut state = AgentState::new();
         state.is_streaming = true;
-        state.streaming_message = Some(user("partial"));
+        state.streaming_message = Some(Arc::new(user("partial")));
         state.pending_tool_calls.insert("call".to_owned());
         state.messages.push(user("kept"));
 

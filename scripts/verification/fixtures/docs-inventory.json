@@ -1,0 +1,149 @@
+{
+	"schema": "pi.docs.inventory.v1",
+	"source": "EXT-24 (issue #24 comment — complete inventory of public documentation and release surfaces)",
+	"categories": [
+		{
+			"id": "root-policy-docs",
+			"name": "Root Project Overview & Policies",
+			"surfaces": [
+				".references/pi/README.md",
+				".references/pi/CONTRIBUTING.md",
+				".references/pi/SECURITY.md",
+				".references/pi/AGENTS.md"
+			]
+		},
+		{
+			"id": "reference-corpus-coding-agent",
+			"name": "Coding Agent Documentation Corpus (29 topics)",
+			"surfaces": [
+				".references/pi/packages/coding-agent/docs/quickstart.md",
+				".references/pi/packages/coding-agent/docs/usage.md",
+				".references/pi/packages/coding-agent/docs/providers.md",
+				".references/pi/packages/coding-agent/docs/llama-cpp.md",
+				".references/pi/packages/coding-agent/docs/security.md",
+				".references/pi/packages/coding-agent/docs/containerization.md",
+				".references/pi/packages/coding-agent/docs/settings.md",
+				".references/pi/packages/coding-agent/docs/keybindings.md",
+				".references/pi/packages/coding-agent/docs/sessions.md",
+				".references/pi/packages/coding-agent/docs/compaction.md",
+				".references/pi/packages/coding-agent/docs/extensions.md",
+				".references/pi/packages/coding-agent/docs/skills.md",
+				".references/pi/packages/coding-agent/docs/prompt-templates.md",
+				".references/pi/packages/coding-agent/docs/themes.md",
+				".references/pi/packages/coding-agent/docs/packages.md",
+				".references/pi/packages/coding-agent/docs/models.md",
+				".references/pi/packages/coding-agent/docs/custom-provider.md",
+				".references/pi/packages/coding-agent/docs/sdk.md",
+				".references/pi/packages/coding-agent/docs/rpc.md",
+				".references/pi/packages/coding-agent/docs/json.md",
+				".references/pi/packages/coding-agent/docs/tui.md",
+				".references/pi/packages/coding-agent/docs/environment-variables.md",
+				".references/pi/packages/coding-agent/docs/session-format.md",
+				".references/pi/packages/coding-agent/docs/windows.md",
+				".references/pi/packages/coding-agent/docs/termux.md",
+				".references/pi/packages/coding-agent/docs/tmux.md",
+				".references/pi/packages/coding-agent/docs/terminal-setup.md",
+				".references/pi/packages/coding-agent/docs/shell-aliases.md",
+				".references/pi/packages/coding-agent/docs/development.md"
+			]
+		},
+		{
+			"id": "reference-corpus-agent-core",
+			"name": "Agent Core Reference Docs (3 topics)",
+			"surfaces": [
+				".references/pi/packages/agent/docs/harness.md",
+				".references/pi/packages/agent/docs/search.md",
+				".references/pi/packages/agent/docs/telemetry-schema.md"
+			]
+		},
+		{
+			"id": "package-readme",
+			"name": "Crate/Package README slots",
+			"surfaces": [
+				".references/pi/packages/coding-agent/README.md",
+				".references/pi/packages/agent/README.md",
+				".references/pi/packages/ai/README.md",
+				".references/pi/packages/tui/README.md",
+				".references/pi/packages/tui/native/darwin/README.md",
+				".references/pi/packages/tui/native/win32/README.md",
+				".references/pi/packages/client/README.md",
+				".references/pi/packages/protocol/README.md",
+				".references/pi/packages/server/README.md",
+				".references/pi/packages/session-backends/sqlite-node/README.md",
+				".references/pi/packages/telemetry/README.md",
+				".references/pi/packages/evals/README.md",
+				"packages/pi-tui-protocol/README.md",
+				"packages/extension-host/README.md",
+				".references/pi/packages/coding-agent/examples/README.md",
+				".references/pi/packages/coding-agent/examples/sdk/README.md"
+			]
+		},
+		{
+			"id": "cli-help",
+			"name": "CLI Help Sources",
+			"surfaces": [
+				"scripts/release/args.ts",
+				".references/pi/packages/coding-agent/package.json",
+				".references/pi/packages/ai/package.json"
+			]
+		},
+		{
+			"id": "changelog",
+			"name": "CHANGELOG slots",
+			"surfaces": [
+				".references/pi/packages/coding-agent/CHANGELOG.md",
+				".references/pi/packages/agent/CHANGELOG.md",
+				".references/pi/packages/ai/CHANGELOG.md",
+				".references/pi/packages/tui/CHANGELOG.md",
+				".references/pi/packages/client/CHANGELOG.md",
+				".references/pi/packages/protocol/CHANGELOG.md",
+				".references/pi/packages/server/CHANGELOG.md",
+				".references/pi/packages/session-backends/sqlite-node/CHANGELOG.md",
+				".references/pi/packages/telemetry/CHANGELOG.md"
+			]
+		},
+		{
+			"id": "version-ref",
+			"name": "Version References",
+			"surfaces": [
+				"packages/pi-tui-protocol/src/types.ts#PROTOCOL_VERSION",
+				"packages/pi-tui-protocol/src/types.ts#COMPATIBILITY_VERSION",
+				"scripts/release/runtime.ts#BUN_RUNTIME_VERSION",
+				"scripts/release/stage.ts#RELEASE_MANIFEST_SCHEMA"
+			]
+		},
+		{
+			"id": "compat-matrix",
+			"name": "Compatibility Matrices",
+			"surfaces": [
+				"scripts/verification/compat-matrix.json"
+			]
+		},
+		{
+			"id": "release-instructions",
+			"name": "Release Instructions",
+			"surfaces": [
+				"scripts/release/"
+			]
+		},
+		{
+			"id": "generated-artifact",
+			"name": "Generated Artifacts",
+			"surfaces": [
+				"release.json",
+				".sha256 checksum sidecars",
+				"model catalogs/data",
+				"npm-shrinkwrap.json",
+				"telemetry documentation",
+				"compiled binaries/bundles"
+			]
+		},
+		{
+			"id": "platform-matrix",
+			"name": "Platform Matrix (release targets)",
+			"surfaces": [
+				"scripts/release/targets.ts#RUST_TARGETS"
+			]
+		}
+	]
+}

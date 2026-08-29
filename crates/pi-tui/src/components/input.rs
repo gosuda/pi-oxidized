@@ -496,6 +496,14 @@ impl Component for Input {
         if area.height == 0 || area.width == 0 {
             return;
         }
+        // Direct cell writer: claim the row span so damage scoping
+        // accounts for it (PERF-T11 Design B).
+        crate::frame::claim_opaque_span(Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        });
         let (line, cursor_byte) = self.render_line(area.width);
         // Paint base text without reverse cursor, then overlay reverse on cursor grapheme.
         let prompt = "> ";

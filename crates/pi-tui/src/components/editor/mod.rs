@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::component::{Component, EventResult, UiEvent};
+use crate::components::util::paint_line;
 use crate::editor_support::{
     ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS, AutocompleteItem, AutocompleteProvider,
     AutocompleteSuggestions, CursorPlacement, DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS, History,
@@ -23,7 +24,7 @@ use crate::keys::{
     KeyId, MODIFY_OTHER_KEYS_OMISSION, backslash_enter_inserts_newline, key_matches,
     should_submit_on_backslash_enter,
 };
-use crate::text::{is_whitespace_char, truncate_to_width, visible_width};
+use crate::text::{is_whitespace_char, truncate_with_marker, visible_width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Position, Rect};
@@ -1566,6 +1567,9 @@ impl Editor {
         event: &KeyEvent,
         kb: &crate::keybindings::KeybindingsManager,
     ) -> Option<EventResult> {
+        if kb.matches(event, "app.exit") && self.get_text().is_empty() {
+            return Some(EventResult::Ignored);
+        }
         if kb.matches(event, "tui.input.copy") {
             return Some(EventResult::Ignored);
         }
@@ -1769,7 +1773,13 @@ impl Editor {
         } else {
             "─".repeat(usize::from(width))
         };
-        paint_plain(buf, area.x, y, width, &top);
+        paint_line(
+            area.x,
+            y,
+            usize::from(width),
+            buf,
+            &(self.border_color)(&top),
+        );
         y.saturating_add(1)
     }
 
@@ -1794,7 +1804,13 @@ impl Editor {
         } else {
             "─".repeat(usize::from(width))
         };
-        paint_plain(buf, area.x, y, width, &bottom);
+        paint_line(
+            area.x,
+            y,
+            usize::from(width),
+            buf,
+            &(self.border_color)(&bottom),
+        );
         y.saturating_add(1)
     }
 
@@ -1875,6 +1891,19 @@ impl Editor {
                     );
                 }
             }
+            // Direct cell writer: blank the unpainted tail (reset-buffer
+            // parity) and claim the row span for damage scoping.
+            for tail in col_x..right {
+                if let Some(cell) = buf.cell_mut((tail, y)) {
+                    cell.reset();
+                }
+            }
+            crate::frame::claim_opaque_span(Rect {
+                x: area.x,
+                y,
+                width,
+                height: 1,
+            });
             y = y.saturating_add(1);
         }
         self.last_cursor_screen = cursor_screen;
@@ -1915,20 +1944,32 @@ impl Editor {
             } else {
                 format!("{prefix}{}", item.label)
             };
-            let line = truncate_to_width(&label, usize::from(content_width), "...", true);
+            let line = truncate_with_marker(&label, usize::from(content_width), true);
             let x0 = area.x + padding_x;
-            let style = if selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            for (j, ch) in line.chars().enumerate() {
-                let x = x0.saturating_add(u16::try_from(j).unwrap_or(u16::MAX));
-                if x >= area.x + width {
-                    break;
+            paint_line(x0, y, usize::from(content_width), buf, &line);
+            if selected {
+                let style = Style::default().add_modifier(Modifier::REVERSED);
+                let mut col = 0usize;
+                while col < usize::from(content_width) {
+                    let x = x0.saturating_add(u16::try_from(col).unwrap_or(u16::MAX));
+                    if x >= area.x + width {
+                        break;
+                    }
+                    if let Some(cell) = buf.cell_mut((x, y))
+                        && cell.diff_option != CellDiffOption::Skip
+                    {
+                        cell.set_style(style);
+                    }
+                    col = col.saturating_add(1);
                 }
-                buf[(x, y)].set_symbol(&ch.to_string());
-                buf[(x, y)].set_style(style);
+                // Selection styling overpaints a keyed line: the row's
+                // content is no longer line-derivable.
+                crate::frame::claim_foreign_span(Rect {
+                    x: x0,
+                    y,
+                    width: content_width,
+                    height: 1,
+                });
             }
             y = y.saturating_add(1);
         }
@@ -2140,16 +2181,6 @@ impl Component for Editor {
 
     fn invalidate(&mut self) {
         self.needs_layout = true;
-    }
-}
-
-fn paint_plain(buf: &mut Buffer, x: u16, y: u16, width: u16, text: &str) {
-    for (i, ch) in text.chars().enumerate() {
-        let cx = x.saturating_add(u16::try_from(i).unwrap_or(u16::MAX));
-        if cx >= x + width {
-            break;
-        }
-        buf[(cx, y)].set_symbol(&ch.to_string());
     }
 }
 
@@ -2388,6 +2419,35 @@ mod tests {
     }
 
     #[test]
+    fn border_color_styles_top_and_bottom_frame() -> Result<(), String> {
+        fn magenta(s: &str) -> String {
+            format!("\u{1b}[35m{s}\u{1b}[39m")
+        }
+        let mut editor = Editor::with_defaults();
+        editor.border_color = magenta;
+        editor.set_text("hello");
+
+        let area = Rect::new(0, 0, 12, 3);
+        let mut buffer = Buffer::empty(area);
+        editor.render(area, &mut buffer);
+
+        for y in [0_u16, 2] {
+            for x in 0..area.width {
+                let cell = buffer
+                    .cell((x, y))
+                    .ok_or_else(|| format!("missing border cell ({x}, {y})"))?;
+                assert_eq!(cell.symbol(), "─");
+                assert_eq!(cell.fg, ratatui::style::Color::Magenta);
+            }
+        }
+        let body = buffer
+            .cell((1, 1))
+            .ok_or_else(|| "missing body cell".to_owned())?;
+        assert_eq!(body.fg, ratatui::style::Color::Reset);
+        Ok(())
+    }
+
+    #[test]
     fn preferred_column_survives_short_line() {
         let mut ed = Editor::with_defaults();
         ed.set_terminal_rows(40);
@@ -2622,5 +2682,145 @@ mod tests {
         );
         assert_ne!(editor.get_cursor(), before);
         Ok(())
+    }
+
+    #[test]
+    fn empty_ctrl_d_falls_through_when_app_exit_bound() {
+        let previous = crate::keybindings::get_keybindings();
+        let mut defs = crate::keybindings::tui_keybindings();
+        defs.insert(
+            "app.exit",
+            crate::keybindings::KeybindingDefinition {
+                default_keys: vec![crate::keys::KeyId::from("ctrl+d")],
+                description: Some("Exit when editor is empty"),
+            },
+        );
+        crate::keybindings::set_keybindings(crate::keybindings::KeybindingsManager::new(
+            defs,
+            crate::keybindings::KeybindingsConfig::new(),
+        ));
+
+        let mut ed = Editor::with_defaults();
+        assert!(ed.get_text().is_empty());
+        assert_eq!(
+            ed.handle_event(&UiEvent::Key(ctrl('d'))),
+            EventResult::Ignored
+        );
+
+        ed.set_text(" ");
+        ed.set_cursor_col(0);
+        assert_eq!(
+            ed.handle_event(&UiEvent::Key(ctrl('d'))),
+            EventResult::Render
+        );
+        assert_eq!(ed.get_text(), "");
+
+        crate::keybindings::set_keybindings(previous);
+    }
+
+    #[test]
+    fn delete_key_on_empty_still_forward_deletes() {
+        let mut ed = Editor::with_defaults();
+        assert!(ed.get_text().is_empty());
+        assert_eq!(
+            ed.handle_event(&UiEvent::Key(press(KeyCode::Delete))),
+            EventResult::Render
+        );
+    }
+
+    #[test]
+    fn autocomplete_truncation_uses_marker_within_budget() {
+        use crate::text::{TRUNCATION_MARKER, truncate_with_marker, visible_width};
+
+        let label = format!("→ {}  {}", "suggestion-label-very-long", "desc-also-long");
+        for width in [0usize, 1, 8, 20] {
+            let truncated = truncate_with_marker(&label, width, true);
+            assert!(
+                visible_width(&truncated) <= width,
+                "width={width} got {}",
+                visible_width(&truncated)
+            );
+            if width == 0 {
+                assert!(truncated.is_empty());
+                continue;
+            }
+            if visible_width(&label) > width {
+                assert!(
+                    truncated.contains(TRUNCATION_MARKER),
+                    "width={width} truncated={truncated}"
+                );
+                assert!(!truncated.contains("..."), "{truncated}");
+            } else {
+                assert!(!truncated.contains(TRUNCATION_MARKER), "{truncated}");
+            }
+        }
+
+        let mut editor = Editor::with_defaults();
+        editor.set_text("abc");
+        editor.set_cursor_col(3);
+        editor.set_autocomplete_provider(Some(Arc::new(TestAutocompleteProvider)));
+        editor.apply_autocomplete_suggestions(
+            AutocompleteSuggestions {
+                items: vec![AutocompleteItem {
+                    value: "long".to_owned(),
+                    label: "abcdefghijklmnopqrstuvwxyz".to_owned(),
+                    description: Some("more-description-text".to_owned()),
+                }],
+                prefix: "abc".to_owned(),
+            },
+            AutocompleteUiState::Regular,
+        );
+
+        let area = Rect::new(0, 0, 16, 8);
+        let mut buffer = Buffer::empty(area);
+        editor.render(area, &mut buffer);
+        let mut found_marker = false;
+        let mut rows = Vec::new();
+        for y in 0..area.height {
+            let mut row = String::new();
+            for x in 0..area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    if cell.diff_option != CellDiffOption::Skip {
+                        row.push_str(cell.symbol());
+                    }
+                    if cell.symbol() == TRUNCATION_MARKER {
+                        found_marker = true;
+                    }
+                }
+            }
+            rows.push(row);
+        }
+        assert!(
+            found_marker,
+            "autocomplete render must show truncation marker; rows={rows:?}"
+        );
+    }
+
+    #[test]
+    fn expanded_paste_content_still_reveals_full_text_with_borders() {
+        let mut editor = Editor::with_defaults();
+        let payload = (0..20)
+            .map(|i| format!("tool-line-{i}-日本語-👍"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.handle_paste(&payload);
+        assert!(editor.get_text().contains("[paste #"));
+        assert_eq!(editor.get_expanded_text(), payload);
+
+        let h = editor.measure(24);
+        assert!(h >= 3, "borders must remain in measure: {h}");
+
+        let area = Rect::new(0, 0, 24, h.max(3));
+        let mut buffer = Buffer::empty(area);
+        editor.render(area, &mut buffer);
+        for x in 0..area.width {
+            let top = buffer.cell((x, 0)).expect("top border");
+            assert_eq!(top.symbol(), "─");
+            let bottom = buffer
+                .cell((x, h.saturating_sub(1)))
+                .expect("bottom border");
+            assert_eq!(bottom.symbol(), "─");
+        }
+        assert_eq!(editor.get_expanded_text(), payload);
     }
 }

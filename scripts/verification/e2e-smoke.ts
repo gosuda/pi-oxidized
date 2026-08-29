@@ -21,6 +21,7 @@ import {
 	VERIFICATION_PROVIDER,
 } from "./extension.ts";
 import { PTY_KEYS, type PtyProcess, spawnPty } from "./pty.ts";
+import { SpawnRunner } from "../release/runner.ts";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
 const EVIDENCE_ROOT = resolve(REPO_ROOT, "target/verification/e2e");
@@ -139,27 +140,58 @@ function finishStep(step: StepEvidence, detail?: JsonValue): void {
 	if (detail !== undefined) step.detail = detail;
 }
 
-function ensureRustPrerequisites(): void {
-	for (const required of [RUST_BINARY, EXTENSION_HOST, EXTENSION_PATH]) {
-		if (!existsSync(required)) {
+async function prepareArtifacts(bun: string, cargo: string): Promise<void> {
+	const runner = new SpawnRunner();
+	const builds = [
+		{
+			product: "Rust product",
+			command: cargo,
+			args: ["build", "-p", "pi", "--release", "--locked"],
+			cwd: REPO_ROOT,
+			env: { CARGO_TARGET_DIR: resolve(REPO_ROOT, "target") },
+			artifact: RUST_BINARY,
+		},
+		{
+			product: "extension host",
+			command: bun,
+			args: ["run", "build"],
+			cwd: resolve(REPO_ROOT, "packages/extension-host"),
+			env: {},
+			artifact: EXTENSION_HOST,
+		},
+	] as const;
+
+	for (const build of builds) {
+		const result = await runner.run(build.command, build.args, {
+			cwd: build.cwd,
+			timeoutMs: 30 * 60 * 1_000,
+			env: build.env,
+		});
+		if (result.exitCode !== 0) {
 			fail(
-				`product prerequisite missing: ${required}${
-					required === RUST_BINARY ? "; run cargo build -p pi --release --locked" : ""
-				}`,
+				`${build.product} build failed (${build.command} ${build.args.join(" ")}): ` +
+					`${result.stderr.slice(0, 2_000)}`,
 			);
+		}
+		if (!existsSync(build.artifact)) {
+			fail(`${build.product} build did not produce ${build.artifact}`);
 		}
 	}
 }
 
-function ensurePrerequisites(): string {
-	ensureRustPrerequisites();
-	for (const required of [TYPESCRIPT_CLI]) {
-		if (!existsSync(required)) {
-			fail(`product prerequisite missing: ${required}`);
-		}
+async function ensurePrerequisites(): Promise<string> {
+	if (!existsSync(EXTENSION_PATH)) {
+		fail(`product prerequisite missing: ${EXTENSION_PATH}`);
 	}
 	const bun = Bun.which("bun");
-	if (!bun) fail("product prerequisite missing: bun executable is required to reopen the Rust session with TypeScript pi");
+	if (!bun) {
+		fail("product prerequisite missing: bun executable is required");
+	}
+	const cargo = Bun.which("cargo");
+	if (!cargo) {
+		fail("product prerequisite missing: cargo executable is required");
+	}
+	await prepareArtifacts(bun, cargo);
 	return bun;
 }
 
@@ -662,12 +694,14 @@ async function assertDialogCompatibility(state: WorkflowState, rust: PtyProcess)
 async function assertCustomUiCompatibility(state: WorkflowState, rust: PtyProcess): Promise<void> {
 	const step = beginStep(state, "rust-extension-custom-ui");
 	const startIndex = readCompatibilityMarkers(state).length;
+	const initialOutputOffset = rust.snapshot().rawText.length;
 	sendLine(rust, `/${VERIFICATION_CUSTOM_UI_COMMAND}`);
 	await waitForCompatibilityMarker(state, "custom initial render marker", rust, startIndex, "custom.render.initial");
-	await waitForScreen(rust, "custom UI initial render", "state=initial");
-	// Ratatui updates only the changed `initial` cells, so the raw PTY receives
-	// `updated` rather than a repeated full line. Markers are file-only; this
-	// post-input offset proves that the native terminal emitted the rerender.
+	// Raw PTY text contains differential writes, not a reconstructed screen.
+	// The deterministic suffix proves that the native terminal emitted the
+	// slot even when unchanged cells split the logical line.
+	await waitForScreen(rust, "custom UI initial render", "initial", initialOutputOffset);
+	// Apply the same rule to the post-input suffix.
 	const updateOutputOffset = rust.snapshot().rawText.length;
 	rust.writeKeys("x");
 	await waitForCompatibilityMarker(
@@ -1184,7 +1218,7 @@ function captureSessions(state: WorkflowState): JsonValue {
 }
 
 async function runReplacementOnly(): Promise<void> {
-	ensureRustPrerequisites();
+	await ensurePrerequisites();
 	const state = createState();
 	let failure: Error | undefined;
 	try {
@@ -1228,7 +1262,10 @@ async function runReplacementOnly(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-	const bun = ensurePrerequisites();
+	const bun = await ensurePrerequisites();
+	if (!existsSync(TYPESCRIPT_CLI)) {
+		fail(`product prerequisite missing: ${TYPESCRIPT_CLI}`);
+	}
 	const state = createState();
 	let failure: Error | undefined;
 	try {

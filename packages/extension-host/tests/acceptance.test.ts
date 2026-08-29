@@ -1321,7 +1321,51 @@ describe("acceptance: registry snapshot and tool/provider bridges", () => {
 		}
 	});
 
-	test("staged register at N is defeated by live unregister at N+1", async () => {
+	test("staged register at N is defeated by staged unregister at N+1", async () => {
+		const stagedPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-staged-self-defeat.ts");
+		const { collector, stdin, host, runPromise } = await connectHost([]);
+		const coordination = globalThis as typeof globalThis & {
+			__providerStagedStarted?: () => void;
+			__providerStagedRelease?: () => void;
+		};
+
+		try {
+			// Start loading the self-defeating fixture.  It stages a
+			// registration for "race_provider" (order N, assigned when the
+			// loader flushes pending runtime changes at load completion),
+			// signals started, then pauses.
+			let markStarted: (() => void) | undefined;
+			const started = new Promise<void>((resolveStarted) => {
+				markStarted = resolveStarted;
+			});
+			coordination.__providerStagedStarted = () => markStarted?.();
+			stdin.push(Buffer.from(encodeFrameString({
+				id: 121, kind: "req", method: "extensions.load",
+				payload: { extensionPaths: [stagedPath], cwd: process.cwd() },
+			})));
+			await started;
+
+			// Release the fixture — after release it stages the unregister
+			// (order N+1).  The loader flush applies register(N) then
+			// unregister(N+1); the N+1 tombstone defeats the registration
+			// at N despite the deferred, async commit ordering.
+			coordination.__providerStagedRelease?.();
+			const loaded = await collector.awaitFrame((f) => f.id === 121 && f.kind === "res");
+			const providers = (loaded.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
+			// "race_provider" must NOT appear — the higher-order staged
+			// unregister defeated the staged registration at commit.
+			expect(providers.map((p) => p["name"])).not.toContain("race_provider");
+		} finally {
+			delete coordination.__providerStagedStarted;
+			coordination.__providerStagedRelease?.();
+			delete coordination.__providerStagedRelease;
+			stdin.push(null);
+			host.dispose("test");
+			await runPromise.catch(() => void 0);
+		}
+	});
+
+	test("live unregister during a paused load does not defeat the later-flushed registration", async () => {
 		const unregRacePath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-unregister-race.ts");
 		const stagedPath = resolve(import.meta.dirname, "..", "fixtures", "extensions", "provider-staged-defeated.ts");
 		const { collector, stdin, host, runPromise } = await connectHost([]);
@@ -1339,9 +1383,10 @@ describe("acceptance: registry snapshot and tool/provider bridges", () => {
 			})));
 			await collector.awaitFrame((f) => f.id === 120 && f.kind === "res");
 
-			// Start loading the staged-defeated fixture.  It stages a
-			// registration for "race_provider" at order N, signals started,
-			// then pauses.
+			// Start loading the staged fixture.  The registration is held in
+			// the reference loader's pendingRuntimeChanges while the factory
+			// runs, so its order is minted at the load-completion flush —
+			// never at the registerProvider call site.
 			let markStarted: (() => void) | undefined;
 			const started = new Promise<void>((resolveStarted) => {
 				markStarted = resolveStarted;
@@ -1353,24 +1398,24 @@ describe("acceptance: registry snapshot and tool/provider bridges", () => {
 			})));
 			await started;
 
-			// While the staged fixture is paused, execute the live unregister
-			// command.  This applies at order N+1 (higher than the staged N)
-			// and sets a durable tombstone for "race_provider".
+			// Execute the live unregister while the load is paused.  It
+			// applies immediately with the next order (N) — necessarily
+			// lower than the flushed registration's order (N+1), because
+			// pending runtime changes flush only at load completion.
 			stdin.push(Buffer.from(encodeFrameString({
 				id: 122, kind: "req", method: "command.execute",
 				payload: { command: "unregisterRaceProvider", args: "" },
 			})));
 			await collector.awaitFrame((f) => f.id === 122 && f.kind === "res");
 
-			// Release the staged fixture — it completes and the host commits
-			// its staged operations.  The register at order N is rejected
-			// because N <= N+1 (the tombstone order).
+			// Release the staged fixture — the flushed registration carries
+			// an order above the live tombstone and therefore survives,
+			// matching the pinned reference loader semantics.
 			coordination.__providerStagedRelease?.();
 			const loaded = await collector.awaitFrame((f) => f.id === 121 && f.kind === "res");
 			const providers = (loaded.payload as Record<string, unknown>)["providers"] as Array<Record<string, unknown>>;
-			// "race_provider" must NOT appear — the live unregister defeated
-			// the staged registration despite async commit ordering.
-			expect(providers.map((p) => p["name"])).not.toContain("race_provider");
+			const staged = providers.find((p) => p["name"] === "race_provider");
+			expect(staged?.["baseUrl"]).toBe("https://staged.example");
 		} finally {
 			delete coordination.__providerStagedStarted;
 			coordination.__providerStagedRelease?.();

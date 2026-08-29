@@ -25,7 +25,7 @@ use pi_tui::keybindings::KeybindingsManager;
 
 use crate::core::keybindings::{app_keybindings_defaults, create_app_keybindings};
 
-use super::state::{OverlayKind, StatusKind, ViewAction, ViewState};
+use super::state::{FocusArea, OverlayKind, StatusKind, ViewAction, ViewState};
 
 /// Default double-tap window for "exit on second tap" semantics.
 ///
@@ -256,11 +256,16 @@ impl InputMapper {
             return;
         }
 
-        // app.exit (default ctrl+d): exit only when the editor is empty AND
-        // no overlay is up (parity with `handleCtrlD`).
+        // app.exit (default ctrl+d): modal focus owns the chord. At the
+        // focused editor, only a truly zero-length buffer exits; whitespace is
+        // content and remains owned by forward-delete.
         if kb.matches(&key, "app.exit") {
-            if editor_text.trim().is_empty() && view.overlay.is_none() {
-                out.push(ViewAction::Exit);
+            if view.focus == FocusArea::Editor
+                && editor_text.is_empty()
+                && view.overlay.is_none()
+                && view.first_run_step.is_none()
+            {
+                out.push(ViewAction::AppExit);
             }
             return;
         }
@@ -678,25 +683,50 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_only_exits_when_editor_empty() {
+    fn ctrl_d_exits_only_for_zero_length_editor() {
         let mapper = mapper();
         let mut state = InputState::default();
         let empty = empty_view();
-        let actions = mapper.map(&ctrl('d'), &empty, "", "", &mut state, false);
-        assert_eq!(actions, vec![ViewAction::Exit]);
+        assert_eq!(
+            mapper.map(&ctrl('d'), &empty, "", "", &mut state, false),
+            vec![ViewAction::AppExit]
+        );
 
-        let nonempty = view_with_editor("x");
-        let actions = mapper.map(&ctrl('d'), &nonempty, "x", "x", &mut state, false);
-        assert!(actions.is_empty());
+        for text in [" ", "   ", "\n", "x"] {
+            let view = view_with_editor(text);
+            let actions = mapper.map(&ctrl('d'), &view, text, text, &mut state, false);
+            assert!(actions.is_empty(), "{text:?} must not be treated as empty");
+        }
     }
 
     #[test]
-    fn ctrl_d_does_not_exit_when_overlay_open() {
+    fn ctrl_d_does_not_exit_while_modal_view_owns_focus() {
         let mapper = mapper();
         let mut state = InputState::default();
-        let view = view_with_overlay(OverlayKind::ShortcutHelp);
-        let actions = mapper.map(&ctrl('d'), &view, "", "", &mut state, false);
-        assert!(actions.is_empty());
+
+        let mut selector = empty_view();
+        selector.focus = FocusArea::Selector;
+        assert!(
+            mapper
+                .map(&ctrl('d'), &selector, "", "", &mut state, false)
+                .is_empty()
+        );
+
+        let mut overlay = view_with_overlay(OverlayKind::ShortcutHelp);
+        overlay.focus = FocusArea::Overlay;
+        assert!(
+            mapper
+                .map(&ctrl('d'), &overlay, "", "", &mut state, false)
+                .is_empty()
+        );
+
+        let mut first_run = empty_view();
+        first_run.first_run_step = Some(0);
+        assert!(
+            mapper
+                .map(&ctrl('d'), &first_run, "", "", &mut state, false)
+                .is_empty()
+        );
     }
 
     #[test]

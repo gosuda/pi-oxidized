@@ -12,9 +12,7 @@ use pi_ai::{AssistantContent, AssistantMessage, StopReason};
 use pi_tui::component::Component;
 use pi_tui::components::{Markdown, Rail, Spacer, Text};
 
-use super::theme::{
-    self, MarkdownOptions, MarkdownTheme, ResolvedTheme, ThemeColor, user_markdown_options,
-};
+use super::theme::{self, MarkdownTheme, ResolvedTheme, ThemeColor, user_markdown_options};
 use super::tool_renderer::{ToolPhase, ToolState};
 /// Shared left-edge indent for unrailed content (column 2; D3).
 pub const CONTENT_INDENT: u16 = 2;
@@ -203,7 +201,7 @@ fn push_assistant_content_blocks(
                         0,
                         md_theme.clone(),
                         theme::default_text_style(),
-                        MarkdownOptions::default(),
+                        user_markdown_options(),
                     )));
                 }
             }
@@ -265,7 +263,7 @@ fn push_thinking_components(
             0,
             md_theme.clone(),
             thinking_text_style(),
-            MarkdownOptions::default(),
+            user_markdown_options(),
         )));
     }
     if has_after {
@@ -287,7 +285,7 @@ fn push_assistant_stop_reason(
             out.push(Box::new(Text::with_padding(
                 theme.fg(
                     ThemeColor::Error,
-                    "Error: Model stopped because it reached the maximum output token limit. The response may be incomplete.",
+                    "Response was truncated before completion.",
                 ),
                 CONTENT_INDENT,
                 0,
@@ -470,7 +468,7 @@ pub fn build_custom(
         0,
         md_theme.clone(),
         custom_text_style(),
-        MarkdownOptions::default(),
+        user_markdown_options(),
     )));
     let mut stack = ColumnStack::new();
     stack.push(Box::new(Spacer::new(1)));
@@ -497,7 +495,7 @@ pub fn build_compaction(
         0,
         md_theme.clone(),
         theme::default_text_style(),
-        MarkdownOptions::default(),
+        user_markdown_options(),
     )));
     let mut stack = ColumnStack::new();
     stack.push(Box::new(Spacer::new(1)));
@@ -524,7 +522,7 @@ pub fn build_branch(
         0,
         md_theme.clone(),
         theme::default_text_style(),
-        MarkdownOptions::default(),
+        user_markdown_options(),
     )));
     let mut stack = ColumnStack::new();
     stack.push(Box::new(Spacer::new(1)));
@@ -551,7 +549,7 @@ pub fn build_skill(
         0,
         md_theme.clone(),
         custom_text_style(),
-        MarkdownOptions::default(),
+        user_markdown_options(),
     )));
     let mut stack = ColumnStack::new();
     stack.push(Box::new(Spacer::new(1)));

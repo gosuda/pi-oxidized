@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use crate::component::{Component, EventResult, UiEvent};
 use crate::text::{visible_width, wrap_text_with_ansi};
 
-use super::util::{apply_background, empty_line, paint_lines};
+use super::util::{KeyedLine, apply_background, empty_line, paint_lines_keyed};
 
 /// Background applicator for a full-width line.
 type TextBgFn = Box<dyn Fn(&str) -> String + Send>;
@@ -24,7 +24,7 @@ pub struct Text {
 struct RenderCache {
     content: String,
     width: u16,
-    lines: Vec<String>,
+    lines: Vec<KeyedLine>,
 }
 
 impl Text {
@@ -85,20 +85,29 @@ impl Text {
         self.cache = None;
     }
 
-    fn lines_for_width(&mut self, width: u16) -> Vec<String> {
-        if let Some(cache) = &self.cache
-            && cache.width == width
-            && cache.content == self.content
-        {
-            return cache.lines.clone();
+    fn lines_for_width(&mut self, width: u16) -> &[KeyedLine] {
+        let cache_hit = match &self.cache {
+            Some(cache) => cache.width == width && cache.content == self.content,
+            None => false,
+        };
+        if !cache_hit {
+            // Key each line once at cache fill (Design E): the paint walk
+            // then reuses the key every frame instead of re-hashing.
+            let lines = self
+                .render_lines(width)
+                .into_iter()
+                .map(|line| KeyedLine::new(line, width))
+                .collect();
+            self.cache = Some(RenderCache {
+                content: self.content.clone(),
+                width,
+                lines,
+            });
         }
-        let lines = self.render_lines(width);
-        self.cache = Some(RenderCache {
-            content: self.content.clone(),
-            width,
-            lines: lines.clone(),
-        });
-        lines
+        self.cache
+            .as_ref()
+            .map(|cache| cache.lines.as_slice())
+            .unwrap_or_default()
     }
 
     fn render_lines(&self, width: u16) -> Vec<String> {
@@ -125,7 +134,7 @@ impl Text {
             let with_margins = format!("{left}{line}{right}");
             // If margins already exceed width (tiny terminal), still clamp.
             let clamped = if visible_width(&with_margins) > usize::from(width) {
-                crate::text::truncate_to_width(&with_margins, usize::from(width), "", false)
+                crate::text::truncate_with_marker(&with_margins, usize::from(width), false)
             } else {
                 with_margins
             };
@@ -161,7 +170,7 @@ impl Component for Text {
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let lines = self.lines_for_width(area.width);
-        paint_lines(area, buf, &lines);
+        paint_lines_keyed(area, buf, lines);
     }
 
     fn handle_event(&mut self, _event: &UiEvent) -> EventResult {
@@ -221,5 +230,21 @@ mod tests {
         let snap = render_snapshot(&mut t, 40);
         let plain = strip_ansi(&snap[0]);
         assert!(plain.contains("a   b") || plain.starts_with("a   b"));
+    }
+
+    #[test]
+    fn tiny_width_clamp_marks_omission() {
+        use crate::text::{TRUNCATION_MARKER, visible_width};
+
+        let mut t = Text::with_padding("hello-world-内容-👍", 3, 0);
+        let snap = render_snapshot(&mut t, 6);
+        assert!(!snap.is_empty());
+        let plain = strip_ansi(&snap[0]);
+        assert!(
+            plain.contains(TRUNCATION_MARKER),
+            "expected marker in {plain}"
+        );
+        assert!(visible_width(&plain) <= 6, "{plain}");
+        assert!(!plain.contains("..."), "{plain}");
     }
 }

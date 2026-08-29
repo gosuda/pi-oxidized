@@ -4,14 +4,18 @@
 //! Wraps pi-tui's `Loader` braille spinner with a kind + message.
 
 use pi_tui::component::Component;
-use pi_tui::components::{Loader, Padded};
+use pi_tui::components::{Loader, LoaderIndicatorOptions, Padded};
 
 use super::state::{SessionStatus, StatusKind};
 use super::theme::{self, ResolvedTheme, ThemeColor};
 
 /// Build a status-indicator loader component for the given status.
 #[must_use]
-pub fn build_status(status: &SessionStatus, th: &ResolvedTheme) -> Box<dyn Component> {
+pub fn build_status(
+    status: &SessionStatus,
+    th: &ResolvedTheme,
+    indicator_frames: Option<&[String]>,
+) -> Box<dyn Component> {
     let spinner_color = match status.kind {
         StatusKind::Working | StatusKind::Compaction | StatusKind::BranchSummary => {
             ThemeColor::Accent
@@ -20,7 +24,16 @@ pub fn build_status(status: &SessionStatus, th: &ResolvedTheme) -> Box<dyn Compo
     };
     let spinner_fn = move |s: &str| theme::current().fg(spinner_color, s);
     let message_fn = move |s: &str| theme::current().fg(ThemeColor::Muted, s);
-    let mut loader = Loader::new(spinner_fn, message_fn, status_message(status, th), None);
+    let indicator = indicator_frames.map(|frames| LoaderIndicatorOptions {
+        frames: Some(frames.to_vec()),
+        interval_ms: None,
+    });
+    let mut loader = Loader::new(
+        spinner_fn,
+        message_fn,
+        status_message(status, th),
+        indicator,
+    );
     loader.set_frame_index(status.frame);
     // Loader self-indents one column inside pi-tui; the product adds the
     // missing column so the status line shares the column-2 left edge.
@@ -32,7 +45,13 @@ pub fn build_status(status: &SessionStatus, th: &ResolvedTheme) -> Box<dyn Compo
 /// The status message text (ports each indicator's label builder).
 #[must_use]
 pub fn status_message(status: &SessionStatus, th: &ResolvedTheme) -> String {
-    let cancel = th.fg(ThemeColor::Dim, " · esc to cancel");
+    let cancel = th.fg(
+        ThemeColor::Dim,
+        &format!(
+            " · {} to cancel",
+            pi_tui::keybindings::key_text("app.interrupt")
+        ),
+    );
     let elapsed = if status.elapsed_secs == 0 {
         String::new()
     } else {
@@ -58,17 +77,24 @@ pub fn status_message(status: &SessionStatus, th: &ResolvedTheme) -> String {
 /// Build a retry-status view-model from attempt/countdown data.
 #[must_use]
 pub fn retry_message(attempt: u32, max_attempts: u32, seconds: u32) -> String {
-    format!("Retrying ({attempt}/{max_attempts}) in {seconds}s… (Esc to cancel)")
+    format!(
+        "Retrying ({attempt}/{max_attempts}) in {seconds}s… ({} to cancel)",
+        pi_tui::keybindings::key_text("app.interrupt")
+    )
 }
 
 /// Build a compaction-status view-model from a reason.
 #[must_use]
 pub fn compaction_message(reason: super::state::CompactionReason) -> String {
+    let cancel = format!(
+        "({} to cancel)",
+        pi_tui::keybindings::key_text("app.interrupt")
+    );
     match reason {
-        super::state::CompactionReason::Manual => "Compacting context… (Esc to cancel)".to_owned(),
-        super::state::CompactionReason::Threshold => "Auto-compacting… (Esc to cancel)".to_owned(),
+        super::state::CompactionReason::Manual => format!("Compacting context… {cancel}"),
+        super::state::CompactionReason::Threshold => format!("Auto-compacting… {cancel}"),
         super::state::CompactionReason::Overflow => {
-            "Context overflow detected, auto-compacting… (Esc to cancel)".to_owned()
+            format!("Context overflow detected, auto-compacting… {cancel}")
         }
     }
 }

@@ -28,6 +28,11 @@ export interface ReleaseArgs {
 	readonly handshake: boolean;
 	/** Override the SOURCE_DATE_EPOCH timestamp used for archive mtimes. */
 	readonly sourceDateEpoch: string;
+	/**
+	 * Offline runtime cache directory (absolute), or `undefined` when
+	 * `--runtime-cache` is absent. Resolved against `cwd` like `outDir`.
+	 */
+	readonly runtimeCache: string | undefined;
 }
 
 /** Sentinel thrown by {@link parseReleaseArgs} when `--help` is requested. */
@@ -108,6 +113,7 @@ export function parseReleaseArgs(
 ): ReleaseArgs {
 	let target: string | undefined;
 	let outDir: string | undefined;
+	let runtimeCache: string | undefined;
 	let dryRun = false;
 	let noCargo = false;
 	let handshake = true;
@@ -125,6 +131,11 @@ export function parseReleaseArgs(
 			case "--out":
 			case "--out-dir": {
 				outDir = requireFlagValue(argv, i, arg);
+				i += 1;
+				break;
+			}
+			case "--runtime-cache": {
+				runtimeCache = requireFlagValue(argv, i, arg);
 				i += 1;
 				break;
 			}
@@ -168,5 +179,6 @@ export function parseReleaseArgs(
 		noCargo,
 		handshake,
 		sourceDateEpoch,
+		runtimeCache: runtimeCache === undefined ? undefined : resolve(cwd, runtimeCache),
 	};
 }

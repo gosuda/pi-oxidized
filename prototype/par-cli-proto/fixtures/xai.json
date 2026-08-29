@@ -1,0 +1,41 @@
+{
+  "provider": "xai",
+  "routes": [
+    {
+      "method": "POST",
+      "pattern": "auth.x.ai/oauth2/device/code",
+      "responses": [
+        {
+          "status": 200,
+          "body": {
+            "device_code": "mock-xai-device-code",
+            "user_code": "XAI-MOCK",
+            "verification_uri": "https://auth.x.ai/device",
+            "verification_uri_complete": "https://auth.x.ai/device?user_code=XAI-MOCK",
+            "interval": 1,
+            "expires_in": 900
+          }
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "pattern": "auth.x.ai/oauth2/token",
+      "responses": [
+        {
+          "status": 400,
+          "body": { "error": "authorization_pending" }
+        },
+        {
+          "status": 200,
+          "body": {
+            "access_token": "mock-xai-access-token",
+            "refresh_token": "mock-xai-refresh-token",
+            "expires_in": 3600,
+            "token_type": "Bearer"
+          }
+        }
+      ]
+    }
+  ]
+}

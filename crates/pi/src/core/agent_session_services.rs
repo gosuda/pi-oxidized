@@ -398,7 +398,7 @@ pub enum AgentSessionServicesError {
 pub fn get_provider_login_help() -> String {
     let docs = get_docs_path();
     format!(
-        "Use /login to log into a provider via OAuth or API key. See:\n  {}\n  {}",
+        "Use /login to log in to a provider via OAuth or API key. See:\n  {}\n  {}",
         docs.join("providers.md").display(),
         docs.join("models.md").display()
     )
@@ -1142,7 +1142,7 @@ mod tests {
     #[test]
     fn auth_guidance_strings_match_typescript() {
         let help = get_provider_login_help();
-        assert!(help.contains("Use /login to log into a provider via OAuth or API key."));
+        assert!(help.contains("Use /login to log in to a provider via OAuth or API key."));
         assert!(help.contains("providers.md"));
         assert!(help.contains("models.md"));
 

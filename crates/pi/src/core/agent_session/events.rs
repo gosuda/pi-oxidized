@@ -23,6 +23,18 @@ pub enum CompactionReason {
     Overflow,
 }
 
+impl CompactionReason {
+    /// Wire discriminant.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Threshold => "threshold",
+            Self::Overflow => "overflow",
+        }
+    }
+}
+
 /// Source of a summarization retry attempt (mirrors TS `_summarizationRetryCallbacks`).
 ///
 /// `branchSummary` carries no reason; `compaction` carries the trigger reason.
@@ -233,8 +245,9 @@ pub enum AgentSessionEvent {
     },
     /// An assistant message was updated during streaming.
     MessageUpdate {
-        /// Latest assistant message snapshot.
-        message: AgentMessage,
+        /// Latest assistant message snapshot (shared via `Arc` to avoid
+        /// cloning on every streaming delta; wire JSON is unchanged).
+        message: Arc<AgentMessage>,
         /// Underlying provider stream event.
         #[serde(rename = "assistantMessageEvent")]
         assistant_message_event: Box<AssistantMessageEvent>,

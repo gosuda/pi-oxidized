@@ -1,0 +1,10675 @@
+{
+	"schema": "pi.deps.exposure-cargo-graph.v1",
+	"argv": [
+		"metadata",
+		"--format-version",
+		"1",
+		"--locked",
+		"--offline",
+		"--all-features"
+	],
+	"workspaceMembers": [
+		"pi",
+		"pi-agent",
+		"pi-ai",
+		"pi-bench-alloc",
+		"pi-ext",
+		"pi-tui"
+	],
+	"edges": [
+		{
+			"from": "aho-corasick",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "android_system_properties",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "annotate-snippets",
+			"to": "anstyle",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "annotate-snippets",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "annotate-snippets",
+			"to": "unicode-width",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "anstyle-parse",
+			"to": "utf8parse",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "approx",
+			"to": "num-traits",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "arc-swap",
+			"to": "rustversion",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "async-trait",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "async-trait",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "async-trait",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "atomic",
+			"to": "bytemuck",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "avt",
+			"to": "rgb",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "avt",
+			"to": "unicode-width",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-credential-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-runtime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-sdk-sso",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-sdk-ssooidc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-sdk-sts",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-smithy-async",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-smithy-http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-smithy-json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-smithy-runtime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-smithy-schema",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "aws-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "fastrand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "hex",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "sha1",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "time",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "url",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-config",
+			"to": "zeroize",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-credential-types",
+			"to": "aws-smithy-async",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-credential-types",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-credential-types",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-credential-types",
+			"to": "zeroize",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-lc-rs",
+			"to": "aws-lc-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-lc-rs",
+			"to": "untrusted",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-lc-rs",
+			"to": "zeroize",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-lc-sys",
+			"to": "cc",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "aws-lc-sys",
+			"to": "cmake",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "aws-lc-sys",
+			"to": "dunce",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "aws-lc-sys",
+			"to": "fs_extra",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "aws-lc-sys",
+			"to": "pkg-config",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "aws-credential-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "aws-sigv4",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "aws-smithy-async",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "aws-smithy-eventstream",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "aws-smithy-http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "aws-smithy-runtime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "aws-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "bytes-utils",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "fastrand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "percent-encoding",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-runtime",
+			"to": "uuid",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "arc-swap",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-credential-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-runtime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-sigv4",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-smithy-async",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-smithy-eventstream",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-smithy-http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-smithy-json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-smithy-observability",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-smithy-runtime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-smithy-schema",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "aws-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "fastrand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "http-body-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "regex-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-bedrockruntime",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "arc-swap",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "aws-credential-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "aws-runtime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "aws-smithy-async",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "aws-smithy-http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "aws-smithy-json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "aws-smithy-observability",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "aws-smithy-runtime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "aws-smithy-schema",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "aws-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "fastrand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "regex-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sso",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "arc-swap",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "aws-credential-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "aws-runtime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "aws-smithy-async",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "aws-smithy-http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "aws-smithy-json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "aws-smithy-observability",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "aws-smithy-runtime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "aws-smithy-schema",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "aws-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "fastrand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "regex-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-ssooidc",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "arc-swap",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-credential-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-runtime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-smithy-async",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-smithy-http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-smithy-json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-smithy-observability",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-smithy-query",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-smithy-runtime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-smithy-schema",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-smithy-xml",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "aws-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "fastrand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "regex-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sdk-sts",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "aws-credential-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "aws-smithy-eventstream",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "aws-smithy-http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "form_urlencoded",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "hex",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "hmac",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "percent-encoding",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "sha2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "time",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-sigv4",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-async",
+			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-async",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-async",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-eventstream",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-eventstream",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-eventstream",
+			"to": "crc32fast",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "aws-smithy-eventstream",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "bytes-utils",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "http-body-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "percent-encoding",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "pin-utils",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "aws-smithy-async",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "h2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "hyper",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "hyper-rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "hyper-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "rustls-native-certs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "rustls-pki-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "tokio-rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "tower",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-http-client",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-json",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-json",
+			"to": "aws-smithy-schema",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-json",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-observability",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-query",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-query",
+			"to": "aws-smithy-schema",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-query",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-query",
+			"to": "aws-smithy-xml",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-query",
+			"to": "urlencoding",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "aws-smithy-async",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "aws-smithy-http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "aws-smithy-http-client",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "aws-smithy-observability",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "aws-smithy-schema",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "fastrand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "http-body-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "pin-utils",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api",
+			"to": "aws-smithy-async",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api",
+			"to": "aws-smithy-runtime-api-macros",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api",
+			"to": "zeroize",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api-macros",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api-macros",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-runtime-api-macros",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-schema",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-schema",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-schema",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "base64-simd",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "bytes-utils",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "http-body-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "itoa",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "num-integer",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "pin-utils",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "ryu",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "time",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-types",
+			"to": "tokio-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-xml",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-xml",
+			"to": "aws-smithy-schema",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-xml",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-xml",
+			"to": "xmlparser",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-types",
+			"to": "aws-credential-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-types",
+			"to": "aws-smithy-async",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-types",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-types",
+			"to": "aws-smithy-schema",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-types",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-types",
+			"to": "rustc_version",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "aws-types",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "axum-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "form_urlencoded",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "http-body-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "hyper",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "hyper-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "itoa",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "matchit",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "mime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "percent-encoding",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "serde_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "serde_path_to_error",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "serde_urlencoded",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "sync_wrapper",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "tower",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "tower-layer",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum",
+			"to": "tower-service",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum-core",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum-core",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum-core",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum-core",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum-core",
+			"to": "http-body-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum-core",
+			"to": "mime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum-core",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum-core",
+			"to": "sync_wrapper",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum-core",
+			"to": "tower-layer",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "axum-core",
+			"to": "tower-service",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "base64-simd",
+			"to": "outref",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "base64-simd",
+			"to": "vsimd",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "bincode",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "bit-set",
+			"to": "bit-vec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "bit-set",
+			"to": "bit-vec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "block-buffer",
+			"to": "generic-array",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "block-buffer",
+			"to": "hybrid-array",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "bs58",
+			"to": "tinyvec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "bstr",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "bstr",
+			"to": "serde_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "bytes",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "bytes-utils",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "bytes-utils",
+			"to": "either",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "castaway",
+			"to": "rustversion",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "cc",
+			"to": "find-msvc-tools",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "cc",
+			"to": "jobserver",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "cc",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "cc",
+			"to": "shlex",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "chacha20",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "chacha20",
+			"to": "cpufeatures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "chacha20",
+			"to": "rand_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "chrono",
+			"to": "iana-time-zone",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "chrono",
+			"to": "num-traits",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "chrono",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "chrono",
+			"to": "windows-link",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "cmake",
+			"to": "cc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "combine",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "combine",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "compact_str",
+			"to": "castaway",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "compact_str",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "compact_str",
+			"to": "itoa",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "compact_str",
+			"to": "rustversion",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "compact_str",
+			"to": "ryu",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "compact_str",
+			"to": "static_assertions",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "console",
+			"to": "encode_unicode",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "console",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "console",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "convert_case",
+			"to": "unicode-segmentation",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "core-foundation",
+			"to": "core-foundation-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "core-foundation",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "core-foundation",
+			"to": "core-foundation-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "core-foundation",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "cpufeatures",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "cpufeatures",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crc32fast",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossbeam-deque",
+			"to": "crossbeam-epoch",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossbeam-deque",
+			"to": "crossbeam-utils",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossbeam-epoch",
+			"to": "crossbeam-utils",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossterm",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossterm",
+			"to": "crossterm_winapi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossterm",
+			"to": "derive_more",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossterm",
+			"to": "document-features",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossterm",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossterm",
+			"to": "mio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossterm",
+			"to": "parking_lot",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossterm",
+			"to": "rustix",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossterm",
+			"to": "signal-hook",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossterm",
+			"to": "signal-hook-mio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossterm",
+			"to": "winapi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crossterm_winapi",
+			"to": "winapi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crypto-common",
+			"to": "generic-array",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crypto-common",
+			"to": "typenum",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "crypto-common",
+			"to": "hybrid-array",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "csscolorparser",
+			"to": "lab",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "csscolorparser",
+			"to": "phf",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ctutils",
+			"to": "cmov",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "darling",
+			"to": "darling_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "darling",
+			"to": "darling_macro",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "darling_core",
+			"to": "ident_case",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "darling_core",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "darling_core",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "darling_core",
+			"to": "strsim",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "darling_core",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "darling_macro",
+			"to": "darling_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "darling_macro",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "darling_macro",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "defmt",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "defmt",
+			"to": "defmt-macros",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "defmt-macros",
+			"to": "defmt-parser",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "defmt-macros",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "defmt-macros",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "defmt-macros",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "defmt-parser",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "deranged",
+			"to": "serde_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "derive_more",
+			"to": "derive_more-impl",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "derive_more-impl",
+			"to": "convert_case",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "derive_more-impl",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "derive_more-impl",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "derive_more-impl",
+			"to": "rustc_version",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "derive_more-impl",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "digest",
+			"to": "block-buffer",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "digest",
+			"to": "crypto-common",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "digest",
+			"to": "block-buffer",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "digest",
+			"to": "const-oid",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "digest",
+			"to": "crypto-common",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "digest",
+			"to": "ctutils",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "dirs",
+			"to": "dirs-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "dirs-sys",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "dirs-sys",
+			"to": "option-ext",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "dirs-sys",
+			"to": "redox_users",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "dirs-sys",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "displaydoc",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "displaydoc",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "displaydoc",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "document-features",
+			"to": "litrs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "encoding_rs",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "encoding_rs_io",
+			"to": "encoding_rs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "errno",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "errno",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "euclid",
+			"to": "num-traits",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "fancy-regex",
+			"to": "bit-set",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "fancy-regex",
+			"to": "regex",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "fancy-regex",
+			"to": "bit-set",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "fancy-regex",
+			"to": "regex-automata",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "fancy-regex",
+			"to": "regex-syntax",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "fdeflate",
+			"to": "simd-adler32",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "filedescriptor",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "filedescriptor",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "filedescriptor",
+			"to": "winapi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "filetime",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "filetime",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "flate2",
+			"to": "crc32fast",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "flate2",
+			"to": "miniz_oxide",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "form_urlencoded",
+			"to": "percent-encoding",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures",
+			"to": "futures-channel",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures",
+			"to": "futures-io",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures",
+			"to": "futures-sink",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures",
+			"to": "futures-task",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures",
+			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-channel",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-channel",
+			"to": "futures-sink",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-macro",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-macro",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-macro",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-util",
+			"to": "futures-channel",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-util",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-util",
+			"to": "futures-io",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-util",
+			"to": "futures-macro",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-util",
+			"to": "futures-sink",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-util",
+			"to": "futures-task",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-util",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-util",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "futures-util",
+			"to": "slab",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "generic-array",
+			"to": "typenum",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "generic-array",
+			"to": "version_check",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "js-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "wasi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "wasm-bindgen",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "r-efi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "wasip2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "js-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "r-efi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "rand_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "getrandom",
+			"to": "wasm-bindgen",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "gif",
+			"to": "color_quant",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "gif",
+			"to": "weezl",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "globset",
+			"to": "aho-corasick",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "globset",
+			"to": "bstr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "globset",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "globset",
+			"to": "regex-automata",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "globset",
+			"to": "regex-syntax",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "async-trait",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "aws-lc-rs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "base64",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "google-cloud-gax",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "hex",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "hmac",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "jiff",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "jsonwebtoken",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "reqwest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "rustc_version",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "rustls-pki-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "sha2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "time",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-auth",
+			"to": "url",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "futures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "google-cloud-rpc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "google-cloud-wkt",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "pin-project",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "rand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-gax",
+			"to": "tokio-stream",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-rpc",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-rpc",
+			"to": "google-cloud-wkt",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-rpc",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-rpc",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-rpc",
+			"to": "serde_with",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-wkt",
+			"to": "base64",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-wkt",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-wkt",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-wkt",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-wkt",
+			"to": "serde_with",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-wkt",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-wkt",
+			"to": "time",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "google-cloud-wkt",
+			"to": "url",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "granit-parser",
+			"to": "arraydeque",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "granit-parser",
+			"to": "smallvec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "h2",
+			"to": "atomic-waker",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "h2",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "h2",
+			"to": "fnv",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "h2",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "h2",
+			"to": "futures-sink",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "h2",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "h2",
+			"to": "indexmap",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "h2",
+			"to": "slab",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "h2",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "h2",
+			"to": "tokio-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "h2",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hashbrown",
+			"to": "allocator-api2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hashbrown",
+			"to": "equivalent",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hashbrown",
+			"to": "foldhash",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hashbrown",
+			"to": "allocator-api2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hashbrown",
+			"to": "equivalent",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hashbrown",
+			"to": "foldhash",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hmac",
+			"to": "digest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http",
+			"to": "fnv",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http",
+			"to": "itoa",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http",
+			"to": "itoa",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http-body",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http-body",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http-body",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http-body",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http-body",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http-body-util",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http-body-util",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http-body-util",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http-body-util",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "http-body-util",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hybrid-array",
+			"to": "typenum",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "atomic-waker",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "futures-channel",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "h2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "httparse",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "httpdate",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "itoa",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "smallvec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper",
+			"to": "want",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-rustls",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-rustls",
+			"to": "hyper",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-rustls",
+			"to": "hyper-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-rustls",
+			"to": "rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-rustls",
+			"to": "rustls-native-certs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-rustls",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-rustls",
+			"to": "tokio-rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-rustls",
+			"to": "tower-service",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "base64",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "futures-channel",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "hyper",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "ipnet",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "percent-encoding",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "socket2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "system-configuration",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "tower-service",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "hyper-util",
+			"to": "windows-registry",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "iana-time-zone",
+			"to": "android_system_properties",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "iana-time-zone",
+			"to": "core-foundation-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "iana-time-zone",
+			"to": "iana-time-zone-haiku",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "iana-time-zone",
+			"to": "js-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "iana-time-zone",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "iana-time-zone",
+			"to": "wasm-bindgen",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "iana-time-zone",
+			"to": "windows-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "iana-time-zone-haiku",
+			"to": "cc",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "icu_collections",
+			"to": "displaydoc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_collections",
+			"to": "potential_utf",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_collections",
+			"to": "utf8_iter",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_collections",
+			"to": "yoke",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_collections",
+			"to": "zerofrom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_collections",
+			"to": "zerovec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_locale_core",
+			"to": "displaydoc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_locale_core",
+			"to": "litemap",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_locale_core",
+			"to": "tinystr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_locale_core",
+			"to": "writeable",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_locale_core",
+			"to": "zerovec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_normalizer",
+			"to": "icu_collections",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_normalizer",
+			"to": "icu_normalizer_data",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_normalizer",
+			"to": "icu_properties",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_normalizer",
+			"to": "icu_provider",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_normalizer",
+			"to": "smallvec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_normalizer",
+			"to": "zerovec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_properties",
+			"to": "icu_collections",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_properties",
+			"to": "icu_locale_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_properties",
+			"to": "icu_properties_data",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_properties",
+			"to": "icu_provider",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_properties",
+			"to": "zerotrie",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_properties",
+			"to": "zerovec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_provider",
+			"to": "displaydoc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_provider",
+			"to": "icu_locale_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_provider",
+			"to": "writeable",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_provider",
+			"to": "yoke",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_provider",
+			"to": "zerofrom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_provider",
+			"to": "zerotrie",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "icu_provider",
+			"to": "zerovec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "idna",
+			"to": "idna_adapter",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "idna",
+			"to": "smallvec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "idna",
+			"to": "utf8_iter",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "idna_adapter",
+			"to": "icu_normalizer",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "idna_adapter",
+			"to": "icu_properties",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ignore",
+			"to": "crossbeam-deque",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ignore",
+			"to": "globset",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ignore",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ignore",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ignore",
+			"to": "regex-automata",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ignore",
+			"to": "same-file",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ignore",
+			"to": "walkdir",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ignore",
+			"to": "winapi-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "image",
+			"to": "bytemuck",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "image",
+			"to": "byteorder-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "image",
+			"to": "color_quant",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "image",
+			"to": "gif",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "image",
+			"to": "image-webp",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "image",
+			"to": "moxcms",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "image",
+			"to": "num-traits",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "image",
+			"to": "png",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "image",
+			"to": "zune-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "image",
+			"to": "zune-jpeg",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "image-webp",
+			"to": "byteorder-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "image-webp",
+			"to": "quick-error",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "indexmap",
+			"to": "autocfg",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "indexmap",
+			"to": "hashbrown",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "indexmap",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "indexmap",
+			"to": "equivalent",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "indexmap",
+			"to": "hashbrown",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "indexmap",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "indexmap",
+			"to": "serde_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "indoc",
+			"to": "rustversion",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "insta",
+			"to": "console",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "insta",
+			"to": "once_cell",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "insta",
+			"to": "regex",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "insta",
+			"to": "similar",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "insta",
+			"to": "strip-ansi-escapes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "insta",
+			"to": "tempfile",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "instability",
+			"to": "darling",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "instability",
+			"to": "indoc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "instability",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "instability",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "instability",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "itertools",
+			"to": "either",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff",
+			"to": "defmt",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff",
+			"to": "jiff-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff",
+			"to": "jiff-static",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff",
+			"to": "jiff-tzdb-platform",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff",
+			"to": "portable-atomic",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff",
+			"to": "portable-atomic-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff",
+			"to": "serde_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff",
+			"to": "windows-link",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff-core",
+			"to": "defmt",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff-static",
+			"to": "jiff-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff-static",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff-static",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff-static",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jiff-tzdb-platform",
+			"to": "jiff-tzdb",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni",
+			"to": "combine",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni",
+			"to": "jni-macros",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni",
+			"to": "jni-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni",
+			"to": "simd_cesu8",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni",
+			"to": "walkdir",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "jni",
+			"to": "windows-link",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni-macros",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni-macros",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni-macros",
+			"to": "rustc_version",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "jni-macros",
+			"to": "simd_cesu8",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni-macros",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni-sys",
+			"to": "jni-sys-macros",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni-sys-macros",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jni-sys-macros",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jobserver",
+			"to": "getrandom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jobserver",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "js-sys",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "js-sys",
+			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "js-sys",
+			"to": "wasm-bindgen",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jsonwebtoken",
+			"to": "aws-lc-rs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jsonwebtoken",
+			"to": "base64",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jsonwebtoken",
+			"to": "getrandom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jsonwebtoken",
+			"to": "js-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jsonwebtoken",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jsonwebtoken",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jsonwebtoken",
+			"to": "signature",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "jsonwebtoken",
+			"to": "zeroize",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "kasuari",
+			"to": "hashbrown",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "kasuari",
+			"to": "portable-atomic",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "kasuari",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "libredox",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "line-clipping",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "lock_api",
+			"to": "scopeguard",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "lru",
+			"to": "hashbrown",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "mac_address",
+			"to": "nix",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "mac_address",
+			"to": "winapi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "memoffset",
+			"to": "autocfg",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "miniz_oxide",
+			"to": "adler2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "miniz_oxide",
+			"to": "simd-adler32",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "mio",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "mio",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "mio",
+			"to": "wasi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "mio",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "moxcms",
+			"to": "num-traits",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "moxcms",
+			"to": "pxfm",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "cfg_aliases",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "cfg_aliases",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "memoffset",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "cfg_aliases",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "nix",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "nom",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "nom",
+			"to": "minimal-lexical",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "num-derive",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "num-derive",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "num-derive",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "num-integer",
+			"to": "num-traits",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "num-traits",
+			"to": "autocfg",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "num_threads",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ordered-float",
+			"to": "num-traits",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "palette",
+			"to": "approx",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "palette",
+			"to": "fast-srgb8",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "palette",
+			"to": "libm",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "palette",
+			"to": "palette_derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "palette_derive",
+			"to": "by_address",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "palette_derive",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "palette_derive",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "palette_derive",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "parking_lot",
+			"to": "lock_api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "parking_lot",
+			"to": "parking_lot_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "parking_lot_core",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "parking_lot_core",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "parking_lot_core",
+			"to": "redox_syscall",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "parking_lot_core",
+			"to": "smallvec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "parking_lot_core",
+			"to": "windows-link",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pest",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pest",
+			"to": "ucd-trie",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pest_derive",
+			"to": "pest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pest_derive",
+			"to": "pest_generator",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pest_generator",
+			"to": "pest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pest_generator",
+			"to": "pest_meta",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pest_generator",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pest_generator",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pest_generator",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pest_meta",
+			"to": "pest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "phf",
+			"to": "phf_macros",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "phf",
+			"to": "phf_shared",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "phf_codegen",
+			"to": "phf_generator",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "phf_codegen",
+			"to": "phf_shared",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "phf_generator",
+			"to": "phf_shared",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "phf_generator",
+			"to": "rand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "phf_macros",
+			"to": "phf_generator",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "phf_macros",
+			"to": "phf_shared",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "phf_macros",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "phf_macros",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "phf_macros",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "phf_shared",
+			"to": "siphasher",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "anstyle",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "base64",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "crossterm",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "dirs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "futures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "globset",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "ignore",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "image",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "indexmap",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "insta",
+			"kinds": [
+				"dev"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "jiff",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "nix",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "pi-agent",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "pi-ai",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "pi-ext",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "pi-tui",
+			"kinds": [
+				"dev",
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "proptest",
+			"kinds": [
+				"dev"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "ratatui",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "regex",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "reqwest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "rustix",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "same-file",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "schemars",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "semver",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "serde-saphyr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "sha2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "syntect",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "tempfile",
+			"kinds": [
+				"dev"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "tokio",
+			"kinds": [
+				"dev",
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "tokio-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "unicode-normalization",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "url",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "uuid",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "wait-timeout",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-agent",
+			"to": "futures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-agent",
+			"to": "pi-ai",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-agent",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-agent",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-agent",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-agent",
+			"to": "tokio",
+			"kinds": [
+				"dev",
+				"normal"
+			]
+		},
+		{
+			"from": "pi-agent",
+			"to": "tokio-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "aws-config",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "aws-sdk-bedrockruntime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "axum",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "base64",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "filetime",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "futures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "getrandom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "google-cloud-auth",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "nix",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "reqwest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "same-file",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "sha2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "tempfile",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "tokio",
+			"kinds": [
+				"dev",
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "tokio-tungstenite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "tokio-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "uuid",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
+			"to": "zstd",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "anstyle-parse",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "crossterm",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "futures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "nix",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "pi-agent",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "pi-ai",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "pi-tui",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "ratatui",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "tempfile",
+			"kinds": [
+				"dev"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ext",
+			"to": "tokio-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "avt",
+			"kinds": [
+				"dev",
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "base64",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "crossterm",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "futures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "insta",
+			"kinds": [
+				"dev"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "nix",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "pi-bench-alloc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "portable-pty",
+			"kinds": [
+				"dev",
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "proptest",
+			"kinds": [
+				"dev"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "pulldown-cmark",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "ratatui",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "serde_json",
+			"kinds": [
+				"dev",
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "sha2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "tempfile",
+			"kinds": [
+				"dev"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "tokio-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "unicode-segmentation",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "unicode-width",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pin-project",
+			"to": "pin-project-internal",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pin-project-internal",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pin-project-internal",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pin-project-internal",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "png",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "png",
+			"to": "crc32fast",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "png",
+			"to": "fdeflate",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "png",
+			"to": "flate2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "png",
+			"to": "miniz_oxide",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-atomic-util",
+			"to": "portable-atomic",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "anyhow",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "downcast-rs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "filedescriptor",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "lazy_static",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "nix",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "serial2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "shared_library",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "shell-words",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "winapi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "portable-pty",
+			"to": "winreg",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "potential_utf",
+			"to": "zerovec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ppv-lite86",
+			"to": "zerocopy",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "proc-macro2",
+			"to": "unicode-ident",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "proptest",
+			"to": "bit-set",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "proptest",
+			"to": "bit-vec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "proptest",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "proptest",
+			"to": "num-traits",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "proptest",
+			"to": "rand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "proptest",
+			"to": "rand_chacha",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "proptest",
+			"to": "rand_xorshift",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "proptest",
+			"to": "regex-syntax",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "proptest",
+			"to": "rusty-fork",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "proptest",
+			"to": "tempfile",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "proptest",
+			"to": "unarray",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pulldown-cmark",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pulldown-cmark",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pulldown-cmark",
+			"to": "unicase",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn",
+			"to": "cfg_aliases",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "quinn",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn",
+			"to": "quinn-proto",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn",
+			"to": "quinn-udp",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn",
+			"to": "rustc-hash",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn",
+			"to": "rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn",
+			"to": "socket2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn",
+			"to": "web-time",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "aws-lc-rs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "getrandom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "lru-slab",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "rand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "rand_pcg",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "ring",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "rustc-hash",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "rustls-pki-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "slab",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "tinyvec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-proto",
+			"to": "web-time",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-udp",
+			"to": "cfg_aliases",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "quinn-udp",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-udp",
+			"to": "once_cell",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-udp",
+			"to": "socket2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-udp",
+			"to": "tracing",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quinn-udp",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "quote",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rand",
+			"to": "rand_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rand",
+			"to": "rand_chacha",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rand",
+			"to": "rand_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rand",
+			"to": "chacha20",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rand",
+			"to": "getrandom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rand",
+			"to": "rand_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rand_chacha",
+			"to": "ppv-lite86",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rand_chacha",
+			"to": "rand_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rand_core",
+			"to": "getrandom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rand_core",
+			"to": "getrandom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rand_pcg",
+			"to": "rand_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rand_xorshift",
+			"to": "rand_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui",
+			"to": "instability",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui",
+			"to": "ratatui-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui",
+			"to": "ratatui-crossterm",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui",
+			"to": "ratatui-termina",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui",
+			"to": "ratatui-termion",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui",
+			"to": "ratatui-termwiz",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui",
+			"to": "ratatui-widgets",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "compact_str",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "hashbrown",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "itertools",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "kasuari",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "lru",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "palette",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "strum",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "unicode-segmentation",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "unicode-truncate",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-core",
+			"to": "unicode-width",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-crossterm",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-crossterm",
+			"to": "crossterm",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-crossterm",
+			"to": "instability",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-crossterm",
+			"to": "ratatui-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-termina",
+			"to": "instability",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-termina",
+			"to": "ratatui-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-termina",
+			"to": "termina",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-termion",
+			"to": "instability",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-termion",
+			"to": "ratatui-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-termion",
+			"to": "termion",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-termwiz",
+			"to": "ratatui-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-termwiz",
+			"to": "termwiz",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-widgets",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-widgets",
+			"to": "hashbrown",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-widgets",
+			"to": "indoc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-widgets",
+			"to": "instability",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-widgets",
+			"to": "itertools",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-widgets",
+			"to": "line-clipping",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-widgets",
+			"to": "ratatui-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-widgets",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-widgets",
+			"to": "strum",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-widgets",
+			"to": "time",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-widgets",
+			"to": "unicode-segmentation",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ratatui-widgets",
+			"to": "unicode-width",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "redox_syscall",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "redox_users",
+			"to": "getrandom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "redox_users",
+			"to": "libredox",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "redox_users",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ref-cast",
+			"to": "ref-cast-impl",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ref-cast-impl",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ref-cast-impl",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ref-cast-impl",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "regex",
+			"to": "aho-corasick",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "regex",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "regex",
+			"to": "regex-automata",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "regex",
+			"to": "regex-syntax",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "regex-automata",
+			"to": "aho-corasick",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "regex-automata",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "regex-automata",
+			"to": "regex-syntax",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "base64",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "http-body-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "hyper",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "hyper-rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "hyper-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "js-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "percent-encoding",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "quinn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "rustls-pki-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "rustls-platform-verifier",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "serde_urlencoded",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "sync_wrapper",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "tokio-rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "tokio-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "tower",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "tower-http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "tower-service",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "url",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "wasm-bindgen",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "wasm-bindgen-futures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "wasm-streams",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "reqwest",
+			"to": "web-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rgb",
+			"to": "bytemuck",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ring",
+			"to": "cc",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "ring",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ring",
+			"to": "getrandom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ring",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ring",
+			"to": "untrusted",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "ring",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustc_version",
+			"to": "semver",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustix",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustix",
+			"to": "errno",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustix",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustix",
+			"to": "linux-raw-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustix",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls",
+			"to": "aws-lc-rs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls",
+			"to": "once_cell",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls",
+			"to": "rustls-pki-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls",
+			"to": "rustls-webpki",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls",
+			"to": "subtle",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls",
+			"to": "zeroize",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-native-certs",
+			"to": "openssl-probe",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-native-certs",
+			"to": "rustls-pki-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-native-certs",
+			"to": "schannel",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-native-certs",
+			"to": "security-framework",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-pki-types",
+			"to": "web-time",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-pki-types",
+			"to": "zeroize",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "core-foundation",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "core-foundation-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "jni",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "once_cell",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "rustls-native-certs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "rustls-platform-verifier-android",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "rustls-webpki",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "security-framework",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "security-framework-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "webpki-root-certs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-platform-verifier",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-webpki",
+			"to": "aws-lc-rs",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-webpki",
+			"to": "ring",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-webpki",
+			"to": "rustls-pki-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rustls-webpki",
+			"to": "untrusted",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rusty-fork",
+			"to": "fnv",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rusty-fork",
+			"to": "quick-error",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rusty-fork",
+			"to": "tempfile",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rusty-fork",
+			"to": "wait-timeout",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "same-file",
+			"to": "winapi-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schannel",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars",
+			"to": "dyn-clone",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars",
+			"to": "ref-cast",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars",
+			"to": "dyn-clone",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars",
+			"to": "ref-cast",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars",
+			"to": "schemars_derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars_derive",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars_derive",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars_derive",
+			"to": "serde_derive_internals",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "schemars_derive",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "security-framework",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "security-framework",
+			"to": "core-foundation",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "security-framework",
+			"to": "core-foundation-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "security-framework",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "security-framework",
+			"to": "security-framework-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "security-framework-sys",
+			"to": "core-foundation-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "security-framework-sys",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde",
+			"to": "serde_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde",
+			"to": "serde_derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde-saphyr",
+			"to": "annotate-snippets",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde-saphyr",
+			"to": "encoding_rs_io",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde-saphyr",
+			"to": "granit-parser",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde-saphyr",
+			"to": "num-traits",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde-saphyr",
+			"to": "serde_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde-saphyr",
+			"to": "smallvec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_core",
+			"to": "serde_derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_derive",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_derive",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_derive",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_derive_internals",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_derive_internals",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_derive_internals",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_json",
+			"to": "itoa",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_json",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_json",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_json",
+			"to": "serde_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_json",
+			"to": "zmij",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_path_to_error",
+			"to": "itoa",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_path_to_error",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_path_to_error",
+			"to": "serde_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_urlencoded",
+			"to": "form_urlencoded",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_urlencoded",
+			"to": "itoa",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_urlencoded",
+			"to": "ryu",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_urlencoded",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with",
+			"to": "base64",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with",
+			"to": "bs58",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with",
+			"to": "chrono",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with",
+			"to": "hex",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with",
+			"to": "indexmap",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with",
+			"to": "indexmap",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with",
+			"to": "schemars",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with",
+			"to": "schemars",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with",
+			"to": "serde_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with",
+			"to": "serde_json",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with",
+			"to": "serde_with_macros",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with",
+			"to": "time",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with_macros",
+			"to": "darling",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with_macros",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with_macros",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serde_with_macros",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serial2",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serial2",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "serial2",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sha1",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sha1",
+			"to": "cpufeatures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sha1",
+			"to": "digest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sha1",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sha1",
+			"to": "cpufeatures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sha1",
+			"to": "digest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sha2",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sha2",
+			"to": "cpufeatures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sha2",
+			"to": "digest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sha2",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sha2",
+			"to": "cpufeatures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sha2",
+			"to": "digest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "shared_library",
+			"to": "lazy_static",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "shared_library",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "signal-hook",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "signal-hook",
+			"to": "signal-hook-registry",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "signal-hook-mio",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "signal-hook-mio",
+			"to": "mio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "signal-hook-mio",
+			"to": "signal-hook",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "signal-hook-registry",
+			"to": "errno",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "signal-hook-registry",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "signature",
+			"to": "rand_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "simd_cesu8",
+			"to": "rustc_version",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "simd_cesu8",
+			"to": "simdutf8",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "socket2",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "socket2",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "strip-ansi-escapes",
+			"to": "vte",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "strum",
+			"to": "strum_macros",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "strum_macros",
+			"to": "heck",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "strum_macros",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "strum_macros",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "strum_macros",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syn",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syn",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syn",
+			"to": "unicode-ident",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syn",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syn",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syn",
+			"to": "unicode-ident",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syn",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syn",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syn",
+			"to": "unicode-ident",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "sync_wrapper",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "synstructure",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "synstructure",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "synstructure",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syntect",
+			"to": "bincode",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syntect",
+			"to": "fancy-regex",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syntect",
+			"to": "flate2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syntect",
+			"to": "fnv",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syntect",
+			"to": "once_cell",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syntect",
+			"to": "regex-syntax",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syntect",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syntect",
+			"to": "serde_derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syntect",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syntect",
+			"to": "walkdir",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "syntect",
+			"to": "yaml-rust",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "system-configuration",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "system-configuration",
+			"to": "core-foundation",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "system-configuration",
+			"to": "system-configuration-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "system-configuration-sys",
+			"to": "core-foundation-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "system-configuration-sys",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tempfile",
+			"to": "fastrand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tempfile",
+			"to": "getrandom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tempfile",
+			"to": "once_cell",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tempfile",
+			"to": "rustix",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tempfile",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termina",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termina",
+			"to": "parking_lot",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termina",
+			"to": "rustix",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termina",
+			"to": "signal-hook",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termina",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "terminfo",
+			"to": "fnv",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "terminfo",
+			"to": "nom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "terminfo",
+			"to": "phf",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "terminfo",
+			"to": "phf_codegen",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "termion",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termion",
+			"to": "numtoa",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termios",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "anyhow",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "base64",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "fancy-regex",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "filedescriptor",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "finl_unicode",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "fixedbitset",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "hex",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "lazy_static",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "memmem",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "nix",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "num-derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "num-traits",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "ordered-float",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "pest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "pest_derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "phf",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "sha2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "signal-hook",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "siphasher",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "terminfo",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "termios",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "ucd-trie",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "unicode-segmentation",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "vtparse",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "wezterm-bidi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "wezterm-blob-leases",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "wezterm-color-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "wezterm-dynamic",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "wezterm-input-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "termwiz",
+			"to": "winapi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "thiserror",
+			"to": "thiserror-impl",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "thiserror",
+			"to": "thiserror-impl",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "thiserror-impl",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "thiserror-impl",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "thiserror-impl",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "thiserror-impl",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "thiserror-impl",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "thiserror-impl",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "time",
+			"to": "deranged",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "time",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "time",
+			"to": "num-conv",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "time",
+			"to": "num_threads",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "time",
+			"to": "powerfmt",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "time",
+			"to": "serde_core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "time",
+			"to": "time-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "time",
+			"to": "time-macros",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "time-macros",
+			"to": "num-conv",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "time-macros",
+			"to": "time-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tinystr",
+			"to": "displaydoc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tinystr",
+			"to": "zerovec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tinyvec",
+			"to": "tinyvec_macros",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio",
+			"to": "mio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio",
+			"to": "signal-hook-registry",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio",
+			"to": "socket2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio",
+			"to": "tokio-macros",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-macros",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-macros",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-macros",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-rustls",
+			"to": "rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-rustls",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-stream",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-stream",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-stream",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-stream",
+			"to": "tokio-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-tungstenite",
+			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-tungstenite",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-tungstenite",
+			"to": "rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-tungstenite",
+			"to": "rustls-pki-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-tungstenite",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-tungstenite",
+			"to": "tokio-rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-tungstenite",
+			"to": "tungstenite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-tungstenite",
+			"to": "webpki-roots",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-util",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-util",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-util",
+			"to": "futures-sink",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-util",
+			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-util",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-util",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tokio-util",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower",
+			"to": "futures-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower",
+			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower",
+			"to": "sync_wrapper",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower",
+			"to": "tokio",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower",
+			"to": "tower-layer",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower",
+			"to": "tower-service",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower-http",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower-http",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower-http",
+			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower-http",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower-http",
+			"to": "http-body",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower-http",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower-http",
+			"to": "tower",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower-http",
+			"to": "tower-layer",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower-http",
+			"to": "tower-service",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tower-http",
+			"to": "url",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tracing",
+			"to": "pin-project-lite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tracing",
+			"to": "tracing-attributes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tracing",
+			"to": "tracing-core",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tracing-attributes",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tracing-attributes",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tracing-attributes",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tracing-core",
+			"to": "once_cell",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tungstenite",
+			"to": "bytes",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tungstenite",
+			"to": "data-encoding",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tungstenite",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tungstenite",
+			"to": "httparse",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tungstenite",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tungstenite",
+			"to": "rand",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tungstenite",
+			"to": "rustls",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tungstenite",
+			"to": "rustls-pki-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tungstenite",
+			"to": "sha1",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "tungstenite",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "unicode-normalization",
+			"to": "tinyvec",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "unicode-truncate",
+			"to": "itertools",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "unicode-truncate",
+			"to": "unicode-segmentation",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "unicode-truncate",
+			"to": "unicode-width",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "url",
+			"to": "form_urlencoded",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "url",
+			"to": "idna",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "url",
+			"to": "percent-encoding",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "url",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "uuid",
+			"to": "atomic",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "uuid",
+			"to": "getrandom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "uuid",
+			"to": "js-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "uuid",
+			"to": "wasm-bindgen",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "vte",
+			"to": "memchr",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "vtparse",
+			"to": "utf8parse",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wait-timeout",
+			"to": "libc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "walkdir",
+			"to": "same-file",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "walkdir",
+			"to": "winapi-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "want",
+			"to": "try-lock",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasip2",
+			"to": "wit-bindgen",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen",
+			"to": "cfg-if",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen",
+			"to": "once_cell",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen",
+			"to": "rustversion",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "wasm-bindgen",
+			"to": "wasm-bindgen-macro",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen",
+			"to": "wasm-bindgen-shared",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen-futures",
+			"to": "js-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen-futures",
+			"to": "wasm-bindgen",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen-macro",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen-macro",
+			"to": "wasm-bindgen-macro-support",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen-macro-support",
+			"to": "bumpalo",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen-macro-support",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen-macro-support",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen-macro-support",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen-macro-support",
+			"to": "wasm-bindgen-shared",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-bindgen-shared",
+			"to": "unicode-ident",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-streams",
+			"to": "futures-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-streams",
+			"to": "js-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-streams",
+			"to": "wasm-bindgen",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-streams",
+			"to": "wasm-bindgen-futures",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wasm-streams",
+			"to": "web-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "web-sys",
+			"to": "js-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "web-sys",
+			"to": "wasm-bindgen",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "web-time",
+			"to": "js-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "web-time",
+			"to": "wasm-bindgen",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "webpki-root-certs",
+			"to": "rustls-pki-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "webpki-roots",
+			"to": "webpki-roots",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "webpki-roots",
+			"to": "rustls-pki-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-bidi",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-bidi",
+			"to": "wezterm-dynamic",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-blob-leases",
+			"to": "getrandom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-blob-leases",
+			"to": "mac_address",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-blob-leases",
+			"to": "sha2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-blob-leases",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-blob-leases",
+			"to": "uuid",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-color-types",
+			"to": "csscolorparser",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-color-types",
+			"to": "deltae",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-color-types",
+			"to": "lazy_static",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-color-types",
+			"to": "wezterm-dynamic",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-dynamic",
+			"to": "log",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-dynamic",
+			"to": "ordered-float",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-dynamic",
+			"to": "strsim",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-dynamic",
+			"to": "thiserror",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-dynamic",
+			"to": "wezterm-dynamic-derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-dynamic-derive",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-dynamic-derive",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-dynamic-derive",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-input-types",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-input-types",
+			"to": "euclid",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-input-types",
+			"to": "lazy_static",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-input-types",
+			"to": "serde",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "wezterm-input-types",
+			"to": "wezterm-dynamic",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "winapi",
+			"to": "winapi-i686-pc-windows-gnu",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "winapi",
+			"to": "winapi-x86_64-pc-windows-gnu",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "winapi-util",
+			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-core",
+			"to": "windows-implement",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-core",
+			"to": "windows-interface",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-core",
+			"to": "windows-link",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-core",
+			"to": "windows-result",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-core",
+			"to": "windows-strings",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-implement",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-implement",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-implement",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-interface",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-interface",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-interface",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-registry",
+			"to": "windows-link",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-registry",
+			"to": "windows-result",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-registry",
+			"to": "windows-strings",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-result",
+			"to": "windows-link",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-strings",
+			"to": "windows-link",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-sys",
+			"to": "windows-targets",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-sys",
+			"to": "windows-link",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-targets",
+			"to": "windows_aarch64_gnullvm",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-targets",
+			"to": "windows_aarch64_msvc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-targets",
+			"to": "windows_i686_gnu",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-targets",
+			"to": "windows_i686_gnullvm",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-targets",
+			"to": "windows_i686_msvc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-targets",
+			"to": "windows_x86_64_gnu",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-targets",
+			"to": "windows_x86_64_gnullvm",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "windows-targets",
+			"to": "windows_x86_64_msvc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "winreg",
+			"to": "winapi",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "yaml-rust",
+			"to": "linked-hash-map",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "yoke",
+			"to": "stable_deref_trait",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "yoke",
+			"to": "yoke-derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "yoke",
+			"to": "zerofrom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "yoke-derive",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "yoke-derive",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "yoke-derive",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "yoke-derive",
+			"to": "synstructure",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerocopy",
+			"to": "zerocopy-derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerocopy-derive",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerocopy-derive",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerocopy-derive",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerofrom",
+			"to": "zerofrom-derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerofrom-derive",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerofrom-derive",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerofrom-derive",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerofrom-derive",
+			"to": "synstructure",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zeroize",
+			"to": "zeroize_derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zeroize_derive",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zeroize_derive",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zeroize_derive",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerotrie",
+			"to": "displaydoc",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerotrie",
+			"to": "yoke",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerotrie",
+			"to": "zerofrom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerovec",
+			"to": "yoke",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerovec",
+			"to": "zerofrom",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerovec",
+			"to": "zerovec-derive",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerovec-derive",
+			"to": "proc-macro2",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerovec-derive",
+			"to": "quote",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zerovec-derive",
+			"to": "syn",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zstd",
+			"to": "zstd-safe",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zstd-safe",
+			"to": "zstd-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "zstd-sys",
+			"to": "cc",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "zstd-sys",
+			"to": "pkg-config",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "zune-jpeg",
+			"to": "zune-core",
+			"kinds": [
+				"normal"
+			]
+		}
+	]
+}

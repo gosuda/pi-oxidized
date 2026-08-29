@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 env:
-  RUST_VERSION: "1.97.1"
+  RUST_VERSION: "1.98.0"
   BUN_VERSION: "1.3.14"
   MUSL_APT_VERSION: "1.2.4-2"
   ALPINE_VERSION: "3.24.1"
@@ -38,10 +38,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Checkout TypeScript reference (pinned)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: earendil-works/pi
+          ref: 8fa7eebd235355522c8104166b4f1f959b4e2f10
+          path: .references/pi
+          persist-credentials: false
+
+      - name: Verify reference pin
+        shell: bash
+        run: |
+          test "$(git -C .references/pi rev-parse HEAD)" = "8fa7eebd235355522c8104166b4f1f959b4e2f10"
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.0
           targets: x86_64-unknown-linux-musl
 
       - name: Set up Bun
@@ -111,7 +124,7 @@ jobs:
           ldd_status=$?
           set -e
           cat "$EVIDENCE/pi-ldd.txt"
-          grep -Fq 'not a dynamic executable' "$EVIDENCE/pi-ldd.txt"
+          grep -Eq 'not a dynamic executable|statically linked' "$EVIDENCE/pi-ldd.txt"
           printf 'ldd_exit=%s\n' "$ldd_status" >> "$EVIDENCE/pi-ldd.txt"
 
           fetch() {
@@ -130,12 +143,13 @@ jobs:
           # env: cannot interpolate RUNNER_TEMP, so pin an absolute writable path here.
           export USERLAND_DIR="$RUNNER_TEMP/pi-musl-userland/$ALPINE_ARCH"
           ROOTFS="$RUNNER_TEMP/alpine-rootfs"
-          rm -rf "$ROOTFS" "$USERLAND_DIR"
+          rm -rf -- "${ROOTFS:?}" "${USERLAND_DIR:?}"
           mkdir -p "$ROOTFS/tmp" "$USERLAND_DIR"
           alpine_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/$ALPINE_ARCH/$ALPINE_ASSET"
           fetch "$alpine_url" "$EVIDENCE/downloads/$ALPINE_ASSET" "$ALPINE_ASSET_SHA256" \
             'matched Alpine vendor-published .sha256 value grounded 2026-08-26'
-          tar -tzf "$EVIDENCE/downloads/$ALPINE_ASSET" | grep -Fxq "./lib/$MUSL_LOADER"
+          tar -tzf "$EVIDENCE/downloads/$ALPINE_ASSET" > "$EVIDENCE/alpine-rootfs-members.txt"
+          grep -Fxq "./lib/$MUSL_LOADER" "$EVIDENCE/alpine-rootfs-members.txt"
           tar -xzf "$EVIDENCE/downloads/$ALPINE_ASSET" -C "$ROOTFS"
           sudo install -m 0755 "$ROOTFS/lib/$MUSL_LOADER" "/lib/$MUSL_LOADER"
 
@@ -144,6 +158,7 @@ jobs:
             local label="$2"
             local pinned_loader="/lib/$MUSL_LOADER"
             local allowed_prefix="$USERLAND_DIR/"
+            local re='^[[:space:]]*(/[^[:space:](]+)'
             local line path
             while IFS= read -r line || [[ -n "$line" ]]; do
               [[ -z "$line" ]] && continue
@@ -151,7 +166,7 @@ jobs:
                 path="${line#*=> }"
                 path="${path%% (*}"
                 path="${path%"${path##*[![:space:]]}"}"
-              elif [[ "$line" =~ ^[[:space:]]*(/[^[:space:](]+) ]]; then
+              elif [[ "$line" =~ $re ]]; then
                 path="${BASH_REMATCH[1]}"
               else
                 continue
@@ -204,12 +219,12 @@ jobs:
             apk_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/main/$ALPINE_ARCH/$apk_name"
             fetch "$apk_url" "$EVIDENCE/downloads/$apk_name" "$expected_sha"               'content-addressed SHA256 pin + acquisition date; .PKGINFO pkgname/pkgver/arch asserted before extract; no signature verification'
             pkginfo_dir="$RUNNER_TEMP/pkginfo-$package"
-            rm -rf "$pkginfo_dir"
+            rm -rf -- "${pkginfo_dir:?}"
             mkdir -p "$pkginfo_dir"
             tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$pkginfo_dir" .PKGINFO
-            grep -Fx "pkgname=$package" "$pkginfo_dir/.PKGINFO"
-            grep -Fx "pkgver=$ALPINE_GCC_RUNTIME_VERSION" "$pkginfo_dir/.PKGINFO"
-            grep -Fx "arch=$ALPINE_ARCH" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "pkgname = $package" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "pkgver = $ALPINE_GCC_RUNTIME_VERSION" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "arch = $ALPINE_ARCH" "$pkginfo_dir/.PKGINFO"
             cp "$pkginfo_dir/.PKGINFO" "$EVIDENCE/downloads/$package.PKGINFO"
             tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$USERLAND_DIR" usr/lib
           done
@@ -227,16 +242,16 @@ jobs:
             bun install --frozen-lockfile
             bun build ./src/main.ts --compile --minify \
               --compile-autoload-tsconfig --compile-autoload-package-json \
-              --target "$BUN_COMPILE_TARGET" --outfile "$GITHUB_WORKSPACE/$STAGE/pi-extension-host"
+              --target "$BUN_COMPILE_TARGET" --outfile "../../$STAGE/pi-extension-host"
             bun build ./src/main.ts --target bun --minify \
-              --outfile "$GITHUB_WORKSPACE/$STAGE/pi-extension-host.js"
+              --outfile "../../$STAGE/pi-extension-host.js"
           )
           bun_url="https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/$BUN_ASSET"
           fetch "$bun_url" "$EVIDENCE/downloads/$BUN_ASSET" "$BUN_ASSET_SHA256" \
             'matched official Bun v1.3.14 SHASUMS256.txt value grounded 2026-08-26'
           unzip -Z1 "$EVIDENCE/downloads/$BUN_ASSET" | tee "$EVIDENCE/bun-archive-members.txt"
           bun_extract="$RUNNER_TEMP/bun-runtime"
-          rm -rf "$bun_extract"
+          rm -rf -- "${bun_extract:?}"
           unzip -q "$EVIDENCE/downloads/$BUN_ASSET" -d "$bun_extract"
           install -m 0755 "$bun_extract/${BUN_ASSET%.zip}/bun" "$STAGE/bun"
           install -m 0755 "$PI" "$STAGE/pi"
@@ -254,7 +269,7 @@ jobs:
           assert_musl_resolution "$EVIDENCE/runtime-loader-resolution.txt" staged-runtime
 
           tar -czf "$EVIDENCE/bakeoff.tar.gz" -C "$STAGE" .
-          rm -rf "$UNPACK"
+          rm -rf -- "${UNPACK:?}"
           mkdir -p "$UNPACK"
           tar -xzf "$EVIDENCE/bakeoff.tar.gz" -C "$UNPACK"
           tar -tzf "$EVIDENCE/bakeoff.tar.gz" | sort > "$EVIDENCE/archive-members.txt"
@@ -414,10 +429,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Checkout TypeScript reference (pinned)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: earendil-works/pi
+          ref: 8fa7eebd235355522c8104166b4f1f959b4e2f10
+          path: .references/pi
+          persist-credentials: false
+
+      - name: Verify reference pin
+        shell: bash
+        run: |
+          test "$(git -C .references/pi rev-parse HEAD)" = "8fa7eebd235355522c8104166b4f1f959b4e2f10"
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.0
           targets: aarch64-unknown-linux-musl
 
       - name: Set up Bun
@@ -504,7 +532,7 @@ jobs:
           mkdir -p "$crate_source"
           tar -xzf "$EVIDENCE/downloads/$crate" -C "$crate_source" --strip-components=1
           cargo install --locked --path "$crate_source"
-          cargo zigbuild --version | tee "$EVIDENCE/candidate-B/cargo-zigbuild-version.txt"
+          cargo-zigbuild --version | tee "$EVIDENCE/candidate-B/cargo-zigbuild-version.txt"
           env -u CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER \
               -u CC_aarch64_unknown_linux_musl \
               PATH="$RUNNER_TEMP/${ZIG_ASSET%.tar.xz}:$PATH" \
@@ -533,7 +561,7 @@ jobs:
           ldd_status=$?
           set -e
           cat "$EVIDENCE/pi-ldd.txt"
-          grep -Fq 'not a dynamic executable' "$EVIDENCE/pi-ldd.txt"
+          grep -Eq 'not a dynamic executable|statically linked' "$EVIDENCE/pi-ldd.txt"
           printf 'ldd_exit=%s\n' "$ldd_status" >> "$EVIDENCE/pi-ldd.txt"
 
           fetch() {
@@ -552,12 +580,13 @@ jobs:
           # env: cannot interpolate RUNNER_TEMP, so pin an absolute writable path here.
           export USERLAND_DIR="$RUNNER_TEMP/pi-musl-userland/$ALPINE_ARCH"
           ROOTFS="$RUNNER_TEMP/alpine-rootfs"
-          rm -rf "$ROOTFS" "$USERLAND_DIR"
+          rm -rf -- "${ROOTFS:?}" "${USERLAND_DIR:?}"
           mkdir -p "$ROOTFS/tmp" "$USERLAND_DIR"
           alpine_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/$ALPINE_ARCH/$ALPINE_ASSET"
           fetch "$alpine_url" "$EVIDENCE/downloads/$ALPINE_ASSET" "$ALPINE_ASSET_SHA256" \
             'matched Alpine vendor-published .sha256 value grounded 2026-08-26'
-          tar -tzf "$EVIDENCE/downloads/$ALPINE_ASSET" | grep -Fxq "./lib/$MUSL_LOADER"
+          tar -tzf "$EVIDENCE/downloads/$ALPINE_ASSET" > "$EVIDENCE/alpine-rootfs-members.txt"
+          grep -Fxq "./lib/$MUSL_LOADER" "$EVIDENCE/alpine-rootfs-members.txt"
           tar -xzf "$EVIDENCE/downloads/$ALPINE_ASSET" -C "$ROOTFS"
           sudo install -m 0755 "$ROOTFS/lib/$MUSL_LOADER" "/lib/$MUSL_LOADER"
 
@@ -566,6 +595,7 @@ jobs:
             local label="$2"
             local pinned_loader="/lib/$MUSL_LOADER"
             local allowed_prefix="$USERLAND_DIR/"
+            local re='^[[:space:]]*(/[^[:space:](]+)'
             local line path
             while IFS= read -r line || [[ -n "$line" ]]; do
               [[ -z "$line" ]] && continue
@@ -573,7 +603,7 @@ jobs:
                 path="${line#*=> }"
                 path="${path%% (*}"
                 path="${path%"${path##*[![:space:]]}"}"
-              elif [[ "$line" =~ ^[[:space:]]*(/[^[:space:](]+) ]]; then
+              elif [[ "$line" =~ $re ]]; then
                 path="${BASH_REMATCH[1]}"
               else
                 continue
@@ -626,12 +656,12 @@ jobs:
             apk_url="https://dl-cdn.alpinelinux.org/alpine/v3.24/main/$ALPINE_ARCH/$apk_name"
             fetch "$apk_url" "$EVIDENCE/downloads/$apk_name" "$expected_sha"               'content-addressed SHA256 pin + acquisition date; .PKGINFO pkgname/pkgver/arch asserted before extract; no signature verification'
             pkginfo_dir="$RUNNER_TEMP/pkginfo-$package"
-            rm -rf "$pkginfo_dir"
+            rm -rf -- "${pkginfo_dir:?}"
             mkdir -p "$pkginfo_dir"
             tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$pkginfo_dir" .PKGINFO
-            grep -Fx "pkgname=$package" "$pkginfo_dir/.PKGINFO"
-            grep -Fx "pkgver=$ALPINE_GCC_RUNTIME_VERSION" "$pkginfo_dir/.PKGINFO"
-            grep -Fx "arch=$ALPINE_ARCH" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "pkgname = $package" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "pkgver = $ALPINE_GCC_RUNTIME_VERSION" "$pkginfo_dir/.PKGINFO"
+            grep -Fx "arch = $ALPINE_ARCH" "$pkginfo_dir/.PKGINFO"
             cp "$pkginfo_dir/.PKGINFO" "$EVIDENCE/downloads/$package.PKGINFO"
             tar -xzf "$EVIDENCE/downloads/$apk_name" -C "$USERLAND_DIR" usr/lib
           done
@@ -649,16 +679,16 @@ jobs:
             bun install --frozen-lockfile
             bun build ./src/main.ts --compile --minify \
               --compile-autoload-tsconfig --compile-autoload-package-json \
-              --target "$BUN_COMPILE_TARGET" --outfile "$GITHUB_WORKSPACE/$STAGE/pi-extension-host"
+              --target "$BUN_COMPILE_TARGET" --outfile "../../$STAGE/pi-extension-host"
             bun build ./src/main.ts --target bun --minify \
-              --outfile "$GITHUB_WORKSPACE/$STAGE/pi-extension-host.js"
+              --outfile "../../$STAGE/pi-extension-host.js"
           )
           bun_url="https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/$BUN_ASSET"
           fetch "$bun_url" "$EVIDENCE/downloads/$BUN_ASSET" "$BUN_ASSET_SHA256" \
             'matched official Bun v1.3.14 SHASUMS256.txt value grounded 2026-08-26'
           unzip -Z1 "$EVIDENCE/downloads/$BUN_ASSET" | tee "$EVIDENCE/bun-archive-members.txt"
           bun_extract="$RUNNER_TEMP/bun-runtime"
-          rm -rf "$bun_extract"
+          rm -rf -- "${bun_extract:?}"
           unzip -q "$EVIDENCE/downloads/$BUN_ASSET" -d "$bun_extract"
           install -m 0755 "$bun_extract/${BUN_ASSET%.zip}/bun" "$STAGE/bun"
           install -m 0755 "$PI" "$STAGE/pi"
@@ -676,7 +706,7 @@ jobs:
           assert_musl_resolution "$EVIDENCE/runtime-loader-resolution.txt" staged-runtime
 
           tar -czf "$EVIDENCE/bakeoff.tar.gz" -C "$STAGE" .
-          rm -rf "$UNPACK"
+          rm -rf -- "${UNPACK:?}"
           mkdir -p "$UNPACK"
           tar -xzf "$EVIDENCE/bakeoff.tar.gz" -C "$UNPACK"
           tar -tzf "$EVIDENCE/bakeoff.tar.gz" | sort > "$EVIDENCE/archive-members.txt"

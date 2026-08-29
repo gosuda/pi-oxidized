@@ -9,29 +9,33 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-aws-config = "=1.9.0"
-aws-sdk-bedrockruntime = { version = "=1.136.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-config = "=1.11.0"
+aws-sdk-bedrockruntime = { version = "=1.142.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "query", "tokio"] }
-base64 = "=0.22.1"
+base64 = "=0.23.1"
 filetime = "=0.2.29"
-futures = { version = "=0.3.32", default-features = false, features = ["alloc", "std"] }
+futures = { version = "=0.3.34", default-features = false, features = ["alloc", "std"] }
 getrandom = { version = "=0.4.3", default-features = false, features = ["std"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "stream", "rustls", "system-proxy"] }
-serde = { version = "=1.0.228", features = ["derive"] }
-google-cloud-auth = "=1.14.0"
+serde = { version = "=1.0.229", features = ["derive", "rc"] }
+google-cloud-auth = "=1.16.0"
 same-file = "=1.0.6"
-serde_json = "=1.0.150"
+serde_json = "=1.0.151"
 sha2 = { version = "=0.11.0", default-features = false }
 tempfile = "=3.27.0"
-thiserror = "=2.0.18"
-tokio = { version = "=1.52.4", default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
-tokio-util = { version = "=0.7.18", default-features = false, features = ["rt"] }
+thiserror = "=2.0.20"
+tokio = { version = "=1.53.1", default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-util = { version = "=0.7.19", default-features = false, features = ["rt"] }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-uuid = { version = "=1.24.0", default-features = false, features = ["v4"] }
+uuid = { version = "=1.26.0", default-features = false, features = ["v4"] }
 zstd = { version = "=0.13.3", default-features = false }
 
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "=0.31.3", default-features = false, features = ["signal"] }
 [dev-dependencies]
-tokio = { version = "=1.52.4", default-features = false, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[[bin]]
+name = "pi-ai"
+path = "src/cli.rs"

@@ -1,0 +1,10 @@
+
+Sign in to Radius:
+  1. Sign in with browser (recommended)
+  2. Sign in with device code (when signing in from another device)
+Enter number (1-2): 
+Open this URL in your browser:
+https://radius.pi.dev/device
+Enter code: RADIUS-MOCK
+
+Credentials saved to auth.json

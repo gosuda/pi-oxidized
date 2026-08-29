@@ -10,6 +10,17 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { arch, cpus, hostname, platform, release } from "node:os";
 import { dirname, resolve } from "node:path";
 
+import {
+	DEFAULT_LEDGER_PATH,
+	DEFAULT_SIDECAR_DIR,
+	EXPECTED_LEDGER_ROW_COUNT,
+	RUN_MANIFEST_FILENAME,
+	canonicalJson,
+	loadLedger,
+	loadRunManifest,
+} from "./docs-evidence.ts";
+import { sha256, type RunManifest } from "./docs-evidence-runners.ts";
+
 const TIER_VALUES = ["unit", "host", "product", "performance", "release"] as const;
 type Tier = (typeof TIER_VALUES)[number];
 
@@ -64,6 +75,7 @@ interface RowResult {
 	readonly error?: string;
 }
 
+
 interface MatrixResult {
 	readonly version: string;
 	readonly matrixPath: string;
@@ -85,6 +97,7 @@ interface MatrixResult {
 	};
 	readonly commandResults: CommandResult[];
 	readonly rowResults: RowResult[];
+	readonly docsEvidence?: RunManifest;
 	readonly summary: {
 		readonly total: number;
 		readonly passed: number;
@@ -93,6 +106,47 @@ interface MatrixResult {
 		readonly requiredFailed: readonly string[];
 	};
 }
+
+const DOCS_EVIDENCE_ARGV = ["bun", "run", "scripts/verification/docs-evidence.ts"] as const;
+
+export function captureDocsEvidence(
+	command: CommandSpec,
+	result: CommandResult,
+	repoRoot: string,
+): RunManifest {
+	const canonicalCommand =
+		command.cwd === "." &&
+		command.argv.length === DOCS_EVIDENCE_ARGV.length &&
+		command.argv.every((arg, index) => arg === DOCS_EVIDENCE_ARGV[index]);
+	const sentinel = result.stdoutTail.match(
+		/(?:^|\n)DOCS_EVIDENCE_OK runId=([^\s]+) rows=77 manifest=([^\r\n]+)(?:\r?\n|$)/,
+	);
+	const manifestPath = resolve(repoRoot, DEFAULT_SIDECAR_DIR, RUN_MANIFEST_FILENAME);
+	if (
+		!canonicalCommand ||
+		result.exitCode !== 0 ||
+		result.timedOut ||
+		sentinel === null ||
+		resolve(sentinel[2] ?? "") !== manifestPath
+	) {
+		throw new Error("docs-evidence row did not run the canonical checker");
+	}
+
+	const manifest = loadRunManifest(manifestPath);
+	const ledger = loadLedger(repoRoot, DEFAULT_LEDGER_PATH);
+	const expectedIds = ledger.rows.map(({ id }) => id).sort();
+	const actualIds = manifest.entries.map(({ rowId }) => rowId).sort();
+	if (
+		manifest.runId !== sentinel[1] ||
+		manifest.ledgerHash !== sha256(canonicalJson(ledger)) ||
+		expectedIds.length !== EXPECTED_LEDGER_ROW_COUNT ||
+		expectedIds.some((id, index) => id !== actualIds[index])
+	) {
+		throw new Error("docs-evidence manifest does not match the command or current ledger");
+	}
+	return manifest;
+}
+
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -384,6 +438,7 @@ export async function runMatrix(options: {
 	const groups = uniqueCommands(runnableRows);
 	const commandResults: CommandResult[] = [];
 	const rowResultById = new Map<string, RowResult>();
+	let docsEvidence: RunManifest | undefined;
 	const startedAt = isoNow();
 
 	for (const row of selected) {
@@ -442,9 +497,12 @@ export async function runMatrix(options: {
 				rowIds: group.rowIds,
 			};
 			commandResults.push(result);
+			const passed = spawnResult.exitCode === 0 && !spawnResult.timedOut;
+			if (passed && group.rowIds.includes("docs-evidence")) {
+				docsEvidence = captureDocsEvidence(group.command, result, repoRoot);
+			}
 
 			for (const rowId of group.rowIds) {
-				const passed = spawnResult.exitCode === 0 && !spawnResult.timedOut;
 				rowResultById.set(rowId, {
 					rowId,
 					status: passed ? "passed" : "failed",
@@ -507,6 +565,7 @@ export async function runMatrix(options: {
 		},
 		commandResults,
 		rowResults,
+		...(docsEvidence === undefined ? {} : { docsEvidence }),
 		summary,
 	};
 }
@@ -632,13 +691,18 @@ async function main(): Promise<void> {
 		request,
 		dryRun: options.dryRun,
 	});
-
 	const outDir = resolve(repoRoot, "target/verification/compat-matrix");
 	mkdirSync(outDir, { recursive: true });
 	const outPath = resolve(outDir, "result.json");
 	writeFileSync(outPath, JSON.stringify(result, null, "\t"), "utf8");
 
 	if (result.summary.requiredFailed.length > 0) {
+		for (const rowId of result.summary.requiredFailed) {
+			const failed = result.rowResults.find((row) => row.rowId === rowId);
+			if (failed?.error !== undefined) {
+				console.error(`[${rowId}] ${failed.error}`);
+			}
+		}
 		console.error(
 			`Compatibility matrix failed required rows: ${result.summary.requiredFailed.join(", ")}`,
 		);

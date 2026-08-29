@@ -58,7 +58,9 @@ pub struct ComposedView {
 /// theme is installed thread-locally for the duration of composition.
 #[must_use]
 pub fn compose(state: &ViewState) -> ComposedView {
-    theme::with_theme(state.theme.clone(), || compose_inner(state))
+    theme::with_theme(state.theme.clone(), || {
+        theme::with_hyperlinks(state.hyperlinks, || compose_inner(state))
+    })
 }
 
 fn compose_inner(state: &ViewState) -> ComposedView {
@@ -156,7 +158,7 @@ fn build_chat(state: &ViewState, md_theme: &MarkdownTheme) -> Box<dyn Component>
         stack.push(Box::new(Text::with_padding(
             state.theme.fg(
                 super::theme::ThemeColor::Dim,
-                "Type a message, or / for commands.",
+                "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.",
             ),
             messages::CONTENT_INDENT,
             0,
@@ -164,7 +166,11 @@ fn build_chat(state: &ViewState, md_theme: &MarkdownTheme) -> Box<dyn Component>
         stack.push(Box::new(Text::with_padding(
             state.theme.fg(
                 super::theme::ThemeColor::Dim,
-                "? shortcuts · ctrl+o expand tools · shift+tab thinking",
+                &format!(
+                    "/hotkeys shortcuts · {} expand tools · {} thinking",
+                    pi_tui::keybindings::key_text("app.tools.expand"),
+                    pi_tui::keybindings::key_text("app.thinking.cycle")
+                ),
             ),
             messages::CONTENT_INDENT,
             0,
@@ -195,7 +201,7 @@ fn build_message(
 /// Build the status section (active indicator or idle).
 fn build_status_section(state: &ViewState) -> Box<dyn Component> {
     if let Some(status) = state.status.as_ref() {
-        status::build_status(status, &state.theme)
+        status::build_status(status, &state.theme, state.indicator_frames.as_deref())
     } else {
         status::build_idle(state.width)
     }
@@ -322,6 +328,12 @@ pub fn render_view(state: &ViewState, width: u16, height: u16) -> Buffer {
 /// height cap). Useful for golden snapshots that want the full content.
 #[must_use]
 pub fn render_view_with_height(state: &ViewState, width: u16, height: u16) -> Buffer {
+    // TUI-G8 floor policy: below 20 columns the render is blanked.
+    // The buffer is allocated at the reported size so callers see the
+    // correct geometry, but no content cells are written.
+    if width < super::runtime::VIEWPORT_WIDTH_FLOOR {
+        return Buffer::empty(Rect::new(0, 0, width.max(1), height.max(1)));
+    }
     let composed = compose(state);
     let area = Rect::new(0, 0, width.max(1), height.max(1));
     let mut buf = Buffer::empty(area);

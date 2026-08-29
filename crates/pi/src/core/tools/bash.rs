@@ -50,7 +50,7 @@ const BASH_TEMP_FILE_PREFIX: &str = "pi-bash";
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct BashToolInput {
     /// Bash command to execute.
-    #[schemars(description = "Bash command to execute")]
+    #[schemars(description = "Shell command to execute")]
     pub command: String,
     /// Timeout in seconds (optional, no default timeout).
     #[serde(default, skip_serializing_if = "Option::is_none")]

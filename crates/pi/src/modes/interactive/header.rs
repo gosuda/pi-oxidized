@@ -9,7 +9,7 @@ use pi_tui::components::{Markdown, Spacer, Text};
 
 use super::messages::CONTENT_INDENT;
 use super::state::HeaderData;
-use super::theme::{self, MarkdownOptions, MarkdownTheme, ResolvedTheme, ThemeColor};
+use super::theme::{self, MarkdownTheme, ResolvedTheme, ThemeColor, user_markdown_options};
 
 /// Build the header component from header data.
 #[must_use]
@@ -35,12 +35,12 @@ pub fn build_header(
             0,
             md_theme,
             theme::default_text_style(),
-            MarkdownOptions::default(),
+            user_markdown_options(),
         )));
     } else {
         let onboarding = data.onboarding.clone().unwrap_or_default();
         let compact = if onboarding.is_empty() {
-            format!("{logo}  •  type a message, `/` for commands, `?` for help")
+            format!("{logo}  •  type a message to begin")
         } else {
             format!("{logo}  •  {onboarding}")
         };

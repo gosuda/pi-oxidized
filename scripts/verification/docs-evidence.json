@@ -1,0 +1,876 @@
+{
+	"schema": "pi.docs.evidence.v1",
+	"referencePin": "8fa7eebd235355522c8104166b4f1f959b4e2f10",
+	"rows": [
+		{
+			"id": "ref-root-readme",
+			"surface": ".references/pi/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/README.md"
+			}
+		},
+		{
+			"id": "ref-contributing",
+			"surface": ".references/pi/CONTRIBUTING.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/CONTRIBUTING.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/CONTRIBUTING.md"
+			}
+		},
+		{
+			"id": "ref-security",
+			"surface": ".references/pi/SECURITY.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/SECURITY.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/SECURITY.md"
+			}
+		},
+		{
+			"id": "ref-agents",
+			"surface": ".references/pi/AGENTS.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/AGENTS.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/AGENTS.md"
+			}
+		},
+		{
+			"id": "ca-doc-quickstart",
+			"surface": ".references/pi/packages/coding-agent/docs/quickstart.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/quickstart.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/quickstart.md"
+			}
+		},
+		{
+			"id": "ca-doc-usage",
+			"surface": ".references/pi/packages/coding-agent/docs/usage.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/usage.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/usage.md"
+			}
+		},
+		{
+			"id": "ca-doc-providers",
+			"surface": ".references/pi/packages/coding-agent/docs/providers.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/providers.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/providers.md"
+			}
+		},
+		{
+			"id": "ca-doc-llama-cpp",
+			"surface": ".references/pi/packages/coding-agent/docs/llama-cpp.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/llama-cpp.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/llama-cpp.md"
+			}
+		},
+		{
+			"id": "ca-doc-security",
+			"surface": ".references/pi/packages/coding-agent/docs/security.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/security.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/security.md"
+			}
+		},
+		{
+			"id": "ca-doc-containerization",
+			"surface": ".references/pi/packages/coding-agent/docs/containerization.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/containerization.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/containerization.md"
+			}
+		},
+		{
+			"id": "ca-doc-settings",
+			"surface": ".references/pi/packages/coding-agent/docs/settings.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/settings.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/settings.md"
+			}
+		},
+		{
+			"id": "ca-doc-keybindings",
+			"surface": ".references/pi/packages/coding-agent/docs/keybindings.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/keybindings.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/keybindings.md"
+			}
+		},
+		{
+			"id": "ca-doc-sessions",
+			"surface": ".references/pi/packages/coding-agent/docs/sessions.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/sessions.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/sessions.md"
+			}
+		},
+		{
+			"id": "ca-doc-compaction",
+			"surface": ".references/pi/packages/coding-agent/docs/compaction.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/compaction.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/compaction.md"
+			}
+		},
+		{
+			"id": "ca-doc-extensions",
+			"surface": ".references/pi/packages/coding-agent/docs/extensions.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/extensions.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/extensions.md"
+			}
+		},
+		{
+			"id": "ca-doc-skills",
+			"surface": ".references/pi/packages/coding-agent/docs/skills.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/skills.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/skills.md"
+			}
+		},
+		{
+			"id": "ca-doc-prompt-templates",
+			"surface": ".references/pi/packages/coding-agent/docs/prompt-templates.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/prompt-templates.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/prompt-templates.md"
+			}
+		},
+		{
+			"id": "ca-doc-themes",
+			"surface": ".references/pi/packages/coding-agent/docs/themes.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/themes.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/themes.md"
+			}
+		},
+		{
+			"id": "ca-doc-packages",
+			"surface": ".references/pi/packages/coding-agent/docs/packages.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/packages.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/packages.md"
+			}
+		},
+		{
+			"id": "ca-doc-models",
+			"surface": ".references/pi/packages/coding-agent/docs/models.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/models.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/models.md"
+			}
+		},
+		{
+			"id": "ca-doc-custom-provider",
+			"surface": ".references/pi/packages/coding-agent/docs/custom-provider.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/custom-provider.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/custom-provider.md"
+			}
+		},
+		{
+			"id": "ca-doc-sdk",
+			"surface": ".references/pi/packages/coding-agent/docs/sdk.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/sdk.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/sdk.md"
+			}
+		},
+		{
+			"id": "ca-doc-rpc",
+			"surface": ".references/pi/packages/coding-agent/docs/rpc.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/rpc.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/rpc.md"
+			}
+		},
+		{
+			"id": "ca-doc-json",
+			"surface": ".references/pi/packages/coding-agent/docs/json.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/json.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/json.md"
+			}
+		},
+		{
+			"id": "ca-doc-tui",
+			"surface": ".references/pi/packages/coding-agent/docs/tui.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/tui.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/tui.md"
+			}
+		},
+		{
+			"id": "ca-doc-environment-variables",
+			"surface": ".references/pi/packages/coding-agent/docs/environment-variables.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/environment-variables.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/environment-variables.md"
+			}
+		},
+		{
+			"id": "ca-doc-session-format",
+			"surface": ".references/pi/packages/coding-agent/docs/session-format.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/session-format.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/session-format.md"
+			}
+		},
+		{
+			"id": "ca-doc-windows",
+			"surface": ".references/pi/packages/coding-agent/docs/windows.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/windows.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/windows.md"
+			}
+		},
+		{
+			"id": "ca-doc-termux",
+			"surface": ".references/pi/packages/coding-agent/docs/termux.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/termux.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/termux.md"
+			}
+		},
+		{
+			"id": "ca-doc-tmux",
+			"surface": ".references/pi/packages/coding-agent/docs/tmux.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/tmux.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/tmux.md"
+			}
+		},
+		{
+			"id": "ca-doc-terminal-setup",
+			"surface": ".references/pi/packages/coding-agent/docs/terminal-setup.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/terminal-setup.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/terminal-setup.md"
+			}
+		},
+		{
+			"id": "ca-doc-shell-aliases",
+			"surface": ".references/pi/packages/coding-agent/docs/shell-aliases.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/shell-aliases.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/shell-aliases.md"
+			}
+		},
+		{
+			"id": "ca-doc-development",
+			"surface": ".references/pi/packages/coding-agent/docs/development.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/docs/development.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/docs/development.md"
+			}
+		},
+		{
+			"id": "ac-doc-harness",
+			"surface": ".references/pi/packages/agent/docs/harness.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/agent/docs/harness.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/agent/docs/harness.md"
+			}
+		},
+		{
+			"id": "ac-doc-search",
+			"surface": ".references/pi/packages/agent/docs/search.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/agent/docs/search.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/agent/docs/search.md"
+			}
+		},
+		{
+			"id": "ac-doc-telemetry-schema",
+			"surface": ".references/pi/packages/agent/docs/telemetry-schema.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/agent/docs/telemetry-schema.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/agent/docs/telemetry-schema.md"
+			}
+		},
+		{
+			"id": "ref-pkg-coding-agent",
+			"surface": ".references/pi/packages/coding-agent/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/README.md"
+			}
+		},
+		{
+			"id": "ref-pkg-agent",
+			"surface": ".references/pi/packages/agent/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/agent/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/agent/README.md"
+			}
+		},
+		{
+			"id": "ref-pkg-ai",
+			"surface": ".references/pi/packages/ai/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/ai/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/ai/README.md"
+			}
+		},
+		{
+			"id": "ref-pkg-tui",
+			"surface": ".references/pi/packages/tui/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/tui/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/tui/README.md"
+			}
+		},
+		{
+			"id": "ref-pkg-tui-native-darwin",
+			"surface": ".references/pi/packages/tui/native/darwin/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/tui/native/darwin/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/tui/native/darwin/README.md"
+			}
+		},
+		{
+			"id": "ref-pkg-tui-native-win32",
+			"surface": ".references/pi/packages/tui/native/win32/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/tui/native/win32/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/tui/native/win32/README.md"
+			}
+		},
+		{
+			"id": "ref-pkg-client",
+			"surface": ".references/pi/packages/client/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/client/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/client/README.md"
+			}
+		},
+		{
+			"id": "ref-pkg-protocol",
+			"surface": ".references/pi/packages/protocol/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/protocol/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/protocol/README.md"
+			}
+		},
+		{
+			"id": "ref-pkg-server",
+			"surface": ".references/pi/packages/server/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/server/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/server/README.md"
+			}
+		},
+		{
+			"id": "ref-pkg-session-sqlite",
+			"surface": ".references/pi/packages/session-backends/sqlite-node/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/session-backends/sqlite-node/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/session-backends/sqlite-node/README.md"
+			}
+		},
+		{
+			"id": "ref-pkg-telemetry",
+			"surface": ".references/pi/packages/telemetry/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/telemetry/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/telemetry/README.md"
+			}
+		},
+		{
+			"id": "ref-pkg-evals",
+			"surface": ".references/pi/packages/evals/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/evals/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/evals/README.md"
+			}
+		},
+		{
+			"id": "ws-pkg-pi-tui-protocol",
+			"surface": "packages/pi-tui-protocol/package.json",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "packages/pi-tui-protocol/package.json",
+			"class": "review-only-prose",
+			"params": {
+				"source": "packages/pi-tui-protocol/package.json"
+			}
+		},
+		{
+			"id": "ws-pkg-extension-host",
+			"surface": "packages/extension-host/package.json",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "packages/extension-host/package.json",
+			"class": "review-only-prose",
+			"params": {
+				"source": "packages/extension-host/package.json"
+			}
+		},
+		{
+			"id": "ref-examples-root",
+			"surface": ".references/pi/packages/coding-agent/examples/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/examples/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/examples/README.md"
+			}
+		},
+		{
+			"id": "ref-examples-sdk",
+			"surface": ".references/pi/packages/coding-agent/examples/sdk/README.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/examples/sdk/README.md",
+			"class": "review-only-prose",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/examples/sdk/README.md"
+			}
+		},
+		{
+			"id": "cli-release-args",
+			"surface": "scripts/release/args.ts",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "scripts/release/args.ts",
+			"class": "transcript-claim",
+			"params": {
+				"source": "scripts/release/args.ts",
+				"claim": "--target"
+			}
+		},
+		{
+			"id": "cli-coding-agent",
+			"surface": ".references/pi/packages/coding-agent/package.json",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/package.json",
+			"class": "transcript-claim",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/package.json",
+				"claim": "cli.js"
+			}
+		},
+		{
+			"id": "cli-ai",
+			"surface": ".references/pi/packages/ai/package.json",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/ai/package.json",
+			"class": "transcript-claim",
+			"params": {
+				"source": ".references/pi/packages/ai/package.json",
+				"claim": "pi-ai"
+			}
+		},
+		{
+			"id": "cl-coding-agent",
+			"surface": ".references/pi/packages/coding-agent/CHANGELOG.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/coding-agent/CHANGELOG.md",
+			"class": "changelog-unreleased",
+			"params": {
+				"source": ".references/pi/packages/coding-agent/CHANGELOG.md"
+			}
+		},
+		{
+			"id": "cl-agent",
+			"surface": ".references/pi/packages/agent/CHANGELOG.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/agent/CHANGELOG.md",
+			"class": "changelog-unreleased",
+			"params": {
+				"source": ".references/pi/packages/agent/CHANGELOG.md"
+			}
+		},
+		{
+			"id": "cl-ai",
+			"surface": ".references/pi/packages/ai/CHANGELOG.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/ai/CHANGELOG.md",
+			"class": "changelog-unreleased",
+			"params": {
+				"source": ".references/pi/packages/ai/CHANGELOG.md"
+			}
+		},
+		{
+			"id": "cl-tui",
+			"surface": ".references/pi/packages/tui/CHANGELOG.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/tui/CHANGELOG.md",
+			"class": "changelog-unreleased",
+			"params": {
+				"source": ".references/pi/packages/tui/CHANGELOG.md"
+			}
+		},
+		{
+			"id": "cl-client",
+			"surface": ".references/pi/packages/client/CHANGELOG.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/client/CHANGELOG.md",
+			"class": "changelog-unreleased",
+			"params": {
+				"source": ".references/pi/packages/client/CHANGELOG.md"
+			}
+		},
+		{
+			"id": "cl-protocol",
+			"surface": ".references/pi/packages/protocol/CHANGELOG.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/protocol/CHANGELOG.md",
+			"class": "changelog-unreleased",
+			"params": {
+				"source": ".references/pi/packages/protocol/CHANGELOG.md"
+			}
+		},
+		{
+			"id": "cl-server",
+			"surface": ".references/pi/packages/server/CHANGELOG.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/server/CHANGELOG.md",
+			"class": "changelog-unreleased",
+			"params": {
+				"source": ".references/pi/packages/server/CHANGELOG.md"
+			}
+		},
+		{
+			"id": "cl-session-sqlite",
+			"surface": ".references/pi/packages/session-backends/sqlite-node/CHANGELOG.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/session-backends/sqlite-node/CHANGELOG.md",
+			"class": "changelog-unreleased",
+			"params": {
+				"source": ".references/pi/packages/session-backends/sqlite-node/CHANGELOG.md"
+			}
+		},
+		{
+			"id": "cl-telemetry",
+			"surface": ".references/pi/packages/telemetry/CHANGELOG.md",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".references/pi/packages/telemetry/CHANGELOG.md",
+			"class": "changelog-unreleased",
+			"params": {
+				"source": ".references/pi/packages/telemetry/CHANGELOG.md"
+			}
+		},
+		{
+			"id": "vr-protocol-version",
+			"surface": "packages/pi-tui-protocol/src/types.ts#PROTOCOL_VERSION",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "packages/pi-tui-protocol/src/types.ts#PROTOCOL_VERSION",
+			"class": "version-pin",
+			"params": {
+				"label": "PROTOCOL_VERSION",
+				"expected": "1",
+				"source": "packages/pi-tui-protocol/src/types.ts"
+			}
+		},
+		{
+			"id": "vr-compatibility-version",
+			"surface": "packages/pi-tui-protocol/src/types.ts#COMPATIBILITY_VERSION",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "packages/pi-tui-protocol/src/types.ts#COMPATIBILITY_VERSION",
+			"class": "version-pin",
+			"params": {
+				"label": "COMPATIBILITY_VERSION",
+				"expected": "0.80.10",
+				"source": "packages/pi-tui-protocol/src/types.ts"
+			}
+		},
+		{
+			"id": "vr-bun-runtime-version",
+			"surface": "scripts/release/runtime.ts#BUN_RUNTIME_VERSION",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "scripts/release/runtime.ts#BUN_RUNTIME_VERSION",
+			"class": "version-pin",
+			"params": {
+				"label": "BUN_RUNTIME_VERSION",
+				"expected": "1.3.14",
+				"source": "scripts/release/runtime.ts"
+			}
+		},
+		{
+			"id": "vr-release-manifest-schema",
+			"surface": "scripts/release/stage.ts#RELEASE_MANIFEST_SCHEMA",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "scripts/release/stage.ts#RELEASE_MANIFEST_SCHEMA",
+			"class": "version-pin",
+			"params": {
+				"label": "RELEASE_MANIFEST_SCHEMA",
+				"expected": "pi.release.v1",
+				"source": "scripts/release/stage.ts"
+			}
+		},
+		{
+			"id": "cm-compat-matrix",
+			"surface": "scripts/verification/compat-matrix.json",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "scripts/verification/compat-matrix.json",
+			"class": "matrix-count",
+			"params": {
+				"source": "scripts/verification/compat-matrix.json",
+				"expectedCount": 40,
+				"countMethod": "json-array",
+				"countKey": "rows"
+			}
+		},
+		{
+			"id": "ri-release-process",
+			"surface": "scripts/release/",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "scripts/release/",
+			"class": "review-only-prose",
+			"params": {
+				"source": "scripts/release/host.ts"
+			}
+		},
+		{
+			"id": "ga-release-json",
+			"surface": "release.json",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "release.json",
+			"class": "generated-block",
+			"params": {
+				"generator": "scripts/release/stage.ts",
+				"artifact": "release.json"
+			}
+		},
+		{
+			"id": "ga-sha256-sidecars",
+			"surface": ".sha256 checksum sidecars",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": ".sha256 checksum sidecars",
+			"class": "generated-block",
+			"params": {
+				"generator": "scripts/release/targets.ts",
+				"artifact": ".sha256 checksum sidecars"
+			}
+		},
+		{
+			"id": "ga-model-catalogs",
+			"surface": "model catalogs/data",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "model catalogs/data",
+			"class": "generated-block",
+			"params": {
+				"generator": ".references/pi/packages/ai/scripts/generate-models.ts",
+				"artifact": "model catalogs/data"
+			}
+		},
+		{
+			"id": "ga-npm-shrinkwrap",
+			"surface": "npm-shrinkwrap.json",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "npm-shrinkwrap.json",
+			"class": "generated-block",
+			"params": {
+				"generator": ".references/pi/packages/coding-agent/package.json",
+				"artifact": "npm-shrinkwrap.json"
+			}
+		},
+		{
+			"id": "ga-telemetry-docs",
+			"surface": "telemetry documentation",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "telemetry documentation",
+			"class": "generated-block",
+			"params": {
+				"generator": ".references/pi/packages/agent/scripts/generate-telemetry-docs.ts",
+				"artifact": "telemetry documentation"
+			}
+		},
+		{
+			"id": "ga-compiled-binaries",
+			"surface": "compiled binaries/bundles",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "compiled binaries/bundles",
+			"class": "generated-block",
+			"params": {
+				"generator": "packages/extension-host/package.json",
+				"artifact": "compiled binaries/bundles"
+			}
+		},
+		{
+			"id": "pm-rust-targets",
+			"surface": "scripts/release/targets.ts#RUST_TARGETS",
+			"owner": "DOC-A",
+			"status": "present",
+			"target": "scripts/release/targets.ts#RUST_TARGETS",
+			"class": "matrix-count",
+			"params": {
+				"source": "scripts/release/targets.ts",
+				"expectedCount": 7,
+				"countMethod": "regex",
+				"countKey": "RUST_TARGETS"
+			}
+		}
+	]
+}

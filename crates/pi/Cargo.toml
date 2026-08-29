@@ -11,14 +11,14 @@ workspace = true
 
 [dependencies]
 anstyle = "=1.0.14"
-base64 = "=0.22.1"
+base64 = "=0.23.1"
 crossterm = { version = "=0.29.0", default-features = false, features = ["bracketed-paste", "events"] }
-futures = { version = "=0.3.32", default-features = false, features = ["alloc"] }
-globset = { version = "=0.4.19", default-features = false }
-ignore = "=0.4.30"
+futures = { version = "=0.3.34", default-features = false, features = ["alloc"] }
+globset = { version = "=0.4.20", default-features = false }
+ignore = "=0.4.33"
 image = { version = "=0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 dirs = "=6.0.0"
-jiff = "=0.2.32"
+jiff = "=0.2.35"
 indexmap = { version = "=2.14.0", features = ["serde"] }
 memchr = "=2.8.3"
 pi-agent = { version = "=0.1.0", path = "../pi-agent" }
@@ -29,19 +29,19 @@ ratatui = { version = "=0.30.2", default-features = false, features = ["crosster
 semver = "=1.0.28"
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "system-proxy"] }
 regex = "=1.13.1"
-serde = { version = "=1.0.228", features = ["derive"] }
-schemars = "=1.2.1"
+serde = { version = "=1.0.229", features = ["derive", "rc"] }
+schemars = "=1.2.2"
 same-file = "=1.0.6"
-serde-saphyr = { version = "=0.0.29", default-features = false, features = ["deserialize"] }
+serde-saphyr = { version = "=1.1.0", default-features = false, features = ["deserialize"] }
 sha2 = { version = "=0.11.0", default-features = false }
-serde_json = "=1.0.150"
+serde_json = "=1.0.151"
 syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "regex-fancy", "yaml-load"] }
-thiserror = "=2.0.18"
-tokio = { version = "=1.52.4", default-features = false, features = ["fs", "io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "=0.7.18", default-features = false, features = ["rt"] }
+thiserror = "=2.0.20"
+tokio = { version = "=1.53.1", default-features = false, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "=0.7.19", default-features = false, features = ["rt"] }
 unicode-normalization = "=0.1.25"
 url = "=2.5.8"
-uuid = { version = "=1.24.0", features = ["v4", "v7"] }
+uuid = { version = "=1.26.0", features = ["v4", "v7"] }
 wait-timeout = "=0.2.1"
 
 [target.'cfg(unix)'.dependencies]
@@ -51,8 +51,13 @@ nix = { version = "=0.31.3", default-features = false, features = ["signal"] }
 rustix = { version = "=1.1.4", default-features = false, features = ["fs"] }
 
 [dev-dependencies]
+pi-tui = { version = "=0.1.0", path = "../pi-tui", features = ["testkit"] }
 insta = { version = "=1.48.0", features = ["filters"] }
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 # test-util enables tokio::time::pause/advance for the spinner runtime test.
-tokio = { version = "=1.52.4", default-features = false, features = ["test-util"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["test-util"] }
 tempfile = "=3.27.0"
+
+[[bin]]
+name = "session-timing"
+path = "src/bin/session-timing.rs"

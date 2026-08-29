@@ -66,6 +66,27 @@ describe("args", () => {
 		expect(args.outDir).toBe("/tmp/r2");
 	});
 
+	test("resolves --runtime-cache to an absolute path and defaults to undefined", () => {
+		const absolute = parseReleaseArgs(
+			["--target", "x86_64-unknown-linux-gnu", "--runtime-cache", "/var/cache/pi"],
+			"/cwd",
+		);
+		expect(absolute.runtimeCache).toBe("/var/cache/pi");
+
+		const relative = parseReleaseArgs(
+			["--target", "x86_64-unknown-linux-gnu", "--runtime-cache", "rel/cache"],
+			"/cwd",
+		);
+		expect(relative.runtimeCache).toBe("/cwd/rel/cache");
+
+		const omitted = parseReleaseArgs(["--target", "x86_64-unknown-linux-gnu"], "/cwd");
+		expect(omitted.runtimeCache).toBeUndefined();
+
+		expect(() =>
+			parseReleaseArgs(["--target", "x86_64-unknown-linux-gnu", "--runtime-cache"]),
+		).toThrow(MissingArgValueError);
+	});
+
 	test("rejects missing --target with MissingTargetError", () => {
 		expect(() => parseReleaseArgs([])).toThrow(MissingTargetError);
 	});

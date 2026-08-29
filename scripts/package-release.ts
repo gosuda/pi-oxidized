@@ -13,12 +13,13 @@
  * Usage:
  *   bun run scripts/package-release.ts --target <triple> [--out <dir>] [--dry-run]
  *
- *   --target <triple>        one of the five supported Rust triples
+ *   --target <triple>        one of the seven supported Rust triples
  *   --out / --out-dir <dir>  output directory (default: <cwd>/dist/release)
  *   --dry-run                skip cargo + host build; assemble from stub binaries
  *   --no-cargo               skip cargo build, but still compile host and archive
  *   --no-handshake           skip the host `hello` handshake verification
  *   --source-date-epoch <s>  override SOURCE_DATE_EPOCH for archive mtimes
+ *   --runtime-cache <dir>   offline cache for pinned Bun runtime assets
  *
  * Verification check 13 calls for, from the unpacked archive:
  *   - `pi --version` (binary runs and reports the workspace version)
@@ -30,11 +31,12 @@
  */
 
 import { mkdir, rm } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import { checksumLine, extractZip, sha256Bytes, writeTarGz, writeZip } from "./release/archive.ts";
 import { parseReleaseArgs } from "./release/args.ts";
 import {
+	buildFallbackBundle,
 	buildHost,
 	helloRequestLine,
 	HOST_COMPATIBILITY_VERSION,
@@ -51,6 +53,56 @@ const CARGO_BUILD_TIMEOUT_MS = 30 * 60_000;
 const ARCHIVE_TOOL_TIMEOUT_MS = 2 * 60_000;
 const SMOKE_TIMEOUT_MS = 30_000;
 
+/** The section a releasable CHANGELOG must carry with at least one entry. */
+const UNRELEASED_SECTION = "## [Unreleased]";
+
+/**
+ * Release-path gate: return the failure reason when the root CHANGELOG.md is
+ * missing or its `## [Unreleased]` section carries no entries, else `null`.
+ * Enforced for every build mode (dry-run, no-cargo, full) before any build
+ * work starts, so no release is cut without release notes.
+ */
+export async function changelogGateFailure(fs: Fs, repoRoot: string): Promise<string | null> {
+	const path = join(repoRoot, "CHANGELOG.md");
+	let text: string;
+	try {
+		text = new TextDecoder().decode(await fs.readFile(path));
+	} catch {
+		return (
+			`release CHANGELOG gate: ${path} is missing; every release build ` +
+			`(dry-run and full) requires a CHANGELOG.md with a non-empty ${UNRELEASED_SECTION} section`
+		);
+	}
+	const lines = text.split(/\r?\n/);
+	const start = lines.findIndex((line) => line.trim() === UNRELEASED_SECTION);
+	if (start === -1) {
+		return (
+			`release CHANGELOG gate: ${path} has no ${UNRELEASED_SECTION} section; ` +
+			`add release notes before building a release`
+		);
+	}
+	const section = lines.slice(start + 1);
+	const end = section.findIndex((line) => line.startsWith("## "));
+	const body = end === -1 ? section : section.slice(0, end);
+	const hasEntries = body.some((line) => {
+		const trimmed = line.trim();
+		return trimmed.length > 0 && !trimmed.startsWith("#");
+	});
+	if (!hasEntries) {
+		return (
+			`release CHANGELOG gate: ${path} has an empty ${UNRELEASED_SECTION} section; ` +
+			`add release notes before building a release`
+		);
+	}
+	return null;
+}
+
+/** Fail the build when the root CHANGELOG gate trips. */
+export async function enforceChangelogGate(fs: Fs, repoRoot: string): Promise<void> {
+	const failure = await changelogGateFailure(fs, repoRoot);
+	if (failure !== null) throw new Error(failure);
+}
+
 
 async function main(): Promise<void> {
 	const args = parseReleaseArgs(process.argv.slice(2));
@@ -65,6 +117,10 @@ async function main(): Promise<void> {
 	process.stdout.write(
 		`Mode:            ${args.dryRun ? "dry-run" : args.noCargo ? "no-cargo" : "full"}\n\n`,
 	);
+
+	// Release CHANGELOG gate: fails every build mode (dry-run and full)
+	// before any build work when release notes are missing or empty.
+	await enforceChangelogGate(fs, repoRoot);
 
 	const stagingRoot = join(args.outDir, `.staging-release-${args.plan.rustTarget}`);
 	await fs.mkdir(stagingRoot, { recursive: true });
@@ -135,8 +191,66 @@ async function main(): Promise<void> {
 				);
 			} else {
 				process.stdout.write(`  Provisioning checksum-verified Bun runtime ${args.plan.bunTarget}...\n`);
-				await provisionBunRuntime({ plan: args.plan, destination: bunRuntimePath, fs });
+				await provisionBunRuntime({
+					plan: args.plan,
+					destination: bunRuntimePath,
+					cacheDir: args.runtimeCache,
+					fs,
+				});
 			}
+		}
+		// Musl rows ship both host execution paths: the compiled sidecar is
+		// the primary resolver path, and the pinned musl Bun runtime plus JS
+		// bundle ride along as the fallback (REL-T4 drives both `hello`
+		// protocols from the same unpacked archive).
+		let fallbackBundle:
+			| { readonly scriptPath: string; readonly bunRuntimePath: string }
+			| undefined;
+		if (args.plan.libc === "musl") {
+			if (host.kind !== "compiled") {
+				throw new Error(
+					`musl release for ${args.plan.rustTarget} requires a compiled sidecar; ` +
+						`host build produced ${host.kind}`,
+				);
+			}
+			const bunRuntimePath = join(
+				stagingRoot,
+				"host",
+				args.plan.rustTarget,
+				args.plan.bunRuntimeName,
+			);
+			let scriptPath: string;
+			await fs.mkdir(dirname(bunRuntimePath), { recursive: true });
+			if (args.dryRun) {
+				scriptPath = join(stagingRoot, args.plan.hostBundleName);
+				await fs.writeFile(
+					scriptPath,
+					`mock-host-bundle ${args.plan.bunTarget} source-date-epoch=${args.sourceDateEpoch}\n`,
+				);
+				await fs.writeFile(
+					bunRuntimePath,
+					`mock-bun-runtime ${args.plan.bunTarget} source-date-epoch=${args.sourceDateEpoch}\n`,
+				);
+			} else {
+				scriptPath = (
+					await buildFallbackBundle({
+						repoRoot,
+						stagingRoot,
+						plan: args.plan,
+						runner,
+					})
+				).scriptPath;
+				process.stdout.write(
+					`  Provisioning checksum-verified musl Bun runtime ${args.plan.bunTarget}...\n`,
+				);
+				await provisionBunRuntime({
+					plan: args.plan,
+					destination: bunRuntimePath,
+					cacheDir: args.runtimeCache,
+					fs,
+				});
+			}
+			fallbackBundle = { scriptPath, bunRuntimePath };
 		}
 
 		// 3. Assembly & verification.
@@ -152,20 +266,13 @@ async function main(): Promise<void> {
 			repoRoot,
 			host,
 			bunRuntimePath,
+			fallbackBundle,
 			fs,
 			sourceDateEpoch: parseInt(args.sourceDateEpoch, 10),
 			compatibilityVersion: HOST_COMPATIBILITY_VERSION,
 			protocolVersion: HOST_PROTOCOL_VERSION,
 			createdAt: new Date(parseInt(args.sourceDateEpoch, 10) * 1000).toISOString(),
-			docsSource: join(repoRoot, "crates", "pi", "docs"),
-			examplesSource: join(
-				repoRoot,
-				".references",
-				"pi",
-				"packages",
-				"coding-agent",
-				"examples",
-			),
+			docsSource: join(repoRoot, "docs"),
 			assetsSource: join(repoRoot, "crates", "pi", "assets"),
 		});
 

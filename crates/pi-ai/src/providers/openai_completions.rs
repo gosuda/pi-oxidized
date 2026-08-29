@@ -501,9 +501,7 @@ impl CompletionsProcessor {
     }
 
     fn update_message(&mut self, update: impl FnOnce(&mut AssistantMessage)) {
-        let mut message = self.state.snapshot();
-        update(&mut message);
-        self.state = AssistantState::new(message);
+        self.state.message_mut(update);
     }
 
     fn update_tool(
@@ -537,12 +535,13 @@ impl CompletionsProcessor {
     ) -> Result<(), AdapterFailure> {
         let index = usize::try_from(content_index)
             .map_err(|_| AdapterFailure::new("content index overflow"))?;
-        let mut message = self.state.snapshot();
-        let block = message.content.get_mut(index).ok_or_else(|| {
-            AdapterFailure::new(format!("content block {content_index} does not exist"))
+        self.state.message_mut(|message| {
+            let block = message.content.get_mut(index).ok_or_else(|| {
+                AdapterFailure::new(format!("content block {content_index} does not exist"))
+            })?;
+            update(block);
+            Ok::<(), AdapterFailure>(())
         })?;
-        update(block);
-        self.state = AssistantState::new(message);
         Ok(())
     }
 }

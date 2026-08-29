@@ -1,0 +1,13 @@
+{
+  "properties": {
+    "limit": {
+      "description": "Maximum number of entries to return (default: 500)",
+      "type": "number"
+    },
+    "path": {
+      "description": "Directory to list (default: current directory)",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

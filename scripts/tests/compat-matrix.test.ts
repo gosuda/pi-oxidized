@@ -1,6 +1,11 @@
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, test } from "bun:test";
 
 import {
+	captureDocsEvidence,
 	runCommand,
 	runMatrix,
 	selectRows,
@@ -8,6 +13,12 @@ import {
 	validateMatrix,
 	type Matrix,
 } from "../verification/compat-matrix.ts";
+import {
+	EXPECTED_LEDGER_ROW_COUNT,
+	canonicalJson,
+} from "../verification/docs-evidence.ts";
+import { RUN_MANIFEST_SCHEMA, sha256 } from "../verification/docs-evidence-runners.ts";
+import { CANONICAL_REFERENCE_SHA } from "../verification/alignment.ts";
 
 function validCommand() {
 	return {
@@ -286,6 +297,147 @@ describe("runMatrix", () => {
 		expect(result.rowResults[0]?.error).toMatch(/launch\/read error/);
 		expect(result.summary.requiredFailed).toEqual(["r1"]);
 	});
+
+	test("fails a required row with a named prerequisite error when requires is missing", async () => {
+		const matrix: Matrix = {
+			version: "0.2.0",
+			rows: [
+				{
+					id: "r1",
+					surface: "a",
+					tier: "unit",
+					required: true,
+					requires: ["/nonexistent-musl-prerequisite-path"],
+					commands: [validCommand()],
+					evidence: "e",
+				},
+			],
+		};
+		const result = await runMatrix({
+			matrix,
+			matrixPath: "scripts/verification/compat-matrix.json",
+			repoRoot,
+			request: {},
+			dryRun: false,
+		});
+		expect(result.rowResults[0]?.status).toBe("failed");
+		expect(result.rowResults[0]?.error).toBe(
+			"missing prerequisite: /nonexistent-musl-prerequisite-path not found under " + repoRoot,
+		);
+		expect(result.summary.requiredFailed).toEqual(["r1"]);
+		expect(result.commandResults).toHaveLength(0);
+	});
+});
+
+describe("captureDocsEvidence", () => {
+	const runId = "2026-08-29T14:09:47.447Z";
+	const entries = Array.from({ length: EXPECTED_LEDGER_ROW_COUNT }, (_, index) => ({
+		rowId: `row-${index}`,
+		status: "present" as const,
+		contentHash: index.toString(16).padStart(64, "0"),
+	}));
+	const ledger = {
+		schema: "pi.docs.evidence.v1",
+		referencePin: CANONICAL_REFERENCE_SHA,
+		rows: entries.map(({ rowId }) => ({ id: rowId })),
+	};
+
+	function writeEvidenceFixture(root: string, rowCount = EXPECTED_LEDGER_ROW_COUNT) {
+		const ledgerDir = join(root, "scripts/verification");
+		const manifestDir = join(root, "target/verification/docs-evidence");
+		mkdirSync(ledgerDir, { recursive: true });
+		mkdirSync(manifestDir, { recursive: true });
+		writeFileSync(join(ledgerDir, "docs-evidence.json"), JSON.stringify(ledger));
+		const manifest = {
+			schema: RUN_MANIFEST_SCHEMA,
+			runId,
+			referencePin: CANONICAL_REFERENCE_SHA,
+			ledgerHash: sha256(canonicalJson(ledger)),
+			rowCount,
+			presentCount: rowCount,
+			entries,
+		};
+		const manifestPath = join(manifestDir, "run-manifest.json");
+		writeFileSync(manifestPath, JSON.stringify(manifest));
+		return { manifest, manifestPath };
+	}
+
+	function passingResult(manifestPath: string, emittedRunId = runId) {
+		return {
+			key: "docs-evidence",
+			cwd: ".",
+			argv: ["bun", "run", "scripts/verification/docs-evidence.ts"],
+			exitCode: 0,
+			durationMs: 1,
+			timedOut: false,
+			stdoutTail: `DOCS_EVIDENCE_OK runId=${emittedRunId} rows=77 manifest=${manifestPath}\n`,
+			stderrTail: "",
+			rowIds: ["docs-evidence"],
+		};
+	}
+
+	test("captures the full manifest from the canonical passing command", () => {
+		const root = mkdtempSync(join(tmpdir(), "compat-docs-evidence-"));
+		try {
+			const { manifest, manifestPath } = writeEvidenceFixture(root);
+			const captured = captureDocsEvidence(
+				{ cwd: ".", argv: ["bun", "run", "scripts/verification/docs-evidence.ts"], timeoutMs: 120_000 },
+				passingResult(manifestPath),
+				root,
+			);
+			expect(captured).toEqual(manifest);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a different command using the reserved row ID", () => {
+		const root = mkdtempSync(join(tmpdir(), "compat-docs-command-"));
+		try {
+			const { manifestPath } = writeEvidenceFixture(root);
+			expect(() =>
+				captureDocsEvidence(
+					{ cwd: ".", argv: ["bun", "-e", "process.exit(0)"], timeoutMs: 120_000 },
+					passingResult(manifestPath),
+					root,
+				),
+			).toThrow("did not run the canonical checker");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a manifest from a different run ID", () => {
+		const root = mkdtempSync(join(tmpdir(), "compat-docs-run-id-"));
+		try {
+			const { manifestPath } = writeEvidenceFixture(root);
+			expect(() =>
+				captureDocsEvidence(
+					{ cwd: ".", argv: ["bun", "run", "scripts/verification/docs-evidence.ts"], timeoutMs: 120_000 },
+					passingResult(manifestPath, "2026-08-29T14:10:00.000Z"),
+					root,
+				),
+			).toThrow("does not match the command or current ledger");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects an incomplete manifest", () => {
+		const root = mkdtempSync(join(tmpdir(), "compat-docs-incomplete-"));
+		try {
+			const { manifestPath } = writeEvidenceFixture(root, EXPECTED_LEDGER_ROW_COUNT - 1);
+			expect(() =>
+				captureDocsEvidence(
+					{ cwd: ".", argv: ["bun", "run", "scripts/verification/docs-evidence.ts"], timeoutMs: 120_000 },
+					passingResult(manifestPath),
+					root,
+				),
+			).toThrow("invalid docs-evidence run manifest");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("runCommand", () => {
@@ -314,5 +466,129 @@ describe("runCommand", () => {
 		);
 		expect(result.exitCode).toBe(3);
 		expect(result.stderr).toContain("err");
+	});
+});
+
+describe("release tier matrix 0.2.0 (REL-T5)", () => {
+	const repoRoot = join(import.meta.dir, "../..");
+	const matrixPath = join(repoRoot, "scripts/verification/compat-matrix.json");
+	const raw = readFileSync(matrixPath, "utf8");
+	const matrix = validateMatrix(JSON.parse(raw));
+	const releaseRows = selectRows(matrix, { tier: "release" });
+	const muslRows = releaseRows.filter((row) => row.id.endsWith("-musl"));
+	const tierNRows = releaseRows.filter(
+		(row) =>
+			/(?<!Not a )Tier N terminal-conformance row/.test(row.evidence) ||
+			(row.rationale !== undefined &&
+				/(?<!Not a )Tier N terminal-conformance row/.test(row.rationale)),
+	);
+	const excludedReleaseRows = releaseRows.filter((row) => row.excluded === true);
+	const locallyRequiredReleaseRows = releaseRows.filter(
+		(row) => row.required && row.excluded !== true,
+	);
+
+	/** Verbatim absence line owned by the musl transcript lane. */
+	function canonicalAbsenceLine(): string {
+		const source = readFileSync(
+			join(repoRoot, "crates/pi-tui/tests/transcript_musl_smoke.rs"),
+			"utf8",
+		);
+		const match = source.match(/const ABSENCE_LINE: &str = "([^"]+)";/);
+		if (match === null || match[1] === undefined) {
+			throw new Error("ABSENCE_LINE not found in transcript_musl_smoke.rs");
+		}
+		return match[1];
+	}
+
+	test("validateMatrix passes on the committed matrix at version 0.2.0", () => {
+		expect(matrix.version).toBe("0.2.0");
+	});
+
+	test("selectRows tier:release returns exactly the seven release target rows", () => {
+		expect(releaseRows.map((row) => row.id)).toEqual([
+			"release-x86_64-linux",
+			"release-aarch64-linux",
+			"release-x86_64-darwin",
+			"release-aarch64-darwin",
+			"release-x86_64-windows",
+			"release-x86_64-linux-musl",
+			"release-aarch64-linux-musl",
+		]);
+	});
+
+	test("exactly five release rows carry the Tier N terminal-conformance claim", () => {
+		expect(tierNRows).toHaveLength(5);
+		expect(tierNRows.map((row) => row.id).sort()).toEqual([
+			"release-aarch64-darwin",
+			"release-aarch64-linux",
+			"release-x86_64-darwin",
+			"release-x86_64-linux",
+			"release-x86_64-windows",
+		]);
+	});
+
+	test("exactly two release rows are locally required and five are excluded", () => {
+		expect(locallyRequiredReleaseRows.map((row) => row.id)).toEqual([
+			"release-x86_64-linux",
+			"release-x86_64-linux-musl",
+		]);
+		expect(excludedReleaseRows.map((row) => row.id).sort()).toEqual([
+			"release-aarch64-darwin",
+			"release-aarch64-linux",
+			"release-aarch64-linux-musl",
+			"release-x86_64-darwin",
+			"release-x86_64-windows",
+		]);
+	});
+
+	test("every excluded release row names its actual CI witness runner", () => {
+		const witnesses: Record<string, string> = {
+			"release-aarch64-linux": "ubuntu-24.04-arm",
+			"release-aarch64-linux-musl": "ubuntu-24.04-arm",
+			"release-aarch64-darwin": "macos-15",
+			"release-x86_64-darwin": "macos-15-intel",
+			"release-x86_64-windows": "windows-2025",
+		};
+		for (const row of excludedReleaseRows) {
+			const text = `${row.evidence} ${row.rationale ?? ""} ${row.citation ?? ""}`;
+			const witness = witnesses[row.id];
+			if (witness === undefined) throw new Error(`no CI witness pinned for ${row.id}`);
+			expect(text).toContain(witness);
+		}
+	});
+
+	test("both musl rows carry the absence line byte-identically to the transcript lane constant", () => {
+		expect(muslRows.map((row) => row.id).sort()).toEqual([
+			"release-aarch64-linux-musl",
+			"release-x86_64-linux-musl",
+		]);
+		const absence = canonicalAbsenceLine();
+		for (const row of muslRows) {
+			expect(row.evidence.includes(absence)).toBe(true);
+		}
+		// The absence line appears exactly twice in the whole matrix — once per
+		// musl row — and never on a Tier N row.
+		expect(raw.split(absence).length - 1).toBe(2);
+		for (const row of tierNRows) {
+			expect(
+				row.evidence.includes(absence) || (row.rationale?.includes(absence) ?? false),
+			).toBe(false);
+		}
+	});
+
+	test("local musl row names the musl userland prerequisite paths", () => {
+		const row = releaseRows.find((r) => r.id === "release-x86_64-linux-musl");
+		expect(row?.requires).toEqual(["/lib/ld-musl-x86_64.so.1", "/etc/ld-musl-x86_64.path"]);
+		expect(row?.rationale).toContain("musl-gcc");
+	});
+
+	test("aarch64 rationales claim native ubuntu-24.04-arm execution, never the cross-compile fallback", () => {
+		for (const id of ["release-aarch64-linux", "release-aarch64-linux-musl"]) {
+			const row = matrix.rows.find((r) => r.id === id);
+			expect(row?.rationale).toContain("ubuntu-24.04-arm");
+			expect(row?.rationale).toContain("no cross-compilation");
+			expect(row?.rationale).toContain("no QEMU");
+			expect(row?.rationale ?? "").not.toContain("Cross-compiling aarch64");
+		}
 	});
 });
