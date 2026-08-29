@@ -9,6 +9,12 @@ export const PTY_KEYS = {
 	left: "\x1b[D",
 } as const;
 
+const TERMINAL_QUERY_REPLIES = [["\x1b[c", "\x1b[?62;1;2;6;7;8;9c"]] as const;
+const MAX_TERMINAL_QUERY_LENGTH = Math.max(
+	"\x1b[6n".length,
+	...TERMINAL_QUERY_REPLIES.map(([query]) => query.length),
+);
+
 
 export interface PtyCommand {
 	argv: readonly [string, ...string[]];
@@ -101,7 +107,7 @@ export class PtyProcess {
 	readonly #stdin: Bun.FileSink;
 	readonly #cursorPosition: { readonly row: number; readonly column: number } | false;
 	#rawText = "";
-	#cursorScanOffset = 0;
+	#queryScanOffset = 0;
 	#exitCode: number | null = null;
 	#version = 0;
 	#listeners = new Set<() => void>();
@@ -271,7 +277,7 @@ export class PtyProcess {
 			const text = decoder.decode(copy, { stream: true });
 			if (source === "pty") {
 				this.#rawText += text;
-				this.#answerCursorQueries();
+				this.#answerTerminalQueries();
 			}
 			this.#chunks.push({
 				stream: source,
@@ -287,7 +293,7 @@ export class PtyProcess {
 		if (tail) {
 			if (source === "pty") {
 				this.#rawText += tail;
-				this.#answerCursorQueries();
+				this.#answerTerminalQueries();
 			}
 			this.#chunks.push({
 				stream: source,
@@ -300,16 +306,31 @@ export class PtyProcess {
 		}
 	}
 
-	#answerCursorQueries(): void {
-		if (this.#cursorPosition === false) return;
-		let query = this.#rawText.indexOf("\x1b[6n", this.#cursorScanOffset);
-		while (query >= 0) {
-			this.#stdin.write(`\x1b[${this.#cursorPosition.row};${this.#cursorPosition.column}R`);
+	#answerTerminalQueries(): void {
+		while (true) {
+			let nextQuery: { index: number; query: string; reply: string } | undefined;
+			const consider = (query: string, reply: string): void => {
+				const index = this.#rawText.indexOf(query, this.#queryScanOffset);
+				if (index >= 0 && (nextQuery === undefined || index < nextQuery.index)) {
+					nextQuery = { index, query, reply };
+				}
+			};
+			for (const [query, reply] of TERMINAL_QUERY_REPLIES) consider(query, reply);
+			if (this.#cursorPosition !== false) {
+				consider(
+					"\x1b[6n",
+					`\x1b[${this.#cursorPosition.row};${this.#cursorPosition.column}R`,
+				);
+			}
+			if (nextQuery === undefined) break;
+			this.#stdin.write(nextQuery.reply);
 			this.#stdin.flush();
-			this.#cursorScanOffset = query + 4;
-			query = this.#rawText.indexOf("\x1b[6n", this.#cursorScanOffset);
+			this.#queryScanOffset = nextQuery.index + nextQuery.query.length;
 		}
-		this.#cursorScanOffset = Math.max(this.#cursorScanOffset, this.#rawText.length - 3);
+		this.#queryScanOffset = Math.max(
+			this.#queryScanOffset,
+			this.#rawText.length - (MAX_TERMINAL_QUERY_LENGTH - 1),
+		);
 	}
 
 	#notify(): void {

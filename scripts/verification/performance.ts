@@ -98,7 +98,7 @@ const STREAM_MEMORY_SAMPLE_WINDOW_MS = 1_000;
 
 
 const implementationNames = ["rust", "typescript"] as const;
-type Implementation = (typeof implementationNames)[number];
+export type Implementation = (typeof implementationNames)[number];
 type SampleKind = "cold" | "warm";
 
 export interface Distribution {
@@ -1366,26 +1366,24 @@ export async function terminateAndRequireCleanExit(pty: PtyProcess, label: strin
 	if (code !== 0) throw new HarnessFailure(label, `${label} /quit exited ${code}\nPTY tail:\n${tail(pty.snapshot().rawText, 4_000)}`);
 }
 
-const REFERENCE_STARTUP_HINT = "Startup is still in progress";
 const EXTENSIONS_SECTION_MARKER = "[Extensions]";
 
-// After the first frame, the TypeScript reference can still be starting up
-// (it paints "Startup is still in progress" and only later repaints the
-// "[Extensions]" section); a prompt submitted inside that window is accepted
-// but never streams, so the lane would wait out the final-marker deadline.
-// Hold until the extensions section repaints. The hint check gates the wait:
-// the rust implementation never paints the hint and returns immediately.
-// Bounded and non-fatal — on timeout the prompt is submitted anyway and the
-// final-marker wait still validates the sample.
-async function settleExtensionStartup(pty: PtyProcess, label: string): Promise<void> {
-	if (!pty.snapshot().rawText.includes(REFERENCE_STARTUP_HINT)) return;
+// The TypeScript reference paints before its extension host is ready. A prompt
+// submitted in that window is accepted but never streams. Rust has no separate
+// extension-startup phase, so only the reference waits for its readiness marker.
+export async function settleExtensionStartup(
+	pty: PtyProcess,
+	implementation: Implementation,
+	label: string,
+): Promise<void> {
+	if (implementation === "rust") return;
 	try {
 		await pty.waitFor((snapshot) => snapshot.rawText.includes(EXTENSIONS_SECTION_MARKER), {
 			deadlineMs: 15_000,
 			source: "raw",
 		});
 	} catch {
-		status(`${label}: ${REFERENCE_STARTUP_HINT} still visible after 15s; submitting prompt anyway`);
+		status(`${label}: extensions not ready after 15s; submitting prompt for the lane deadline to adjudicate`);
 	}
 }
 
@@ -1442,7 +1440,6 @@ async function runFirstFrameSample(
 		cwd: sandbox,
 		env: benchmarkEnvironment(sandbox),
 		size: { columns: 100, rows: 32 },
-		cursorPosition: false,
 	});
 	const sampler = new ProcTreeSampler(pty.pid, PROC_SAMPLE_INTERVAL_MS);
 	try {
@@ -1573,7 +1570,7 @@ async function runStreamProcess(
 	const sampler = new ProcTreeSampler(pty.pid, PROC_SAMPLE_INTERVAL_MS);
 	try {
 		await pty.waitFor((snapshot) => frameObservation(snapshot) !== undefined, { deadlineMs: 20_000, source: "raw" });
-		await settleExtensionStartup(pty, `stream:${implementation}:${sampleId}`);
+		await settleExtensionStartup(pty, implementation, `stream:${implementation}:${sampleId}`);
 		const sample = await runStreamTurn(
 			pty,
 			sampler,
@@ -1998,7 +1995,7 @@ async function runStreamLoadMemorySample(
 			deadlineMs: 20_000,
 			source: "raw",
 		});
-		await settleExtensionStartup(pty, label);
+		await settleExtensionStartup(pty, implementation, label);
 		const promptOutputOffset = pty.snapshot().rawText.length;
 		const prompt = `check 9 memory-${implementation}-${sampleId}`;
 		pty.writeKeys("\x1b[200~", prompt, "\x1b[201~");
@@ -2182,7 +2179,7 @@ async function main(): Promise<void> {
 		coldCacheMethod: "sync once per cold group, then posix_fadvise(POSIX_FADV_DONTNEED) on the implementation executable before every cold sample",
 		firstFrameDefinition: "first complete DEC synchronized-output transaction; row-local printable CSI transaction is the recorded fallback",
 		firstFrameTerminalProfile:
-			"silent terminal during first-frame collection only: cursor-position replies disabled; elapsed time remains the completed-frame boundary",
+			"verification PTY answers device-attribute and cursor-position queries required to complete startup probing before the completed-frame boundary",
 		streamCpuDefinition: "whole-process-tree CPU immediately before submit Enter through final marker, divided by the fixed 256 deterministic provider text-delta frames; painted frame/coalescing counts recorded separately",
 		keypressDefinition: "per-key PTY write receipt to the completing chunk of the first balanced DEC 2026 transaction containing the typed key, empty editor per key, Ctrl+U clear paint outside timing, evaluated over fresh process rounds",
 		ptyTerm: PTY_TERM,

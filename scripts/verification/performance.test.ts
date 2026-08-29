@@ -20,6 +20,7 @@ import {
 	recordedQuitTimeouts,
 	recordEntrypointHarnessFailure,
 	sampleProcessTreeMemoryWindow,
+	settleExtensionStartup,
 	terminateAndRequireCleanExit,
 	STREAM_PTY_SIZE,
 	validateMemoryCoverage,
@@ -126,8 +127,61 @@ process.stdin.resume();
 setInterval(() => {}, 1_000);
 `;
 
+const DELAYED_EXTENSIONS_CHILD = `
+process.stdout.write(${JSON.stringify(SYNC_BEGIN)} + "first frame" + ${JSON.stringify(SYNC_END)} + "\\n");
+process.stdin.setEncoding("utf8");
+process.stdin.resume();
+const iterator = process.stdin[Symbol.asyncIterator]();
+await iterator.next();
+process.stdout.write(${JSON.stringify(SYNC_BEGIN)} + "[Extensions]" + ${JSON.stringify(SYNC_END)} + "\\n");
+await iterator.next();
+`;
+
+const TERMINAL_PROBE_CHILD = `
+process.stdin.setRawMode?.(true);
+process.stdin.setEncoding("utf8");
+process.stdin.resume();
+process.stdout.write("\\x1b[>1u\\x1b[?u\\x1b[c\\x1b[16t\\x1b]11;?\\x07\\x1b[6n");
+const expected = ["\\x1b[?62;1;2;6;7;8;9c", "\\x1b[1;1R"];
+let input = "";
+for await (const chunk of process.stdin) {
+	input += chunk;
+	if (expected.every((reply) => input.includes(reply))) break;
+}
+process.stdout.write(${JSON.stringify(SYNC_BEGIN)} + "probe complete" + ${JSON.stringify(SYNC_END)} + "\\n");
+`;
+
 const CLEAN_EXIT_CHILD = "process.exit(0);";
 const FAILURE_EXIT_CHILD = "process.exit(7);";
+
+describe.skipIf(isWindows)("TypeScript extension startup settlement", () => {
+	test("waits past the first frame for the extensions readiness marker", async () => {
+		const sandbox = temporaryDirectory("perf-extension-startup-");
+		const pty = spawnPty({
+			argv: [bunExecutable, "-e", DELAYED_EXTENSIONS_CHILD],
+			cwd: sandbox,
+			size: { columns: 80, rows: 24 },
+		});
+		try {
+			await pty.waitFor((candidate) => frameObservation(candidate) !== undefined, {
+				deadlineMs: 5_000,
+				source: "raw",
+			});
+			expect(pty.snapshot().rawText).not.toContain("[Extensions]");
+			let settled = false;
+			const settlement = settleExtensionStartup(pty, "typescript", "test:extension-startup").then(() => {
+				settled = true;
+			});
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			pty.writeKeys("r", "\r");
+			await settlement;
+			expect(pty.snapshot().rawText).toContain("[Extensions]");
+		} finally {
+			await pty.terminate();
+		}
+	}, 10_000);
+});
 
 describe.skipIf(isWindows)("performance first-frame lifecycle", () => {
 	// Internal deadlines exercised by the ignore-quit test: 5_000ms frame
@@ -355,17 +409,32 @@ describe("timed CPU sampler purity", () => {
 	}, 15_000);
 });
 
-describe("first-frame PTY profile", () => {
-	test("uses a silent terminal instead of answering one probe from the startup batch", () => {
+describe.skipIf(isWindows)("terminal probe emulation", () => {
+	test("answers completion-required probes through a real PTY", async () => {
+		const sandbox = temporaryDirectory("perf-terminal-probes-");
+		const pty = spawnPty({
+			argv: [bunExecutable, "-e", TERMINAL_PROBE_CHILD],
+			cwd: sandbox,
+			size: { columns: 100, rows: 32 },
+		});
+		try {
+			await pty.waitFor((snapshot) => snapshot.rawText.includes("probe complete"), {
+				deadlineMs: 5_000,
+				source: "raw",
+			});
+			expect(await pty.waitForExit(5_000)).toBe(0);
+		} finally {
+			await pty.terminate();
+		}
+	}, 15_000);
+
+	test("first-frame collection uses the complete default probe profile", () => {
 		const source = readFileSync(PERFORMANCE_MODULE, "utf8");
 		const functionStart = source.indexOf("async function runFirstFrameSample(");
 		const spawnStart = source.indexOf("const pty = spawnPty({", functionStart);
 		const spawnEnd = source.indexOf("const sampler = new ProcTreeSampler", spawnStart);
-		const firstFrameSpawn = source.slice(spawnStart, spawnEnd);
-		expect(firstFrameSpawn).toContain("cursorPosition: false");
-		expect(source.match(/cursorPosition:\s*false/g)).toHaveLength(1);
-		expect(source).toContain("firstFrameTerminalProfile:");
-		expect(source).toContain('"silent terminal during first-frame collection only:');
+		expect(source.slice(spawnStart, spawnEnd)).not.toContain("cursorPosition: false");
+		expect(source).toContain('"verification PTY answers device-attribute and cursor-position');
 	});
 });
 
