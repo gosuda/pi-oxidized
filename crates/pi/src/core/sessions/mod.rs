@@ -258,11 +258,7 @@ impl SessionManager {
     /// Shared constructor body: resolved cwd/dir, session-dir creation, and
     /// the empty manager that the file-loading entry points
     /// ([`Self::set_session_file`], [`Self::open`]) then populate.
-    fn construct_empty(
-        cwd: &str,
-        session_dir: &str,
-        persist: bool,
-    ) -> Result<Self, SessionError> {
+    fn construct_empty(cwd: &str, session_dir: &str, persist: bool) -> Result<Self, SessionError> {
         let cwd = path_to_string(&resolve_path(cwd));
         let session_dir = path_to_string(&normalize_path(session_dir, PathInputOptions::new()));
         if persist && !session_dir.is_empty() && !path_exists(Path::new(&session_dir)) {
@@ -297,13 +293,12 @@ impl SessionManager {
         self.session_file = Some(resolved.clone());
 
         if path_exists(Path::new(&resolved)) {
-            let entries =
-                load_file_entries_from_file(Path::new(&resolved)).map_err(|source| {
-                    SessionError::Io {
-                        path: resolved.clone(),
-                        source,
-                    }
-                })?;
+            let entries = load_file_entries_from_file(Path::new(&resolved)).map_err(|source| {
+                SessionError::Io {
+                    path: resolved.clone(),
+                    source,
+                }
+            })?;
             self.apply_session_file_entries(resolved, entries)
         } else {
             self.new_session(None)?;
@@ -361,19 +356,16 @@ impl SessionManager {
             .find(|entry| entry.is_session_header())
             .map_or(1, |entry| match entry {
                 FileEntry::Header(header) => header.version.unwrap_or(1),
-                FileEntry::RawHeader(raw) => raw
-                    .get("version")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1),
+                FileEntry::RawHeader(raw) => {
+                    raw.get("version").and_then(Value::as_u64).unwrap_or(1)
+                }
                 FileEntry::Entry(_) => 1,
             });
         if version < CURRENT_SESSION_VERSION {
             let mut values =
-                load_values_from_file(Path::new(&resolved)).map_err(|source| {
-                    SessionError::Io {
-                        path: resolved.clone(),
-                        source,
-                    }
+                load_values_from_file(Path::new(&resolved)).map_err(|source| SessionError::Io {
+                    path: resolved.clone(),
+                    source,
                 })?;
             let migrated = migrate_values_to_current(&mut values);
             self.file_entries = values

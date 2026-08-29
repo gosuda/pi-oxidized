@@ -29,7 +29,10 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures::{FutureExt, stream::{FuturesUnordered, StreamExt}};
+use futures::{
+    FutureExt,
+    stream::{FuturesUnordered, StreamExt},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -1146,11 +1149,17 @@ where
     // JoinSet::spawn. The bounded channel capacity equals the semaphore
     // bound so the semaphore remains the single concurrency bound.
     let (job_tx, job_rx) = mpsc::channel::<RequestJob>(runtime.max_in_flight);
-    let worker_handle =
-        tokio::spawn(run_request_worker(Arc::clone(&runtime), job_rx));
+    let worker_handle = tokio::spawn(run_request_worker(Arc::clone(&runtime), job_rx));
 
-    let run_result = drive(reader, &runtime, &writer_dead, &rejection_tx, &mut tasks, &job_tx)
-        .await;
+    let run_result = drive(
+        reader,
+        &runtime,
+        &writer_dead,
+        &rejection_tx,
+        &mut tasks,
+        &job_tx,
+    )
+    .await;
 
     if run_result.is_err() {
         // Fatal read/dispatch errors must not wait on a peer that already

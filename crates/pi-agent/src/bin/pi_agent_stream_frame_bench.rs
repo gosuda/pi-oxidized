@@ -165,35 +165,31 @@ fn rematerialize(
     script: Arc<Vec<FrameTemplate>>,
 ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
     let len = script.len();
-    stream::iter(
-        (0..len)
-            .map(move |i| script[i].clone())
-            .map(|frame| {
-                let inner = frame.inner.as_ref();
-                let partial = Arc::new(inner.clone());
-                Ok(match frame.kind {
-                    FrameKind::Start => AssistantMessageEvent::Start { partial },
-                    FrameKind::TextStart => AssistantMessageEvent::TextStart {
-                        content_index: frame.content_index,
-                        partial,
-                    },
-                    FrameKind::TextDelta { delta } => AssistantMessageEvent::TextDelta {
-                        content_index: frame.content_index,
-                        delta,
-                        partial,
-                    },
-                    FrameKind::TextEnd { content } => AssistantMessageEvent::TextEnd {
-                        content_index: frame.content_index,
-                        content,
-                        partial,
-                    },
-                    FrameKind::Done { reason } => AssistantMessageEvent::Done {
-                        reason,
-                        message: frame.inner.as_ref().clone(),
-                    },
-                })
-            }),
-    )
+    stream::iter((0..len).map(move |i| script[i].clone()).map(|frame| {
+        let inner = frame.inner.as_ref();
+        let partial = Arc::new(inner.clone());
+        Ok(match frame.kind {
+            FrameKind::Start => AssistantMessageEvent::Start { partial },
+            FrameKind::TextStart => AssistantMessageEvent::TextStart {
+                content_index: frame.content_index,
+                partial,
+            },
+            FrameKind::TextDelta { delta } => AssistantMessageEvent::TextDelta {
+                content_index: frame.content_index,
+                delta,
+                partial,
+            },
+            FrameKind::TextEnd { content } => AssistantMessageEvent::TextEnd {
+                content_index: frame.content_index,
+                content,
+                partial,
+            },
+            FrameKind::Done { reason } => AssistantMessageEvent::Done {
+                reason,
+                message: frame.inner.as_ref().clone(),
+            },
+        })
+    }))
     .boxed()
 }
 
@@ -301,9 +297,10 @@ fn bench_config() -> AgentLoopConfig {
 /// One measured funnel round: provider -> drain -> reduce, end to end.
 /// Returns `(elapsed_ns, message_update_count)`.
 fn bench_funnel(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
-    let rt = Builder::new_current_thread().enable_all().build().unwrap_or_else(|error| {
-        panic!("bench runtime: {error}")
-    });
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| panic!("bench runtime: {error}"));
     let provider = FrameProvider {
         script: Arc::clone(script),
     };
@@ -359,9 +356,10 @@ fn bench_funnel(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
 /// `FrameProvider` so the `funnel - drain` delta is exactly the reduce leg.
 /// Returns `(elapsed_ns, delivered_items)`.
 fn bench_drain(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
-    let rt = Builder::new_current_thread().enable_all().build().unwrap_or_else(|error| {
-        panic!("bench runtime: {error}")
-    });
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| panic!("bench runtime: {error}"));
     let start = Instant::now();
     let delivered = rt.block_on(async {
         let (event_tx, mut event_rx) =
@@ -418,9 +416,10 @@ fn event_partial(event: &AssistantMessageEvent) -> Option<&Arc<AssistantMessage>
 /// rematerialization (`Arc::new(inner.clone())`) with both channel legs
 /// disabled. Returns `(elapsed_ns, events_pulled)`.
 fn bench_source(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
-    let rt = Builder::new_current_thread().enable_all().build().unwrap_or_else(|error| {
-        panic!("bench runtime: {error}")
-    });
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| panic!("bench runtime: {error}"));
     let start = Instant::now();
     let count = rt.block_on(async {
         let cancel = CancellationToken::new();
@@ -446,9 +445,10 @@ fn bench_source(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
 /// task identical to `bench_drain`'s) with the mpsc forward disabled.
 /// Returns `(elapsed_ns, events_pulled)`.
 fn bench_source_watch(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
-    let rt = Builder::new_current_thread().enable_all().build().unwrap_or_else(|error| {
-        panic!("bench runtime: {error}")
-    });
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| panic!("bench runtime: {error}"));
     let start = Instant::now();
     let count = rt.block_on(async {
         let (partial_tx, mut partial_rx) = watch::channel(None);
@@ -488,9 +488,10 @@ fn bench_source_watch(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
 /// select, receiver loop identical to `bench_drain`'s) with the watch leg
 /// disabled. Returns `(elapsed_ns, delivered_items)`.
 fn bench_source_forward(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
-    let rt = Builder::new_current_thread().enable_all().build().unwrap_or_else(|error| {
-        panic!("bench runtime: {error}")
-    });
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| panic!("bench runtime: {error}"));
     let start = Instant::now();
     let delivered = rt.block_on(async {
         let (event_tx, mut event_rx) =
@@ -504,7 +505,9 @@ fn bench_source_forward(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
                     () = cancel.cancelled() => return,
                     item = stream.next() => item,
                 };
-                let Some(Ok(event)) = next else { return; };
+                let Some(Ok(event)) = next else {
+                    return;
+                };
                 tokio::select! {
                     () = cancel.cancelled() => return,
                     result = event_tx
@@ -578,20 +581,13 @@ fn median(values: &mut [u64]) -> u64 {
 
 fn main() {
     let script = Arc::new(frame_script());
-    let final_len = script
-        .last()
-        .map_or(0, |frame| match &frame.kind {
-            FrameKind::Done { .. } => {
-                frame
-                    .inner
-                    .as_ref()
-                    .content.first().map_or(0, |c| match c {
-                    AssistantContent::Text(block) => block.text.len(),
-                    _ => 0,
-                })
-            }
+    let final_len = script.last().map_or(0, |frame| match &frame.kind {
+        FrameKind::Done { .. } => frame.inner.as_ref().content.first().map_or(0, |c| match c {
+            AssistantContent::Text(block) => block.text.len(),
             _ => 0,
-        });
+        }),
+        _ => 0,
+    });
     let rounds = measured_rounds();
     let warmups = warmup_rounds();
 
@@ -679,9 +675,7 @@ fn main() {
     println!(
         "stream-frame-pipeline bench (pinned: {FRAMES} x verification-chunk frames, final text {final_len} B)"
     );
-    println!(
-        "protocol: release, medians of {rounds} interleaved rounds after {warmups} warmups"
-    );
+    println!("protocol: release, medians of {rounds} interleaved rounds after {warmups} warmups");
     println!();
     println!("scenario | median ns/frame | rs");
     println!("funnel (decode+forward+reduce)   | {funnel_ns} | {funnel_rs:.2}%");
@@ -694,9 +688,15 @@ fn main() {
     println!("E1 stage attribution (stage disabling; sums to the drain median by construction):");
     println!("source materialization+poll      = {source_ns} ns/frame");
     println!("watch leg (refcount publish)     = {watch_leg} ns/frame  = source-watch - source");
-    println!("mpsc leg (boxed fwd + handoff)   = {forward_leg} ns/frame  = source-forward - source");
-    println!("cross-task interaction           = {interaction} ns/frame  = drain - source-watch - (source-forward - source)");
-    println!("attributed sum                   = {attributed_sum} ns/frame (drain median {drain_ns})");
+    println!(
+        "mpsc leg (boxed fwd + handoff)   = {forward_leg} ns/frame  = source-forward - source"
+    );
+    println!(
+        "cross-task interaction           = {interaction} ns/frame  = drain - source-watch - (source-forward - source)"
+    );
+    println!(
+        "attributed sum                   = {attributed_sum} ns/frame (drain median {drain_ns})"
+    );
     println!();
     println!("drain samples (ns/frame): {drain_samples:?}");
     println!("source samples (ns/frame): {source_samples:?}");

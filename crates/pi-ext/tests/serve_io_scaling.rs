@@ -1092,8 +1092,7 @@ fn run_timed_round() -> (u64, Vec<u64>, Vec<u64>, Vec<u64>) {
         .expect("build current-thread runtime");
 
     let (rtt_ns, q_samples, h_samples, s_samples) = rt.block_on(async {
-        let (ext, handles) =
-            ScalingAdapter::new(LoadProfile::Active20, TerminalInputMode::Fast);
+        let (ext, handles) = ScalingAdapter::new(LoadProfile::Active20, TerminalInputMode::Fast);
         let (mut peer, server) = spawn_server(ext, ServerConfig::default());
 
         // Setup outside timing
@@ -1147,10 +1146,7 @@ fn run_timed_round() -> (u64, Vec<u64>, Vec<u64>, Vec<u64>) {
             let q = task_start.duration_since(decode_start).as_nanos() as u64;
             let h = encode_complete.duration_since(task_start).as_nanos() as u64;
             let s = encode_complete.duration_since(decode_start).as_nanos() as u64;
-            assert_eq!(
-                q + h, s,
-                "id {id}: Q+H must equal S (Q={q}, H={h}, S={s})"
-            );
+            assert_eq!(q + h, s, "id {id}: Q+H must equal S (Q={q}, H={h}, S={s})");
             q_samples.push(q);
             h_samples.push(h);
             s_samples.push(s);
@@ -1330,8 +1326,13 @@ fn timed_serve_io_perf_t11_extension_rpc_dispatch() -> R {
     };
 
     eprintln!();
-    eprintln!("extension-rpc-dispatch bench (pinned: 300 x terminalInput round-trips, Active20 + Fast)");
-    eprintln!("protocol: release, median of {} rounds after {} warmups", measured_rounds, WARMUP_ROUNDS);
+    eprintln!(
+        "extension-rpc-dispatch bench (pinned: 300 x terminalInput round-trips, Active20 + Fast)"
+    );
+    eprintln!(
+        "protocol: release, median of {} rounds after {} warmups",
+        measured_rounds, WARMUP_ROUNDS
+    );
     eprintln!("inclusive RTT | {:.0} ns/request", rtt_aggregate_median);
     eprintln!("Q (spawn+hop) | {:.0} ns/request", q_aggregate_median);
     eprintln!("H (handler+encode) | {:.0} ns/request", h_aggregate_median);
@@ -1361,12 +1362,25 @@ fn timed_serve_io_perf_t11_extension_rpc_dispatch() -> R {
 
         eprintln!();
         eprintln!("attribution analysis (S gate failed, examining Q and H):");
-        eprintln!("  H trusted: {} (rs_H={:.2}%, limit {:.0}%)", h_trusted, h_relative_spread * 100.0, NOISE_LIMIT * 100.0);
-        eprintln!("  Q noisy: {} (rs_Q={:.2}%, limit {:.0}%)", q_relative_spread > NOISE_LIMIT, q_relative_spread * 100.0, NOISE_LIMIT * 100.0);
+        eprintln!(
+            "  H trusted: {} (rs_H={:.2}%, limit {:.0}%)",
+            h_trusted,
+            h_relative_spread * 100.0,
+            NOISE_LIMIT * 100.0
+        );
+        eprintln!(
+            "  Q noisy: {} (rs_Q={:.2}%, limit {:.0}%)",
+            q_relative_spread > NOISE_LIMIT,
+            q_relative_spread * 100.0,
+            NOISE_LIMIT * 100.0
+        );
 
         if h_trusted && q_is_noise_source {
             eprintln!("  verdict: Q (spawn + cooperative scheduler hop) is the noise source");
-            eprintln!("  H is tight at {:.0} ns — handler + encode cost is stable", h_aggregate_median);
+            eprintln!(
+                "  H is tight at {:.0} ns — handler + encode cost is stable",
+                h_aggregate_median
+            );
             eprintln!("  Q carries the multi-modal distribution matching S noise");
             eprintln!("  iteration-25 candidate (NAMED, NOT IMPLEMENTED):");
             eprintln!("    inline terminalInput handler on drive loop (skip tasks.spawn)");

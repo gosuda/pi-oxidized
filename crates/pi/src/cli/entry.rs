@@ -244,7 +244,10 @@ pub async fn run_pipeline(args: Vec<String>, io: &Io) -> ExitCode {
 /// code; a resolved dispatch runs the mode runner.
 async fn dispatch_outcome(outcome: BootstrapOutcome, io: &Io) -> ExitCode {
     match outcome {
-        BootstrapOutcome::Exit { code, drain_quirk: _ } => ExitCode::from(code),
+        BootstrapOutcome::Exit {
+            code,
+            drain_quirk: _,
+        } => ExitCode::from(code),
         BootstrapOutcome::Dispatch(dispatched) => {
             run_mode_default(dispatched, io.dispatcher.as_ref()).await
         }

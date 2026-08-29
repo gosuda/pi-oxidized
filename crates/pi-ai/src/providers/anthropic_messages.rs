@@ -60,7 +60,11 @@ impl Provider for AnthropicMessages {
         let (sender, stream) = ProviderEventSender::channel(STREAM_CAPACITY);
         tokio::spawn(async move {
             let mut assembler = StreamAssembler::new(&model);
-            if sender.start(Arc::new(assembler.message.clone())).await.is_err() {
+            if sender
+                .start(Arc::new(assembler.message.clone()))
+                .await
+                .is_err()
+            {
                 return;
             }
             if let Err(error) = run_stream(

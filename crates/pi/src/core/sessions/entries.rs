@@ -1526,7 +1526,9 @@ not valid json
         std::fs::remove_file(&file).ok();
         assert_eq!(entries.len(), 3, "all three lines must load");
         assert!(
-            entries[0].header().is_some_and(|h| h.id.as_deref() == Some("x")),
+            entries[0]
+                .header()
+                .is_some_and(|h| h.id.as_deref() == Some("x")),
             "escaped-tag header must be recognized, got {:?}",
             entries[0]
         );
@@ -1539,5 +1541,4 @@ not valid json
             FileEntry::Entry(SessionEntry::Unknown(_))
         ));
     }
-
 }

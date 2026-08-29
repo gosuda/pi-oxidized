@@ -149,7 +149,12 @@ pub fn probe_collect_replies_with_yield(
 ) -> io::Result<Vec<UiEvent>> {
     let mut session = ProbeSession::new();
     let mut pending = Vec::new();
-    collect_probe_replies(&mut session, &mut pending, ProbeSession::is_complete, yield_now)?;
+    collect_probe_replies(
+        &mut session,
+        &mut pending,
+        ProbeSession::is_complete,
+        yield_now,
+    )?;
     pending.extend(session.flush_timeout());
     session.apply_to(caps);
     Ok(reinject_bytes_as_events(&pending))
