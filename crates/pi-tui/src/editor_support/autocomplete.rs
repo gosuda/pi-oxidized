@@ -4,7 +4,6 @@
 //! abstracted behind [`FileLister`] so product code can inject an `fd`-backed
 //! implementation without coupling `pi-tui` to process spawning.
 
-use std::cmp::Reverse;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 
@@ -378,29 +377,38 @@ impl<L: FileLister> CombinedAutocompleteProvider<L> {
         if cancelled {
             return Vec::new();
         }
-        let mut ranked_entries: Vec<(FileEntry, i32)> = entries
+        let mut ranked_entries: Vec<(FileEntry, i32, String, usize)> = entries
             .into_iter()
-            .map(|e| {
+            .map(|entry| {
                 let relevance = if fd_query.is_empty() {
                     1
                 } else {
-                    Self::score_entry(&e.path, fd_query, e.is_directory)
+                    Self::score_entry(&entry.path, fd_query, entry.is_directory)
                 };
-                (e, relevance)
+                let path_without_slash = entry.path.trim_end_matches('/');
+                let display_path = if let Some(base) = display_base {
+                    to_display_path(&scoped_path_for_display(base, path_without_slash))
+                } else {
+                    to_display_path(path_without_slash)
+                };
+                let display_depth = display_path
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .count();
+                (entry, relevance, display_path, display_depth)
             })
-            .filter(|(_, relevance)| *relevance > 0)
+            .filter(|(_, relevance, _, _)| *relevance > 0)
             .collect();
-        ranked_entries.sort_by_key(|entry| Reverse(entry.1));
+        ranked_entries.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.3.cmp(&b.3))
+                .then_with(|| a.0.path.len().cmp(&b.0.path.len()))
+                .then_with(|| a.0.path.cmp(&b.0.path))
+        });
         ranked_entries.truncate(20);
 
         let mut suggestions = Vec::new();
-        for (entry, _) in ranked_entries {
-            let path_without_slash = entry.path.trim_end_matches('/');
-            let display_path = if let Some(base) = display_base {
-                to_display_path(&scoped_path_for_display(base, path_without_slash))
-            } else {
-                to_display_path(path_without_slash)
-            };
+        for (entry, _, display_path, _) in ranked_entries {
             let entry_name = display_path
                 .rsplit('/')
                 .next()
@@ -1035,5 +1043,119 @@ mod tests {
         assert!(!provider.should_trigger_file_completion(&lines, 0, 4));
         let lines = vec!["/help arg".to_owned()];
         assert!(provider.should_trigger_file_completion(&lines, 0, 9));
+    }
+
+    #[test]
+    fn fuzzy_orders_equal_scores_before_limiting_results() {
+        let lister = FakeLister::new();
+        let mut entries = (1..=25)
+            .rev()
+            .map(|index| FileEntry {
+                path: format!("d{index:02}/profile"),
+                is_directory: false,
+            })
+            .collect::<Vec<_>>();
+        entries.push(FileEntry {
+            path: "projects".into(),
+            is_directory: false,
+        });
+        lister.insert("/tmp", entries);
+        let provider = CombinedAutocompleteProvider::new(vec![], "/tmp", lister);
+
+        let suggestions = provider.get_fuzzy_file_suggestions("pro", false, false);
+        let descriptions = suggestions
+            .iter()
+            .filter_map(|item| item.description.as_deref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(descriptions.len(), 20);
+        assert_eq!(descriptions[0], "projects");
+        assert_eq!(descriptions[1], "d01/profile");
+        assert_eq!(descriptions[19], "d19/profile");
+    }
+
+    #[test]
+    fn fuzzy_uses_length_then_lexical_order_for_depth_ties() {
+        let lister = FakeLister::new();
+        lister.insert(
+            "/tmp",
+            vec![
+                FileEntry {
+                    path: "z/profile".into(),
+                    is_directory: false,
+                },
+                FileEntry {
+                    path: "b/pro".into(),
+                    is_directory: false,
+                },
+                FileEntry {
+                    path: "a/pro".into(),
+                    is_directory: false,
+                },
+            ],
+        );
+        let provider = CombinedAutocompleteProvider::new(vec![], "/tmp", lister);
+
+        let suggestions = provider.get_fuzzy_file_suggestions("pro", false, false);
+        let descriptions = suggestions
+            .iter()
+            .filter_map(|item| item.description.as_deref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(descriptions, ["a/pro", "b/pro", "z/profile"]);
+    }
+
+    #[test]
+    fn fuzzy_score_dominates_path_tie_breaks() {
+        let lister = FakeLister::new();
+        lister.insert(
+            "/tmp",
+            vec![
+                FileEntry {
+                    path: "pro".into(),
+                    is_directory: false,
+                },
+                FileEntry {
+                    path: "a/projects".into(),
+                    is_directory: false,
+                },
+            ],
+        );
+        let provider = CombinedAutocompleteProvider::new(vec![], "/tmp", lister);
+
+        let suggestions = provider.get_fuzzy_file_suggestions("pro", false, false);
+        let descriptions = suggestions
+            .iter()
+            .filter_map(|item| item.description.as_deref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(descriptions, ["pro", "a/projects"]);
+    }
+
+    #[test]
+    fn fuzzy_ranks_by_normalized_scoped_display_depth() {
+        let lister = FakeLister::new();
+        lister.insert(
+            "/tmp/a/b",
+            vec![
+                FileEntry {
+                    path: "c/pro".into(),
+                    is_directory: false,
+                },
+                FileEntry {
+                    path: "../../pro".into(),
+                    is_directory: false,
+                },
+            ],
+        );
+        let provider = CombinedAutocompleteProvider::new(vec![], "/tmp", lister);
+
+        let suggestions = provider.get_fuzzy_file_suggestions("a/b/pro", false, false);
+        let descriptions = suggestions
+            .iter()
+            .filter_map(|item| item.description.as_deref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(descriptions, ["pro", "a/b/c/pro"]);
     }
 }
