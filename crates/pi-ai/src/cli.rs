@@ -7,19 +7,21 @@
 //! classes `Unknown command: <cmd>`, `Unknown provider: <id>`,
 //! `Invalid selection`.
 
-use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
 
 use futures::future::BoxFuture;
-use pi_ai::auth::error::AuthError;
+use pi_ai::auth::error::{AuthError, StoreError};
+use pi_ai::auth::file_store::FileCredentialStore;
 use pi_ai::auth::oauth::radius::RadiusOAuthOptions;
 use pi_ai::auth::oauth::{
     anthropic::AnthropicOAuth, github_copilot::GitHubCopilotOAuth, kimi_coding::KimiCodingOAuth,
     openai_codex::OpenAiCodexOAuth, openrouter::OpenRouterOAuth, radius::RadiusOAuth,
     xai::XaiOAuth,
 };
-use pi_ai::auth::types::{AuthEvent, AuthInteraction, AuthPrompt, Credential, OAuthAuth};
+use pi_ai::auth::types::{
+    AuthEvent, AuthInteraction, AuthPrompt, Credential, CredentialStore, OAuthAuth,
+};
 use tokio_util::sync::CancellationToken;
 
 const AUTH_FILE: &str = "auth.json";
@@ -135,16 +137,19 @@ fn prompt_line(question: &str) -> String {
     line.trim_end_matches(['\r', '\n']).to_owned()
 }
 
-fn load_auth(path: &Path) -> BTreeMap<String, Credential> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => BTreeMap::new(),
-    }
-}
-
-fn save_auth(path: &Path, auth: &BTreeMap<String, Credential>) {
-    let content = serde_json::to_string_pretty(auth).unwrap_or_else(|_| "{}".to_owned());
-    let _ = std::fs::write(path, content);
+async fn persist_credential(
+    path: &Path,
+    provider_id: &str,
+    credential: Credential,
+) -> Result<(), StoreError> {
+    let store = FileCredentialStore::new(path)?;
+    store
+        .modify(
+            provider_id,
+            Box::new(move |_| Box::pin(async move { Ok(Some(credential)) })),
+        )
+        .await?;
+    Ok(())
 }
 
 struct StdinInteraction {
@@ -258,9 +263,9 @@ async fn login(provider_id: &str) -> Result<(), String> {
     let credential = oauth.login(&interaction).await.map_err(|e| e.to_string())?;
 
     let auth_path = std::path::PathBuf::from(AUTH_FILE);
-    let mut auth = load_auth(&auth_path);
-    auth.insert(provider_id.to_owned(), Credential::Oauth(credential));
-    save_auth(&auth_path, &auth);
+    persist_credential(&auth_path, provider_id, Credential::Oauth(credential))
+        .await
+        .map_err(|error| error.to_string())?;
     println!("\nCredentials saved to {AUTH_FILE}");
     Ok(())
 }
@@ -339,5 +344,69 @@ async fn main() {
             eprintln!("Error: {message}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    use pi_ai::auth::types::OAuthCredential;
+
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    fn oauth(access: &str) -> Credential {
+        Credential::Oauth(OAuthCredential {
+            refresh: "refresh".to_owned(),
+            access: access.to_owned(),
+            expires: 1,
+            extra: BTreeMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn corrupt_auth_bytes_are_not_replaced() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("auth.json");
+        let corrupt = b"{\"openai-codex\":";
+        fs::write(&path, corrupt)?;
+
+        let result = persist_credential(&path, "openai-codex", oauth("new")).await;
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(path)?, corrupt);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_auth_file_is_created() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("auth.json");
+        let expected = oauth("first");
+
+        persist_credential(&path, "openai-codex", expected.clone()).await?;
+
+        let store = FileCredentialStore::new(path)?;
+        assert_eq!(store.read("openai-codex").await?, Some(expected));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn valid_auth_entries_survive_an_update() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("auth.json");
+        let first = oauth("first");
+        let second = oauth("second");
+        persist_credential(&path, "anthropic", first.clone()).await?;
+
+        persist_credential(&path, "openai-codex", second.clone()).await?;
+
+        let store = FileCredentialStore::new(path)?;
+        assert_eq!(store.read("anthropic").await?, Some(first));
+        assert_eq!(store.read("openai-codex").await?, Some(second));
+        Ok(())
     }
 }
