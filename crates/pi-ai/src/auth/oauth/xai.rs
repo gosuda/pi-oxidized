@@ -421,7 +421,9 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
     use crate::auth::types::{AuthEvent, AuthPrompt};
@@ -483,6 +485,63 @@ mod tests {
         }
     }
 
+    const NOT_FOUND_RESPONSE: &[u8] =
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const SCRIPTED_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Option<String> {
+        const MAX_REQUEST_BYTES: usize = 16_384;
+        let deadline = Instant::now().checked_add(SCRIPTED_REQUEST_TIMEOUT)?;
+
+        let mut request = Vec::with_capacity(1_024);
+        loop {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            if remaining.is_zero() {
+                return None;
+            }
+            stream.set_read_timeout(Some(remaining)).ok()?;
+
+            if request.len() == MAX_REQUEST_BYTES {
+                return None;
+            }
+            let mut chunk = [0_u8; 1_024];
+            let read_limit = (MAX_REQUEST_BYTES - request.len()).min(chunk.len());
+            let read = stream.read(&mut chunk[..read_limit]).ok()?;
+            if read == 0 {
+                return None;
+            }
+            request.extend_from_slice(&chunk[..read]);
+
+            let Some(headers_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..headers_end]).ok()?;
+            let content_length = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then_some(value.trim())
+            });
+            let content_length = content_length
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .ok()?
+                .unwrap_or(0);
+            let request_end = headers_end.checked_add(content_length)?;
+            if request_end > MAX_REQUEST_BYTES {
+                return None;
+            }
+            if request.len() < request_end {
+                continue;
+            }
+            request.truncate(request_end);
+            return String::from_utf8(request).ok();
+        }
+    }
+
     struct ScriptedServer {
         requests: Arc<Mutex<Vec<String>>>,
         _join: thread::JoinHandle<()>,
@@ -501,9 +560,26 @@ mod tests {
                     let Ok((mut stream, _)) = listener.accept() else {
                         break;
                     };
-                    let mut buf = vec![0_u8; 16_384];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let Some(request) = read_http_request(&mut stream) else {
+                        let _ = stream.write_all(NOT_FOUND_RESPONSE);
+                        continue;
+                    };
+                    let mut request_line = request
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .split_ascii_whitespace();
+                    let method = request_line.next();
+                    let target = request_line.next();
+                    let version = request_line.next();
+                    let expected = method == Some("POST")
+                        && matches!(target, Some("/oauth2/device/code" | "/oauth2/token"))
+                        && version == Some("HTTP/1.1")
+                        && request_line.next().is_none();
+                    if !expected {
+                        let _ = stream.write_all(NOT_FOUND_RESPONSE);
+                        continue;
+                    }
                     if let Ok(mut guard) = requests_thread.lock() {
                         guard.push(request);
                     }
@@ -679,6 +755,58 @@ mod tests {
             ),
         ])?;
 
+        let address = server
+            .base
+            .strip_prefix("http://")
+            .ok_or_else(|| err("scripted server base must use http"))?;
+        let mut probe = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|error| err(error.to_string()))?;
+        probe
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .map_err(|error| err(error.to_string()))?;
+        let mut probe_response = String::new();
+        probe
+            .read_to_string(&mut probe_response)
+            .await
+            .map_err(|error| err(error.to_string()))?;
+        assert!(
+            probe_response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "unexpected route response: {probe_response:?}"
+        );
+        let mut stalled_probe = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|error| err(error.to_string()))?;
+        stalled_probe
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .map_err(|error| err(error.to_string()))?;
+        let (mut stalled_reader, mut stalled_writer) = stalled_probe.into_split();
+        let drip = tokio::spawn(async move {
+            loop {
+                if stalled_writer.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let mut stalled_response = String::new();
+        let stalled_read = tokio::time::timeout(
+            Duration::from_secs(3),
+            stalled_reader.read_to_string(&mut stalled_response),
+        )
+        .await;
+        drip.abort();
+        let _ = drip.await;
+        stalled_read
+            .map_err(|_| err("scripted server did not enforce the request deadline"))?
+            .map_err(|error| err(error.to_string()))?;
+        assert!(
+            stalled_response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "unexpected incomplete request response: {stalled_response:?}"
+        );
+
         let flow = XaiOAuth::with_endpoints(
             AuthHttpClient::new().map_err(|e| err(e.to_string()))?,
             server.device_url(),
@@ -686,10 +814,13 @@ mod tests {
         );
         let interaction = MockInteraction::new();
         let before = now_ms();
-        let cred = flow
-            .login(&interaction)
-            .await
-            .map_err(|e| err(e.to_string()))?;
+        let result = flow.login(&interaction).await;
+        let cred = result.map_err(|error| {
+            let requests = server
+                .requests()
+                .unwrap_or_else(|read_error| vec![format!("request capture failed: {read_error}")]);
+            err(format!("{error}; requests={requests:?}"))
+        })?;
         let after = now_ms();
 
         assert_eq!(cred.access, "access-live");
@@ -719,7 +850,7 @@ mod tests {
         }
 
         let requests = server.requests()?;
-        assert!(requests.len() >= 3);
+        assert_eq!(requests.len(), 3, "OAuth requests: {requests:?}");
         assert!(
             requests[0].contains("referrer=pi") || requests[0].contains("referrer%3Dpi"),
             "device request must include referrer=pi: {}",
