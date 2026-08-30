@@ -38,15 +38,16 @@ use crate::core::compaction::{
 use crate::core::model_runtime::ModelRuntimeAuthOverrides;
 use crate::core::sessions::{CompactionEntry, SessionEntry, get_latest_compaction_entry};
 use crate::core::settings::ResolvedCompactionSettings;
+use pi_agent::AgentContext;
+use pi_agent::telemetry::{
+    AiOperation, AiRequestStart, HarnessCompactionStart, SpanStatus, contained,
+    start_ai_request_span, start_harness_compaction_span,
+};
 
 use super::AgentSession;
 use super::events::{AgentSessionEvent, CompactionReason, SummarizationRetrySource};
 use super::extension_runner::ExtensionRunner;
 use super::tree::SummarizationAuth;
-use pi_agent::telemetry::{
-    AiOperation, AiRequestStart, HarnessCompactionStart, SpanStatus, contained,
-    start_ai_request_span, start_harness_compaction_span,
-};
 
 // ---------------------------------------------------------------------------
 // Resolved auth + stream source for compaction
@@ -262,7 +263,7 @@ impl AgentSession {
                 // Successful response that silently overflowed: compact but
                 // do NOT retry (cannot continue from an assistant message).
                 return self
-                    .run_auto_compaction(CompactionReason::Overflow, false)
+                    .run_auto_compaction(CompactionReason::Overflow, false, None)
                     .await;
             }
 
@@ -298,7 +299,7 @@ impl AgentSession {
             }
             let _ = self.agent.pop_last_if_assistant();
             return self
-                .run_auto_compaction(CompactionReason::Overflow, will_retry)
+                .run_auto_compaction(CompactionReason::Overflow, will_retry, None)
                 .await;
         }
 
@@ -307,11 +308,46 @@ impl AgentSession {
             self.threshold_context_tokens(assistant_message, compaction_entry.as_ref());
         if should_compact(context_tokens, context_window, &settings_to_pure(settings)) {
             return self
-                .run_auto_compaction(CompactionReason::Threshold, false)
+                .run_auto_compaction(CompactionReason::Threshold, false, None)
                 .await;
         }
 
         false
+    }
+
+    // -- same-run post-turn compaction ------------------------------------
+
+    /// Threshold compaction for the `prepare_next_turn` callback.
+    ///
+    /// Gates on the runtime auto-compaction flag, a nonzero context window,
+    /// and the pure threshold check over the callback context estimate.
+    /// Runs the shared auto lifecycle (`Threshold`, no retry) with the active
+    /// run's cancellation token, so an aborted run cancels the session-owned
+    /// token and drains the same core future through the normal
+    /// `compaction_end` + cleanup path. The caller rebuilds its context from
+    /// the agent transcript on every outcome.
+    pub(super) async fn compact_before_next_assistant_response(
+        &self,
+        context: &AgentContext,
+        run_cancel: &CancellationToken,
+    ) {
+        // Runtime flag is the source of truth (mirrors `check_compaction`).
+        if !self.lock_inner().auto_compaction_enabled {
+            return;
+        }
+        // A zero window cannot define a threshold to cross.
+        let context_window = self.model().context_window;
+        if context_window == 0 {
+            return;
+        }
+        let settings = self.compaction_settings();
+        let context_tokens = compaction::estimate_context_tokens(&context.messages).tokens;
+        if !should_compact(context_tokens, context_window, &settings_to_pure(settings)) {
+            return;
+        }
+
+        self.run_auto_compaction(CompactionReason::Threshold, false, Some(run_cancel.clone()))
+            .await;
     }
 
     // -- internal auto-compaction runner ----------------------------------
@@ -320,15 +356,36 @@ impl AgentSession {
     ///
     /// Returns `true` when the caller should continue the run (overflow retry
     /// or queued-message delivery), `false` otherwise.
-    async fn run_auto_compaction(&self, reason: CompactionReason, will_retry: bool) -> bool {
-        let abort_token = self.begin_auto_compaction_abort();
+    async fn run_auto_compaction(
+        &self,
+        reason: CompactionReason,
+        will_retry: bool,
+        run_cancel: Option<CancellationToken>,
+    ) -> bool {
+        let (abort_token, owner) = self.begin_auto_compaction_abort();
 
         self.emit_public_awaited(&AgentSessionEvent::CompactionStart { reason })
             .await;
 
-        let result = self
-            .run_compaction_core(reason, None, will_retry, abort_token, false)
-            .await;
+        // One pinned core future: when the run token wins the race, the
+        // session-owned token is cancelled and the SAME future is awaited to
+        // completion so its terminal cleanup (span settle, extension
+        // after-compact guards) still runs; the future is never dropped.
+        let core = self.run_compaction_core(reason, None, will_retry, abort_token.clone(), false);
+        tokio::pin!(core);
+
+        let result = if let Some(run_cancel) = run_cancel {
+            tokio::select! {
+                biased;
+                () = run_cancel.cancelled() => {
+                    abort_token.cancel();
+                    core.as_mut().await
+                }
+                result = core.as_mut() => result,
+            }
+        } else {
+            core.as_mut().await
+        };
 
         let should_continue = match result {
             Ok(Some(compaction_result)) => {
@@ -397,7 +454,7 @@ impl AgentSession {
             }
         };
 
-        self.clear_auto_compaction_abort();
+        self.clear_auto_compaction_abort(owner);
         should_continue
     }
 
@@ -422,29 +479,29 @@ impl AgentSession {
         is_manual: bool,
     ) -> Result<Option<CompactionResult>, CompactionError> {
         let model = self.model();
+        let settings = self.compaction_settings();
+        let (session_id, path_entries) = {
+            let sm = tokio::select! {
+                biased;
+                () = abort_token.cancelled() => return Err(CompactionError::Cancelled),
+                sm = self.session_manager.lock() => sm,
+            };
+            let entries: Vec<SessionEntry> = sm.get_branch(None).into_iter().cloned().collect();
+            (sm.get_session_id().to_owned(), entries)
+        };
 
         // Start a pi.harness.compaction span through the session telemetry
         // context. The span is contained: a panicking telemetry backend
         // degrades to a no-op span and never affects the compaction outcome.
-        let session_id = self.session_id().await;
         let compaction_span = start_harness_compaction_span(
             self.telemetry.as_ref(),
             HarnessCompactionStart {
-                session_id: session_id.clone(),
+                session_id,
                 lane_name: "main".to_owned(),
                 operation_id: format!("compaction-{}", reason.as_str()),
                 recovery: will_retry,
             },
         );
-
-        // Snapshot path entries + settings under the session-manager lock,
-        // then release before any await.
-        let (path_entries, settings) = {
-            let sm = self.session_manager.lock().await;
-            let branch: Vec<&SessionEntry> = sm.get_branch(None);
-            let entries: Vec<SessionEntry> = branch.into_iter().cloned().collect();
-            (entries, self.compaction_settings())
-        };
         let pure_settings = settings_to_pure(settings);
 
         let path_refs: Vec<&SessionEntry> = path_entries.iter().collect();
@@ -466,7 +523,12 @@ impl AgentSession {
         };
 
         // Resolve auth + stream inputs.
-        let inputs = self.resolve_compaction_inputs().await.map_err(|err| {
+        let inputs = tokio::select! {
+            biased;
+            () = abort_token.cancelled() => Err(CompactionError::Cancelled),
+            result = self.resolve_compaction_inputs() => result,
+        }
+        .map_err(|err| {
             contained(
                 || {
                     compaction_span.set_status(SpanStatus::Error {
@@ -484,7 +546,7 @@ impl AgentSession {
         if runner.has_handlers("session_before_compact") {
             let event = AgentSessionEvent::CompactionStart { reason };
             let cancel = self
-                .extension_before_compact(&runner, event)
+                .extension_before_compact(&runner, event, &abort_token)
                 .await
                 .map_err(|err| {
                     contained(
@@ -623,13 +685,13 @@ impl AgentSession {
         will_retry: bool,
         abort_token: &CancellationToken,
     ) -> Result<CompactionResult, CompactionError> {
-        if abort_token.is_cancelled() {
-            return Err(CompactionError::Cancelled);
-        }
-
         // Persist the compaction entry.
         let (_entry_id, saved_entry) = {
-            let mut sm = self.session_manager.lock().await;
+            let mut sm = tokio::select! {
+                biased;
+                () = abort_token.cancelled() => return Err(CompactionError::Cancelled),
+                sm = self.session_manager.lock() => sm,
+            };
             let tokens_before_i64: i64 = i64::try_from(result.tokens_before).unwrap_or(i64::MAX);
             let details = result.details.clone();
             let entry_id = sm
@@ -666,8 +728,15 @@ impl AgentSession {
         // Extension session_compact after-event (best-effort via CompactionEnd).
         if let Some(SessionEntry::Compaction(compaction_entry)) = &saved_entry {
             let runner = self.hooks.runner();
-            self.extension_after_compact(&runner, compaction_entry, from_hook, reason, will_retry)
-                .await;
+            self.extension_after_compact(
+                &runner,
+                compaction_entry,
+                from_hook,
+                reason,
+                will_retry,
+                abort_token,
+            )
+            .await;
         }
 
         // Emit the EntryAppended event for the new compaction entry.
@@ -765,7 +834,8 @@ impl AgentSession {
     /// using [`AgentSessionEvent::CompactionStart`] as the carrier (the TS
     /// `session_before_compact` payload — preparation/branchEntries/etc —
     /// requires dedicated runner methods not yet on the trait). Cancellation
-    /// is honoured via the returned [`super::extension_runner::CancelResult`].
+    /// is honoured through both the active token and the returned
+    /// [`super::extension_runner::CancelResult`].
     ///
     /// Returns a [`BeforeCompactResult`] with `cancel` set when the extension
     /// cancelled, and `compaction` always `None` (replacement not deliverable
@@ -774,8 +844,14 @@ impl AgentSession {
         &self,
         runner: &Arc<dyn ExtensionRunner>,
         event: AgentSessionEvent,
+        abort_token: &CancellationToken,
     ) -> Result<BeforeCompactResult, CompactionError> {
-        match runner.emit(event).await {
+        let result = tokio::select! {
+            biased;
+            () = abort_token.cancelled() => return Err(CompactionError::Cancelled),
+            result = runner.emit(event) => result,
+        };
+        match result {
             Ok(Some(cancel)) if cancel.cancel => Ok(BeforeCompactResult {
                 cancel: true,
                 compaction: None,
@@ -798,6 +874,7 @@ impl AgentSession {
         _from_hook: bool,
         reason: CompactionReason,
         will_retry: bool,
+        abort_token: &CancellationToken,
     ) {
         let event = AgentSessionEvent::CompactionEnd {
             reason,
@@ -806,27 +883,45 @@ impl AgentSession {
             will_retry,
             error_message: None,
         };
-        if let Err(err) = runner.emit(event).await {
+        let result = tokio::select! {
+            biased;
+            () = abort_token.cancelled() => return,
+            result = runner.emit(event) => result,
+        };
+        if let Err(err) = result {
             runner.emit_error(err.to_string());
         }
     }
 
     // -- auto-compaction abort -------------------------------------------
 
-    /// Begin the auto-compaction abort slot.
-    fn begin_auto_compaction_abort(&self) -> CancellationToken {
+    /// Begin the auto-compaction cancellation slot.
+    ///
+    /// Returns the token plus a monotonically unique owner generation. The
+    /// owner must be passed to
+    /// [`clear_auto_compaction_abort`](Self::clear_auto_compaction_abort) so
+    /// that an older compaction finishing after a newer one started cannot
+    /// remove the newer compaction's token.
+    fn begin_auto_compaction_abort(&self) -> (CancellationToken, u64) {
         let token = CancellationToken::new();
         let mut inner = self.lock_inner();
         if let Some(prev) = inner.auto_compaction_abort.take() {
             prev.cancel();
         }
+        inner.auto_compaction_owner = inner.auto_compaction_owner.wrapping_add(1);
+        let owner = inner.auto_compaction_owner;
         inner.auto_compaction_abort = Some(token.clone());
-        token
+        (token, owner)
     }
 
-    /// Clear the auto-compaction abort slot.
-    fn clear_auto_compaction_abort(&self) {
-        self.lock_inner().auto_compaction_abort = None;
+    /// Clear the auto-compaction cancellation slot, but only when `owner`
+    /// matches the generation stored at install time. A stale owner (an older
+    /// compaction superseded by a newer one) leaves the newer slot intact.
+    fn clear_auto_compaction_abort(&self, owner: u64) {
+        let mut inner = self.lock_inner();
+        if inner.auto_compaction_owner == owner {
+            inner.auto_compaction_abort = None;
+        }
     }
 
     // -- settings / session helpers --------------------------------------
@@ -1162,6 +1257,7 @@ mod tests {
         ModelThinkingLevel, Provider, ProviderError, StreamOptions, TextContent, Usage, UsageCost,
     };
     use serde_json::{Map, Value};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio::time::{sleep, timeout};
@@ -2220,5 +2316,1090 @@ mod tests {
             clamp_summarization_max_retries(u64::MAX),
             SUMMARIZATION_MAX_RETRIES_CEILING
         );
+    }
+
+    // -- same-run post-turn compaction behavioral tests --------------------
+
+    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use crate::core::agent_session::extension_runner::{
+        BeforeAgentStartResult, CancelResult, ExtensionRunnerError, InputTransformResult,
+    };
+    use crate::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
+    use crate::core::resources::ResourceExtensionPaths;
+    use futures::future::BoxFuture;
+    use pi_agent::{
+        AfterToolCallResult, AgentMessage, AgentTool, AgentToolResult, BeforeToolCallResult,
+        ToolError, ToolUpdates,
+    };
+    use pi_ai::ToolResultContent;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BlockingCompactionHook {
+        Before,
+        After,
+    }
+
+    struct BlockingCompactionRunner {
+        hook: BlockingCompactionHook,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl ExtensionRunner for BlockingCompactionRunner {
+        fn has_handlers(&self, event: &str) -> bool {
+            self.hook == BlockingCompactionHook::Before && event == "session_before_compact"
+        }
+
+        fn emit(
+            &self,
+            event: AgentSessionEvent,
+        ) -> BoxFuture<'_, Result<Option<CancelResult>, ExtensionRunnerError>> {
+            let blocks = matches!(
+                (self.hook, &event),
+                (
+                    BlockingCompactionHook::Before,
+                    AgentSessionEvent::CompactionStart { .. }
+                ) | (
+                    BlockingCompactionHook::After,
+                    AgentSessionEvent::CompactionEnd { .. }
+                )
+            );
+            if !blocks {
+                return Box::pin(async { Ok(None) });
+            }
+            let entered = Arc::clone(&self.entered);
+            Box::pin(async move {
+                entered.notify_one();
+                std::future::pending::<Result<Option<CancelResult>, ExtensionRunnerError>>().await
+            })
+        }
+
+        fn emit_message_end(
+            &self,
+            _message: AgentMessage,
+        ) -> BoxFuture<'_, Result<Option<AgentMessage>, ExtensionRunnerError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn emit_tool_call(
+            &self,
+            _tool_name: &str,
+            _tool_call_id: &str,
+            _input: Map<String, Value>,
+        ) -> BoxFuture<'_, Result<Option<BeforeToolCallResult>, ExtensionRunnerError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn emit_tool_result(
+            &self,
+            _tool_name: &str,
+            _tool_call_id: &str,
+            _input: Map<String, Value>,
+            _content: Vec<ToolResultContent>,
+            _details: Value,
+            _is_error: bool,
+        ) -> BoxFuture<'_, Result<Option<AfterToolCallResult>, ExtensionRunnerError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn emit_input(
+            &self,
+            _text: &str,
+            _images: Option<Value>,
+            _source: &str,
+            _streaming_behavior: Option<&str>,
+        ) -> BoxFuture<'_, Result<InputTransformResult, ExtensionRunnerError>> {
+            Box::pin(async { Ok(InputTransformResult::default()) })
+        }
+
+        fn emit_before_agent_start(
+            &self,
+            _prompt: &str,
+            _images: Option<Value>,
+        ) -> BoxFuture<'_, Result<Option<BeforeAgentStartResult>, ExtensionRunnerError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn emit_resources_discover(
+            &self,
+            _cwd: &str,
+            _reason: &str,
+        ) -> BoxFuture<'_, Result<ResourceExtensionPaths, ExtensionRunnerError>> {
+            Box::pin(async { Ok(ResourceExtensionPaths::default()) })
+        }
+
+        fn get_registered_commands(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn execute_command(
+            &self,
+            _name: &str,
+            _args: &str,
+        ) -> BoxFuture<'_, Result<bool, ExtensionRunnerError>> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn get_all_registered_tools(&self) -> HashMap<String, Arc<dyn AgentTool>> {
+            HashMap::new()
+        }
+
+        fn get_flag_values(&self) -> HashMap<String, Value> {
+            HashMap::new()
+        }
+
+        fn invalidate(&self) {}
+
+        fn emit_error(&self, _message: String) {}
+    }
+
+    struct BlockingCredentialStore {
+        inner: pi_ai::auth::InMemoryCredentialStore,
+        blocking: AtomicBool,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl pi_ai::auth::CredentialStore for BlockingCredentialStore {
+        fn read<'a>(
+            &'a self,
+            provider_id: &'a str,
+        ) -> BoxFuture<'a, Result<Option<pi_ai::auth::Credential>, pi_ai::auth::StoreError>>
+        {
+            if !self.blocking.load(Ordering::SeqCst) {
+                return self.inner.read(provider_id);
+            }
+            let entered = Arc::clone(&self.entered);
+            Box::pin(async move {
+                entered.notify_one();
+                std::future::pending::<
+                    Result<Option<pi_ai::auth::Credential>, pi_ai::auth::StoreError>,
+                >()
+                .await
+            })
+        }
+
+        fn list(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<pi_ai::auth::CredentialInfo>, pi_ai::auth::StoreError>>
+        {
+            self.inner.list()
+        }
+
+        fn modify<'a>(
+            &'a self,
+            provider_id: &'a str,
+            update: Box<pi_ai::auth::types::CredentialModifyFn<'a>>,
+        ) -> BoxFuture<'a, Result<Option<pi_ai::auth::Credential>, pi_ai::auth::StoreError>>
+        {
+            self.inner.modify(provider_id, update)
+        }
+
+        fn delete<'a>(
+            &'a self,
+            provider_id: &'a str,
+        ) -> BoxFuture<'a, Result<(), pi_ai::auth::StoreError>> {
+            self.inner.delete(provider_id)
+        }
+    }
+
+    static BULKY_TOOL_PARAMS: LazyLock<Value> =
+        LazyLock::new(|| serde_json::json!({"type": "object", "properties": {}}));
+
+    const BULKY_RESULT_PREFIX: &str = "BULKY_MARKER:";
+
+    fn bulky_result_text() -> String {
+        // Match the canonical fixture: 6,800 payload chars are about 1,700 tokens.
+        format!("{BULKY_RESULT_PREFIX}{}", "x".repeat(6_800))
+    }
+
+    /// A tool that returns a large fixed text result immediately.
+    struct BulkyTool {
+        name: String,
+    }
+
+    impl AgentTool for BulkyTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn label(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &'static str {
+            "returns a large fixed text result"
+        }
+
+        fn parameters(&self) -> &Value {
+            &BULKY_TOOL_PARAMS
+        }
+
+        fn validate_arguments(
+            &self,
+            args: &Map<String, Value>,
+        ) -> Result<Map<String, Value>, ToolError> {
+            Ok(args.clone())
+        }
+
+        fn execute(
+            &self,
+            _tool_call_id: &str,
+            _args: Map<String, Value>,
+            _cancel: CancellationToken,
+            _updates: ToolUpdates,
+        ) -> futures::future::BoxFuture<'static, Result<AgentToolResult, ToolError>> {
+            Box::pin(async move {
+                Ok(AgentToolResult {
+                    content: vec![pi_ai::ToolResultContent::Text(TextContent::new(
+                        bulky_result_text(),
+                    ))],
+                    ..AgentToolResult::default()
+                })
+            })
+        }
+    }
+
+    /// Provider: first stream call returns a tool call for `BulkyTool`,
+    /// later calls return a plain stop. Records every request context.
+    struct ToolThenFinalProvider {
+        call_count: Arc<AtomicUsize>,
+        contexts: Arc<std::sync::Mutex<Vec<Context>>>,
+    }
+
+    fn scripted_assistant(
+        build: impl FnOnce(&mut AssistantMessage),
+        reason: DoneReason,
+    ) -> Result<AssistantMessageEvent, ProviderError> {
+        let mut message =
+            AssistantMessage::new("test-api", "test-provider", "m", pi_agent::now_millis());
+        build(&mut message);
+        Ok(AssistantMessageEvent::Done { reason, message })
+    }
+
+    impl Provider for ToolThenFinalProvider {
+        fn stream(
+            &self,
+            _model: &Model,
+            context: Context,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+            self.contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(context);
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let events: Vec<Result<AssistantMessageEvent, ProviderError>> = if count == 0 {
+                vec![
+                    Ok(AssistantMessageEvent::Start {
+                        partial: Arc::new(AssistantMessage::new(
+                            "test-api",
+                            "test-provider",
+                            "m",
+                            pi_agent::now_millis(),
+                        )),
+                    }),
+                    scripted_assistant(
+                        |message| {
+                            message.content = vec![AssistantContent::ToolCall(
+                                pi_ai::ToolCall::new("tc-1", "bulky", Map::new()),
+                            )];
+                            message.stop_reason = StopReason::ToolUse;
+                            message.usage.total_tokens = 8_000;
+                        },
+                        DoneReason::ToolUse,
+                    ),
+                ]
+            } else {
+                vec![
+                    Ok(AssistantMessageEvent::Start {
+                        partial: Arc::new(AssistantMessage::new(
+                            "test-api",
+                            "test-provider",
+                            "m",
+                            pi_agent::now_millis(),
+                        )),
+                    }),
+                    scripted_assistant(
+                        |message| {
+                            message.content =
+                                vec![AssistantContent::Text(TextContent::new("final answer"))];
+                            message.stop_reason = StopReason::Stop;
+                            message.usage.total_tokens = 500;
+                        },
+                        DoneReason::Stop,
+                    ),
+                ]
+            };
+            Box::pin(stream::iter(events))
+                as Pin<
+                    Box<
+                        dyn futures::Stream<Item = Result<AssistantMessageEvent, ProviderError>>
+                            + Send,
+                    >,
+                >
+        }
+    }
+
+    /// Summary stream that waits for the release latch before producing the
+    /// summary, so tests can act while compaction is in flight.
+    fn gated_summary_stream_fn(
+        text: &str,
+        release: tokio::sync::watch::Receiver<bool>,
+    ) -> SummarizeStreamFn {
+        let text = text.to_owned();
+        Arc::new(move |_model, _ctx, _opts| {
+            let text = text.clone();
+            let mut release = release.clone();
+            Box::pin(async move {
+                if !*release.borrow() {
+                    assert!(
+                        release.changed().await.is_ok(),
+                        "compaction release sender dropped"
+                    );
+                }
+                let mut msg = AssistantMessage::new("a", "p", "m", 1);
+                msg.content = vec![AssistantContent::Text(TextContent::new(text))];
+                msg.stop_reason = StopReason::Stop;
+                Box::pin(stream::iter(vec![Ok(AssistantMessageEvent::Done {
+                    reason: DoneReason::Stop,
+                    message: msg,
+                })]))
+                    as Pin<
+                        Box<
+                            dyn futures::Stream<Item = Result<AssistantMessageEvent, ProviderError>>
+                                + Send,
+                        >,
+                    >
+            })
+        })
+    }
+
+    /// Session wired for same-run compaction: canonical-size window, history
+    /// tail in the tree, a bulky tool, and recorded provider contexts.
+    /// Keep-recent (1,750) retains the current turn and summarizes older history.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SameRunAgentSource {
+        Session,
+        Prebuilt,
+    }
+
+    async fn make_same_run_session(
+        stream_fn: SummarizeStreamFn,
+        should_stop: bool,
+    ) -> TestResult<(
+        Arc<AgentSession>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<Context>>>,
+    )> {
+        make_same_run_session_with_model_runtime(
+            stream_fn,
+            should_stop,
+            test_model(2_600),
+            None,
+            SameRunAgentSource::Session,
+        )
+        .await
+    }
+
+    async fn make_prebuilt_same_run_session(
+        stream_fn: SummarizeStreamFn,
+    ) -> TestResult<(
+        Arc<AgentSession>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<Context>>>,
+    )> {
+        make_same_run_session_with_model_runtime(
+            stream_fn,
+            false,
+            test_model(2_600),
+            None,
+            SameRunAgentSource::Prebuilt,
+        )
+        .await
+    }
+
+    async fn make_same_run_session_with_model_runtime(
+        stream_fn: SummarizeStreamFn,
+        should_stop: bool,
+        model: Model,
+        model_runtime: Option<Arc<ModelRuntime>>,
+        agent_source: SameRunAgentSource,
+    ) -> TestResult<(
+        Arc<AgentSession>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<Context>>>,
+    )> {
+        let provider = Arc::new(ToolThenFinalProvider {
+            call_count: Arc::new(AtomicUsize::new(0)),
+            contexts: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let call_count = Arc::clone(&provider.call_count);
+        let contexts = Arc::clone(&provider.contexts);
+
+        let mut config = AgentSessionConfig::test_config(provider.clone(), model.clone())?;
+        config.model_runtime = model_runtime;
+        config.system_prompt = "sys".into();
+        config.compaction_stream_override = Some(CompactionStreamHandle::new(stream_fn));
+        config.tools = vec![Arc::new(BulkyTool {
+            name: "bulky".to_owned(),
+        }) as Arc<dyn AgentTool>];
+
+        // Two history pairs so the compaction cut summarizes real entries.
+        let mut messages = Vec::new();
+        for i in 0..2 {
+            messages.push(user_text(
+                format!("history user message {i} with padding"),
+                std::iter::empty(),
+            ));
+            let mut assistant =
+                AssistantMessage::new("test-api", "test-provider", "m", pi_agent::now_millis());
+            assistant
+                .content
+                .push(AssistantContent::Text(TextContent::new(format!(
+                    "history-{i}:{}",
+                    "x".repeat(800)
+                ))));
+            assistant.stop_reason = StopReason::Stop;
+            messages.push(pi_agent::AgentMessage::Llm(Box::new(
+                pi_ai::Message::Assistant(assistant),
+            )));
+        }
+        config.messages = messages;
+
+        if should_stop {
+            let mut base = pi_agent::AgentLoopConfig::base(model.clone());
+            base.should_stop_after_turn =
+                Some(Arc::new(|_ctx: pi_agent::ShouldStopAfterTurnContext| {
+                    Box::pin(async move { Ok(true) })
+                        as futures::future::BoxFuture<
+                            'static,
+                            Result<bool, pi_agent::AgentLoopError>,
+                        >
+                }) as pi_agent::ShouldStopAfterTurn);
+            config.base_config = Some(base);
+        }
+
+        if agent_source == SameRunAgentSource::Prebuilt {
+            let base = config
+                .base_config
+                .take()
+                .unwrap_or_else(|| pi_agent::AgentLoopConfig::base(model.clone()));
+            config.agent = Some(pi_agent::Agent::new(pi_agent::AgentOptions {
+                system_prompt: config.system_prompt.clone(),
+                model,
+                thinking_level: config.thinking_level,
+                tools: config.tools.clone(),
+                messages: config.messages.clone(),
+                config: base,
+                provider,
+            }));
+            config.provider = None;
+        }
+
+        let session = AgentSession::new(config)?;
+        session.set_auto_compaction_enabled(true);
+        {
+            let mut settings = session.lock_settings();
+            let mut compaction = Map::new();
+            compaction.insert("keepRecentTokens".into(), Value::from(1_750u64));
+            compaction.insert("reserveTokens".into(), Value::from(400u64));
+            let mut overrides = Map::new();
+            overrides.insert("compaction".into(), Value::Object(compaction));
+            settings.apply_overrides(&overrides);
+        }
+        // Persist the history so compaction has tree entries to summarize;
+        // the live run persists the prompt/assistant/tool-result tail itself.
+        {
+            let mut sm = session.session_manager.lock().await;
+            for msg in session.agent.transcript() {
+                sm.append_message(&msg)?;
+            }
+        }
+        Ok((session, call_count, contexts))
+    }
+
+    #[tokio::test]
+    async fn same_run_large_tool_compaction_before_request_two() -> TestResult {
+        let (session, call_count, contexts) =
+            make_same_run_session(summary_stream_fn("## Goal\nSame-run summary"), false).await?;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _unsub = session.subscribe(move |event| {
+            let _ = tx.send(event.type_name().to_owned());
+        });
+
+        session
+            .agent
+            .prompt(vec![user_text("go", std::iter::empty())])
+            .await?;
+        session.agent.wait_for_idle().await;
+        sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 2, "two provider calls");
+
+        let events = collect_events(&mut rx, 40).await;
+        assert_eq!(
+            events.iter().filter(|e| *e == "compaction_start").count(),
+            1,
+            "exactly one compaction_start: {events:?}"
+        );
+        assert_eq!(
+            events.iter().filter(|e| *e == "compaction_end").count(),
+            1,
+            "exactly one compaction_end: {events:?}"
+        );
+        let first_turn_end = events
+            .iter()
+            .position(|e| e == "turn_end")
+            .ok_or("turn_end position")?;
+        let compaction_start = events
+            .iter()
+            .position(|e| e == "compaction_start")
+            .ok_or("compaction_start position")?;
+        assert!(
+            first_turn_end < compaction_start,
+            "compaction must wait for the persisted TurnEnd barrier: {events:?}"
+        );
+
+        // The transcript keeps the tool result and carries the summary.
+        let transcript = serde_json::to_string(&session.agent.transcript())?;
+        assert!(
+            transcript.contains(BULKY_RESULT_PREFIX),
+            "tool result must be retained after compaction"
+        );
+        assert!(
+            transcript.contains("Same-run summary"),
+            "summary must be present after compaction: {transcript}"
+        );
+
+        // Request two ran on the rebuilt (compacted) context.
+        let contexts = contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let second = contexts.get(1).ok_or("second provider context")?;
+        let second = serde_json::to_string(second)?;
+        assert!(
+            second.contains("Same-run summary"),
+            "request two must use the compacted context: {second}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prebuilt_agent_compacts_before_request_two() -> TestResult {
+        let (session, call_count, contexts) =
+            make_prebuilt_same_run_session(summary_stream_fn("## Goal\nPrebuilt summary")).await?;
+
+        session
+            .agent
+            .prompt(vec![user_text("go", std::iter::empty())])
+            .await?;
+        session.agent.wait_for_idle().await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 2, "two provider calls");
+        let contexts = contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let second = serde_json::to_string(contexts.get(1).ok_or("second provider context")?)?;
+        assert!(
+            second.contains("Prebuilt summary"),
+            "request two must use the compacted context: {second}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn steering_during_same_run_compaction_is_delivered() -> TestResult {
+        let (release, gate) = tokio::sync::watch::channel(false);
+        let (session, call_count, contexts) = make_same_run_session(
+            gated_summary_stream_fn("## Goal\nGated summary", gate),
+            false,
+        )
+        .await?;
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let started_observer = Arc::clone(&started);
+        let _unsub = session.subscribe(move |event| {
+            if matches!(event, AgentSessionEvent::CompactionStart { .. }) {
+                started_observer.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let run_session = Arc::clone(&session);
+        let run = tokio::spawn(async move {
+            run_session
+                .agent
+                .prompt(vec![user_text("go", std::iter::empty())])
+                .await
+        });
+
+        // Hold compaction on the gate, then steer mid-compaction.
+        for _ in 0..400 {
+            if started.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            started.load(Ordering::SeqCst) > 0,
+            "compaction never started"
+        );
+        session.mirror_steering_push("steer-me".into());
+        session
+            .agent
+            .steer(user_text("steer-me", std::iter::empty()));
+        release.send_replace(true);
+
+        timeout(std::time::Duration::from_secs(5), run).await???;
+        session.agent.wait_for_idle().await;
+        sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "steering must join request two"
+        );
+        let contexts = contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let second = serde_json::to_string(contexts.get(1).ok_or("second provider context")?)?;
+        assert!(
+            second.contains("steer-me"),
+            "steering message must be delivered in request two: {second}"
+        );
+        assert!(!session.is_compacting());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_turn_custom_message_waits_for_next_user_prompt() -> TestResult {
+        let (release, gate) = tokio::sync::watch::channel(false);
+        let (session, call_count, contexts) = make_same_run_session(
+            gated_summary_stream_fn("## Goal\nGated summary", gate),
+            false,
+        )
+        .await?;
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_observer = Arc::clone(&started);
+        let _unsub = session.subscribe(move |event| {
+            if matches!(event, AgentSessionEvent::CompactionStart { .. }) {
+                started_observer.notify_one();
+            }
+        });
+
+        let run_session = Arc::clone(&session);
+        let run = tokio::spawn(async move {
+            run_session
+                .agent
+                .prompt(vec![user_text("go", std::iter::empty())])
+                .await
+        });
+        timeout(std::time::Duration::from_secs(5), started.notified()).await?;
+
+        // `NextTurn` means the next top-level user prompt. Steering owns
+        // delivery into another provider request within the active run.
+        session
+            .send_custom_message(
+                crate::core::agent_session::prompt::CustomMessageInput {
+                    custom_type: "next-user-prompt".to_owned(),
+                    content: crate::core::messages::CustomMessageContent::Text(
+                        "carry next prompt".to_owned(),
+                    ),
+                    display: true,
+                    details: None,
+                },
+                false,
+                Some(crate::core::agent_session::prompt::DeliverAs::NextTurn),
+            )
+            .await?;
+        release.send_replace(true);
+        timeout(std::time::Duration::from_secs(5), run).await???;
+        session.agent.wait_for_idle().await;
+
+        let second = {
+            let contexts = contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            serde_json::to_string(contexts.get(1).ok_or("second provider context")?)?
+        };
+        assert!(
+            !second.contains("carry next prompt"),
+            "next-user-prompt message leaked into request two: {second}"
+        );
+
+        session.set_auto_compaction_enabled(false);
+        session
+            .prompt(
+                "next user prompt",
+                crate::core::agent_session::prompt::PromptOptions::default(),
+            )
+            .await?;
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "the next user prompt must issue request three"
+        );
+        let third = {
+            let contexts = contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            serde_json::to_string(contexts.get(2).ok_or("third provider context")?)?
+        };
+        assert!(
+            third.contains("carry next prompt"),
+            "next-user-prompt message missing from request three: {third}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminating_large_tool_result_does_not_compact() -> TestResult {
+        let (session, call_count, _contexts) =
+            make_same_run_session(summary_stream_fn("unused summary"), true).await?;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _unsub = session.subscribe(move |event| {
+            let _ = tx.send(event.type_name().to_owned());
+        });
+
+        session
+            .agent
+            .prompt(vec![user_text("go", std::iter::empty())])
+            .await?;
+        session.agent.wait_for_idle().await;
+        sleep(std::time::Duration::from_millis(50)).await;
+
+        // A terminating turn decision happens before prepare: the loop ends
+        // without a second request and without any compaction lifecycle.
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "no request two");
+        let events = collect_events(&mut rx, 40).await;
+        assert!(
+            !events.iter().any(|e| e == "compaction_start"),
+            "terminating turn must not compact: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e == "compaction_end"),
+            "terminating turn must not compact: {events:?}"
+        );
+        assert_eq!(
+            events.iter().filter(|e| *e == "agent_end").count(),
+            1,
+            "exactly one agent_end: {events:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_compaction_aborts_once_without_request_two() -> TestResult {
+        let (_release, gate) = tokio::sync::watch::channel(false);
+        let (session, call_count, _contexts) =
+            make_same_run_session(gated_summary_stream_fn("## Goal\nNever used", gate), false)
+                .await?;
+
+        let ends = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ends_observer = Arc::clone(&ends);
+        let started = Arc::new(AtomicUsize::new(0));
+        let started_observer = Arc::clone(&started);
+        let _unsub = session.subscribe(move |event| match event {
+            AgentSessionEvent::CompactionStart { .. } => {
+                started_observer.fetch_add(1, Ordering::SeqCst);
+            }
+            AgentSessionEvent::CompactionEnd { aborted, .. } => {
+                ends_observer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(*aborted);
+            }
+            _ => {}
+        });
+
+        let run_session = Arc::clone(&session);
+        let run = tokio::spawn(async move {
+            run_session
+                .agent
+                .prompt(vec![user_text("go", std::iter::empty())])
+                .await
+        });
+
+        for _ in 0..400 {
+            if started.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            started.load(Ordering::SeqCst) > 0,
+            "compaction never started"
+        );
+        assert!(session.is_compacting());
+
+        // Cancel the active run: the run token wins, cancels the
+        // session-owned compaction token, and the same pinned core future
+        // drains through the normal aborted end + cleanup.
+        session.agent.abort();
+        timeout(std::time::Duration::from_secs(5), run).await???;
+        session.agent.wait_for_idle().await;
+        sleep(std::time::Duration::from_millis(50)).await;
+
+        let aborted_ends = ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(aborted_ends.len(), 1, "exactly one compaction end");
+        assert!(aborted_ends[0], "the end must be aborted");
+        assert!(
+            !session.is_compacting(),
+            "compaction slot must be cleared after the aborted end"
+        );
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "no request two");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_blocked_compaction_auth_resolution() -> TestResult {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let store = Arc::new(BlockingCredentialStore {
+            inner: pi_ai::auth::InMemoryCredentialStore::new(),
+            blocking: AtomicBool::new(false),
+            entered: Arc::clone(&entered),
+        });
+        let runtime = Arc::new(
+            ModelRuntime::create(CreateModelRuntimeOptions {
+                credentials: Some(store.clone()),
+                allow_model_network: Some(false),
+                ..CreateModelRuntimeOptions::default()
+            })
+            .await?,
+        );
+        store.blocking.store(true, Ordering::SeqCst);
+
+        let mut model = test_model(2_600);
+        model.provider = "anthropic".to_owned();
+        model.api = "anthropic-messages".to_owned();
+        let (session, call_count, _) = make_same_run_session_with_model_runtime(
+            summary_stream_fn("unused"),
+            false,
+            model,
+            Some(runtime),
+            SameRunAgentSource::Session,
+        )
+        .await?;
+
+        let ends = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ends_observer = Arc::clone(&ends);
+        let _unsub = session.subscribe(move |event| {
+            if let AgentSessionEvent::CompactionEnd {
+                aborted, result, ..
+            } = event
+            {
+                ends_observer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((*aborted, result.is_some()));
+            }
+        });
+
+        let run_session = Arc::clone(&session);
+        let run = tokio::spawn(async move {
+            run_session
+                .agent
+                .prompt(vec![user_text("go", std::iter::empty())])
+                .await
+        });
+        timeout(std::time::Duration::from_secs(5), entered.notified()).await?;
+        assert!(
+            session.is_compacting(),
+            "compaction must own the blocked auth lookup"
+        );
+
+        session.agent.abort();
+        timeout(std::time::Duration::from_secs(5), run).await???;
+        session.agent.wait_for_idle().await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "no request two");
+        let compaction_entries = session
+            .session_manager
+            .lock()
+            .await
+            .get_entries()
+            .into_iter()
+            .filter(|entry| entry.discriminant() == "compaction")
+            .count();
+        assert_eq!(
+            compaction_entries, 0,
+            "cancelled auth must not persist a summary"
+        );
+        assert_eq!(
+            ends.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[(true, false)],
+            "one aborted end without a result"
+        );
+        assert!(!session.is_compacting(), "compaction slot must be cleared");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_initial_compaction_snapshot_lock() -> TestResult {
+        let (session, _, _) = make_same_run_session(summary_stream_fn("unused"), false).await?;
+        let session_manager = session.session_manager.lock().await;
+        let abort_token = CancellationToken::new();
+        let mut compaction = Box::pin(session.run_compaction_core(
+            CompactionReason::Threshold,
+            None,
+            false,
+            abort_token.clone(),
+            false,
+        ));
+
+        assert!(matches!(
+            futures::poll!(compaction.as_mut()),
+            std::task::Poll::Pending
+        ));
+        abort_token.cancel();
+        drop(session_manager);
+
+        let result = timeout(std::time::Duration::from_secs(1), compaction).await?;
+        assert!(
+            matches!(result, Err(CompactionError::Cancelled)),
+            "initial snapshot lock must not outlive cancellation: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_auto_compaction_owner_cannot_clear_current_slot() -> TestResult {
+        let (session, _, _) = make_same_run_session(summary_stream_fn("unused"), false).await?;
+        let (stale_token, stale_owner) = session.begin_auto_compaction_abort();
+        let (current_token, current_owner) = session.begin_auto_compaction_abort();
+
+        assert!(stale_token.is_cancelled());
+        assert!(!current_token.is_cancelled());
+
+        session.clear_auto_compaction_abort(stale_owner);
+        assert!(session.is_compacting());
+        assert!(!current_token.is_cancelled());
+
+        session.clear_auto_compaction_abort(current_owner);
+        assert!(!session.is_compacting());
+        Ok(())
+    }
+
+    async fn cancel_blocked_compaction_hook(
+        hook: BlockingCompactionHook,
+    ) -> TestResult<(String, Vec<(bool, bool)>)> {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let runner = Arc::new(BlockingCompactionRunner {
+            hook,
+            entered: Arc::clone(&entered),
+        });
+        let (session, call_count, _) =
+            make_same_run_session(summary_stream_fn("blocked-hook summary"), false).await?;
+        session
+            .hooks()
+            .set_runner(runner as Arc<dyn ExtensionRunner>);
+
+        let ends = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ends_observer = Arc::clone(&ends);
+        let _unsub = session.subscribe(move |event| {
+            if let AgentSessionEvent::CompactionEnd {
+                result, aborted, ..
+            } = event
+            {
+                ends_observer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((*aborted, result.is_some()));
+            }
+        });
+
+        let run_session = Arc::clone(&session);
+        let run = tokio::spawn(async move {
+            run_session
+                .agent
+                .prompt(vec![user_text("go", std::iter::empty())])
+                .await
+        });
+
+        timeout(std::time::Duration::from_secs(5), entered.notified()).await?;
+        assert!(session.is_compacting());
+        session.agent.abort();
+        timeout(std::time::Duration::from_secs(5), run).await???;
+        session.agent.wait_for_idle().await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "no request two");
+        assert!(!session.is_compacting());
+        let transcript = serde_json::to_string(&session.agent.transcript())?;
+        let ends = ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Ok((transcript, ends))
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_blocked_before_compact_hook() -> TestResult {
+        let (transcript, ends) =
+            cancel_blocked_compaction_hook(BlockingCompactionHook::Before).await?;
+
+        assert!(!transcript.contains("blocked-hook summary"));
+        assert_eq!(ends, vec![(true, false)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_blocked_after_compact_hook() -> TestResult {
+        let (transcript, ends) =
+            cancel_blocked_compaction_hook(BlockingCompactionHook::After).await?;
+
+        assert!(transcript.contains("blocked-hook summary"));
+        assert_eq!(ends, vec![(false, true)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_while_waiting_for_persistence_lock() -> TestResult {
+        let (session, _, _) = make_same_run_session(summary_stream_fn("unused"), false).await?;
+        let session_manager = session.session_manager.lock().await;
+        let first_kept_entry_id = session_manager
+            .get_branch(None)
+            .last()
+            .and_then(|entry| entry.id())
+            .ok_or("missing first kept entry")?
+            .to_owned();
+        let entries_before = session_manager.get_entries().len();
+        let abort_token = CancellationToken::new();
+        let mut finalize = Box::pin(session.finalize_compaction_result(
+            CompactionResult {
+                summary: "must not persist".to_owned(),
+                first_kept_entry_id,
+                tokens_before: 1,
+                estimated_tokens_after: None,
+                details: None,
+                from_hook: None,
+                usage: None,
+            },
+            false,
+            CompactionReason::Threshold,
+            false,
+            &abort_token,
+        ));
+
+        assert!(matches!(
+            futures::poll!(finalize.as_mut()),
+            std::task::Poll::Pending
+        ));
+        abort_token.cancel();
+        drop(session_manager);
+
+        let result = timeout(std::time::Duration::from_secs(1), finalize).await?;
+        assert!(matches!(result, Err(CompactionError::Cancelled)));
+        let entries_after = session.session_manager.lock().await.get_entries().len();
+        assert_eq!(entries_after, entries_before);
+        Ok(())
     }
 }

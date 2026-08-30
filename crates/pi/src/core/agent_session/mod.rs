@@ -223,6 +223,18 @@ pub(super) struct AgentSessionInner {
     pub(super) agent_end_notify: Arc<Notify>,
     /// Cancels prompt lifecycle barriers when the event pump disconnects.
     pub(super) agent_end_wait_cancel: CancellationToken,
+    /// Persistence epoch, advanced on every `AgentStart` observed by the
+    /// FIFO pump. The TurnEnd counters below are scoped to it so a stale
+    /// terminal marker from a previous run can never release a later run.
+    pub(super) persistence_epoch: u64,
+    /// `TurnEnd` events fully processed (extension → public → persistence)
+    /// by the FIFO pump within the current epoch.
+    pub(super) processed_turn_ends: u64,
+    /// `TurnEnd` events claimed by the prepare-next-turn callback within
+    /// the current epoch.
+    pub(super) claimed_turn_ends: u64,
+    /// Wakes TurnEnd barrier waiters after a fully persisted `TurnEnd`.
+    pub(super) turn_end_notify: Arc<Notify>,
     /// Scoped models list.
     pub(super) scoped_models: Vec<ScopedModel>,
     /// Active tool names.
@@ -235,6 +247,10 @@ pub(super) struct AgentSessionInner {
     pub(super) compaction_abort: Option<CancellationToken>,
     /// Cancellation: auto compaction.
     pub(super) auto_compaction_abort: Option<CancellationToken>,
+    /// Owner generation for the auto-compaction slot; prevents an older
+    /// compaction finishing after a newer one started from clearing the
+    /// newer compaction's token (`branch_summary_owner` precedent).
+    pub(super) auto_compaction_owner: u64,
     /// Cancellation: branch summary.
     pub(super) branch_summary_abort: Option<CancellationToken>,
     /// Owner generation for the branch-summary slot; prevents an older
@@ -351,6 +367,10 @@ impl AgentSessionInner {
             processed_agent_ends: 0,
             agent_end_notify: Arc::new(Notify::new()),
             agent_end_wait_cancel: CancellationToken::new(),
+            persistence_epoch: 0,
+            processed_turn_ends: 0,
+            claimed_turn_ends: 0,
+            turn_end_notify: Arc::new(Notify::new()),
             scoped_models,
             active_tool_names: Vec::new(),
             base_system_prompt,
@@ -361,6 +381,7 @@ impl AgentSessionInner {
             branch_summary_owner: 0,
             bash_abort: None,
             pending_next_turn_messages: Vec::new(),
+            auto_compaction_owner: 0,
             extension_mode: None,
             extension_ui_tag: None,
             extension_shutdown_handler: None,
@@ -451,6 +472,12 @@ impl AgentSession {
         let hooks = Arc::new(SessionHooks::new(runner));
         hooks.set_base_system_prompt(config.system_prompt.clone());
         hooks.set_tools(config.tools.clone());
+        let convert_to_llm: pi_agent::ConvertToLlm = Arc::new(|messages| {
+            Box::pin(async move {
+                crate::core::messages::convert_to_llm(&messages)
+                    .map_err(|error| pi_agent::AgentLoopError::message(error.to_string()))
+            })
+        });
 
         let agent = if let Some(agent) = config.agent {
             agent
@@ -464,37 +491,37 @@ impl AgentSession {
                 .unwrap_or_else(pi_agent::state::default_model);
             let telemetry =
                 crate::core::telemetry::resolve_session_telemetry(&config.settings_manager);
-            let mut base = config.base_config.unwrap_or_else(|| AgentLoopConfig {
-                model: model.clone(),
-                reasoning: None,
-                temperature: None,
-                max_tokens: None,
-                session_id: None,
-                transport: None,
-                cache_retention: None,
-                thinking_budgets: None,
-                max_retry_delay_ms: None,
-                metadata: None,
-                headers: None,
-                env: None,
-                stream_extra: serde_json::Map::new(),
-                tool_execution: pi_agent::ToolExecutionMode::Parallel,
-                convert_to_llm: pi_agent::default_convert_to_llm_hook(),
-                transform_context: None,
-                get_api_key: None,
-                should_stop_after_turn: None,
-                prepare_next_turn: None,
-                get_steering_messages: None,
-                get_follow_up_messages: None,
-                before_tool_call: None,
-                after_tool_call: None,
-                on_payload: None,
-                on_response: None,
-                telemetry,
-            });
-            base.before_tool_call = Some(hooks.before_tool_call_hook());
-            base.after_tool_call = Some(hooks.after_tool_call_hook());
-            base.prepare_next_turn = Some(hooks.prepare_next_turn_hook());
+            let base = match config.base_config {
+                Some(base) => base,
+                None => AgentLoopConfig {
+                    model: model.clone(),
+                    reasoning: None,
+                    temperature: None,
+                    max_tokens: None,
+                    session_id: None,
+                    transport: None,
+                    cache_retention: None,
+                    thinking_budgets: None,
+                    max_retry_delay_ms: None,
+                    metadata: None,
+                    headers: None,
+                    env: None,
+                    stream_extra: serde_json::Map::new(),
+                    tool_execution: pi_agent::ToolExecutionMode::Parallel,
+                    convert_to_llm: Arc::clone(&convert_to_llm),
+                    transform_context: None,
+                    get_api_key: None,
+                    should_stop_after_turn: None,
+                    prepare_next_turn: None,
+                    get_steering_messages: None,
+                    get_follow_up_messages: None,
+                    before_tool_call: None,
+                    after_tool_call: None,
+                    on_payload: None,
+                    on_response: None,
+                    telemetry,
+                },
+            };
             Agent::new(AgentOptions {
                 system_prompt: config.system_prompt.clone(),
                 model,
@@ -505,6 +532,12 @@ impl AgentSession {
                 provider,
             })
         };
+        agent.install_loop_hooks(
+            convert_to_llm,
+            hooks.before_tool_call_hook(),
+            hooks.after_tool_call_hook(),
+            hooks.prepare_next_turn_hook(),
+        );
         let telemetry = agent.telemetry();
 
         let retry = config.settings_manager.get_retry_settings();
@@ -539,6 +572,10 @@ impl AgentSession {
             bind_lock: AsyncMutex::new(()),
             telemetry,
         });
+        // Bind the owning session into the shared hooks before the event
+        // pump starts. The reference is weak (no session → hooks → session
+        // cycle) and the slot fills exactly once.
+        session.hooks.bind_session(Arc::downgrade(&session));
 
         // Build the initial tool registry from configured base tools and active
         // names. Extension tools will be picked up on the first reload.
@@ -1214,7 +1251,7 @@ fn _duration_keep() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use futures::stream::{self, BoxStream, StreamExt};

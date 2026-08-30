@@ -899,10 +899,32 @@ async fn complete_summarization_once(
 ) -> Result<AssistantMessage, CompactionError> {
     ensure_not_cancelled(options.signal.as_ref())?;
 
-    let mut stream = stream_fn(model.clone(), context, options).await;
+    let signal = options.signal.clone();
+    let mut stream_future = stream_fn(model.clone(), context, options);
+    let mut stream = if let Some(signal) = signal.as_ref() {
+        tokio::select! {
+            biased;
+            () = signal.cancelled() => return Err(CompactionError::Cancelled),
+            stream = stream_future.as_mut() => stream,
+        }
+    } else {
+        stream_future.await
+    };
     let mut last: Option<AssistantMessage> = None;
 
-    while let Some(item) = stream.next().await {
+    loop {
+        let item = if let Some(signal) = signal.as_ref() {
+            tokio::select! {
+                biased;
+                () = signal.cancelled() => return Err(CompactionError::Cancelled),
+                item = stream.next() => item,
+            }
+        } else {
+            stream.next().await
+        };
+        let Some(item) = item else {
+            break;
+        };
         match item {
             Ok(AssistantMessageEvent::Done { message, .. }) => return Ok(message),
             Ok(AssistantMessageEvent::Error { error, .. }) => return Ok(error),
@@ -2113,6 +2135,66 @@ mod tests {
             .await,
         );
         assert!(matches!(err, CompactionError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn compact_cancels_stalled_stream_item() {
+        let model = test_model(2_048, 128_000);
+        let prep = CompactionPreparation {
+            first_kept_entry_id: "k".into(),
+            messages_to_summarize: vec![user_msg("x")],
+            turn_prefix_messages: Vec::new(),
+            is_split_turn: false,
+            tokens_before: 1,
+            previous_summary: None,
+            file_ops: FileOperations::default(),
+            settings: DEFAULT_COMPACTION_SETTINGS,
+        };
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let stream_fn: SummarizeStreamFn = Arc::new({
+            let entered = Arc::clone(&entered);
+            move |_model, _context, _options| {
+                let entered = Arc::clone(&entered);
+                Box::pin(async move {
+                    entered.notify_one();
+                    let stream: Pin<
+                        Box<
+                            dyn futures::Stream<Item = Result<AssistantMessageEvent, ProviderError>>
+                                + Send,
+                        >,
+                    > = Box::pin(futures::stream::pending());
+                    stream
+                })
+            }
+        });
+        let cancel = CancellationToken::new();
+        let mut run = Box::pin(compact(
+            &prep,
+            CompactOptions {
+                model: &model,
+                api_key: None,
+                headers: None,
+                custom_instructions: None,
+                signal: Some(cancel.clone()),
+                thinking_level: None,
+                stream_fn,
+                env: None,
+                retry: None,
+                retry_callbacks: None,
+                hooks: None,
+            },
+        ));
+
+        tokio::select! {
+            () = entered.notified() => {}
+            result = run.as_mut() => panic!("stalled stream returned early: {result:?}"),
+        }
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), run.as_mut())
+            .await
+            .expect("cancellation timed out");
+        assert!(matches!(result, Err(CompactionError::Cancelled)));
     }
 
     #[tokio::test]

@@ -116,6 +116,17 @@ impl AgentSession {
     /// Process one agent event through extension → public → persistence.
     async fn process_agent_event(self: &Arc<Self>, event: AgentEvent) {
         let is_agent_end = matches!(&event, AgentEvent::AgentEnd { .. });
+        let is_turn_end = matches!(&event, AgentEvent::TurnEnd { .. });
+        if matches!(&event, AgentEvent::AgentStart) {
+            // New persistence epoch: reset the TurnEnd counters before any
+            // handler work so terminal markers from a previous run can never
+            // release a later run.
+            let mut inner = self.lock_inner();
+            inner.persistence_epoch = inner.persistence_epoch.wrapping_add(1);
+            inner.processed_turn_ends = 0;
+            inner.claimed_turn_ends = 0;
+        }
+
         if matches!(&event, AgentEvent::MessageStart { message } if message.role() == "user")
             && let Err(error) = self
                 .handle_agent_event_side_effects(&event, &AgentSessionEvent::AgentStart)
@@ -199,13 +210,33 @@ impl AgentSession {
             self.agent.abort();
         }
 
-        if is_agent_end {
+        if is_turn_end {
+            // The TurnEnd has now run its full extension → public →
+            // persistence sequence: publish the terminal marker. `notify_one`
+            // stores a permit when no waiter is registered yet, so a waiter
+            // racing between its locked check and registration is still woken.
             let notify = {
                 let mut inner = self.lock_inner();
-                inner.processed_agent_ends = inner.processed_agent_ends.saturating_add(1);
-                Arc::clone(&inner.agent_end_notify)
+                inner.processed_turn_ends = inner.processed_turn_ends.saturating_add(1);
+                Arc::clone(&inner.turn_end_notify)
             };
-            notify.notify_waiters();
+            notify.notify_one();
+        }
+
+        if is_agent_end {
+            let (agent_end_notify, turn_end_notify) = {
+                let mut inner = self.lock_inner();
+                // The run is over: discard this run's unclaimed terminal
+                // markers so they can never release a later run.
+                inner.claimed_turn_ends = inner.processed_turn_ends;
+                inner.processed_agent_ends = inner.processed_agent_ends.saturating_add(1);
+                (
+                    Arc::clone(&inner.agent_end_notify),
+                    Arc::clone(&inner.turn_end_notify),
+                )
+            };
+            turn_end_notify.notify_one();
+            agent_end_notify.notify_waiters();
         }
     }
 
@@ -228,6 +259,35 @@ impl AgentSession {
             tokio::select! {
                 () = notified => {}
                 () = cancelled.cancelled() => return false,
+            }
+        }
+    }
+
+    /// Cancellation-aware barrier: atomically claim one fully persisted
+    /// `TurnEnd` of the current epoch, or register for the next one.
+    ///
+    /// The claim/registration happens under the inner lock so no wake is
+    /// lost; the await then selects without holding any lock against the
+    /// active run token and the pump wait-cancel (pump exit/disconnect).
+    /// Returns `true` when a processed `TurnEnd` was claimed.
+    pub(super) async fn claim_processed_turn_end(&self, run_cancel: &CancellationToken) -> bool {
+        loop {
+            let (notified, pump_cancel) = {
+                let mut inner = self.lock_inner();
+                if inner.processed_turn_ends > inner.claimed_turn_ends {
+                    inner.claimed_turn_ends += 1;
+                    return true;
+                }
+                (
+                    Arc::clone(&inner.turn_end_notify).notified_owned(),
+                    inner.agent_end_wait_cancel.clone(),
+                )
+            };
+            tokio::select! {
+                biased;
+                () = run_cancel.cancelled() => return false,
+                () = pump_cancel.cancelled() => return false,
+                () = notified => {}
             }
         }
     }
@@ -446,6 +506,170 @@ mod tests {
             1,
             "exactly one settle: {snapshot:?}"
         );
+        Ok(())
+    }
+
+    fn scripted_user(text: &str) -> pi_agent::AgentMessage {
+        pi_agent::user_text(text, std::iter::empty())
+    }
+
+    fn turn_end_event() -> AgentEvent {
+        AgentEvent::TurnEnd {
+            message: assistant_message(),
+            tool_results: Vec::new(),
+        }
+    }
+
+    /// Drive one scripted run through the real pump: `AgentStart`, a user
+    /// message pair, an assistant message pair, and a `TurnEnd` (plus
+    /// `AgentEnd` when `with_end` is set).
+    fn emit_scripted_run(sink: &AgentEventSink, with_end: bool) {
+        sink.emit(AgentEvent::AgentStart);
+        sink.emit(AgentEvent::MessageStart {
+            message: scripted_user("hi"),
+        });
+        sink.emit(AgentEvent::MessageEnd {
+            message: scripted_user("hi"),
+        });
+        sink.emit(AgentEvent::MessageStart {
+            message: assistant_message(),
+        });
+        sink.emit(AgentEvent::MessageEnd {
+            message: assistant_message(),
+        });
+        sink.emit(turn_end_event());
+        if with_end {
+            sink.emit(AgentEvent::AgentEnd {
+                messages: Vec::new(),
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_end_marker_released_only_after_full_pump_handling() -> TestResult {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let config =
+            super::super::AgentSessionConfig::test_config(Arc::new(StubProvider), model())?;
+        let session = super::super::AgentSession::new(config)?;
+        session.mark_agent_run_active();
+
+        // Snapshot the terminal marker state at the moment the public
+        // `turn_end` reaches listeners: the marker must still be unpublished
+        // because the pump increments only after the full extension → public
+        // → persistence sequence.
+        let marker_at_public = Arc::new(std::sync::Mutex::new(None::<u64>));
+        let marker_observer = Arc::clone(&marker_at_public);
+        let session_for_marker = Arc::clone(&session);
+        let _unsub = session.subscribe(move |event| {
+            if matches!(event, AgentSessionEvent::TurnEnd { .. }) {
+                let marker = session_for_marker.lock_inner().processed_turn_ends;
+                *marker_observer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(marker);
+            }
+        });
+
+        let sink = AgentEventSink::new(Arc::new(std::sync::Mutex::new(AgentState::new())));
+        let rx = sink.subscribe_with_capacity(16);
+        emit_scripted_run(&sink, false);
+
+        let pump = session.spawn_event_pump_with_subscription(rx);
+        let claimed = timeout(
+            Duration::from_secs(2),
+            session.claim_processed_turn_end(&CancellationToken::new()),
+        )
+        .await?;
+        assert!(
+            claimed,
+            "processed TurnEnd must be claimable after the pump"
+        );
+
+        let at_public = marker_at_public
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            at_public,
+            Some(0),
+            "marker must be unpublished while the public turn_end is in flight"
+        );
+        {
+            let inner = session.lock_inner();
+            assert_eq!(inner.processed_turn_ends, 1);
+            assert_eq!(inner.claimed_turn_ends, 1);
+            assert_eq!(inner.persistence_epoch, 1);
+        }
+
+        drop(sink);
+        pump.join.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_terminal_turn_end_does_not_release_later_run() -> TestResult {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let config =
+            super::super::AgentSessionConfig::test_config(Arc::new(StubProvider), model())?;
+        let session = super::super::AgentSession::new(config)?;
+        session.mark_agent_run_active();
+
+        let sink = AgentEventSink::new(Arc::new(std::sync::Mutex::new(AgentState::new())));
+        let rx = sink.subscribe_with_capacity(32);
+        let pump = session.spawn_event_pump_with_subscription(rx);
+
+        // Run one: fully processed, terminal marker left unclaimed.
+        let ends_before = session.processed_agent_end_count();
+        emit_scripted_run(&sink, true);
+        assert!(
+            timeout(
+                Duration::from_secs(2),
+                session.wait_for_processed_agent_end(ends_before),
+            )
+            .await?
+        );
+        {
+            let inner = session.lock_inner();
+            assert_eq!(
+                inner.claimed_turn_ends, inner.processed_turn_ends,
+                "agent_end must discard unclaimed terminal markers"
+            );
+        }
+
+        // The stale marker from run one must not satisfy a claim.
+        let stale_claim = timeout(
+            Duration::from_millis(150),
+            session.claim_processed_turn_end(&CancellationToken::new()),
+        )
+        .await;
+        assert!(
+            stale_claim.is_err(),
+            "stale terminal marker must not release a claim"
+        );
+
+        // Run two: a fresh epoch; its own TurnEnd releases the claim.
+        emit_scripted_run(&sink, false);
+        let claimed = timeout(
+            Duration::from_secs(2),
+            session.claim_processed_turn_end(&CancellationToken::new()),
+        )
+        .await?;
+        assert!(
+            claimed,
+            "run two's persisted TurnEnd must release the claim"
+        );
+        {
+            let inner = session.lock_inner();
+            assert_eq!(inner.persistence_epoch, 2);
+            assert_eq!(inner.processed_turn_ends, 1);
+            assert_eq!(inner.claimed_turn_ends, 1);
+        }
+
+        drop(sink);
+        pump.join.await?;
         Ok(())
     }
 }

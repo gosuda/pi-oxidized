@@ -9,19 +9,19 @@
 //! reinstalling those closures. Sync locks are never held across `.await`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 use crate::core::resources::ResourceExtensionPaths;
 use futures::future::BoxFuture;
 use pi_agent::{
     AfterToolCallContext, AfterToolCallResult, AgentLoopError, AgentLoopTurnUpdate, AgentMessage,
-    AgentTool, AgentToolResult, BeforeToolCallContext, BeforeToolCallResult,
-    PrepareNextTurnContext,
+    AgentTool, BeforeToolCallContext, BeforeToolCallResult, PrepareNextTurnContext,
 };
-use pi_ai::{AssistantMessageEvent, Model, ModelThinkingLevel, ToolCall, ToolResultContent};
+use pi_ai::{AssistantMessageEvent, ToolResultContent};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
+use super::AgentSession;
 use super::events::AgentSessionEvent;
 
 /// Result of an extension `input` transform.
@@ -283,12 +283,18 @@ pub struct SystemPromptState {
 ///
 /// The agent event pump and public `AgentSession` methods coordinate through
 /// [`super::AgentSessionInner`]; `SessionHooks` only exposes runner/prompt/tool
-/// snapshots for the pi-agent hook closures.
+/// snapshots plus the weak owning-session handle for the pi-agent hook
+/// closures.
 #[derive(Clone)]
 pub struct SessionHooks {
     runner: Arc<RwLock<Arc<dyn ExtensionRunner>>>,
     system_prompt: Arc<RwLock<SystemPromptState>>,
     tools: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
+    /// Weak back-reference to the owning session, bound exactly once after
+    /// `Arc<AgentSession>` construction and before the event pump starts.
+    /// `Arc<OnceLock<_>>` keeps `SessionHooks: Clone` sharing one slot; the
+    /// weak reference avoids a session → hooks → session `Arc` cycle.
+    session: Arc<OnceLock<Weak<AgentSession>>>,
 }
 
 impl SessionHooks {
@@ -299,7 +305,19 @@ impl SessionHooks {
             runner: Arc::new(RwLock::new(runner)),
             system_prompt: Arc::new(RwLock::new(SystemPromptState::default())),
             tools: Arc::new(RwLock::new(Vec::new())),
+            session: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Bind the owning session (weak, cycle-free). Only the first bind wins;
+    /// later calls are ignored so hook closures observe a stable slot.
+    pub(super) fn bind_session(&self, session: Weak<AgentSession>) {
+        let _ = self.session.set(session);
+    }
+
+    /// Upgrade the bound session, if it is still alive.
+    fn session(&self) -> Option<Arc<AgentSession>> {
+        self.session.get()?.upgrade()
     }
 
     /// Create hooks with a null runner.
@@ -435,37 +453,48 @@ impl SessionHooks {
         )
     }
 
-    /// Build the `prepare_next_turn` closure that refreshes system prompt + tools.
+    /// Build the `prepare_next_turn` closure.
+    ///
+    /// Session phase (when the weak binding upgrades): wait until the FIFO
+    /// pump has fully processed and persisted the matching `TurnEnd`, then
+    /// run same-run threshold compaction through the session. When the
+    /// barrier reports cancellation or pump disconnect, compaction is
+    /// skipped. On every session-phase path the context is rebuilt from the
+    /// agent transcript.
+    ///
+    /// Refresh phase (always): overlay the latest system prompt and the
+    /// non-empty tool snapshot, returning one authoritative context update.
+    /// A failed session upgrade keeps this refresh-only behavior.
     #[must_use]
     pub fn prepare_next_turn_hook(self: &Arc<Self>) -> pi_agent::PrepareNextTurn {
         let hooks = Arc::clone(self);
-        Arc::new(move |turn: PrepareNextTurnContext| {
-            let hooks = Arc::clone(&hooks);
-            Box::pin(async move {
-                let system_prompt = hooks.effective_system_prompt();
-                let tools = hooks.tools_snapshot();
-                let mut context = turn.context;
-                context.system_prompt = system_prompt;
-                if !tools.is_empty() {
-                    context.tools = tools;
-                }
-                Ok(Some(AgentLoopTurnUpdate {
-                    context: Some(context),
-                    model: None,
-                    thinking_level: None,
-                }))
-            })
-        })
+        Arc::new(
+            move |turn: PrepareNextTurnContext, cancel: CancellationToken| {
+                let hooks = Arc::clone(&hooks);
+                Box::pin(async move {
+                    let mut context = turn.context;
+                    if let Some(session) = hooks.session() {
+                        let claimed = session.claim_processed_turn_end(&cancel).await;
+                        if claimed {
+                            session
+                                .compact_before_next_assistant_response(&context, &cancel)
+                                .await;
+                        }
+                        context.messages = session.agent.transcript();
+                    }
+                    let system_prompt = hooks.effective_system_prompt();
+                    let tools = hooks.tools_snapshot();
+                    context.system_prompt = system_prompt;
+                    if !tools.is_empty() {
+                        context.tools = tools;
+                    }
+                    Ok(Some(AgentLoopTurnUpdate {
+                        context: Some(context),
+                        model: None,
+                        thinking_level: None,
+                    }))
+                })
+            },
+        )
     }
-}
-
-/// Helper: unused imports kept for sibling modules via re-exports.
-#[allow(dead_code)]
-fn _keep_types(
-    _: ToolCall,
-    _: AssistantMessageEvent,
-    _: Model,
-    _: ModelThinkingLevel,
-    _: AgentToolResult,
-) {
 }

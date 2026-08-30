@@ -118,7 +118,7 @@ async fn run_loop(
     io: &RunIo<'_>,
     cancel: CancellationToken,
 ) -> Result<(), AgentLoopError> {
-    let mut first_turn = true;
+    let mut last_completed_turn: Option<PrepareNextTurnContext> = None;
     let mut pending_messages = poll_messages(config.get_steering_messages.as_ref()).await?;
 
     // Outer loop: re-enters when follow-up messages arrive after tools finish.
@@ -127,9 +127,39 @@ async fn run_loop(
 
         // Inner loop: stream, tools, steering.
         while has_more_tool_calls || !pending_messages.is_empty() {
-            if first_turn {
-                first_turn = false;
-            } else {
+            // A saved completed turn means the caller-emitted first turn is
+            // over and this iteration starts a real subsequent provider
+            // request; decide continuation before touching provider state.
+            if let Some(completed_turn) = last_completed_turn.take() {
+                if cancel.is_cancelled() {
+                    emit_agent_end(io.sink, new_messages);
+                    return Ok(());
+                }
+
+                apply_prepare_next_turn(
+                    current_context,
+                    &mut config,
+                    completed_turn,
+                    cancel.clone(),
+                )
+                .await?;
+
+                if cancel.is_cancelled() {
+                    emit_agent_end(io.sink, new_messages);
+                    return Ok(());
+                }
+
+                // Messages queued while preparation ran join this same next
+                // request; a pending poll delivery keeps one-at-a-time
+                // semantics and skips the extra poll.
+                if pending_messages.is_empty() {
+                    pending_messages = poll_messages(config.get_steering_messages.as_ref()).await?;
+                    if cancel.is_cancelled() {
+                        emit_agent_end(io.sink, new_messages);
+                        return Ok(());
+                    }
+                }
+
                 io.sink.emit(AgentEvent::TurnStart);
             }
 
@@ -185,29 +215,26 @@ async fn run_loop(
                 return Ok(());
             }
 
-            apply_prepare_next_turn(
-                current_context,
-                &mut config,
-                &message,
-                &tool_results,
-                new_messages,
-            )
-            .await?;
+            let completed_turn = PrepareNextTurnContext {
+                message: message.clone(),
+                tool_results: tool_results.clone(),
+                context: current_context.clone(),
+                new_messages: new_messages.clone(),
+            };
 
-            if should_stop_after_turn(
-                &config,
-                &message,
-                &tool_results,
-                current_context,
-                new_messages,
-            )
-            .await?
-            {
+            if should_stop_after_turn(&config, &completed_turn).await? {
                 emit_agent_end(io.sink, new_messages);
                 return Ok(());
             }
 
             pending_messages = poll_messages(config.get_steering_messages.as_ref()).await?;
+
+            if cancel.is_cancelled() {
+                emit_agent_end(io.sink, new_messages);
+                return Ok(());
+            }
+
+            last_completed_turn = Some(completed_turn);
         }
 
         let follow_up = poll_messages(config.get_follow_up_messages.as_ref()).await?;
@@ -460,20 +487,13 @@ async fn poll_messages(
 async fn apply_prepare_next_turn(
     current_context: &mut AgentContext,
     config: &mut AgentLoopConfig,
-    message: &AssistantMessage,
-    tool_results: &[ToolResultMessage],
-    new_messages: &[AgentMessage],
+    completed_turn: PrepareNextTurnContext,
+    cancel: CancellationToken,
 ) -> Result<(), AgentLoopError> {
     let Some(prepare) = config.prepare_next_turn.clone() else {
         return Ok(());
     };
-    let update = prepare(PrepareNextTurnContext {
-        message: message.clone(),
-        tool_results: tool_results.to_vec(),
-        context: current_context.clone(),
-        new_messages: new_messages.to_vec(),
-    })
-    .await?;
+    let update = prepare(completed_turn, cancel).await?;
     apply_turn_update(current_context, config, update);
     Ok(())
 }
@@ -503,21 +523,12 @@ fn apply_turn_update(
 
 async fn should_stop_after_turn(
     config: &AgentLoopConfig,
-    message: &AssistantMessage,
-    tool_results: &[ToolResultMessage],
-    current_context: &AgentContext,
-    new_messages: &[AgentMessage],
+    completed_turn: &ShouldStopAfterTurnContext,
 ) -> Result<bool, AgentLoopError> {
     let Some(should_stop) = config.should_stop_after_turn.as_ref() else {
         return Ok(false);
     };
-    should_stop(ShouldStopAfterTurnContext {
-        message: message.clone(),
-        tool_results: tool_results.to_vec(),
-        context: current_context.clone(),
-        new_messages: new_messages.to_vec(),
-    })
-    .await
+    should_stop(completed_turn.clone()).await
 }
 
 fn message_has_tool_calls(message: &AssistantMessage) -> bool {
@@ -601,10 +612,21 @@ mod tests {
     type ScriptItem = Result<AssistantMessageEvent, ProviderError>;
     type Script = Vec<ScriptItem>;
 
+    type OrderLog = Arc<Mutex<Vec<&'static str>>>;
+
+    fn record_order(log: &OrderLog, entry: &'static str) {
+        if let Ok(mut guard) = log.lock() {
+            guard.push(entry);
+        }
+    }
+
     #[derive(Clone)]
     struct ScriptedProvider {
         scripts: Arc<Mutex<Vec<Script>>>,
         contexts: Arc<Mutex<Vec<Context>>>,
+        models: Arc<Mutex<Vec<String>>>,
+        reasoning: Arc<Mutex<Vec<Option<String>>>>,
+        order_log: Option<OrderLog>,
         hang_after: Option<usize>,
         item_delay: Duration,
         delivered: Arc<AtomicUsize>,
@@ -616,6 +638,9 @@ mod tests {
             Self {
                 scripts: Arc::new(Mutex::new(scripts)),
                 contexts: Arc::new(Mutex::new(Vec::new())),
+                models: Arc::new(Mutex::new(Vec::new())),
+                reasoning: Arc::new(Mutex::new(Vec::new())),
+                order_log: None,
                 hang_after: None,
                 item_delay: Duration::ZERO,
                 delivered: Arc::new(AtomicUsize::new(0)),
@@ -626,6 +651,9 @@ mod tests {
             Self {
                 scripts: Arc::new(Mutex::new(scripts)),
                 contexts: Arc::new(Mutex::new(Vec::new())),
+                models: Arc::new(Mutex::new(Vec::new())),
+                reasoning: Arc::new(Mutex::new(Vec::new())),
+                order_log: None,
                 hang_after: None,
                 item_delay,
                 delivered: Arc::new(AtomicUsize::new(0)),
@@ -637,6 +665,9 @@ mod tests {
             Self {
                 scripts: Arc::new(Mutex::new(scripts)),
                 contexts: Arc::new(Mutex::new(Vec::new())),
+                models: Arc::new(Mutex::new(Vec::new())),
+                reasoning: Arc::new(Mutex::new(Vec::new())),
+                order_log: None,
                 hang_after: Some(hang_after),
                 item_delay: Duration::ZERO,
                 delivered: Arc::new(AtomicUsize::new(0)),
@@ -654,15 +685,51 @@ mod tests {
                 .ok()
                 .and_then(|guard| guard.last().cloned())
         }
+
+        fn model_ids(&self) -> Vec<String> {
+            self.models
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default()
+        }
+
+        fn reasoning_values(&self) -> Vec<Option<String>> {
+            self.reasoning
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default()
+        }
+
+        fn with_order_log(mut self, log: OrderLog) -> Self {
+            self.order_log = Some(log);
+            self
+        }
     }
 
     impl Provider for ScriptedProvider {
         fn stream(
             &self,
-            _model: &Model,
+            model: &Model,
             context: Context,
             options: pi_ai::StreamOptions,
         ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+            if let Some(log) = &self.order_log
+                && let Ok(mut guard) = log.lock()
+            {
+                guard.push("stream");
+            }
+            if let Ok(mut guard) = self.models.lock() {
+                guard.push(model.id.clone());
+            }
+            if let Ok(mut guard) = self.reasoning.lock() {
+                guard.push(
+                    options
+                        .extra
+                        .get("reasoning")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
             if let Ok(mut guard) = self.contexts.lock() {
                 guard.push(context);
             }
@@ -750,6 +817,7 @@ mod tests {
         executed: Arc<AtomicUsize>,
         delay: Duration,
         result_text: String,
+        terminate: bool,
     }
 
     impl RecordingTool {
@@ -759,6 +827,14 @@ mod tests {
                 executed: Arc::new(AtomicUsize::new(0)),
                 delay: Duration::from_millis(0),
                 result_text: format!("{name}-ok"),
+                terminate: false,
+            }
+        }
+
+        fn terminating(name: &str) -> Self {
+            Self {
+                terminate: true,
+                ..Self::new(name)
             }
         }
     }
@@ -797,6 +873,7 @@ mod tests {
             let executed = Arc::clone(&self.executed);
             let delay = self.delay;
             let result_text = self.result_text.clone();
+            let terminate = self.terminate;
             Box::pin(async move {
                 executed.fetch_add(1, Ordering::SeqCst);
                 if !delay.is_zero() {
@@ -809,7 +886,7 @@ mod tests {
                     content: vec![ToolResultContent::Text(TextContent::new(result_text))],
                     details: json!({}),
                     added_tool_names: None,
-                    terminate: None,
+                    terminate: terminate.then_some(true),
                 })
             })
         }
@@ -1155,7 +1232,7 @@ mod tests {
             })
         }));
         let prepare_calls_hook = Arc::clone(&prepare_calls);
-        config.prepare_next_turn = Some(Arc::new(move |_| {
+        config.prepare_next_turn = Some(Arc::new(move |_, _| {
             let prepare_calls_hook = Arc::clone(&prepare_calls_hook);
             Box::pin(async move {
                 prepare_calls_hook.fetch_add(1, Ordering::SeqCst);
@@ -1310,6 +1387,20 @@ mod tests {
         Ok(())
     }
 
+    fn context_has_user_text(context: &Context, needle: &str) -> bool {
+        context.messages.iter().any(|message| {
+            match message {
+            Message::User(user) => match &user.content {
+                pi_ai::UserMessageContent::Text(text) => text.contains(needle),
+                pi_ai::UserMessageContent::Blocks(blocks) => blocks.iter().any(|block| {
+                    matches!(block, pi_ai::UserContent::Text(text) if text.text.contains(needle))
+                }),
+            },
+            _ => false,
+        }
+        })
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn prepare_next_turn_updates_model_and_reasoning() -> TestResult {
         let tool = Arc::new(RecordingTool::new("read"));
@@ -1318,9 +1409,14 @@ mod tests {
         let mut next_model = sample_model();
         next_model.id = "m2".to_owned();
         let next_model_for_hook = next_model.clone();
-        config.prepare_next_turn = Some(Arc::new(move |_| {
+        let order: OrderLog = Arc::new(Mutex::new(Vec::new()));
+        let order_for_hook = Arc::clone(&order);
+        let provider = provider.with_order_log(Arc::clone(&order));
+        config.prepare_next_turn = Some(Arc::new(move |_, _| {
             let next_model = next_model_for_hook.clone();
+            let order = Arc::clone(&order_for_hook);
             Box::pin(async move {
+                record_order(&order, "prepare");
                 Ok(Some(AgentLoopTurnUpdate {
                     context: None,
                     model: Some(next_model),
@@ -1339,6 +1435,335 @@ mod tests {
         .await?;
 
         assert_eq!(provider.call_count(), 2);
+        assert_eq!(count_type(&events, "agent_end"), 1);
+        assert_eq!(
+            provider.model_ids(),
+            vec!["m".to_owned(), "m2".to_owned()],
+            "request two must use the model prepared after turn one"
+        );
+        assert_eq!(
+            provider.reasoning_values(),
+            vec![None, Some("high".to_owned())],
+            "request two must carry the prepared thinking level"
+        );
+        let order = order
+            .lock()
+            .map_err(|_| "order mutex poisoned".to_owned())?;
+        let stream_positions: Vec<usize> = order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| (*entry == "stream").then_some(index))
+            .collect();
+        let prepare_position = order
+            .iter()
+            .position(|entry| *entry == "prepare")
+            .ok_or("prepare never recorded")?;
+        assert_eq!(stream_positions.len(), 2);
+        assert!(
+            stream_positions[0] < prepare_position && prepare_position < stream_positions[1],
+            "prepare must run between the two provider requests"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_after_turn_precedes_prepare_next_turn() -> TestResult {
+        let tool = Arc::new(RecordingTool::new("read"));
+        let provider =
+            ScriptedProvider::new(vec![tool_script("c1", "read"), text_script("unused")]);
+        let mut config = sample_config();
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let order: OrderLog = Arc::new(Mutex::new(Vec::new()));
+        let prepare_calls_hook = Arc::clone(&prepare_calls);
+        config.prepare_next_turn = Some(Arc::new(move |_, _| {
+            let prepare_calls_hook = Arc::clone(&prepare_calls_hook);
+            Box::pin(async move {
+                prepare_calls_hook.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            })
+        }));
+        let stop_calls_hook = Arc::clone(&stop_calls);
+        let order_for_stop = Arc::clone(&order);
+        config.should_stop_after_turn = Some(Arc::new(move |_| {
+            let stop_calls_hook = Arc::clone(&stop_calls_hook);
+            let order = Arc::clone(&order_for_stop);
+            Box::pin(async move {
+                stop_calls_hook.fetch_add(1, Ordering::SeqCst);
+                record_order(&order, "stop");
+                Ok(true)
+            })
+        }));
+
+        let (_messages, events, _) = run_prompt(
+            vec![text_user_message("prompt")],
+            base_context(vec![tool]),
+            config,
+            &provider,
+            CancellationToken::new(),
+        )
+        .await?;
+
+        assert_eq!(stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            prepare_calls.load(Ordering::SeqCst),
+            0,
+            "a stopped turn must never reach prepare_next_turn"
+        );
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(count_type(&events, "turn_start"), 1);
+        assert_eq!(count_type(&events, "agent_end"), 1);
+        let order = order
+            .lock()
+            .map_err(|_| "order mutex poisoned".to_owned())?;
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0], "stop");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminating_tool_result_skips_prepare_next_turn() -> TestResult {
+        let tool = Arc::new(RecordingTool::terminating("finish"));
+        let provider =
+            ScriptedProvider::new(vec![tool_script("c1", "finish"), text_script("unused")]);
+        let mut config = sample_config();
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let prepare_calls_hook = Arc::clone(&prepare_calls);
+        config.prepare_next_turn = Some(Arc::new(move |_, _| {
+            let prepare_calls_hook = Arc::clone(&prepare_calls_hook);
+            Box::pin(async move {
+                prepare_calls_hook.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            })
+        }));
+
+        let (_messages, events, _) = run_prompt(
+            vec![text_user_message("prompt")],
+            base_context(vec![tool]),
+            config,
+            &provider,
+            CancellationToken::new(),
+        )
+        .await?;
+
+        assert_eq!(
+            prepare_calls.load(Ordering::SeqCst),
+            0,
+            "a terminating batch without queued work must skip preparation"
+        );
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(count_type(&events, "agent_start"), 1);
+        assert_eq!(count_type(&events, "turn_start"), 1);
+        assert_eq!(count_type(&events, "turn_end"), 1);
+        assert_eq!(count_type(&events, "agent_end"), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steering_queued_during_prepare_reaches_same_next_turn() -> TestResult {
+        let tool = Arc::new(RecordingTool::new("read"));
+        let provider =
+            ScriptedProvider::new(vec![tool_script("c1", "read"), text_script("after-steer")]);
+        let mut config = sample_config();
+        let queue: Arc<Mutex<Vec<AgentMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let steer_polls = Arc::new(AtomicUsize::new(0));
+        let prepare_started = Arc::new(AtomicBool::new(false));
+        let release_prepare = Arc::new(tokio::sync::Notify::new());
+
+        let steer_polls_hook = Arc::clone(&steer_polls);
+        let queue_for_hook = Arc::clone(&queue);
+        config.get_steering_messages = Some(Arc::new(move || {
+            let steer_polls_hook = Arc::clone(&steer_polls_hook);
+            let queue = Arc::clone(&queue_for_hook);
+            Box::pin(async move {
+                steer_polls_hook.fetch_add(1, Ordering::SeqCst);
+                let mut guard = queue
+                    .lock()
+                    .map_err(|_| AgentLoopError::message("poisoned"))?;
+                if guard.is_empty() {
+                    return Ok(Vec::new());
+                }
+                Ok(vec![guard.remove(0)])
+            })
+        }));
+        let prepare_started_hook = Arc::clone(&prepare_started);
+        let release_for_hook = Arc::clone(&release_prepare);
+        config.prepare_next_turn = Some(Arc::new(move |_, _| {
+            let prepare_started_hook = Arc::clone(&prepare_started_hook);
+            let release = Arc::clone(&release_for_hook);
+            Box::pin(async move {
+                prepare_started_hook.store(true, Ordering::SeqCst);
+                release.notified().await;
+                Ok(None)
+            })
+        }));
+
+        let provider = Arc::new(provider);
+        let task_provider = Arc::clone(&provider);
+        let task_tool = Arc::clone(&tool);
+        let run = tokio::spawn(async move {
+            run_prompt(
+                vec![text_user_message("prompt")],
+                base_context(vec![task_tool]),
+                config,
+                &task_provider,
+                CancellationToken::new(),
+            )
+            .await
+        });
+
+        let mut waited = 0usize;
+        while !prepare_started.load(Ordering::SeqCst) {
+            waited += 1;
+            if waited > 5_000 {
+                return Err("prepare never started".to_owned());
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+        queue
+            .lock()
+            .map_err(|_| "queue mutex poisoned".to_owned())?
+            .push(text_user_message("steer-during-prepare"));
+        release_prepare.notify_one();
+
+        let (_messages, events, _) = run.await.map_err(|error| error.to_string())??;
+        assert_eq!(
+            steer_polls.load(Ordering::SeqCst),
+            4,
+            "polls: initial, bottom, guarded post-prepare, bottom after final turn"
+        );
+        assert_eq!(provider.call_count(), 2);
+        let context = provider.last_context().ok_or("no provider context")?;
+        assert!(
+            context_has_user_text(&context, "steer-during-prepare"),
+            "steering queued during prepare must reach the same next request"
+        );
+        assert_eq!(count_type(&events, "agent_start"), 1);
+        assert_eq!(count_type(&events, "turn_start"), 2);
+        assert_eq!(count_type(&events, "agent_end"), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepare_skips_extra_poll_when_steering_already_delivered() -> TestResult {
+        let tool = Arc::new(RecordingTool::new("read"));
+        let provider =
+            ScriptedProvider::new(vec![tool_script("c1", "read"), text_script("after-steer")]);
+        let mut config = sample_config();
+        let steer_polls = Arc::new(AtomicUsize::new(0));
+        let polls_at_prepare = Arc::new(AtomicUsize::new(0));
+
+        let steer_polls_hook = Arc::clone(&steer_polls);
+        config.get_steering_messages = Some(Arc::new(move || {
+            let steer_polls_hook = Arc::clone(&steer_polls_hook);
+            Box::pin(async move {
+                let poll = steer_polls_hook.fetch_add(1, Ordering::SeqCst) + 1;
+                if poll == 2 {
+                    return Ok(vec![text_user_message("steer-early")]);
+                }
+                Ok(Vec::new())
+            })
+        }));
+        let steer_polls_for_prepare = Arc::clone(&steer_polls);
+        let polls_at_prepare_hook = Arc::clone(&polls_at_prepare);
+        config.prepare_next_turn = Some(Arc::new(move |_, _| {
+            let steer_polls = Arc::clone(&steer_polls_for_prepare);
+            let polls_at_prepare = Arc::clone(&polls_at_prepare_hook);
+            Box::pin(async move {
+                polls_at_prepare.store(steer_polls.load(Ordering::SeqCst), Ordering::SeqCst);
+                Ok(None)
+            })
+        }));
+
+        let (_messages, events, _) = run_prompt(
+            vec![text_user_message("prompt")],
+            base_context(vec![tool]),
+            config,
+            &provider,
+            CancellationToken::new(),
+        )
+        .await?;
+
+        assert_eq!(
+            polls_at_prepare.load(Ordering::SeqCst),
+            2,
+            "prepare must run right after the bottom poll delivered steering"
+        );
+        assert_eq!(
+            steer_polls.load(Ordering::SeqCst),
+            3,
+            "no extra poll may run between the delivered poll and prepare"
+        );
+        assert_eq!(provider.call_count(), 2);
+        let context = provider.last_context().ok_or("no provider context")?;
+        assert!(
+            context_has_user_text(&context, "steer-early"),
+            "delivered steering must still be part of request two"
+        );
+        assert_eq!(count_type(&events, "agent_end"), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_during_prepare_stops_before_next_request() -> TestResult {
+        let tool = Arc::new(RecordingTool::new("read"));
+        let provider =
+            ScriptedProvider::new(vec![tool_script("c1", "read"), text_script("unused")]);
+        let mut config = sample_config();
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let prepare_started = Arc::new(AtomicBool::new(false));
+        let hook_saw_cancel = Arc::new(AtomicBool::new(false));
+        let prepare_calls_hook = Arc::clone(&prepare_calls);
+        let prepare_started_hook = Arc::clone(&prepare_started);
+        let hook_saw_cancel_hook = Arc::clone(&hook_saw_cancel);
+        config.prepare_next_turn = Some(Arc::new(move |_ctx, cancel| {
+            let prepare_calls = Arc::clone(&prepare_calls_hook);
+            let prepare_started = Arc::clone(&prepare_started_hook);
+            let hook_saw_cancel = Arc::clone(&hook_saw_cancel_hook);
+            Box::pin(async move {
+                prepare_calls.fetch_add(1, Ordering::SeqCst);
+                prepare_started.store(true, Ordering::SeqCst);
+                cancel.cancelled().await;
+                hook_saw_cancel.store(true, Ordering::SeqCst);
+                Ok(None)
+            })
+        }));
+
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let provider = Arc::new(provider);
+        let task_provider = Arc::clone(&provider);
+        let task_tool = Arc::clone(&tool);
+        let run = tokio::spawn(async move {
+            run_prompt(
+                vec![text_user_message("prompt")],
+                base_context(vec![task_tool]),
+                config,
+                &task_provider,
+                run_cancel,
+            )
+            .await
+        });
+
+        let mut waited = 0usize;
+        while !prepare_started.load(Ordering::SeqCst) {
+            waited += 1;
+            if waited > 5_000 {
+                return Err("prepare never started".to_owned());
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+        cancel.cancel();
+
+        let (_messages, events, _) = run.await.map_err(|error| error.to_string())??;
+        assert!(
+            hook_saw_cancel.load(Ordering::SeqCst),
+            "prepare must receive the active run cancellation token"
+        );
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(count_type(&events, "agent_start"), 1);
+        assert_eq!(count_type(&events, "turn_start"), 1);
         assert_eq!(count_type(&events, "agent_end"), 1);
         Ok(())
     }

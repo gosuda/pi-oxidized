@@ -134,10 +134,14 @@ pub type ShouldStopAfterTurn = Arc<
         + Sync,
 >;
 
-/// Supplies replacement context/model/thinking state before the next request.
+/// Prepares replacement state before the next provider request in an active low-level run.
+///
+/// The cancellation token belongs to that run. Implementations that wait or perform
+/// long-running preparation must honor it.
 pub type PrepareNextTurn = Arc<
     dyn Fn(
             PrepareNextTurnContext,
+            CancellationToken,
         ) -> BoxFuture<'static, Result<Option<AgentLoopTurnUpdate>, AgentLoopError>>
         + Send
         + Sync,

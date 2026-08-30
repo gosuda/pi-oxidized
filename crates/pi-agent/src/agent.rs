@@ -110,7 +110,7 @@ struct AgentInner {
     steering: Arc<Mutex<PendingMessageQueue>>,
     follow_up: Arc<Mutex<PendingMessageQueue>>,
     provider: Arc<dyn Provider>,
-    base_config: AgentLoopConfig,
+    base_config: Mutex<AgentLoopConfig>,
     partial_tx: watch::Sender<Option<Arc<AssistantMessage>>>,
     idle: Notify,
     run: Arc<Mutex<RunState>>,
@@ -141,7 +141,7 @@ impl Agent {
             steering: Arc::new(Mutex::new(PendingMessageQueue::new(QueueMode::OneAtATime))),
             follow_up: Arc::new(Mutex::new(PendingMessageQueue::new(QueueMode::OneAtATime))),
             provider: options.provider,
-            base_config: options.config,
+            base_config: Mutex::new(options.config),
             partial_tx,
             idle: Notify::new(),
             run: Arc::new(Mutex::new(RunState {
@@ -304,10 +304,29 @@ impl Agent {
         lock(&self.inner.follow_up).clear();
     }
 
+    /// Installs the run-boundary hooks used by future prompt snapshots.
+    ///
+    /// Callers must serialize this operation with the prompt lifecycle. The
+    /// four fields change under one lock, so a new run cannot observe a partial
+    /// hook set. An active run keeps its existing snapshot.
+    pub fn install_loop_hooks(
+        &self,
+        convert_to_llm: crate::config::ConvertToLlm,
+        before_tool_call: crate::config::BeforeToolCall,
+        after_tool_call: crate::config::AfterToolCall,
+        prepare_next_turn: crate::config::PrepareNextTurn,
+    ) {
+        let mut config = lock(&self.inner.base_config);
+        config.convert_to_llm = convert_to_llm;
+        config.before_tool_call = Some(before_tool_call);
+        config.after_tool_call = Some(after_tool_call);
+        config.prepare_next_turn = Some(prepare_next_turn);
+    }
+
     /// Returns the telemetry context from the base config.
     #[must_use]
     pub fn telemetry(&self) -> Arc<dyn crate::telemetry::TelemetryContext> {
-        Arc::clone(&self.inner.base_config.telemetry)
+        Arc::clone(&lock(&self.inner.base_config).telemetry)
     }
 
     /// Returns true when either queue still contains pending messages.
@@ -529,8 +548,8 @@ fn snapshot_context(inner: &AgentInner) -> AgentContext {
 }
 
 fn snapshot_config(inner: &AgentInner) -> AgentLoopConfig {
+    let mut config = lock(&inner.base_config).clone();
     let state = lock(&inner.state);
-    let mut config = inner.base_config.clone();
     config.model = state.model.clone();
     config.reasoning = if state.thinking_level == ModelThinkingLevel::Off {
         None
@@ -1244,10 +1263,11 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let provider = Arc::new(MockProvider(vec![Ok(start_event()), Ok(done_event("ok"))]));
         let mut options = agent_options(provider);
-        options.config.prepare_next_turn = Some(Arc::new(|_ctx| {
+        options.config.prepare_next_turn = Some(Arc::new(|_ctx, _cancel| {
             Box::pin(async { Err(AgentLoopError::message("turn hook failed")) })
         }));
         let agent = Agent::new(options);
+        agent.follow_up(user_text("continue", std::iter::empty()));
         let mut rx = agent.subscribe();
 
         let result = agent
