@@ -5,7 +5,7 @@
 | Issue | [#36][issue-36], `PAR-MATH-RESEARCH` (research) |
 | Decision type | recorded decision, not implementation |
 | Deliverable | this document plus the T4 evidence cell in `docs/PARITY_LEDGER.md`, and only these |
-| Decision | Port the upstream pi-tui LaTeX renderer (`.references/pi/packages/tui/src/latex.ts` plus the markdown math hooks in `.references/pi/packages/tui/src/components/markdown.ts`) as a Rust-native layout engine inside `pi-tui`; reject the reduced TeX→unicode tier, the embedded JavaScript engine, the third-party crate, and the external process. |
+| Decision | Port the canonical pi-tui LaTeX renderer (`.references/pi-2.0/packages/tui/src/latex.ts` plus the markdown math hooks in `.references/pi-2.0/packages/tui/src/components/markdown.ts` at canonical SHA `853a80d26c90a14c1886f0ebb8ffaae133ca2185`) as a Rust-native layout engine inside `pi-tui`; reject the reduced TeX→unicode tier, the embedded JavaScript engine, the third-party crate, and the external process. |
 
 [issue-36]: https://github.com/metaphorics/pi-oxidized/issues/36
 
@@ -103,7 +103,7 @@ No JavaScript engine, no new crate, no external process. The port computes width
 1. New module `crates/pi-tui/src/latex.rs` with the seam `render_latex(source: &str, display: bool) -> Option<String>` — an observable port of `latex.ts` (tables, grammar, environments, PUA protocol, layout composer).
 2. `crates/pi-tui/src/components/markdown.rs`: implement the delimiter and streaming contract at the tokenizer seam, replacing the `Event::InlineMath`/`Event::DisplayMath` drop at `markdown.rs:457-463`; render through `render_latex` with raw-span fallback.
 3. `MarkdownOptions` (`crates/pi-tui/src/components/markdown.rs:154-163`) gains `render_latex: bool`, default `true`, gating both inline and block paths (parity with `markdown.ts:227-228`).
-4. Corpus port: `.references/pi/packages/tui/test/latex.test.ts` (496 lines: 5 session-table describes plus 18 focused cases) and the `describe("LaTeX math")` block of `.references/pi/packages/tui/test/markdown.test.ts` (12 cases, lines 785–969) become the Rust unit corpus for `latex.rs` and the markdown math path.
+4. Corpus port: `.references/pi-2.0/packages/tui/test/latex.test.ts` (496 lines: 5 session-table describes plus 18 focused cases) and the `describe("LaTeX math")` block of `.references/pi-2.0/packages/tui/test/markdown.test.ts` (12 cases, lines 785–969) become the Rust unit corpus for `latex.rs` and the markdown math path.
 5. T4 parity witness: host-tier real-PTY rendering evidence for representative inline and block math per issue #37, then the T4 ledger flip from `planned` to `landed` recording the rendered-vs-fallback contract.
 
 ## Ledger effect

@@ -1637,11 +1637,10 @@ fn repair_unterminated_tail(path: &str) -> Result<(), SessionError> {
     if last[0] == b'\n' {
         return Ok(());
     }
-    file.write_all(b"\n")
-        .map_err(|source| SessionError::Io {
-            path: path.to_owned(),
-            source,
-        })
+    file.write_all(b"\n").map_err(|source| SessionError::Io {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 fn message_to_value(message: &AgentMessage) -> Result<Value, SessionError> {

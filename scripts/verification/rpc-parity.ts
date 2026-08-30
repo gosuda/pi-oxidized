@@ -8,7 +8,7 @@
  * normalized response/event transcripts.
  *
  * Command coverage is derived from the authoritative `RpcCommand` union in
- * `.references/pi/packages/coding-agent/src/modes/rpc/rpc-types.ts`; a newly
+ * `.references/pi-2.0/packages/coding-agent/src/modes/rpc/rpc-types.ts`; a newly
  * added command fails the coverage assertion instead of silently escaping.
  *
  * Normalization is limited to generated identifiers (UUIDs and 8-hex entry
@@ -21,15 +21,23 @@
 
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import {
+	CANONICAL_REFERENCE_ROOT,
+	assertCanonicalReference,
+	canonicalReferenceRoot,
+} from "../reference-identity.ts";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 const RUST_BINARY = resolve(REPO_ROOT, "target/release/pi");
 const EXTENSION_HOST = resolve(REPO_ROOT, "packages/extension-host/dist/pi-extension-host");
 const EXTENSION_PATH = resolve(import.meta.dirname, "extension.ts");
-const TYPESCRIPT_CLI = resolve(REPO_ROOT, ".references/pi/packages/coding-agent/src/cli.ts");
+const TYPESCRIPT_CLI = resolve(
+	canonicalReferenceRoot(REPO_ROOT),
+	"packages/coding-agent/src/cli.ts",
+);
 export const AUTHORITATIVE_RPC_TYPES_PATH = resolve(
-	REPO_ROOT,
-	".references/pi/packages/coding-agent/src/modes/rpc/rpc-types.ts",
+	canonicalReferenceRoot(REPO_ROOT),
+	"packages/coding-agent/src/modes/rpc/rpc-types.ts",
 );
 const EVIDENCE_ROOT = resolve(REPO_ROOT, "target/verification/rpc-parity");
 
@@ -249,6 +257,12 @@ export function buildScenario(): ScenarioStep[] {
 		}),
 	);
 	steps.push(step("prompt", { message: "Flush the queued messages." }, { settle: true, suffix: "-flush" }));
+	// Re-populate both queues after the flush turn so clear_queue replays
+	// against real state: its response data carries the queued texts, while
+	// the first pair above still exercises queue flush delivery.
+	steps.push(step("steer", { message: "queued steering note for clear" }, { suffix: "-requeue" }));
+	steps.push(step("follow_up", { message: "queued follow-up note for clear" }, { suffix: "-requeue" }));
+	steps.push(step("clear_queue", {}));
 	steps.push(step("get_last_assistant_text", {}));
 	steps.push(step("get_messages", {}));
 	steps.push(step("get_session_stats", {}));
@@ -713,6 +727,7 @@ function writeJsonl(path: string, records: readonly JsonValue[]): void {
 }
 
 async function main(): Promise<void> {
+	const referenceSha = assertCanonicalReference();
 	for (const required of [RUST_BINARY, EXTENSION_HOST, EXTENSION_PATH, TYPESCRIPT_CLI, AUTHORITATIVE_RPC_TYPES_PATH]) {
 		try {
 			statSync(required);
@@ -782,6 +797,8 @@ async function main(): Promise<void> {
 	}
 
 	const summary = {
+		referenceRoot: CANONICAL_REFERENCE_ROOT,
+		referenceSha,
 		authoritativeCommandCount: authoritative.length,
 		authoritativeCommands: authoritative,
 		scenarioSteps: scenario.length,

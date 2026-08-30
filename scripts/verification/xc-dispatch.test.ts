@@ -45,6 +45,22 @@ describe("XC-6 hook-dispatch semantics lattice witnesses", () => {
 		expect(verifyLatticeCompleteness(mutated)).not.toEqual([]);
 	});
 
+	test("lattice mutation: adding a discriminant fails the witness", () => {
+		const mutated = INPUTS.hostSource.replace(
+			/"input",\n/,
+			'"input",\n\t"extra_event",\n',
+		);
+		expect(verifyLatticeCompleteness(mutated)).not.toEqual([]);
+	});
+
+	test("lattice mutation: reordering discriminants fails the witness", () => {
+		const mutated = INPUTS.hostSource.replace(
+			/"tool_result",\n\t"user_bash",\n\t"input",/,
+			'"input",\n\t"user_bash",\n\t"tool_result",',
+		);
+		expect(verifyLatticeCompleteness(mutated)).not.toEqual([]);
+	});
+
 	// --- M7: tool_call in-place input mutation comparison ---
 
 	test("M7: tool_call in-place comparison is present", () => {

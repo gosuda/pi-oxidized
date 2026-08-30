@@ -164,15 +164,15 @@ describe("verifyCitedLiterals", () => {
 
 	test("fails when a cited literal no longer exists in its file", () => {
 		const mutated = LEDGER_TEXT.replace(
-			"`crates/pi/src/cli/bootstrap.rs:491` `Error: {message}`",
-			"`crates/pi/src/cli/bootstrap.rs:491` `No Such Literal Anymore`",
+			"`crates/pi/src/cli/bootstrap.rs:503` `Error: {message}`",
+			"`crates/pi/src/cli/bootstrap.rs:503` `No Such Literal Anymore`",
 		);
 		expect(verifyCitedLiterals(REPO_ROOT, mutated)).not.toEqual([]);
 	});
 
 	test("fails when a witness line number drifts", () => {
 		const mutated = LEDGER_TEXT.replace(
-			"crates/pi/src/cli/bootstrap.rs:491",
+			"crates/pi/src/cli/bootstrap.rs:503",
 			"crates/pi/src/cli/bootstrap.rs:1",
 		);
 		expect(verifyCitedLiterals(REPO_ROOT, mutated)).not.toEqual([]);
@@ -180,8 +180,8 @@ describe("verifyCitedLiterals", () => {
 
 	test("fails when a cited path is unreadable", () => {
 		const mutated = LEDGER_TEXT.replace(
-			"crates/pi/src/cli/bootstrap.rs:491",
-			"crates/pi/src/cli/missing-file.rs:491",
+			"crates/pi/src/cli/bootstrap.rs:503",
+			"crates/pi/src/cli/missing-file.rs:503",
 		);
 		expect(
 			verifyCitedLiterals(REPO_ROOT, mutated).some((problem) => problem.includes("not readable")),

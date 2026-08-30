@@ -1,21 +1,22 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, watch } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type {
 	Api,
 	AssistantMessageEvent,
 	Context,
 	Model,
 	SimpleStreamOptions,
-} from "../../.references/pi/packages/ai/src/index.ts";
-import type { ExtensionAPI } from "../../.references/pi/packages/coding-agent/src/core/extensions/types.ts";
+} from "../../.references/pi-2.0/packages/ai/src/index.ts";
+import type { ExtensionAPI } from "../../.references/pi-2.0/packages/coding-agent/src/core/extensions/types.ts";
 import verificationExtension, {
 	DEFAULT_FINAL_MARKER,
 	VERIFICATION_MODEL,
 	VERIFICATION_PROVIDER,
 } from "./extension.ts";
 import { PTY_KEYS, spawnPty } from "./pty.ts";
+import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-identity.ts";
 
 const isWindows = process.platform === "win32";
 
@@ -92,6 +93,37 @@ function withEnvironment(values: Readonly<Record<string, string | undefined>>, r
 			else process.env[name] = value;
 		}
 	});
+}
+async function waitForFileContent(path: string, expected: string, deadlineMs: number): Promise<void> {
+	const matches = (): boolean => {
+		try {
+			return readFileSync(path, "utf8") === expected;
+		} catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+			throw error;
+		}
+	};
+	if (matches()) return;
+	const { promise, resolve, reject } = Promise.withResolvers<void>();
+	const watcher = watch(dirname(path), (_event, filename) => {
+		if (filename !== null && filename.toString() !== basename(path)) return;
+		try {
+			if (matches()) resolve();
+		} catch (error) {
+			reject(error);
+		}
+	});
+	// The deadline guards a real child-process event; fake time cannot drive it.
+	const timeout = setTimeout(
+		() => reject(new Error(`${path} did not reach the expected content within ${deadlineMs}ms`)),
+		deadlineMs,
+	);
+	try {
+		if (!matches()) await promise;
+	} finally {
+		clearTimeout(timeout);
+		watcher.close();
+	}
 }
 
 describe("verification extension", () => {
@@ -202,6 +234,7 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 	const extensionPath = resolve(import.meta.dirname, "extension.ts");
 	const hostPath = resolve("packages/extension-host/dist/pi-extension-host");
 	const agentDirectory = join(sharedDirectory, "agent");
+	const readyPath = join(sharedDirectory, `${fixture.name}-ready`);
 	const sessionDirectory = join(sharedDirectory, "sessions");
 	mkdirSync(agentDirectory, { recursive: true });
 	mkdirSync(sessionDirectory, { recursive: true });
@@ -234,11 +267,11 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 			PI_VERIFICATION_CHUNK_COUNT: "1",
 			PI_VERIFICATION_CHUNK_DELAY_MS: "0",
 			PI_VERIFICATION_FINAL_MARKER: DEFAULT_FINAL_MARKER,
-			PI_VERIFICATION_LOAD_COUNT_PATH: join(sharedDirectory, `${fixture.name}-loads.txt`),
+			PI_VERIFICATION_READY_PATH: readyPath,
 		},
 	});
 	try {
-		await cli.waitFor((snapshot) => snapshot.rawText.length > 20, { deadlineMs: 20_000, source: "raw" });
+		await waitForFileContent(readyPath, "ready\n", 20_000);
 		cli.writeKeys(`foundation prompt for ${fixture.name}`, PTY_KEYS.enter);
 		const response = await cli.waitFor(new RegExp(DEFAULT_FINAL_MARKER), {
 			deadlineMs: 30_000,
@@ -248,8 +281,15 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 		cli.writeKeys("/quit", PTY_KEYS.enter);
 		expect(await cli.waitForExit(10_000)).toBe(0);
 	} catch (error) {
-		const tail = cli.snapshot().rawText.slice(-4_000);
-		throw new Error(`${fixture.name} smoke failed: ${error instanceof Error ? error.message : String(error)}\nPTY tail:\n${tail}`);
+		const snapshot = cli.snapshot();
+		const tail = snapshot.rawText.slice(-4_000);
+		const markerState =
+			`marker raw=${snapshot.rawText.includes(DEFAULT_FINAL_MARKER)} ` +
+			`application=${snapshot.applicationText.includes(DEFAULT_FINAL_MARKER)} ` +
+			`echo=${snapshot.echoText.includes(DEFAULT_FINAL_MARKER)}`;
+		throw new Error(
+			`${fixture.name} smoke failed: ${error instanceof Error ? error.message : String(error)}\n${markerState}\nPTY tail:\n${tail}`,
+		);
 	} finally {
 		await cli.terminate();
 	}
@@ -257,6 +297,9 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 
 describe.skipIf(isWindows)("shared interactive provider smoke", () => {
 	test("drives Rust and TypeScript CLIs with one extension and model", async () => {
+		// Gate before the first reference spawn: the TypeScript fixture runs the
+		// canonical checkout's CLI, so its HEAD must match the pinned SHA.
+		assertCanonicalReference();
 		const rustBinary = resolve("target/debug/pi");
 		const hostBinary = resolve("packages/extension-host/dist/pi-extension-host");
 		expect(existsSync(rustBinary), `missing ${rustBinary}; run cargo build -p pi`).toBe(true);
@@ -268,7 +311,7 @@ describe.skipIf(isWindows)("shared interactive provider smoke", () => {
 		const fixtures: readonly CliFixture[] = [
 			{
 				name: "typescript",
-				argvPrefix: [bun, resolve(".references/pi/packages/coding-agent/src/cli.ts")],
+				argvPrefix: [bun, join(canonicalReferenceRoot(), "packages/coding-agent/src/cli.ts")],
 			},
 			{ name: "rust", argvPrefix: [rustBinary] },
 		];

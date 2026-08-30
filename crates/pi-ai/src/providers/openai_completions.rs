@@ -1777,11 +1777,7 @@ mod tests {
     fn openrouter_omits_reasoning_when_off_level_is_null() {
         let mut model = model("openrouter");
         model.reasoning = true;
-        model.thinking_level_map = Some(
-            [(ModelThinkingLevel::Off, None)]
-                .into_iter()
-                .collect(),
-        );
+        model.thinking_level_map = Some([(ModelThinkingLevel::Off, None)].into_iter().collect());
         let payload = build_payload(
             &model,
             &Context::default(),

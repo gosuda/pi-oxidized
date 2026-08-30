@@ -26,7 +26,7 @@ Component focus and cursor styling:
 
 Current seams:
 
-- Upstream reference (`.references/pi`):
+- Canonical reference (`.references/pi-2.0` at `853a80d26c90a14c1886f0ebb8ffaae133ca2185`):
   - `packages/coding-agent/src/core/settings-manager.ts`: declares `showHardwareCursor?: boolean` in `Settings` (line 132), provides `getShowHardwareCursor(): boolean` checking `this.settings.showHardwareCursor ?? process.env.PI_HARDWARE_CURSOR === "1"` (line 1282), and `setShowHardwareCursor(enabled: boolean): void` saving to global settings (line 1286).
   - `packages/coding-agent/src/modes/interactive/components/settings-selector.ts`: registers the `show-hardware-cursor` settings item (lines 76, 753–758) with `id: "show-hardware-cursor"`, label `"Show hardware cursor"`, description `"Show the terminal cursor while still positioning it for IME support"`, and values `["true", "false"]`.
   - `packages/coding-agent/src/cli/startup-ui.ts`: `createStartupTui` (line 82) passes `settingsManager.getShowHardwareCursor()` to `TuiMainScreen`.

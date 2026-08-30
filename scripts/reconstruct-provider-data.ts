@@ -1,6 +1,6 @@
 /**
  * Reconstruct the reference tree's gitignored provider data JSONs
- * (`.references/pi/packages/ai/src/providers/data/*.json`) from the committed
+ * (`.references/pi-2.0/packages/ai/src/providers/data/*.json`) from the committed
  * Rust catalog (`crates/pi-ai/data/builtin-models.json`).
  *
  * Upstream produces these files with a network-fetching generator; this repo
@@ -27,12 +27,13 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertCanonicalReference, canonicalReferenceRoot } from "./reference-identity.ts";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_CATALOG_PATH = join(REPO_ROOT, "crates/pi-ai/data/builtin-models.json");
 const DEFAULT_PROVIDERS_DIR = join(
-	REPO_ROOT,
-	".references/pi/packages/ai/src/providers",
+	canonicalReferenceRoot(REPO_ROOT),
+	"packages/ai/src/providers",
 );
 const DEFAULT_DATA_DIR = join(DEFAULT_PROVIDERS_DIR, "data");
 const DATA_DIRECTORY_LOCK_RETRY_MS = 10;
@@ -41,8 +42,9 @@ const LOCK_INITIALIZING_GRACE_MS = 30_000;
 const LOCK_OWNER_FILE = "owner.json";
 const DATA_MANIFEST_FILE = ".manifest.json";
 const MANIFEST_SCHEMA_VERSION = 3;
-// UTC time of the newest provider snapshot commit in pinned reference 8fa7eebd235355522c8104166b4f1f959b4e2f10.
-const PINNED_PROVIDER_DATA_GENERATED_AT = "2026-07-30T07:01:42.000Z";
+// UTC time of the newest provider snapshot commit in the canonical reference
+// checkout pinned by scripts/reference-identity.ts (commit e8c632ef6).
+const PINNED_PROVIDER_DATA_GENERATED_AT = "2026-08-25T09:03:13.000Z";
 const LOCK_OWNER_VERSION = 2;
 /**
  * Heartbeat freshness contract: while an owner holds the lock it atomically
@@ -916,6 +918,11 @@ export async function reconstructProviderData(
 	const catalogPath = options.catalogPath ?? DEFAULT_CATALOG_PATH;
 	const providersDir = options.providersDir ?? DEFAULT_PROVIDERS_DIR;
 	const dataDir = options.dataDir ?? DEFAULT_DATA_DIR;
+	if (providersDir === DEFAULT_PROVIDERS_DIR) {
+		// Gate every read of the live reference providers tree on the exact
+		// canonical pin; custom fixture paths are already excluded above.
+		assertCanonicalReference();
+	}
 	const proofCtx: ReconstructProofContext = {
 		repoRoot,
 		catalogPath,

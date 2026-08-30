@@ -20,9 +20,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import {
-	CANONICAL_REFERENCE_SHA,
-} from "../verification/alignment.ts";
+import { CANONICAL_REFERENCE_SHA } from "../reference-identity.ts";
 import {
 	TOOL_VERSION,
 	checkUnreleasedEntriesHaveEvidence,
@@ -88,7 +86,7 @@ describe("DOC-G2: stale-sidecar-reuse after code change", () => {
 			status: "present",
 			target: "test-stale",
 			class: "review-only-prose",
-			params: { source: ".references/pi/README.md" },
+			params: { source: ".references/pi-2.0/README.md" },
 		};
 
 		// Compute the fresh hash
@@ -254,7 +252,7 @@ describe("DOC-G2: out-of-band-deps-doc-edit", () => {
 // ---------------------------------------------------------------------------
 
 describe("DOC-G2: disguised-example-product-import", () => {
-	test("value import from .references/pi/ is detected by scanForExampleProductImports", () => {
+	test("value import from .references/pi-2.0/ is detected by scanForExampleProductImports", () => {
 		const dir = mkdtempSync(join(tmpdir(), "doc-g2-import-"));
 		const subDir = join(dir, "scripts", "tests");
 		mkdirSync(subDir, { recursive: true });
@@ -263,7 +261,7 @@ describe("DOC-G2: disguised-example-product-import", () => {
 		writeFileSync(
 			join(subDir, "malicious-fixture.ts"),
 			[
-				'import { something } from "../../.references/pi/packages/coding-agent/src/index.ts";',
+				'import { something } from "../../.references/pi-2.0/packages/coding-agent/src/index.ts";',
 				'export const x = something;',
 			].join("\n"),
 		);
@@ -275,7 +273,7 @@ describe("DOC-G2: disguised-example-product-import", () => {
 		expect(findings.some((f) => f.includes("disguised example-product import"))).toBe(true);
 	});
 
-	test("type-only import from .references/pi/ is NOT flagged (no runtime behavior accretion)", () => {
+	test("type-only import from .references/pi-2.0/ is NOT flagged (no runtime behavior accretion)", () => {
 		const dir = mkdtempSync(join(tmpdir(), "doc-g2-type-import-"));
 		const subDir = join(dir, "scripts", "tests");
 		mkdirSync(subDir, { recursive: true });
@@ -283,7 +281,7 @@ describe("DOC-G2: disguised-example-product-import", () => {
 		writeFileSync(
 			join(subDir, "type-only-fixture.ts"),
 			[
-				'import type { Foo } from "../../.references/pi/packages/coding-agent/src/types.ts";',
+				'import type { Foo } from "../../.references/pi-2.0/packages/coding-agent/src/types.ts";',
 				'export const x: Foo = {} as Foo;',
 			].join("\n"),
 		);
@@ -303,7 +301,7 @@ describe("DOC-G2: disguised-example-product-import", () => {
 		mkdirSync(join(dir, "scripts", "tests"), { recursive: true });
 		writeFileSync(
 			join(dir, "scripts", "tests", "injected-fixture.ts"),
-			'import { evil } from "../../.references/pi/packages/coding-agent/src/index.ts";\n' +
+			'import { evil } from "../../.references/pi-2.0/packages/coding-agent/src/index.ts";\n' +
 				'export const x = evil;\n',
 		);
 

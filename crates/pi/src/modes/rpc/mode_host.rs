@@ -158,6 +158,11 @@ impl RpcSessionHost for Arc<AgentSessionRuntime> {
         })
     }
 
+    fn clear_queue(&self) -> BoxFuture<'static, (Vec<String>, Vec<String>)> {
+        let session = self.session();
+        Box::pin(async move { session.clear_queue() })
+    }
+
     fn get_state(&self) -> BoxFuture<'static, RpcSessionState> {
         let session = self.session();
         Box::pin(async move {

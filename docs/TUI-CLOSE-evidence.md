@@ -28,19 +28,19 @@ Single consolidated review routed to all six owning `better-*` domain skills (ac
 | MEDIUM | Typography | `crates/pi-tui/src/components/editor/mod.rs:2045-2046` | `visible_width(grapheme).max(1)` in the editor cursor painter | advance 0 for standalone zero-width graphemes, matching `util.rs::paint_line` and the TUI-R2 contract | caret/column divergence on the editing surface; V3 P08 ZWSP oracle is the tripwire |
 | MEDIUM | UI | `crates/pi/src/modes/interactive/progress.rs:77-84,140-155,159-172` | auth/compaction/retry spinners build `Loader::new(..., None)` — reduced-motion override honored only on the status line (`status.rs:27-32`) | thread `indicator_frames` through the three secondary builders | TUI-G1 static-frame setting incomplete on secondary surfaces |
 
-LOW (work-to-do, no action required for closure): truncation-marker styling divergence (`slice.rs` plain vs footer/theme dim `…`); H2/H3+ markdown heading face collapse (`markdown.rs:1067-1081`, reference-parity default); extension Confirm button casing (`runtime.rs:3597-3602`); footer `>90%` context band uses the Error hue — **byte-level reference parity** (`footer.ts:154-157` at pin `8fa7eebd`), owned upstream.
+LOW (work-to-do, no action required for closure): truncation-marker styling divergence (`slice.rs` plain vs footer/theme dim `…`); H2/H3+ markdown heading face collapse (`markdown.rs:1067-1081`, reference-parity default); extension Confirm button casing (`runtime.rs:3597-3602`); footer `>90%` context band uses the Error hue — **byte-level reference parity** (`footer.ts:154-157` at canonical pin `853a80d`), owned upstream.
 
 ### 1.1 HIGH finding outside the settled polish scope — recorded and routed
 
 **Default light-theme semantic text fails WCAG AA-normal.** Measured by the track's own committed oracle (`prototype/tui-p2-contrast/report.txt`, light/truecolor): `error` `#fc0035` on white = **4.0459**, `mdLinkUrl`/`syntaxComment` `#8f8f8f` = **3.2340** (all flagged `wcag-aa-normal<4.5`); error renders normal-weight (`messages.rs:313`, no bold bit) so 4.5 is the required ratio; antd-light `error` 3.25 same root cause.
 
-Introduced by the **pre-track Geist rebase** `68bf5b5` (2026-07-31, "rebase dark/light themes onto the Geist palette") — before any TUI-track ticket; the reference pinned at `8fa7eebd` ships `error=red → vars.red #aa5555` = 5.06 (passes). TUI-R1's admission matrix covered only the eight non-default palettes; V5's oracle encodes only the 10 `NATIVE_CONTRAST_PAIRS` (`theme.rs:2456`), which exclude fg-on-default-bg semantic pairs — so the gap was measured and flagged by P2 but never triaged or gated.
+Introduced by the **pre-track Geist rebase** `68bf5b5` (2026-07-31, "rebase dark/light themes onto the Geist palette") — before any TUI-track ticket; the reference pinned at `853a80d` ships `error=red → vars.red #aa5555` = 5.06 (passes). TUI-R1's admission matrix covered only the eight non-default palettes; V5's oracle encodes only the 10 `NATIVE_CONTRAST_PAIRS` (`theme.rs:2456`), which exclude fg-on-default-bg semantic pairs — so the gap was measured and flagged by P2 but never triaged or gated.
 
 Disposition: a palette-value change **requires its own decision ticket** per `docs/TUI-G6-color-doctrine.md` ruling 5 precedent; changing it inside TUI-CLOSE would violate the polish classification this close exists to prove. Recorded here at full severity, reported to Main for ticket minting. **Zero open HIGH findings remain within the settled polish scope.**
 
 ### Verification
 
-Per-suite deterministic runs on this tree (§2); contrast/oracle claims carried by the committed P2 report and `theme_contrast_matrix` (5/5 green, re-run here); wrap-token integrity verified from `wrap.rs` source; parity claims verified against `.references/pi` at `8fa7eebd`.
+Per-suite deterministic runs on this tree (§2); contrast/oracle claims carried by the committed P2 report and `theme_contrast_matrix` (5/5 green, re-run here); wrap-token integrity verified from `wrap.rs` source; parity claims verified against `.references/pi-2.0` at `853a80d26c90a14c1886f0ebb8ffaae133ca2185`.
 
 **Verdict: Approve** — no HIGH findings within the settled polish scope; five MEDIUM + three LOW work-to-do rows above.
 

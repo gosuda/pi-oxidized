@@ -13,6 +13,11 @@ import { arch, platform, release } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { PTY_KEYS, type PtyProcess, type PtySnapshot, spawnPty } from "./pty.ts";
 import {
+	CANONICAL_REFERENCE_ROOT,
+	assertCanonicalReference,
+	canonicalReferenceRoot,
+} from "../reference-identity.ts";
+import {
 	NOISE_EXIT_CODE,
 	NoiseRejection,
 	REMEDIATION_LADDER,
@@ -22,11 +27,13 @@ import {
 	type NoisyDistribution,
 } from "../statistics.ts";
 
-
 const REPOSITORY_ROOT = resolve(import.meta.dirname, "../..");
 const ARTIFACT_PATH = resolve(REPOSITORY_ROOT, "target/bench/performance-comparison.json");
 const RUST_BINARY = resolve(REPOSITORY_ROOT, "target/release/pi");
-const TYPESCRIPT_BINARY = resolve(REPOSITORY_ROOT, ".references/pi/packages/coding-agent/dist/pi");
+const TYPESCRIPT_BINARY = resolve(
+	canonicalReferenceRoot(REPOSITORY_ROOT),
+	"packages/coding-agent/dist/pi",
+);
 const HOST_BUILD_ROOT = resolve(REPOSITORY_ROOT, "target/bench/performance-extension-host");
 const EXTENSION_HOST = resolve(
 	HOST_BUILD_ROOT,
@@ -52,12 +59,12 @@ const RUST_SOURCE_ROOTS = [
 	"scripts/release",
 ] as const;
 const TYPESCRIPT_SOURCE_ROOTS = [
-	".references/pi/package.json",
-	".references/pi/package-lock.json",
-	".references/pi/packages/ai",
-	".references/pi/packages/agent",
-	".references/pi/packages/tui",
-	".references/pi/packages/coding-agent",
+	join(CANONICAL_REFERENCE_ROOT, "package.json"),
+	join(CANONICAL_REFERENCE_ROOT, "package-lock.json"),
+	join(CANONICAL_REFERENCE_ROOT, "packages/ai"),
+	join(CANONICAL_REFERENCE_ROOT, "packages/agent"),
+	join(CANONICAL_REFERENCE_ROOT, "packages/tui"),
+	join(CANONICAL_REFERENCE_ROOT, "packages/coding-agent"),
 ] as const;
 const SOURCE_IGNORED_DIRECTORIES: Record<string, true> = {
 	".git": true,
@@ -2141,13 +2148,13 @@ async function buildProducts(): Promise<void> {
 	});
 	await runCheckedCommand({
 		label: "TypeScript pi locked dependency install",
-		cwd: resolve(REPOSITORY_ROOT, ".references/pi"),
+		cwd: canonicalReferenceRoot(REPOSITORY_ROOT),
 		argv: [npm, "ci", "--ignore-scripts"],
 	});
 	await runCheckedCommand({
 		label: "TypeScript pi official package binary build",
 		cwd: REPOSITORY_ROOT,
-		argv: [npm, "--prefix", ".references/pi/packages/coding-agent", "run", "build:binary"],
+		argv: [npm, "--prefix", join(CANONICAL_REFERENCE_ROOT, "packages/coding-agent"), "run", "build:binary"],
 	});
 	artifact.build.artifacts = {
 		rustPi: fileRecord(RUST_BINARY),
@@ -2159,6 +2166,7 @@ async function buildProducts(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+	assertCanonicalReference();
 	artifact.machine = machineMetadata();
 	const ticksPerSecond = clockTicksPerSecond();
 	const python = requiredExecutable("python3");
@@ -2196,7 +2204,7 @@ async function main(): Promise<void> {
 	// from; capturing only after the build could report fingerprint B for
 	// binaries built from source A. The build legitimately regenerates files
 	// inside the fingerprinted roots (provider data under
-	// .references/pi/packages/ai), so the drift blocker below compares the
+	// .references/pi-2.0/packages/ai), so the drift blocker below compares the
 	// post-build baseline against the post-measurement state and records the
 	// build-window delta separately instead of hiding it.
 	const sourceBefore = {

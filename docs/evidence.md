@@ -15,7 +15,7 @@ docs-evidence.json (ledger)  ──►  docs-evidence.ts (checker)
          │                              ├──► docs-inventory.json (surface count assertion)
          │                              └──► target/verification/docs-evidence/ (sidecars + run-manifest.json)
          │
-         └── referencePin: 8fa7eebd235355522c8104166b4f1f959b4e2f10
+         └── referencePin: 853a80d26c90a14c1886f0ebb8ffaae133ca2185
 ```
 
 ## Files
@@ -112,9 +112,10 @@ schemas require human review and fresh evidence.
 
 ## Reference Pin
 
-The ledger records exactly one reference-pin literal:
-`8fa7eebd235355522c8104166b4f1f959b4e2f10`. The checker rejects the stale
-hash `4488ad55c18f07ae89a489096c90de8667b3adfb`.
+The ledger records exactly one canonical reference-pin literal:
+`853a80d26c90a14c1886f0ebb8ffaae133ca2185` (pointing to `.references/pi-2.0`).
+
+The checker rejects every reference hash other than the canonical pin above.
 
 ## Usage
 

@@ -105,11 +105,11 @@ describe("supported-platforms document (REL-T9)", () => {
 		}
 	});
 
-	test("document records the dated pins it narrates", () => {
+	test("document records the release authorities and dated pins it narrates", () => {
 		for (const pin of [
-			"1.3.14",
-			"1.97.1",
-			"pi.release.v1",
+			"compatibility.md",
+			"BUN_RUNTIME_VERSION",
+			"RELEASE_MANIFEST_SCHEMA",
 			"SOURCE_DATE_EPOCH=1735689600",
 			"windows-2025",
 			"15.2.0-r5",

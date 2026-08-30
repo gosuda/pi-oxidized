@@ -18,7 +18,7 @@ import {
 	canonicalJson,
 } from "../verification/docs-evidence.ts";
 import { RUN_MANIFEST_SCHEMA, sha256 } from "../verification/docs-evidence-runners.ts";
-import { CANONICAL_REFERENCE_SHA } from "../verification/alignment.ts";
+import { CANONICAL_REFERENCE_SHA } from "../reference-identity.ts";
 
 function validCommand() {
 	return {

@@ -61,7 +61,7 @@ export function getVirtualModules(): Record<string, unknown> {
 }
 
 /** Reference packages root for source-mode alias resolution. */
-const REF_ROOT = resolve(__dirname, "..", "..", "..", ".references", "pi", "packages");
+const REF_ROOT = resolve(__dirname, "..", "..", "..", ".references", "pi-2.0", "packages");
 
 /** Map every extension-importable specifier to reference source (source mode). */
 export function getExtensionAliases(): Record<string, string> {

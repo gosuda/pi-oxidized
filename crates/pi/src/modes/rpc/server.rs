@@ -289,6 +289,7 @@ fn command_response_normalization(command: &RpcCommand) -> ResponseDataNormaliza
         | RpcCommand::Steer { .. }
         | RpcCommand::FollowUp { .. }
         | RpcCommand::Abort { .. }
+        | RpcCommand::ClearQueue { .. }
         | RpcCommand::NewSession { .. }
         | RpcCommand::GetState { .. }
         | RpcCommand::SetModel { .. }
@@ -595,7 +596,7 @@ pub struct ModelCycleResult {
 }
 
 /// Abstracts the `AgentSessionRuntime` + `AgentSession` surface consumed by the
-/// 31 [`RpcCommand`] variants.
+/// 33 [`RpcCommand`] variants.
 ///
 /// All async methods return [`BoxFuture<'static>`] so they can be `tokio::spawn`'d
 /// without borrowing the host; the preflight callback fires synchronously
@@ -626,6 +627,8 @@ pub trait RpcSessionHost: Send + Sync {
     ) -> BoxFuture<'static, Result<(), String>>;
     /// Abort the active agent run + retry, wait for idle.
     fn abort(&self) -> BoxFuture<'static, ()>;
+    /// Drain queued steering and follow-up texts, clearing both queues.
+    fn clear_queue(&self) -> BoxFuture<'static, (Vec<String>, Vec<String>)>;
 
     // ---- State ----
     /// Snapshot the current session for the `get_state` RPC.
@@ -1232,6 +1235,20 @@ where
         RpcCommand::Abort { .. } => {
             host.abort().await;
             Some(RpcResponse::ok(id, "abort"))
+        }
+
+        RpcCommand::ClearQueue { .. } => {
+            // Drain first: the session emits the empty `queue_update` event
+            // synchronously inside the call, before this response is built.
+            let (steering, follow_up) = host.clear_queue().await;
+            Some(RpcResponse::ok_data(
+                id,
+                "clear_queue",
+                RpcResponseData::ClearedQueue {
+                    steering,
+                    follow_up,
+                },
+            ))
         }
 
         RpcCommand::NewSession { parent_session, .. } => {
@@ -2172,6 +2189,15 @@ mod tests {
             self.rec("abort");
             Box::pin(async {})
         }
+        fn clear_queue(&self) -> BoxFuture<'static, (Vec<String>, Vec<String>)> {
+            self.rec("clear_queue");
+            Box::pin(async {
+                (
+                    vec!["drained-steering".to_owned()],
+                    vec!["drained-follow-up".to_owned()],
+                )
+            })
+        }
         fn get_state(&self) -> BoxFuture<'static, RpcSessionState> {
             self.rec("get_state");
             let cfg = Arc::clone(&self.cfg);
@@ -2577,6 +2603,25 @@ mod tests {
     async fn abort_success() {
         let (r, _) = dispatch(r#"{"type":"abort","id":"a1"}"#, FakeConfig::default()).await;
         assert_eq!(r["command"], "abort");
+    }
+
+    #[tokio::test]
+    async fn clear_queue_returns_drained_texts() {
+        let (r, _) = dispatch(
+            r#"{"type":"clear_queue","id":"cq1"}"#,
+            FakeConfig::default(),
+        )
+        .await;
+        assert_eq!(r["command"], "clear_queue");
+        assert_eq!(r["success"], true);
+        // Distinct fake values catch swapped arrays and empty replacements.
+        assert_eq!(
+            r["data"],
+            serde_json::json!({
+                "steering": ["drained-steering"],
+                "followUp": ["drained-follow-up"]
+            })
+        );
     }
 
     #[tokio::test]

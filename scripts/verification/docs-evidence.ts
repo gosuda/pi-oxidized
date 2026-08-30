@@ -24,8 +24,10 @@ import { join, resolve } from "node:path";
 
 import {
 	CANONICAL_REFERENCE_SHA,
-	STALE_REFERENCE_SHA,
-} from "./alignment.ts";
+	LEGACY_REFERENCE_SHA,
+	RETIRED_REFERENCE_SHA,
+	assertCanonicalReference,
+} from "../reference-identity.ts";
 import {
 	DEFAULT_REPROOF_INTERVAL_MS,
 	FORBIDDEN_FIELDS,
@@ -171,10 +173,16 @@ export function validateLedger(ledger: Ledger): readonly ValidationProblem[] {
 			message: `referencePin is ${ledger.referencePin}, expected ${CANONICAL_REFERENCE_SHA}`,
 		});
 	}
-	if (ledger.referencePin === STALE_REFERENCE_SHA) {
+	if (ledger.referencePin === LEGACY_REFERENCE_SHA) {
 		problems.push({
 			rowId: "(ledger)",
-			message: `referencePin is the stale hash ${STALE_REFERENCE_SHA}`,
+			message: `referencePin is the legacy pin ${LEGACY_REFERENCE_SHA}; the legacy checkout is not an active ledger identity`,
+		});
+	}
+	if (ledger.referencePin === RETIRED_REFERENCE_SHA) {
+		problems.push({
+			rowId: "(ledger)",
+			message: `referencePin is the retired pin ${RETIRED_REFERENCE_SHA}; retired identity must never reappear in an active ledger`,
 		});
 	}
 
@@ -488,6 +496,16 @@ async function main(): Promise<void> {
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
 		console.error(`docs-evidence: failed to load inputs: ${detail}`);
+		process.exit(1);
+	}
+
+	// Fail closed before any current evidence reads: the canonical reference
+	// checkout must sit at the pinned commit.
+	try {
+		assertCanonicalReference(root);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		console.error(`docs-evidence: ${detail}`);
 		process.exit(1);
 	}
 

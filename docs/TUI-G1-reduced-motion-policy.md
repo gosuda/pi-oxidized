@@ -17,7 +17,7 @@ environment setting, or terminal capability selects those forms.
 
 Current seams:
 
-- Upstream reference, `.references/pi/packages/coding-agent/src/modes/interactive/components/status-indicator.ts`:
+- Reference, `.references/pi-2.0/packages/coding-agent/src/modes/interactive/components/status-indicator.ts` (at `853a80d26c90a14c1886f0ebb8ffaae133ca2185`):
   the default status indicator uses the animated `Loader` frames. The underlying
   loader also accepts caller-supplied static or empty frame lists. A search of
   the upstream interactive mode finds no reduced-motion or motion-gate setting.

@@ -74,15 +74,15 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           repository: earendil-works/pi
-          ref: 8fa7eebd235355522c8104166b4f1f959b4e2f10
-          path: .references/pi
+          ref: 853a80d26c90a14c1886f0ebb8ffaae133ca2185
+          path: .references/pi-2.0
           persist-credentials: false
 
       - name: Verify reference pin
         if: matrix.musl != 'true'
         shell: bash
         run: |
-          test "$(git -C .references/pi rev-parse HEAD)" = "8fa7eebd235355522c8104166b4f1f959b4e2f10"
+          test "$(git -C .references/pi-2.0 rev-parse HEAD)" = "853a80d26c90a14c1886f0ebb8ffaae133ca2185"
 
       # REL-T4: aarch64 legs run natively (ubuntu-24.04-arm) — no QEMU, no
       # cross-compiler. The verification fails loudly if the runner is not a
@@ -133,7 +133,7 @@ jobs:
 
       - name: Install reference dependencies
         if: matrix.musl != 'true'
-        run: npm ci --ignore-scripts --prefix .references/pi
+        run: npm ci --ignore-scripts --prefix .references/pi-2.0
 
       - name: Prepare interactive script test prerequisites
         if: runner.os != 'Windows' && matrix.musl != 'true'

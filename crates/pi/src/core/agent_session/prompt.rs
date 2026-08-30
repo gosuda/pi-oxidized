@@ -1286,7 +1286,9 @@ mod tests {
         assert_eq!(session.pending_message_count(), 1);
         session.queue_follow_up("b", Vec::new());
         assert_eq!(session.pending_message_count(), 2);
-        session.clear_queue();
+        let (steering, follow_up) = session.clear_queue();
+        assert_eq!(steering, vec!["a".to_owned()]);
+        assert_eq!(follow_up, vec!["b".to_owned()]);
         assert_eq!(session.pending_message_count(), 0);
         Ok(())
     }

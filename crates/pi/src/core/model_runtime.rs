@@ -2026,8 +2026,8 @@ mod tests {
     use crate::core::settings::{Settings, SettingsManagerCreateOptions};
     use pi_ai::auth::OAuthCredential;
     use serde_json::json;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn required<T>(value: Option<T>, message: &'static str) -> Result<T, ModelRuntimeError> {
         value.ok_or_else(|| ModelRuntimeError::Registration(message.to_owned()))

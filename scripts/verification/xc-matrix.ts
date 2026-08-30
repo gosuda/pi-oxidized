@@ -9,17 +9,19 @@
 
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-identity.ts";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
 export interface XcWitnessInputs {
-	/** Contents of `.references/pi/packages/coding-agent/src/core/extensions/runner.ts`. */
+	/** Contents of `.references/pi-2.0/packages/coding-agent/src/core/extensions/runner.ts`. */
 	runnerSource: string;
 }
 
 export function loadXcWitnessInputs(root: string): XcWitnessInputs {
+	assertCanonicalReference(root);
 	const runnerSource = readFileSync(
-		join(root, ".references/pi/packages/coding-agent/src/core/extensions/runner.ts"),
+		join(canonicalReferenceRoot(root), "packages/coding-agent/src/core/extensions/runner.ts"),
 		"utf8",
 	);
 	return { runnerSource };

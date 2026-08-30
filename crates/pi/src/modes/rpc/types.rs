@@ -216,7 +216,7 @@ pub enum StreamingBehavior {
 // RpcCommand (stdin)
 // ---------------------------------------------------------------------------
 
-/// All 32 known RPC commands, plus an unknown catch-all.
+/// All 33 known RPC commands, plus an unknown catch-all.
 ///
 /// Each known variant carries an optional correlation `id`. The unknown arm
 /// preserves the raw `type` string and remaining fields so the server can echo
@@ -254,6 +254,11 @@ pub enum RpcCommand {
     },
     /// Abort the current agent turn.
     Abort {
+        /// Correlation id.
+        id: Option<String>,
+    },
+    /// Drain queued steering and follow-up messages, returning their text.
+    ClearQueue {
         /// Correlation id.
         id: Option<String>,
     },
@@ -449,6 +454,7 @@ impl RpcCommand {
             | Self::Steer { id, .. }
             | Self::FollowUp { id, .. }
             | Self::Abort { id }
+            | Self::ClearQueue { id }
             | Self::NewSession { id, .. }
             | Self::GetState { id }
             | Self::SetModel { id, .. }
@@ -489,6 +495,7 @@ impl RpcCommand {
             Self::Steer { .. } => "steer",
             Self::FollowUp { .. } => "follow_up",
             Self::Abort { .. } => "abort",
+            Self::ClearQueue { .. } => "clear_queue",
             Self::NewSession { .. } => "new_session",
             Self::GetState { .. } => "get_state",
             Self::SetModel { .. } => "set_model",
@@ -571,6 +578,9 @@ fn serialize_rpc_command<S: Serializer>(
             images.as_deref(),
         ),
         RpcCommand::Abort { id } => serialize_type_only(serializer, id.as_deref(), "abort"),
+        RpcCommand::ClearQueue { id } => {
+            serialize_type_only(serializer, id.as_deref(), "clear_queue")
+        }
         RpcCommand::NewSession { id, parent_session } => {
             serialize_new_session(serializer, id.as_deref(), parent_session.as_deref())
         }
@@ -929,6 +939,7 @@ fn parse_known_command(
         "steer" => parse_message_images_cmd(obj, id, "steer"),
         "follow_up" => parse_message_images_cmd(obj, id, "follow_up"),
         "abort" => Ok(RpcCommand::Abort { id }),
+        "clear_queue" => Ok(RpcCommand::ClearQueue { id }),
         "new_session" => Ok(RpcCommand::NewSession {
             id,
             parent_session: optional_string(obj, "parentSession")?,
@@ -1185,6 +1196,14 @@ pub enum RpcResponseData {
         /// Whether the user cancelled the operation.
         cancelled: bool,
     },
+    /// `{ steering, followUp }` from `clear_queue`.
+    ClearedQueue {
+        /// Drained steering texts.
+        steering: Vec<String>,
+        /// Drained follow-up texts.
+        #[serde(rename = "followUp")]
+        follow_up: Vec<String>,
+    },
     /// Full session state.
     SessionState(RpcSessionState),
     /// Selected model from `set_model`.
@@ -1264,6 +1283,7 @@ impl RpcResponseData {
     fn deserialize_for_command(command: &str, value: &Value) -> Result<Self, String> {
         match command {
             "new_session" | "switch_session" | "clone" => parse_cancelled_data(command, value),
+            "clear_queue" => parse_clear_queue_data(value),
             "get_state" => Ok(Self::SessionState(
                 RpcSessionState::deserialize(value).map_err(|e| e.to_string())?,
             )),
@@ -1302,6 +1322,21 @@ fn parse_cancelled_data(command: &str, value: &Value) -> Result<RpcResponseData,
         .and_then(Value::as_bool)
         .ok_or_else(|| format!("{command} data missing cancelled"))?;
     Ok(RpcResponseData::Cancelled { cancelled })
+}
+
+fn parse_clear_queue_data(value: &Value) -> Result<RpcResponseData, String> {
+    let steering = value
+        .get("steering")
+        .ok_or_else(|| "clear_queue data missing steering".to_owned())?;
+    let steering = Vec::<String>::deserialize(steering).map_err(|e| e.to_string())?;
+    let follow_up = value
+        .get("followUp")
+        .ok_or_else(|| "clear_queue data missing followUp".to_owned())?;
+    let follow_up = Vec::<String>::deserialize(follow_up).map_err(|e| e.to_string())?;
+    Ok(RpcResponseData::ClearedQueue {
+        steering,
+        follow_up,
+    })
 }
 
 fn parse_cycle_model_data(value: &Value) -> Result<RpcResponseData, String> {
@@ -2461,6 +2496,7 @@ mod tests {
                 images: None,
             },
             RpcCommand::Abort { id: None },
+            RpcCommand::ClearQueue { id: None },
             RpcCommand::NewSession {
                 id: None,
                 parent_session: Some("/tmp/s".into()),
@@ -2537,10 +2573,10 @@ mod tests {
     }
 
     #[test]
-    fn all_32_known_command_types_roundtrip() -> TestResult {
+    fn all_33_known_command_types_roundtrip() -> TestResult {
         let samples = sample_commands();
-        if samples.len() != 32 {
-            return Err(fail(format!("expected 32 samples, got {}", samples.len())));
+        if samples.len() != 33 {
+            return Err(fail(format!("expected 33 samples, got {}", samples.len())));
         }
         for cmd in &samples {
             let rt = roundtrip_command(cmd)?;
@@ -2689,6 +2725,32 @@ mod tests {
         }
         if roundtrip_response(&resp)? != resp {
             return Err(fail("cancelled roundtrip mismatch"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn response_clear_queue_data_camel_case_roundtrip() -> TestResult {
+        // Distinct steering vs follow-up texts catch a swapped field rename,
+        // and the wire assertion pins the camelCase `followUp` key.
+        let resp = RpcResponse::ok_data(
+            Some("cq".into()),
+            "clear_queue",
+            RpcResponseData::ClearedQueue {
+                steering: vec!["steer-me".into()],
+                follow_up: vec!["follow-me".into()],
+            },
+        );
+        let value = to_value(&resp)?;
+        assert_json_eq(
+            &value["data"],
+            &json!({
+                "steering": ["steer-me"],
+                "followUp": ["follow-me"]
+            }),
+        )?;
+        if roundtrip_response(&resp)? != resp {
+            return Err(fail("clear_queue data roundtrip mismatch"));
         }
         Ok(())
     }

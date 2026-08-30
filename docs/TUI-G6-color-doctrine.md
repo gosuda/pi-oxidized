@@ -31,7 +31,7 @@ capability-driven color depth, hyperlink capability handling, extension `setThem
 guardrails, and the ANSI-256 quantization rule used by HTML export and theme conversion.
 
 Under the repository parity doctrine (issue #25), the TypeScript reference tree
-(`.references/pi/…`) is canonical and every deviation is an explicit, recorded decision. Two of
+(`.references/pi-2.0/…` at `853a80d26c90a14c1886f0ebb8ffaae133ca2185`) is canonical and every deviation is an explicit, recorded decision. Two of
 the four rulings below fixed a gap toward the reference and recorded the then-current Rust state
 as a standing divergence pending its remediation ticket; both remediations have since landed (TUI-T2
 commits 04f91de and dc9d412; TUI-T3 commits 583b2f5 and 701bdd3), and this record's Rust witness
@@ -51,7 +51,7 @@ the Rust witnesses below describe the post-remediation state.
 
 ### Reference witnesses
 
-- `.references/pi/packages/coding-agent/src/modes/interactive/theme/theme.ts:630`: `createTheme`
+- `.references/pi-2.0/packages/coding-agent/src/modes/interactive/theme/theme.ts:630`: `createTheme`
   derives `const colorMode = mode ?? (getCapabilities().trueColor ? "truecolor" : "256color")`.
   Capability inference is the default; an explicit mode argument is the override.
 - `theme.ts:663-670`: `loadTheme(name, mode?)` is modeless in practice. Registered themes return
@@ -137,7 +137,7 @@ witnesses below describe the post-remediation state.
 
 ### Reference witnesses
 
-- `.references/pi/packages/tui/src/components/markdown.ts:692`: the inline link renderer gates
+- `.references/pi-2.0/packages/tui/src/components/markdown.ts:692`: the inline link renderer gates
   OSC 8 emission on `getCapabilities().hyperlinks` at render time and falls back to printing the
   URL in parentheses (mailto prefix stripped for the equality check) on incapable terminals.
 - `markdown.ts:220-229`: the reference `MarkdownOptions` interface exposes no hyperlink option.
@@ -192,10 +192,10 @@ is exact reference parity, not a divergence, and requires no code change.
 
 ### Reference witnesses
 
-- `.references/pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2467-2478`: the
+- `.references/pi-2.0/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2467-2478`: the
   extension API `setTheme` either installs a `Theme` instance via `setThemeInstance` or resolves
   and persists a name. It inspects no palette content.
-- `.references/pi/packages/coding-agent/src/modes/interactive/theme/theme-controller.ts:101-107`:
+- `.references/pi-2.0/packages/coding-agent/src/modes/interactive/theme/theme-controller.ts:101-107`:
   `setThemeInstance` returns `{ success: true }` unconditionally; no validation runs.
 - `theme.ts:892-922`: `setTheme` loads the named theme and falls back to `dark` on load failure.
   The only failure mode is a load/parse failure, never palette content.
@@ -252,8 +252,8 @@ one named here.
 
 | Converter | Site | Form |
 |---|---|---|
-| Reference HTML export | `.references/pi/packages/coding-agent/src/core/export-html/ansi-to-html.ts:49` | `toComponent = (n) => (n === 0 ? 0 : 55 + n * 40)` |
-| Reference theme conversion | `.references/pi/packages/coding-agent/src/modes/interactive/theme/theme.ts:1050` | `toHex` over `n === 0 ? 0 : 55 + n * 40` |
+| Reference HTML export | `.references/pi-2.0/packages/coding-agent/src/core/export-html/ansi-to-html.ts:49` | `toComponent = (n) => (n === 0 ? 0 : 55 + n * 40)` |
+| Reference theme conversion | `.references/pi-2.0/packages/coding-agent/src/modes/interactive/theme/theme.ts:1050` | `toHex` over `n === 0 ? 0 : 55 + n * 40` |
 | Rust HTML export | `crates/pi/src/core/export_html/ansi_to_html.rs:87-104` (`color_256`, `component` closure) | `if value == 0 { 0 } else { 55 + value * 40 }` |
 | Rust export theme | `crates/pi/src/core/export_html/mod.rs:329-350` (`ansi_256_to_hex`, `part` closure) | `if value == 0 { 0 } else { 55 + value * 40 }` |
 

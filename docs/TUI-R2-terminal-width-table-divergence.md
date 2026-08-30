@@ -16,7 +16,7 @@ This record is the only deliverable of TUI-R2: a survey, a probe corpus, a verdi
 
 ## 2. The width.rs contract under survey
 
-Contract owner: `grapheme_width` / `visible_width` / `normalize_terminal_output` in `crates/pi-tui/src/text/width.rs`, pinned to `unicode-width = "=0.2.2"` (`crates/pi-tui/Cargo.toml:25`). The module doc (width.rs:1-5) declares parity with the upstream TypeScript helpers `graphemeWidth` / `visibleWidth` (`.references/pi/packages/tui/src/utils.ts:174-235`, `:240-295`) and `normalizeTerminalOutput` (utils.ts:379-384) — those TS helpers are the parity target this survey measures against, via the Rust contract's identical rules.
+Contract owner: `grapheme_width` / `visible_width` / `normalize_terminal_output` in `crates/pi-tui/src/text/width.rs`, pinned to `unicode-width = "=0.2.2"` (`crates/pi-tui/Cargo.toml:25`). The module doc (width.rs:1-5) declares parity with the reference TypeScript helpers `graphemeWidth` / `visibleWidth` (`.references/pi-2.0/packages/tui/src/utils.ts:174-235`, `:240-295` at `853a80d26c90a14c1886f0ebb8ffaae133ca2185`) and `normalizeTerminalOutput` (utils.ts:379-384) — those TS helpers are the parity target this survey measures against, via the Rust contract's identical rules.
 
 ### 2.1 The four named axes
 

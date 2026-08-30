@@ -13,7 +13,8 @@
  * - Rust: `target/release/pi_tool_dispatch_bench` drives the production
  *   `pi_agent::execute_tool_calls` entry in-process.
  * - TypeScript: this file in `--worker` mode drives upstream `runAgentLoop`
- *   from `.references/pi` (pinned `8fa7eebd235355522c8104166b4f1f959b4e2f10`)
+ *   from `.references/pi-2.0` (pinned `853a80d2`, asserted via
+ *   `scripts/reference-identity.ts` before any reference load)
  *   with a deterministic scripted stream function. Upstream keeps
  *   `executeToolCalls` module-private, so the loop is the closest public
  *   path that executes upstream's real dispatch code.
@@ -41,24 +42,14 @@
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { arch, cpus, hostname, platform, release, tmpdir, totalmem } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import type { AssistantMessage, Message, Model, UserMessage } from "@earendil-works/pi-ai";
 import {
-	EventStream,
-	type AssistantMessage,
-	type AssistantMessageEvent,
-	type Message,
-	type Model,
-	type UserMessage,
-} from "../.references/pi/packages/ai/dist/index.js";
-import {
-	runAgentLoop,
-	type AgentContext,
-	type AgentEvent,
-	type AgentLoopConfig,
-	type AgentMessage,
-	type AgentTool,
-	type AgentToolResult,
-} from "../.references/pi/packages/agent/dist/index.js";
-import { SessionManager } from "../.references/pi/packages/coding-agent/dist/core/session-manager.js";
+	CANONICAL_REFERENCE_ROOT,
+	CANONICAL_REFERENCE_SHA,
+	assertCanonicalReference,
+	canonicalReferenceRoot,
+} from "./reference-identity.ts";
 import {
 	NOISE_EXIT_CODE,
 	NOISE_RELATIVE_SPREAD_LIMIT,
@@ -70,13 +61,113 @@ import {
 	type NoisyDistribution,
 } from "./statistics.ts";
 
+type AgentMessage = Message;
+
+type NoopToolDetails =
+	| { readonly kind: "noop-progress"; readonly count: number }
+	| { readonly kind: "noop"; readonly path: string; readonly count: number };
+interface NoopParameters {
+	readonly path: string;
+	readonly count?: number;
+}
+
+interface AgentToolResult<T> {
+	readonly content: readonly { readonly type: "text"; readonly text: string }[];
+	readonly details: T;
+}
+
+interface AgentTool {
+	readonly name: string;
+	readonly label: string;
+	readonly description: string;
+	readonly parameters: Readonly<Record<string, unknown>>;
+	execute(
+		toolCallId: string,
+		params: NoopParameters,
+		signal?: AbortSignal,
+		onUpdate?: (result: AgentToolResult<NoopToolDetails>) => void,
+	): Promise<AgentToolResult<NoopToolDetails>>;
+}
+
+interface AgentContext {
+	readonly systemPrompt: string;
+	readonly messages: AgentMessage[];
+	readonly tools?: AgentTool[];
+}
+
+interface AgentLoopConfig {
+	readonly model: Model<string>;
+	readonly convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+}
+
+type AgentEvent =
+	| { readonly type: "agent_start" }
+	| { readonly type: "agent_end"; readonly messages: AgentMessage[] }
+	| { readonly type: "turn_start" }
+	| { readonly type: "turn_end"; readonly message: AgentMessage; readonly toolResults: Message[] }
+	| { readonly type: "message_start"; readonly message: AgentMessage }
+	| { readonly type: "message_update"; readonly message: AgentMessage; readonly assistantMessageEvent: unknown }
+	| { readonly type: "message_end"; readonly message: AgentMessage }
+	| { readonly type: "tool_execution_start"; readonly toolCallId: string; readonly toolName: string; readonly args: unknown }
+	| { readonly type: "tool_execution_update"; readonly toolCallId: string; readonly toolName: string; readonly args: unknown; readonly partialResult: unknown }
+	| { readonly type: "tool_execution_end"; readonly toolCallId: string; readonly toolName: string; readonly result: unknown; readonly isError: boolean };
+
+interface MockAssistantStream extends AsyncIterable<unknown> {
+	push(event: { readonly type: "done"; readonly reason: "stop" | "toolUse"; readonly message: AssistantMessage }): void;
+}
+
+interface ReferenceSessionManager {
+	appendMessage(message: AgentMessage): string;
+	getSessionFile(): string | undefined;
+}
+
+type ReferenceRunAgentLoop = (
+	prompts: AgentMessage[],
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: (event: AgentEvent) => Promise<void> | void,
+	signal: AbortSignal | undefined,
+	streamFn: () => MockAssistantStream,
+) => Promise<AgentMessage[]>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object";
+}
+
+function isAgentMessage(value: unknown): value is AgentMessage {
+	return (
+		isRecord(value) &&
+		(value.role === "user" || value.role === "assistant" || value.role === "toolResult")
+	);
+}
+
+function isAssistantMessage(value: unknown): value is AssistantMessage {
+	return isAgentMessage(value) && value.role === "assistant";
+}
+
+function isMockAssistantStream(value: unknown): value is MockAssistantStream {
+	return (
+		isRecord(value) &&
+		typeof value.push === "function" &&
+		typeof Reflect.get(value, Symbol.asyncIterator) === "function"
+	);
+}
+
+function isReferenceSessionManager(value: unknown): value is ReferenceSessionManager {
+	return (
+		isRecord(value) &&
+		typeof value.appendMessage === "function" &&
+		typeof value.getSessionFile === "function"
+	);
+}
+
 // ── Shared protocol constants ─────────────────────────────────────────────
 
 export type Implementation = "rust" | "typescript";
 export const IMPLEMENTATIONS: readonly Implementation[] = ["rust", "typescript"];
 
 export const RUST_BIN = resolve(import.meta.dirname, "../target/release/pi_tool_dispatch_bench");
-export const UPSTREAM_PIN = "8fa7eebd235355522c8104166b4f1f959b4e2f10";
+export const UPSTREAM_PIN = CANONICAL_REFERENCE_SHA;
 
 /** Argument payloads are byte-identical on both implementations. */
 export const VALID_ARGUMENTS: Record<string, unknown> = {
@@ -236,17 +327,73 @@ export function validateWorkerReport(
 
 // ── TypeScript implementation worker (upstream path) ──────────────────────
 
-class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
+/** Canonical upstream worker bindings loaded only after the SHA gate. */
+interface UpstreamBindings {
+	runAgentLoop: ReferenceRunAgentLoop;
+	createSession(cwd: string, sessionDir: string): ReferenceSessionManager;
+	createStream(): MockAssistantStream;
+}
+
+let upstream: UpstreamBindings;
+
+async function loadUpstream(): Promise<UpstreamBindings> {
+	assertCanonicalReference();
+	const root = canonicalReferenceRoot();
+	const [aiModule, agentModule, codingAgentModule]: unknown[] = await Promise.all([
+		import(pathToFileURL(join(root, "packages/ai/dist/index.js")).href),
+		import(pathToFileURL(join(root, "packages/agent/dist/index.js")).href),
+		import(pathToFileURL(join(root, "packages/coding-agent/dist/core/session-manager.js")).href),
+	]);
+	if (!isRecord(aiModule) || typeof aiModule.EventStream !== "function") {
+		throw new Error("canonical pi-ai dist does not export EventStream");
 	}
+	if (!isRecord(agentModule) || typeof agentModule.runAgentLoop !== "function") {
+		throw new Error("canonical pi-agent dist does not export runAgentLoop");
+	}
+	if (!isRecord(codingAgentModule) || typeof codingAgentModule.SessionManager !== "function") {
+		throw new Error("canonical coding-agent dist does not export SessionManager");
+	}
+	const sessionCreate = Reflect.get(codingAgentModule.SessionManager, "create");
+	if (typeof sessionCreate !== "function") {
+		throw new Error("canonical SessionManager does not expose create");
+	}
+	const EventStream = aiModule.EventStream;
+	const runAgentLoop = agentModule.runAgentLoop;
+	const SessionManager = codingAgentModule.SessionManager;
+	return {
+		runAgentLoop: async (...args) => {
+			const messages: unknown = await Reflect.apply(runAgentLoop, undefined, args);
+			if (!Array.isArray(messages) || !messages.every(isAgentMessage)) {
+				throw new Error("canonical runAgentLoop returned malformed messages");
+			}
+			return messages;
+		},
+		createSession: (cwd, sessionDir) => {
+			const session: unknown = Reflect.apply(sessionCreate, SessionManager, [cwd, sessionDir]);
+			if (!isReferenceSessionManager(session)) {
+				throw new Error("canonical SessionManager.create returned a malformed session");
+			}
+			return session;
+		},
+		createStream: () => {
+			const stream: unknown = Reflect.construct(EventStream, [
+				(event: unknown) => isRecord(event) && (event.type === "done" || event.type === "error"),
+				(event: unknown) => {
+					if (isRecord(event) && event.type === "done" && isAssistantMessage(event.message)) {
+						return event.message;
+					}
+					if (isRecord(event) && event.type === "error" && isAssistantMessage(event.error)) {
+						return event.error;
+					}
+					throw new Error("canonical EventStream emitted a malformed terminal event");
+				},
+			]);
+			if (!isMockAssistantStream(stream)) {
+				throw new Error("canonical EventStream constructor returned a malformed stream");
+			}
+			return stream;
+		},
+	};
 }
 
 function createUsage() {
@@ -306,14 +453,13 @@ function userPrompt(): UserMessage {
 }
 
 /** No-op deterministic tool mirroring the Rust bench tool 1:1. */
-const noopTool: AgentTool<any> = {
+const noopTool: AgentTool = {
 	name: "noop",
 	label: "noop",
 	description: "Benchmark no-op tool; validates arguments, emits one update, returns a fixed result.",
 	parameters: structuredClone(NOOP_PARAMETERS),
 	execute: async (_toolCallId, params, _signal, onUpdate) => {
-		const input = params as { path: string; count?: number };
-		const count = input.count ?? 1;
+		const count = params.count ?? 1;
 		if (onUpdate) {
 			onUpdate({
 				content: [{ type: "text", text: "noop progress" }],
@@ -321,14 +467,14 @@ const noopTool: AgentTool<any> = {
 			} satisfies AgentToolResult<{ kind: "noop-progress"; count: number }>);
 		}
 		return {
-			content: [{ type: "text", text: `noop ok: ${input.path} x${count}` }],
-			details: { kind: "noop", path: input.path, count },
+			content: [{ type: "text", text: `noop ok: ${params.path} x${count}` }],
+			details: { kind: "noop", path: params.path, count },
 		} satisfies AgentToolResult<{ kind: "noop"; path: string; count: number }>;
 	},
 };
 
 interface SinkState {
-	session: SessionManager;
+	session: ReferenceSessionManager;
 	t0: number | null;
 	slices: number[];
 	starts: number;
@@ -340,7 +486,7 @@ interface SinkState {
 
 let state: SinkState;
 
-function makeSink(session: SessionManager): (event: AgentEvent) => void {
+function makeSink(session: ReferenceSessionManager): (event: AgentEvent) => void {
 	return (event: AgentEvent): void => {
 		switch (event.type) {
 			case "tool_execution_start":
@@ -390,7 +536,7 @@ async function runWorkerBlock(
 	for (let i = 0; i < calls; i++) {
 		nextCallId = `call-${i}`;
 		nextArgs = structuredClone(args);
-		await runAgentLoop([userPrompt()], context, config, sink, undefined, streamFn);
+		await upstream.runAgentLoop([userPrompt()], context, config, sink, undefined, streamFn);
 	}
 	const cpuDelta = process.cpuUsage(cpuBefore);
 	const slicesMs = state.slices;
@@ -424,7 +570,7 @@ let nextArgs: Record<string, unknown> = structuredClone(VALID_ARGUMENTS);
 function makeStreamFn(): () => MockAssistantStream {
 	let streamCalls = 0;
 	return () => {
-		const stream = new MockAssistantStream();
+		const stream = upstream.createStream();
 		const callId = nextCallId;
 		const args = nextArgs;
 		const turn = streamCalls++;
@@ -440,8 +586,9 @@ function makeStreamFn(): () => MockAssistantStream {
 }
 
 async function runWorker(flags: WorkerFlags): Promise<number> {
+	upstream = await loadUpstream();
 	mkdirSync(flags.sessionDir, { recursive: true });
-	const session = SessionManager.create(process.cwd(), flags.sessionDir);
+	const session = upstream.createSession(process.cwd(), flags.sessionDir);
 	state = {
 		session,
 		t0: null,
@@ -748,7 +895,7 @@ async function main(): Promise<number> {
 			warmupCalls: warmup,
 			blocks: 1,
 			noiseLimit: NOISE_RELATIVE_SPREAD_LIMIT,
-			upstream: `.references/pi@${UPSTREAM_PIN}`,
+			upstream: `${CANONICAL_REFERENCE_ROOT}@${UPSTREAM_PIN}`,
 			rustEntry: "pi_agent::execute_tool_calls",
 			typescriptEntry: "runAgentLoop (upstream agent-loop, executeToolCalls is module-private)",
 			boundary:

@@ -1,5 +1,7 @@
 # PERF-T11: iterative hot-unit rebuild campaign log
 
+> **Historical regression witness**: This document is an iterative campaign log recording historical benchmark runs, measurements, and defect investigations against previous reference checkouts. All legacy reference paths and commit SHAs herein are preserved historical regression witnesses and are excluded from canonical closure metrics.
+>
 > Executes [issue #97](https://github.com/metaphorics/pi-oxidized/issues/97) (PERF-T11).
 > Method per the binding Phase-5 contract in
 > [`floors/README.md`](floors/README.md): candidates derived blind from each
@@ -185,7 +187,7 @@ measure/render seam: cached wrapped lines are re-materialized as an owned
 path stores the freshly built vector by move (no double clone); the hit path
 allocates nothing. This restores the upstream contract exactly: the reference
 bench's `EditorSim.linesForWidth` returns `this.cachedLines` — a reference
-return, zero copies (`.references/pi/packages/tui/test/render-churn-bench.ts:80-87`).
+return, zero copies (`.references/pi/packages/tui/test/render-churn-bench.ts:80-87`). <!-- historical witness -->
 The same pattern ships in the production components on the identical seam
 (`Text::lines_for_width`, `Markdown::lines_for_width` — each called from
 `measure` and `render` every frame), so the fix is product work, not bench
@@ -542,7 +544,7 @@ medians of 5×3000-frame reps + scenario-isolated callgrind Ir): the frame
 decomposes and closes exactly: `frameEditorSteady` 13.97 µs = static
 2.14 (measure walk + pooled claim install/compare + audit + cursor +
 write of 35 B) + EditorSim cache-miss rebuild 1.59 (workload-side,
-upstream-faithful: `.references/pi/packages/tui/test/render-churn-bench.ts:74-87`
+upstream-faithful: `.references/pi/packages/tui/test/render-churn-bench.ts:74-87` <!-- historical witness -->
 re-materializes borders + text row on every text miss) + changed-row
 commit 10.24 (dominated by the fresh-key full derive: unicode-segmentation
 ~18.5 kIr/frame marginal + width ~6.3 kIr + ANSI scan + paint/record
@@ -1044,7 +1046,7 @@ serializes `Arc<T>` as `T`); both drain fidelity legs unchanged
 (publish_partial forwards the Arc, publish_terminal materializes once at
 terminal); loop cancellation/finalization semantics untouched; session
 JSONL persistence per message end (untouched). Conformance suites pass
-(2 pre-existing env failures: missing `.references/pi/` checkout, identical
+(2 pre-existing env failures: missing `.references/pi/` checkout, identical <!-- historical witness -->
 on base).
 
 **Measurements** (release, `taskset -c 20-40`, 9 interleaved pairs, medians;
@@ -1072,7 +1074,7 @@ The residual is channel/scheduler cost + the one source-side
 materialization per frame; the redundant downstream clones are eliminated.
 
 **Verification**: `cargo check --workspace --all-targets` green; pi-ai
-7+2 pass (2 conformance failures pre-existing — missing `.references/pi/`
+7+2 pass (2 conformance failures pre-existing — missing `.references/pi/` <!-- historical witness -->
 checkout, identical on base 6a31935); pi-agent 118/118 green; pi-ext
 176+1 pass (1 failure pre-existing — missing extension-host artifact,
 identical on base); pi --lib 1658 pass, 5 fail (all pre-existing
@@ -3109,8 +3111,8 @@ performance.ts`, and four defects — none in the memory collectors — aborted
 every full run before them (six full-run attempts, R8-era artifact showed the
 same first-frame abort two days prior):
 
-1. **TypeScript reference never exits on /quit** (upstream `.references/pi`
-   `4e4949299`; deterministic, reproduced standalone). `terminateAndRequireCleanExit`
+1. **TypeScript reference never exits on /quit** (upstream `.references/pi` <!-- historical witness -->
+   `4e4949299`; deterministic, reproduced standalone). `terminateAndRequireCleanExit` <!-- historical witness -->
    now escalates to tree termination on quit-timeout, keeps the captured
    sample, and discloses per-sample escalations in `harness.quitTimeouts`
    (50 first-frame escalations this run). Teardown is not measurement.
@@ -3180,7 +3182,7 @@ recorded distribution.
 **Handoffs**: keypress-dispatch owns the burst-write paint stall
 (defect + window above; its own wall lane remains noisy, rs 29.49% this run,
 67-69% in two prior runs); upstream-reference defects (/quit hang, offline
-no-stream) belong to the `.references/pi` pin owners.
+no-stream) belong to the `.references/pi` pin owners. <!-- historical witness -->
 
 **Not touched** (out of scope, file-disjoint): production code
 (`crates/*`), `.github/workflows/`, `scripts/release/`, `Cargo.lock`,

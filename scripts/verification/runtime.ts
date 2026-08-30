@@ -1,7 +1,7 @@
 /**
  * Runtime loader for the reference createAssistantMessageEventStream.
  *
- * The implementation lives in the optional `.references/pi` checkout and is
+ * The implementation lives in the optional `.references/pi-2.0` checkout and is
  * loaded dynamically so the reference source's pre-existing type errors never
  * reach this program. Every prerequisite at that boundary is validated before
  * the factory is called: the resolved reference path must exist, the module
@@ -11,10 +11,11 @@
  * inside the provider stream.
  */
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { join } from "node:path";
+import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-identity.ts";
 import type { AssistantMessageEventStream } from "@earendil-works/pi-ai";
 
-const REFERENCE_MODULE = "../../.references/pi/packages/ai/src/utils/event-stream.ts";
+const REFERENCE_MODULE = join(canonicalReferenceRoot(), "packages/ai/src/utils/event-stream.ts");
 
 type CreateAssistantMessageEventStream = () => AssistantMessageEventStream;
 
@@ -24,12 +25,13 @@ interface ReferenceEventStreamModule {
 }
 
 export function createAssistantMessageEventStream(): AssistantMessageEventStream {
-	const modulePath = resolve(import.meta.dirname, REFERENCE_MODULE);
+	assertCanonicalReference();
+	const modulePath = REFERENCE_MODULE;
 
 	if (!existsSync(modulePath)) {
 		throw new Error(
 			`[verification] reference prerequisite missing: ${modulePath}. ` +
-				"Restore the .references/pi checkout before running verification.",
+				"Restore the .references/pi-2.0 checkout before running verification.",
 		);
 	}
 
@@ -40,7 +42,7 @@ export function createAssistantMessageEventStream(): AssistantMessageEventStream
 		const detail = cause instanceof Error ? cause.message : String(cause);
 		throw new Error(
 			`[verification] reference prerequisite failed to load: ${modulePath} (${detail}). ` +
-				"Restore or rebuild .references/pi before running verification.",
+				"Restore or rebuild .references/pi-2.0 before running verification.",
 			{ cause },
 		);
 	}
@@ -48,7 +50,7 @@ export function createAssistantMessageEventStream(): AssistantMessageEventStream
 	if (raw === null || typeof raw !== "object") {
 		throw new Error(
 			`[verification] reference prerequisite ${modulePath} did not export a module object. ` +
-				"Ensure .references/pi is current.",
+				"Ensure .references/pi-2.0 is current.",
 		);
 	}
 
@@ -56,7 +58,7 @@ export function createAssistantMessageEventStream(): AssistantMessageEventStream
 	if (typeof eventStreamModule.createAssistantMessageEventStream !== "function") {
 		throw new Error(
 			`[verification] reference prerequisite ${modulePath} did not export ` +
-				"createAssistantMessageEventStream as a function. Ensure .references/pi is current.",
+				"createAssistantMessageEventStream as a function. Ensure .references/pi-2.0 is current.",
 		);
 	}
 

@@ -670,7 +670,7 @@ describe("acceptance: extension runtime", () => {
 			"..",
 			"..",
 			".references",
-			"pi",
+			"pi-2.0",
 			"packages",
 			"coding-agent",
 			"examples",
@@ -2087,9 +2087,10 @@ describe("extension theme API", () => {
 		expect(report["m3"]).toEqual({ name: "m3-dark", accent: "\x1b[38;2;17;34;51m" });
 		expect(report["missing"]).toBe(true);
 
-		// Plain name: success + immediate ctx.ui.theme switch.
+		// Canonical pi-2.0 wraps the UI context by value, so its theme getter
+		// remains the bind-time snapshot while setTheme still emits each update.
 		expect(report["setClassic"]).toEqual({ success: true });
-		expect(report["afterClassic"]).toBe("classic-light");
+		expect(report["afterClassic"]).toBe("dark");
 
 		// Pair resolves by polarity (auto + dark terminal → dark member).
 		expect(report["setPair"]).toEqual({ success: true });
@@ -2102,9 +2103,9 @@ describe("extension theme API", () => {
 		});
 		expect(report["afterMissing"]).toBe("dark");
 
-		// Theme-object form applies the instance itself.
+		// The Theme object reaches Rust, while the wrapped getter keeps its snapshot.
 		expect(report["setObject"]).toEqual({ success: true });
-		expect(report["final"]).toBe("inmem");
+		expect(report["final"]).toBe("dark");
 
 		const commandRes = await collector.awaitFrame((f) => f.id === 60 && f.kind === "res");
 		expect(commandRes.payload).toEqual({ ok: true });

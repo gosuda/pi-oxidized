@@ -1,5 +1,7 @@
 # Floor ledger: memory resource units (terminal state, stream-load growth)
 
+> **Historical regression witness**: The measured distributions and degradation disclosures in this ledger reflect historical runs against previous reference checkouts. All legacy paths and commit identifiers herein are preserved historical witnesses and are excluded from canonical closure metrics.
+
 Owning R2 hot rows (lane 10): *Terminal state*, *Stream-load memory growth* — hot by
 input-scaling, graded in the resource currency. State: **GRADED — PERF-T14 cold grading
 in the bytes currency (docs/performance/PERF-T14-cold-grading.md); distribution
@@ -63,7 +65,7 @@ transcript bytes are <=~0.005% of the measured growth, and churn above retained 
 owned by the timing ledgers.
 
 TypeScript stream-load is disclosed as a lane degradation in the artifact
-(`harness.laneDegradations`): the reference build (.references/pi `4e4949299`) accepts the
+(`harness.laneDegradations`): the reference build (.references/pi `4e4949299`) accepts the <!-- historical witness -->
 submitted prompt but never streams offline — an upstream reference regression, not a
 pi-oxidized measurement.
 

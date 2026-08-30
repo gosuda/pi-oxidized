@@ -46,14 +46,12 @@ packaging phase reads one source of truth.
   `image_os`/`image_version` into `witness-environment.txt` (`workflow:609-620`), and
   every musl leg records the same image fields plus `rustc`/`bun` versions into its
   environment evidence (`workflow:231-243`).
-- Every release leg installs the Rust version registered in [docs/compatibility.md#engine-floors](compatibility.md#engine-floors) through the SHA-pinned
-  `dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4` action (`workflow:110-114`).
-- Every release leg installs the Bun runtime registered in [docs/compatibility.md#runtime-and-release-constants](compatibility.md#runtime-and-release-constants)
-  through the SHA-pinned `oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6`
-  action (`workflow:116-119`).
-- The workspace Rust and Bun floors are registered in
-  [docs/compatibility.md#engine-floors](compatibility.md#engine-floors)
-  (`Cargo.toml` `[workspace.package]` `rust-version`; `package.json` `engines.bun`).
+- Toolchain versions and workspace floors are generated in
+  [docs/compatibility.md](compatibility.md). The workflow installs those versions through
+  `dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4`
+  (`workflow:110-114`) and
+  `oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6`
+  (`workflow:116-119`).
 
 ## 2. Verbatim tier statement — five Tier N rows, two musl rows
 
@@ -130,12 +128,13 @@ musl smoke-lane row (`crates/pi-tui/tests/transcript_musl_smoke.rs:57`;
   packages twice and `diff -u dist/pass1/*.sha256 dist/pass2/*.sha256` must be empty
   (`workflow:593-603`); the musl legs repackage from the prebuilt `pi` with `--no-cargo`
   (`workflow:413-419`).
-- `release.json` carries the release schema constant (see [docs/compatibility.md#runtime-and-release-constants](compatibility.md#runtime-and-release-constants); `RELEASE_MANIFEST_SCHEMA`,
-  `scripts/release/stage.ts:19`) with fields `schema`, `version`, `rustTarget`,
-  `bunTarget`, `hostKind`, `compatibilityVersion`, `protocolVersion`,
-  `sourceDateEpoch`, `createdAt`, `files` (`scripts/release/stage.ts:34-46`); each
-  `files` entry carries `path`, `size`, `sha256`, `executable`
-  (`scripts/release/stage.ts:22-31`).
+- `release.json` carries the schema owned by `RELEASE_MANIFEST_SCHEMA`
+  (`scripts/release/stage.ts:19`; see
+  [docs/compatibility.md#runtime-and-release-constants](compatibility.md#runtime-and-release-constants))
+  with fields `schema`, `version`, `rustTarget`, `bunTarget`, `hostKind`,
+  `compatibilityVersion`, `protocolVersion`, `sourceDateEpoch`, `createdAt`,
+  `files` (`scripts/release/stage.ts:34-46`); each `files` entry carries `path`,
+  `size`, `sha256`, `executable` (`scripts/release/stage.ts:22-31`).
 - Staged contents are ordered by `stagedInputs` (`scripts/release/stage.ts:123-215`):
   the `pi` binary, the host artifact, the musl fallback pair, mandatory `CHANGELOG.md`
   and `README.md`, optional `LICENSE`/`LICENSE-MIT`, the docs tree, optional
@@ -258,9 +257,10 @@ musl smoke-lane row (`crates/pi-tui/tests/transcript_musl_smoke.rs:57`;
 
 ## 9. Dated Bun-bump procedure — re-pinning all seven assets plus the Alpine userland
 
-1. Pick the new Bun version from the release channel and record the grounding date; the
-   version constant is `BUN_RUNTIME_VERSION` in `scripts/release/runtime.ts:8`
-   (see [docs/compatibility.md#runtime-and-release-constants](compatibility.md#runtime-and-release-constants)).
+1. Pick the new Bun version from the release channel and record the grounding date.
+   `BUN_RUNTIME_VERSION` in `scripts/release/runtime.ts:8` owns the version;
+   [docs/compatibility.md#runtime-and-release-constants](compatibility.md#runtime-and-release-constants)
+   publishes it.
 2. Re-pin all seven `ASSET_PINS` entries (`scripts/release/runtime.ts:25-61`) from the
    new release's official `SHASUMS256.txt` — the vendor-verification channel used for
    the current pins (REL-T2 #104; `docs/REL-R1-musl-toolchain-bakeoff.md` §5 Bun rows,

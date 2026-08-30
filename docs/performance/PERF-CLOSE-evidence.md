@@ -116,7 +116,7 @@ run. The check-9 closing artifact supplies the current per-run values above.
 
 ## Campaign ledger completeness
 
-- 33 numbered iterations plus one residual-classification record in `docs/performance/t11-iterations.md`; every hot unit terminal.
+- The prior campaign contains 33 numbered iterations and one residual-classification record. This historical count is context only; it does not back canonical closure.
 - 11 floor ledgers in `docs/performance/floors/`; every State column synced to terminal verdicts.
 - `docs/performance/PERF-T14-cold-grading.md`: 12 cold rows graded (2 AT-FLOOR, 10 LEFT, 0 FIXED).
 - All four audit blockers CLOSED: #92 (G13), #96 (G12), #99 (G16), #101 (G15).

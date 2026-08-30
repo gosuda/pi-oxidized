@@ -562,11 +562,11 @@ export const EXAMPLE_PRODUCT_SCAN_DIRS = [
 ] as const;
 
 /** Path segment that identifies the example-product (reference corpus) tree. */
-export const EXAMPLE_PRODUCT_MARKER = ".references/pi/";
+export const EXAMPLE_PRODUCT_MARKER = ".references/pi-2.0/";
 
 /**
  * Scan test and verification .ts files for value import statements referencing
- * the example-product tree (.references/pi/).  A disguised import accretes
+ * the example-product tree (.references/pi-2.0/).  A disguised import accretes
  * example-product behavior into the evidence program and is a drift class
  * the checker must catch.  Type-only imports are skipped (erased at runtime).
  *

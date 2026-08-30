@@ -374,18 +374,18 @@ describe("parity witness suite", () => {
 		expect(violations).toEqual(["ledger oracle sentence is missing"]);
 	});
 
-	test("a sixth literal site fails the AgentLoopConfig site witness", () => {
-		const directory = writeFixtureRepo(temporaryDirectory("parity-sixth-site-"), {
+	test("a seventh literal site fails the AgentLoopConfig site witness", () => {
+		const directory = writeFixtureRepo(temporaryDirectory("parity-seventh-site-"), {
 			extraLiteralPath: "crates/pi/src/main.rs",
 		});
 		const violations = runParityWitnesses(directory);
-		expect(hasViolation(violations, "expected exactly 5 AgentLoopConfig literal sites, found 6")).toBe(true);
+		expect(hasViolation(violations, "expected exactly 6 AgentLoopConfig literal sites, found 7")).toBe(true);
 		expect(hasViolation(violations, "crates/pi/src/main.rs:1 matches no pinned site")).toBe(true);
 	});
 
 	test("empty site list fails the AgentLoopConfig site witness", () => {
 		const violations = verifyAgentLoopConfigSites([]);
-		expect(hasViolation(violations, "expected exactly 5 AgentLoopConfig literal sites, found 0")).toBe(true);
+		expect(hasViolation(violations, "expected exactly 6 AgentLoopConfig literal sites, found 0")).toBe(true);
 		expect(hasViolation(violations, "missing pinned AgentLoopConfig literal site")).toBe(true);
 	});
 });

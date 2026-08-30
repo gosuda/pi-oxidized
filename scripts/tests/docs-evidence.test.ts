@@ -6,8 +6,9 @@ import { spawnSync } from "node:child_process";
 
 import {
 	CANONICAL_REFERENCE_SHA,
-	STALE_REFERENCE_SHA,
-} from "../verification/alignment.ts";
+	LEGACY_REFERENCE_SHA,
+	RETIRED_REFERENCE_SHA,
+} from "../reference-identity.ts";
 import {
 	DEFAULT_REPROOF_INTERVAL_MS,
 	EVIDENCE_CLASSES,
@@ -64,9 +65,9 @@ function sampleRow(evidenceClass: string, id: string): LedgerRow {
 		case "matrix-count":
 			return { ...base, params: { source: "scripts/verification/compat-matrix.json", expectedCount: 35, countMethod: "json-array", countKey: "rows" } };
 		case "review-only-prose":
-			return { ...base, params: { source: ".references/pi/README.md" } };
+			return { ...base, params: { source: ".references/pi-2.0/README.md" } };
 		case "changelog-unreleased":
-			return { ...base, params: { source: ".references/pi/packages/coding-agent/CHANGELOG.md" } };
+			return { ...base, params: { source: ".references/pi-2.0/packages/coding-agent/CHANGELOG.md" } };
 		default:
 			return { ...base, params: {} };
 	}
@@ -437,7 +438,7 @@ describe("docs-evidence: mutation suite (per class)", () => {
 			status: "present",
 			target: "test",
 			class: "review-only-prose",
-			params: { source: ".references/pi/README.md" },
+			params: { source: ".references/pi-2.0/README.md" },
 			command: "bun run something",
 		};
 		const result = runScratchCheck([row as unknown as LedgerRow]);
@@ -583,11 +584,18 @@ describe("docs-evidence: mutation suite (per class)", () => {
 // ---------------------------------------------------------------------------
 
 describe("docs-evidence: reference-pin literal", () => {
-	test("stale hash injected into scratch ledger fails the checker", () => {
-		const row = sampleRow("review-only-prose", "stale-pin-test");
-		const result = runScratchCheck([row], STALE_REFERENCE_SHA);
+	test("legacy pin injected into scratch ledger fails the checker", () => {
+		const row = sampleRow("review-only-prose", "legacy-pin-test");
+		const result = runScratchCheck([row], LEGACY_REFERENCE_SHA);
 		expect(result.ok).toBe(false);
-		expect(result.problems.some((p) => p.includes("stale hash") || p.includes(STALE_REFERENCE_SHA))).toBe(true);
+		expect(result.problems.some((p) => p.includes("legacy pin") || p.includes(LEGACY_REFERENCE_SHA))).toBe(true);
+	});
+
+	test("retired pin injected into scratch ledger fails the checker", () => {
+		const row = sampleRow("review-only-prose", "retired-pin-test");
+		const result = runScratchCheck([row], RETIRED_REFERENCE_SHA);
+		expect(result.ok).toBe(false);
+		expect(result.problems.some((p) => p.includes("retired pin") || p.includes(RETIRED_REFERENCE_SHA))).toBe(true);
 	});
 
 	test("validateLedger rejects a non-canonical referencePin", () => {

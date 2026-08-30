@@ -96,7 +96,7 @@ C1 + C2 + C3.
    file C2; `release.json` (which lists every file and size) is recorded as
    an authority.
 
-**Upstream** (`.references/pi`, read-only):
+**Reference** (`.references/pi-2.0`, read-only):
 
 1. `npm pack --dry-run --json` in `packages/coding-agent` — the exact shipped
    payload file list and per-file bytes of the pinned package.

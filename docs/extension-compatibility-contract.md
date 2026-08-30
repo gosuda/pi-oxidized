@@ -11,9 +11,10 @@ document changes protocol, fixtures, scripts, `.references`, `.outline`, or the
 parity ledger; those surfaces are cited read-only (see [Ownership](#ownership)).
 
 The compatibility target is the reference TypeScript packages under
-`.references/pi/packages/{ai,agent,coding-agent,tui}`. Serialized names and
-behavior are the contract; JavaScript object order and implementation identity
-are explicitly **not** (see [Non-contracts](#non-contracts)).
+`.references/pi-2.0/packages/{ai,agent,coding-agent,tui}` pinned at canonical
+SHA `853a80d26c90a14c1886f0ebb8ffaae133ca2185` as the canonical behavior authority.
+Serialized names and behavior are the contract; JavaScript object order and
+implementation identity are explicitly **not** (see [Non-contracts](#non-contracts)).
 
 ---
 
@@ -197,18 +198,18 @@ and hooks.
 Witnesses:
 
 - Mode 1 tools and flags use guarded insertion in
-  `.references/pi/packages/coding-agent/src/core/extensions/runner.ts::getAllRegisteredTools`
+  `.references/pi-2.0/packages/coding-agent/src/core/extensions/runner.ts::getAllRegisteredTools`
   and `::getFlags` (lines 450-483). Commands use
   `::resolveRegisteredCommands` (lines 603-636), which retains collisions and
   assigns unique invocation names.
 - Mode 1 shortcut resolution is defined by
-  `.references/pi/packages/coding-agent/src/core/extensions/runner.ts::getShortcuts`
+  `.references/pi-2.0/packages/coding-agent/src/core/extensions/runner.ts::getShortcuts`
   (lines 494-536): restricted built-ins are skipped and later extension
   registrations replace earlier ones. Host dispatch walks extensions from the
   last index in `packages/extension-host/src/host.ts::handleShortcutExecute`
   (lines 860-866), so the same later-registration rule is observable over JSONL.
 - Mode 1 provider re-registration is defined by
-  `.references/pi/packages/coding-agent/src/core/model-runtime.ts::registerProvider`
+  `.references/pi-2.0/packages/coding-agent/src/core/model-runtime.ts::registerProvider`
   (lines 742-777): validation runs first, then defined fields merge over the
   previous entry.
 - Mode 2 registration binds first-wins for tools, commands, flags, and providers.
@@ -232,7 +233,7 @@ later-override-unless-reserved rules?
 
 1. **Command suffix disambiguation (Rule 2, Mode 1):** The TypeScript host
    performs suffix assignment in
-   `.references/pi/packages/coding-agent/src/core/extensions/runner.ts::
+   `.references/pi-2.0/packages/coding-agent/src/core/extensions/runner.ts::
    resolveRegisteredCommands` (lines 603-636) *before* the snapshot is
    serialized. The Rust side receives already-disambiguated invocation names
    as `CommandWire.name` (`crates/pi/src/core/extension_host.rs::CommandWire`,
@@ -250,7 +251,7 @@ later-override-unless-reserved rules?
 
 2. **Shortcut later-override-unless-reserved (Rule 4, Mode 1):** The
    TypeScript host resolves restricted built-ins in
-   `.references/pi/packages/coding-agent/src/core/extensions/runner.ts::
+   `.references/pi-2.0/packages/coding-agent/src/core/extensions/runner.ts::
    getShortcuts` (lines 494-536): shortcuts with `restrictOverride === true`
    are skipped (line 511), and later extension registrations replace earlier
    ones (line 533). The Rust product layer does **not** rely on

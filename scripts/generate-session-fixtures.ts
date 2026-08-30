@@ -3,7 +3,7 @@
  * Offline deterministic generator for Phase 3 session compatibility fixtures.
  *
  * Source of truth: the reference SessionManager and public helpers under
- * `.references/pi/packages/coding-agent/src/core/session-manager.ts`. Network
+ * `.references/pi-2.0/packages/coding-agent/src/core/session-manager.ts`. Network
  * fetches are forbidden; runtime Rust never needs Bun.
  *
  * Emits:
@@ -50,6 +50,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
+import { assertCanonicalReference, canonicalReferenceRoot } from "./reference-identity.ts";
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -57,7 +58,7 @@ import { randomUUID } from "node:crypto";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
-const REF_ROOT = join(REPO_ROOT, ".references/pi");
+const REF_ROOT = canonicalReferenceRoot(REPO_ROOT);
 const REF_SESSION_MANAGER = join(
 	REF_ROOT,
 	"packages/coding-agent/src/core/session-manager.ts",
@@ -253,6 +254,8 @@ interface ReferenceSessionModule {
 let ref: ReferenceSessionModule;
 
 async function loadReference(): Promise<void> {
+	// Fail closed before the reference SessionManager module is read.
+	assertCanonicalReference(REPO_ROOT);
 	await assertPathReadable(REF_SESSION_MANAGER, "reference SessionManager");
 	await assertPathReadable(REF_UUID, "reference uuidv7");
 
@@ -320,7 +323,7 @@ async function loadReference(): Promise<void> {
 	}
 
 	ref = {
-		// Escape hatch: the read-only `.references/pi` module is imported
+		// Escape hatch: the read-only `.references/pi-2.0` module is imported
 		// untyped at runtime; the typeof check above is the runtime gate.
 		SessionManager: SessionManager as unknown as SessionManagerStatic,
 		migrateSessionEntries: migrateSessionEntries as (

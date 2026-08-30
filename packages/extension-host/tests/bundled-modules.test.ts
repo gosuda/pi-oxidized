@@ -115,7 +115,7 @@ const REFERENCE_MODULES = [
 
 test("resolves reference modules from this workspace", () => {
 	const hostRoot = resolve(import.meta.dirname, "..");
-	const referenceRoot = resolve(hostRoot, "../..", ".references", "pi");
+	const referenceRoot = resolve(hostRoot, "../..", ".references", "pi-2.0");
 	const importer = resolve(hostRoot, "src", "main.ts");
 
 	for (const [specifier, expectedPath] of REFERENCE_MODULES) {

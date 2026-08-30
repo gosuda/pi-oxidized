@@ -1,8 +1,10 @@
 # PERF-R8: Trusted paired baselines on the newly symmetric lanes
 
+> **Historical regression witness**: This document records historical paired baselines collected against previous reference checkouts. All legacy checkout paths, runner paths, and commit references herein are preserved historical witnesses and are excluded from canonical closure metrics.
+>
 > Resolves [issue #95](https://github.com/metaphorics/pi-oxidized/issues/95).
 > Parent: [Wayfinder: Complete pi Rust port](https://github.com/metaphorics/pi-oxidized/issues/12).
-> Upstream baseline: `.references/pi` at `8fa7eebd235355522c8104166b4f1f959b4e2f10`.
+> Upstream baseline: `.references/pi` at `8fa7eebd235355522c8104166b4f1f959b4e2f10`. <!-- historical witness -->
 > Prior ranking: [PERF-R2](PERF-R2-workload-surface-ranking.md).
 
 ## Scope
@@ -40,7 +42,7 @@ for timing lanes), and updates the hot list.
 |-------|-------|
 | Workload | 100x30 viewport, 150-line transcript/dock tree, 20 warmups, 300 frames, static + editor scenarios, null-sink terminal |
 | Rust runner | `target/release/pi_tui_render_churn_bench` (PERF-T3) |
-| TypeScript runner | `.references/pi/packages/tui/test/render-churn-bench.ts` |
+| TypeScript runner | `.references/pi/packages/tui/test/render-churn-bench.ts` | <!-- historical witness -->
 | Parameters diff-checked | Yes — viewport, transcript lines, warmup frames, measured frames, scenarios all match |
 | Alternating order | N/A — separate processes, 10 runs each, interleaved collection |
 | Artifact | Inline (10 runs per implementation, 2026-08-27, Xeon Gold 6138) |
@@ -361,7 +363,7 @@ Seven lanes now have trusted baselines or paired measurements (up from five in R
 - `target/bench/session-timing.json`: PERF-T4 artifact, generated 2026-08-27T06:48Z. 360 samples (180 rust, 180 typescript), 186 distinct SHA-256 prefixes, 0 missing.
 - `target/bench/tool-dispatch.json`: PERF-T5 artifact, generated 2026-08-27T08:15:45Z. 10 samples x 10 000 calls, alternating order.
 - `target/bench/install-footprint.json`: PERF-T7 artifact, generated 2026-08-27T08:22:17Z (incomplete — runner blocked by extension-host typecheck failure).
-- Render-churn (lane 7): 10 inline runs per implementation, 2026-08-27, Xeon Gold 6138. Rust binary `target/release/pi_tui_render_churn_bench`, TS script `.references/pi/packages/tui/test/render-churn-bench.ts`.
+- Render-churn (lane 7): 10 inline runs per implementation, 2026-08-27, Xeon Gold 6138. Rust binary `target/release/pi_tui_render_churn_bench`, TS script `.references/pi/packages/tui/test/render-churn-bench.ts`. <!-- historical witness -->
 - `scripts/verification/performance.ts`: workload definitions, noise gate integration, alternating order (`implementationOrder`), memory instrumentation.
 - `scripts/bench-tool-dispatch.ts`: paired dispatch-only tool benchmark (lane 8).
 - `scripts/session-timing.ts`: isolated session append/reopen timing (lane 9).
@@ -370,7 +372,7 @@ Seven lanes now have trusted baselines or paired measurements (up from five in R
 - `scripts/statistics.ts`: `NOISE_RELATIVE_SPREAD_LIMIT = 0.2`, `requireQuiet`, `REMEDIATION_LADDER`.
 - `crates/pi-ext/tests/serve_io_scaling.rs`: Rust production `serve_io` scaling correctness suite (lane 6/10).
 - `crates/pi-tui/src/bin/pi_tui_render_churn_bench.rs`: Rust render-churn benchmark binary (lane 7).
-- `.references/pi/packages/tui/test/render-churn-bench.ts`: upstream render-churn parameters (lane 7).
+- `.references/pi/packages/tui/test/render-churn-bench.ts`: upstream render-churn parameters (lane 7). <!-- historical witness -->
 - Issues #89, #86, #93, #88, #91: closed sibling tasks (PERF-T3 through PERF-T7).
 - Issue #90: PERF-R2 prior ranking.
 - Issue #22: performance superiority acceptance decisions D1-D9, including D8 unsupported-claims registry.

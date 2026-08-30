@@ -1,9 +1,11 @@
 # PERF-R2: Repo-wide performance workload surface ranking with trusted baselines
 
+> **Historical regression witness**: This document records historical baseline measurements collected against previous reference checkouts. All legacy paths, runner paths, commands, and commit references herein are preserved historical witnesses and are excluded from canonical closure metrics.
+>
 > Resolves [issue #90](https://github.com/metaphorics/pi-oxidized/issues/90).
 > Artifact: `target/bench/performance-comparison.json` (generated 2026-08-26).
 > Extension-scaling artifact: `target/bench/extension-scaling.json` (generated 2026-08-26).
-> Upstream baseline: `.references/pi` at `8fa7eebd235355522c8104166b4f1f959b4e2f10`.
+> Upstream baseline: `.references/pi` at `8fa7eebd235355522c8104166b4f1f959b4e2f10`. <!-- historical witness -->
 
 ## Trusted-baseline criteria
 
@@ -34,7 +36,7 @@ Eleven lanes span the five crates. Lanes 1 through 4 are measured by `scripts/ve
 | Crates | `pi` |
 | Script | `scripts/verification/performance.ts` measurements.version |
 | Command (Rust) | `target/release/pi --version` |
-| Command (TS) | `.references/pi/packages/coding-agent/dist/pi --version` |
+| Command (TS) | `.references/pi/packages/coding-agent/dist/pi --version` | <!-- historical witness -->
 | Samples | 20 cold, 10 warmups + 50 warm per implementation |
 | Alternating order | Yes |
 | Unit | milliseconds wall time |
@@ -232,7 +234,7 @@ Claim class: D8-blocked. Functional correctness is proven through the production
 | Field | Value |
 |---|---|
 | Crates | `pi-tui` |
-| Upstream | `.references/pi/packages/tui/test/render-churn-bench.ts` |
+| Upstream | `.references/pi/packages/tui/test/render-churn-bench.ts` | <!-- historical witness -->
 | Parameters | 100x30 viewport, 150-line transcript/dock tree, 20 warmups, 300 frames, static + editor scenarios, NullTerminal |
 | Rust | None (PERF-T3 #89 is open) |
 
@@ -261,7 +263,7 @@ Claim class: D8-blocked. Upstream-only; no symmetric Rust benchmark. PERF-T3 (#8
 | Crates | `pi` (entry), `pi-agent` (dispatch), `pi-ai` (tool schema) |
 | Script | `scripts/bench-tool-dispatch.ts` (PERF-T5) |
 | Rust worker | `target/release/pi_tool_dispatch_bench` driving `pi_agent::execute_tool_calls` in-process |
-| TypeScript worker | `scripts/bench-tool-dispatch.ts --worker` driving upstream `runAgentLoop` (`.references/pi`, `executeToolCalls` is module-private) |
+| TypeScript worker | `scripts/bench-tool-dispatch.ts --worker` driving upstream `runAgentLoop` (`.references/pi`, `executeToolCalls` is module-private) | <!-- historical witness -->
 | Tool | `noop`: JSON Schema `{path: string minLength 1, count: integer 1..64}`, required `path`, no additional properties; one partial update per call |
 | Samples | 10 per implementation, fresh process each, alternating order (`implementationOrder`) |
 | Unit | milliseconds per tool call, slice = `tool_execution_start` event → tool-result message session append |
@@ -340,7 +342,7 @@ Claim class: D8-blocked. Instrumentation was added by PERF-T1 (#85, closed), but
 |---|---|
 | Crates | `pi` |
 | Script | `scripts/verification/performance.ts` build.artifacts |
-| Artifacts | `target/release/pi` (Rust ELF) vs `.references/pi/packages/coding-agent/dist/pi` (Bun-compiled executable) |
+| Artifacts | `target/release/pi` (Rust ELF) vs `.references/pi/packages/coding-agent/dist/pi` (Bun-compiled executable) | <!-- historical witness -->
 
 Trusted baseline (from artifact):
 
@@ -420,7 +422,7 @@ All five crates have at least one paired comparative lane with a trusted baselin
 - `scripts/bench-tool-dispatch.ts`: paired dispatch-only tool benchmark (lane 8), noise gate integration, artifact `target/bench/tool-dispatch.json`.
 - `scripts/statistics.ts`: `NOISE_RELATIVE_SPREAD_LIMIT = 0.2`, `requireQuiet`, `REMEDIATION_LADDER`.
 - `crates/pi-ext/tests/serve_io_scaling.rs`: Rust production `serve_io` scaling correctness suite.
-- `.references/pi/packages/tui/test/render-churn-bench.ts`: upstream render-churn parameters (100x30, 20 warmups, 300 frames, static + editor).
+- `.references/pi/packages/tui/test/render-churn-bench.ts`: upstream render-churn parameters (100x30, 20 warmups, 300 frames, static + editor). <!-- historical witness -->
 - Issue #13 comment: ranked comparative workload and floor plan (10 lanes with dispositions).
 - Issue #22 comment: performance superiority acceptance decisions D1 through D9, including D8 unsupported-claims registry.
 - Issue #85 (PERF-T1, closed): noise gate and process memory instrumentation.

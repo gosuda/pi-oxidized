@@ -17,7 +17,7 @@
 
 This document is the single authority for the supported viewport width floor below the
 initial 20-column clamp during live terminal resizes. Under the repository parity doctrine
-(issue #25), the TypeScript reference tree (`.references/pi/…`) is canonical and every
+(issue #25), the TypeScript reference tree (`.references/pi-2.0/…` at `853a80d26c90a14c1886f0ebb8ffaae133ca2185`) is canonical and every
 deviation is an explicit recorded decision. The reference imposes no explicit live-resize
 width floor: it reads `terminal.columns` directly and renders at whatever width the
 kernel reports. The Rust port therefore records its 20-column floor as an intentional

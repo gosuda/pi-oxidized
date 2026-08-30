@@ -247,7 +247,7 @@ describe("host: loads real example extensions via jiti", () => {
 	// because their internal @earendil-works/* imports need the alias map.
 	const REF_EXAMPLES = resolve(
 		import.meta.dirname, "..", "..", "..",
-		".references", "pi", "packages", "coding-agent", "examples", "extensions",
+		".references", "pi-2.0", "packages", "coding-agent", "examples", "extensions",
 	);
 
 	async function loadViaJiti(name: string): Promise<{ tools: string[]; handlers: string[] }> {

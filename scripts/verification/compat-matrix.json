@@ -357,7 +357,7 @@
 			"surface": "generated v1/v2/v3 session interoperability",
 			"tier": "product",
 			"required": true,
-			"requires": [".references/pi"],
+			"requires": [".references/pi-2.0"],
 			"commands": [
 				{
 					"cwd": ".",
@@ -372,7 +372,7 @@
 			"surface": "rpc protocol parity",
 			"tier": "product",
 			"required": true,
-			"requires": [".references/pi"],
+			"requires": [".references/pi-2.0"],
 			"commands": [
 				{
 					"cwd": ".",

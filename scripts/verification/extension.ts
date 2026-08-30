@@ -20,6 +20,7 @@ const ENV = {
 	chunkDelayMs: "PI_VERIFICATION_CHUNK_DELAY_MS",
 	finalMarker: "PI_VERIFICATION_FINAL_MARKER",
 	loadCountPath: "PI_VERIFICATION_LOAD_COUNT_PATH",
+	readyPath: "PI_VERIFICATION_READY_PATH",
 	toolPath: "PI_VERIFICATION_TOOL_PATH",
 	compatibilityPath: "PI_VERIFICATION_COMPATIBILITY_PATH",
 } as const;
@@ -231,9 +232,14 @@ export default function verificationExtension(pi: ExtensionAPI): void {
 		type: "string",
 	});
 
-	pi.on("session_start", () => {
+	pi.on("session_start", (_event, ctx) => {
 		recordCompatibility("session_start.before", { flag: VERIFICATION_PROFILE_FLAG });
 		recordCompatibility("session_start.after", { value: pi.getFlag(VERIFICATION_PROFILE_FLAG) ?? null });
+		const readyPath = process.env[ENV.readyPath];
+		if (readyPath !== undefined) {
+			mkdirSync(dirname(readyPath), { recursive: true });
+			writeFileSync(readyPath, "ready\n", "utf8");
+		}
 	});
 
 	pi.registerShortcut(VERIFICATION_SHORTCUT, {

@@ -172,17 +172,17 @@ optional `assets`/`theme`, then `release.json`.
 
 ## 10. Generated artifacts
 
-Three offline deterministic generators produce checked-in fixtures. Each rerun
+Three offline deterministic generators produce checked-in fixtures against canonical reference `.references/pi-2.0` at pinned SHA `853a80d26c90a14c1886f0ebb8ffaae133ca2185` as the canonical authority. Each rerun
 is a byte-stable no-op when the source has not changed:
 
 - `scripts/generate-builtin-models.ts` — `crates/pi-ai/data/builtin-models.json`
-  from `.references/pi/packages/ai/src/models.generated.ts`.
+  from `.references/pi-2.0/packages/ai/src/models.generated.ts`.
 - `scripts/generate-session-fixtures.ts` —
   `.agent-tasks/pi-rust-rewrite/fixtures/sessions/` from the reference
-  `SessionManager`.
+  `SessionManager` in `.references/pi-2.0`.
 - `scripts/generate-tool-schemas.ts` —
   `.agent-tasks/pi-rust-rewrite/fixtures/tool-schemas/` from the reference
-  tool registry.
+  tool registry in `.references/pi-2.0`.
 
 ```bash
 bun run scripts/generate-builtin-models.ts

@@ -18,11 +18,12 @@ import {
 
 test("derives the authoritative RPC command set from the source-pinned union", () => {
 	const derived = deriveRpcCommandTypes(readFileSync(AUTHORITATIVE_RPC_TYPES_PATH, "utf8"));
-	expect(derived.length).toBe(32);
+	expect(derived.length).toBe(33);
 	expect(derived).toContain("prompt");
 	expect(derived).toContain("get_commands");
 	expect(derived).toContain("get_available_thinking_levels");
 	expect(derived).toContain("switch_session");
+	expect(derived).toContain("clear_queue");
 	expect(new Set(derived).size).toBe(derived.length);
 });
 
@@ -57,10 +58,25 @@ test("manual RPC correlation ids are ordered from c23 onward with no collisions"
 	const scenario = buildScenario();
 	const names = scenario.map((s) => s.name);
 	expect(new Set(names).size).toBe(names.length);
-	// The last step()-generated step is c22-follow_up; manual steps start at c23.
+	// The first manual step is c23-get_state-harvest; the re-queue pair feeds
+	// clear_queue real queue state, and the final step closes the transcript.
 	expect(names).toContain("c22-follow_up");
-	expect(names).not.toContain("c22-get_state-harvest");
-	expect(names[scenario.length - 1]).toBe("c40-get_state-final");
+	expect(names).toContain("c24-prompt-flush");
+	expect(names).toContain("c27-clear_queue");
+	expect(names).not.toContain("c27-get_last_assistant_text");
+	expect(names[scenario.length - 1]).toBe("c43-get_state-final");
+	// clear_queue must replay while the re-queued pair is still pending.
+	expect(names.indexOf("c27-clear_queue")).toBeGreaterThan(names.indexOf("c26-follow_up-requeue"));
+	expect(names.indexOf("c27-clear_queue")).toBeLessThan(names.indexOf("c28-get_last_assistant_text"));
+});
+
+test("clear_queue replays the canonical no-payload wire form", () => {
+	const scenario = buildScenario();
+	const step = scenario.find((s) => s.name === "c27-clear_queue");
+	expect(step?.commandType).toBe("clear_queue");
+	// Canonical union variant: { id?: string; type: "clear_queue" } — the
+	// replay sends id + type and invents no payload fields.
+	expect(step?.build({ workDir: "/run/root" })).toEqual({ id: "c27-clear_queue", type: "clear_queue" });
 });
 
 test("a newly added authoritative command cannot silently escape", () => {

@@ -3,7 +3,7 @@
  * PAR-WIRE fixture corpus generator (issue #30).
  *
  * Derives the golden remote-session wire corpus from the pinned upstream
- * `.references/pi` protocol package at 8fa7eeb. Offline-deterministic: the
+ * `.references/pi-2.0` protocol package at 853a80d2. Offline-deterministic: the
  * upstream encoder is invoked over fixed messages; outputs are hex records.
  *
  * Corpus shape (packages/pi-remote-protocol/tests/fixtures/par-wire-corpus.jsonl):
@@ -15,10 +15,14 @@
 import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-identity.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const upstreamRoot = join(here, "../../.references/pi/packages/protocol/src");
+const upstreamRoot = join(canonicalReferenceRoot(), "packages/protocol/src");
 
+// Dynamic imports: the specifiers are only known after the canonical checkout
+// has been identity-verified, and the gate must run before any reference read.
+assertCanonicalReference();
 const { FrameDecoder, DEFAULT_MAX_FRAME_LENGTH } = await import(join(upstreamRoot, "framing.ts"));
 const { encodeClientMessage, encodeServerMessage } = await import(join(upstreamRoot, "codec.ts"));
 const { PROTOCOL_VERSION } = await import(join(upstreamRoot, "schemas.ts"));

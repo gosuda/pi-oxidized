@@ -13,8 +13,9 @@ import {
 	verifyConfigValueSingleOwner,
 	runCompatAuditWitnesses,
 } from "./compat-audit.ts";
+import { CANONICAL_REFERENCE_ROOT } from "../reference-identity.ts";
 
-const REF_ROOT = join(REPO_ROOT, ".references", "pi", "packages");
+const REF_ROOT = join(REPO_ROOT, CANONICAL_REFERENCE_ROOT, "packages");
 const COMPAT_TS = join(REF_ROOT, "ai", "src", "compat.ts");
 
 const temporaryPaths: string[] = [];

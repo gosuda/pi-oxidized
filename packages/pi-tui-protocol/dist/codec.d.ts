@@ -1,9 +1,9 @@
 import { type Frame, type Method } from "./types.js";
 /** Protocol encode/decode/validation failure. */
 export declare class ProtocolError extends Error {
-    readonly details?: unknown | undefined;
+    readonly details?: unknown;
     readonly code: "frame_too_large" | "invalid_utf8" | "invalid_json" | "malformed_frame" | "invalid_frame" | "version_mismatch" | "compatibility_mismatch" | "unknown_method" | "truncated";
-    constructor(code: ProtocolError["code"], message: string, details?: unknown | undefined);
+    constructor(code: ProtocolError["code"], message: string, details?: unknown);
 }
 /**
  * Validate id/kind rules and optionally the method allowlist.

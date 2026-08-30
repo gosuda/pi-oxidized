@@ -105,6 +105,94 @@ export const REQUIRED_SNIPPET_FIXTURES: readonly RequiredSnippetFixture[] = [
 	},
 ] as const;
 
+export interface PublicShellSnippet {
+	readonly path: string;
+	readonly fenceIndex: number;
+	readonly probes: readonly string[];
+}
+
+/**
+ * Contract for the public `bash` command blocks in README.md and
+ * docs/getting-started.md. Every probe must coexist inside the single bash
+ * fence at `fenceIndex`. Commands are registered, never executed; the real
+ * commands are verified separately.
+ */
+export const PUBLIC_SHELL_SNIPPETS: readonly PublicShellSnippet[] = [
+	{
+		path: "README.md",
+		fenceIndex: 0,
+		probes: [
+			"mkdir -p .references",
+			"git clone https://github.com/earendil-works/pi.git .references/pi-2.0",
+			"git -C .references/pi-2.0 checkout --detach 853a80d26c90a14c1886f0ebb8ffaae133ca2185",
+			'test "$(git -C .references/pi-2.0 rev-parse HEAD)" = "853a80d26c90a14c1886f0ebb8ffaae133ca2185"',
+			"bun install --frozen-lockfile",
+			"bun run scripts/reconstruct-provider-data.ts",
+			"npm ci --ignore-scripts --prefix .references/pi-2.0",
+			"bun run build:extension-host --target x86_64-unknown-linux-gnu",
+			"cargo build -p pi --release --locked",
+		],
+	},
+	{
+		path: "README.md",
+		fenceIndex: 1,
+		probes: ['read -rsp "Enter Gemini API key: " GEMINI_API_KEY && export GEMINI_API_KEY', "printf '\\n'"],
+	},
+	{
+		path: "README.md",
+		fenceIndex: 2,
+		probes: [
+			'PI_EXTENSION_HOST="$PWD/dist/release/.staging-host/host/x86_64-unknown-linux-gnu/pi-extension-host"',
+			"target/release/pi --provider google --model gemini-flash-latest",
+		],
+	},
+	{
+		path: "docs/getting-started.md",
+		fenceIndex: 0,
+		probes: [
+			"git clone https://github.com/gosuda/pi-oxidized.git",
+			"cd pi-oxidized",
+			"mkdir -p .references",
+			"git clone https://github.com/earendil-works/pi.git .references/pi-2.0",
+			"git -C .references/pi-2.0 checkout --detach 853a80d26c90a14c1886f0ebb8ffaae133ca2185",
+			'test "$(git -C .references/pi-2.0 rev-parse HEAD)" = "853a80d26c90a14c1886f0ebb8ffaae133ca2185"',
+			"bun install --frozen-lockfile",
+			"bun run scripts/reconstruct-provider-data.ts",
+			"npm ci --ignore-scripts --prefix .references/pi-2.0",
+			"bun run build:extension-host --target x86_64-unknown-linux-gnu",
+			"cargo build -p pi --release --locked",
+			"target/release/pi --help",
+		],
+	},
+	{
+		path: "docs/getting-started.md",
+		fenceIndex: 1,
+		probes: ['read -rsp "Enter Gemini API key: " GEMINI_API_KEY && export GEMINI_API_KEY', "printf '\\n'"],
+	},
+	{
+		path: "docs/getting-started.md",
+		fenceIndex: 2,
+		probes: [
+			'PI_EXTENSION_HOST="$PWD/dist/release/.staging-host/host/x86_64-unknown-linux-gnu/pi-extension-host"',
+			"target/release/pi --provider google --model gemini-flash-latest",
+		],
+	},
+	{
+		path: "docs/getting-started.md",
+		fenceIndex: 3,
+		probes: ["target/release/pi --provider google --model gemini-flash-latest"],
+	},
+	{
+		path: "docs/getting-started.md",
+		fenceIndex: 4,
+		probes: [
+			"bun run build:extension-host --target x86_64-unknown-linux-gnu",
+			'PI_EXTENSION_HOST="$PWD/dist/release/.staging-host/host/x86_64-unknown-linux-gnu/pi-extension-host"',
+			"target/release/pi --provider google --model gemini-flash-latest",
+		],
+	},
+] as const;
+
 export interface Fence {
 	readonly docPath: string;
 	readonly openLine: number;
@@ -688,6 +776,52 @@ export function verifyRequiredSnippetFixtures(root: string): string[] {
 	return violations.sort();
 }
 
+function isBashFence(infoString: string): boolean {
+	const language = infoString.split(",")[0]?.trim().toLowerCase() ?? "";
+	return language === "bash";
+}
+
+/**
+ * Assert the registered public `bash` command blocks exist intact. Reports
+ * missing documents, missing bash fences, missing probes, and probes that
+ * drifted into a different bash fence of the same document.
+ */
+export function verifyPublicShellSnippets(root: string): string[] {
+	const violations: string[] = [];
+	for (const required of PUBLIC_SHELL_SNIPPETS) {
+		const safePath = validateSourcePath(root, required.path);
+		if (safePath === undefined) {
+			violations.push(`${required.path}: public shell snippet path escaped repo root`);
+			continue;
+		}
+		const absolute = join(resolve(root), safePath);
+		if (!existsSync(absolute)) {
+			violations.push(`${safePath}: required public shell document is missing`);
+			continue;
+		}
+		const extracted = extractFences(readFileSync(absolute, "utf8"), safePath);
+		for (const item of extracted.failures) {
+			violations.push(`${safePath}:${item.line}: ${item.message}`);
+		}
+		const bashFences = extracted.fences.filter((fence) => isBashFence(fence.infoString));
+		const fence = bashFences[required.fenceIndex];
+		if (fence === undefined) {
+			violations.push(`${safePath}: missing public bash fence #${required.fenceIndex}`);
+			continue;
+		}
+		for (const probe of required.probes) {
+			if (fence.body.includes(probe)) continue;
+			const elsewhere = bashFences.findIndex((other, index) => index !== required.fenceIndex && other.body.includes(probe));
+			violations.push(
+				elsewhere === -1
+					? `${safePath}: bash fence #${required.fenceIndex} missing probe ${JSON.stringify(probe)}`
+					: `${safePath}: probe ${JSON.stringify(probe)} split out of bash fence #${required.fenceIndex} into bash fence #${elsewhere}`,
+			);
+		}
+	}
+	return violations.sort();
+}
+
 function sortFailures(failures: readonly SnippetFailure[]): SnippetFailure[] {
 	return [...failures].sort((a, b) => a.docPath.localeCompare(b.docPath) || a.line - b.line || (a.column ?? 0) - (b.column ?? 0) || (a.code ?? "").localeCompare(b.code ?? "") || a.message.localeCompare(b.message));
 }
@@ -703,11 +837,12 @@ export async function runSnippetHarness(root = REPO_ROOT): Promise<SnippetReport
 	const collected = collectDocFences(absoluteRoot);
 	const fixtureViolations = verifyNoExcludedExampleProducts(absoluteRoot).map((message) => failure(FIXTURE_ROOT, 1, "env", "env", message));
 	const registryViolations = verifyRequiredSnippetFixtures(absoluteRoot).map((message) => failure(FIXTURE_ROOT, 1, "env", "env", message));
+	const shellRegistryViolations = verifyPublicShellSnippets(absoluteRoot).map((message) => failure("docs", 1, "env", "env", message));
 	const entrypointViolations = verifyShippedEntrypointsExist(absoluteRoot).map((message) => failure("packages", 1, "env", "env", message));
 	const examplesViolations = verifyNoExamplesDirectory(absoluteRoot).map((message) => failure("tree", 1, "env", "env", message));
 	const importResolutionViolations = assertFenceImportsResolve(absoluteRoot).map((message) => failure(FIXTURE_ROOT, 1, "env", "env", message));
 	const [rust, ts] = await Promise.all([runRustLane(absoluteRoot, collected.fences), runTypeScriptLane(absoluteRoot, collected.fences)]);
-	const failures = sortFailures([...collected.failures, ...fixtureViolations, ...registryViolations, ...entrypointViolations, ...examplesViolations, ...importResolutionViolations, ...rust.failures, ...ts.failures]);
+	const failures = sortFailures([...collected.failures, ...fixtureViolations, ...registryViolations, ...shellRegistryViolations, ...entrypointViolations, ...examplesViolations, ...importResolutionViolations, ...rust.failures, ...ts.failures]);
 	const violations = failures.map(renderFailure).sort();
 	return { ok: violations.length === 0, lanes: { rust, ts }, violations };
 }

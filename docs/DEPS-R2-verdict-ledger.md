@@ -59,7 +59,7 @@ entry is an audit failure at DEPS-D1.
 - **b90362dc / npm:typebox — sanity, not a remediation.** Known-member anchor from the
   checker `self-check` at DEPS-R2 landing: production-field position
   (`packages/extension-host/package.json` `dependencies`, pre and post) and bundled into
-  the shipped sidecar (metafile inputs under `.references/pi/node_modules/typebox/`).
+  the shipped sidecar (metafile inputs under `.references/pi-2.0/node_modules/typebox/`).
   Any future typebox remediation is Class S: full seven-target lane including both musl
   per-artifact proofs.
 - **b90362dc / npm:@types/bun — sanity, its recorded verdict.** Complete E1–E4 bundle:

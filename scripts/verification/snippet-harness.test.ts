@@ -6,6 +6,7 @@ import {
 	assertFenceImportsResolve,
 	enumerateFenceImports,
 	EXCLUDED_EXAMPLE_PRODUCTS,
+	PUBLIC_SHELL_SNIPPETS,
 	REQUIRED_SNIPPET_FIXTURES,
 	REPO_ROOT,
 	classifyFence,
@@ -20,6 +21,7 @@ import {
 	validateSourcePath,
 	verifyNoExamplesDirectory,
 	verifyNoExcludedExampleProducts,
+	verifyPublicShellSnippets,
 	verifyRequiredSnippetFixtures,
 	wrapRustSnippet,
 } from "./snippet-harness.ts";
@@ -223,6 +225,63 @@ describe("required fixture registry", () => {
 		rmSync(join(root, target.path), { force: true });
 		const problems = verifyRequiredSnippetFixtures(root);
 		expect(problems.some((problem) => problem.includes(target.path) && problem.includes("missing"))).toBe(true);
+	});
+});
+
+describe("public shell snippet registry", () => {
+	test("live README and getting-started docs satisfy every public bash contract", () => {
+		expect(verifyPublicShellSnippets(REPO_ROOT)).toEqual([]);
+		expect(PUBLIC_SHELL_SNIPPETS.filter((entry) => entry.path === "README.md")).toHaveLength(3);
+		expect(PUBLIC_SHELL_SNIPPETS.filter((entry) => entry.path === "docs/getting-started.md")).toHaveLength(5);
+	});
+
+	test("missing public shell document fails the registry", () => {
+		const root = temporaryDirectory("shell-registry-missing-");
+		mkdirSync(join(root, "docs"), { recursive: true });
+		writeFileSync(join(root, "docs/getting-started.md"), readFileSync(join(REPO_ROOT, "docs/getting-started.md"), "utf8"));
+		const problems = verifyPublicShellSnippets(root);
+		expect(problems.some((problem) => problem.includes("README.md") && problem.includes("missing"))).toBe(true);
+		expect(problems.some((problem) => problem.includes("docs/getting-started.md"))).toBe(false);
+	});
+
+	test("deleting --model gemini-flash-latest from a temporary copy fails every launch contract", () => {
+		const root = temporaryDirectory("shell-registry-drift-");
+		mkdirSync(join(root, "docs"), { recursive: true });
+		for (const path of ["README.md", "docs/getting-started.md"]) {
+			writeFileSync(join(root, path), readFileSync(join(REPO_ROOT, path), "utf8").replaceAll("--model gemini-flash-latest", ""));
+		}
+		const problems = verifyPublicShellSnippets(root);
+		const launchViolations = problems.filter((problem) => problem.includes("target/release/pi --provider google --model gemini-flash-latest"));
+		expect(launchViolations).toHaveLength(4);
+		for (const problem of launchViolations) expect(problem).toContain("missing probe");
+	});
+
+	test("a probe present only in a different bash fence is reported as split", () => {
+		const root = temporaryDirectory("shell-registry-split-");
+		writeFileSync(
+			join(root, "README.md"),
+			[
+				"# pi",
+				"",
+				"```bash",
+				"cargo build -p pi --release --locked",
+				"```",
+				"",
+				"```bash",
+				'read -rsp "Enter Gemini API key: " GEMINI_API_KEY && export GEMINI_API_KEY',
+				"```",
+				"",
+				"```bash",
+				"printf '\\n'",
+				"target/release/pi --provider google --model gemini-flash-latest",
+				"```",
+				"",
+			].join("\n"),
+		);
+		mkdirSync(join(root, "docs"), { recursive: true });
+		writeFileSync(join(root, "docs/getting-started.md"), readFileSync(join(REPO_ROOT, "docs/getting-started.md"), "utf8"));
+		const problems = verifyPublicShellSnippets(root);
+		expect(problems.some((problem) => problem.includes("README.md") && problem.includes("split out of bash fence #1 into bash fence #2"))).toBe(true);
 	});
 });
 

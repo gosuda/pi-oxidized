@@ -51,7 +51,7 @@ A disagreement fails generation.
 
 | Pin | Value | Source |
 |-----|-------|--------|
-| Canonical reference SHA | `8fa7eebd235355522c8104166b4f1f959b4e2f10` | `scripts/verification/docs-evidence.json` referencePin |
+| Canonical reference SHA | `853a80d26c90a14c1886f0ebb8ffaae133ca2185` | `scripts/verification/docs-evidence.json` referencePin |
 
 ## Machine-Readable Compatibility Matrix
 

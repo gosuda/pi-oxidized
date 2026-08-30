@@ -6,76 +6,76 @@
 			"id": "root-policy-docs",
 			"name": "Root Project Overview & Policies",
 			"surfaces": [
-				".references/pi/README.md",
-				".references/pi/CONTRIBUTING.md",
-				".references/pi/SECURITY.md",
-				".references/pi/AGENTS.md"
+				".references/pi-2.0/README.md",
+				".references/pi-2.0/CONTRIBUTING.md",
+				".references/pi-2.0/SECURITY.md",
+				".references/pi-2.0/AGENTS.md"
 			]
 		},
 		{
 			"id": "reference-corpus-coding-agent",
 			"name": "Coding Agent Documentation Corpus (29 topics)",
 			"surfaces": [
-				".references/pi/packages/coding-agent/docs/quickstart.md",
-				".references/pi/packages/coding-agent/docs/usage.md",
-				".references/pi/packages/coding-agent/docs/providers.md",
-				".references/pi/packages/coding-agent/docs/llama-cpp.md",
-				".references/pi/packages/coding-agent/docs/security.md",
-				".references/pi/packages/coding-agent/docs/containerization.md",
-				".references/pi/packages/coding-agent/docs/settings.md",
-				".references/pi/packages/coding-agent/docs/keybindings.md",
-				".references/pi/packages/coding-agent/docs/sessions.md",
-				".references/pi/packages/coding-agent/docs/compaction.md",
-				".references/pi/packages/coding-agent/docs/extensions.md",
-				".references/pi/packages/coding-agent/docs/skills.md",
-				".references/pi/packages/coding-agent/docs/prompt-templates.md",
-				".references/pi/packages/coding-agent/docs/themes.md",
-				".references/pi/packages/coding-agent/docs/packages.md",
-				".references/pi/packages/coding-agent/docs/models.md",
-				".references/pi/packages/coding-agent/docs/custom-provider.md",
-				".references/pi/packages/coding-agent/docs/sdk.md",
-				".references/pi/packages/coding-agent/docs/rpc.md",
-				".references/pi/packages/coding-agent/docs/json.md",
-				".references/pi/packages/coding-agent/docs/tui.md",
-				".references/pi/packages/coding-agent/docs/environment-variables.md",
-				".references/pi/packages/coding-agent/docs/session-format.md",
-				".references/pi/packages/coding-agent/docs/windows.md",
-				".references/pi/packages/coding-agent/docs/termux.md",
-				".references/pi/packages/coding-agent/docs/tmux.md",
-				".references/pi/packages/coding-agent/docs/terminal-setup.md",
-				".references/pi/packages/coding-agent/docs/shell-aliases.md",
-				".references/pi/packages/coding-agent/docs/development.md"
+				".references/pi-2.0/packages/coding-agent/docs/quickstart.md",
+				".references/pi-2.0/packages/coding-agent/docs/usage.md",
+				".references/pi-2.0/packages/coding-agent/docs/providers.md",
+				".references/pi-2.0/packages/coding-agent/docs/llama-cpp.md",
+				".references/pi-2.0/packages/coding-agent/docs/security.md",
+				".references/pi-2.0/packages/coding-agent/docs/containerization.md",
+				".references/pi-2.0/packages/coding-agent/docs/settings.md",
+				".references/pi-2.0/packages/coding-agent/docs/keybindings.md",
+				".references/pi-2.0/packages/coding-agent/docs/sessions.md",
+				".references/pi-2.0/packages/coding-agent/docs/compaction.md",
+				".references/pi-2.0/packages/coding-agent/docs/extensions.md",
+				".references/pi-2.0/packages/coding-agent/docs/skills.md",
+				".references/pi-2.0/packages/coding-agent/docs/prompt-templates.md",
+				".references/pi-2.0/packages/coding-agent/docs/themes.md",
+				".references/pi-2.0/packages/coding-agent/docs/packages.md",
+				".references/pi-2.0/packages/coding-agent/docs/models.md",
+				".references/pi-2.0/packages/coding-agent/docs/custom-provider.md",
+				".references/pi-2.0/packages/coding-agent/docs/sdk.md",
+				".references/pi-2.0/packages/coding-agent/docs/rpc.md",
+				".references/pi-2.0/packages/coding-agent/docs/json.md",
+				".references/pi-2.0/packages/coding-agent/docs/tui.md",
+				".references/pi-2.0/packages/coding-agent/docs/environment-variables.md",
+				".references/pi-2.0/packages/coding-agent/docs/session-format.md",
+				".references/pi-2.0/packages/coding-agent/docs/windows.md",
+				".references/pi-2.0/packages/coding-agent/docs/termux.md",
+				".references/pi-2.0/packages/coding-agent/docs/tmux.md",
+				".references/pi-2.0/packages/coding-agent/docs/terminal-setup.md",
+				".references/pi-2.0/packages/coding-agent/docs/shell-aliases.md",
+				".references/pi-2.0/packages/coding-agent/docs/development.md"
 			]
 		},
 		{
 			"id": "reference-corpus-agent-core",
 			"name": "Agent Core Reference Docs (3 topics)",
 			"surfaces": [
-				".references/pi/packages/agent/docs/harness.md",
-				".references/pi/packages/agent/docs/search.md",
-				".references/pi/packages/agent/docs/telemetry-schema.md"
+				".references/pi-2.0/packages/agent/docs/harness.md",
+				".references/pi-2.0/packages/agent/docs/search.md",
+				".references/pi-2.0/packages/agent/docs/telemetry-schema.md"
 			]
 		},
 		{
 			"id": "package-readme",
 			"name": "Crate/Package README slots",
 			"surfaces": [
-				".references/pi/packages/coding-agent/README.md",
-				".references/pi/packages/agent/README.md",
-				".references/pi/packages/ai/README.md",
-				".references/pi/packages/tui/README.md",
-				".references/pi/packages/tui/native/darwin/README.md",
-				".references/pi/packages/tui/native/win32/README.md",
-				".references/pi/packages/client/README.md",
-				".references/pi/packages/protocol/README.md",
-				".references/pi/packages/server/README.md",
-				".references/pi/packages/session-backends/sqlite-node/README.md",
-				".references/pi/packages/telemetry/README.md",
-				".references/pi/packages/evals/README.md",
+				".references/pi-2.0/packages/coding-agent/README.md",
+				".references/pi-2.0/packages/agent/README.md",
+				".references/pi-2.0/packages/ai/README.md",
+				".references/pi-2.0/packages/tui/README.md",
+				".references/pi-2.0/packages/tui/native/darwin/README.md",
+				".references/pi-2.0/packages/tui/native/win32/README.md",
+				".references/pi-2.0/packages/client/README.md",
+				".references/pi-2.0/packages/protocol/README.md",
+				".references/pi-2.0/packages/server/README.md",
+				".references/pi-2.0/packages/session-backends/sqlite-node/README.md",
+				".references/pi-2.0/packages/telemetry/README.md",
+				".references/pi-2.0/packages/evals/README.md",
 				"packages/pi-tui-protocol/README.md",
 				"packages/extension-host/README.md",
-				".references/pi/packages/coding-agent/examples/README.md",
-				".references/pi/packages/coding-agent/examples/sdk/README.md"
+				".references/pi-2.0/packages/coding-agent/examples/README.md",
+				".references/pi-2.0/packages/coding-agent/examples/sdk/README.md"
 			]
 		},
 		{
@@ -83,23 +83,23 @@
 			"name": "CLI Help Sources",
 			"surfaces": [
 				"scripts/release/args.ts",
-				".references/pi/packages/coding-agent/package.json",
-				".references/pi/packages/ai/package.json"
+				".references/pi-2.0/packages/coding-agent/package.json",
+				".references/pi-2.0/packages/ai/package.json"
 			]
 		},
 		{
 			"id": "changelog",
 			"name": "CHANGELOG slots",
 			"surfaces": [
-				".references/pi/packages/coding-agent/CHANGELOG.md",
-				".references/pi/packages/agent/CHANGELOG.md",
-				".references/pi/packages/ai/CHANGELOG.md",
-				".references/pi/packages/tui/CHANGELOG.md",
-				".references/pi/packages/client/CHANGELOG.md",
-				".references/pi/packages/protocol/CHANGELOG.md",
-				".references/pi/packages/server/CHANGELOG.md",
-				".references/pi/packages/session-backends/sqlite-node/CHANGELOG.md",
-				".references/pi/packages/telemetry/CHANGELOG.md"
+				".references/pi-2.0/packages/coding-agent/CHANGELOG.md",
+				".references/pi-2.0/packages/agent/CHANGELOG.md",
+				".references/pi-2.0/packages/ai/CHANGELOG.md",
+				".references/pi-2.0/packages/tui/CHANGELOG.md",
+				".references/pi-2.0/packages/client/CHANGELOG.md",
+				".references/pi-2.0/packages/protocol/CHANGELOG.md",
+				".references/pi-2.0/packages/server/CHANGELOG.md",
+				".references/pi-2.0/packages/session-backends/sqlite-node/CHANGELOG.md",
+				".references/pi-2.0/packages/telemetry/CHANGELOG.md"
 			]
 		},
 		{

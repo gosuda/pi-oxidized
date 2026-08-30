@@ -11,7 +11,7 @@
 
 ## 1. Scope, authority, and parity doctrine
 
-This document is the single authority for default landing selection, Enter/Esc resolution, and Ctrl+D dispatch precedence across all interactive TUI confirm dialogs, selectors, and overlays. Under the repository parity doctrine (issue #25, `STYLE_LEDGER.md`), TypeScript reference behavior is canonical (`.references/pi/…`), and every deviation is an explicit recorded decision. This record establishes policy only and makes no code changes.
+This document is the single authority for default landing selection, Enter/Esc resolution, and Ctrl+D dispatch precedence across all interactive TUI confirm dialogs, selectors, and overlays. Under the repository parity doctrine (issue #25, `STYLE_LEDGER.md`), TypeScript reference behavior is canonical (`.references/pi-2.0/…` at `853a80d26c90a14c1886f0ebb8ffaae133ca2185`), and every deviation is an explicit recorded decision. This record establishes policy only and makes no code changes.
 
 ## 2. Confirm dialog dispatch matrix
 

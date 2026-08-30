@@ -3,7 +3,7 @@
  * Deterministic generator for the Phase 3 tool JSON-Schema fixtures (plan check 5).
  *
  * Source of truth: the checked-in reference tool registry at
- * `.references/pi/packages/coding-agent/src/core/tools/index.ts`. The reference
+ * `.references/pi-2.0/packages/coding-agent/src/core/tools/index.ts`. The reference
  * factories are executed under Bun and each ToolDefinition's TypeBox `parameters`
  * schema is dumped as JSON for the seven portable built-in tools
  * (read, bash, edit, write, grep, find, ls). The generator selects those seven
@@ -14,8 +14,8 @@
  * The TypeBox version determines the emitted JSON, so bare `typebox` imports are
  * pinned via a Bun resolve plugin to the exact version declared by the reference
  * authorities: `dependencies.typebox` in
- * `.references/pi/packages/coding-agent/package.json` and the matching
- * `node_modules/typebox` entry in `.references/pi/package-lock.json` must agree.
+ * `.references/pi-2.0/packages/coding-agent/package.json` and the matching
+ * `node_modules/typebox` entry in `.references/pi-2.0/package-lock.json` must agree.
  * The pinned package is resolved from the reference's own node_modules when
  * present, otherwise from Bun's global install cache; in both cases the resolved
  * package.json version is verified exactly. When the pinned package cannot be
@@ -43,15 +43,17 @@ import { access, mkdir, readdir, readFile, rename, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { assertCanonicalReference, canonicalReferenceRoot } from "./reference-identity.ts";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
-const REFERENCE_PACKAGE_MANIFEST = join(REPO_ROOT, ".references/pi/packages/coding-agent/package.json");
-const REFERENCE_PACKAGE_LOCK = join(REPO_ROOT, ".references/pi/package-lock.json");
-const REFERENCE_TOOLS_INDEX = join(REPO_ROOT, ".references/pi/packages/coding-agent/src/core/tools/index.ts");
+const REFERENCE_ROOT = canonicalReferenceRoot(REPO_ROOT);
+const REFERENCE_PACKAGE_MANIFEST = join(REFERENCE_ROOT, "packages/coding-agent/package.json");
+const REFERENCE_PACKAGE_LOCK = join(REFERENCE_ROOT, "package-lock.json");
+const REFERENCE_TOOLS_INDEX = join(REFERENCE_ROOT, "packages/coding-agent/src/core/tools/index.ts");
 const REFERENCE_TYPEBOX_DIRS = [
-	join(REPO_ROOT, ".references/pi/packages/coding-agent/node_modules/typebox"),
-	join(REPO_ROOT, ".references/pi/node_modules/typebox"),
+	join(REFERENCE_ROOT, "packages/coding-agent/node_modules/typebox"),
+	join(REFERENCE_ROOT, "node_modules/typebox"),
 ] as const;
 const OUTPUT_DIR = join(REPO_ROOT, ".agent-tasks/pi-rust-rewrite/fixtures/tool-schemas");
 
@@ -295,6 +297,8 @@ export interface LoadedToolRegistry {
  */
 export async function loadCanonicalToolRegistry(): Promise<LoadedToolRegistry> {
 	assertBunRuntime();
+	// Fail closed before any reference manifest, lockfile, or registry is read.
+	assertCanonicalReference(REPO_ROOT);
 	const typeboxPin = await readPinnedTypeboxVersion();
 	const typeboxEntry = await resolvePinnedTypeboxEntry(typeboxPin);
 	registerTypeboxPin(typeboxEntry);

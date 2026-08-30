@@ -31,12 +31,12 @@ and the docs phase has not regained release-packaging implementation scope.
 
 Scans `scripts/tests/` and `scripts/verification/` `.ts` files for **value**
 import statements (not type-only — type-only imports are erased at runtime and
-do not accrete behavior) referencing the `.references/pi/` example-product tree.
+do not accrete behavior) referencing the `.references/pi-2.0/` example-product tree.
 Wired into `runCheck` as step 2b; findings appear as `[example-product-import]`
 problems.
 
 **Pre-existing finding:** `scripts/verification/foundation.test.ts` has a
-type-only import from `.references/pi/` — not flagged because it does not
+type-only import from `.references/pi-2.0/` — not flagged because it does not
 accrete runtime behavior.  No value imports were found on the current tree.
 
 ### 2. `checkUnreleasedEntriesHaveEvidence` (DOC-A, `docs-evidence-runners.ts`)

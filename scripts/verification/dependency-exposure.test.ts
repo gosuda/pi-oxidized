@@ -171,7 +171,7 @@ describe("E2 metafile reachability and ownership", () => {
 
 	test("npm ownership follows innermost node_modules segments", () => {
 		expect(resolveInputOwner("node_modules/typebox/build/index.mjs")).toBe("typebox");
-		expect(resolveInputOwner("../../.references/pi/node_modules/typebox/build/index.mjs")).toBe("typebox");
+		expect(resolveInputOwner("../../.references/pi-2.0/node_modules/typebox/build/index.mjs")).toBe("typebox");
 		expect(resolveInputOwner("a/node_modules/@scope/pkg/src/x.ts")).toBe("@scope/pkg");
 		expect(resolveInputOwner("packages/extension-host/src/main.ts")).toBeNull();
 		expect(resolveInputOwner("node_modules/a/node_modules/b/i.js")).toBe("b");
@@ -179,7 +179,7 @@ describe("E2 metafile reachability and ownership", () => {
 
 	test("reachable npm subject fails; zero-reachability passes; unrelated names are not substring-matched", () => {
 		const inputs = [
-			"../../.references/pi/node_modules/typebox/build/index.mjs",
+			"../../.references/pi-2.0/node_modules/typebox/build/index.mjs",
 			"../pi-tui-protocol/src/index.ts",
 		];
 		expect(e2Reachability(subjectOf("npm:typebox"), inputs, surfaces).status).toBe("fail");

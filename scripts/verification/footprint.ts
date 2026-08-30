@@ -51,6 +51,12 @@ import { provisionBunRuntime } from "../release/runtime.ts";
 import { assembleRelease } from "../release/stage.ts";
 import { planFor, type TargetPlan } from "../release/targets.ts";
 import {
+	CANONICAL_REFERENCE_ROOT,
+	CANONICAL_REFERENCE_SHA,
+	assertCanonicalReference,
+	canonicalReferenceRoot,
+} from "../reference-identity.ts";
+import {
 	formatNoiseRejection,
 	NoiseRejection,
 	type NoisyDistribution,
@@ -64,7 +70,7 @@ const ARTIFACT_PATH = resolve(
 	REPOSITORY_ROOT,
 	"target/bench/install-footprint.json",
 );
-const REFERENCE_ROOT = resolve(REPOSITORY_ROOT, ".references/pi");
+const REFERENCE_ROOT = canonicalReferenceRoot(REPOSITORY_ROOT);
 const CODING_AGENT_DIR = join(REFERENCE_ROOT, "packages/coding-agent");
 const FOOTPRINT_BUILD_ROOT = resolve(
 	REPOSITORY_ROOT,
@@ -88,7 +94,7 @@ export const FIRST_PARTY_SCOPE = "@earendil-works/pi-";
 /** The primary payload package itself; excluded from C3 by the double-counting ban. */
 export const PRIMARY_PAYLOAD_PACKAGE = "@earendil-works/pi-coding-agent";
 /** Upstream reference pin the accounting contract is defined against. */
-export const REFERENCE_PIN = "8fa7eebd235355522c8104166b4f1f959b4e2f10";
+export const REFERENCE_PIN = CANONICAL_REFERENCE_SHA;
 
 export const FOOTPRINT_SCHEMA = "pi.footprint.v1" as const;
 
@@ -871,7 +877,7 @@ async function measureUpstreamSide(): Promise<SideMeasurement> {
 	if (!existsSync(CODING_AGENT_DIR)) {
 		throw new HarnessFailure(
 			"prerequisite",
-			`pinned reference checkout is missing: ${CODING_AGENT_DIR} (expected .references/pi at ${REFERENCE_PIN})`,
+			`pinned reference checkout is missing: ${CODING_AGENT_DIR} (expected ${CANONICAL_REFERENCE_ROOT} at ${REFERENCE_PIN})`,
 		);
 	}
 	const npm = requiredExecutable("npm");
@@ -995,7 +1001,7 @@ async function measureUpstreamSide(): Promise<SideMeasurement> {
 		} else {
 			throw new HarnessFailure(
 				"prerequisite",
-				`closure package ${entry.name}@${entry.version} is not installed at ${dir}; run npm ci in .references/pi first`,
+				`closure package ${entry.name}@${entry.version} is not installed at ${dir}; run npm ci in ${CANONICAL_REFERENCE_ROOT} first`,
 			);
 		}
 	}
@@ -1162,6 +1168,7 @@ function writeArtifact(): void {
 }
 
 async function main(): Promise<void> {
+	assertCanonicalReference();
 	status("measuring Rust distribution footprint");
 	const rust = await measureRustSide();
 	artifact.sides.rust = rust.record;

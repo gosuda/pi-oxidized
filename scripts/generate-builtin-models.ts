@@ -3,7 +3,7 @@
  * Offline deterministic generator for crates/pi-ai/data/builtin-models.json.
  *
  * Source of truth: the checked-in reference catalog at
- * `.references/pi/packages/ai/src/models.generated.ts` (and the per-provider
+ * `.references/pi-2.0/packages/ai/src/models.generated.ts` (and the per-provider
  * `*.models.ts` files it re-exports). Network fetches are intentionally
  * forbidden; runtime never needs Bun.
  *
@@ -14,12 +14,16 @@ import { access, mkdir, rename, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+	assertCanonicalReference,
+	canonicalReferenceRoot,
+} from "./reference-identity.ts";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
 const REFERENCE_MODELS_PATH = join(
-	REPO_ROOT,
-	".references/pi/packages/ai/src/models.generated.ts",
+	canonicalReferenceRoot(),
+	"packages/ai/src/models.generated.ts",
 );
 const OUTPUT_PATH = join(REPO_ROOT, "crates/pi-ai/data/builtin-models.json");
 
@@ -335,6 +339,8 @@ function summarize(catalog: Record<string, Record<string, unknown>>): string {
 }
 
 async function main(): Promise<void> {
+	// Fail closed before the reference catalog is imported or read.
+	assertCanonicalReference();
 	assertBunRuntime();
 	const catalog = await loadReferenceModels();
 	validateProviderSet(catalog);

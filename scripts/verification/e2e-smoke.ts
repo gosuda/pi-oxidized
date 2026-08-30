@@ -22,6 +22,11 @@ import {
 } from "./extension.ts";
 import { PTY_KEYS, type PtyProcess, spawnPty } from "./pty.ts";
 import { SpawnRunner } from "../release/runner.ts";
+import {
+	CANONICAL_REFERENCE_ROOT,
+	assertCanonicalReference,
+	canonicalReferenceRoot,
+} from "../reference-identity.ts";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
 const EVIDENCE_ROOT = resolve(REPO_ROOT, "target/verification/e2e");
@@ -29,8 +34,8 @@ const RUST_BINARY = resolve(REPO_ROOT, "target/release/pi");
 const EXTENSION_HOST = resolve(REPO_ROOT, "packages/extension-host/dist/pi-extension-host");
 const EXTENSION_PATH = resolve(import.meta.dirname, "extension.ts");
 const TYPESCRIPT_CLI = resolve(
-	REPO_ROOT,
-	".references/pi/packages/coding-agent/src/cli.ts",
+	canonicalReferenceRoot(REPO_ROOT),
+	"packages/coding-agent/src/cli.ts",
 );
 const FINAL_MARKER = `${DEFAULT_FINAL_MARKER}_E2E`;
 const STEERING_MARKER = "verification-steering-next-turn";
@@ -1219,6 +1224,7 @@ function captureSessions(state: WorkflowState): JsonValue {
 
 async function runReplacementOnly(): Promise<void> {
 	await ensurePrerequisites();
+	const referenceSha = assertCanonicalReference();
 	const state = createState();
 	let failure: Error | undefined;
 	try {
@@ -1234,6 +1240,8 @@ async function runReplacementOnly(): Promise<void> {
 			startedAt: state.steps[0]?.startedAt ?? isoNow(),
 			finishedAt: isoNow(),
 			runRoot: state.runRoot,
+			referenceRoot: CANONICAL_REFERENCE_ROOT,
+			referenceSha,
 			machine: {
 				platform: process.platform,
 				arch: process.arch,
@@ -1263,6 +1271,7 @@ async function runReplacementOnly(): Promise<void> {
 
 async function main(): Promise<void> {
 	const bun = await ensurePrerequisites();
+	const referenceSha = assertCanonicalReference();
 	if (!existsSync(TYPESCRIPT_CLI)) {
 		fail(`product prerequisite missing: ${TYPESCRIPT_CLI}`);
 	}
@@ -1284,6 +1293,8 @@ async function main(): Promise<void> {
 			startedAt: state.steps[0]?.startedAt ?? isoNow(),
 			finishedAt: isoNow(),
 			runRoot: state.runRoot,
+			referenceRoot: CANONICAL_REFERENCE_ROOT,
+			referenceSha,
 			machine: {
 				platform: process.platform,
 				arch: process.arch,

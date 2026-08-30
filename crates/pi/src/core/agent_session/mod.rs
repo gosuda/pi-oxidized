@@ -897,15 +897,21 @@ impl AgentSession {
         self.emit_queue_update();
     }
 
-    /// Clear both mirror queues and emit `queue_update`.
-    pub fn clear_queue(&self) {
-        {
+    /// Clear both mirror queues and emit the now-empty `queue_update`.
+    ///
+    /// Returns the drained steering and follow-up texts so callers can restore
+    /// them after cancellation.
+    pub fn clear_queue(&self) -> (Vec<String>, Vec<String>) {
+        let (steering, follow_up) = {
             let mut inner = self.lock_inner();
-            inner.steering_messages.clear();
-            inner.follow_up_messages.clear();
-        }
+            (
+                std::mem::take(&mut inner.steering_messages),
+                std::mem::take(&mut inner.follow_up_messages),
+            )
+        };
         self.agent.clear_queues();
         self.emit_queue_update();
+        (steering, follow_up)
     }
 
     // -------------------------------------------------------------------------

@@ -9,6 +9,7 @@
 
 import { readdir, readFile, rm } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
+import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-identity.ts";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
 const FIXTURES = join(
@@ -16,9 +17,11 @@ const FIXTURES = join(
 	".agent-tasks/pi-rust-rewrite/fixtures/sessions",
 );
 const OUTPUT = join(REPO_ROOT, "target/verification/session-interop");
-const REFERENCE_ROOT = join(REPO_ROOT, ".references/pi");
-const REFERENCE_UUID = join(REFERENCE_ROOT, "packages/agent/src/harness/session/uuid.ts");
-const REFERENCE_AI_TYPES = join(REFERENCE_ROOT, "packages/ai/src/types.ts");
+// Canonical pi-2.0 module map — what canonical session-manager.ts actually pulls in:
+// AgentMessage (type-only) from packages/agent/src/types.ts, uuidv7 from packages/ai/src/utils/uuid.ts.
+const REFERENCE_ROOT = canonicalReferenceRoot(REPO_ROOT);
+const REFERENCE_AGENT_TYPES = join(REFERENCE_ROOT, "packages/agent/src/types.ts");
+const REFERENCE_AI_UUID = join(REFERENCE_ROOT, "packages/ai/src/utils/uuid.ts");
 
 interface SessionManagerLike {
 	getHeader(): Record<string, unknown> | null;
@@ -68,10 +71,10 @@ function installReferenceResolver(): void {
 		name: "source-pinned-pi-reference",
 		setup(build) {
 			build.onResolve({ filter: /^@earendil-works\/pi-agent-core$/ }, () => ({
-				path: REFERENCE_UUID,
+				path: REFERENCE_AGENT_TYPES,
 			}));
 			build.onResolve({ filter: /^@earendil-works\/pi-ai$/ }, () => ({
-				path: REFERENCE_AI_TYPES,
+				path: REFERENCE_AI_UUID,
 			}));
 			build.onResolve({ filter: /^cross-spawn$/ }, () => ({
 				path: "cross-spawn",
@@ -87,6 +90,7 @@ function installReferenceResolver(): void {
 }
 
 async function referenceSessionManager(): Promise<SessionManagerStatic> {
+	assertCanonicalReference(REPO_ROOT);
 	installReferenceResolver();
 	// Bun plugins register at runtime, so this source-pinned import cannot be static.
 	const module = (await import(
