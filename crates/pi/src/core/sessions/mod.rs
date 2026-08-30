@@ -12,7 +12,7 @@ pub mod list;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -336,6 +336,8 @@ impl SessionManager {
             self.flushed = true;
             return Ok(());
         }
+
+        repair_unterminated_tail(&resolved)?;
 
         let header_id = entries
             .iter()
@@ -1612,6 +1614,36 @@ fn append_line(path: &str, entry: &SessionEntry) -> Result<(), SessionError> {
         })
 }
 
+fn repair_unterminated_tail(path: &str) -> Result<(), SessionError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| SessionError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    file.seek(SeekFrom::End(-1))
+        .map_err(|source| SessionError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)
+        .map_err(|source| SessionError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    file.write_all(b"\n")
+        .map_err(|source| SessionError::Io {
+            path: path.to_owned(),
+            source,
+        })
+}
+
 fn message_to_value(message: &AgentMessage) -> Result<Value, SessionError> {
     Ok(serde_json::to_value(message)?)
 }
@@ -1946,6 +1978,77 @@ mod tests {
         let header: Value = serde_json::from_str(content.trim())?;
         assert_eq!(header["type"], "session");
         assert_eq!(header["id"], sm.get_session_id());
+        Ok(())
+    }
+
+    #[test]
+    fn unterminated_tail_is_repaired_before_append() -> TestResult {
+        let dir = tempdir()?;
+        let file = dir.path().join("unterminated.jsonl");
+        let original = concat!(
+            r#"{"type":"session","version":3,"id":"sess-1","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2025-01-01T00:00:01.000Z","message":{"role":"user","content":"first","timestamp":1}}"#,
+        );
+        fs::write(&file, original)?;
+
+        let mut session =
+            SessionManager::open(path_str(&file)?, Some(path_str(dir.path())?), None)?;
+        assert_eq!(fs::read(&file)?, [original.as_bytes(), b"\n"].concat());
+        let appended = session.append_message(&user_agent("second", 2))?;
+        let after_append = fs::read(&file)?;
+        assert!(after_append.starts_with(original.as_bytes()));
+
+        let reopened = SessionManager::open(path_str(&file)?, Some(path_str(dir.path())?), None)?;
+        assert!(reopened.get_entry("m1").is_some());
+        assert!(reopened.get_entry(&appended).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn unterminated_malformed_tail_is_delimited() -> TestResult {
+        let dir = tempdir()?;
+        let file = dir.path().join("malformed-tail.jsonl");
+        let original = concat!(
+            r#"{"type":"session","version":3,"id":"sess-1","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+            "\n",
+            r#"{"type":"message""#,
+        );
+        fs::write(&file, original)?;
+
+        SessionManager::open(path_str(&file)?, Some(path_str(dir.path())?), None)?;
+
+        assert_eq!(fs::read(&file)?, [original.as_bytes(), b"\n"].concat());
+        Ok(())
+    }
+
+    #[test]
+    fn terminated_session_is_not_rewritten() -> TestResult {
+        let dir = tempdir()?;
+        let file = dir.path().join("terminated.jsonl");
+        let original = concat!(
+            r#"{"type":"session","version":3,"id":"sess-1","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+            "\n",
+        );
+        fs::write(&file, original)?;
+
+        SessionManager::open(path_str(&file)?, Some(path_str(dir.path())?), None)?;
+
+        assert_eq!(fs::read(&file)?, original.as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn unterminated_invalid_file_is_preserved() -> TestResult {
+        let dir = tempdir()?;
+        let file = dir.path().join("invalid-unterminated.jsonl");
+        let original = r#"{"type":"event","data":"not a session"}"#;
+        fs::write(&file, original)?;
+
+        let result = SessionManager::open(path_str(&file)?, Some(path_str(dir.path())?), None);
+
+        assert!(matches!(result, Err(SessionError::InvalidSessionFile(_))));
+        assert_eq!(fs::read(&file)?, original.as_bytes());
         Ok(())
     }
 
