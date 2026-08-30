@@ -21,7 +21,7 @@ use futures::stream::{self, BoxStream};
 use pi_ai::auth::config_value::{
     is_config_value_configured, resolve_config_value, resolve_headers,
 };
-use pi_ai::auth::context::MapAuthContext;
+use pi_ai::auth::context::{DefaultAuthContext, overlay_env_auth_context};
 use pi_ai::auth::resolve::resolve_provider_auth_with_signal;
 use pi_ai::auth::{
     AMBIENT_AUTH_MARKER, AuthCheck, AuthContext, AuthResolutionOverrides, AuthResult, AuthType,
@@ -1231,16 +1231,14 @@ impl ModelRuntime {
     }
 
     fn auth_context_for(&self, overrides: &ModelRuntimeAuthOverrides) -> Arc<dyn AuthContext> {
-        let mut map = MapAuthContext::new();
-        for (key, value) in &self.inner.auth_env {
-            map = map.with_env(key.clone(), value.clone());
+        let mut env = self.inner.auth_env.clone();
+        if let Some(overrides) = overrides.env.as_ref() {
+            env.extend(overrides.clone());
         }
-        if let Some(env) = overrides.env.as_ref() {
-            for (key, value) in env {
-                map = map.with_env(key.clone(), value.clone());
-            }
-        }
-        Arc::new(map)
+        Arc::new(overlay_env_auth_context(
+            Arc::new(DefaultAuthContext::from_process()),
+            env,
+        ))
     }
 
     fn apply_configured_auth_projection(
@@ -2029,6 +2027,7 @@ mod tests {
     use pi_ai::auth::OAuthCredential;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::process::Command;
 
     fn required<T>(value: Option<T>, message: &'static str) -> Result<T, ModelRuntimeError> {
         value.ok_or_else(|| ModelRuntimeError::Registration(message.to_owned()))
@@ -2174,6 +2173,45 @@ mod tests {
             "auth",
         )?;
         assert_eq!(auth.auth.api_key.as_deref(), Some("sk-env"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_env_auth_child() -> Result<(), ModelRuntimeError> {
+        if std::env::var_os("PI_PROCESS_ENV_AUTH_TEST_CHILD").is_none() {
+            return Ok(());
+        }
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
+            models_store: Some(Arc::new(InMemoryModelsStore::new())),
+            models_config: Some(ModelsJsonConfig::empty()),
+            allow_model_network: Some(false),
+            ..CreateModelRuntimeOptions::default()
+        })
+        .await?;
+        let auth = required(
+            runtime
+                .get_auth_for_provider("google", ModelRuntimeAuthOverrides::default())
+                .await?,
+            "auth",
+        )?;
+        assert_eq!(auth.auth.api_key.as_deref(), Some("gemini-test"));
+        Ok(())
+    }
+
+    #[test]
+    fn process_env_auth_reaches_runtime() -> Result<(), Box<dyn std::error::Error>> {
+        let output = Command::new(std::env::current_exe()?)
+            .arg("process_env_auth_child")
+            .arg("--nocapture")
+            .env("PI_PROCESS_ENV_AUTH_TEST_CHILD", "1")
+            .env("GEMINI_API_KEY", "gemini-test")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "child test failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         Ok(())
     }
 
