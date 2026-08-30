@@ -1773,6 +1773,46 @@ mod tests {
         assert_eq!(payload["tool_choice"], "required");
     }
 
+    #[test]
+    fn openrouter_omits_reasoning_when_off_level_is_null() {
+        let mut model = model("openrouter");
+        model.reasoning = true;
+        model.thinking_level_map = Some(
+            [(ModelThinkingLevel::Off, None)]
+                .into_iter()
+                .collect(),
+        );
+        let payload = build_payload(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+            &Compat::resolve(&model),
+            CacheRetention::None,
+        );
+
+        assert_eq!(payload.get("reasoning"), None);
+    }
+
+    #[test]
+    fn openrouter_sends_none_for_optional_reasoning() {
+        let mut model = model("openrouter");
+        model.reasoning = true;
+        model.thinking_level_map = Some(
+            [(ModelThinkingLevel::Off, Some("none".into()))]
+                .into_iter()
+                .collect(),
+        );
+        let payload = build_payload(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+            &Compat::resolve(&model),
+            CacheRetention::None,
+        );
+
+        assert_eq!(payload["reasoning"], json!({"effort":"none"}));
+    }
+
     #[tokio::test]
     async fn indexed_tools_coalesce_and_missing_finish_reason_fails() -> Result<(), String> {
         let model = model("openai");
