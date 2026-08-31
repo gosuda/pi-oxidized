@@ -170,8 +170,11 @@ pub struct DefaultResourceLoaderOptions {
     pub cwd: PathBuf,
     /// Agent config directory.
     pub agent_dir: PathBuf,
-    /// Optional settings manager (created when absent).
-    pub settings_manager: Option<SettingsManager>,
+    /// Whether project-scoped resources are trusted and loaded.
+    ///
+    /// Direct construction defaults to trusted. Service construction supplies
+    /// the resolved trust state.
+    pub project_trusted: bool,
     /// Additional CLI extension sources.
     pub additional_extension_paths: Vec<String>,
     /// Additional CLI skill paths.
@@ -201,7 +204,7 @@ impl Default for DefaultResourceLoaderOptions {
         Self {
             cwd: PathBuf::from("."),
             agent_dir: crate::core::config::get_agent_dir(),
-            settings_manager: None,
+            project_trusted: true,
             additional_extension_paths: Vec::new(),
             additional_skill_paths: Vec::new(),
             additional_prompt_template_paths: Vec::new(),
@@ -246,7 +249,7 @@ pub trait ResourceLoader {
     fn get_append_system_prompt(&self) -> &[String];
     /// Extend skill/prompt/theme paths after load.
     fn extend_resources(&mut self, paths: ResourceExtensionPaths);
-    /// Reload settings, packages, and all resource snapshots.
+    /// Reload packages and all resource snapshots.
     ///
     /// # Errors
     ///
@@ -321,7 +324,7 @@ struct ReloadDiscovery {
 pub struct DefaultResourceLoader {
     cwd: PathBuf,
     agent_dir: PathBuf,
-    settings_manager: SettingsManager,
+    project_trusted: bool,
     additional_extension_paths: Vec<String>,
     additional_skill_paths: Vec<String>,
     additional_prompt_template_paths: Vec<String>,
@@ -357,17 +360,10 @@ impl DefaultResourceLoader {
             PathInputOptions::new(),
         );
         let discovery = ResourceDiscoveryPolicy::from_options(&options);
-        let settings_manager = options.settings_manager.unwrap_or_else(|| {
-            SettingsManager::create(
-                &cwd,
-                Some(&agent_dir),
-                SettingsManagerCreateOptions::default(),
-            )
-        });
         Self {
             cwd,
             agent_dir,
-            settings_manager,
+            project_trusted: options.project_trusted,
             additional_extension_paths: options.additional_extension_paths,
             additional_skill_paths: options.additional_skill_paths,
             additional_prompt_template_paths: options.additional_prompt_template_paths,
@@ -387,17 +383,6 @@ impl DefaultResourceLoader {
             snapshot: ResourceSnapshot::default(),
             loaded: false,
         }
-    }
-
-    /// Mutable access to the settings manager.
-    pub fn settings_manager_mut(&mut self) -> &mut SettingsManager {
-        &mut self.settings_manager
-    }
-
-    /// Shared settings manager reference.
-    #[must_use]
-    pub fn settings_manager(&self) -> &SettingsManager {
-        &self.settings_manager
     }
 
     fn resolve_resource_path(&self, path: &str) -> PathBuf {
@@ -657,7 +642,7 @@ impl DefaultResourceLoader {
 
     fn discover_system_prompt_file(&self) -> Option<String> {
         let project_path = self.cwd.join(CONFIG_DIR_NAME).join("SYSTEM.md");
-        if self.settings_manager.is_project_trusted() && project_path.exists() {
+        if self.project_trusted && project_path.exists() {
             return Some(path_to_string(&project_path));
         }
         let global_path = self.agent_dir.join("SYSTEM.md");
@@ -669,7 +654,7 @@ impl DefaultResourceLoader {
 
     fn discover_append_system_prompt_file(&self) -> Option<String> {
         let project_path = self.cwd.join(CONFIG_DIR_NAME).join("APPEND_SYSTEM.md");
-        if self.settings_manager.is_project_trusted() && project_path.exists() {
+        if self.project_trusted && project_path.exists() {
             return Some(path_to_string(&project_path));
         }
         let global_path = self.agent_dir.join("APPEND_SYSTEM.md");
@@ -708,9 +693,12 @@ impl DefaultResourceLoader {
     async fn resolve_reload_discovery(&self) -> Result<ReloadDiscovery, ResourceLoaderError> {
         let cwd = self.cwd.clone();
         let agent_dir = self.agent_dir.clone();
-        let project_trusted = self.settings_manager.is_project_trusted();
+        let project_trusted = self.project_trusted;
         let additional_extension_paths = self.additional_extension_paths.clone();
         let (resolved, cli) = tokio::task::spawn_blocking(move || {
+            // Deliberately local: a short-lived manager that lives only for
+            // package discovery so the resolver's long `&SettingsManager`
+            // borrow never runs under the session settings lock.
             let settings = SettingsManager::create(
                 &cwd,
                 Some(&agent_dir),
@@ -998,9 +986,11 @@ impl ResourceLoader for DefaultResourceLoader {
         self.update_themes_from_paths(&theme_snapshot, None);
     }
 
+    // Resource reload refreshes paths and snapshots only. Settings live with
+    // their single owner (services, then the session); that owner refreshes
+    // them before or after resource reloads.
     async fn reload(&mut self) -> Result<(), ResourceLoaderError> {
         let _ = self.loaded;
-        self.settings_manager.reload();
         let discovery = self.resolve_reload_discovery().await?;
         self.extension_skill_source_infos.clear();
         self.extension_prompt_source_infos.clear();
@@ -1166,7 +1156,6 @@ fn enabled_paths(resources: &[ResolvedResource]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::settings::SettingsManagerCreateOptions;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(label: &str) -> std::io::Result<PathBuf> {
@@ -1203,15 +1192,10 @@ mod tests {
         fs::write(agent.join("SYSTEM.md"), "system\n")?;
         fs::write(agent.join("APPEND_SYSTEM.md"), "append\n")?;
 
-        let settings = SettingsManager::create(
-            &cwd,
-            Some(&agent),
-            SettingsManagerCreateOptions::new().project_trusted(true),
-        );
         let mut loader = DefaultResourceLoader::new(DefaultResourceLoaderOptions {
             cwd: cwd.clone(),
             agent_dir: agent.clone(),
-            settings_manager: Some(settings),
+            project_trusted: true,
             ..Default::default()
         });
         loader.reload().await?;
@@ -1340,15 +1324,10 @@ mod tests {
         let fixture = setup_extension_fixture()?;
         let extension_path = path_to_string(&fixture.extension_path);
 
-        let settings = SettingsManager::create(
-            &fixture.cwd,
-            Some(&fixture.agent),
-            SettingsManagerCreateOptions::new().project_trusted(true),
-        );
         let mut loader = DefaultResourceLoader::new(DefaultResourceLoaderOptions {
             cwd: fixture.cwd.clone(),
             agent_dir: fixture.agent,
-            settings_manager: Some(settings),
+            project_trusted: true,
             additional_skill_paths: vec![path_to_string(&fixture.base_skill)],
             ..Default::default()
         });
@@ -1397,6 +1376,38 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert!(files[0].content.contains('p'));
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn loader_reload_honors_project_trust_without_owning_a_manager()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = temp_root("trust")?;
+        let cwd = root.join("project");
+        let agent = root.join("agent");
+        fs::create_dir_all(cwd.join(CONFIG_DIR_NAME))?;
+        fs::create_dir_all(&agent)?;
+        fs::write(cwd.join(CONFIG_DIR_NAME).join("SYSTEM.md"), "project\n")?;
+        fs::write(agent.join("SYSTEM.md"), "global\n")?;
+
+        let mut trusted = DefaultResourceLoader::new(DefaultResourceLoaderOptions {
+            cwd: cwd.clone(),
+            agent_dir: agent.clone(),
+            project_trusted: true,
+            ..Default::default()
+        });
+        trusted.reload().await?;
+        assert_eq!(trusted.get_system_prompt(), Some("project\n"));
+
+        let mut untrusted = DefaultResourceLoader::new(DefaultResourceLoaderOptions {
+            cwd,
+            agent_dir: agent,
+            project_trusted: false,
+            ..Default::default()
+        });
+        untrusted.reload().await?;
+        assert_eq!(untrusted.get_system_prompt(), Some("global\n"));
+
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 }

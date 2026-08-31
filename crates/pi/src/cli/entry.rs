@@ -102,16 +102,24 @@ impl Io {
             .with_interactive(|dispatched, runtime| {
                 Box::pin(async move {
                     let _ = dispatched;
+                    let overrides = {
+                        let session = runtime.session();
+                        let settings = session.lock_settings();
+                        settings.get_terminal_capability_overrides()
+                    };
                     // Detection probes the terminal with blocking I/O; keep it
-                    // off the runtime worker. The blocking pool does not change
-                    // the result — the tmux hyperlink probe is cached in a
-                    // process-wide `OnceLock`.
-                    let options = tokio::task::spawn_blocking(InteractiveRuntimeOptions::detect)
-                        .await
-                        .map_err(|e| format!("interactive: {e}"))?;
+                    // off the runtime worker. Read settings before awaiting so
+                    // no session or settings lock guard crosses the boundary.
+                    let options = tokio::task::spawn_blocking(move || {
+                        InteractiveRuntimeOptions::detect_with_overrides(overrides)
+                    })
+                    .await
+                    .map_err(|error| {
+                        format!("interactive: capability detection join failed: {error}")
+                    })?;
                     run_interactive_mode(runtime, options)
                         .await
-                        .map_err(|e| format!("interactive: {e}"))
+                        .map_err(|error| format!("interactive: {error}"))
                 })
             })
             .with_rpc(|_dispatched, runtime| {
@@ -370,7 +378,6 @@ fn thinking_level_from_str(level: &str) -> Option<pi_ai::ModelThinkingLevel> {
 struct SessionBuildOptions {
     cwd: String,
     session_manager: crate::core::sessions::SessionManager,
-    settings_manager: SettingsManager,
     session_result: CreateAgentSessionResult,
     tools: Vec<Arc<dyn pi_agent::AgentTool>>,
     messages: Vec<pi_agent::AgentMessage>,
@@ -397,7 +404,7 @@ fn build_session(options: SessionBuildOptions) -> Result<BuiltSession, String> {
             session_result.model_runtime.clone(),
         ))),
         session_manager: options.session_manager,
-        settings_manager: options.settings_manager,
+        settings_manager: session_result.settings_manager,
         cwd: options.cwd,
         scoped_models: session_result
             .scoped_models
@@ -583,23 +590,17 @@ async fn apply_cli_api_key(
     Ok(())
 }
 
-/// Build the settings manager, built-in tools, and base system prompt that
-/// `build_session` consumes together. Pulled out of `RealRuntimeFactory::create`
-/// to keep the entry pipeline under the strict `too_many_lines` ceiling.
+/// Build built-in tools and the base system prompt that `build_session` consumes together.
+/// Pulled out of `RealRuntimeFactory::create` to keep the entry pipeline under
+/// the strict `too_many_lines` ceiling.
 fn build_session_inputs(
     cwd: &str,
-    agent_dir: &str,
-    project_trusted: bool,
+    settings_manager: &SettingsManager,
     model: Option<Model>,
     initial_active_tool_names: Vec<String>,
     resources: &SessionResources,
-) -> (SettingsManager, Vec<Arc<dyn pi_agent::AgentTool>>, String) {
-    let settings_manager = SettingsManager::create(
-        cwd,
-        Some(agent_dir),
-        SettingsManagerCreateOptions::default().project_trusted(project_trusted),
-    );
-    let tools = build_builtin_tools(Path::new(cwd), &settings_manager, model);
+) -> (Vec<Arc<dyn pi_agent::AgentTool>>, String) {
+    let tools = build_builtin_tools(Path::new(cwd), settings_manager, model);
     let system_prompt = build_system_prompt(&BuildSystemPromptOptions {
         custom_prompt: resources.custom_prompt.clone(),
         selected_tools: Some(initial_active_tool_names),
@@ -610,7 +611,7 @@ fn build_session_inputs(
         context_files: Some(resources.context_files.clone()),
         skills: Some(resources.skills.clone()),
     });
-    (settings_manager, tools, system_prompt)
+    (tools, system_prompt)
 }
 fn initialize_session_metadata(
     manager: &mut SessionManager,
@@ -681,7 +682,6 @@ impl RuntimeFactory for RealRuntimeFactory {
             let has_saved_thinking_level = saved_thinking_level.is_some();
 
             let services = create_runtime_services(&cwd, &agent_dir, &parsed).await?;
-            let project_trusted = services.settings_manager().is_project_trusted();
 
             // Services refresh registers extension providers before model resolution.
             let cli_scope = CliRuntimeScope::from_args(&parsed);
@@ -729,10 +729,9 @@ impl RuntimeFactory for RealRuntimeFactory {
             )
             .await?;
 
-            let (settings_manager, tools, system_prompt) = build_session_inputs(
+            let (tools, system_prompt) = build_session_inputs(
                 &cwd,
-                &agent_dir,
-                project_trusted,
+                &session_result.settings_manager,
                 session_result.model.clone(),
                 session_result.initial_active_tool_names.clone(),
                 &resources,
@@ -741,7 +740,6 @@ impl RuntimeFactory for RealRuntimeFactory {
             let built = build_session(SessionBuildOptions {
                 cwd: cwd.clone(),
                 session_manager,
-                settings_manager,
                 session_result,
                 tools,
                 messages: existing_messages,
@@ -749,6 +747,7 @@ impl RuntimeFactory for RealRuntimeFactory {
                 skills: resources.skills,
                 prompt_templates: resources.prompt_templates,
             })?;
+
             let runtime = AgentSessionRuntime::new(
                 built.session,
                 AgentSessionRuntimeServices {
@@ -899,7 +898,6 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
             )
             .await
             .map_err(|error| AgentSessionRuntimeError::Factory(error.to_string()))?;
-            let project_trusted = services.settings_manager().is_project_trusted();
             apply_replacement_api_key(api_key, &services.model_runtime).await?;
             let resources = session_resources(&services.resource_loader);
             let (scope, scope_diagnostics) =
@@ -932,15 +930,12 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
 
             let built = assemble_replacement_session(
                 &cwd,
-                &agent_dir,
-                project_trusted,
                 session_manager,
                 session_result,
                 resources,
                 existing_messages,
             )
             .map_err(AgentSessionRuntimeError::Factory)?;
-
             Ok(CreateAgentSessionRuntimeResult {
                 session: built.session,
                 services: AgentSessionRuntimeServices {
@@ -955,12 +950,9 @@ impl CreateAgentSessionRuntimeFactory for RealReplacementFactory {
 }
 
 /// Assemble the replacement session inputs (settings, tools, system prompt)
-/// and build the session. Pulled out of [`RealReplacementFactory::create`] to
-/// keep it under the strict `too_many_lines` ceiling.
+/// and build the session.
 fn assemble_replacement_session(
     cwd: &str,
-    agent_dir: &str,
-    project_trusted: bool,
     session_manager: crate::core::sessions::SessionManager,
     session_result: CreateAgentSessionResult,
     resources: SessionResources,
@@ -973,14 +965,9 @@ fn assemble_replacement_session(
         custom_prompt,
         append_prompt,
     } = resources;
-    let settings_manager = SettingsManager::create(
-        cwd,
-        Some(agent_dir),
-        SettingsManagerCreateOptions::default().project_trusted(project_trusted),
-    );
     let tools = build_builtin_tools(
         Path::new(cwd),
-        &settings_manager,
+        &session_result.settings_manager,
         session_result.model.clone(),
     );
     let system_prompt = build_system_prompt(&BuildSystemPromptOptions {
@@ -996,7 +983,6 @@ fn assemble_replacement_session(
     build_session(SessionBuildOptions {
         cwd: cwd.to_owned(),
         session_manager,
-        settings_manager,
         session_result,
         tools,
         messages: existing_messages,

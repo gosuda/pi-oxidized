@@ -22,6 +22,7 @@ use std::sync::Mutex;
 
 use pi_agent::QueueMode;
 use pi_ai::{ModelThinkingLevel, Transport};
+use pi_tui::terminal::{ImageProtocolOverride, TerminalCapabilityOverrides};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
@@ -299,6 +300,90 @@ fn infer_theme_mode(theme: Option<&str>) -> ThemeMode {
     }
 }
 
+/// Terminal capability preference for hyperlinks and truecolor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalCapabilitySetting {
+    /// Let terminal detection decide.
+    Auto,
+    /// Force the capability on.
+    Enabled,
+    /// Force the capability off.
+    Disabled,
+}
+
+impl TerminalCapabilitySetting {
+    fn from_value(value: Option<&Value>) -> Option<Self> {
+        match value {
+            Some(Value::Bool(true)) => Some(Self::Enabled),
+            Some(Value::Bool(false)) => Some(Self::Disabled),
+            Some(Value::String(value)) if value == "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    fn to_override(self) -> Option<bool> {
+        match self {
+            Self::Enabled => Some(true),
+            Self::Disabled => Some(false),
+            Self::Auto => None,
+        }
+    }
+
+    fn to_value(self) -> Value {
+        match self {
+            Self::Auto => Value::String("auto".to_owned()),
+            Self::Enabled => Value::Bool(true),
+            Self::Disabled => Value::Bool(false),
+        }
+    }
+}
+
+/// Terminal image protocol preference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalImageSetting {
+    /// Let terminal detection decide.
+    Auto,
+    /// Disable inline images.
+    Disabled,
+    /// Force the Kitty graphics protocol.
+    Kitty,
+    /// Force iTerm2 inline images.
+    ITerm2,
+}
+
+impl TerminalImageSetting {
+    fn from_value(value: Option<&Value>) -> Option<Self> {
+        match value {
+            Some(Value::Bool(false)) => Some(Self::Disabled),
+            Some(Value::String(value)) => match value.as_str() {
+                "auto" => Some(Self::Auto),
+                "kitty" => Some(Self::Kitty),
+                "iterm2" => Some(Self::ITerm2),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn to_override(self) -> Option<ImageProtocolOverride> {
+        match self {
+            Self::Kitty => Some(ImageProtocolOverride::Kitty),
+            Self::ITerm2 => Some(ImageProtocolOverride::ITerm2),
+            Self::Disabled => Some(ImageProtocolOverride::Disabled),
+            Self::Auto => None,
+        }
+    }
+
+    fn to_value(self) -> Value {
+        match self {
+            Self::Auto => Value::String("auto".to_owned()),
+            Self::Disabled => Value::Bool(false),
+            Self::Kitty => Value::String("kitty".to_owned()),
+            Self::ITerm2 => Value::String("iterm2".to_owned()),
+        }
+    }
+}
+
 /// Horizontal chat-message output padding (`outputPad`, wire `0 | 1`).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum OutputPad {
@@ -375,6 +460,12 @@ pub struct RetrySettings {
 /// Nested `terminal` settings object.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TerminalSettings {
+    /// Hyperlink capability preference.
+    pub hyperlinks: Option<TerminalCapabilitySetting>,
+    /// Image protocol preference.
+    pub images: Option<TerminalImageSetting>,
+    /// Truecolor capability preference.
+    pub true_color: Option<TerminalCapabilitySetting>,
     /// Show inline images when the terminal supports them (default: true).
     pub show_images: Option<bool>,
     /// Preferred inline image width in terminal cells (default: 60).
@@ -931,25 +1022,56 @@ impl RetrySettings {
 
 impl TerminalSettings {
     fn from_map(map: &Map<String, Value>) -> Self {
+        let hyperlinks = TerminalCapabilitySetting::from_value(map.get("hyperlinks"));
+        let images = TerminalImageSetting::from_value(map.get("images"));
+        let true_color = TerminalCapabilitySetting::from_value(map.get("trueColor"));
+        let mut extra = unknown_fields(
+            map,
+            &[
+                "showImages",
+                "imageWidthCells",
+                "clearOnShrink",
+                "showTerminalProgress",
+            ],
+        );
+        if hyperlinks.is_some() {
+            extra.remove("hyperlinks");
+        }
+        if images.is_some() {
+            extra.remove("images");
+        }
+        if true_color.is_some() {
+            extra.remove("trueColor");
+        }
         Self {
+            hyperlinks,
+            images,
+            true_color,
             show_images: bool_field(map, "showImages"),
             image_width_cells: number_to_u64(map.get("imageWidthCells")),
             clear_on_shrink: bool_field(map, "clearOnShrink"),
             show_terminal_progress: bool_field(map, "showTerminalProgress"),
-            extra: unknown_fields(
-                map,
-                &[
-                    "showImages",
-                    "imageWidthCells",
-                    "clearOnShrink",
-                    "showTerminalProgress",
-                ],
-            ),
+            extra,
         }
     }
 
     fn to_map(&self) -> Map<String, Value> {
         let mut map = self.extra.clone();
+        insert_opt_value(
+            &mut map,
+            "hyperlinks",
+            self.hyperlinks.map(TerminalCapabilitySetting::to_value),
+        );
+        insert_opt_value(
+            &mut map,
+            "images",
+            self.images.map(TerminalImageSetting::to_value),
+        );
+        insert_opt_value(
+            &mut map,
+            "trueColor",
+            self.true_color.map(TerminalCapabilitySetting::to_value),
+        );
         insert_opt_bool(&mut map, "showImages", self.show_images);
         insert_opt_u64(&mut map, "imageWidthCells", self.image_width_cells);
         insert_opt_bool(&mut map, "clearOnShrink", self.clear_on_shrink);
@@ -2504,6 +2626,29 @@ impl SettingsManager {
         self.set_global_nested_field("images", "blockImages", Value::Bool(blocked));
     }
 
+    /// Terminal capability overrides from the merged `terminal` settings.
+    ///
+    /// Reads the merged view, so trusted project values override global
+    /// siblings. Only explicit values produce overrides; `auto`, absent, and
+    /// invalid values leave detection to the environment.
+    #[must_use]
+    pub fn get_terminal_capability_overrides(&self) -> TerminalCapabilityOverrides {
+        let terminal = self.settings.get("terminal").and_then(Value::as_object);
+        TerminalCapabilityOverrides {
+            images: terminal
+                .and_then(|terminal| TerminalImageSetting::from_value(terminal.get("images")))
+                .and_then(TerminalImageSetting::to_override),
+            hyperlinks: terminal.and_then(|terminal| {
+                TerminalCapabilitySetting::from_value(terminal.get("hyperlinks"))
+                    .and_then(TerminalCapabilitySetting::to_override)
+            }),
+            true_color: terminal.and_then(|terminal| {
+                TerminalCapabilitySetting::from_value(terminal.get("trueColor"))
+                    .and_then(TerminalCapabilitySetting::to_override)
+            }),
+        }
+    }
+
     // -- Markdown / warnings --------------------------------------------------
 
     /// `markdown.codeBlockIndent` (default: two spaces).
@@ -3903,5 +4048,177 @@ mod tests {
         let roundtrip = settings.to_map();
         assert_eq!(roundtrip.get("theme"), Some(&Value::String("dark".into())));
         assert_eq!(roundtrip.get("future"), Some(&Value::from(42)));
+    }
+
+    fn in_memory_manager_with_terminal(terminal: Map<String, Value>) -> SettingsManager {
+        let mut map = Map::new();
+        map.insert("terminal".into(), Value::Object(terminal));
+        SettingsManager::in_memory(
+            &Settings::from_map(&map),
+            SettingsManagerCreateOptions::default(),
+        )
+    }
+
+    #[test]
+    fn terminal_capability_overrides_explicit_values() {
+        let mut enabled = Map::new();
+        enabled.insert("hyperlinks".into(), Value::Bool(true));
+        enabled.insert("trueColor".into(), Value::Bool(false));
+        enabled.insert("images".into(), Value::String("kitty".into()));
+        let overrides =
+            in_memory_manager_with_terminal(enabled).get_terminal_capability_overrides();
+        assert_eq!(overrides.hyperlinks, Some(true));
+        assert_eq!(overrides.true_color, Some(false));
+        assert_eq!(overrides.images, Some(ImageProtocolOverride::Kitty));
+
+        let mut disabled = Map::new();
+        disabled.insert("hyperlinks".into(), Value::Bool(false));
+        disabled.insert("trueColor".into(), Value::Bool(true));
+        disabled.insert("images".into(), Value::String("iterm2".into()));
+        let overrides =
+            in_memory_manager_with_terminal(disabled).get_terminal_capability_overrides();
+        assert_eq!(overrides.hyperlinks, Some(false));
+        assert_eq!(overrides.true_color, Some(true));
+        assert_eq!(overrides.images, Some(ImageProtocolOverride::ITerm2));
+
+        let mut off = Map::new();
+        off.insert("images".into(), Value::Bool(false));
+        let overrides = in_memory_manager_with_terminal(off).get_terminal_capability_overrides();
+        assert_eq!(overrides.images, Some(ImageProtocolOverride::Disabled));
+        assert_eq!(overrides.hyperlinks, None);
+        assert_eq!(overrides.true_color, None);
+    }
+
+    #[test]
+    fn terminal_capability_overrides_auto_missing_and_invalid_stay_empty() {
+        let mut auto = Map::new();
+        auto.insert("hyperlinks".into(), Value::String("auto".into()));
+        auto.insert("trueColor".into(), Value::String("auto".into()));
+        auto.insert("images".into(), Value::String("auto".into()));
+        let manager = in_memory_manager_with_terminal(auto);
+        assert_eq!(
+            manager.get_terminal_capability_overrides(),
+            TerminalCapabilityOverrides::default()
+        );
+
+        let manager = in_memory_manager_with_terminal(Map::new());
+        assert_eq!(
+            manager.get_terminal_capability_overrides(),
+            TerminalCapabilityOverrides::default()
+        );
+
+        let mut invalid = Map::new();
+        invalid.insert("hyperlinks".into(), Value::from(5));
+        invalid.insert("trueColor".into(), Value::String("yes".into()));
+        invalid.insert("images".into(), Value::Bool(true));
+        let manager = in_memory_manager_with_terminal(invalid);
+        assert_eq!(
+            manager.get_terminal_capability_overrides(),
+            TerminalCapabilityOverrides::default()
+        );
+
+        let mut mixed = Map::new();
+        mixed.insert("hyperlinks".into(), Value::Bool(true));
+        mixed.insert("images".into(), Value::from(7));
+        let overrides = in_memory_manager_with_terminal(mixed).get_terminal_capability_overrides();
+        assert_eq!(overrides.hyperlinks, Some(true));
+        assert_eq!(overrides.images, None);
+        assert_eq!(overrides.true_color, None);
+    }
+
+    #[test]
+    fn terminal_settings_typed_view_serializes_valid_keys_and_keeps_unknown_sibling() -> TestResult
+    {
+        let mut terminal = Map::new();
+        terminal.insert("hyperlinks".into(), Value::Bool(true));
+        terminal.insert("images".into(), Value::String("kitty".into()));
+        terminal.insert("trueColor".into(), Value::String("auto".into()));
+        terminal.insert("futureThing".into(), Value::from(42));
+        let mut map = Map::new();
+        map.insert("terminal".into(), Value::Object(terminal));
+
+        let settings = Settings::from_map(&map);
+        let view = settings
+            .terminal
+            .as_ref()
+            .ok_or_else(|| "typed terminal settings missing".to_owned())?;
+        assert_eq!(view.hyperlinks, Some(TerminalCapabilitySetting::Enabled));
+        assert_eq!(view.images, Some(TerminalImageSetting::Kitty));
+        assert_eq!(view.true_color, Some(TerminalCapabilitySetting::Auto));
+        assert_eq!(view.extra.get("futureThing"), Some(&Value::from(42)));
+
+        let written = settings.to_map();
+        let written = written
+            .get("terminal")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "serialized terminal settings missing".to_owned())?;
+        assert_eq!(written.get("hyperlinks"), Some(&Value::Bool(true)));
+        assert_eq!(written.get("images"), Some(&Value::String("kitty".into())));
+        assert_eq!(
+            written.get("trueColor"),
+            Some(&Value::String("auto".into()))
+        );
+        let mut invalid_terminal = Map::new();
+        invalid_terminal.insert("hyperlinks".into(), Value::from(5));
+        invalid_terminal.insert("images".into(), Value::Bool(true));
+        invalid_terminal.insert("trueColor".into(), Value::String("yes".into()));
+        let mut invalid_map = Map::new();
+        invalid_map.insert("terminal".into(), Value::Object(invalid_terminal));
+        let settings = Settings::from_map(&invalid_map);
+        let view = settings
+            .terminal
+            .as_ref()
+            .ok_or_else(|| "invalid terminal settings view missing".to_owned())?;
+        assert_eq!(view.hyperlinks, None);
+        assert_eq!(view.images, None);
+        assert_eq!(view.true_color, None);
+        assert_eq!(view.extra.get("hyperlinks"), Some(&Value::from(5)));
+        assert_eq!(view.extra.get("images"), Some(&Value::Bool(true)));
+        assert_eq!(
+            view.extra.get("trueColor"),
+            Some(&Value::String("yes".into()))
+        );
+        let written = settings.to_map();
+        let written = written
+            .get("terminal")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "serialized invalid terminal settings missing".to_owned())?;
+        assert_eq!(written.get("hyperlinks"), Some(&Value::from(5)));
+        assert_eq!(written.get("images"), Some(&Value::Bool(true)));
+        assert_eq!(written.get("trueColor"), Some(&Value::String("yes".into())));
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_project_terminal_values_override_global_and_keep_siblings() -> TestResult {
+        let (_root, agent, project) = make_dirs("terminal-overrides")?;
+        write_settings_file(
+            &agent.join("settings.json"),
+            r#"{
+  "terminal": {
+    "hyperlinks": true,
+    "trueColor": false,
+    "images": "kitty",
+    "showImages": false
+  }
+}"#,
+        )?;
+        write_settings_file(
+            &project.join(".pi").join("settings.json"),
+            r#"{
+  "terminal": {
+    "hyperlinks": false,
+    "images": "iterm2"
+  }
+}"#,
+        )?;
+        let manager = create_manager(&project, &agent, true);
+        let overrides = manager.get_terminal_capability_overrides();
+        assert_eq!(overrides.hyperlinks, Some(false));
+        assert_eq!(overrides.images, Some(ImageProtocolOverride::ITerm2));
+        // Untouched global siblings survive the trusted-project merge.
+        assert_eq!(overrides.true_color, Some(false));
+        assert!(!manager.get_show_images());
+        Ok(())
     }
 }

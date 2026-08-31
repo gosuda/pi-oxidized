@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use pi_tui::component::{Component, UiEvent};
 use pi_tui::components::{SettingItem, SettingsList, SettingsListOptions};
 use pi_tui::terminal::{
-    TerminalCapabilities, TerminalGuard, TerminalInput, Tui, Txn, install_panic_emergency_hook,
-    write_emergency_restore_bytes,
+    TerminalCapabilities, TerminalCapabilityOverrides, TerminalGuard, TerminalInput, Tui, Txn,
+    install_panic_emergency_hook, write_emergency_restore_bytes,
 };
 
 use crate::core::config::{APP_NAME, CONFIG_DIR_NAME, get_agent_dir};
@@ -121,6 +121,11 @@ pub async fn select_config(options: ConfigSelectorOptions) -> Result<(), String>
         SettingsManagerCreateOptions::default().project_trusted(project_trusted),
     );
 
+    // Read capability overrides before the settings manager moves into its
+    // slot; the selector's startup detection honors them like the interactive
+    // runtime's (settings JSON wins over `PI_*` environment values).
+    let terminal_overrides = settings.get_terminal_capability_overrides();
+
     let pm = PackageManager::with_offline(
         PackageManager::new(PackageManagerOptions::new(&options.cwd, &options.agent_dir)),
         options.offline,
@@ -190,7 +195,7 @@ pub async fn select_config(options: ConfigSelectorOptions) -> Result<(), String>
         },
     );
 
-    run_standalone_list(&mut list, &closed).await?;
+    run_standalone_list(&mut list, &closed, terminal_overrides).await?;
     let _ = settings_slot;
     Ok(())
 }
@@ -544,7 +549,11 @@ fn strip_pattern_prefix(entry: &str) -> &str {
         .unwrap_or(entry)
 }
 
-async fn run_standalone_list(list: &mut SettingsList, closed: &AtomicBool) -> Result<(), String> {
+async fn run_standalone_list(
+    list: &mut SettingsList,
+    closed: &AtomicBool,
+    terminal_overrides: TerminalCapabilityOverrides,
+) -> Result<(), String> {
     let size = crossterm::terminal::size().unwrap_or((80, 24));
     let mut guard = TerminalGuard::new(io::stdout());
     guard.set_viewport_bottom_row(size.1.saturating_sub(1));
@@ -564,9 +573,11 @@ async fn run_standalone_list(list: &mut SettingsList, closed: &AtomicBool) -> Re
         .activate(!cfg!(windows))
         .map_err(|error| format!("terminal activation failed: {error}"))?;
 
-    let caps = tokio::task::spawn_blocking(TerminalCapabilities::detect)
-        .await
-        .map_err(|err| format!("capability detection join failed: {err}"))?;
+    let caps = tokio::task::spawn_blocking(move || {
+        TerminalCapabilities::detect_with_overrides(terminal_overrides)
+    })
+    .await
+    .map_err(|err| format!("capability detection join failed: {err}"))?;
     let mut tui = Tui::new(
         io::stdout(),
         ratatui::layout::Size::new(size.0, size.1),
@@ -657,5 +668,39 @@ mod tests {
         assert_eq!(strip_pattern_prefix("-foo"), "foo");
         assert_eq!(strip_pattern_prefix("!foo"), "foo");
         assert_eq!(strip_pattern_prefix("foo"), "foo");
+    }
+
+    #[test]
+    fn default_overrides_use_the_environment_detector() {
+        let with_default =
+            TerminalCapabilities::detect_with_overrides(TerminalCapabilityOverrides::default());
+        let environment_only = TerminalCapabilities::detect();
+        assert_eq!(with_default, environment_only);
+    }
+
+    #[test]
+    fn explicit_overrides_win_over_detection() {
+        let forced_on = TerminalCapabilityOverrides {
+            images: Some(pi_tui::terminal::ImageProtocolOverride::Kitty),
+            hyperlinks: Some(true),
+            true_color: Some(true),
+        };
+        let capabilities = TerminalCapabilities::detect_with_overrides(forced_on);
+        assert_eq!(
+            capabilities.images,
+            Some(pi_tui::terminal::ImageProtocol::Kitty)
+        );
+        assert!(capabilities.hyperlinks);
+        assert!(capabilities.true_color);
+
+        let forced_off = TerminalCapabilityOverrides {
+            images: Some(pi_tui::terminal::ImageProtocolOverride::Disabled),
+            hyperlinks: Some(false),
+            true_color: Some(false),
+        };
+        let capabilities = TerminalCapabilities::detect_with_overrides(forced_off);
+        assert_eq!(capabilities.images, None);
+        assert!(!capabilities.hyperlinks);
+        assert!(!capabilities.true_color);
     }
 }

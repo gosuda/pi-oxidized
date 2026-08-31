@@ -1144,6 +1144,21 @@ impl AgentSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Re-read settings from storage on a blocking worker.
+    ///
+    /// The settings mutex is acquired and released entirely inside the
+    /// blocking task, so no synchronous guard crosses an `.await`.
+    /// Settings storage and parse failures retain [`SettingsManager::reload`]
+    /// semantics: the manager records the error and keeps the last good scope.
+    async fn reload_settings(self: &Arc<Self>) -> Result<(), ExtensionBindError> {
+        let session = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            session.lock_settings().reload();
+        })
+        .await
+        .map_err(|error| ExtensionBindError::SettingsReload(error.to_string()))
+    }
+
     fn store_pump(&self, pump: EventPump) {
         let mut inner = self.lock_inner();
         if let Some(prev) = inner.pump.take() {
@@ -2084,6 +2099,67 @@ mod tests {
             "queues should be empty after abort with no enqueued messages"
         );
 
+        Ok(())
+    }
+    /// Storage double that records the thread of every `with_lock` read.
+    struct RecordingStorage {
+        thread_ids: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+    }
+
+    impl crate::core::settings::SettingsStorage for RecordingStorage {
+        fn with_lock(
+            &mut self,
+            _scope: crate::core::settings::SettingsScope,
+            f: &mut dyn FnMut(Option<String>) -> Result<Option<String>, String>,
+        ) -> Result<(), String> {
+            let reader = std::thread::current().id();
+            self.thread_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(reader);
+            let _ = f(None)?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_reads_settings_storage_on_a_blocking_worker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let thread_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Construction loads both scopes through `with_lock`; those are
+        // build-time observations, so clear them before exercising reload.
+        let settings = crate::core::settings::SettingsManager::from_storage(
+            Box::new(RecordingStorage {
+                thread_ids: Arc::clone(&thread_ids),
+            }),
+            crate::core::settings::SettingsManagerCreateOptions::new(),
+        );
+        thread_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        let provider = Arc::new(MockProvider(vec![Ok(start_event()), Ok(done_event("ok"))]));
+        let mut config = AgentSessionConfig::test_config(provider, test_model())?;
+        config.settings_manager = settings;
+        let session = AgentSession::new(config)?;
+        let test_thread = std::thread::current().id();
+
+        session.reload().await?;
+
+        let reads = thread_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            !reads.is_empty(),
+            "session reload must re-read settings storage"
+        );
+        assert!(
+            reads.iter().all(|thread| *thread != test_thread),
+            "settings reads must run on a blocking worker, not the \
+             current-thread runtime worker"
+        );
         Ok(())
     }
 }

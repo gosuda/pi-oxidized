@@ -53,6 +53,9 @@ use super::events::{
     AgentSessionEvent, SessionShutdownReason, SessionStartEvent, SessionStartReason,
 };
 
+const RELOAD_BUSY: &str = "session replacement in progress";
+const RELOAD_INVALIDATED: &str = "extension runtime was invalidated during reload";
+
 /// Mode the session is bound to (mirrors `AppMode` minus `Interactive`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExtensionMode {
@@ -151,6 +154,9 @@ pub enum ExtensionBindError {
     /// Host restart after reload failed.
     #[error("extension host restart failed: {0}")]
     HostRestart(String),
+    /// Settings-refresh blocking task failed to join (panic/cancellation).
+    #[error("settings reload failed: {0}")]
+    SettingsReload(String),
 }
 
 impl AgentSession {
@@ -330,20 +336,29 @@ impl AgentSession {
     /// Reload extensions.
     ///
     /// Mirrors TS `reload`:
+    /// 0. Re-read settings from storage on a blocking worker before anything
+    ///    reads them (authoritative settings refresh for direct and
+    ///    interactive callers).
     /// 1. Capture previous flag values (preserved across the swap).
-    /// 2. Prepare a concrete runtime replacement before notifying the old generation.
-    /// 3. Emit `session_shutdown{reload}` only after preparation succeeds, then
-    ///    commit the replacement and re-register providers without replacing the
-    ///    stable facade.
+    /// 2. Prepare a concrete runtime replacement before notifying the old
+    ///    generation.
+    /// 3. Emit `session_shutdown{reload}` only after preparation succeeds,
+    ///    then commit the replacement and re-register providers without
+    ///    replacing the stable facade.
     /// 4. Emit `session_start{reload}` on the replacement generation.
     /// 5. Reload base resources and re-discover extension resources.
     ///
     /// # Errors
     ///
-    /// Returns [`ExtensionBindError`] on host preparation or resource-discovery
-    /// failure. Non-fatal extension diagnostics are returned after a successful
-    /// reload.
-    pub async fn reload(&self) -> Result<Vec<ExtensionSetDiagnostic>, ExtensionBindError> {
+    /// Returns [`ExtensionBindError`] when the settings refresh, host
+    /// preparation, or resource discovery fails. Non-fatal extension
+    /// diagnostics are returned after a successful reload.
+    pub async fn reload(
+        self: &Arc<Self>,
+    ) -> Result<Vec<ExtensionSetDiagnostic>, ExtensionBindError> {
+        // Authoritative settings refresh: re-read storage on a blocking
+        // worker before any branch reads settings-derived state.
+        self.reload_settings().await?;
         let host = self.host_extension_runner();
         let runner = self.hooks.runner();
         let previous_flag_values = runner.get_flag_values();
@@ -351,9 +366,7 @@ impl AgentSession {
         if let (Some(host), Some(runtime)) = (host.as_ref(), self.model_runtime()) {
             let reload_guard = host.reload_lock().lock().await;
             if host.is_pending_busy() {
-                return Err(ExtensionBindError::HostRestart(
-                    "session replacement in progress".to_owned(),
-                ));
+                return Err(ExtensionBindError::HostRestart(RELOAD_BUSY.to_owned()));
             }
             let prepared = host
                 .prepare_reload(previous_flag_values)
@@ -368,9 +381,7 @@ impl AgentSession {
                         model_runtime: runtime,
                     },
                 )
-                .map_err(|_| {
-                    ExtensionBindError::HostRestart("session replacement in progress".to_owned())
-                })?;
+                .map_err(|_| ExtensionBindError::HostRestart(RELOAD_BUSY.to_owned()))?;
             drop(reload_guard);
 
             // Never hold reload_lock across a host callback: a reload hook may
@@ -385,7 +396,7 @@ impl AgentSession {
             if !host.complete_ready(&token) {
                 drop(ready_rx);
                 return Err(ExtensionBindError::HostRestart(
-                    "extension runtime was invalidated during reload".to_owned(),
+                    RELOAD_INVALIDATED.to_owned(),
                 ));
             }
             drop(ready_rx);
@@ -398,7 +409,7 @@ impl AgentSession {
             )) = host.take_finalizing(&token)
             else {
                 return Err(ExtensionBindError::HostRestart(
-                    "extension runtime was invalidated during reload".to_owned(),
+                    RELOAD_INVALIDATED.to_owned(),
                 ));
             };
             let reload_guard = host.reload_lock().lock().await;
@@ -406,7 +417,7 @@ impl AgentSession {
             let _ = host.finish_finalize(&token);
             if !reload.committed {
                 return Err(ExtensionBindError::HostRestart(
-                    "extension runtime was invalidated during reload".to_owned(),
+                    RELOAD_INVALIDATED.to_owned(),
                 ));
             }
             let diagnostics = reload.diagnostics;
@@ -2258,16 +2269,11 @@ mod tests {
                 ..crate::core::resources::ResourceExtensionPaths::default()
             };
 
-        let settings = crate::core::settings::SettingsManager::create(
-            &cwd,
-            Some(&agent_dir),
-            crate::core::settings::SettingsManagerCreateOptions::new().project_trusted(true),
-        );
         let mut loader = crate::core::resources::DefaultResourceLoader::new(
             crate::core::resources::DefaultResourceLoaderOptions {
                 cwd: cwd.clone(),
                 agent_dir,
-                settings_manager: Some(settings),
+                project_trusted: true,
                 ..crate::core::resources::DefaultResourceLoaderOptions::default()
             },
         );
@@ -2318,8 +2324,54 @@ mod tests {
                 .skills
                 .lock()
                 .map_err(|_| io::Error::other("skills mutex poisoned"))?
-                .is_empty()
+                .iter()
+                .all(|skill| skill.name != "extension-skill")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_refreshes_session_terminal_settings_from_disk() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path().join("project");
+        let agent_dir = temp.path().join("agent");
+        std::fs::create_dir_all(&cwd)?;
+        std::fs::create_dir_all(&agent_dir)?;
+        let settings_path = agent_dir.join("settings.json");
+        std::fs::write(&settings_path, r#"{ "terminal": { "hyperlinks": true } }"#)?;
+
+        // One manager owns settings: the loader receives only the resolved
+        // trust bit, and this manager moves into the session's slot. A stale
+        // manager (or a dropped refresh) leaves the old overrides visible.
+        let settings = crate::core::settings::SettingsManager::create(
+            &cwd,
+            Some(&agent_dir),
+            crate::core::settings::SettingsManagerCreateOptions::new().project_trusted(true),
+        );
+        let loader = crate::core::resources::DefaultResourceLoader::new(
+            crate::core::resources::DefaultResourceLoaderOptions {
+                cwd: cwd.clone(),
+                agent_dir: agent_dir.clone(),
+                project_trusted: true,
+                ..crate::core::resources::DefaultResourceLoaderOptions::default()
+            },
+        );
+
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.cwd = cwd.to_string_lossy().into_owned();
+        config.settings_manager = settings;
+        config.resource_loader = Some(loader);
+        let session = AgentSession::new(config)?;
+
+        std::fs::write(
+            &settings_path,
+            r#"{ "terminal": { "hyperlinks": false, "trueColor": true } }"#,
+        )?;
+        session.reload().await?;
+
+        let overrides = session.lock_settings().get_terminal_capability_overrides();
+        assert_eq!(overrides.hyperlinks, Some(false));
+        assert_eq!(overrides.true_color, Some(true));
         Ok(())
     }
 

@@ -51,7 +51,7 @@ use pi_tui::components::editor::{Editor, EditorOptions};
 use pi_tui::keys::{
     ParsedKeyId, encode_key_event, key_matches_parsed, parse_key_id, set_kitty_protocol_active,
 };
-use pi_tui::terminal::caps::TerminalCapabilities;
+use pi_tui::terminal::caps::{TerminalCapabilities, TerminalCapabilityOverrides};
 use pi_tui::terminal::input::TerminalInput;
 use pi_tui::terminal::probe::{
     TerminalTheme, detect_terminal_theme, probe_collect_replies_with_yield, probe_write_batch,
@@ -387,6 +387,21 @@ pub trait SessionHost: Send + Sync + 'static {
     /// Reload extensions / resources / keybindings.
     fn reload(&self) -> BoxFuture<'_, Result<Vec<String>, String>>;
 
+    /// Re-detect terminal capabilities using the current session settings.
+    ///
+    /// Implementations MUST perform settings reads and terminal probing on a
+    /// blocking worker. Settings JSON wins over `PI_*` environment values,
+    /// which win over automatic detection.
+    fn detect_terminal_capabilities(&self) -> BoxFuture<'_, Result<TerminalCapabilities, String>> {
+        Box::pin(async {
+            tokio::task::spawn_blocking(|| {
+                TerminalCapabilities::detect_with_overrides(TerminalCapabilityOverrides::default())
+            })
+            .await
+            .map_err(|error| format!("capability detection join failed: {error}"))
+        })
+    }
+
     /// Returns the full transcript for the current session (used on rebind).
     fn messages(&self) -> Vec<pi_agent::AgentMessage>;
 
@@ -621,7 +636,10 @@ pub enum InteractiveExit {
     ExternalEditor,
 }
 
-/// Outcome of dispatching one [`ViewAction`].
+/// Options for constructing an [`InteractiveRuntime`].
+///
+/// Production callers build these with [`Self::detect`] or
+/// [`Self::detect_with_overrides`]; tests construct them directly.
 pub struct InteractiveRuntimeOptions {
     /// Initial resolved theme (dark / light).
     pub theme: Arc<ResolvedTheme>,
@@ -757,11 +775,22 @@ impl InteractiveRuntimeOptions {
     /// worker.
     #[must_use]
     pub fn detect() -> Self {
-        let caps = TerminalCapabilities::detect();
+        Self::detect_with_overrides(TerminalCapabilityOverrides::default())
+    }
+
+    /// Build production startup options with explicit settings overrides.
+    ///
+    /// Explicit values take precedence over `PI_*` environment values, which
+    /// in turn take precedence over automatic terminal detection; fields left
+    /// unset keep the lower-layer environment result.
+    #[must_use]
+    pub fn detect_with_overrides(overrides: TerminalCapabilityOverrides) -> Self {
+        let caps = TerminalCapabilities::detect_with_overrides(overrides);
         let colorfgbg = std::env::var("COLORFGBG").ok();
+        let terminal_theme = detect_terminal_theme(caps.dark_background, colorfgbg.as_deref());
         Self {
-            caps: caps.clone(),
-            terminal_theme: detect_terminal_theme(caps.dark_background, colorfgbg.as_deref()),
+            caps,
+            terminal_theme,
             ..Self::default()
         }
     }
@@ -1689,14 +1718,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     /// Merge late startup-probe capability refinements: replace the Tui
-    /// capability set, refresh the cached true-color flag, re-detect the
-    /// polarity, and re-resolve the theme (no-op when it did not change).
+    /// capability set, refresh the cached true-color flag and the live
+    /// hyperlink flag, re-detect the polarity, and re-resolve the theme
+    /// (no-op when it did not change).
     /// Returns whether the capability set changed; the caller repaints.
     fn adopt_probe_caps(&mut self, caps: TerminalCapabilities) -> bool {
         if *self.tui.capabilities() == caps {
             return false;
         }
         *self.tui.capabilities_mut() = caps;
+        self.view.hyperlinks = self.tui.capabilities().hyperlinks;
         self.true_color = self.tui.capabilities().true_color;
         self.requery_terminal_theme();
         self.apply_theme_from_settings();
@@ -2435,7 +2466,23 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         if self.pending_extension_dialog.is_some() {
             self.cancel_extension_dialog().await;
         }
-        match self.session.reload().await {
+        let reload_result = self.session.reload().await;
+        // Re-detect after every reload attempt. Settings refresh runs before
+        // host/resource work, so a later failure must not leave the TUI on the
+        // previous capability set.
+        match self.session.detect_terminal_capabilities().await {
+            Ok(fresh) => {
+                let mut merged = self.tui.capabilities().clone();
+                merged.images = fresh.images;
+                merged.hyperlinks = fresh.hyperlinks;
+                merged.true_color = fresh.true_color;
+                self.adopt_probe_caps(merged);
+            }
+            Err(error) => {
+                self.last_error = Some(format!("reload: {error}"));
+            }
+        }
+        match reload_result {
             Ok(messages) => {
                 for message in messages {
                     self.push_notice("reload", message);
@@ -5913,6 +5960,21 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
+    fn detect_terminal_capabilities(&self) -> BoxFuture<'_, Result<TerminalCapabilities, String>> {
+        let session = self.read_session();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let overrides = {
+                    let settings = session.lock_settings();
+                    settings.get_terminal_capability_overrides()
+                };
+                TerminalCapabilities::detect_with_overrides(overrides)
+            })
+            .await
+            .map_err(|error| format!("capability detection join failed: {error}"))
+        })
+    }
+
     fn messages(&self) -> Vec<pi_agent::AgentMessage> {
         self.read_session().messages()
     }
@@ -7246,7 +7308,10 @@ mod tests {
     use futures::future::BoxFuture;
     use pi_ai::{AssistantContent, AssistantMessage, TextContent};
     use pi_tui::component::UiEvent;
-    use pi_tui::terminal::caps::TerminalCapabilities;
+    use pi_tui::terminal::caps::{
+        CellDimensions, ImageProtocol, ImageProtocolOverride, KeyboardProtocol,
+        TerminalCapabilities,
+    };
     use pi_tui::terminal::writer::Tui;
     use ratatui::layout::{Position, Size};
     use tokio::sync::{Mutex, mpsc, watch};
@@ -7268,6 +7333,23 @@ mod tests {
         let offloaded = tokio::task::spawn_blocking(InteractiveRuntimeOptions::detect)
             .await
             .map_err(|error| format!("spawn_blocking join failed: {error}"))?;
+        assert_eq!(sync.caps, offloaded.caps);
+        assert_eq!(sync.terminal_theme, offloaded.terminal_theme);
+        Ok(())
+    }
+
+    /// Async startup offloads settings-aware detection to the blocking pool;
+    /// forwarding explicit overrides must produce the same options as a direct
+    /// synchronous call.
+    #[tokio::test]
+    async fn detect_with_overrides_offloaded_matches_sync() -> TestResult {
+        let overrides = enabled_terminal_override();
+        let sync = InteractiveRuntimeOptions::detect_with_overrides(overrides);
+        let offloaded = tokio::task::spawn_blocking(move || {
+            InteractiveRuntimeOptions::detect_with_overrides(overrides)
+        })
+        .await
+        .map_err(|error| format!("spawn_blocking join failed: {error}"))?;
         assert_eq!(sync.caps, offloaded.caps);
         assert_eq!(sync.terminal_theme, offloaded.terminal_theme);
         Ok(())
@@ -7313,13 +7395,16 @@ mod tests {
         cancel_fork: Arc<std::sync::atomic::AtomicBool>,
         cancel_switch: Arc<std::sync::atomic::AtomicBool>,
         fork_selected_text: Arc<std::sync::Mutex<Option<String>>>,
-        reload_diagnostics: Arc<std::sync::Mutex<Vec<String>>>,
+        reload_result: Arc<std::sync::Mutex<Result<Vec<String>, String>>>,
         extension_runner: Option<Arc<ExtensionRuntimeSet>>,
         import_missing_cwd: Arc<std::sync::atomic::AtomicBool>,
         current_session_path: Arc<std::sync::Mutex<Option<String>>>,
         /// Held by tests to simulate session-manager lock contention.
         session_file_gate: Arc<tokio::sync::Mutex<()>>,
         session_entries: Arc<std::sync::Mutex<Vec<super::state::SessionPickerEntry>>>,
+        /// Explicit terminal capability overrides served through the
+        /// [`SessionHost`] seam (tests set these to drive reload detection).
+        capability_overrides: Arc<std::sync::Mutex<TerminalCapabilityOverrides>>,
     }
 
     impl FakeHost {
@@ -7338,12 +7423,15 @@ mod tests {
                 cancel_fork: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 cancel_switch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fork_selected_text: Arc::new(std::sync::Mutex::new(None)),
-                reload_diagnostics: Arc::new(std::sync::Mutex::new(Vec::new())),
+                reload_result: Arc::new(std::sync::Mutex::new(Ok(Vec::new()))),
                 extension_runner: None,
                 import_missing_cwd: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 current_session_path: Arc::new(std::sync::Mutex::new(None)),
                 session_file_gate: Arc::new(tokio::sync::Mutex::new(())),
                 session_entries: Arc::new(std::sync::Mutex::new(Vec::new())),
+                capability_overrides: Arc::new(std::sync::Mutex::new(
+                    TerminalCapabilityOverrides::default(),
+                )),
             };
             (host, log)
         }
@@ -7388,9 +7476,23 @@ mod tests {
 
         fn set_reload_diagnostics(&self, diagnostics: Vec<String>) {
             *self
-                .reload_diagnostics
+                .reload_result
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = diagnostics;
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Ok(diagnostics);
+        }
+
+        fn set_reload_error(&self, error: impl Into<String>) {
+            *self
+                .reload_result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Err(error.into());
+        }
+
+        fn set_capability_overrides(&self, overrides: TerminalCapabilityOverrides) {
+            *self
+                .capability_overrides
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = overrides;
         }
 
         fn session_file_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
@@ -7589,13 +7691,29 @@ mod tests {
 
         fn reload(&self) -> BoxFuture<'_, Result<Vec<String>, String>> {
             let log = Arc::clone(&self.log);
-            let diagnostics = Arc::clone(&self.reload_diagnostics);
+            let result = Arc::clone(&self.reload_result);
             Box::pin(async move {
                 *log.reloads.lock().await += 1;
-                Ok(diagnostics
+                result
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone())
+                    .clone()
+            })
+        }
+
+        fn detect_terminal_capabilities(
+            &self,
+        ) -> BoxFuture<'_, Result<TerminalCapabilities, String>> {
+            let overrides = *self
+                .capability_overrides
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    TerminalCapabilities::detect_with_overrides(overrides)
+                })
+                .await
+                .map_err(|error| format!("capability detection join failed: {error}"))
             })
         }
 
@@ -7927,14 +8045,24 @@ mod tests {
 
     fn try_make_runtime()
     -> Result<(InteractiveRuntime<SharedWriter, FakeHost>, Arc<ActionLog>), String> {
+        try_make_runtime_with_caps(TerminalCapabilities::default())
+    }
+
+    /// Runtime variant with explicit startup capabilities; reload tests pin
+    /// the probe-owned fields (sync output, kitty keyboard, cell, polarity)
+    /// against these.
+    fn try_make_runtime_with_caps(
+        caps: TerminalCapabilities,
+    ) -> Result<(InteractiveRuntime<SharedWriter, FakeHost>, Arc<ActionLog>), String> {
         let writer = SharedWriter::new();
-        let caps = TerminalCapabilities::default();
-        let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps)
+        let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps.clone())
             .map_err(|error| format!("tui construction: {error}"))?;
         let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
         let input = TerminalInput::mock(rx);
         let (host, log) = FakeHost::new();
         let options = InteractiveRuntimeOptions {
+            caps: caps.clone(),
+            terminal_theme: detect_terminal_theme(caps.dark_background, None),
             size: (80, 24),
             ..InteractiveRuntimeOptions::default()
         };
@@ -10603,6 +10731,242 @@ mod tests {
         Ok(())
     }
 
+    // ----- Terminal capability overrides: startup + /reload ----------------
+
+    /// Probe-owned startup capability set: `/reload` must replace only the
+    /// settings-owned trio (images / hyperlinks / `true_color`) and preserve
+    /// every one of these fields.
+    fn probe_owned_caps() -> TerminalCapabilities {
+        TerminalCapabilities {
+            images: None,
+            hyperlinks: false,
+            true_color: false,
+            sync_output: false,
+            keyboard_protocol: KeyboardProtocol::Kitty,
+            cell: CellDimensions {
+                width: 7,
+                height: 13,
+            },
+            dark_background: Some(false),
+        }
+    }
+
+    fn enabled_terminal_override() -> TerminalCapabilityOverrides {
+        TerminalCapabilityOverrides {
+            hyperlinks: Some(true),
+            true_color: Some(true),
+            images: Some(ImageProtocolOverride::Kitty),
+        }
+    }
+
+    fn disabled_terminal_override() -> TerminalCapabilityOverrides {
+        TerminalCapabilityOverrides {
+            hyperlinks: Some(false),
+            true_color: Some(false),
+            images: Some(ImageProtocolOverride::Disabled),
+        }
+    }
+
+    /// `InteractiveRuntimeOptions::detect_with_overrides` applies explicit
+    /// settings deterministically: forced values land verbatim, `detect()`
+    /// stays the environment-only default, and fields left unset keep the
+    /// fresh lower-layer detection result (same process, no env mutation).
+    #[test]
+    fn detect_with_overrides_applies_explicit_settings_deterministically() {
+        let auto = InteractiveRuntimeOptions::detect_with_overrides(
+            TerminalCapabilityOverrides::default(),
+        );
+        assert_eq!(
+            InteractiveRuntimeOptions::detect().caps,
+            TerminalCapabilities::detect_with_overrides(TerminalCapabilityOverrides::default()),
+            "detect() must delegate with Default::default()"
+        );
+
+        let forced_off =
+            InteractiveRuntimeOptions::detect_with_overrides(disabled_terminal_override());
+        assert!(!forced_off.caps.hyperlinks);
+        assert!(!forced_off.caps.true_color);
+        assert_eq!(forced_off.caps.images, None, "Disabled must clear images");
+
+        let forced_on =
+            InteractiveRuntimeOptions::detect_with_overrides(enabled_terminal_override());
+        assert!(forced_on.caps.hyperlinks);
+        assert!(forced_on.caps.true_color);
+        assert_eq!(forced_on.caps.images, Some(ImageProtocol::Kitty));
+
+        let iterm = InteractiveRuntimeOptions::detect_with_overrides(TerminalCapabilityOverrides {
+            images: Some(ImageProtocolOverride::ITerm2),
+            ..TerminalCapabilityOverrides::default()
+        });
+        assert_eq!(iterm.caps.images, Some(ImageProtocol::ITerm2));
+
+        // Unset fields keep the fresh detector result.
+        for forced in [forced_off.caps, forced_on.caps] {
+            assert_eq!(forced.sync_output, auto.caps.sync_output);
+            assert_eq!(forced.keyboard_protocol, auto.caps.keyboard_protocol);
+            assert_eq!(forced.cell, auto.caps.cell);
+            assert_eq!(forced.dark_background, auto.caps.dark_background);
+        }
+    }
+
+    /// The test [`SessionHost`] adapter serves explicit overrides through the
+    /// same async detection seam the production [`AgentSessionHost`] reads
+    /// settings through.
+    #[tokio::test]
+    async fn session_host_override_seam_serves_explicit_values() -> TestResult {
+        let (host, _log) = FakeHost::new();
+        let default = host.detect_terminal_capabilities().await?;
+        let fresh =
+            TerminalCapabilities::detect_with_overrides(TerminalCapabilityOverrides::default());
+        assert_eq!(default.images, fresh.images);
+        assert_eq!(default.hyperlinks, fresh.hyperlinks);
+        assert_eq!(default.true_color, fresh.true_color);
+
+        host.set_capability_overrides(TerminalCapabilityOverrides {
+            hyperlinks: Some(true),
+            true_color: Some(false),
+            images: Some(ImageProtocolOverride::ITerm2),
+        });
+        let served = host.detect_terminal_capabilities().await?;
+        assert!(served.hyperlinks);
+        assert!(!served.true_color);
+        assert_eq!(served.images, Some(ImageProtocol::ITerm2));
+        Ok(())
+    }
+
+    /// `/reload` re-detects through the [`SessionHost`] seam: a changed
+    /// explicit override lands in the live capability set.
+    #[tokio::test]
+    async fn reload_observes_changed_override_through_host_seam() -> TestResult {
+        let (mut rt, log) = try_make_runtime_with_caps(probe_owned_caps())?;
+        assert!(!rt.tui.capabilities().hyperlinks);
+        rt.session
+            .set_capability_overrides(enabled_terminal_override());
+
+        let outcome = rt.dispatch_action(ViewAction::Reload).await;
+
+        assert_eq!(outcome, ActionOutcome::Repaint);
+        assert_eq!(*log.reloads.lock().await, 1);
+        let caps = rt.tui.capabilities().clone();
+        assert!(caps.hyperlinks);
+        assert!(caps.true_color);
+        assert_eq!(caps.images, Some(ImageProtocol::Kitty));
+        Ok(())
+    }
+
+    /// Capability settings become live even when a later reload stage fails.
+    #[tokio::test]
+    async fn reload_applies_capability_changes_after_host_error() -> TestResult {
+        let (mut rt, log) = try_make_runtime_with_caps(probe_owned_caps())?;
+        rt.session
+            .set_capability_overrides(enabled_terminal_override());
+        rt.session.set_reload_error("host reload failed");
+
+        let outcome = rt.dispatch_action(ViewAction::Reload).await;
+
+        assert_eq!(outcome, ActionOutcome::Repaint);
+        assert_eq!(*log.reloads.lock().await, 1);
+        assert_eq!(rt.last_error.as_deref(), Some("host reload failed"));
+        let caps = rt.tui.capabilities().clone();
+        assert!(caps.hyperlinks);
+        assert!(caps.true_color);
+        assert_eq!(caps.images, Some(ImageProtocol::Kitty));
+        Ok(())
+    }
+
+    /// Returning the host override to the default makes the next `/reload`
+    /// serve fresh lower-layer detection again.
+    #[tokio::test]
+    async fn reload_restores_fresh_detection_when_override_returns_to_default() -> TestResult {
+        let (mut rt, _log) = try_make_runtime_with_caps(probe_owned_caps())?;
+        rt.session
+            .set_capability_overrides(enabled_terminal_override());
+        let _ = rt.dispatch_action(ViewAction::Reload).await;
+        assert!(
+            rt.tui.capabilities().hyperlinks,
+            "forced-on reload must land first"
+        );
+
+        rt.session
+            .set_capability_overrides(TerminalCapabilityOverrides::default());
+        let _ = rt.dispatch_action(ViewAction::Reload).await;
+
+        let fresh =
+            TerminalCapabilities::detect_with_overrides(TerminalCapabilityOverrides::default());
+        let caps = rt.tui.capabilities().clone();
+        assert_eq!(caps.images, fresh.images);
+        assert_eq!(caps.hyperlinks, fresh.hyperlinks);
+        assert_eq!(caps.true_color, fresh.true_color);
+        Ok(())
+    }
+
+    /// `/reload` updates the live projection: the hyperlink flag, the
+    /// true-color mode, and the resolved theme re-apply from the merged set.
+    #[tokio::test]
+    async fn reload_updates_live_hyperlink_flag_and_true_color_theme() -> TestResult {
+        let (mut rt, _log) = try_make_runtime_with_caps(probe_owned_caps())?;
+        assert!(!rt.view.hyperlinks);
+        assert!(!rt.true_color);
+        assert_eq!(
+            rt.color_mode(),
+            crate::modes::interactive::theme::ColorMode::Palette256
+        );
+        let generation_before = rt.theme_generation;
+        rt.session
+            .set_capability_overrides(TerminalCapabilityOverrides {
+                hyperlinks: Some(true),
+                true_color: Some(true),
+                ..TerminalCapabilityOverrides::default()
+            });
+
+        let _ = rt.dispatch_action(ViewAction::Reload).await;
+
+        assert!(rt.view.hyperlinks, "live hyperlink flag must follow reload");
+        assert!(rt.true_color, "true-color cache must follow reload");
+        assert_eq!(
+            rt.color_mode(),
+            crate::modes::interactive::theme::ColorMode::Truecolor
+        );
+        // Preserved polarity (dark_background Some(false)) re-resolves the
+        // theme onto the light member; the switch must regenerate it.
+        assert_eq!(rt.terminal_theme(), TerminalTheme::Light);
+        assert_eq!(rt.view.theme.name, "light");
+        assert!(
+            rt.theme_generation > generation_before,
+            "resolved theme must refresh on reload"
+        );
+        Ok(())
+    }
+
+    /// `/reload` replaces only the settings-owned trio; sync output, the
+    /// keyboard protocol, cell size, and background polarity stay under the
+    /// startup escape probes' ownership.
+    #[tokio::test]
+    async fn reload_preserves_probe_owned_capability_fields() -> TestResult {
+        let (mut rt, _log) = try_make_runtime_with_caps(probe_owned_caps())?;
+        rt.session
+            .set_capability_overrides(enabled_terminal_override());
+
+        let _ = rt.dispatch_action(ViewAction::Reload).await;
+
+        let caps = rt.tui.capabilities().clone();
+        assert!(!caps.sync_output, "sync_output must stay probe-owned");
+        assert_eq!(caps.keyboard_protocol, KeyboardProtocol::Kitty);
+        assert_eq!(
+            caps.cell,
+            CellDimensions {
+                width: 7,
+                height: 13
+            }
+        );
+        assert_eq!(
+            caps.dark_background,
+            Some(false),
+            "polarity must stay probe-owned"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn import_confirm_decline_cancels() -> TestResult {
         let (mut rt, log) = try_make_runtime()?;
@@ -11884,7 +12248,7 @@ mod tests {
     /// The boundary: width exactly 20 renders content (floor is < 20, not ≤ 20).
     #[tokio::test]
     async fn floor_boundary_20_renders_content() -> TestResult {
-        let (mut rt, _log) = try_make_runtime()?;
+        let (rt, _log) = try_make_runtime()?;
         let buf = render_view(&rt.view, 20, 24);
         assert!(
             !buffer_is_blank(&buf),

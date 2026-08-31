@@ -64,6 +64,43 @@ The native product and its TypeScript compatibility boundary have separate owner
 - An out-of-process TypeScript sidecar runs existing extensions without requiring a Rust port.
 - `pi-ext` validates inbound frames and converts raw extension UI slots to `SanitizedSlot`. `pi-tui` paints only the sanitized form. See the [extension compatibility contract](docs/extension-compatibility-contract.md#7-extension-ui-sanitization-boundary).
 
+## Terminal capability overrides
+
+`pi` detects terminal capabilities automatically. You can override three capabilities through JSON settings or environment variables. JSON settings take precedence over environment variables, which take precedence over automatic terminal detection.
+
+Precedence: `JSON settings > PI_* environment override > terminal detection`.
+
+Settings files:
+
+- Global: `~/.pi/agent/settings.json`
+- Trusted project: `.pi/settings.json` (requires project trust)
+
+Trusted-project values override global values. Both files use a nested object:
+
+```json
+{
+  "terminal": {
+    "hyperlinks": true,
+    "images": "kitty",
+    "trueColor": "auto"
+  }
+}
+```
+
+JSON keys and accepted values, under the `terminal` object:
+
+| Key | Accepted values | Effect |
+| --- | --- | --- |
+| `terminal.hyperlinks` | `true`, `false`, `"auto"` | `true` forces hyperlinks on, `false` forces them off, and `"auto"` continues to the environment override and terminal detection. |
+| `terminal.images` | `"kitty"`, `"iterm2"`, `false`, `"auto"` | Selects the inline image protocol. `false` disables images. `"auto"` continues to the environment override and terminal detection. |
+| `terminal.trueColor` | `true`, `false`, `"auto"` | `true` forces 24-bit color on, `false` forces it off, and `"auto"` continues to the environment override and terminal detection. |
+
+A trusted-project key replaces the same global key before capability resolution. If the project value is `"auto"` or invalid, resolution continues with the environment override and terminal detection instead of returning to the global value. `pi` preserves invalid known JSON values when it rewrites the settings file.
+
+Equivalent environment variables (lower precedence than JSON settings): `PI_HYPERLINKS` (`1`, `0`, `auto`), `PI_IMAGE_PROTOCOL` (`kitty`, `iterm2`, `none`, `0`, `auto`), and `PI_TRUE_COLOR` (`1`, `0`, `auto`). Run `pi --help` for the full list.
+
+Run `/reload` after changing a settings file. It recomputes images, hyperlinks, and true color through the same precedence chain. It preserves synchronized output, keyboard protocol, cell dimensions, and dark-background detection.
+
 ## Project status and limitations
 
 The repository currently has these limitations:

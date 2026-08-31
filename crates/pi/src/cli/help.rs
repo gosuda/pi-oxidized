@@ -201,6 +201,9 @@ Extensions can register additional flags (e.g., --plan from plan-mode extension)
   PI_OFFLINE                       - Disable startup network operations when set to 1/true/yes
   PI_TELEMETRY                     - Override install telemetry when set to 1/true/yes or 0/false/no
   PI_SHARE_VIEWER_URL              - Base URL for /share command (default: https://pi.dev/session/)
+  PI_HYPERLINKS                    - Hyperlink override: 1, 0, auto
+  PI_IMAGE_PROTOCOL                - Image protocol override: kitty, iterm2, none, 0, auto
+  PI_TRUE_COLOR                    - True color override: 1, 0, auto
 
 {bold_s}Built-in Tool Names:{bold_e}
   read   - Read file contents
@@ -322,5 +325,18 @@ mod tests {
         let text = format_help(None, HelpStyle::default());
         assert!(text.contains("--export ~/.pi/agent/sessions/--path--/session.jsonl"));
         assert!(text.contains("--export session.jsonl output.html"));
+    }
+
+    #[test]
+    fn help_lists_terminal_capability_override_variables_and_values() {
+        let text = format_help(None, HelpStyle { styled: false });
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines.contains(&"  PI_HYPERLINKS                    - Hyperlink override: 1, 0, auto")
+        );
+        assert!(lines.contains(&"  PI_IMAGE_PROTOCOL                - Image protocol override: kitty, iterm2, none, 0, auto"));
+        assert!(
+            lines.contains(&"  PI_TRUE_COLOR                    - True color override: 1, 0, auto")
+        );
     }
 }

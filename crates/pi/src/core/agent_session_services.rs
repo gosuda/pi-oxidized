@@ -143,7 +143,7 @@ pub struct CreateAgentSessionServicesOptions {
     pub model_runtime: Option<ModelRuntime>,
     /// Extension CLI flag values (`--flag` / `--flag value`) awaiting validation.
     pub extension_flag_values: Option<BTreeMap<String, ExtensionFlagValue>>,
-    /// Resource loader options excluding `cwd`/`agent_dir`/`settings_manager`.
+    /// Resource-loader discovery options. Services supply paths and trust.
     pub resource_loader_options: Option<ResourceLoaderServiceOptions>,
     /// Pending provider registrations discovered by extensions (tests / host).
     ///
@@ -261,7 +261,13 @@ pub struct AgentSessionServices {
     pub agent_dir: PathBuf,
     /// Shared model/auth runtime.
     pub model_runtime: ModelRuntime,
-    /// Resource loader (paths + snapshots; owns the cwd-bound settings manager).
+    /// Settings manager bound to this services `cwd`/`agent_dir`.
+    ///
+    /// The single authoritative owner until it moves into the session via
+    /// [`CreateAgentSessionResult`]. The resource loader no longer holds a
+    /// manager; it stores only the resolved `project_trusted` bit.
+    pub settings_manager: SettingsManager,
+    /// Resource loader (paths + snapshots; stores the resolved trust bit only).
     pub resource_loader: DefaultResourceLoader,
     /// Diagnostics collected during creation.
     pub diagnostics: Vec<AgentSessionRuntimeDiagnostic>,
@@ -272,19 +278,6 @@ pub struct AgentSessionServices {
     /// `None` when no extension paths were discovered, discovery was disabled,
     /// or host start failed (degraded to diagnostics only).
     pub extension_runner: Option<Arc<ExtensionRuntimeSet>>,
-}
-
-impl AgentSessionServices {
-    /// Settings manager bound to this services `cwd`/`agent_dir`.
-    #[must_use]
-    pub fn settings_manager(&self) -> &SettingsManager {
-        self.resource_loader.settings_manager()
-    }
-
-    /// Mutable settings manager.
-    pub fn settings_manager_mut(&mut self) -> &mut SettingsManager {
-        self.resource_loader.settings_manager_mut()
-    }
 }
 
 /// Inputs for creating a session from already-created services.
@@ -341,13 +334,11 @@ pub struct InitialModelResult {
     pub fallback_message: Option<String>,
 }
 
-/// Result of creating an agent session from services.
+/// Complete inputs for constructing an agent session.
 ///
-/// The concrete [`crate::core::agent_session::AgentSession`] constructor is
-/// owned by a sibling slice. This factory packages the resolved inputs and
-/// fallback message so callers (and later the real constructor) share one
-/// resolution path. When `AgentSession::new` lands, this result can carry the
-/// live session without changing the resolution contract.
+/// The result owns each cwd-bound runtime component. A caller can borrow the
+/// settings manager while it builds dependent inputs, then move the manager
+/// into the session.
 pub struct CreateAgentSessionResult {
     /// Resolved model after restore / initial selection.
     pub model: Option<Model>,
@@ -371,6 +362,8 @@ pub struct CreateAgentSessionResult {
     pub agent_dir: PathBuf,
     /// Shared model runtime.
     pub model_runtime: ModelRuntime,
+    /// Settings manager moved from services into the session (single owner).
+    pub settings_manager: SettingsManager,
     /// Resource loader retained for extension-driven reloads.
     pub resource_loader: DefaultResourceLoader,
     /// Session-start metadata forwarded from the creation options.
@@ -496,7 +489,7 @@ pub async fn create_agent_session_services_with_trust(
     let (resource_loader, discovery) = create_service_resource_loader(
         &foundation.cwd,
         &foundation.agent_dir,
-        foundation.settings_manager,
+        project_trusted,
         resource_loader_options.unwrap_or_default(),
     )
     .await?;
@@ -558,6 +551,7 @@ pub async fn create_agent_session_services_with_trust(
         cwd: foundation.cwd,
         agent_dir: foundation.agent_dir,
         model_runtime: foundation.model_runtime,
+        settings_manager: foundation.settings_manager,
         resource_loader,
         diagnostics,
         extension_flag_values: applied_flags,
@@ -613,14 +607,14 @@ async fn create_service_foundation(
 async fn create_service_resource_loader(
     cwd: &Path,
     agent_dir: &Path,
-    settings_manager: SettingsManager,
+    project_trusted: bool,
     options: ResourceLoaderServiceOptions,
 ) -> Result<(DefaultResourceLoader, ResourceDiscoveryPolicy), AgentSessionServicesError> {
     let discovery = ResourceDiscoveryPolicy::from_options(&options);
     let mut loader = DefaultResourceLoader::new(DefaultResourceLoaderOptions {
         cwd: cwd.to_path_buf(),
         agent_dir: agent_dir.to_path_buf(),
-        settings_manager: Some(settings_manager),
+        project_trusted,
         additional_extension_paths: options.additional_extension_paths,
         additional_skill_paths: options.additional_skill_paths,
         additional_prompt_template_paths: options.additional_prompt_template_paths,
@@ -981,7 +975,7 @@ pub async fn create_agent_session_from_services(
     .await;
     let mut thinking_level = explicit_thinking.unwrap_or_else(|| {
         services
-            .settings_manager()
+            .settings_manager
             .get_default_thinking_level()
             .unwrap_or(DEFAULT_THINKING_LEVEL)
     });
@@ -1004,6 +998,7 @@ pub async fn create_agent_session_from_services(
         cwd: services.cwd,
         agent_dir: services.agent_dir,
         model_runtime: services.model_runtime,
+        settings_manager: services.settings_manager,
         resource_loader: services.resource_loader,
         extension_runner: services.extension_runner,
         session_start_event,
@@ -1037,12 +1032,9 @@ async fn resolve_session_model(
             cli_model: None,
             scoped_models,
             is_continuing: has_existing_session,
-            default_provider: services
-                .settings_manager()
-                .get_default_provider()
-                .as_deref(),
-            default_model_id: services.settings_manager().get_default_model().as_deref(),
-            default_thinking_level: services.settings_manager().get_default_thinking_level(),
+            default_provider: services.settings_manager.get_default_provider().as_deref(),
+            default_model_id: services.settings_manager.get_default_model().as_deref(),
+            default_thinking_level: services.settings_manager.get_default_thinking_level(),
             model_runtime: &services.model_runtime,
         })
         .await
@@ -1642,9 +1634,9 @@ mod tests {
             )
             .await?;
 
-            assert_eq!(services.settings_manager().is_project_trusted(), trusted);
+            assert_eq!(services.settings_manager.is_project_trusted(), trusted);
             assert_eq!(
-                services.settings_manager().get_theme().as_deref(),
+                services.settings_manager.get_theme().as_deref(),
                 Some(if trusted { "project" } else { "global" })
             );
         }
@@ -1761,5 +1753,62 @@ mod tests {
         );
         assert!(map.contains_key("/ext/d"));
         assert!(map.contains_key("/resolved/d"));
+    }
+    #[tokio::test]
+    async fn result_settings_manager_is_the_services_manager_not_a_reconstruction() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let cwd = dir.path().join("project");
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(&cwd)?;
+        std::fs::create_dir_all(&agent)?;
+
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let mut services = create_agent_session_services(CreateAgentSessionServicesOptions {
+            cwd,
+            agent_dir: Some(agent),
+            model_runtime: Some(runtime),
+            resource_loader_options: Some(ResourceLoaderServiceOptions {
+                no_extensions: true,
+                no_skills: true,
+                no_prompt_templates: true,
+                no_themes: true,
+                no_context_files: true,
+                ..ResourceLoaderServiceOptions::default()
+            }),
+            ..CreateAgentSessionServicesOptions::default()
+        })
+        .await?;
+
+        // Apply a NON-PERSISTED in-memory override. A freshly reconstructed
+        // manager (the old duplicate-owner bug) reads only disk and cannot
+        // observe this value; the single-owner manager carried from services
+        // can.
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "theme".to_owned(),
+            serde_json::Value::String("in-memory-sentinel".to_owned()),
+        );
+        services.settings_manager.apply_overrides(&overrides);
+
+        let result = create_agent_session_from_services(CreateAgentSessionFromServicesOptions {
+            services,
+            model: None,
+            thinking_level: None,
+            scoped_models: Vec::new(),
+            tools: None,
+            exclude_tools: None,
+            no_tools: None,
+            session_start_event: None,
+            saved_session_model: None,
+            has_existing_session: false,
+        })
+        .await?;
+
+        assert_eq!(
+            result.settings_manager.get_theme().as_deref(),
+            Some("in-memory-sentinel"),
+            "result must carry the services manager, not a disk-only reconstruction"
+        );
+        Ok(())
     }
 }

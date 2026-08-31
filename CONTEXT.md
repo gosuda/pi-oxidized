@@ -27,3 +27,13 @@ The staging and destination paths stay on one filesystem. If that filesystem rej
 The alignment classifier treats every content-addressed generation as a structural historical witness only after its full hash and bundle grammar pass. Retired identity is allowed only inside the canonical-witness JSON fence; the rendered map remains subject to normal scanning.
 
 `scripts/verification/map.ts` owns pointer and bundle parsing plus registry verification. `scripts/verification/publish-map.ts` owns generation installation and pointer selection. `scripts/verification/publish-map.test.ts` is the executable failure matrix.
+
+## Terminal capabilities
+
+**Terminal capability override**:
+An explicit image-protocol, hyperlink, or true-color choice. JSON settings take precedence over `PI_*` environment values. `auto`, absence, and invalid values do not set an explicit choice, so environment overrides and terminal detection still apply. Invalid known values remain in the raw settings map for round-trip preservation.
+_Avoid_: Capability flag, terminal preference
+
+**Probe-owned refinement**:
+A terminal fact learned from the startup escape-sequence exchange, such as keyboard protocol, cell dimensions, synchronized output, or background polarity. Settings reload preserves these facts.
+_Avoid_: Terminal override
