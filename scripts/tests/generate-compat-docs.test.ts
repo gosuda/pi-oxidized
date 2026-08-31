@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -195,36 +194,6 @@ describe("generate-compat-docs: no hand-edited version numbers in other docs", (
 		const pins = collectPins();
 		const drift = findRegisteredPinsInOtherDocs(pins, REPO_ROOT);
 		expect(drift).toEqual([]);
-	});
-
-	test("execution-map title pins are opaque but prose pins still fail", () => {
-		const root = mkdtempSync(join(tmpdir(), "compat-map-pin-scan-"));
-		const docs = join(root, "docs");
-		mkdirSync(docs);
-		const pins = collectPins();
-		writeFileSync(
-			join(docs, "EXECUTION_MAP.md"),
-			[
-				"# Execution map",
-				"",
-				"## Registry",
-				"",
-				"| Stable ID | Kind | Issue | Title | blocked_by |",
-				"| --- | --- | --- | --- | --- |",
-				"| REL-T5 | task | #113 | Pin compat-matrix 0.2.0 | REL-T4 |",
-				"",
-				"## Evidence",
-				"",
-				"Hand-edited 0.2.0 claim.",
-			].join("\n"),
-		);
-		try {
-			expect(findRegisteredPinsInOtherDocs(pins, root)).toEqual([
-				"EXECUTION_MAP.md:11 — registered pin value found outside compatibility.md: 0.2.0",
-			]);
-		} finally {
-			rmSync(root, { recursive: true, force: true });
-		}
 	});
 });
 

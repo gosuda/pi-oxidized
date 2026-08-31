@@ -146,8 +146,6 @@ export function loadCurrentExecutionMap(repoRoot: string): CurrentExecutionMap {
 // Published pins
 // ============================================================================
 
-export const SNAPSHOT_PATH = "scripts/verification/fixtures/execution-map-ticket-records.json";
-export const MAP_DOC_PATH = "docs/EXECUTION_MAP.md";
 export const PARITY_LEDGER_PATH = "docs/PARITY_LEDGER.md";
 
 export const MAP_ROOT_ID = "MAP-ROOT";
@@ -288,14 +286,17 @@ export function parseSnapshot(snapshotText: string): { snapshot: Snapshot | null
 	try {
 		parsed = JSON.parse(snapshotText);
 	} catch (error) {
-		return { snapshot: null, problems: [`${SNAPSHOT_PATH} is not valid JSON: ${String(error)}`] };
+		return {
+			snapshot: null,
+			problems: [`witness selected by ${EXECUTION_MAP_CURRENT_PATH} is not valid JSON: ${String(error)}`],
+		};
 	}
 	if (typeof parsed !== "object" || parsed === null) {
-		return { snapshot: null, problems: [`${SNAPSHOT_PATH} is not a JSON object`] };
+		return { snapshot: null, problems: [`witness selected by ${EXECUTION_MAP_CURRENT_PATH} is not a JSON object`] };
 	}
 	const candidate = parsed as Partial<Snapshot>;
 	if (!Array.isArray(candidate.records)) {
-		return { snapshot: null, problems: [`${SNAPSHOT_PATH} has no records array`] };
+		return { snapshot: null, problems: [`witness selected by ${EXECUTION_MAP_CURRENT_PATH} has no records array`] };
 	}
 	const snapshot: Snapshot = {
 		version: typeof candidate.version === "number" ? candidate.version : -1,
@@ -516,7 +517,7 @@ export function parseExecutionMap(mapText: string): ParsedMapDocument {
 			telemetrySites.push(`${path}:${startText}-${endText}`);
 		}
 	}
-	if (rows.length === 0) problems.push(`${MAP_DOC_PATH} contains no registry rows`);
+	if (rows.length === 0) problems.push(`map selected by ${EXECUTION_MAP_CURRENT_PATH} contains no registry rows`);
 	return { rows, telemetrySites, headerHash, problems };
 }
 
@@ -644,10 +645,10 @@ function checkRowSet(docRows: readonly MapRow[], expected: readonly ExpectedRow[
 	const docIds = new Set(docRows.map((row) => row.stableId));
 	const expectedIds = new Set(expected.map((row) => row.stableId));
 	for (const id of [...expectedIds].sort()) {
-		if (!docIds.has(id)) violations.push(`registry row ${id} is missing from ${MAP_DOC_PATH}`);
+		if (!docIds.has(id)) violations.push(`registry row ${id} is missing from the map selected by ${EXECUTION_MAP_CURRENT_PATH}`);
 	}
 	for (const id of [...docIds].sort()) {
-		if (!expectedIds.has(id)) violations.push(`${MAP_DOC_PATH} row ${id} matches no snapshot record`);
+		if (!expectedIds.has(id)) violations.push(`map selected by ${EXECUTION_MAP_CURRENT_PATH} has row ${id}, which matches no witness record`);
 	}
 	if (expected.length !== EXPECTED_ROW_COUNT) {
 		violations.push(
@@ -655,7 +656,7 @@ function checkRowSet(docRows: readonly MapRow[], expected: readonly ExpectedRow[
 		);
 	}
 	if (docRows.length !== EXPECTED_ROW_COUNT) {
-		violations.push(`${MAP_DOC_PATH} has ${docRows.length} rows, expected ${EXPECTED_ROW_COUNT}`);
+		violations.push(`map selected by ${EXECUTION_MAP_CURRENT_PATH} has ${docRows.length} rows, expected ${EXPECTED_ROW_COUNT}`);
 	}
 	return violations;
 }
@@ -701,9 +702,9 @@ function checkAliases(docRows: readonly MapRow[], expected: readonly ExpectedRow
 		fields.push({ where: `registry ${record.stableId}`, text: record.acceptance ?? "" });
 	}
 	for (const row of docRows) {
-		fields.push({ where: `${MAP_DOC_PATH} ${row.stableId}`, text: row.stableId });
-		fields.push({ where: `${MAP_DOC_PATH} ${row.stableId}`, text: row.title });
-		fields.push({ where: `${MAP_DOC_PATH} ${row.stableId}`, text: row.blockedBy.join(", ") });
+		fields.push({ where: `current map ${row.stableId}`, text: row.stableId });
+		fields.push({ where: `current map ${row.stableId}`, text: row.title });
+		fields.push({ where: `current map ${row.stableId}`, text: row.blockedBy.join(", ") });
 	}
 	for (const field of fields) {
 		for (const token of BANNED_ALIAS_TOKENS) {
@@ -941,7 +942,7 @@ function checkTelemetryPin(docRows: readonly MapRow[], telemetrySites: readonly 
 	for (const pin of PINNED_AGENT_LOOP_CONFIG_SITES) {
 		const site = `${pin.path}:${pin.start}-${pin.end}`;
 		if (!documented.has(site)) {
-			violations.push(`pinned AgentLoopConfig site ${site} is missing from ${MAP_DOC_PATH}`);
+			violations.push(`pinned AgentLoopConfig site ${site} is missing from the map selected by ${EXECUTION_MAP_CURRENT_PATH}`);
 		}
 	}
 	if (telemetrySites.length !== PINNED_AGENT_LOOP_CONFIG_SITES.length) {
@@ -950,7 +951,7 @@ function checkTelemetryPin(docRows: readonly MapRow[], telemetrySites: readonly 
 		);
 	}
 	if (docRows.length > 0 && telemetrySites.length === 0) {
-		violations.push(`${MAP_DOC_PATH} has no pinned telemetry migration surface`);
+		violations.push(`map selected by ${EXECUTION_MAP_CURRENT_PATH} has no pinned telemetry migration surface`);
 	}
 	return violations;
 }
@@ -977,16 +978,22 @@ export function runMapLedgerChecks(inputs: MapLedgerInputs): string[] {
 	const snapshot = parsed.snapshot;
 	if (snapshot === null) return violations;
 
-	if (snapshot.version !== 2) add("snapshot", [`${SNAPSHOT_PATH} version is ${snapshot.version}, expected 2`]);
+	if (snapshot.version !== 2) {
+		add("snapshot", [`witness selected by ${EXECUTION_MAP_CURRENT_PATH} has version ${snapshot.version}, expected 2`]);
+	}
 	if (snapshot.repository !== "gosuda/pi-oxidized") {
-		add("snapshot", [`${SNAPSHOT_PATH} repository is '${snapshot.repository}', expected 'gosuda/pi-oxidized'`]);
+		add("snapshot", [
+			`witness selected by ${EXECUTION_MAP_CURRENT_PATH} has repository '${snapshot.repository}', expected 'gosuda/pi-oxidized'`,
+		]);
 	}
 	if (snapshot.canonicalIssue !== 12) {
-		add("snapshot", [`${SNAPSHOT_PATH} canonicalIssue is ${snapshot.canonicalIssue}, expected 12`]);
+		add("snapshot", [
+			`witness selected by ${EXECUTION_MAP_CURRENT_PATH} has canonicalIssue ${snapshot.canonicalIssue}, expected 12`,
+		]);
 	}
 	if (snapshot.sourceHash !== SNAPSHOT_SOURCE_HASH) {
 		add("source-hash", [
-			`${SNAPSHOT_PATH} sourceHash '${snapshot.sourceHash}' does not match the pinned ${SNAPSHOT_SOURCE_HASH}; the witness was not published by the live authority`,
+			`witness selected by ${EXECUTION_MAP_CURRENT_PATH} has sourceHash '${snapshot.sourceHash}', which does not match the pinned ${SNAPSHOT_SOURCE_HASH}; the live authority did not publish this witness`,
 		]);
 	}
 	try {
@@ -1003,30 +1010,30 @@ export function runMapLedgerChecks(inputs: MapLedgerInputs): string[] {
 	const externalCount = snapshot.records.filter((record) => record.kind === "external").length;
 	if (snapshot.sourceRecordCount !== snapshot.records.length) {
 		add("source-hash", [
-			`${SNAPSHOT_PATH} sourceRecordCount is ${snapshot.sourceRecordCount} but ${snapshot.records.length} record(s) parsed`,
+			`selected witness sourceRecordCount is ${snapshot.sourceRecordCount} but ${snapshot.records.length} record(s) parsed`,
 		]);
 	}
 	if (snapshot.sourceRecordCount !== EXPECTED_SOURCE_RECORD_COUNT) {
 		add("source-hash", [
-			`${SNAPSHOT_PATH} sourceRecordCount is ${snapshot.sourceRecordCount}, expected ${EXPECTED_SOURCE_RECORD_COUNT}`,
+			`selected witness sourceRecordCount is ${snapshot.sourceRecordCount}, expected ${EXPECTED_SOURCE_RECORD_COUNT}`,
 		]);
 	}
 	if (snapshot.taskCount !== executionCount) {
 		add("source-hash", [
-			`${SNAPSHOT_PATH} taskCount is ${snapshot.taskCount} but ${executionCount} execution record(s) parsed`,
+			`selected witness taskCount is ${snapshot.taskCount} but ${executionCount} execution record(s) parsed`,
 		]);
 	}
 	if (snapshot.taskCount !== EXPECTED_TASK_COUNT) {
-		add("source-hash", [`${SNAPSHOT_PATH} taskCount is ${snapshot.taskCount}, expected ${EXPECTED_TASK_COUNT}`]);
+		add("source-hash", [`selected witness taskCount is ${snapshot.taskCount}, expected ${EXPECTED_TASK_COUNT}`]);
 	}
 	if (snapshot.externalCount !== externalCount) {
 		add("source-hash", [
-			`${SNAPSHOT_PATH} externalCount is ${snapshot.externalCount} but ${externalCount} external record(s) parsed`,
+			`selected witness externalCount is ${snapshot.externalCount} but ${externalCount} external record(s) parsed`,
 		]);
 	}
 	if (snapshot.externalCount !== EXPECTED_EXTERNAL_COUNT) {
 		add("source-hash", [
-			`${SNAPSHOT_PATH} externalCount is ${snapshot.externalCount}, expected ${EXPECTED_EXTERNAL_COUNT}`,
+			`selected witness externalCount is ${snapshot.externalCount}, expected ${EXPECTED_EXTERNAL_COUNT}`,
 		]);
 	}
 
@@ -1044,7 +1051,7 @@ export function runMapLedgerChecks(inputs: MapLedgerInputs): string[] {
 	add("map-document", doc.problems);
 	if (doc.headerHash === null || doc.headerHash !== SNAPSHOT_STRUCTURAL_SHA256) {
 		add("structural-hash", [
-			`${MAP_DOC_PATH} header must state exactly the pinned snapshot structural sha256 ${SNAPSHOT_STRUCTURAL_SHA256}`,
+			`map selected by ${EXECUTION_MAP_CURRENT_PATH} must state exactly the pinned snapshot structural sha256 ${SNAPSHOT_STRUCTURAL_SHA256}`,
 		]);
 	}
 

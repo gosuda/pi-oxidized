@@ -45,8 +45,6 @@ import {
 	renderExecutionMapPointer,
 } from "./map.ts";
 
-const WITNESS_PATH = "scripts/verification/fixtures/execution-map-ticket-records.json";
-const MAP_DOC_PATH = "docs/EXECUTION_MAP.md";
 const REPOSITORY = "gosuda/pi-oxidized";
 
 export interface PublisherRecord {
@@ -141,7 +139,7 @@ function buildWitnessText(envelope: WitnessEnvelope, sourceHash: string): string
  * modalities), or declared counts that do not match the actual validated
  * records. Malformed envelope metadata cannot reach publication.
  */
-export function validateAndRender(envelope: WitnessEnvelope): {
+function validateAndRender(envelope: WitnessEnvelope): {
 	witnessText: string;
 	mapText: string;
 	sourceHash: string;
@@ -307,137 +305,6 @@ export function publishExecutionMap(
 	} catch (primaryFailure) {
 		throwWithCleanup(primaryFailure, cleanupKnownStages(fs, knownStages));
 	}
-}
-
-/**
- * Filesystem operations the publication transaction depends on. This seam
- * exists solely to protect the two-output publication invariant and to allow
- * failure-injection tests; it is not a general filesystem abstraction.
- */
-export interface PublicationFilesystem {
-	writeFileSync(path: string, data: string): void;
-	renameSync(from: string, to: string): void;
-	unlinkSync(path: string): void;
-	existsSync(path: string): boolean;
-}
-
-export interface PublicationDestination {
-	readonly path: string;
-	readonly content: string;
-}
-
-const realFilesystem: PublicationFilesystem = {
-	writeFileSync,
-	renameSync,
-	unlinkSync,
-	existsSync,
-};
-
-let transactionCounter = 0;
-function transactionSuffix(): string {
-	transactionCounter += 1;
-	return `${process.pid.toString(36)}-${transactionCounter.toString(36)}`;
-}
-
-/**
- * Two-output publication transaction. Materialize both complete outputs into
- * unique same-directory staging files, preserve both prior destinations as
- * unique same-directory backups, install both staged files with synchronous
- * same-directory renames, then remove backups.
- *
- * No destination is ever written directly: only same-directory renames move
- * fully-materialized content into place. If any staging, backup, or install
- * operation throws, restore every prior destination from its backup (or
- * remove it if it had no prior file), remove any staged partial, and rethrow
- * the primary failure. If rollback also fails, surface both the primary and
- * rollback failures rather than hiding either.
- */
-export function publishPair(fs: PublicationFilesystem, destinations: readonly PublicationDestination[]): void {
-	if (destinations.length === 0) throw new Error("publishPair requires at least one destination");
-	const suffix = transactionSuffix();
-	const staged: string[] = [];
-	const backups: Array<{ backup: string; original: string }> = [];
-	const noPrior: string[] = [];
-	try {
-		for (const dest of destinations) {
-			const stagingPath = `${dest.path}.stage-${suffix}`;
-			fs.writeFileSync(stagingPath, dest.content);
-			staged.push(stagingPath);
-		}
-		for (const dest of destinations) {
-			if (fs.existsSync(dest.path)) {
-				const backupPath = `${dest.path}.backup-${suffix}`;
-				fs.renameSync(dest.path, backupPath);
-				backups.push({ backup: backupPath, original: dest.path });
-			} else {
-				noPrior.push(dest.path);
-			}
-		}
-		for (let i = 0; i < destinations.length; i += 1) {
-			const stagingPath = staged[i];
-			const dest = destinations[i];
-			if (stagingPath === undefined || dest === undefined) {
-				throw new Error("publishPair: staging invariant violated — staged/destination index mismatch");
-			}
-			fs.renameSync(stagingPath, dest.path);
-			staged[i] = "";
-		}
-		for (const backup of backups) {
-			fs.unlinkSync(backup.backup);
-		}
-	} catch (primaryFailure) {
-		const rollbackErrors: unknown[] = [];
-		for (let bi = backups.length - 1; bi >= 0; bi -= 1) {
-			const backup = backups[bi];
-			if (backup === undefined) continue;
-			try {
-				if (fs.existsSync(backup.original)) fs.unlinkSync(backup.original);
-				fs.renameSync(backup.backup, backup.original);
-			} catch (rollbackError) {
-				rollbackErrors.push(rollbackError);
-			}
-		}
-		for (const path of noPrior) {
-			try {
-				if (fs.existsSync(path)) fs.unlinkSync(path);
-			} catch (rollbackError) {
-				rollbackErrors.push(rollbackError);
-			}
-		}
-		for (const stagingPath of staged) {
-			if (stagingPath === "") continue;
-			try {
-				fs.unlinkSync(stagingPath);
-			} catch (rollbackError) {
-				rollbackErrors.push(rollbackError);
-			}
-		}
-		if (rollbackErrors.length > 0) {
-			throw new AggregateError(
-				[primaryFailure, ...rollbackErrors],
-				"publishPair: publication failed and rollback could not fully restore prior destinations",
-			);
-		}
-		throw primaryFailure;
-	}
-}
-
-/**
- * Legacy two-output pair publication. Superseded by publishExecutionMap;
- * retained only until the deletion-only cleanup commit removes it together
- * with publishPair, its destination type, and the old adapter.
- */
-export function publishFromEnvelope(
-	envelope: WitnessEnvelope,
-	fs: PublicationFilesystem,
-	rootDir: string,
-): { sourceHash: string; structuralSha: string; recordCount: number } {
-	const { witnessText, mapText, sourceHash, structuralSha } = validateAndRender(envelope);
-	publishPair(fs, [
-		{ path: join(rootDir, WITNESS_PATH), content: witnessText },
-		{ path: join(rootDir, MAP_DOC_PATH), content: mapText },
-	]);
-	return { sourceHash, structuralSha, recordCount: envelope.records.length };
 }
 
 async function main(): Promise<void> {

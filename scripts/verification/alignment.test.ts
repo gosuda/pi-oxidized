@@ -4,8 +4,6 @@ import {
 	ALIGNMENT_POLICY_PATH,
 	CLASSIFIER_FIXTURE_PATH,
 	HISTORICAL_LABEL,
-	ISSUE_RECORD_PATH,
-	ISSUE_RECORD_SHA256,
 	LEDGER_CARRIER_PATH,
 	LEGACY_ALLOWANCES,
 	PIN_LITERAL_PATHS,
@@ -73,7 +71,6 @@ describe("VER-ALIGN reference identity", () => {
 				"docs/PERF-R8-paired-baselines.md",
 				"docs/performance/floors/memory-resource-units.md",
 				"docs/performance/t11-iterations.md",
-				ISSUE_RECORD_PATH,
 				"scripts/reference-identity.ts",
 			].sort(),
 		);
@@ -240,29 +237,12 @@ describe("VER-ALIGN legacy identity classifier", () => {
 		expect(problems.some((p) => p.includes("unlabelled") && p.includes("legacy-sha-full"))).toBe(true);
 	});
 
-	test("classifier rejects a drifted immutable issue record", () => {
-		const issueAllowance = LEGACY_ALLOWANCES[ISSUE_RECORD_PATH];
-		if (issueAllowance === undefined) throw new Error("issue allowance is missing");
+	test("classifier rejects closure contamination in DOC-F sources", () => {
 		const problems = verifyLegacyIdentity(
-			{ [ISSUE_RECORD_PATH]: "{}\n" },
-			{ [ISSUE_RECORD_PATH]: issueAllowance },
-		);
-		expect(problems.some((p) => p.includes("digest drift") && p.includes(ISSUE_RECORD_SHA256))).toBe(true);
-	});
-
-	test("classifier rejects closure contamination in DOC-F and PERF-CLOSE sources", () => {
-		const docf = verifyLegacyIdentity(
 			{ "docs/DOC-F-closure-evidence.md": `witness: ${LEGACY_REFERENCE_ROOT}/README.md\n` },
 			{},
 		);
-		expect(docf.some((p) => p.includes("current DOC-F source consuming a legacy witness"))).toBe(true);
-		const issueAllowance = LEGACY_ALLOWANCES[ISSUE_RECORD_PATH];
-		if (issueAllowance === undefined) throw new Error("issue allowance is missing");
-		const perf = verifyLegacyIdentity(
-			{ "docs/performance/PERF-CLOSE-evidence.md": `tickets: ${ISSUE_RECORD_PATH}\n` },
-			{ [ISSUE_RECORD_PATH]: issueAllowance },
-		);
-		expect(perf.some((p) => p.includes("current PERF-CLOSE source consuming a legacy witness"))).toBe(true);
+		expect(problems.some((problem) => problem.includes("current DOC-F source consuming a legacy witness"))).toBe(true);
 	});
 
 	test("classifier passes the canonical witnesses byte-exactly", () => {

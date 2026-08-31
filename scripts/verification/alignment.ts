@@ -63,12 +63,6 @@ export const LEDGER_CARRIER_PATH = "scripts/verification/docs-evidence.json";
 export const ALIGNMENT_POLICY_PATH = "scripts/verification/alignment.ts";
 export const CLASSIFIER_FIXTURE_PATH = "scripts/verification/alignment.test.ts";
 
-/** Immutable historical issue record allowed to retain retired identity. */
-export const ISSUE_RECORD_PATH = "scripts/verification/fixtures/execution-map-ticket-records.json";
-
-/** Exact SHA-256 of the immutable issue record; any byte drift fails closed. */
-export const ISSUE_RECORD_SHA256 = "be2accf8885ad352aac75cfb48d12dc78f2589c328bb01a1c254c6ce92b5b178";
-
 /** Inline marker every counted legacy occurrence must carry on its line. */
 export const HISTORICAL_LABEL = "historical witness";
 
@@ -278,13 +272,6 @@ export const LEGACY_ALLOWANCES: Readonly<Record<string, LegacyAllowance>> = {
 			"legacy-sha-full": 1,
 			"retired-sha-full": 1,
 		},
-	},
-	[ISSUE_RECORD_PATH]: {
-		label: "immutable issue record",
-		reason:
-			"issued execution-map ticket text is a frozen historical record; any byte drift fails closed and its retired identity is never closure-eligible",
-		closureEligible: false,
-		digest: ISSUE_RECORD_SHA256,
 	},
 	"docs/PERF-R2-workload-surface-ranking.md": {
 		label: "historical performance ranking",

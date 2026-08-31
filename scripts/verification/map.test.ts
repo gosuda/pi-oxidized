@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import {
 	EXPECTED_EXTERNAL_COUNT,
 	EXPECTED_ROW_COUNT,
@@ -31,13 +31,6 @@ import {
 	runMapLedgerChecks,
 } from "./map.ts";
 import { section as extractSection } from "./fetch-map-source.ts";
-import {
-	type PublicationFilesystem,
-	type WitnessEnvelope,
-	publishFromEnvelope,
-	publishPair,
-	validateAndRender,
-} from "./publish-map.ts";
 import { PINNED_AGENT_LOOP_CONFIG_SITES, REPO_ROOT } from "./parity.ts";
 
 const CURRENT_EXECUTION_MAP = loadCurrentExecutionMap(REPO_ROOT);
@@ -176,7 +169,11 @@ describe("execution map ledger (MAP-1)", () => {
 		const violations = run(mutated);
 		expect(violations.some((entry) => entry.includes("two rows share issue #111"))).toBe(true);
 		expect(violations.some((entry) => entry.includes("banned retired spelling 'REL-PKGDOC'"))).toBe(true);
-		expect(violations.some((entry) => entry.includes("row REL-PKGDOC matches no snapshot record"))).toBe(true);
+		expect(
+			violations.some(
+				(entry) => entry.includes("row REL-PKGDOC") && entry.includes("matches no witness record"),
+			),
+		).toBe(true);
 	});
 
 	test("mutation: an exact duplicate row fails duplicate detection", () => {
@@ -329,7 +326,7 @@ describe("execution map ledger (MAP-1)", () => {
 		const mutated = MAP_TEXT.replace(headerLine, "");
 		const violations = run(mutated);
 		expect(
-			violations.some((entry) => entry.startsWith("[structural-hash]") && entry.includes("header must state")),
+			violations.some((entry) => entry.startsWith("[structural-hash]") && entry.includes("must state exactly")),
 		).toBe(true);
 	});
 
@@ -422,96 +419,6 @@ describe("execution map ledger (MAP-1)", () => {
 		).toBe(true);
 	});
 
-	test("publication: malformed structural record produces validation problems and publication rejects before any write", () => {
-		const parsed: unknown = JSON.parse(SNAPSHOT_TEXT);
-		if (typeof parsed !== "object" || parsed === null) throw new Error("snapshot must parse");
-		const container = parsed as { records?: unknown[] };
-		const records = container.records;
-		if (records === undefined || !Array.isArray(records)) throw new Error("snapshot must have records");
-		const first = records[0] as Record<string, unknown>;
-		if (first === undefined) throw new Error("snapshot must have at least one record");
-		const originalKindFirst = first.kind;
-		first.kind = "bogus";
-		const envelope = parsed as WitnessEnvelope;
-		let threw = false;
-		try {
-			validateAndRender(envelope);
-		} catch (error) {
-			threw = true;
-			expect(String(error)).toContain("validation problems");
-		}
-		expect(threw).toBe(true);
-		first.kind = originalKindFirst;
-		const originalModality = first.modality;
-		first.modality = "nonexistent";
-		let modalityThrew = false;
-		try {
-			validateAndRender(envelope);
-		} catch (error) {
-			modalityThrew = true;
-			expect(String(error)).toContain("validation problems");
-		}
-		expect(modalityThrew).toBe(true);
-		first.modality = originalModality;
-		let writeCount = 0;
-		const trackingFs: PublicationFilesystem = {
-			writeFileSync: () => { writeCount += 1; },
-			renameSync: () => { writeCount += 1; },
-			unlinkSync: () => { writeCount += 1; },
-			existsSync: () => false,
-		};
-		first.kind = "bogus";
-		let envelopeThrew = false;
-		try {
-			publishFromEnvelope(envelope, trackingFs, "/nonexistent-root");
-		} catch {
-			envelopeThrew = true;
-		}
-		expect(envelopeThrew).toBe(true);
-		expect(writeCount).toBe(0);
-		first.kind = originalKindFirst;
-	});
-
-	test("publication: injected failure while installing the second destination restores both original outputs and leaves no staging/backup files", () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "publish-pair-test-"));
-		try {
-			const witnessDest = join(tempDir, "witness.json");
-			const mapDest = join(tempDir, "map.md");
-			const originalWitness = "ORIGINAL_WITNESS\n";
-			const originalMap = "ORIGINAL_MAP\n";
-			writeFileSync(witnessDest, originalWitness);
-			writeFileSync(mapDest, originalMap);
-			const failingFs: PublicationFilesystem = {
-				writeFileSync,
-				renameSync: (from: string, to: string) => {
-					if (to === mapDest && from.includes(".stage-")) {
-						throw new Error("injected install failure on second destination");
-					}
-					renameSync(from, to);
-				},
-				unlinkSync,
-				existsSync,
-			};
-			let caught: unknown = null;
-			try {
-				publishPair(failingFs, [
-					{ path: witnessDest, content: "NEW_WITNESS\n" },
-					{ path: mapDest, content: "NEW_MAP\n" },
-				]);
-			} catch (error) {
-				caught = error;
-			}
-			expect(caught).not.toBeNull();
-			expect(String(caught)).toContain("injected install failure");
-			expect(readFileSync(witnessDest, "utf8")).toBe(originalWitness);
-			expect(readFileSync(mapDest, "utf8")).toBe(originalMap);
-			const leftovers = readdirSync(tempDir).filter((name) => name !== "witness.json" && name !== "map.md");
-			expect(leftovers).toEqual([]);
-		} finally {
-			rmSync(tempDir, { recursive: true, force: true });
-		}
-	});
-
 	test("section parser: suffixed required heading is rejected while trailing whitespace and CRLF remain accepted", () => {
 		const body = [
 			"Stable ID: `ARC-T2`",
@@ -583,8 +490,8 @@ describe("execution-map immutable publication reader", () => {
 			`${pointer}${pointer}`,
 			pointer.replace(generationId, generationId.toUpperCase()),
 			`[Execution map](generations/${generationId}.md)\n`,
+			`[Current execution map](legacy/map.md)\n`,
 			`[Current execution map](generations/${"z".repeat(64)}.md)\n`,
-			"[Current execution map](docs/EXECUTION_MAP.md)\n",
 			`[Current execution map](generations/${generationId.slice(0, 63)}.md)\n`,
 		];
 		for (const candidate of malformed) {
@@ -600,7 +507,7 @@ describe("execution-map immutable publication reader", () => {
 			`generations/${"0A".repeat(32)}.md`,
 			`generations/${"0a".repeat(31)}.md`,
 			".staging/0a.md",
-			"docs/EXECUTION_MAP.md",
+			"legacy-map.md",
 		];
 		for (const candidate of rejected) {
 			expect(isExecutionMapGenerationPath(candidate)).toBe(false);
