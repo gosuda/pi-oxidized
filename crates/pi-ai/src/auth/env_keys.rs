@@ -14,11 +14,12 @@ use futures::future::BoxFuture;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
+use super::builtin::{api_key_env_vars, auth_env_vars};
 use super::config_value::resolve_config_value;
 use super::error::AuthError;
 use super::types::{
     ApiKeyAuth, ApiKeyCredential, AuthCheck, AuthContext, AuthInteraction, AuthPrompt, AuthResult,
-    AuthType, ModelAuth, OAuthAuth, OAuthCredential, ProviderEnv,
+    ModelAuth, OAuthAuth, OAuthCredential, ProviderEnv,
 };
 
 /// Status-only marker returned when Vertex ADC or Bedrock ambient credentials
@@ -100,60 +101,12 @@ pub fn has_vertex_adc_credentials(env: Option<&ProviderEnv>) -> bool {
     exists
 }
 
-/// Known API-key environment variables for a provider, in precedence order.
-///
-/// Ambient-only sources (AWS profiles, ADC files) are intentionally excluded.
-#[must_use]
-pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
-    if provider == "github-copilot" {
-        return Some(&["COPILOT_GITHUB_TOKEN"]);
-    }
-
-    // ANTHROPIC_OAUTH_TOKEN takes precedence over ANTHROPIC_API_KEY.
-    if provider == "anthropic" {
-        return Some(&["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]);
-    }
-
-    Some(match provider {
-        "ant-ling" => &["ANT_LING_API_KEY"],
-        "openai" => &["OPENAI_API_KEY"],
-        "azure-openai-responses" => &["AZURE_OPENAI_API_KEY"],
-        "nvidia" => &["NVIDIA_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
-        "google" => &["GEMINI_API_KEY"],
-        "google-vertex" => &["GOOGLE_CLOUD_API_KEY"],
-        "groq" => &["GROQ_API_KEY"],
-        "cerebras" => &["CEREBRAS_API_KEY"],
-        "xai" => &["XAI_API_KEY"],
-        "radius" => &["RADIUS_API_KEY"],
-        "openrouter" => &["OPENROUTER_API_KEY"],
-        "vercel-ai-gateway" => &["AI_GATEWAY_API_KEY"],
-        "zai" => &["ZAI_API_KEY"],
-        "zai-coding-cn" => &["ZAI_CODING_CN_API_KEY"],
-        "mistral" => &["MISTRAL_API_KEY"],
-        "minimax" => &["MINIMAX_API_KEY"],
-        "minimax-cn" => &["MINIMAX_CN_API_KEY"],
-        "moonshotai" | "moonshotai-cn" => &["MOONSHOT_API_KEY"],
-        "huggingface" => &["HF_TOKEN"],
-        "fireworks" => &["FIREWORKS_API_KEY"],
-        "together" => &["TOGETHER_API_KEY"],
-        "opencode" | "opencode-go" => &["OPENCODE_API_KEY"],
-        "kimi-coding" => &["KIMI_API_KEY"],
-        "cloudflare-workers-ai" | "cloudflare-ai-gateway" => &["CLOUDFLARE_API_KEY"],
-        "xiaomi" => &["XIAOMI_API_KEY"],
-        "xiaomi-token-plan-cn" => &["XIAOMI_TOKEN_PLAN_CN_API_KEY"],
-        "xiaomi-token-plan-ams" => &["XIAOMI_TOKEN_PLAN_AMS_API_KEY"],
-        "xiaomi-token-plan-sgp" => &["XIAOMI_TOKEN_PLAN_SGP_API_KEY"],
-        _ => return None,
-    })
-}
-
-/// Configured environment variable names that can provide an API key.
+/// Configured environment variable names that can authenticate a provider.
 ///
 /// Excludes ambient credential sources (AWS profiles, ADC files, IAM roles).
 #[must_use]
 pub fn find_env_keys(provider: &str, env: Option<&ProviderEnv>) -> Option<Vec<String>> {
-    let env_vars = api_key_env_vars(provider)?;
+    let env_vars = auth_env_vars(provider)?;
     let found: Vec<String> = env_vars
         .iter()
         .filter(|env_var| get_provider_env_value(env_var, env).is_some())
@@ -169,10 +122,12 @@ pub fn find_env_keys(provider: &str, env: Option<&ProviderEnv>) -> Option<Vec<St
 /// That sentinel is status only and must never be used as request bearer material.
 #[must_use]
 pub fn get_env_api_key(provider: &str, env: Option<&ProviderEnv>) -> Option<String> {
-    if let Some(env_keys) = find_env_keys(provider, env)
-        && let Some(first) = env_keys.first()
-    {
-        return get_provider_env_value(first, env);
+    if let Some(value) = api_key_env_vars(provider).and_then(|env_vars| {
+        env_vars
+            .iter()
+            .find_map(|name| get_provider_env_value(name, env))
+    }) {
+        return Some(value);
     }
 
     // Vertex AI: explicit API key (above) or Application Default Credentials.
@@ -380,19 +335,6 @@ impl OAuthAuth for LazyOAuthAuth {
     }
 }
 
-/// Side-effect-free availability probe matching `envApiKeyAuth` resolve rules.
-#[must_use]
-pub fn env_api_key_check(source: Option<String>, configured: bool) -> Option<AuthCheck> {
-    if configured {
-        Some(AuthCheck {
-            source,
-            kind: AuthType::ApiKey,
-        })
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +426,42 @@ mod tests {
         );
         assert!(api_key_env_vars("amazon-bedrock").is_none());
         assert!(api_key_env_vars("unknown").is_none());
+    }
+
+    #[test]
+    fn canonical_provider_env_keys_cover_baseten_and_qwen() {
+        let cases = [
+            ("baseten", "BASETEN_API_KEY"),
+            ("qwen-token-plan", "QWEN_TOKEN_PLAN_API_KEY"),
+            ("qwen-token-plan-cn", "QWEN_TOKEN_PLAN_CN_API_KEY"),
+            ("qwen-token-plan-individual", "QWEN_TOKEN_PLAN_API_KEY"),
+        ];
+
+        for (provider, variable) in cases {
+            assert_eq!(api_key_env_vars(provider), Some(&[variable][..]));
+        }
+    }
+
+    #[test]
+    fn anthropic_bearer_token_is_discovered_but_not_used_as_api_key() {
+        let env = env_map(&[
+            ("ANTHROPIC_AUTH_TOKEN", "bearer-token"),
+            ("ANTHROPIC_OAUTH_TOKEN", "oauth-token"),
+            ("ANTHROPIC_API_KEY", "api-key"),
+        ]);
+
+        assert_eq!(
+            find_env_keys("anthropic", Some(&env)),
+            Some(vec![
+                "ANTHROPIC_AUTH_TOKEN".to_owned(),
+                "ANTHROPIC_OAUTH_TOKEN".to_owned(),
+                "ANTHROPIC_API_KEY".to_owned(),
+            ])
+        );
+        assert_eq!(
+            get_env_api_key("anthropic", Some(&env)).as_deref(),
+            Some("oauth-token")
+        );
     }
 
     #[test]

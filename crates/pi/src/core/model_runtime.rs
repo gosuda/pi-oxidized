@@ -26,8 +26,8 @@ use pi_ai::auth::resolve::resolve_provider_auth_with_signal;
 use pi_ai::auth::{
     AMBIENT_AUTH_MARKER, AuthCheck, AuthContext, AuthResolutionOverrides, AuthResult, AuthType,
     Credential, CredentialInfo, CredentialStore, FileCredentialStore, InMemoryCredentialStore,
-    ModelAuth, ModelsError, ModelsErrorCode, OAuthAuth, ProviderAuth, ProviderEnv,
-    RuntimeCredentials, api_key_env_vars, env_api_key_auth, get_env_api_key,
+    ModelAuth, ModelsError, ModelsErrorCode, OAuthAuth, ProviderEnv, RuntimeCredentials,
+    default_provider_auth, find_env_keys, get_env_api_key,
 };
 use pi_ai::catalog::{BuiltinModels, ModelsStoreEntry, builtin_models};
 use pi_ai::models_store::{
@@ -37,7 +37,7 @@ use pi_ai::models_store::{
 use pi_ai::provider::{Provider, ProviderError, StreamOptions};
 use pi_ai::providers::{
     AnthropicMessages, AzureOpenAiResponses, BedrockConverseStream, DefaultBedrockClientFactory,
-    GoogleGenerativeAi, GoogleVertex, KnownProvider, MistralConversations, OpenAiCodexResponses,
+    GoogleGenerativeAi, GoogleVertex, MistralConversations, OpenAiCodexResponses,
     OpenAiCompletions, OpenAiResponses, PiMessages, ProviderRegistry,
 };
 use pi_ai::types::{
@@ -1166,7 +1166,10 @@ impl ModelRuntime {
     ) -> Result<Option<AuthResult>, ModelRuntimeError> {
         // Runtime API key is exposed through RuntimeCredentials::read, so the
         // shared resolver sees it as a stored api_key credential.
-        let provider_auth = self.provider_auth_for(provider_id);
+        let provider_auth = default_provider_auth(
+            provider_id,
+            self.inner.oauth_handlers.get(provider_id).cloned(),
+        );
         let auth_context = self.auth_context_for(&overrides);
         let resolution_overrides = AuthResolutionOverrides {
             api_key: overrides.api_key.clone(),
@@ -1202,32 +1205,6 @@ impl ModelRuntime {
             self.apply_configured_auth_projection(provider_id, model, result, &overrides)?;
         }
         Ok(result)
-    }
-
-    fn provider_auth_for(&self, provider_id: &str) -> ProviderAuth {
-        // Every provider can receive an explicitly supplied or stored API key.
-        // Unknown extension providers intentionally have no ambient env names.
-        let env_vars = api_key_env_vars(provider_id).unwrap_or(&[]);
-        let api_key = Some(env_api_key_auth(format!("{provider_id} API key"), env_vars));
-        let oauth =
-            self.inner
-                .oauth_handlers
-                .get(provider_id)
-                .cloned()
-                .or_else(|| match provider_id {
-                    "anthropic" => pi_ai::auth::oauth::anthropic::AnthropicOAuth::new()
-                        .ok()
-                        .map(|auth| Arc::new(auth) as Arc<dyn OAuthAuth>),
-                    "openai-codex" => {
-                        pi_ai::auth::oauth::openai_codex::OpenAiCodexOAuth::shared().ok()
-                    }
-                    "github-copilot" => {
-                        pi_ai::auth::oauth::github_copilot::GitHubCopilotOAuth::shared().ok()
-                    }
-                    "xai" => pi_ai::auth::oauth::xai::XaiOAuth::shared().ok(),
-                    _ => None,
-                });
-        ProviderAuth { api_key, oauth }
     }
 
     fn auth_context_for(&self, overrides: &ModelRuntimeAuthOverrides) -> Arc<dyn AuthContext> {
@@ -1552,15 +1529,19 @@ impl ModelRuntime {
                 },
             });
         }
-        if let Some(api_key) = get_env_api_key(provider_id, Some(&self.inner.auth_env)) {
-            let source = if api_key == AMBIENT_AUTH_MARKER {
-                Some("ambient credentials".to_owned())
-            } else {
-                api_key_env_vars(provider_id)
-                    .and_then(|vars| vars.first().map(|name| (*name).to_owned()))
-            };
+        if let Some(source) = find_env_keys(provider_id, Some(&self.inner.auth_env))
+            .and_then(|sources| sources.into_iter().next())
+        {
             return Some(AuthCheck {
-                source,
+                source: Some(source),
+                kind: AuthType::ApiKey,
+            });
+        }
+        if get_env_api_key(provider_id, Some(&self.inner.auth_env)).as_deref()
+            == Some(AMBIENT_AUTH_MARKER)
+        {
+            return Some(AuthCheck {
+                source: Some("ambient credentials".to_owned()),
                 kind: AuthType::ApiKey,
             });
         }
@@ -1591,16 +1572,6 @@ impl ModelRuntime {
                 kind: AuthType::Oauth,
             });
         }
-        // Known ambient-only providers still report configured when ambient probes succeed.
-        if matches!(provider_id, "amazon-bedrock" | "google-vertex")
-            && get_env_api_key(provider_id, Some(&self.inner.auth_env)).is_some()
-        {
-            return Some(AuthCheck {
-                source: Some("ambient credentials".to_owned()),
-                kind: AuthType::ApiKey,
-            });
-        }
-        let _ = KnownProvider::from_id(provider_id);
         None
     }
 }
@@ -2177,6 +2148,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn env_auth_probe_reports_the_selected_variable() -> Result<(), ModelRuntimeError> {
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
+            models_store: Some(Arc::new(InMemoryModelsStore::new())),
+            models_config: Some(ModelsJsonConfig::empty()),
+            allow_model_network: Some(false),
+            auth_env: Some(BTreeMap::from([(
+                "ANTHROPIC_API_KEY".to_owned(),
+                "sk-ant".to_owned(),
+            )])),
+            ..CreateModelRuntimeOptions::default()
+        })
+        .await?;
+
+        let check = required(runtime.check_auth("anthropic").await, "auth check")?;
+
+        assert_eq!(check.source.as_deref(), Some("ANTHROPIC_API_KEY"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn anthropic_bearer_environment_resolves_authorization_header()
+    -> Result<(), ModelRuntimeError> {
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
+            models_store: Some(Arc::new(InMemoryModelsStore::new())),
+            models_config: Some(ModelsJsonConfig::empty()),
+            allow_model_network: Some(false),
+            auth_env: Some(BTreeMap::from([(
+                "ANTHROPIC_AUTH_TOKEN".to_owned(),
+                "bearer-token".to_owned(),
+            )])),
+            ..CreateModelRuntimeOptions::default()
+        })
+        .await?;
+
+        let auth = required(
+            runtime
+                .get_auth_for_provider("anthropic", ModelRuntimeAuthOverrides::default())
+                .await?,
+            "Anthropic bearer auth",
+        )?;
+        let authorization = auth
+            .auth
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get("Authorization"))
+            .and_then(Option::as_deref);
+
+        assert_eq!(auth.auth.api_key, None);
+        assert_eq!(authorization, Some("Bearer bearer-token"));
+        assert_eq!(auth.source.as_deref(), Some("ANTHROPIC_AUTH_TOKEN"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn process_env_auth_child() -> Result<(), ModelRuntimeError> {
         if std::env::var_os("PI_PROCESS_ENV_AUTH_TEST_CHILD").is_none() {
             return Ok(());
@@ -2243,6 +2270,46 @@ mod tests {
         .await?;
         assert!(runtime.has_configured_auth("openai-codex"));
         assert!(runtime.is_using_oauth("openai-codex"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builtin_openrouter_oauth_resolves_without_injected_handler()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemoryCredentialStore::new());
+        store
+            .modify(
+                "openrouter",
+                Box::new(|_| {
+                    Box::pin(async {
+                        Ok(Some(Credential::Oauth(OAuthCredential {
+                            refresh: "refresh".into(),
+                            access: "openrouter-key".into(),
+                            expires: i64::MAX,
+                            extra: BTreeMap::new(),
+                        })))
+                    })
+                }),
+            )
+            .await?;
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(store),
+            models_store: Some(Arc::new(InMemoryModelsStore::new())),
+            models_config: Some(ModelsJsonConfig::empty()),
+            allow_model_network: Some(false),
+            ..CreateModelRuntimeOptions::default()
+        })
+        .await?;
+
+        let auth = required(
+            runtime
+                .get_auth_for_provider("openrouter", ModelRuntimeAuthOverrides::default())
+                .await?,
+            "OpenRouter OAuth auth",
+        )?;
+
+        assert_eq!(auth.auth.api_key.as_deref(), Some("openrouter-key"));
+        assert_eq!(auth.source.as_deref(), Some("OAuth"));
         Ok(())
     }
 
