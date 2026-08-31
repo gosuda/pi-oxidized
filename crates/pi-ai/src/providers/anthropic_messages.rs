@@ -16,6 +16,7 @@ use crate::types::{
     ToolResultContent, UserContent, UserMessageContent,
 };
 
+use super::shared::cloudflare::resolve_model;
 use super::shared::{
     calculate_cost, parse_streaming_json, sanitize_surrogates, truncate_error_body,
 };
@@ -54,7 +55,7 @@ impl Provider for AnthropicMessages {
         context: Context,
         options: StreamOptions,
     ) -> ProviderEventStream {
-        let model = model.clone();
+        let model = resolve_model(model, options.env.as_ref()).into_owned();
         let transport = self.transport.clone();
         let client = self.client.clone();
         let (sender, stream) = ProviderEventSender::channel(STREAM_CAPACITY);

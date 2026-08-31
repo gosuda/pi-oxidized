@@ -11,6 +11,7 @@ use futures::{StreamExt, stream::BoxStream};
 use reqwest::{Client, Request, Response};
 use serde_json::{Map, Value, json};
 
+use super::shared::cloudflare::resolve_model;
 use super::shared::{
     calculate_cost, parse_streaming_json, sanitize_surrogates, transform_messages,
     truncate_error_body,
@@ -54,7 +55,7 @@ impl Provider for OpenAiCompletions {
             NonZeroUsize::new(EVENT_CHANNEL_CAPACITY).unwrap_or(NonZeroUsize::MIN),
         );
         let adapter = self.clone();
-        let model = model.clone();
+        let model = resolve_model(model, options.env.as_ref()).into_owned();
         tokio::spawn(async move {
             let message = AssistantMessage::new(
                 model.api.clone(),

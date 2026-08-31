@@ -1,6 +1,5 @@
 //! Built-in provider metadata and native API-shape dispatch.
 
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -519,14 +518,6 @@ impl Provider for ProviderRegistry {
                     ),
                 );
             }
-
-            if matches!(
-                provider,
-                KnownProvider::CloudflareAiGateway | KnownProvider::CloudflareWorkersAi
-            ) {
-                let resolved_model = resolve_cloudflare_model(model, options.env.as_ref());
-                return self.adapter(api).stream(&resolved_model, context, options);
-            }
         }
 
         self.adapter(api).stream(model, context, options)
@@ -535,37 +526,6 @@ impl Provider for ProviderRegistry {
 
 const fn provider_index(provider: KnownProvider) -> usize {
     provider as usize
-}
-
-fn resolve_cloudflare_model<'a>(
-    model: &'a Model,
-    env: Option<&std::collections::BTreeMap<String, String>>,
-) -> Cow<'a, Model> {
-    let Some(env) = env else {
-        return Cow::Borrowed(model);
-    };
-    let account_id = env
-        .get("CLOUDFLARE_ACCOUNT_ID")
-        .filter(|_| model.base_url.contains("{CLOUDFLARE_ACCOUNT_ID}"));
-    let gateway_id = env
-        .get("CLOUDFLARE_GATEWAY_ID")
-        .filter(|_| model.base_url.contains("{CLOUDFLARE_GATEWAY_ID}"));
-    if account_id.is_none() && gateway_id.is_none() {
-        return Cow::Borrowed(model);
-    }
-
-    let mut resolved = model.clone();
-    if let Some(account_id) = account_id {
-        resolved.base_url = resolved
-            .base_url
-            .replace("{CLOUDFLARE_ACCOUNT_ID}", account_id);
-    }
-    if let Some(gateway_id) = gateway_id {
-        resolved.base_url = resolved
-            .base_url
-            .replace("{CLOUDFLARE_GATEWAY_ID}", gateway_id);
-    }
-    Cow::Owned(resolved)
 }
 
 fn semantic_error_stream(
@@ -878,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn cloudflare_placeholders_expand_only_for_cloudflare_providers() {
+    fn cloudflare_models_reach_selected_adapters_unchanged() {
         let recorders = recorders();
         let registry = registry_with(&recorders);
         let template = "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/openai";
@@ -911,13 +871,6 @@ mod tests {
             .lock()
             .map(|calls| calls.iter().map(|call| call.1.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
-        assert_eq!(
-            urls,
-            vec![
-                "https://gateway.ai.cloudflare.com/v1/account/gateway/openai",
-                "https://gateway.ai.cloudflare.com/v1/account/gateway/openai",
-                template,
-            ]
-        );
+        assert_eq!(urls, vec![template, template, template]);
     }
 }

@@ -1,5 +1,6 @@
 //! Pure helpers shared by native provider adapters.
 
+pub(crate) mod cloudflare;
 pub(crate) mod google;
 pub(crate) mod responses;
 

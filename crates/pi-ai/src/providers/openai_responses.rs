@@ -8,6 +8,7 @@ use futures::{StreamExt, stream::BoxStream};
 use reqwest::{Client, Request, Response};
 use serde_json::{Value, json};
 
+use super::shared::cloudflare::resolve_model;
 use super::shared::responses::{
     ConvertMessagesOptions, ConvertToolsOptions, ProcessOptions, ResponsesStreamProcessor,
     convert_messages, convert_tools,
@@ -50,7 +51,7 @@ impl Provider for OpenAiResponses {
             NonZeroUsize::new(EVENT_CHANNEL_CAPACITY).unwrap_or(NonZeroUsize::MIN),
         );
         let adapter = self.clone();
-        let model = model.clone();
+        let model = resolve_model(model, options.env.as_ref()).into_owned();
         tokio::spawn(async move {
             let request_tier = string_option(&options, StreamOptionKey::SERVICE_TIER);
             let message = AssistantMessage::new(
