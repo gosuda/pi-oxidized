@@ -32,7 +32,8 @@
 		"verify:snippets": "bun run scripts/verification/snippet-harness.ts",
 		"verify:extension-scaling": "bun run scripts/bench-extension-scaling.ts",
 		"gen:compat-docs": "bun run scripts/verification/generate-compat-docs.ts",
-		"verify:compat-docs": "bun run scripts/verification/generate-compat-docs.ts"
+		"verify:compat-docs": "bun run scripts/verification/generate-compat-docs.ts",
+		"gen:execution-map": "bun run scripts/verification/fetch-map-source.ts | bun run scripts/verification/publish-map.ts"
 	},
 	"devDependencies": {
 		"@types/bun": "1.4.0",

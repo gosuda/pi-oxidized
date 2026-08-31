@@ -19,6 +19,7 @@ import {
 	verifyReferenceCheckout,
 } from "./alignment.ts";
 import { describe, expect, test } from "bun:test";
+import { EXECUTION_MAP_CURRENT_PATH, computeExecutionMapGenerationId } from "./map.ts";
 
 import {
 	CANONICAL_REFERENCE_ROOT,
@@ -272,6 +273,71 @@ describe("VER-ALIGN legacy identity classifier", () => {
 			]),
 		);
 		expect(verifyLegacyIdentity(trackedFiles)).toEqual([]);
+	});
+});
+
+describe("VER-ALIGN execution-map generation classifier", () => {
+	const GENERATIONS_DIRECTORY = "scripts/verification/fixtures/execution-map/generations";
+
+	/** Build one digest-valid generation bundle and its content-addressed path. */
+	function generationPath(mapText: string, witness: unknown): { readonly path: string; readonly text: string } {
+		const text = `${mapText}\n## Canonical witness\n\n\`\`\`json\n${JSON.stringify(witness)}\n\`\`\`\n`;
+		return { path: `${GENERATIONS_DIRECTORY}/${computeExecutionMapGenerationId(text)}.md`, text };
+	}
+
+	test("retired identity inside a verified generation's canonical witness passes", () => {
+		const { path, text } = generationPath("# Execution map\n\nRendered registry rows.\n", {
+			retiredSha: RETIRED_REFERENCE_SHA,
+			retiredRoot: LEGACY_REFERENCE_ROOT,
+		});
+		expect(verifyLegacyIdentity({ [path]: text }, {})).toEqual([]);
+	});
+
+	test("rendered map text is never exempt from scanning", () => {
+		const { path, text } = generationPath(`# Execution map\n\npin ${RETIRED_REFERENCE_SHA}\n`, {});
+		expect(verifyLegacyIdentity({ [path]: text }, {})).toEqual([
+			`unclassified legacy retired-sha-full occurrence at ${path}:3`,
+		]);
+	});
+
+	test("digest mismatch fails closed before the witness exemption", () => {
+		const { text } = generationPath("# Execution map\n\nRendered registry rows.\n", {
+			retiredSha: RETIRED_REFERENCE_SHA,
+		});
+		const forgedId = "ff".repeat(32);
+		expect(verifyLegacyIdentity({ [`${GENERATIONS_DIRECTORY}/${forgedId}.md`]: text }, {})).toEqual([
+			`${GENERATIONS_DIRECTORY}/${forgedId}.md generation digest drift: expected ${forgedId}, found ${computeExecutionMapGenerationId(text)}`,
+		]);
+	});
+
+	test("malformed bundle grammar fails closed before the witness exemption", () => {
+		const text = `# Execution map\n\n## Canonical witness\n\n\`\`\`json\n${JSON.stringify({ retiredSha: RETIRED_REFERENCE_SHA })}\n`;
+		const path = `${GENERATIONS_DIRECTORY}/${computeExecutionMapGenerationId(text)}.md`;
+		const problems = verifyLegacyIdentity({ [path]: text }, {});
+		expect(problems).toHaveLength(1);
+		expect(problems[0]).toContain("malformed execution-map generation bundle");
+	});
+
+	test("pointer and generation references from closure sources are historical-witness dependencies", () => {
+		const docf = verifyLegacyIdentity(
+			{ "docs/DOC-F-final-tree.md": `map: ${EXECUTION_MAP_CURRENT_PATH}\n` },
+			{},
+		);
+		expect(
+			docf.some((p) => p.includes("references historical witness") && p.includes(EXECUTION_MAP_CURRENT_PATH)),
+		).toBe(true);
+		const generationRef = `${GENERATIONS_DIRECTORY}/${"ab".repeat(32)}.md`;
+		const perf = verifyLegacyIdentity(
+			{ "docs/performance/PERF-CLOSE-evidence.md": `generation: ${generationRef}\n` },
+			{},
+		);
+		expect(
+			perf.some((p) => p.includes("references historical witness") && p.includes(generationRef)),
+		).toBe(true);
+	});
+
+	test("non-closure sources may reference the publication pointer", () => {
+		expect(verifyLegacyIdentity({ "docs/README.md": `map: ${EXECUTION_MAP_CURRENT_PATH}\n` }, {})).toEqual([]);
 	});
 });
 

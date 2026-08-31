@@ -163,7 +163,15 @@ describe("required edges (MAP-4)", () => {
 		const mutated = removeEdge(ROWS, "MAP-5", "PAR-CLOSE");
 		const violations = checkGateEdges(mutated);
 		expect(violations).toContain(
-			"G-ALLTRACKS: required edge MAP-5 blocked_by PAR-CLOSE missing (actual: [MAP-4, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E])",
+			"G-ALLTRACKS: required edge MAP-5 blocked_by PAR-CLOSE missing (actual: [MAP-4, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E, ARC-CLOSE])",
+		);
+	});
+
+	test("removing the MAP-5<-ARC-CLOSE edge fails G-ALLTRACKS", () => {
+		const mutated = removeEdge(ROWS, "MAP-5", "ARC-CLOSE");
+		const violations = checkGateEdges(mutated);
+		expect(violations).toContain(
+			"G-ALLTRACKS: required edge MAP-5 blocked_by ARC-CLOSE missing (actual: [MAP-4, PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E])",
 		);
 	});
 
@@ -301,13 +309,14 @@ describe("gate predicate evaluation (MAP-4)", () => {
 	});
 
 	test("MAP-5 resolved while a closer is open fails G-ALLTRACKS", () => {
-		const alltracksGate = GATES.find((g) => g.id === "G-ALLTRACKS")!;
+		const alltracksGate = GATES.find((g) => g.id === "G-ALLTRACKS");
+		if (alltracksGate === undefined) throw new Error("G-ALLTRACKS not found");
 		// All closers resolved except PAR-CLOSE
-		const closers = ["XC-CLOSE", "TUI-CLOSE", "PERF-CLOSE", "REL-CLOSE", "DEPS-D1", "DOC-F", "MAP-5"];
+		const closers = ["XC-CLOSE", "TUI-CLOSE", "PERF-CLOSE", "REL-CLOSE", "DEPS-D1", "DOC-F", "ARC-CLOSE", "MAP-5"];
 		const statuses = statusesFor(closers);
 		const violations = evaluateGate(ROWS, alltracksGate, statuses);
 		expect(violations).toContain(
-			"G-ALLTRACKS: MAP-5 resolved before trigger(s) PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F resolved",
+			"G-ALLTRACKS: MAP-5 resolved before trigger(s) PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, ARC-CLOSE resolved",
 		);
 	});
 

@@ -19,6 +19,13 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import {
+	EXECUTION_MAP_CURRENT_PATH,
+	EXECUTION_MAP_GENERATIONS_DIRECTORY,
+	computeExecutionMapGenerationId,
+	extractExecutionMapBundle,
+	isExecutionMapGenerationPath,
+} from "./map.ts";
 import { REQUIRED_TOOL_NAMES, loadCanonicalToolRegistry, selectPortableToolParameters } from "../generate-tool-schemas.ts";
 import {
 	CANONICAL_REFERENCE_ROOT,
@@ -60,7 +67,7 @@ export const CLASSIFIER_FIXTURE_PATH = "scripts/verification/alignment.test.ts";
 export const ISSUE_RECORD_PATH = "scripts/verification/fixtures/execution-map-ticket-records.json";
 
 /** Exact SHA-256 of the immutable issue record; any byte drift fails closed. */
-export const ISSUE_RECORD_SHA256 = "f366f5d1c11c141ab7389780bff1b01feb939ed80a7799dce7bfea7605fe37d5";
+export const ISSUE_RECORD_SHA256 = "be2accf8885ad352aac75cfb48d12dc78f2589c328bb01a1c254c6ce92b5b178";
 
 /** Inline marker every counted legacy occurrence must carry on its line. */
 export const HISTORICAL_LABEL = "historical witness";
@@ -349,12 +356,23 @@ export function scanLegacyIdentity(content: string): LegacyOccurrence[] {
 	return occurrences;
 }
 
+/** Collect the historical-witness paths a closure source depends on. */
+function historicalWitnessReferences(content: string, allowances: Readonly<Record<string, LegacyAllowance>>): string[] {
+	const references = Object.keys(allowances).filter((witness) => content.includes(witness));
+	if (content.includes(EXECUTION_MAP_CURRENT_PATH)) references.push(EXECUTION_MAP_CURRENT_PATH);
+	for (const match of content.matchAll(new RegExp(`${escapeRegExp(EXECUTION_MAP_GENERATIONS_DIRECTORY)}/[0-9a-f]{64}\\.md`, "g"))) {
+		references.push(match[0]);
+	}
+	return references;
+}
+
 /**
  * Exact-file legacy classifier over tracked text. Retired identity is
  * accepted only inside an enumerated allowance (exact counts on labelled
- * lines, or the pinned whole-file digest); unknown files, extra or
- * unlabelled occurrences, stale allowances, digest drift, and any DOC-F or
- * PERF-CLOSE source consuming a legacy witness are all violations.
+ * lines, or the pinned whole-file digest), or the canonical-witness JSON of
+ * a digest-verified, strictly parsed immutable map generation. Unknown files,
+ * extra or unlabelled occurrences, stale allowances, digest drift, and any
+ * DOC-F or PERF-CLOSE source consuming a historical witness are violations.
  */
 export function verifyLegacyIdentity(
 	trackedFiles: Readonly<Record<string, string>>,
@@ -365,10 +383,30 @@ export function verifyLegacyIdentity(
 	for (const path of paths) {
 		const content = trackedFiles[path];
 		if (content === undefined) continue;
+		const publicationRelativePath = path.startsWith(`${EXECUTION_MAP_GENERATIONS_DIRECTORY}/`)
+			? `generations/${path.slice(EXECUTION_MAP_GENERATIONS_DIRECTORY.length + 1)}`
+			: "";
+		if (isExecutionMapGenerationPath(publicationRelativePath)) {
+			const generationId = publicationRelativePath.slice("generations/".length, -3);
+			const actualId = computeExecutionMapGenerationId(content);
+			if (actualId !== generationId) {
+				problems.push(`${path} generation digest drift: expected ${generationId}, found ${actualId}`);
+				continue;
+			}
+			try {
+				const bundle = extractExecutionMapBundle(content);
+				for (const occurrence of scanLegacyIdentity(bundle.mapText)) {
+					problems.push(`unclassified legacy ${occurrence.kind} occurrence at ${path}:${occurrence.line}`);
+				}
+			} catch (error) {
+				problems.push(`${path} generation bundle is malformed: ${String(error)}`);
+			}
+			continue;
+		}
 		const occurrences = scanLegacyIdentity(content);
 		const closureSource = CLOSURE_SOURCE_RES.find(([, re]) => re.test(path));
 		if (closureSource !== undefined) {
-			const witnessRefs = Object.keys(allowances).filter((witness) => content.includes(witness));
+			const witnessRefs = historicalWitnessReferences(content, allowances);
 			if (occurrences.length > 0 || witnessRefs.length > 0) {
 				const detail = [
 					...occurrences.map((occurrence) => `${occurrence.kind}@${occurrence.line}`),

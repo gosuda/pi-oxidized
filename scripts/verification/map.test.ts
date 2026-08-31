@@ -1,32 +1,49 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import {
 	EXPECTED_EXTERNAL_COUNT,
 	EXPECTED_ROW_COUNT,
 	EXPECTED_SOURCE_RECORD_COUNT,
 	EXPECTED_TASK_COUNT,
-	MAP_DOC_PATH,
+	EXECUTION_MAP_CURRENT_PATH,
+	EXECUTION_MAP_DIRECTORY,
+	EXECUTION_MAP_GENERATIONS_DIRECTORY,
 	MAP_ROOT_ID,
 	PARITY_LEDGER_PATH,
-	SEVEN_CLOSERS,
-	SNAPSHOT_PATH,
+	TRACK_CLOSERS,
 	SNAPSHOT_SOURCE_HASH,
 	SNAPSHOT_STRUCTURAL_SHA256,
 	TERMINAL_NODE_ID,
+	computeExecutionMapGenerationId,
 	computeSnapshotSourceHash,
 	computeSnapshotStructuralHash,
 	deriveExpectedRegistry,
+	extractExecutionMapBundle,
+	isExecutionMapGenerationPath,
+	loadCurrentExecutionMap,
 	loadMapLedgerInputs,
 	parseExecutionMap,
+	parseExecutionMapPointer,
 	parseSnapshot,
+	renderExecutionMapPointer,
 	runMapLedgerChecks,
 } from "./map.ts";
+import { section as extractSection } from "./fetch-map-source.ts";
+import {
+	type PublicationFilesystem,
+	type WitnessEnvelope,
+	publishFromEnvelope,
+	publishPair,
+	validateAndRender,
+} from "./publish-map.ts";
 import { PINNED_AGENT_LOOP_CONFIG_SITES, REPO_ROOT } from "./parity.ts";
 
-const SNAPSHOT_TEXT = readFileSync(join(REPO_ROOT, SNAPSHOT_PATH), "utf8");
+const CURRENT_EXECUTION_MAP = loadCurrentExecutionMap(REPO_ROOT);
+const SNAPSHOT_TEXT = CURRENT_EXECUTION_MAP.witnessText;
 const LEDGER_TEXT = readFileSync(join(REPO_ROOT, PARITY_LEDGER_PATH), "utf8");
-const MAP_TEXT = readFileSync(join(REPO_ROOT, MAP_DOC_PATH), "utf8");
+const MAP_TEXT = CURRENT_EXECUTION_MAP.mapText;
 
 function run(mapText: string, snapshotText: string = SNAPSHOT_TEXT): string[] {
 	return runMapLedgerChecks({ snapshotText, ledgerText: LEDGER_TEXT, mapText });
@@ -96,7 +113,7 @@ describe("execution map ledger (MAP-1)", () => {
 		expect(run(MAP_TEXT)).toEqual([]);
 	});
 
-	test("row count is exactly 123: 109 siblings + 6 map tickets + 7 externals + MAP-ROOT", () => {
+	test("row count is exactly 151: 137 siblings + 6 map tickets + 7 externals + MAP-ROOT", () => {
 		const doc = parseExecutionMap(MAP_TEXT);
 		expect(doc.rows.length).toBe(EXPECTED_ROW_COUNT);
 		const parsed = parseSnapshot(SNAPSHOT_TEXT);
@@ -104,12 +121,12 @@ describe("execution map ledger (MAP-1)", () => {
 		const derived = deriveExpectedRegistry(parsed.snapshot);
 		expect(derived.problems).toEqual([]);
 		expect(derived.rows.length).toBe(EXPECTED_ROW_COUNT);
-		expect(derived.rows.filter((row) => row.recordKind === "execution").length).toBe(115);
+		expect(derived.rows.filter((row) => row.recordKind === "execution").length).toBe(143);
 		expect(
 			derived.rows.filter((row) => row.recordKind === "external").map((row) => row.stableId),
 		).toEqual(["EXT-14", "EXT-15", "EXT-21", "EXT-23", "EXT-24", "EXT-25", "EXT-26"]);
 		expect(derived.rows.some((row) => row.stableId === MAP_ROOT_ID)).toBe(true);
-		for (const closer of SEVEN_CLOSERS) {
+		for (const closer of TRACK_CLOSERS) {
 			expect(doc.rows.some((row) => row.stableId === closer)).toBe(true);
 		}
 		expect(doc.telemetrySites.length).toBe(PINNED_AGENT_LOOP_CONFIG_SITES.length);
@@ -324,11 +341,11 @@ describe("execution map ledger (MAP-1)", () => {
 		).toBe(true);
 	});
 
-	test("loader: a checkout missing the tracked witness fails with a stable input diagnostic", () => {
+	test("loader: a checkout missing the current pointer fails with a stable input diagnostic", () => {
 		const missingRoot = join(REPO_ROOT, "scripts", "verification", "no-such-checkout-root");
 		const load = () => loadMapLedgerInputs(missingRoot);
 		expect(load).toThrow("cannot read required");
-		expect(load).toThrow(SNAPSHOT_PATH);
+		expect(load).toThrow(EXECUTION_MAP_CURRENT_PATH);
 	});
 
 	test("mutation: a document-only zero-blocker island fails two-sided MAP-ROOT anchoring", () => {
@@ -343,5 +360,320 @@ describe("execution map ledger (MAP-1)", () => {
 			expect(row).toContain(`not reachable from ${MAP_ROOT_ID}`);
 			expect(row).toContain(`no path into terminal ${TERMINAL_NODE_ID}`);
 		}
+	});
+
+	test("mutation: dropping ARC-CLOSE from MAP-5 fails the closure composition check", () => {
+		const mutated = editRow(MAP_TEXT, "MAP-5", dropBlocker("MAP-5", "ARC-CLOSE"));
+		const violations = run(mutated);
+		expect(violations.some((entry) => entry.includes("MAP-5 closure composition is missing ARC-CLOSE"))).toBe(
+			true,
+		);
+	});
+
+	test("mutation: a document modality that differs from the witness fails row-field check", () => {
+		const mutated = editRow(MAP_TEXT, "ARC-CLOSE", (cells) => {
+			cells[1] = "research";
+			return cells;
+		});
+		const violations = run(mutated);
+		expect(
+			violations.some((entry) => entry.includes("ARC-CLOSE modality 'research' differs from witness 'task'")),
+		).toBe(true);
+	});
+
+	test("section parser: multi-bullet Blocked by is not truncated", () => {
+		const body = [
+			"Stable ID: `ARC-T2`",
+			"",
+			"## Question",
+			"",
+			"Question text",
+			"",
+			"## Blocked by",
+			"",
+			"- [ARC-R1](https://github.com/gosuda/pi-oxidized/issues/153)",
+			"- [ARC-T1](https://github.com/gosuda/pi-oxidized/issues/158)",
+			"- [ARC-R2](https://github.com/gosuda/pi-oxidized/issues/154)",
+			"",
+			"## Acceptance",
+			"",
+			"Acceptance text",
+		].join("\n");
+		const blockedBy = extractSection(body, "Blocked by", true);
+		expect(blockedBy).toContain("ARC-R1");
+		expect(blockedBy).toContain("ARC-T1");
+		expect(blockedBy).toContain("ARC-R2");
+		const question = extractSection(body, "Question", true);
+		expect(question).toBe("Question text");
+		const acceptance = extractSection(body, "Acceptance", true);
+		expect(acceptance).toBe("Acceptance text");
+	});
+
+	test("mutation: stale count pins fail the source-hash check", () => {
+		const parsed: unknown = JSON.parse(SNAPSHOT_TEXT);
+		if (typeof parsed !== "object" || parsed === null) throw new Error("snapshot must parse");
+		const container = parsed as { sourceRecordCount?: unknown; records?: unknown[] };
+		container.sourceRecordCount = (container.sourceRecordCount as number) + 1;
+		const violations = run(MAP_TEXT, JSON.stringify(parsed));
+		expect(
+			violations.some((entry) =>
+				entry.includes("[source-hash]") && entry.includes("sourceRecordCount"),
+			),
+		).toBe(true);
+	});
+
+	test("publication: malformed structural record produces validation problems and publication rejects before any write", () => {
+		const parsed: unknown = JSON.parse(SNAPSHOT_TEXT);
+		if (typeof parsed !== "object" || parsed === null) throw new Error("snapshot must parse");
+		const container = parsed as { records?: unknown[] };
+		const records = container.records;
+		if (records === undefined || !Array.isArray(records)) throw new Error("snapshot must have records");
+		const first = records[0] as Record<string, unknown>;
+		if (first === undefined) throw new Error("snapshot must have at least one record");
+		const originalKindFirst = first.kind;
+		first.kind = "bogus";
+		const envelope = parsed as WitnessEnvelope;
+		let threw = false;
+		try {
+			validateAndRender(envelope);
+		} catch (error) {
+			threw = true;
+			expect(String(error)).toContain("validation problems");
+		}
+		expect(threw).toBe(true);
+		first.kind = originalKindFirst;
+		const originalModality = first.modality;
+		first.modality = "nonexistent";
+		let modalityThrew = false;
+		try {
+			validateAndRender(envelope);
+		} catch (error) {
+			modalityThrew = true;
+			expect(String(error)).toContain("validation problems");
+		}
+		expect(modalityThrew).toBe(true);
+		first.modality = originalModality;
+		let writeCount = 0;
+		const trackingFs: PublicationFilesystem = {
+			writeFileSync: () => { writeCount += 1; },
+			renameSync: () => { writeCount += 1; },
+			unlinkSync: () => { writeCount += 1; },
+			existsSync: () => false,
+		};
+		first.kind = "bogus";
+		let envelopeThrew = false;
+		try {
+			publishFromEnvelope(envelope, trackingFs, "/nonexistent-root");
+		} catch {
+			envelopeThrew = true;
+		}
+		expect(envelopeThrew).toBe(true);
+		expect(writeCount).toBe(0);
+		first.kind = originalKindFirst;
+	});
+
+	test("publication: injected failure while installing the second destination restores both original outputs and leaves no staging/backup files", () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "publish-pair-test-"));
+		try {
+			const witnessDest = join(tempDir, "witness.json");
+			const mapDest = join(tempDir, "map.md");
+			const originalWitness = "ORIGINAL_WITNESS\n";
+			const originalMap = "ORIGINAL_MAP\n";
+			writeFileSync(witnessDest, originalWitness);
+			writeFileSync(mapDest, originalMap);
+			const failingFs: PublicationFilesystem = {
+				writeFileSync,
+				renameSync: (from: string, to: string) => {
+					if (to === mapDest && from.includes(".stage-")) {
+						throw new Error("injected install failure on second destination");
+					}
+					renameSync(from, to);
+				},
+				unlinkSync,
+				existsSync,
+			};
+			let caught: unknown = null;
+			try {
+				publishPair(failingFs, [
+					{ path: witnessDest, content: "NEW_WITNESS\n" },
+					{ path: mapDest, content: "NEW_MAP\n" },
+				]);
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught).not.toBeNull();
+			expect(String(caught)).toContain("injected install failure");
+			expect(readFileSync(witnessDest, "utf8")).toBe(originalWitness);
+			expect(readFileSync(mapDest, "utf8")).toBe(originalMap);
+			const leftovers = readdirSync(tempDir).filter((name) => name !== "witness.json" && name !== "map.md");
+			expect(leftovers).toEqual([]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	test("section parser: suffixed required heading is rejected while trailing whitespace and CRLF remain accepted", () => {
+		const body = [
+			"Stable ID: `ARC-T2`",
+			"",
+			"## Question draft",
+			"",
+			"Should not match",
+			"",
+			"## Blocked by TODO",
+			"",
+			"Should not match either",
+			"",
+			"## Question",
+			"",
+			"Real question text",
+			"",
+			"## Acceptance",
+			"",
+			"Acceptance text",
+		].join("\n");
+		const question = extractSection(body, "Question", true);
+		expect(question).toBe("Real question text");
+		expect(question).not.toContain("Should not match");
+		const crlfBody = "Stable ID: `ARC-T2`\r\n\r\n## Question \r\n\r\nCRLF question\r\n\r\n## Acceptance\r\n\r\nAcceptance\r\n";
+		const crlfQuestion = extractSection(crlfBody, "Question", true);
+		expect(crlfQuestion).toBe("CRLF question");
+		const trailingSpaceBody = "## Question   \n\nTrailing space question\n\n## Acceptance\n\nAcceptance\n";
+		const trailingSpaceQuestion = extractSection(trailingSpaceBody, "Question", true);
+		expect(trailingSpaceQuestion).toBe("Trailing space question");
+		let suffixedThrew = false;
+		try {
+			extractSection("## Question draft\n\nbody\n", "Question", true);
+		} catch {
+			suffixedThrew = true;
+		}
+		expect(suffixedThrew).toBe(true);
+	});
+});
+
+describe("execution-map immutable publication reader", () => {
+	const READER_MAP_TEXT = "# Execution map\n\nRendered map body for the reader fixture.\n";
+	const READER_WITNESS_JSON = '{\n  "version": 2\n}\n';
+
+	function bundleOf(mapText: string, witnessJson: string): string {
+		return `${mapText}\n## Canonical witness\n\n\`\`\`json\n${witnessJson}\`\`\`\n`;
+	}
+
+	function stagePublication(root: string, mapText: string, witnessJson: string): string {
+		const generationText = bundleOf(mapText, witnessJson);
+		const generationId = computeExecutionMapGenerationId(generationText);
+		mkdirSync(join(root, EXECUTION_MAP_GENERATIONS_DIRECTORY), { recursive: true });
+		writeFileSync(join(root, EXECUTION_MAP_CURRENT_PATH), renderExecutionMapPointer(generationId));
+		writeFileSync(join(root, EXECUTION_MAP_GENERATIONS_DIRECTORY, `${generationId}.md`), generationText);
+		return generationId;
+	}
+
+	test("pointer render and parse round-trip the exact grammar", () => {
+		const generationId = "0a".repeat(32);
+		const pointer = renderExecutionMapPointer(generationId);
+		expect(pointer).toBe(`[Current execution map](generations/${generationId}.md)\n`);
+		expect(parseExecutionMapPointer(pointer)).toBe(generationId);
+	});
+
+	test("malformed pointers fail closed", () => {
+		const generationId = "0a".repeat(32);
+		const pointer = renderExecutionMapPointer(generationId);
+		const malformed = [
+			pointer.trimEnd(),
+			`${pointer}${pointer}`,
+			pointer.replace(generationId, generationId.toUpperCase()),
+			`[Execution map](generations/${generationId}.md)\n`,
+			`[Current execution map](generations/${"z".repeat(64)}.md)\n`,
+			"[Current execution map](docs/EXECUTION_MAP.md)\n",
+			`[Current execution map](generations/${generationId.slice(0, 63)}.md)\n`,
+		];
+		for (const candidate of malformed) {
+			expect(() => parseExecutionMapPointer(candidate)).toThrow("malformed execution-map pointer");
+		}
+	});
+
+	test("generation path recognition accepts only content-addressed generations", () => {
+		expect(isExecutionMapGenerationPath(`generations/${"0a".repeat(32)}.md`)).toBe(true);
+		const rejected = [
+			"generations/current.md",
+			"generations/0a.md",
+			`generations/${"0A".repeat(32)}.md`,
+			`generations/${"0a".repeat(31)}.md`,
+			".staging/0a.md",
+			"docs/EXECUTION_MAP.md",
+		];
+		for (const candidate of rejected) {
+			expect(isExecutionMapGenerationPath(candidate)).toBe(false);
+		}
+	});
+
+	test("bundle extraction restores exact map bytes and witness body", () => {
+		const bundle = extractExecutionMapBundle(bundleOf(READER_MAP_TEXT, READER_WITNESS_JSON));
+		expect(bundle.mapText).toBe(READER_MAP_TEXT);
+		expect(bundle.witnessText).toBe(READER_WITNESS_JSON);
+		expect(bundle.bundleText).toBe(bundleOf(READER_MAP_TEXT, READER_WITNESS_JSON));
+	});
+
+	test("bundle extraction rejects non-terminal witness grammar", () => {
+		const doubleWitnessMap = `${READER_MAP_TEXT}\n## Canonical witness\n\n\`\`\`json\n{}\n\`\`\`\n`;
+		const malformedBundles = [
+			READER_MAP_TEXT,
+			bundleOf(doubleWitnessMap, READER_WITNESS_JSON),
+			bundleOf(READER_MAP_TEXT, "{}"),
+			bundleOf(READER_MAP_TEXT, "not json\n"),
+			`${bundleOf(READER_MAP_TEXT, READER_WITNESS_JSON)}trailing bytes\n`,
+		];
+		for (const candidate of malformedBundles) {
+			expect(() => extractExecutionMapBundle(candidate)).toThrow("malformed execution-map generation");
+		}
+	});
+
+	test("loadCurrentExecutionMap returns the pointer-selected generation", () => {
+		const root = mkdtempSync(join(tmpdir(), "execution-map-reader-ok-"));
+		const generationId = stagePublication(root, READER_MAP_TEXT, READER_WITNESS_JSON);
+		const current = loadCurrentExecutionMap(root);
+		expect(current.generationId).toBe(generationId);
+		expect(current.mapText).toBe(READER_MAP_TEXT);
+		expect(current.witnessText).toBe(READER_WITNESS_JSON);
+		expect(current.bundleText).toBe(bundleOf(READER_MAP_TEXT, READER_WITNESS_JSON));
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	test("loadCurrentExecutionMap rejects a malformed pointer", () => {
+		const root = mkdtempSync(join(tmpdir(), "execution-map-reader-pointer-"));
+		mkdirSync(join(root, EXECUTION_MAP_GENERATIONS_DIRECTORY), { recursive: true });
+		writeFileSync(join(root, EXECUTION_MAP_CURRENT_PATH), "[Current execution map](generations/deadbeef.md)\n");
+		expect(() => loadCurrentExecutionMap(root)).toThrow("malformed execution-map pointer");
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	test("loadCurrentExecutionMap rejects a missing generation", () => {
+		const root = mkdtempSync(join(tmpdir(), "execution-map-reader-missing-"));
+		mkdirSync(join(root, EXECUTION_MAP_DIRECTORY), { recursive: true });
+		writeFileSync(join(root, EXECUTION_MAP_CURRENT_PATH), renderExecutionMapPointer("1b".repeat(32)));
+		const load = () => loadCurrentExecutionMap(root);
+		expect(load).toThrow("cannot read required");
+		expect(load).toThrow(`generations/${"1b".repeat(32)}.md`);
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	test("loadCurrentExecutionMap rejects a digest mismatch", () => {
+		const root = mkdtempSync(join(tmpdir(), "execution-map-reader-digest-"));
+		const generationId = stagePublication(root, READER_MAP_TEXT, READER_WITNESS_JSON);
+		writeFileSync(join(root, EXECUTION_MAP_GENERATIONS_DIRECTORY, `${generationId}.md`), `${READER_MAP_TEXT}tampered\n`);
+		expect(() => loadCurrentExecutionMap(root)).toThrow("digest mismatch");
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	test("loadMapLedgerInputs serves both inputs from the pointer-selected generation", () => {
+		const root = mkdtempSync(join(tmpdir(), "execution-map-ledger-"));
+		mkdirSync(join(root, "docs"), { recursive: true });
+		writeFileSync(join(root, PARITY_LEDGER_PATH), LEDGER_TEXT);
+		stagePublication(root, READER_MAP_TEXT, READER_WITNESS_JSON);
+		const inputs = loadMapLedgerInputs(root);
+		expect(inputs.snapshotText).toBe(READER_WITNESS_JSON);
+		expect(inputs.ledgerText).toBe(LEDGER_TEXT);
+		expect(inputs.mapText).toBe(READER_MAP_TEXT);
+		rmSync(root, { recursive: true, force: true });
 	});
 });

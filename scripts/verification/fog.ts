@@ -4,10 +4,10 @@
  *
  * The execution map stays a single graph authority: this tool imports the
  * MAP-1 ledger (`map.ts`) and consumes its published artifacts — the
- * structural ticket-record witness, docs/EXECUTION_MAP.md, and
- * docs/PARITY_LEDGER.md — through `loadMapLedgerInputs`. It never re-parses
- * the registry or re-derives edges; every graph assertion here is a re-run
- * of `runMapLedgerChecks` over the unchanged published texts.
+ * structural ticket-record witness, the pointer-selected execution-map
+ * generation, and docs/PARITY_LEDGER.md — through `loadMapLedgerInputs`. It
+ * never re-parses the registry or re-derives edges; every graph assertion
+ * here is a re-run of `runMapLedgerChecks` over the unchanged published texts.
  *
  * The lint owns three contracts:
  *

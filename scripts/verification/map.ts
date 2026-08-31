@@ -2,54 +2,26 @@
 /**
  * Execution-map ledger verifier (MAP-1, issue #134).
  *
- * docs/EXECUTION_MAP.md is the published view of the port program's
- * stable-ID DAG. The authority is the live GitHub issue tree rooted at
- * canonical issue #12; the tracked fixture at
- * scripts/verification/fixtures/execution-map-ticket-records.json is the
- * commit-pinned offline witness published from that authority — not a
- * live API view. This tool never reads a shadow graph: it re-derives the
- * expected row set from the witness and recomputes both its source-record
- * provenance hash and the mapped structural sha256, so hand edits to any
- * side fail one command. `bun run verify:map-ledger` is the single
- * acceptance path and prints MAP_LEDGER_OK when every assertion holds:
+ * `scripts/verification/fixtures/execution-map/current.md` is the sole
+ * selection point. It names one immutable, content-addressed Markdown
+ * generation containing both the rendered stable-ID DAG and its canonical v2
+ * JSON witness. The live GitHub issue tree rooted at issue #12 remains the
+ * authority.
  *
- * 1. witness pins           - v2 witness, repository, canonical issue #12,
- *                             declared source hash matches its pin and the
- *                             recomputed publisher-canonical hash;
- *                             131 records / 115 tasks / 16 externals
- *                             agree; mapped structural sha256 matches the
- *                             pinned value. The two hashes guard distinct
- *                             contracts: full ticket-record provenance
- *                             versus the mapped registry rows.
- * 2. row set                - exactly the 123 expected rows, no extras, none
- *                             missing, no duplicate stable IDs, no two rows
- *                             sharing one issue (alias detection).
- * 3. row fields             - every row's Issue, Title, and blocked_by match
- *                             the witness record exactly (ordered blockers).
- * 4. resolution             - every blocked_by reference resolves to a row.
- * 5. acyclicity             - Kahn topological sort over blocked_by edges.
- * 6. anchoring              - the verifier alone adds synthetic
- *                             MAP-ROOT -> frontier edges (fixture-derived
- *                             zero-blocker rows only); every published row
- *                             must be reachable from MAP-ROOT alone and
- *                             must reach terminal MAP-6. Published
- *                             blocked_by cells stay synthetic-free.
- * 7. modalities             - vocabulary pinned to PARITY_LEDGER's settled
- *                             kinds, PAR rows matching the ledger's
- *                             graduated DAG, all four graduation modalities
- *                             populated.
- * 8. closure composition    - REL-CLOSE and DOC-F required closure edges,
- *                             MAP-5 composition over the seven closers,
- *                             MAP-6 blocked by exactly MAP-5.
- * 9. REL-DOCS dominance     - no REL-* node reaches DOC-F around the
- *                             REL-DOCS/REL-CLOSE gate (delete-node
- *                             simulation, with single-deletion non-vacuity).
- * 10. telemetry pin         - the documented five AgentLoopConfig sites are
- *                             exactly parity.ts's pinned oracle.
+ * The verifier resolves the pointer once, checks the complete generation
+ * digest, and re-derives the registry from the embedded witness. One command,
+ * `bun run verify:map-ledger`, checks these contracts:
  *
- * Each check is a pure function over text so the mutation suite can drive
- * malformed, aliased, cyclic, and tampered fixtures through them. Input
- * loading is the only impure boundary (loadMapLedgerInputs).
+ * 1. witness identity, source hash, record counts, and structural hash;
+ * 2. the exact 151-row set, fields, stable IDs, issue identities, and aliases;
+ * 3. blocker resolution and acyclicity;
+ * 4. MAP-ROOT anchoring and MAP-6 terminal reachability;
+ * 5. modality vocabulary and the PARITY_LEDGER mapping;
+ * 6. closure composition and REL-DOCS dominance;
+ * 7. the six pinned AgentLoopConfig telemetry sites.
+ *
+ * Each check is a pure transform over text. `loadMapLedgerInputs` is the only
+ * file-system seam.
  */
 
 
@@ -57,6 +29,118 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { PINNED_AGENT_LOOP_CONFIG_SITES, REPO_ROOT } from "./parity.ts";
+
+// ============================================================================
+// Immutable execution-map publication
+// ============================================================================
+
+/**
+ * Repo-relative publication paths. The pointer is the sole selection point,
+ * generations are content-addressed, and staging is reserved for the
+ * publisher and is never an authority.
+ */
+export const EXECUTION_MAP_DIRECTORY = "scripts/verification/fixtures/execution-map";
+export const EXECUTION_MAP_CURRENT_PATH = `${EXECUTION_MAP_DIRECTORY}/current.md`;
+export const EXECUTION_MAP_GENERATIONS_DIRECTORY = `${EXECUTION_MAP_DIRECTORY}/generations`;
+export const EXECUTION_MAP_STAGING_DIRECTORY = `${EXECUTION_MAP_DIRECTORY}/.staging`;
+
+/** Exact pointer grammar: one generated link to one lowercase 64-hex generation. */
+const EXECUTION_MAP_POINTER_PATTERN = /^\[Current execution map\]\(generations\/([0-9a-f]{64})\.md\)\n$/;
+const EXECUTION_MAP_GENERATION_PATH_PATTERN = /^generations\/([0-9a-f]{64})\.md$/;
+/** Strict terminal bundle grammar: map, one witness heading, one json fence closed at EOF. */
+const EXECUTION_MAP_BUNDLE_PATTERN = /^([\s\S]*)\n## Canonical witness\n\n```json\n([\s\S]*)```\n$/;
+const EXECUTION_MAP_WITNESS_HEADING_PATTERN = /(^|\n)## Canonical witness\n/;
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+export interface ExecutionMapBundle {
+	readonly bundleText: string;
+	readonly mapText: string;
+	readonly witnessText: string;
+}
+
+export interface CurrentExecutionMap {
+	readonly generationId: string;
+	readonly bundleText: string;
+	readonly mapText: string;
+	readonly witnessText: string;
+}
+
+/**
+ * The generation ID is the SHA-256 of the bundle's complete bytes — the raw
+ * file bytes and their UTF-8 rendering hash identically. No normalized or
+ * trimmed view is ever hashed.
+ */
+export function computeExecutionMapGenerationId(bundleText: string | Uint8Array): string {
+	return createHash("sha256").update(bundleText).digest("hex");
+}
+
+export function renderExecutionMapPointer(generationId: string): string {
+	if (!/^[0-9a-f]{64}$/.test(generationId)) throw new Error("invalid execution-map generation id");
+	return `[Current execution map](generations/${generationId}.md)\n`;
+}
+
+export function parseExecutionMapPointer(pointerText: string): string {
+	const generationId = EXECUTION_MAP_POINTER_PATTERN.exec(pointerText)?.[1];
+	if (generationId === undefined) throw new Error("malformed execution-map pointer");
+	return generationId;
+}
+
+/** Content-addressed path recognition: only generations/<64 lowercase hex>.md. */
+export function isExecutionMapGenerationPath(relativePath: string): boolean {
+	return EXECUTION_MAP_GENERATION_PATH_PATTERN.test(relativePath);
+}
+
+/**
+ * Split one generation's complete text under the strict terminal grammar:
+ * the rendered map, exactly one `## Canonical witness` section, one `json`
+ * fence whose JSON body ends in a newline and contains no fence of its own,
+ * and a closing fence that ends the file. The map part keeps its exact
+ * original bytes; the newline before the witness heading is section syntax.
+ */
+export function extractExecutionMapBundle(bundleText: string): ExecutionMapBundle {
+	const [mapPart, witnessText] = EXECUTION_MAP_BUNDLE_PATTERN.exec(bundleText)?.slice(1) ?? [];
+	if (mapPart === undefined || witnessText === undefined) {
+		throw new Error("malformed execution-map generation bundle");
+	}
+	if (!witnessText.endsWith("\n") || witnessText.includes("```") || EXECUTION_MAP_WITNESS_HEADING_PATTERN.test(mapPart)) {
+		throw new Error("malformed execution-map generation bundle");
+	}
+	try {
+		JSON.parse(witnessText);
+	} catch (error) {
+		throw new Error(`malformed execution-map generation witness: ${String(error)}`);
+	}
+	return { bundleText, mapText: mapPart, witnessText };
+}
+
+/**
+ * Resolve the current-generation pointer exactly once and return the
+ * pointer-selected generation. The generation's complete bytes must hash to
+ * the pointer's generation ID; a malformed pointer, missing generation, or
+ * digest mismatch fails closed — there is no old-path fallback.
+ */
+export function loadCurrentExecutionMap(repoRoot: string): CurrentExecutionMap {
+	let pointerText: string;
+	try {
+		pointerText = readFileSync(join(repoRoot, EXECUTION_MAP_CURRENT_PATH), "utf8");
+	} catch (error) {
+		throw new Error(`cannot read required ${EXECUTION_MAP_CURRENT_PATH}: ${String(error)}`);
+	}
+	const generationId = parseExecutionMapPointer(pointerText);
+	let generationBytes: Uint8Array;
+	try {
+		generationBytes = readFileSync(join(repoRoot, EXECUTION_MAP_GENERATIONS_DIRECTORY, `${generationId}.md`));
+	} catch (error) {
+		throw new Error(`cannot read required ${EXECUTION_MAP_GENERATIONS_DIRECTORY}/${generationId}.md: ${String(error)}`);
+	}
+	const computedGenerationId = computeExecutionMapGenerationId(generationBytes);
+	if (computedGenerationId !== generationId) {
+		throw new Error(
+			`execution-map generation ${EXECUTION_MAP_GENERATIONS_DIRECTORY}/${generationId}.md digest mismatch: complete bytes hash to ${computedGenerationId}`,
+		);
+	}
+	return { generationId, ...extractExecutionMapBundle(UTF8_DECODER.decode(generationBytes)) };
+}
 
 // ============================================================================
 // Published pins
@@ -74,23 +158,29 @@ export const REL_DOCS_ID = "REL-DOCS";
 export const REL_CLOSE_ID = "REL-CLOSE";
 export const DOC_F_ID = "DOC-F";
 
-/** The seven track closers, in canonical order. */
-export const SEVEN_CLOSERS: readonly string[] = [
+/** The six closers DOC-F directly requires, in canonical order. */
+export const PRE_DOCUMENT_CLOSERS: readonly string[] = [
 	"PAR-CLOSE",
 	"XC-CLOSE",
 	"TUI-CLOSE",
 	"PERF-CLOSE",
 	"REL-CLOSE",
 	"DEPS-D1",
-	"DOC-F",
 ];
 
-/** 123 rows: 109 sibling graduate tickets + 6 map tickets + 7 externals + MAP-ROOT. */
-export const EXPECTED_ROW_COUNT = 123;
+/** The eight track closers: the six pre-document closers plus DOC-F and ARC-CLOSE. */
+export const TRACK_CLOSERS: readonly string[] = [
+	...PRE_DOCUMENT_CLOSERS,
+	"DOC-F",
+	"ARC-CLOSE",
+];
+
+/** 151 rows: 137 sibling graduate tickets + 6 map tickets + 7 externals + MAP-ROOT. */
+export const EXPECTED_ROW_COUNT = 151;
 
 /** Witness provenance counts pinned from the publishing authority. */
-export const EXPECTED_SOURCE_RECORD_COUNT = 131;
-export const EXPECTED_TASK_COUNT = 115;
+export const EXPECTED_SOURCE_RECORD_COUNT = 159;
+export const EXPECTED_TASK_COUNT = 143;
 export const EXPECTED_EXTERNAL_COUNT = 16;
 /**
  * Retired spellings that must appear nowhere in the registry or published
@@ -103,17 +193,17 @@ export const BANNED_ALIAS_PATTERN = /DOCS-[A-Z0-9]+/g;
 export const BANNED_PHRASE = "six struct-literal";
 
 /** Structural sha256 over the mapped snapshot records; rejects hand edits. */
-export const SNAPSHOT_STRUCTURAL_SHA256 = "abc3c1b4f09b145e7ae9cdf3510d5dd9c21022dce1ff565444888f9f360a88ad";
+export const SNAPSHOT_STRUCTURAL_SHA256 = "4f6997271223f1f3bf477e6562fac138b49acd17e72d5f384635a068122d2426";
 
 /**
  * Pinned canonical source-record hash of the tracked witness: the
  * publisher's SHA-256 over canonical UTF-8 JSON (sorted object keys,
- * compact separators, record order preserved) of all 131 structural ticket
+ * compact separators, record order preserved) of all 159 structural ticket
  * records, with mutable issue status excluded. Guards full ticket-record
  * provenance — a distinct contract from the mapped structural hash above,
  * which guards the derived registry rows.
  */
-export const SNAPSHOT_SOURCE_HASH = "sha256:8ab7e57344727c59a722359adb852c6a8e4d98c53fee4df48fe103ffaf5aadfd";
+export const SNAPSHOT_SOURCE_HASH = "sha256:4af3051a18a80ddc979ee83c27fa07f33356ab41c50847fde35ae59c3a021d2f";
 
 // ============================================================================
 // Snapshot ingestion
@@ -122,6 +212,8 @@ export const SNAPSHOT_SOURCE_HASH = "sha256:8ab7e57344727c59a722359adb852c6a8e4d
 export interface SnapshotRecord {
 	/** Structural ticket record: `execution` task or `external` prerequisite. */
 	readonly kind: "execution" | "external";
+	/** Graduation modality derived from the issue's single wayfinder:* label. */
+	readonly modality: string;
 	readonly stableId: string;
 	readonly issue: number;
 	readonly url: string;
@@ -147,6 +239,8 @@ export interface ExpectedRow {
 	readonly stableId: string;
 	/** `execution`, `external`, or `map-root` for the synthetic anchor. */
 	readonly recordKind: string;
+	/** Witness modality; `task` for the synthetic MAP-ROOT anchor. */
+	readonly modality: string;
 	readonly issue: number;
 	readonly title: string;
 	readonly blockedBy: readonly string[];
@@ -159,10 +253,10 @@ export interface DerivedRegistry {
 }
 
 const RECORD_KINDS: Record<string, true> = { execution: true, external: true };
-
+const RECORD_MODALITIES: Record<string, true> = { task: true, prototype: true, research: true, grilling: true, external: true };
 /**
- * Validate every retained structural field: kind, nonempty stable ID,
- * integer issue, URL, nullable question/acceptance, native parent, and
+ * Validate every retained structural field: kind, modality, nonempty stable
+ * ID, integer issue, URL, nullable question/acceptance, native parent, and
  * ordered string blockers. Mutable issue status is not part of the
  * tracked-witness contract.
  */
@@ -174,6 +268,8 @@ function isSnapshotRecord(value: unknown): value is SnapshotRecord {
 		candidate.stableId.length > 0 &&
 		typeof candidate.kind === "string" &&
 		RECORD_KINDS[candidate.kind] === true &&
+		typeof candidate.modality === "string" &&
+		RECORD_MODALITIES[candidate.modality] === true &&
 		typeof candidate.issue === "number" &&
 		Number.isInteger(candidate.issue) &&
 		typeof candidate.url === "string" &&
@@ -269,6 +365,7 @@ export function deriveExpectedRegistry(snapshot: Snapshot): DerivedRegistry {
 	rows.push({
 		stableId: MAP_ROOT_ID,
 		recordKind: "map-root",
+		modality: "task",
 		issue: snapshot.canonicalIssue,
 		title: MAP_ROOT_TITLE,
 		blockedBy: [],
@@ -299,6 +396,7 @@ function toExpectedRow(record: SnapshotRecord): ExpectedRow {
 	return {
 		stableId: record.stableId,
 		recordKind: record.kind,
+		modality: record.modality,
 		issue: record.issue,
 		title: record.title,
 		blockedBy: [...record.blockers],
@@ -307,10 +405,11 @@ function toExpectedRow(record: SnapshotRecord): ExpectedRow {
 }
 
 /**
- * Structural sha256 over the mapped snapshot records (stableId, kind, issue,
- * title, blockers in record order), prefixed by the snapshot identity
- * header. Status fields are deliberately excluded so status flips keep the
- * graph check green while any structural hand edit breaks the pin.
+ * Structural sha256 over the mapped snapshot records (stableId, kind,
+ * modality, issue, title, blockers in record order), prefixed by the
+ * snapshot identity header. Status fields are deliberately excluded so
+ * status flips keep the graph check green while any structural hand edit
+ * breaks the pin.
  */
 export function computeSnapshotStructuralHash(snapshot: Snapshot): string {
 	const lines: string[] = [
@@ -321,7 +420,7 @@ export function computeSnapshotStructuralHash(snapshot: Snapshot): string {
 	mapped.sort((left, right) => (left.stableId < right.stableId ? -1 : left.stableId > right.stableId ? 1 : 0));
 	for (const row of mapped) {
 		lines.push(
-			`${row.stableId}\t${row.recordKind}\t#${row.issue}\t${row.title}\t${row.blockedBy.join(",") || "-"}`,
+			`${row.stableId}\t${row.recordKind}\t${row.modality}\t#${row.issue}\t${row.title}\t${row.blockedBy.join(",") || "-"}`,
 		);
 	}
 	return createHash("sha256").update(lines.join("\n"), "utf8").digest("hex");
@@ -552,7 +651,7 @@ function checkRowSet(docRows: readonly MapRow[], expected: readonly ExpectedRow[
 	}
 	if (expected.length !== EXPECTED_ROW_COUNT) {
 		violations.push(
-			`derived registry has ${expected.length} rows, expected ${EXPECTED_ROW_COUNT} (109 sibling graduate tickets + 6 map tickets + 7 prerequisite externals + ${MAP_ROOT_ID})`,
+			`derived registry has ${expected.length} rows, expected ${EXPECTED_ROW_COUNT} (137 sibling graduate tickets + 6 map tickets + 7 prerequisite externals + ${MAP_ROOT_ID})`,
 		);
 	}
 	if (docRows.length !== EXPECTED_ROW_COUNT) {
@@ -636,6 +735,9 @@ function checkRowFields(docRows: readonly MapRow[], expected: readonly ExpectedR
 		}
 		if (row.title !== wanted.title) {
 			violations.push(`${row.stableId} title differs from the snapshot record`);
+		}
+		if (row.modality !== wanted.modality) {
+			violations.push(`${row.stableId} modality '${row.modality}' differs from witness '${wanted.modality}'`);
 		}
 		const docBlockers = row.blockedBy.join(", ");
 		const wantedBlockers = wanted.blockedBy.join(", ");
@@ -758,7 +860,7 @@ function checkClosureComposition(docRows: readonly MapRow[]): string[] {
 	}
 	const docF = byId.get(DOC_F_ID);
 	if (docF !== undefined) {
-		for (const prerequisite of [...SEVEN_CLOSERS.filter((closer) => closer !== DOC_F_ID), REL_DOCS_ID]) {
+		for (const prerequisite of [...PRE_DOCUMENT_CLOSERS, REL_DOCS_ID]) {
 			if (!docF.blockedBy.includes(prerequisite)) {
 				violations.push(`required prerequisite ${prerequisite} of ${DOC_F_ID} is missing`);
 			}
@@ -766,7 +868,7 @@ function checkClosureComposition(docRows: readonly MapRow[]): string[] {
 	}
 	const map5 = byId.get(CLOSURE_GATE_NODE_ID);
 	if (map5 !== undefined) {
-		for (const closer of ["MAP-4", ...SEVEN_CLOSERS]) {
+		for (const closer of ["MAP-4", ...TRACK_CLOSERS]) {
 			if (!map5.blockedBy.includes(closer)) {
 				violations.push(`${CLOSURE_GATE_NODE_ID} closure composition is missing ${closer}`);
 			}
@@ -876,8 +978,8 @@ export function runMapLedgerChecks(inputs: MapLedgerInputs): string[] {
 	if (snapshot === null) return violations;
 
 	if (snapshot.version !== 2) add("snapshot", [`${SNAPSHOT_PATH} version is ${snapshot.version}, expected 2`]);
-	if (snapshot.repository !== "metaphorics/pi-oxidized") {
-		add("snapshot", [`${SNAPSHOT_PATH} repository is '${snapshot.repository}', expected 'metaphorics/pi-oxidized'`]);
+	if (snapshot.repository !== "gosuda/pi-oxidized") {
+		add("snapshot", [`${SNAPSHOT_PATH} repository is '${snapshot.repository}', expected 'gosuda/pi-oxidized'`]);
 	}
 	if (snapshot.canonicalIssue !== 12) {
 		add("snapshot", [`${SNAPSHOT_PATH} canonicalIssue is ${snapshot.canonicalIssue}, expected 12`]);
@@ -967,23 +1069,21 @@ export function runMapLedgerChecks(inputs: MapLedgerInputs): string[] {
 }
 
 /**
- * Read the three required inputs; the tracked witness is read first so a
- * fresh checkout without ignored workflow state reports the exact missing
- * fixture. Any read failure throws one stable diagnostic naming the
- * repo-relative path, keeping `runMapLedgerChecks` pure over text.
+ * Resolve one immutable generation, then pair its witness and rendered map
+ * with the parity ledger. No old publication path is read.
  */
 export function loadMapLedgerInputs(repoRoot: string): MapLedgerInputs {
-	const readRequired = (relativePath: string): string => {
-		try {
-			return readFileSync(join(repoRoot, relativePath), "utf8");
-		} catch (error) {
-			throw new Error(`cannot read required ${relativePath}: ${String(error)}`);
-		}
-	};
+	const current = loadCurrentExecutionMap(repoRoot);
+	let ledgerText: string;
+	try {
+		ledgerText = readFileSync(join(repoRoot, PARITY_LEDGER_PATH), "utf8");
+	} catch (error) {
+		throw new Error(`cannot read required ${PARITY_LEDGER_PATH}: ${String(error)}`);
+	}
 	return {
-		snapshotText: readRequired(SNAPSHOT_PATH),
-		ledgerText: readRequired(PARITY_LEDGER_PATH),
-		mapText: readRequired(MAP_DOC_PATH),
+		snapshotText: current.witnessText,
+		ledgerText,
+		mapText: current.mapText,
 	};
 }
 

@@ -2,3 +2,4 @@ target/
 node_modules/
 packages/extension-host/dist/
 .outline/
+scripts/verification/fixtures/execution-map/.staging/

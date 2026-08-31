@@ -86,15 +86,15 @@ describe("graduation census (MAP-3)", () => {
 		const census = graduationCensus(SNAPSHOT, all);
 		expect(census.open).toEqual([]);
 		expect(census.unknownState).toEqual([]);
-		expect(census.graduated).toHaveLength(115);
-		expect(census.closedDecisions).toHaveLength(131);
+		expect(census.graduated).toHaveLength(143);
+		expect(census.closedDecisions).toHaveLength(159);
 	});
 
 	test("open execution nodes are the ungraduated frontier; open externals are not", () => {
 		const census = graduationCensus(SNAPSHOT, statesFor([141, 13]));
 		expect(census.open).toEqual(["MAP-3"]);
-		expect(census.graduated).toHaveLength(114);
-		expect(census.closedDecisions).toHaveLength(129);
+		expect(census.graduated).toHaveLength(142);
+		expect(census.closedDecisions).toHaveLength(157);
 		expect(census.closedDecisions).not.toContain("MAP-3");
 	});
 
@@ -170,7 +170,7 @@ describe("dry-run status flip (MAP-3)", () => {
 		expect(flip.relDocsBypassViolations).toEqual([]);
 		expect(flip.structuralSha256).toBe(SNAPSHOT_STRUCTURAL_SHA256);
 		expect(flip.census.open).toEqual(["PAR-WIRE"]);
-		expect(flip.census.graduated).toHaveLength(114);
+		expect(flip.census.graduated).toHaveLength(142);
 	});
 
 	test("flipping a closed node (reopen simulation) leaves the published graph green", () => {
@@ -180,7 +180,7 @@ describe("dry-run status flip (MAP-3)", () => {
 		expect(flip.graphViolations).toEqual([]);
 		expect(flip.aliasViolations.length).toBe(0);
 		expect(flip.relDocsBypassViolations.length).toBe(0);
-		expect(flip.census.closedDecisions).toHaveLength(130);
+		expect(flip.census.closedDecisions).toHaveLength(158);
 	});
 
 	test("a flip that perturbs the records fails the re-run loudly", () => {

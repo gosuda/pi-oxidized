@@ -138,7 +138,7 @@ describe("binding edges (MAP-2)", () => {
 		const mutated = removeEdge(DOC.rows, "MAP-5", "PAR-CLOSE");
 		const violations = checkBindingEdges(mutated);
 		expect(violations).toContain(
-			"AR15: binding edge MAP-5 blocked_by PAR-CLOSE missing (actual: [MAP-4, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E])",
+			"AR15: binding edge MAP-5 blocked_by PAR-CLOSE missing (actual: [MAP-4, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E, ARC-CLOSE])",
 		);
 	});
 
@@ -170,7 +170,7 @@ describe("binding edges (MAP-2)", () => {
 		const mutated = removeEdge(DOC.rows, "MAP-5", "XC-CLOSE");
 		const violations = checkBindingEdges(mutated);
 		expect(violations).toContain(
-			"AR15: binding edge MAP-5 blocked_by XC-CLOSE missing (actual: [MAP-4, PAR-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E])",
+			"AR15: binding edge MAP-5 blocked_by XC-CLOSE missing (actual: [MAP-4, PAR-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E, ARC-CLOSE])",
 		);
 	});
 
@@ -178,7 +178,7 @@ describe("binding edges (MAP-2)", () => {
 		const mutated = removeEdge(DOC.rows, "MAP-5", "TUI-CLOSE");
 		const violations = checkBindingEdges(mutated);
 		expect(violations).toContain(
-			"AR15: binding edge MAP-5 blocked_by TUI-CLOSE missing (actual: [MAP-4, PAR-CLOSE, XC-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E])",
+			"AR15: binding edge MAP-5 blocked_by TUI-CLOSE missing (actual: [MAP-4, PAR-CLOSE, XC-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E, ARC-CLOSE])",
 		);
 	});
 
@@ -186,7 +186,7 @@ describe("binding edges (MAP-2)", () => {
 		const mutated = removeEdge(DOC.rows, "MAP-5", "PERF-CLOSE");
 		const violations = checkBindingEdges(mutated);
 		expect(violations).toContain(
-			"AR15: binding edge MAP-5 blocked_by PERF-CLOSE missing (actual: [MAP-4, PAR-CLOSE, XC-CLOSE, TUI-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E])",
+			"AR15: binding edge MAP-5 blocked_by PERF-CLOSE missing (actual: [MAP-4, PAR-CLOSE, XC-CLOSE, TUI-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E, ARC-CLOSE])",
 		);
 	});
 
@@ -194,7 +194,7 @@ describe("binding edges (MAP-2)", () => {
 		const mutated = removeEdge(DOC.rows, "MAP-5", "REL-CLOSE");
 		const violations = checkBindingEdges(mutated);
 		expect(violations).toContain(
-			"AR15: binding edge MAP-5 blocked_by REL-CLOSE missing (actual: [MAP-4, PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E])",
+			"AR15: binding edge MAP-5 blocked_by REL-CLOSE missing (actual: [MAP-4, PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E, ARC-CLOSE])",
 		);
 	});
 
@@ -202,7 +202,7 @@ describe("binding edges (MAP-2)", () => {
 		const mutated = removeEdge(DOC.rows, "MAP-5", "DEPS-D1");
 		const violations = checkBindingEdges(mutated);
 		expect(violations).toContain(
-			"AR15: binding edge MAP-5 blocked_by DEPS-D1 missing (actual: [MAP-4, PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E])",
+			"AR15: binding edge MAP-5 blocked_by DEPS-D1 missing (actual: [MAP-4, PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E, ARC-CLOSE])",
 		);
 	});
 
@@ -210,7 +210,15 @@ describe("binding edges (MAP-2)", () => {
 		const mutated = removeEdge(DOC.rows, "MAP-5", "DOC-F");
 		const violations = checkBindingEdges(mutated);
 		expect(violations).toContain(
-			"AR15: binding edge MAP-5 blocked_by DOC-F missing (actual: [MAP-4, PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E])",
+			"AR15: binding edge MAP-5 blocked_by DOC-F missing (actual: [MAP-4, PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E, ARC-CLOSE])",
+		);
+	});
+
+	test("removing the MAP-5<-ARC-CLOSE edge fails", () => {
+		const mutated = removeEdge(DOC.rows, "MAP-5", "ARC-CLOSE");
+		const violations = checkBindingEdges(mutated);
+		expect(violations).toContain(
+			"AR15: binding edge MAP-5 blocked_by ARC-CLOSE missing (actual: [MAP-4, PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, REL-R2, DEPS-R3, DEPS-R2, DEPS-G1, DOC-D, DOC-E])",
 		);
 	});
 });

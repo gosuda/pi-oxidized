@@ -15,7 +15,7 @@ assignment below against the live registry.
 | --- | --- | --- | --- | --- |
 | AR1 | XC-2 (#41) | Mirror lockstep witness for protocol.rs, TypeScript METHODS, and frames.jsonl | PAR-CLOSE blocked_by XC-2 | Shared ownership between PAR and XC tracks |
 | AR2 | PAR-CLIENT (#33) | cfg(unix) platform contract for PAR transports: Unix adapter gated, transport-neutral client plus in-memory adapter portable to windows-msvc, typed EndpointSpecError::UnsupportedOnPlatform on non-Unix, same commit | — | Portable-only (loses Unix sockets) or Unix-only (not portable) |
-| AR3 | PAR-TEL (#71) | Five-site AgentLoopConfig telemetry boundary: agent.rs, config.rs, run.rs, schedule.rs, pi/src/core/agent_session/mod.rs | — | Six struct-literal sites (banned phrase) |
+| AR3 | PAR-TEL (#71) | Six-site AgentLoopConfig telemetry boundary: agent.rs, config.rs, run.rs, schedule.rs, pi/src/core/agent_session/mod.rs, pi_agent_stream_frame_bench.rs | — | Unpinned AgentLoopConfig literal construction |
 | AR4 | XC-1 (#52) | Extension-host endpoint ownership: pi-ext owns the endpoint; pi and pi-agent do not | — | pi or pi-agent owning the extension-host endpoint |
 | AR5 | REL-DOCS (#111) | Release constants plus documentation staging under the single REL-DOCS row; DOC-F is consume-only | REL-CLOSE blocked_by REL-DOCS; DOC-F blocked_by REL-DOCS, REL-CLOSE, and DOC-F's existing closure prerequisites | DOC track owning release docs |
 | AR6 | PAR-COMPAT-DISPO (#45) | Config-value: one parser and one command cache (A7); dead config_value wrapper disposed | — | Split parser/cache across crates |
@@ -27,7 +27,7 @@ assignment below against the live registry.
 | AR12 | TUI-V1 (#76) | TUI state-matrix verification depends on the portable PTY harness | TUI-V1 blocked_by TUI-P1 | No dependency |
 | AR13 | PERF-T6 (#88) | Extension-host scaling lane bound to pi_ext::server::serve_io with a deterministic NativeExtension adapter | — | Different boundary or no binding |
 | AR14 | PAR-CLOSE (#39) | PAR closure precedes extension compatibility closure | XC-CLOSE blocked_by PAR-CLOSE | Parallel or before PAR closure |
-| AR15 | MAP-5 (#144) | All seven track closers precede the final cross-plan gate | MAP-5 blocked_by PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F | Partial closure or subset |
+| AR15 | MAP-5 (#144) | All eight track closers precede the final cross-plan gate | MAP-5 blocked_by PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, ARC-CLOSE | Partial closure or subset |
 
 ## Ownership cross-check
 
@@ -37,14 +37,14 @@ No surface ends with two owners:
 - **Release constants plus documentation staging** → REL under the single REL-DOCS row (DOC-F is consume-only)
 - **Extension-host endpoint** → pi-ext (XC track; pi and pi-agent do not own it)
 - **Config-value** → one parser and one command cache (A7; PAR-COMPAT-DISPO disposes the dead wrapper)
-- **Telemetry** → PAR at five AgentLoopConfig struct-literal sites (PAR-TEL)
+- **Telemetry** → PAR at six AgentLoopConfig struct-literal sites (PAR-TEL)
 
 ## Binding edges
 
-All binding edges are present in the published registry
-(docs/EXECUTION_MAP.md) and the tracked witness
-(scripts/verification/fixtures/execution-map-ticket-records.json). The
-arbitration verifier confirms each edge against the live registry and re-runs
+All binding edges and the tracked canonical witness live in the immutable
+generation selected by
+`scripts/verification/fixtures/execution-map/current.md`. The arbitration
+verifier confirms each edge against the live registry and re-runs
 the MAP-1 graph check to assert acyclicity, exact canonical IDs, zero
 duplicates, zero aliases, full reachability, and zero REL-DOCS bypass paths.
 
@@ -59,4 +59,4 @@ duplicates, zero aliases, full reachability, and zero REL-DOCS bypass paths.
 | TUI V-proof depends on portable transcript harness | TUI-V1 | TUI-P1 | AR12 |
 | REL-CLOSE depends on REL-DOCS | REL-CLOSE | REL-DOCS | AR5 |
 | PAR closure precedes XC closure | XC-CLOSE | PAR-CLOSE | AR14 |
-| All seven closers precede MAP-5 | MAP-5 | PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F | AR15 |
+| All eight closers precede MAP-5 | MAP-5 | PAR-CLOSE, XC-CLOSE, TUI-CLOSE, PERF-CLOSE, REL-CLOSE, DEPS-D1, DOC-F, ARC-CLOSE | AR15 |

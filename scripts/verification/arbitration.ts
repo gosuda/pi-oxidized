@@ -4,10 +4,10 @@
  *
  * The execution map stays a single graph authority: this tool imports the
  * MAP-1 ledger (`map.ts`) and consumes its published artifacts — the
- * structural ticket-record witness, docs/EXECUTION_MAP.md, and
- * docs/PARITY_LEDGER.md — through `loadMapLedgerInputs`. It never re-parses
- * the registry or re-derives edges; every graph assertion here is a re-run
- * of `runMapLedgerChecks` over the unchanged published texts.
+ * structural ticket-record witness, the pointer-selected execution-map
+ * generation, and docs/PARITY_LEDGER.md — through `loadMapLedgerInputs`. It
+ * never re-parses the registry or re-derives edges; every graph assertion
+ * here is a re-run of `runMapLedgerChecks` over the unchanged published texts.
  *
  * The verifier owns three contracts:
  *
@@ -16,9 +16,9 @@
  *                         ruling ID, exactly one owning sibling ticket, and
  *                         a non-empty rejected option.
  * 2. binding edges      - every binding edge named by the rulings is present
- *                         in the live registry (docs/EXECUTION_MAP.md
- *                         blocked_by cells). The DAG re-passes MAP-1's full
- *                         graph check: acyclic, exact canonical IDs, zero
+ *                         in the live registry (the execution-map
+ *                         generation's blocked_by cells). The DAG re-passes
+ *                         MAP-1's full graph check: acyclic, exact canonical IDs, zero
  *                         duplicates, zero aliases, full reachability, zero
  *                         REL-DOCS bypass paths.
  * 3. ownership uniqueness - no surface ends with two owners. The five named
@@ -87,8 +87,8 @@ export const RULINGS: readonly Ruling[] = [
 		id: "AR3",
 		owner: "PAR-TEL",
 		ownerIssue: 71,
-		surface: "Five-site AgentLoopConfig telemetry boundary",
-		rejectedOption: "Six struct-literal sites (banned phrase)",
+		surface: "Six-site AgentLoopConfig telemetry boundary",
+		rejectedOption: "Unpinned AgentLoopConfig literal construction",
 		edges: [],
 	},
 	{
@@ -187,7 +187,7 @@ export const RULINGS: readonly Ruling[] = [
 		id: "AR15",
 		owner: "MAP-5",
 		ownerIssue: 144,
-		surface: "All seven track closers precede the final cross-plan gate",
+		surface: "All eight track closers precede the final cross-plan gate",
 		rejectedOption: "Partial closure or subset",
 		edges: [
 			["MAP-5", "PAR-CLOSE"],
@@ -197,6 +197,7 @@ export const RULINGS: readonly Ruling[] = [
 			["MAP-5", "REL-CLOSE"],
 			["MAP-5", "DEPS-D1"],
 			["MAP-5", "DOC-F"],
+			["MAP-5", "ARC-CLOSE"],
 		],
 	},
 ];

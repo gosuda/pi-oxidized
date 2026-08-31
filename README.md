@@ -139,7 +139,7 @@ from the repository root after `bun install`.
 | compatibility matrix | `bun run verify:compatibility` | [`docs/compatibility.md`](docs/compatibility.md) |
 | dependency exposure | `bun run verify:dependency-exposure` | [`scripts/verification/dependency-exposure.ts`](scripts/verification/dependency-exposure.ts) |
 | e2e smoke | `bun run verify:e2e` | [`scripts/verification/e2e-smoke.ts`](scripts/verification/e2e-smoke.ts) |
-| execution map ledger | `bun run verify:map-ledger` | [`docs/EXECUTION_MAP.md`](docs/EXECUTION_MAP.md) |
+| execution map ledger | `bun run verify:map-ledger` | [scripts/verification/fixtures/execution-map/current.md](scripts/verification/fixtures/execution-map/current.md) |
 | gates | `bun run verify:gates` | [`scripts/verification/gates.ts`](scripts/verification/gates.ts) |
 | snippets | `bun run verify:snippets` | [`scripts/verification/snippet-harness.ts`](scripts/verification/snippet-harness.ts) |
 | extension scaling | `bun run verify:extension-scaling` | [`docs/extension-compatibility-contract.md`](docs/extension-compatibility-contract.md) |
@@ -177,7 +177,7 @@ bun run package-release         # cargo + host + runtime + archive + smoke
 | [docs/compatibility.md](docs/compatibility.md) | compatibility matrix |
 | [docs/evidence.md](docs/evidence.md) | doc-evidence program |
 | [docs/extension-compatibility-contract.md](docs/extension-compatibility-contract.md) | extension compatibility contract |
-| [docs/EXECUTION_MAP.md](docs/EXECUTION_MAP.md) | execution map ledger |
+| [scripts/verification/fixtures/execution-map/current.md](scripts/verification/fixtures/execution-map/current.md) | execution map (current-generation pointer) |
 | [docs/PARITY_LEDGER.md](docs/PARITY_LEDGER.md) | parity ledger |
 | [docs/performance/PERF-CLOSE-evidence.md](docs/performance/PERF-CLOSE-evidence.md) | performance acceptance evidence |
 | [docs/terminal-rail-doctrine.md](docs/terminal-rail-doctrine.md) | terminal rail doctrine |

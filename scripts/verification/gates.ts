@@ -4,10 +4,10 @@
  *
  * The execution map stays a single graph authority: this tool imports the
  * MAP-1 ledger (`map.ts`) and consumes its published artifacts — the
- * structural ticket-record witness, docs/EXECUTION_MAP.md, and
- * docs/PARITY_LEDGER.md — through `loadMapLedgerInputs`. It never re-parses
- * the registry or re-derives edges; every graph assertion here is a re-run
- * of `runMapLedgerChecks` over the unchanged published texts.
+ * structural ticket-record witness, the pointer-selected execution-map
+ * generation, and docs/PARITY_LEDGER.md — through `loadMapLedgerInputs`. It
+ * never re-parses the registry or re-derives edges; every graph assertion
+ * here is a re-run of `runMapLedgerChecks` over the unchanged published texts.
  *
  * The verifier owns three contracts:
  *
@@ -45,7 +45,7 @@ import {
 	parseExecutionMap,
 	prerequisiteClosure,
 	runMapLedgerChecks,
-	SEVEN_CLOSERS,
+	TRACK_CLOSERS,
 	type MapLedgerInputs,
 	type MapRow,
 } from "./map.ts";
@@ -111,9 +111,9 @@ export const GATES: readonly Gate[] = [
 	},
 	{
 		id: "G-ALLTRACKS",
-		description: "All seven closers resolved precedes MAP-5",
-		trigger: SEVEN_CLOSERS,
-		requiredEdges: SEVEN_CLOSERS.map((closer) => ["MAP-5", closer] as readonly [string, string]),
+		description: "All eight track closers resolved precedes MAP-5",
+		trigger: TRACK_CLOSERS,
+		requiredEdges: TRACK_CLOSERS.map((closer) => ["MAP-5", closer] as readonly [string, string]),
 	},
 	{
 		id: "G-RELDOCS",
