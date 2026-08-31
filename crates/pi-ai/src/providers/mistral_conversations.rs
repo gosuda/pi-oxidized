@@ -9,7 +9,7 @@ use futures::{StreamExt, stream::BoxStream};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
-use crate::provider::{Provider, ProviderError, StreamOptions};
+use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DoneReason,
     ErrorReason, Message, Model, ModelInput, StopReason, TextContent, ThinkingContent, ToolCall,
@@ -286,7 +286,7 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
     if let Some(max_tokens) = options.max_tokens {
         payload.insert("max_tokens".into(), Value::Number(max_tokens.into()));
     }
-    if let Some(choice) = options.extra.get("toolChoice") {
+    if let Some(choice) = options.extra_value(StreamOptionKey::TOOL_CHOICE) {
         payload.insert("tool_choice".into(), choice.clone());
     }
     apply_reasoning_options(&mut payload, model, options);
@@ -304,15 +304,18 @@ fn apply_reasoning_options(
     model: &Model,
     options: &StreamOptions,
 ) {
-    if let Some(value) = options.extra.get("promptMode") {
+    if let Some(value) = options.extra_value(StreamOptionKey::PROMPT_MODE) {
         payload.insert("prompt_mode".into(), value.clone());
         return;
     }
-    if let Some(value) = options.extra.get("reasoningEffort") {
+    if let Some(value) = options.extra_value(StreamOptionKey::REASONING_EFFORT) {
         payload.insert("reasoning_effort".into(), value.clone());
         return;
     }
-    let Some(level) = options.extra.get("reasoning").and_then(Value::as_str) else {
+    let Some(level) = options
+        .extra_value(StreamOptionKey::REASONING)
+        .and_then(Value::as_str)
+    else {
         return;
     };
     if !model.reasoning || matches!(level, "off" | "none") {
@@ -1090,9 +1093,7 @@ mod tests {
             cache_retention: Some(CacheRetention::Short),
             ..StreamOptions::default()
         };
-        options
-            .extra
-            .insert("reasoning".into(), Value::String("high".into()));
+        options.insert_extra(StreamOptionKey::REASONING, Value::String("high".into()));
         let payload = build_payload(&model("mistral-small-latest", true), &context, &options);
         assert_eq!(payload["max_tokens"], 123);
         assert_eq!(payload["reasoning_effort"], "high");
@@ -1102,9 +1103,7 @@ mod tests {
         assert_eq!(payload["tools"][0]["function"]["strict"], false);
 
         options.extra.clear();
-        options
-            .extra
-            .insert("reasoning".into(), Value::String("high".into()));
+        options.insert_extra(StreamOptionKey::REASONING, Value::String("high".into()));
         context.tools = None;
         let payload = build_payload(&model("magistral-medium", true), &context, &options);
         assert_eq!(payload["prompt_mode"], "reasoning");

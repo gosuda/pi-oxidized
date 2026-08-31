@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
 
-use crate::provider::StreamOptions;
+use crate::provider::{StreamOptionKey, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, Context, DoneReason, ErrorReason,
     Message, Model, ModelInput, StopReason, TextContent, ThinkingContent, Tool, ToolCall,
@@ -128,10 +128,13 @@ pub(crate) fn build_request_body(
             body.insert("tools".to_owned(), converted);
         }
         if let Some(choice) = options
-            .extra
-            .get("toolChoice")
+            .extra_value(StreamOptionKey::TOOL_CHOICE)
             .and_then(Value::as_str)
-            .or_else(|| options.extra.get("tool_choice").and_then(Value::as_str))
+            .or_else(|| {
+                options
+                    .extra_value(StreamOptionKey::TOOL_CHOICE_SNAKE_CASE)
+                    .and_then(Value::as_str)
+            })
         {
             body.insert(
                 "toolConfig".to_owned(),

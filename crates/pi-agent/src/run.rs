@@ -598,7 +598,7 @@ mod tests {
     use futures::stream::{self, BoxStream, StreamExt};
     use pi_ai::{
         AssistantContent, DoneReason, ErrorReason, Model, ModelCost, ModelInput,
-        ModelThinkingLevel, TextContent, ToolCall, ToolResultContent,
+        ModelThinkingLevel, StreamOptionKey, TextContent, ToolCall, ToolResultContent,
     };
     use serde_json::{Map, Value, json};
     use tokio::sync::watch;
@@ -731,8 +731,7 @@ mod tests {
             if let Ok(mut guard) = self.reasoning.lock() {
                 guard.push(
                     options
-                        .extra
-                        .get("reasoning")
+                        .extra_value(StreamOptionKey::REASONING)
                         .and_then(Value::as_str)
                         .map(str::to_owned),
                 );

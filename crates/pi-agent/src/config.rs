@@ -6,8 +6,8 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use pi_ai::provider::{OnPayloadFn, OnResponseFn};
 use pi_ai::{
-    AssistantMessage, CacheRetention, ImageContent, Model, ModelThinkingLevel, StreamOptions,
-    TextContent, ToolCall, ToolResultMessage, Transport,
+    AssistantMessage, CacheRetention, ImageContent, Model, ModelThinkingLevel, StreamOptionKey,
+    StreamOptions, TextContent, ToolCall, ToolResultMessage, Transport,
 };
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -246,11 +246,10 @@ impl AgentLoopConfig {
     /// Builds provider stream options from this config, a resolved key, and cancel token.
     ///
     /// When `reasoning` is present and not [`ModelThinkingLevel::Off`], inserts
-    /// `extra["reasoning"]` as the lowercase level string. When
-    /// `thinking_budgets` is present, inserts `extra["thinkingBudgets"]`.
-    /// Values already present in `stream_extra` are preserved and take
-    /// precedence over the mapped reasoning/thinking keys only when the caller
-    /// already set those exact keys; otherwise the mapped keys are inserted.
+    /// [`StreamOptionKey::REASONING`] as the lowercase level string. When
+    /// `thinking_budgets` is present, inserts [`StreamOptionKey::THINKING_BUDGETS`].
+    /// Values already present in `stream_extra` take precedence over both
+    /// mapped values; otherwise the mapped values are inserted.
     #[must_use]
     pub fn build_stream_options(
         &self,
@@ -268,25 +267,7 @@ pub fn build_stream_options(
     resolved_key: Option<String>,
     signal: Option<CancellationToken>,
 ) -> StreamOptions {
-    let mut extra = config.stream_extra.clone();
-    if let Some(level) = config.reasoning
-        && (level != ModelThinkingLevel::Off
-            || matches!(
-                config.model.api.as_str(),
-                "google-generative-ai" | "google-vertex"
-            ))
-    {
-        extra
-            .entry("reasoning".to_owned())
-            .or_insert_with(|| Value::String(thinking_level_wire(level).to_owned()));
-    }
-    if let Some(budgets) = &config.thinking_budgets {
-        extra
-            .entry("thinkingBudgets".to_owned())
-            .or_insert_with(|| budgets.clone());
-    }
-
-    StreamOptions {
+    let mut options = StreamOptions {
         temperature: config.temperature,
         max_tokens: config.max_tokens,
         signal,
@@ -303,8 +284,23 @@ pub fn build_stream_options(
         max_retry_delay_ms: config.max_retry_delay_ms,
         metadata: config.metadata.clone(),
         env: config.env.clone(),
-        extra,
+        extra: config.stream_extra.clone(),
+    };
+    if let Some(level) = config.reasoning
+        && (level != ModelThinkingLevel::Off
+            || matches!(
+                config.model.api.as_str(),
+                "google-generative-ai" | "google-vertex"
+            ))
+    {
+        options.insert_extra_if_absent_with(StreamOptionKey::REASONING, || {
+            Value::String(thinking_level_wire(level).to_owned())
+        });
     }
+    if let Some(budgets) = &config.thinking_budgets {
+        options.insert_extra_if_absent_with(StreamOptionKey::THINKING_BUDGETS, || budgets.clone());
+    }
+    options
 }
 
 fn thinking_level_wire(level: ModelThinkingLevel) -> &'static str {
@@ -390,7 +386,13 @@ mod tests {
                 Some("1".to_owned()),
             )])),
             env: Some(BTreeMap::from([("FOO".to_owned(), "bar".to_owned())])),
-            stream_extra: Map::from_iter([("toolChoice".to_owned(), json!("auto"))]),
+            stream_extra: Map::from_iter([
+                (
+                    StreamOptionKey::TOOL_CHOICE.as_str().to_owned(),
+                    json!("auto"),
+                ),
+                ("vendorOption".to_owned(), json!({ "enabled": true })),
+            ]),
             tool_execution: ToolExecutionMode::Parallel,
             convert_to_llm: default_convert_to_llm_hook(),
             transform_context: None,
@@ -428,9 +430,22 @@ mod tests {
             Some(Map::from_iter([("k".to_owned(), json!("v"))]))
         );
         assert!(options.signal.is_some());
-        assert_eq!(options.extra.get("reasoning"), Some(&json!("high")));
-        assert_eq!(options.extra.get("thinkingBudgets"), Some(&budgets));
-        assert_eq!(options.extra.get("toolChoice"), Some(&json!("auto")));
+        assert_eq!(
+            options.extra_value(StreamOptionKey::REASONING),
+            Some(&json!("high"))
+        );
+        assert_eq!(
+            options.extra_value(StreamOptionKey::THINKING_BUDGETS),
+            Some(&budgets)
+        );
+        assert_eq!(
+            options.extra_value(StreamOptionKey::TOOL_CHOICE),
+            Some(&json!("auto"))
+        );
+        assert_eq!(
+            options.extra.get("vendorOption"),
+            Some(&json!({ "enabled": true }))
+        );
     }
 
     #[test]
@@ -438,34 +453,42 @@ mod tests {
         let mut google = sample_config(Some(ModelThinkingLevel::Off), None);
         google.model.api = "google-generative-ai".to_owned();
         let off = build_stream_options(&google, None, None);
-        assert_eq!(off.extra.get("reasoning"), Some(&json!("off")));
-        assert!(off.extra.get("thinkingBudgets").is_none());
+        assert_eq!(
+            off.extra_value(StreamOptionKey::REASONING),
+            Some(&json!("off"))
+        );
+        assert!(off.extra_value(StreamOptionKey::THINKING_BUDGETS).is_none());
 
         let absent = build_stream_options(&sample_config(None, None), None, None);
-        assert!(absent.extra.get("reasoning").is_none());
+        assert!(absent.extra_value(StreamOptionKey::REASONING).is_none());
 
         let non_google = build_stream_options(
             &sample_config(Some(ModelThinkingLevel::Off), None),
             None,
             None,
         );
-        assert!(non_google.extra.get("reasoning").is_none());
+        assert!(non_google.extra_value(StreamOptionKey::REASONING).is_none());
     }
 
     #[test]
     fn build_stream_options_preserves_existing_stream_extra_keys() {
         let mut config = sample_config(Some(ModelThinkingLevel::Low), Some(json!({ "low": 1 })));
-        config
-            .stream_extra
-            .insert("reasoning".to_owned(), json!("custom"));
-        config
-            .stream_extra
-            .insert("thinkingBudgets".to_owned(), json!({ "low": 9 }));
+        config.stream_extra.insert(
+            StreamOptionKey::REASONING.as_str().to_owned(),
+            json!("custom"),
+        );
+        config.stream_extra.insert(
+            StreamOptionKey::THINKING_BUDGETS.as_str().to_owned(),
+            json!({ "low": 9 }),
+        );
 
         let options = build_stream_options(&config, None, None);
-        assert_eq!(options.extra.get("reasoning"), Some(&json!("custom")));
         assert_eq!(
-            options.extra.get("thinkingBudgets"),
+            options.extra_value(StreamOptionKey::REASONING),
+            Some(&json!("custom"))
+        );
+        assert_eq!(
+            options.extra_value(StreamOptionKey::THINKING_BUDGETS),
             Some(&json!({ "low": 9 }))
         );
     }

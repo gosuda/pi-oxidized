@@ -101,6 +101,76 @@ pub type OnResponseFn = Arc<
         + Sync,
 >;
 
+/// A supported provider-specific stream option name.
+///
+/// The private constructor keeps supported key spellings in this module. Raw
+/// entries in [`StreamOptions::extra`] remain available for unknown options.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamOptionKey(&'static str);
+
+impl StreamOptionKey {
+    /// Google Vertex API version.
+    pub const API_VERSION: Self = Self("apiVersion");
+    /// `Azure OpenAI` API version.
+    pub const AZURE_API_VERSION: Self = Self("azureApiVersion");
+    /// Explicit `Azure OpenAI` endpoint base URL.
+    pub const AZURE_BASE_URL: Self = Self("azureBaseUrl");
+    /// `Azure OpenAI` deployment name.
+    pub const AZURE_DEPLOYMENT_NAME: Self = Self("azureDeploymentName");
+    /// `Azure OpenAI` resource name.
+    pub const AZURE_RESOURCE_NAME: Self = Self("azureResourceName");
+    /// Pi Messages debug mode.
+    pub const DEBUG: Self = Self("debug");
+    /// Anthropic adaptive-thinking effort.
+    pub const EFFORT: Self = Self("effort");
+    /// Bedrock interleaved-thinking mode.
+    pub const INTERLEAVED_THINKING: Self = Self("interleavedThinking");
+    /// Google Vertex location.
+    pub const LOCATION: Self = Self("location");
+    /// AWS credential profile.
+    pub const PROFILE: Self = Self("profile");
+    /// Google Cloud project.
+    pub const PROJECT: Self = Self("project");
+    /// Mistral prompt mode.
+    pub const PROMPT_MODE: Self = Self("promptMode");
+    /// Google Cloud quota project.
+    pub const QUOTA_PROJECT: Self = Self("quotaProject");
+    /// Provider-neutral reasoning level.
+    pub const REASONING: Self = Self("reasoning");
+    /// `OpenAI`-compatible reasoning effort.
+    pub const REASONING_EFFORT: Self = Self("reasoningEffort");
+    /// `OpenAI`-compatible reasoning summary mode.
+    pub const REASONING_SUMMARY: Self = Self("reasoningSummary");
+    /// AWS region.
+    pub const REGION: Self = Self("region");
+    /// Bedrock request metadata.
+    pub const REQUEST_METADATA: Self = Self("requestMetadata");
+    /// `OpenAI` service tier.
+    pub const SERVICE_TIER: Self = Self("serviceTier");
+    /// `OpenAI Codex` response-text verbosity.
+    pub const TEXT_VERBOSITY: Self = Self("textVerbosity");
+    /// Google thinking configuration.
+    pub const THINKING: Self = Self("thinking");
+    /// Anthropic scalar thinking-token budget.
+    pub const THINKING_BUDGET_TOKENS: Self = Self("thinkingBudgetTokens");
+    /// Provider thinking budgets by reasoning level.
+    pub const THINKING_BUDGETS: Self = Self("thinkingBudgets");
+    /// Provider thinking display mode.
+    pub const THINKING_DISPLAY: Self = Self("thinkingDisplay");
+    /// Anthropic thinking activation.
+    pub const THINKING_ENABLED: Self = Self("thinkingEnabled");
+    /// Canonical provider tool selection.
+    pub const TOOL_CHOICE: Self = Self("toolChoice");
+    /// Google snake-case tool-selection fallback.
+    pub const TOOL_CHOICE_SNAKE_CASE: Self = Self("tool_choice");
+
+    /// Return the serialized option name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
 /// Options that control how a provider streams a response.
 ///
 /// All optional scalar and map fields use `Option`. This type is not `Debug`
@@ -181,7 +251,41 @@ pub struct StreamOptions {
     pub env: Option<BTreeMap<String, String>>,
 
     /// Extra provider-specific options not covered by the common fields.
+    ///
+    /// In-tree code uses [`StreamOptionKey`] for supported names. The raw map
+    /// preserves arbitrary options supplied by extension providers.
     pub extra: Map<String, Value>,
+}
+
+impl StreamOptions {
+    /// Read a supported provider-specific option.
+    #[must_use]
+    pub fn extra_value(&self, key: StreamOptionKey) -> Option<&Value> {
+        self.extra.get(key.as_str())
+    }
+
+    /// Mutably read a supported provider-specific option.
+    #[must_use]
+    pub fn extra_value_mut(&mut self, key: StreamOptionKey) -> Option<&mut Value> {
+        self.extra.get_mut(key.as_str())
+    }
+
+    /// Insert or replace a supported provider-specific option.
+    pub fn insert_extra(&mut self, key: StreamOptionKey, value: Value) {
+        drop(self.extra.insert(key.as_str().to_owned(), value));
+    }
+
+    /// Insert a supported option only when the caller did not supply it.
+    pub fn insert_extra_if_absent_with(
+        &mut self,
+        key: StreamOptionKey,
+        value: impl FnOnce() -> Value,
+    ) {
+        if self.extra.contains_key(key.as_str()) {
+            return;
+        }
+        self.insert_extra(key, value());
+    }
 }
 
 #[cfg(test)]
@@ -304,5 +408,66 @@ mod tests {
 
         assert!(options.on_payload.is_some());
         assert!(options.on_response.is_some());
+    }
+
+    #[test]
+    fn stream_option_vocabulary_has_stable_wire_names() {
+        for (key, wire_name) in [
+            (StreamOptionKey::API_VERSION, "apiVersion"),
+            (StreamOptionKey::AZURE_API_VERSION, "azureApiVersion"),
+            (StreamOptionKey::AZURE_BASE_URL, "azureBaseUrl"),
+            (
+                StreamOptionKey::AZURE_DEPLOYMENT_NAME,
+                "azureDeploymentName",
+            ),
+            (StreamOptionKey::AZURE_RESOURCE_NAME, "azureResourceName"),
+            (StreamOptionKey::DEBUG, "debug"),
+            (StreamOptionKey::EFFORT, "effort"),
+            (StreamOptionKey::INTERLEAVED_THINKING, "interleavedThinking"),
+            (StreamOptionKey::LOCATION, "location"),
+            (StreamOptionKey::PROFILE, "profile"),
+            (StreamOptionKey::PROJECT, "project"),
+            (StreamOptionKey::PROMPT_MODE, "promptMode"),
+            (StreamOptionKey::QUOTA_PROJECT, "quotaProject"),
+            (StreamOptionKey::REASONING, "reasoning"),
+            (StreamOptionKey::REASONING_EFFORT, "reasoningEffort"),
+            (StreamOptionKey::REASONING_SUMMARY, "reasoningSummary"),
+            (StreamOptionKey::REGION, "region"),
+            (StreamOptionKey::REQUEST_METADATA, "requestMetadata"),
+            (StreamOptionKey::SERVICE_TIER, "serviceTier"),
+            (StreamOptionKey::TEXT_VERBOSITY, "textVerbosity"),
+            (StreamOptionKey::THINKING, "thinking"),
+            (
+                StreamOptionKey::THINKING_BUDGET_TOKENS,
+                "thinkingBudgetTokens",
+            ),
+            (StreamOptionKey::THINKING_BUDGETS, "thinkingBudgets"),
+            (StreamOptionKey::THINKING_DISPLAY, "thinkingDisplay"),
+            (StreamOptionKey::THINKING_ENABLED, "thinkingEnabled"),
+            (StreamOptionKey::TOOL_CHOICE, "toolChoice"),
+            (StreamOptionKey::TOOL_CHOICE_SNAKE_CASE, "tool_choice"),
+        ] {
+            assert_eq!(key.as_str(), wire_name);
+        }
+
+        let mut options = StreamOptions::default();
+        options.insert_extra(StreamOptionKey::REASONING, Value::String("high".to_owned()));
+        options.insert_extra_if_absent_with(StreamOptionKey::REASONING, || {
+            Value::String("ignored".to_owned())
+        });
+        assert_eq!(
+            options.extra_value(StreamOptionKey::REASONING),
+            Some(&Value::String("high".to_owned()))
+        );
+
+        let value = options.extra_value_mut(StreamOptionKey::REASONING);
+        assert!(value.is_some());
+        if let Some(value) = value {
+            *value = Value::String("low".to_owned());
+        }
+        assert_eq!(
+            options.extra_value(StreamOptionKey::REASONING),
+            Some(&Value::String("low".to_owned()))
+        );
     }
 }

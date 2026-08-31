@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{StreamExt, stream::BoxStream};
 use reqwest::{Client, Request, Response};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use super::shared::responses::{
     ConvertMessagesOptions, ConvertToolsOptions, ProcessOptions, ResponsesStreamProcessor,
@@ -14,7 +14,7 @@ use super::shared::responses::{
 };
 use super::shared::truncate_error_body;
 use super::transport::{DataSseDecoder, DataSseEvent, HttpTransport, TransportError};
-use crate::provider::{Provider, ProviderError, StreamOptions};
+use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, CacheRetention, Context, ErrorReason, Message, Model,
     ModelThinkingLevel, Tool,
@@ -52,7 +52,7 @@ impl Provider for OpenAiResponses {
         let adapter = self.clone();
         let model = model.clone();
         tokio::spawn(async move {
-            let request_tier = string_option(&options.extra, "serviceTier");
+            let request_tier = string_option(&options, StreamOptionKey::SERVICE_TIER);
             let message = AssistantMessage::new(
                 model.api.clone(),
                 model.provider.clone(),
@@ -320,14 +320,16 @@ fn build_payload(
     if let Some(temperature) = options.temperature {
         payload["temperature"] = Value::from(temperature);
     }
-    copy_extra(&mut payload, &options.extra, "serviceTier", "service_tier");
+    if let Some(value) = options.extra_value(StreamOptionKey::SERVICE_TIER) {
+        payload["service_tier"] = value.clone();
+    }
     if !immediate_tools.is_empty() {
         payload["tools"] = Value::Array(convert_tools(
             &immediate_tools,
             ConvertToolsOptions::default(),
         ));
     }
-    if let Some(tool_choice) = options.extra.get("toolChoice") {
+    if let Some(tool_choice) = options.extra_value(StreamOptionKey::TOOL_CHOICE) {
         payload["tool_choice"] = tool_choice.clone();
     }
     apply_reasoning(model, options, &mut payload, true);
@@ -343,10 +345,9 @@ fn apply_reasoning(
     if !model.reasoning {
         return;
     }
-    let effort = string_option(&options.extra, "reasoningEffort");
+    let effort = string_option(options, StreamOptionKey::REASONING_EFFORT);
     let summary = options
-        .extra
-        .get("reasoningSummary")
+        .extra_value(StreamOptionKey::REASONING_SUMMARY)
         .and_then(Value::as_str);
     if effort.is_some() || summary.is_some() {
         let resolved_effort = effort.as_deref().map_or_else(
@@ -469,14 +470,11 @@ fn compat_bool(model: &Model, name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn copy_extra(payload: &mut Value, extra: &Map<String, Value>, from: &str, to: &str) {
-    if let Some(value) = extra.get(from) {
-        payload[to] = value.clone();
-    }
-}
-
-fn string_option(extra: &Map<String, Value>, name: &str) -> Option<String> {
-    extra.get(name).and_then(Value::as_str).map(str::to_owned)
+fn string_option(options: &StreamOptions, key: StreamOptionKey) -> Option<String> {
+    options
+        .extra_value(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn merge_option_headers(
@@ -603,12 +601,11 @@ mod tests {
             session_id: Some("x".repeat(80)),
             ..StreamOptions::default()
         };
-        options
-            .extra
-            .insert("reasoningEffort".into(), Value::String("high".into()));
-        options
-            .extra
-            .insert("serviceTier".into(), Value::String("flex".into()));
+        options.insert_extra(
+            StreamOptionKey::REASONING_EFFORT,
+            Value::String("high".into()),
+        );
+        options.insert_extra(StreamOptionKey::SERVICE_TIER, Value::String("flex".into()));
         let payload = build_payload(&model(), &context, &options, CacheRetention::Long);
         assert_eq!(payload["store"], false);
         assert_eq!(payload["max_output_tokens"], MIN_OUTPUT_TOKENS);

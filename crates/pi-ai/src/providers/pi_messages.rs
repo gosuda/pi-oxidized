@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use super::shared::{parse_streaming_json, truncate_error_body};
 use super::stream_state::ProviderEventSender;
 use super::transport::{HttpTransport, SseLineBuffer, TransportError};
-use crate::provider::{Provider, ProviderError, StreamOptions};
+use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantMessageEvent, Context,
     DiagnosticCode, DiagnosticErrorInfo, DoneReason, ErrorReason, Model, StopReason, TextContent,
@@ -299,8 +299,7 @@ fn endpoint(model: &Model, debug: bool) -> Result<Url, AdapterFailure> {
 
 fn debug_enabled(options: &StreamOptions) -> bool {
     options
-        .extra
-        .get("debug")
+        .extra_value(StreamOptionKey::DEBUG)
         .and_then(Value::as_bool)
         .unwrap_or(false)
 }
@@ -313,7 +312,7 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
     if let Some(max_tokens) = options.max_tokens {
         request_options.insert("maxTokens".into(), Value::from(max_tokens));
     }
-    if let Some(reasoning) = options.extra.get("reasoning") {
+    if let Some(reasoning) = options.extra_value(StreamOptionKey::REASONING) {
         request_options.insert("reasoning".into(), reasoning.clone());
     }
     if let Some(cache_retention) = resolve_cache_retention(options)
@@ -324,7 +323,7 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
     if let Some(session_id) = &options.session_id {
         request_options.insert("sessionId".into(), Value::String(session_id.clone()));
     }
-    if let Some(tool_choice) = options.extra.get("toolChoice") {
+    if let Some(tool_choice) = options.extra_value(StreamOptionKey::TOOL_CHOICE) {
         request_options.insert("toolChoice".into(), tool_choice.clone());
     }
 
@@ -1080,8 +1079,8 @@ mod tests {
             session_id: Some("session-1".into()),
             ..StreamOptions::default()
         };
-        options.extra.insert("reasoning".into(), json!("high"));
-        options.extra.insert("toolChoice".into(), json!("required"));
+        options.insert_extra(StreamOptionKey::REASONING, json!("high"));
+        options.insert_extra(StreamOptionKey::TOOL_CHOICE, json!("required"));
 
         assert_eq!(
             build_payload(&model(), &context, &options),
@@ -1172,7 +1171,7 @@ mod tests {
     {
         let adapter = PiMessages::new(Client::new());
         let mut options = StreamOptions::default();
-        options.extra.insert("debug".into(), Value::Bool(true));
+        options.insert_extra(StreamOptionKey::DEBUG, Value::Bool(true));
         let url = endpoint(&model(), debug_enabled(&options))?;
         let request = adapter.build_request(
             &model(),

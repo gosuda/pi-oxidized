@@ -14,7 +14,7 @@ use super::shared::responses::{
 };
 use super::shared::truncate_error_body;
 use super::transport::{DataSseDecoder, DataSseEvent, HttpTransport, TransportError};
-use crate::provider::{Provider, ProviderError, StreamOptions};
+use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
 use crate::types::{AssistantMessage, Context, ErrorReason, Model, ModelThinkingLevel};
 
 const DEFAULT_API_VERSION: &str = "v1";
@@ -220,16 +220,16 @@ fn resolve_azure_config(
     model: &Model,
     options: &StreamOptions,
 ) -> Result<AzureConfig, AdapterFailure> {
-    let api_version = extra_string(options, "azureApiVersion")
+    let api_version = extra_string(options, StreamOptionKey::AZURE_API_VERSION)
         .or_else(|| env_value(options, "AZURE_OPENAI_API_VERSION").map(str::to_owned))
         .unwrap_or_else(|| DEFAULT_API_VERSION.to_owned());
-    let explicit_base = extra_string(options, "azureBaseUrl").or_else(|| {
+    let explicit_base = extra_string(options, StreamOptionKey::AZURE_BASE_URL).or_else(|| {
         env_value(options, "AZURE_OPENAI_BASE_URL")
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
     });
-    let resource = extra_string(options, "azureResourceName")
+    let resource = extra_string(options, StreamOptionKey::AZURE_RESOURCE_NAME)
         .or_else(|| env_value(options, "AZURE_OPENAI_RESOURCE_NAME").map(str::to_owned));
     let base_url = explicit_base
         .or_else(|| resource.map(|resource| format!("https://{resource}.openai.azure.com/openai/v1")))
@@ -259,7 +259,7 @@ fn normalize_azure_base_url(base_url: &str) -> Result<String, AdapterFailure> {
 }
 
 fn resolve_deployment_name(model: &Model, options: &StreamOptions) -> String {
-    if let Some(deployment) = extra_string(options, "azureDeploymentName") {
+    if let Some(deployment) = extra_string(options, StreamOptionKey::AZURE_DEPLOYMENT_NAME) {
         return deployment;
     }
     let mapping = env_value(options, "AZURE_OPENAI_DEPLOYMENT_NAME_MAP").unwrap_or("");
@@ -357,10 +357,9 @@ fn apply_reasoning(model: &Model, options: &StreamOptions, payload: &mut Value) 
     if !model.reasoning {
         return;
     }
-    let effort = extra_string(options, "reasoningEffort");
+    let effort = extra_string(options, StreamOptionKey::REASONING_EFFORT);
     let summary = options
-        .extra
-        .get("reasoningSummary")
+        .extra_value(StreamOptionKey::REASONING_SUMMARY)
         .and_then(Value::as_str);
     if effort.is_some() || summary.is_some() {
         let effort = effort
@@ -399,10 +398,9 @@ fn map_thinking_level(model: &Model, value: &str) -> String {
         .unwrap_or_else(|| value.to_owned())
 }
 
-fn extra_string(options: &StreamOptions, name: &str) -> Option<String> {
+fn extra_string(options: &StreamOptions, key: StreamOptionKey) -> Option<String> {
     options
-        .extra
-        .get(name)
+        .extra_value(key)
         .and_then(Value::as_str)
         .map(str::to_owned)
 }
@@ -501,12 +499,14 @@ mod tests {
     #[test]
     fn azure_urls_resource_and_api_version_are_resolved() -> Result<(), String> {
         let mut options = StreamOptions::default();
-        options
-            .extra
-            .insert("azureResourceName".into(), Value::String("resource".into()));
-        options
-            .extra
-            .insert("azureApiVersion".into(), Value::String("2026-01-01".into()));
+        options.insert_extra(
+            StreamOptionKey::AZURE_RESOURCE_NAME,
+            Value::String("resource".into()),
+        );
+        options.insert_extra(
+            StreamOptionKey::AZURE_API_VERSION,
+            Value::String("2026-01-01".into()),
+        );
         let config =
             resolve_azure_config(&model(""), &options).map_err(|error| error.message.clone())?;
         assert_eq!(

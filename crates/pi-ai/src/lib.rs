@@ -15,7 +15,7 @@ pub use estimate::{
     estimate_message_tokens, estimate_messages_tokens, estimate_text_and_image_content_tokens,
     estimate_text_tokens,
 };
-pub use provider::{Provider, ProviderError, ProviderResponse, StreamOptions};
+pub use provider::{Provider, ProviderError, ProviderResponse, StreamOptionKey, StreamOptions};
 pub use simple_options::{
     AdjustedMaxTokens, CONTEXT_SAFETY_TOKENS, DEFAULT_CACHE_RETENTION, DEFAULT_MAX_RETRY_DELAY_MS,
     DEFAULT_THINKING_BUDGET_HIGH, DEFAULT_THINKING_BUDGET_LOW, DEFAULT_THINKING_BUDGET_MEDIUM,

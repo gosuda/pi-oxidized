@@ -29,8 +29,8 @@ use futures::StreamExt;
 use pi_agent::AgentMessage;
 use pi_ai::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, Context, Message, Model,
-    ModelThinkingLevel, ProviderError, StopReason, StreamOptions, TextContent, Usage, UserContent,
-    UserMessage, UserMessageContent,
+    ModelThinkingLevel, ProviderError, StopReason, StreamOptionKey, StreamOptions, TextContent,
+    Usage, UserContent, UserMessage, UserMessageContent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -884,9 +884,7 @@ fn create_summarization_options(
         && (level != "off"
             || matches!(model.api.as_str(), "google-generative-ai" | "google-vertex"))
     {
-        options
-            .extra
-            .insert("reasoning".to_owned(), Value::String(level.to_owned()));
+        options.insert_extra(StreamOptionKey::REASONING, Value::String(level.to_owned()));
     }
     options
 }
@@ -1641,7 +1639,7 @@ mod tests {
         let options =
             create_summarization_options(&model, 1_024, None, None, None, None, Some("off"));
         assert_eq!(
-            options.extra.get("reasoning"),
+            options.extra_value(StreamOptionKey::REASONING),
             Some(&Value::String("off".to_owned()))
         );
     }

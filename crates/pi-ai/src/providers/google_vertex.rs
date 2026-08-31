@@ -19,7 +19,7 @@ use google_cloud_auth::credentials::{
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
-use crate::provider::{Provider, ProviderError, StreamOptions};
+use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
 use crate::types::{AssistantMessage, AssistantMessageEvent, Context, Model, ModelThinkingLevel};
 
 use super::shared::google::{
@@ -531,7 +531,7 @@ async fn resolve_auth(
         scope: CLOUD_PLATFORM_SCOPE,
         application_credentials: env_string(options, "GOOGLE_APPLICATION_CREDENTIALS"),
         quota_project_id: env_string(options, "GOOGLE_CLOUD_QUOTA_PROJECT")
-            .or_else(|| option_string(options, "quotaProject")),
+            .or_else(|| option_string(options, StreamOptionKey::QUOTA_PROJECT)),
     };
     let token = if let Some(signal) = &options.signal {
         tokio::select! {
@@ -568,7 +568,7 @@ fn resolve_api_key(options: &StreamOptions) -> Option<String> {
 }
 
 fn resolve_project(options: &StreamOptions) -> Result<String, GoogleFailure> {
-    option_string(options, "project")
+    option_string(options, StreamOptionKey::PROJECT)
         .or_else(|| env_string(options, "GOOGLE_CLOUD_PROJECT"))
         .or_else(|| env_string(options, "GCLOUD_PROJECT"))
         .ok_or_else(|| {
@@ -579,7 +579,7 @@ fn resolve_project(options: &StreamOptions) -> Result<String, GoogleFailure> {
 }
 
 fn resolve_location(options: &StreamOptions) -> Result<String, GoogleFailure> {
-    option_string(options, "location")
+    option_string(options, StreamOptionKey::LOCATION)
         .or_else(|| env_string(options, "GOOGLE_CLOUD_LOCATION"))
         .ok_or_else(|| {
             GoogleFailure::error(
@@ -588,10 +588,9 @@ fn resolve_location(options: &StreamOptions) -> Result<String, GoogleFailure> {
         })
 }
 
-fn option_string(options: &StreamOptions, key: &str) -> Option<String> {
+fn option_string(options: &StreamOptions, key: StreamOptionKey) -> Option<String> {
     options
-        .extra
-        .get(key)
+        .extra_value(key)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -617,7 +616,7 @@ fn endpoint(
     let model_path = vertex_model_path(&model.id)?;
     let custom_base = resolve_custom_base_url(&model.base_url);
     let configured_version =
-        option_string(options, "apiVersion").unwrap_or_else(|| API_VERSION.into());
+        option_string(options, StreamOptionKey::API_VERSION).unwrap_or_else(|| API_VERSION.into());
 
     let (base, include_version, prefix) = if let Some(base) = custom_base {
         let include_version = !base_url_includes_api_version(base);
@@ -773,7 +772,10 @@ fn thinking_config(model: &Model, options: &StreamOptions) -> Result<Option<Valu
     if !model.reasoning {
         return Ok(None);
     }
-    if let Some(thinking) = options.extra.get("thinking").and_then(Value::as_object) {
+    if let Some(thinking) = options
+        .extra_value(StreamOptionKey::THINKING)
+        .and_then(Value::as_object)
+    {
         let enabled = thinking
             .get("enabled")
             .and_then(Value::as_bool)
@@ -797,7 +799,10 @@ fn thinking_config(model: &Model, options: &StreamOptions) -> Result<Option<Valu
         return Ok(Some(Value::Object(config)));
     }
 
-    let Some(requested) = options.extra.get("reasoning").and_then(Value::as_str) else {
+    let Some(requested) = options
+        .extra_value(StreamOptionKey::REASONING)
+        .and_then(Value::as_str)
+    else {
         return Ok(None);
     };
     let effort = clamp_effort(model, requested)?;
@@ -939,8 +944,7 @@ fn thinking_budget(model: &Model, effort: Effort, options: &StreamOptions) -> i6
         _ => "high",
     };
     if let Some(custom) = options
-        .extra
-        .get("thinkingBudgets")
+        .extra_value(StreamOptionKey::THINKING_BUDGETS)
         .and_then(Value::as_object)
         .and_then(|budgets| budgets.get(key))
         .and_then(Value::as_i64)
@@ -1146,10 +1150,8 @@ mod tests {
 
     fn bearer_options() -> StreamOptions {
         let mut options = StreamOptions::default();
-        options.extra.insert("project".into(), json!("project-1"));
-        options
-            .extra
-            .insert("location".into(), json!("us-central1"));
+        options.insert_extra(StreamOptionKey::PROJECT, json!("project-1"));
+        options.insert_extra(StreamOptionKey::LOCATION, json!("us-central1"));
         options
     }
 
@@ -1163,7 +1165,7 @@ mod tests {
             api_key: Some("  AIza-real  ".into()),
             ..StreamOptions::default()
         };
-        options.extra.insert("project".into(), json!("ignored"));
+        options.insert_extra(StreamOptionKey::PROJECT, json!("ignored"));
         let trait_source: Arc<dyn VertexTokenProvider> = source.clone();
         assert_eq!(
             resolve_auth(&options, Some(&trait_source)).await?,
@@ -1257,15 +1259,13 @@ mod tests {
         let mut gemma = model();
         gemma.id = "gemma-4-26b".into();
         let mut options = StreamOptions::default();
-        options
-            .extra
-            .insert("thinking".into(), json!({"enabled": false}));
+        options.insert_extra(StreamOptionKey::THINKING, json!({"enabled": false}));
         assert_eq!(
             thinking_config(&gemma, &options)?,
             Some(json!({"thinkingBudget": 0}))
         );
         options.extra.clear();
-        options.extra.insert("reasoning".into(), json!("minimal"));
+        options.insert_extra(StreamOptionKey::REASONING, json!("minimal"));
         assert_eq!(
             thinking_config(&gemma, &options)?,
             Some(json!({"includeThoughts": true, "thinkingBudget": -1}))

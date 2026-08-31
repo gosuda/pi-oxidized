@@ -9,7 +9,7 @@ use futures::stream::BoxStream;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
-use crate::provider::{Provider, ProviderError, StreamOptions};
+use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
 use crate::types::{AssistantMessage, AssistantMessageEvent, Context, Model, ModelThinkingLevel};
 
 use super::shared::google::{
@@ -245,7 +245,10 @@ fn thinking_config(model: &Model, options: &StreamOptions) -> Result<Option<Valu
     if !model.reasoning {
         return Ok(None);
     }
-    if let Some(thinking) = options.extra.get("thinking").and_then(Value::as_object) {
+    if let Some(thinking) = options
+        .extra_value(StreamOptionKey::THINKING)
+        .and_then(Value::as_object)
+    {
         let enabled = thinking
             .get("enabled")
             .and_then(Value::as_bool)
@@ -269,7 +272,10 @@ fn thinking_config(model: &Model, options: &StreamOptions) -> Result<Option<Valu
         return Ok(Some(Value::Object(config)));
     }
 
-    let Some(requested) = options.extra.get("reasoning").and_then(Value::as_str) else {
+    let Some(requested) = options
+        .extra_value(StreamOptionKey::REASONING)
+        .and_then(Value::as_str)
+    else {
         return Ok(None);
     };
     let effort = clamp_effort(model, requested)?;
@@ -421,8 +427,7 @@ fn thinking_budget(model: &Model, effort: Effort, options: &StreamOptions) -> i6
         _ => "high",
     };
     if let Some(custom) = options
-        .extra
-        .get("thinkingBudgets")
+        .extra_value(StreamOptionKey::THINKING_BUDGETS)
         .and_then(Value::as_object)
         .and_then(|budgets| budgets.get(key))
         .and_then(Value::as_i64)
@@ -558,9 +563,7 @@ mod tests {
     #[test]
     fn model_families_choose_distinct_thinking_controls() -> Result<(), GoogleFailure> {
         let mut disabled = StreamOptions::default();
-        disabled
-            .extra
-            .insert("thinking".into(), json!({"enabled": false}));
+        disabled.insert_extra(StreamOptionKey::THINKING, json!({"enabled": false}));
         assert_eq!(
             thinking_config(&model("gemini-3.1-pro-preview"), &disabled)?,
             Some(json!({"thinkingLevel": "LOW"}))
@@ -579,7 +582,7 @@ mod tests {
         );
 
         let mut enabled = StreamOptions::default();
-        enabled.extra.insert("reasoning".into(), json!("medium"));
+        enabled.insert_extra(StreamOptionKey::REASONING, json!("medium"));
         assert_eq!(
             thinking_config(&model("gemini-3.1-pro-preview"), &enabled)?,
             Some(json!({"includeThoughts": true, "thinkingLevel": "HIGH"}))

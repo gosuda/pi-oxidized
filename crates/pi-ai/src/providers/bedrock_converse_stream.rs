@@ -31,7 +31,7 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde_json::{Map, Value, json};
 
-use crate::provider::{Provider, ProviderError, ProviderResponse, StreamOptions};
+use crate::provider::{Provider, ProviderError, ProviderResponse, StreamOptionKey, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DoneReason,
     ErrorReason, Message, Model, ModelThinkingLevel, ThinkingLevel, ToolResultContent, Usage,
@@ -401,7 +401,7 @@ fn build_client_request(
 }
 
 fn resolve_profile(options: &StreamOptions) -> Option<String> {
-    option_string(&options.extra, "profile").or_else(|| env_value(options, "AWS_PROFILE"))
+    option_string(options, StreamOptionKey::PROFILE).or_else(|| env_value(options, "AWS_PROFILE"))
 }
 
 fn resolve_static_credentials(options: &StreamOptions) -> Option<BedrockStaticCredentials> {
@@ -426,7 +426,7 @@ fn redacted_access_key_id(access_key_id: &str) -> String {
 }
 
 fn resolve_region_and_endpoint(model: &Model, options: &StreamOptions) -> (String, Option<String>) {
-    let configured_region = option_string(&options.extra, "region")
+    let configured_region = option_string(options, StreamOptionKey::REGION)
         .or_else(|| env_value(options, "AWS_REGION"))
         .or_else(|| env_value(options, "AWS_DEFAULT_REGION"));
     let endpoint_region = standard_bedrock_endpoint_region(&model.base_url);
@@ -481,9 +481,9 @@ fn env_value(options: &StreamOptions, name: &str) -> Option<String> {
         .cloned()
 }
 
-fn option_string(options: &Map<String, Value>, name: &str) -> Option<String> {
+fn option_string(options: &StreamOptions, key: StreamOptionKey) -> Option<String> {
     options
-        .get(name)
+        .extra_value(key)
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
@@ -844,7 +844,7 @@ fn convert_tool_config(
     let Some(tools) = context.tools.as_ref().filter(|tools| !tools.is_empty()) else {
         return Ok(None);
     };
-    let choice = options.extra.get("toolChoice");
+    let choice = options.extra_value(StreamOptionKey::TOOL_CHOICE);
     if choice.and_then(Value::as_str) == Some("none") {
         return Ok(None);
     }
@@ -886,7 +886,7 @@ fn convert_tool_config(
 }
 
 fn request_metadata(options: &StreamOptions) -> Result<Option<Map<String, Value>>, String> {
-    let object = if let Some(source) = options.extra.get("requestMetadata") {
+    let object = if let Some(source) = options.extra_value(StreamOptionKey::REQUEST_METADATA) {
         source
             .as_object()
             .ok_or_else(|| "Bedrock requestMetadata must be an object".to_owned())?
@@ -908,8 +908,7 @@ fn request_metadata(options: &StreamOptions) -> Result<Option<Map<String, Value>
 
 fn reasoning_level(options: &StreamOptions) -> Result<Option<ThinkingLevel>, String> {
     options
-        .extra
-        .get("reasoning")
+        .extra_value(StreamOptionKey::REASONING)
         .map(|value| {
             serde_json::from_value(value.clone())
                 .map_err(|error| format!("Invalid Bedrock reasoning level: {error}"))
@@ -933,8 +932,7 @@ fn build_additional_model_request_fields(
     } else {
         Some(
             options
-                .extra
-                .get("thinkingDisplay")
+                .extra_value(StreamOptionKey::THINKING_DISPLAY)
                 .and_then(Value::as_str)
                 .unwrap_or("summarized"),
         )
@@ -967,8 +965,7 @@ fn build_additional_model_request_fields(
         }
         result.insert("thinking".to_owned(), Value::Object(thinking));
         if options
-            .extra
-            .get("interleavedThinking")
+            .extra_value(StreamOptionKey::INTERLEAVED_THINKING)
             .and_then(Value::as_bool)
             .unwrap_or(true)
         {
@@ -989,8 +986,7 @@ fn thinking_budget(options: &StreamOptions, reasoning: ThinkingLevel) -> Result<
         ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "high",
     };
     if let Some(value) = options
-        .extra
-        .get("thinkingBudgets")
+        .extra_value(StreamOptionKey::THINKING_BUDGETS)
         .and_then(Value::as_object)
         .and_then(|budgets| budgets.get(level))
     {
@@ -1055,7 +1051,7 @@ fn map_thinking_effort(model: &Model, level: ThinkingLevel) -> String {
 }
 
 fn is_govcloud_target(model: &Model, options: &StreamOptions) -> bool {
-    option_string(&options.extra, "region")
+    option_string(options, StreamOptionKey::REGION)
         .or_else(|| env_value(options, "AWS_REGION"))
         .or_else(|| env_value(options, "AWS_DEFAULT_REGION"))
         .is_some_and(|region| region.to_ascii_lowercase().starts_with("us-gov-"))
@@ -1976,9 +1972,7 @@ mod tests {
             cache_retention: Some(CacheRetention::Long),
             ..StreamOptions::default()
         };
-        options
-            .extra
-            .insert("reasoning".to_owned(), Value::String("high".to_owned()));
+        options.insert_extra(StreamOptionKey::REASONING, Value::String("high".to_owned()));
 
         let payload = build_request_payload(&model, &context, &options)
             .map_err(|error| format!("request conversion failed: {error}"))?;
@@ -2015,9 +2009,7 @@ mod tests {
             tools: None,
         };
         let mut options = StreamOptions::default();
-        options
-            .extra
-            .insert("reasoning".to_owned(), Value::String("high".to_owned()));
+        options.insert_extra(StreamOptionKey::REASONING, Value::String("high".to_owned()));
 
         let payload = build_request_payload(&model, &context, &options)
             .map_err(|error| format!("request conversion failed: {error}"))?;
@@ -2297,16 +2289,12 @@ mod tests {
     fn build_client_request_selects_region_endpoint_and_profile() {
         let mut model = test_model("anthropic.claude-3-7-sonnet", "Claude 3.7 Sonnet");
         model.base_url = "https://bedrock-runtime.eu-central-1.amazonaws.com".to_owned();
-        let mut extra = Map::new();
-        extra.insert(
-            "region".to_owned(),
+        let mut options = StreamOptions::default();
+        options.insert_extra(
+            StreamOptionKey::REGION,
             Value::String("ap-southeast-2".to_owned()),
         );
-        extra.insert("profile".to_owned(), Value::String("prod".to_owned()));
-        let options = StreamOptions {
-            extra,
-            ..StreamOptions::default()
-        };
+        options.insert_extra(StreamOptionKey::PROFILE, Value::String("prod".to_owned()));
 
         let request = build_client_request(&model, &options, model.id.clone());
         assert_eq!(request.region, "ap-southeast-2");

@@ -17,7 +17,7 @@ use super::shared::{
 };
 use super::stream_state::{AssistantState, ProviderEventSender};
 use super::transport::{DataSseDecoder, DataSseEvent, HttpTransport, TransportError};
-use crate::provider::{Provider, ProviderError, StreamOptions};
+use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DoneReason,
     ErrorReason, Message, Model, ModelInput, ModelThinkingLevel, StopReason, ThinkingContent, Tool,
@@ -669,7 +669,7 @@ fn build_payload(
         apply_anthropic_cache_control(&mut messages, payload.get_mut("tools"), &cache_control);
         payload["messages"] = Value::Array(messages);
     }
-    if let Some(tool_choice) = options.extra.get("toolChoice") {
+    if let Some(tool_choice) = options.extra_value(StreamOptionKey::TOOL_CHOICE) {
         payload["tool_choice"] = tool_choice.clone();
     }
     apply_thinking(model, options, compat, &mut payload);
@@ -1027,7 +1027,9 @@ fn apply_thinking(model: &Model, options: &StreamOptions, compat: &Compat, paylo
     if !model.reasoning {
         return;
     }
-    let effort = options.extra.get("reasoningEffort").and_then(Value::as_str);
+    let effort = options
+        .extra_value(StreamOptionKey::REASONING_EFFORT)
+        .and_then(Value::as_str);
     let mapped = effort.map(|value| map_thinking_level(model, value));
     match compat.thinking.thinking_format.as_str() {
         "zai" => {
@@ -1754,9 +1756,10 @@ mod tests {
             session_id: Some("session".into()),
             ..StreamOptions::default()
         };
-        options
-            .extra
-            .insert("toolChoice".into(), Value::String("required".into()));
+        options.insert_extra(
+            StreamOptionKey::TOOL_CHOICE,
+            Value::String("required".into()),
+        );
         let model = model("openai");
         let payload = build_payload(
             &model,

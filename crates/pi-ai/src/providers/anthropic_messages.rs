@@ -9,7 +9,7 @@ use futures::StreamExt;
 use reqwest::{Client, Request};
 use serde_json::{Map, Value, json};
 
-use crate::provider::{Provider, StreamOptions};
+use crate::provider::{Provider, StreamOptionKey, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DoneReason,
     ErrorReason, Message, Model, ModelThinkingLevel, StopReason, ThinkingContent, ToolCall,
@@ -289,7 +289,7 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
     {
         payload.insert("metadata".to_owned(), json!({ "user_id": user_id }));
     }
-    if let Some(tool_choice) = options.extra.get("toolChoice") {
+    if let Some(tool_choice) = options.extra_value(StreamOptionKey::TOOL_CHOICE) {
         payload.insert(
             "tool_choice".to_owned(),
             if let Some(kind) = tool_choice.as_str() {
@@ -303,7 +303,7 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
 }
 
 fn insert_temperature(payload: &mut Map<String, Value>, model: &Model, options: &StreamOptions) {
-    let thinking_enabled = extra_bool(options, "thinkingEnabled");
+    let thinking_enabled = extra_bool(options, StreamOptionKey::THINKING_ENABLED);
     if let Some(temperature) = options.temperature
         && thinking_enabled != Some(true)
         && compat_bool(model, "supportsTemperature", true)
@@ -317,11 +317,10 @@ fn insert_thinking(payload: &mut Map<String, Value>, model: &Model, options: &St
     if !model.reasoning {
         return;
     }
-    match extra_bool(options, "thinkingEnabled") {
+    match extra_bool(options, StreamOptionKey::THINKING_ENABLED) {
         Some(true) => {
             let display = options
-                .extra
-                .get("thinkingDisplay")
+                .extra_value(StreamOptionKey::THINKING_DISPLAY)
                 .and_then(Value::as_str)
                 .unwrap_or("summarized");
             if compat_bool(model, "forceAdaptiveThinking", false) {
@@ -329,13 +328,15 @@ fn insert_thinking(payload: &mut Map<String, Value>, model: &Model, options: &St
                     "thinking".to_owned(),
                     json!({ "type": "adaptive", "display": display }),
                 );
-                if let Some(effort) = options.extra.get("effort").and_then(Value::as_str) {
+                if let Some(effort) = options
+                    .extra_value(StreamOptionKey::EFFORT)
+                    .and_then(Value::as_str)
+                {
                     payload.insert("output_config".to_owned(), json!({ "effort": effort }));
                 }
             } else {
                 let budget = options
-                    .extra
-                    .get("thinkingBudgetTokens")
+                    .extra_value(StreamOptionKey::THINKING_BUDGET_TOKENS)
                     .and_then(Value::as_u64)
                     .unwrap_or(1024);
                 payload.insert(
@@ -437,8 +438,8 @@ fn compat_bool(model: &Model, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn extra_bool(options: &StreamOptions, key: &str) -> Option<bool> {
-    options.extra.get(key).and_then(Value::as_bool)
+fn extra_bool(options: &StreamOptions, key: StreamOptionKey) -> Option<bool> {
+    options.extra_value(key).and_then(Value::as_bool)
 }
 
 fn convert_messages(model: &Model, context: &Context, cache: Option<&Value>) -> Vec<Value> {
@@ -1257,12 +1258,8 @@ mod tests {
             cache_retention: Some(CacheRetention::Long),
             ..StreamOptions::default()
         };
-        options
-            .extra
-            .insert("thinkingEnabled".to_owned(), Value::Bool(true));
-        options
-            .extra
-            .insert("thinkingBudgetTokens".to_owned(), Value::from(2048));
+        options.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(true));
+        options.insert_extra(StreamOptionKey::THINKING_BUDGET_TOKENS, Value::from(2048));
         let payload = build_payload(&model(), &context, &options);
         assert_eq!(payload["system"][0]["cache_control"]["ttl"], "1h");
         assert_eq!(payload["thinking"]["budget_tokens"], 2048);
@@ -1284,9 +1281,7 @@ mod tests {
     fn thinking_disable_respects_off_null_sentinel() {
         let context = Context::default();
         let mut options = StreamOptions::default();
-        options
-            .extra
-            .insert("thinkingEnabled".to_owned(), Value::Bool(false));
+        options.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(false));
 
         // Plain reasoning model: explicit disable is sent (upstream parity).
         let payload = build_payload(&model(), &context, &options);

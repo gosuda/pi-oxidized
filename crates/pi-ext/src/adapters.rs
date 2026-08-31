@@ -1452,6 +1452,7 @@ mod tests {
 
     #[tokio::test]
     async fn extension_provider_forwards_prepared_stream_options() -> R {
+        use pi_ai::StreamOptionKey;
         use pi_ai::types::{CacheRetention, Transport};
         use std::collections::BTreeMap;
 
@@ -1473,13 +1474,7 @@ mod tests {
         headers.insert("X-Drop".to_owned(), None);
         let mut env = BTreeMap::new();
         env.insert("CUSTOM_REGION".to_owned(), "us-test".to_owned());
-        let mut extra = Map::new();
-        extra.insert("reasoning".to_owned(), Value::String("high".to_owned()));
-        extra.insert(
-            "thinkingBudgets".to_owned(),
-            serde_json::json!({"high": 4096}),
-        );
-        let options = StreamOptions {
+        let mut options = StreamOptions {
             temperature: Some(0.2),
             max_tokens: Some(128),
             api_key: Some("sk-runtime".to_owned()),
@@ -1498,9 +1493,20 @@ mod tests {
                     .ok_or("metadata object")?,
             ),
             env: Some(env),
-            extra,
             ..StreamOptions::default()
         };
+        options.insert_extra(StreamOptionKey::REASONING, Value::String("high".to_owned()));
+        options.insert_extra(
+            StreamOptionKey::THINKING_BUDGETS,
+            serde_json::json!({"high": 4096}),
+        );
+        options.extra.insert(
+            "vendorOption".to_owned(),
+            serde_json::json!({"enabled": true}),
+        );
+        options
+            .extra
+            .insert("timeoutMs".to_owned(), Value::from(99));
         let mut stream = provider.stream(&model, Context::default(), options);
         let req = host.require_frame("provider.stream").await?;
         assert_eq!(req.method, methods::PROVIDER_STREAM);
@@ -1525,6 +1531,8 @@ mod tests {
         assert_eq!(opts["env"]["CUSTOM_REGION"], "us-test");
         assert_eq!(opts["reasoning"], "high");
         assert_eq!(opts["thinkingBudgets"]["high"], 4096);
+        assert_eq!(opts["vendorOption"]["enabled"], true);
+        assert!(opts.get("extra").is_none());
         // Credentials must stay inside options — not at the request root.
         assert!(req.payload.get("apiKey").is_none());
         assert!(req.payload.get("headers").is_none());

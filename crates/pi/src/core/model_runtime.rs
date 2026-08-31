@@ -34,7 +34,7 @@ use pi_ai::models_store::{
     FileModelsStore, InMemoryModelsStore, ModelOverrides, ModelsStore, apply_model_overrides,
     compose_provider_models, models_error_from_catalog,
 };
-use pi_ai::provider::{Provider, ProviderError, StreamOptions};
+use pi_ai::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
 use pi_ai::providers::{
     AnthropicMessages, AzureOpenAiResponses, BedrockConverseStream, DefaultBedrockClientFactory,
     GoogleGenerativeAi, GoogleVertex, MistralConversations, OpenAiCodexResponses,
@@ -1033,10 +1033,8 @@ impl ModelRuntime {
         }
     }
 
-    /// Map the generic `extra["reasoning"]` onto per-API activation keys and
-    /// apply the upstream max-token clamps (thinking-budget inflation for the
-    /// anthropic/bedrock family, plain context clamp otherwise), mirroring
-    /// what each reference `streamSimple` does inside its API module.
+    /// Map the generic [`StreamOptionKey::REASONING`] value onto per-API
+    /// activation keys and apply the upstream max-token clamps.
     fn shape_reasoning_options(
         model: &Model,
         context: &Context,
@@ -1044,8 +1042,7 @@ impl ModelRuntime {
     ) -> StreamOptions {
         let reasoning_level = if model.reasoning {
             options
-                .extra
-                .get("reasoning")
+                .extra_value(StreamOptionKey::REASONING)
                 .and_then(Value::as_str)
                 .and_then(|level| {
                     (level != "off")
@@ -1059,24 +1056,19 @@ impl ModelRuntime {
             // Upstream anthropic streamSimple always sends the activation flag,
             // so off/absent reaches the adapter as an explicit disable.
             if model.api == "anthropic-messages" && model.reasoning {
-                options
-                    .extra
-                    .insert("thinkingEnabled".to_owned(), Value::Bool(false));
+                options.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(false));
             }
             return pi_ai::apply_simple_max_tokens_clamp(model, context, options);
         };
         let custom_budgets = options
-            .extra
-            .get("thinkingBudgets")
+            .extra_value(StreamOptionKey::THINKING_BUDGETS)
             .and_then(|value| serde_json::from_value(value.clone()).ok());
         match model.api.as_str() {
             "anthropic-messages" => {
-                options
-                    .extra
-                    .insert("thinkingEnabled".to_owned(), Value::Bool(true));
+                options.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(true));
                 if Self::uses_adaptive_thinking(model) {
-                    options.extra.insert(
-                        "effort".to_owned(),
+                    options.insert_extra(
+                        StreamOptionKey::EFFORT,
                         Value::String(Self::adaptive_effort(model, level)),
                     );
                     return pi_ai::apply_simple_max_tokens_clamp(model, context, options);
@@ -1086,12 +1078,17 @@ impl ModelRuntime {
             | "azure-openai-responses"
             | "openai-codex-responses"
             | "openai-completions" => {
-                // ThinkingLevel is a plain string enum; serde cannot fail.
-                #[allow(clippy::expect_used)]
-                options.extra.insert(
-                    "reasoningEffort".to_owned(),
-                    serde_json::to_value(level)
-                        .expect("ThinkingLevel serializes to a plain string"),
+                let effort = match level {
+                    ThinkingLevel::Minimal => "minimal",
+                    ThinkingLevel::Low => "low",
+                    ThinkingLevel::Medium => "medium",
+                    ThinkingLevel::High => "high",
+                    ThinkingLevel::Xhigh => "xhigh",
+                    ThinkingLevel::Max => "max",
+                };
+                options.insert_extra(
+                    StreamOptionKey::REASONING_EFFORT,
+                    Value::String(effort.to_owned()),
                 );
             }
             _ => {}
@@ -1143,17 +1140,23 @@ impl ModelRuntime {
                 | pi_ai::ThinkingLevel::Xhigh
                 | pi_ai::ThinkingLevel::Max => "high",
             };
-            let budgets = options
-                .extra
-                .entry("thinkingBudgets".to_owned())
-                .or_insert_with(|| Value::Object(serde_json::Map::new()));
-            if let Some(map) = budgets.as_object_mut() {
+            if options
+                .extra_value(StreamOptionKey::THINKING_BUDGETS)
+                .is_none()
+            {
+                options.insert_extra(
+                    StreamOptionKey::THINKING_BUDGETS,
+                    Value::Object(serde_json::Map::new()),
+                );
+            }
+            if let Some(map) = options
+                .extra_value_mut(StreamOptionKey::THINKING_BUDGETS)
+                .and_then(Value::as_object_mut)
+            {
                 map.insert(key.to_owned(), budget);
             }
         } else {
-            options
-                .extra
-                .insert("thinkingBudgetTokens".to_owned(), budget);
+            options.insert_extra(StreamOptionKey::THINKING_BUDGET_TOKENS, budget);
         }
     }
 
@@ -2389,6 +2392,12 @@ mod tests {
         extra: serde_json::Map<String, Value>,
     }
 
+    impl RecordedStreamCall {
+        fn extra_value(&self, key: StreamOptionKey) -> Option<&Value> {
+            self.extra.get(key.as_str())
+        }
+    }
+
     impl RecordingExtensionProvider {
         fn new() -> Self {
             Self {
@@ -3281,8 +3290,6 @@ mod tests {
     async fn prepare_request_applies_thinking_budget_for_reasoning_model()
     -> Result<(), ModelRuntimeError> {
         let runtime = ModelRuntime::create_in_memory().await?;
-        let mut extra = serde_json::Map::new();
-        extra.insert("reasoning".to_owned(), Value::String("high".to_owned()));
         runtime.register_provider(
             "reasoning-provider",
             &ProviderConfigInput {
@@ -3311,11 +3318,11 @@ mod tests {
         runtime.register_extension_stream_provider("reasoning-provider", extension.clone());
 
         let model = required(runtime.get_model("reasoning-provider", "m"), "model")?;
-        let options = StreamOptions {
+        let mut options = StreamOptions {
             max_tokens: Some(1_024),
-            extra,
             ..StreamOptions::default()
         };
+        options.insert_extra(StreamOptionKey::REASONING, Value::String("high".to_owned()));
         let mut stream = runtime.stream_simple(model, Context::default(), options);
         let first = futures::StreamExt::next(&mut stream).await;
         assert!(
@@ -3330,19 +3337,20 @@ mod tests {
             max_tokens, 4_096,
             "thinking budget should expand max_tokens up to model cap"
         );
-        let extra = &calls[0].extra;
         assert_eq!(
-            extra.get("thinkingBudgetTokens"),
+            calls[0].extra_value(StreamOptionKey::THINKING_BUDGET_TOKENS),
             Some(&Value::Number(3_072.into())),
             "thinking budget should be exposed for adapter use"
         );
         assert_eq!(
-            extra.get("thinkingEnabled"),
+            calls[0].extra_value(StreamOptionKey::THINKING_ENABLED),
             Some(&Value::Bool(true)),
             "anthropic-messages activates extended thinking via thinkingEnabled"
         );
         assert!(
-            extra.get("reasoningEffort").is_none(),
+            calls[0]
+                .extra_value(StreamOptionKey::REASONING_EFFORT)
+                .is_none(),
             "anthropic-messages must not receive the openai activation key"
         );
         Ok(())
@@ -3369,11 +3377,11 @@ mod tests {
             compat,
             extra: BTreeMap::new(),
         };
-        let options = StreamOptions {
+        let mut options = StreamOptions {
             max_tokens: Some(1_024),
-            extra: serde_json::Map::from_iter([("reasoning".to_owned(), json!("high"))]),
             ..StreamOptions::default()
         };
+        options.insert_extra(StreamOptionKey::REASONING, json!("high"));
 
         let anthropic = ModelRuntime::shape_reasoning_options(
             &adaptive_model(
@@ -3386,9 +3394,19 @@ mod tests {
             options.clone(),
         );
         assert_eq!(anthropic.max_tokens, Some(1_024));
-        assert_eq!(anthropic.extra.get("thinkingEnabled"), Some(&json!(true)));
-        assert_eq!(anthropic.extra.get("effort"), Some(&json!("max")));
-        assert!(anthropic.extra.get("thinkingBudgetTokens").is_none());
+        assert_eq!(
+            anthropic.extra_value(StreamOptionKey::THINKING_ENABLED),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            anthropic.extra_value(StreamOptionKey::EFFORT),
+            Some(&json!("max"))
+        );
+        assert!(
+            anthropic
+                .extra_value(StreamOptionKey::THINKING_BUDGET_TOKENS)
+                .is_none()
+        );
 
         let bedrock = ModelRuntime::shape_reasoning_options(
             &adaptive_model(
@@ -3401,8 +3419,15 @@ mod tests {
             options,
         );
         assert_eq!(bedrock.max_tokens, Some(1_024));
-        assert_eq!(bedrock.extra.get("reasoning"), Some(&json!("high")));
-        assert!(bedrock.extra.get("thinkingBudgetTokens").is_none());
+        assert_eq!(
+            bedrock.extra_value(StreamOptionKey::REASONING),
+            Some(&json!("high"))
+        );
+        assert!(
+            bedrock
+                .extra_value(StreamOptionKey::THINKING_BUDGET_TOKENS)
+                .is_none()
+        );
     }
 
     #[test]
@@ -3423,13 +3448,11 @@ mod tests {
             compat: None,
             extra: BTreeMap::new(),
         };
-        let off = StreamOptions {
-            extra: serde_json::Map::from_iter([("reasoning".to_owned(), json!("off"))]),
-            ..StreamOptions::default()
-        };
+        let mut off = StreamOptions::default();
+        off.insert_extra(StreamOptionKey::REASONING, json!("off"));
         let shaped = ModelRuntime::shape_reasoning_options(&model, &Context::default(), off);
         assert_eq!(
-            shaped.extra.get("thinkingEnabled"),
+            shaped.extra_value(StreamOptionKey::THINKING_ENABLED),
             Some(&json!(false)),
             "upstream streamSimple always sends the explicit disable"
         );
@@ -3439,7 +3462,10 @@ mod tests {
             &Context::default(),
             StreamOptions::default(),
         );
-        assert_eq!(absent.extra.get("thinkingEnabled"), Some(&json!(false)));
+        assert_eq!(
+            absent.extra_value(StreamOptionKey::THINKING_ENABLED),
+            Some(&json!(false))
+        );
     }
 
     #[test]
@@ -3460,15 +3486,14 @@ mod tests {
             compat: None,
             extra: BTreeMap::new(),
         };
-        let options = StreamOptions {
+        let mut options = StreamOptions {
             max_tokens: Some(2_048),
-            extra: serde_json::Map::from_iter([("reasoning".to_owned(), json!("high"))]),
             ..StreamOptions::default()
         };
+        options.insert_extra(StreamOptionKey::REASONING, json!("high"));
         let shaped = ModelRuntime::shape_reasoning_options(&model, &Context::default(), options);
         let budget = shaped
-            .extra
-            .get("thinkingBudgets")
+            .extra_value(StreamOptionKey::THINKING_BUDGETS)
             .and_then(|budgets| budgets.get("high"))
             .and_then(Value::as_u64);
         assert_eq!(
@@ -3478,7 +3503,9 @@ mod tests {
             shaped.extra
         );
         assert!(
-            shaped.extra.get("thinkingBudgetTokens").is_none(),
+            shaped
+                .extra_value(StreamOptionKey::THINKING_BUDGET_TOKENS)
+                .is_none(),
             "the scalar key is the anthropic contract, not bedrock's"
         );
     }
@@ -3487,8 +3514,6 @@ mod tests {
     async fn prepare_request_maps_reasoning_effort_for_openai_family()
     -> Result<(), ModelRuntimeError> {
         let runtime = ModelRuntime::create_in_memory().await?;
-        let mut extra = serde_json::Map::new();
-        extra.insert("reasoning".to_owned(), Value::String("high".to_owned()));
         runtime.register_provider(
             "openai-reasoning",
             &ProviderConfigInput {
@@ -3517,11 +3542,11 @@ mod tests {
         runtime.register_extension_stream_provider("openai-reasoning", extension.clone());
 
         let model = required(runtime.get_model("openai-reasoning", "m"), "model")?;
-        let options = StreamOptions {
+        let mut options = StreamOptions {
             max_tokens: Some(1_024),
-            extra,
             ..StreamOptions::default()
         };
+        options.insert_extra(StreamOptionKey::REASONING, Value::String("high".to_owned()));
         let mut stream = runtime.stream_simple(model, Context::default(), options);
         let first = futures::StreamExt::next(&mut stream).await;
         assert!(
@@ -3531,14 +3556,18 @@ mod tests {
 
         let calls = extension.calls();
         assert_eq!(calls.len(), 1);
-        let extra = &calls[0].extra;
         assert_eq!(
-            extra.get("reasoningEffort"),
+            calls[0].extra_value(StreamOptionKey::REASONING_EFFORT),
             Some(&Value::String("high".to_owned())),
             "openai family activates reasoning via reasoningEffort"
         );
         assert!(
-            extra.get("thinkingEnabled").is_none() && extra.get("thinkingBudgetTokens").is_none(),
+            calls[0]
+                .extra_value(StreamOptionKey::THINKING_ENABLED)
+                .is_none()
+                && calls[0]
+                    .extra_value(StreamOptionKey::THINKING_BUDGET_TOKENS)
+                    .is_none(),
             "openai family must not receive anthropic thinking keys"
         );
         assert_eq!(
@@ -3553,8 +3582,6 @@ mod tests {
     async fn prepare_request_ignores_reasoning_for_non_reasoning_model()
     -> Result<(), ModelRuntimeError> {
         let runtime = ModelRuntime::create_in_memory().await?;
-        let mut extra = serde_json::Map::new();
-        extra.insert("reasoning".to_owned(), Value::String("high".to_owned()));
         runtime.register_provider(
             "non-reasoning-provider",
             &ProviderConfigInput {
@@ -3583,11 +3610,11 @@ mod tests {
         runtime.register_extension_stream_provider("non-reasoning-provider", extension.clone());
 
         let model = required(runtime.get_model("non-reasoning-provider", "m"), "model")?;
-        let options = StreamOptions {
+        let mut options = StreamOptions {
             max_tokens: Some(1_024),
-            extra,
             ..StreamOptions::default()
         };
+        options.insert_extra(StreamOptionKey::REASONING, Value::String("high".to_owned()));
         let mut stream = runtime.stream_simple(model, Context::default(), options);
         let first = futures::StreamExt::next(&mut stream).await;
         assert!(
@@ -3603,7 +3630,9 @@ mod tests {
             "non-reasoning model must not apply thinking budget"
         );
         assert!(
-            calls[0].extra.get("thinkingBudgetTokens").is_none(),
+            calls[0]
+                .extra_value(StreamOptionKey::THINKING_BUDGET_TOKENS)
+                .is_none(),
             "non-reasoning model must not emit thinking budget"
         );
         Ok(())

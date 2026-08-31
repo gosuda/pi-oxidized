@@ -114,8 +114,8 @@ pub fn clamp_max_tokens_to_context(model: &Model, context: &Context, max_tokens:
 /// Unified simple-stream options (TS `SimpleStreamOptions`).
 ///
 /// Extends the transport [`StreamOptions`] surface with reasoning effort and
-/// optional custom thinking budgets. Product code maps these into
-/// `StreamOptions.extra` for adapters that still read the ad-hoc keys.
+/// optional custom thinking budgets. Product code maps these through the
+/// typed provider-option vocabulary for the adapters that consume them.
 #[derive(Clone, Default)]
 pub struct SimpleStreamOptions {
     /// Base stream options (temperature, headers, timeouts, …).

@@ -29,7 +29,7 @@ use super::shared::responses::{
 use super::shared::truncate_error_body;
 use super::stream_state::ProviderEventSender;
 use super::transport::{DataSseDecoder, DataSseEvent, HttpTransport, TransportError};
-use crate::provider::{Provider, ProviderError, ProviderResponse, StreamOptions};
+use crate::provider::{Provider, ProviderError, ProviderResponse, StreamOptionKey, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageDiagnostic, DiagnosticCode,
     DiagnosticErrorInfo, ErrorReason, Message, Model, ModelThinkingLevel, StopReason, Tool,
@@ -110,7 +110,7 @@ impl OpenAiCodexResponses {
         options: StreamOptions,
         sender: ProviderEventSender,
     ) {
-        let request_service_tier = extra_string(&options, "serviceTier");
+        let request_service_tier = extra_string(&options, StreamOptionKey::SERVICE_TIER);
         let process_options = ProcessOptions {
             request_service_tier,
             apply_service_tier_pricing: true,
@@ -1111,12 +1111,15 @@ fn codex_base_request_fields(
     body.insert("input".into(), Value::Array(input));
     body.insert(
         "text".into(),
-        json!({"verbosity": extra_string(options, "textVerbosity").unwrap_or_else(|| "low".into())}),
+        json!({"verbosity": extra_string(options, StreamOptionKey::TEXT_VERBOSITY)
+            .unwrap_or_else(|| "low".into())}),
     );
     body.insert("include".into(), json!(["reasoning.encrypted_content"]));
     body.insert(
         "tool_choice".into(),
-        Value::String(extra_string(options, "toolChoice").unwrap_or_else(|| "auto".into())),
+        Value::String(
+            extra_string(options, StreamOptionKey::TOOL_CHOICE).unwrap_or_else(|| "auto".into()),
+        ),
     );
     body.insert("parallel_tool_calls".into(), Value::Bool(true));
     body
@@ -1137,7 +1140,7 @@ fn apply_codex_optional_request_fields(
     if let Some(temperature) = options.temperature.and_then(serde_json::Number::from_f64) {
         body.insert("temperature".into(), Value::Number(temperature));
     }
-    if let Some(service_tier) = extra_string(options, "serviceTier") {
+    if let Some(service_tier) = extra_string(options, StreamOptionKey::SERVICE_TIER) {
         body.insert("service_tier".into(), Value::String(service_tier));
     }
     if !immediate_tools.is_empty() {
@@ -1152,14 +1155,15 @@ fn apply_codex_optional_request_fields(
             )),
         );
     }
-    if let Some(reasoning_effort) = extra_string(options, "reasoningEffort")
+    if let Some(reasoning_effort) = extra_string(options, StreamOptionKey::REASONING_EFFORT)
         && let Some(mapped) = map_reasoning_effort(model, &reasoning_effort)
     {
         body.insert(
             "reasoning".into(),
             json!({
                 "effort": mapped,
-                "summary": extra_string(options, "reasoningSummary").unwrap_or_else(|| "auto".into()),
+                "summary": extra_string(options, StreamOptionKey::REASONING_SUMMARY)
+                    .unwrap_or_else(|| "auto".into()),
             }),
         );
     }
@@ -1245,10 +1249,9 @@ fn compat_bool(model: &Model, name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn extra_string(options: &StreamOptions, name: &str) -> Option<String> {
+fn extra_string(options: &StreamOptions, key: StreamOptionKey) -> Option<String> {
     options
-        .extra
-        .get(name)
+        .extra_value(key)
         .and_then(Value::as_str)
         .map(str::to_owned)
 }
