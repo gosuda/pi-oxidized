@@ -38,6 +38,13 @@ pub struct RunIo<'a> {
 
 /// Runs a prompt turn: injects `prompts`, then enters the shared loop.
 ///
+/// # Transcript contract
+///
+/// On success, the returned messages are exactly this invocation's ordered
+/// [`AgentEvent::MessageEnd`] payloads. When `io.sink` is an
+/// [`crate::bus::AgentEventSink`] and no external transcript mutation races the
+/// run, `messages_after = messages_before ++ returned_messages`.
+///
 /// # Errors
 ///
 /// Returns [`AgentLoopError`] for unrecoverable hook / conversion failures.
@@ -1200,6 +1207,73 @@ mod tests {
         );
         assert_eq!(count_type(&events, "agent_end"), 1);
         assert_eq!(provider.call_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_transcript_is_prior_plus_ordered_message_ends() -> TestResult {
+        let prior = vec![text_user_message("prior")];
+        let mut initial_state = AgentState::new();
+        initial_state.messages = prior.clone();
+        let state = Arc::new(Mutex::new(initial_state));
+        let sink = AgentEventSink::new(Arc::clone(&state));
+        let mut subscription = sink.subscribe();
+
+        let tool = Arc::new(RecordingTool::new("read"));
+        let provider = ScriptedProvider::new(vec![tool_script("c1", "read"), text_script("done")]);
+        let mut config = sample_config();
+        config.tool_execution = ToolExecutionMode::Sequential;
+        let mut context = base_context(vec![tool]);
+        context.messages = prior.clone();
+        let (partial_tx, _) = watch::channel(None);
+        let io = RunIo {
+            sink: &sink,
+            provider: &provider,
+            partial: partial_tx,
+        };
+
+        let new_messages = run_agent_loop(
+            vec![text_user_message("use tool")],
+            context,
+            config,
+            io,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let mut message_ends = Vec::new();
+        while let Ok(event) = subscription.try_recv() {
+            if let AgentEvent::MessageEnd { message } = event {
+                message_ends.push(message);
+            }
+        }
+        assert!(
+            !subscription.is_lagged(),
+            "the contract witness must observe every run event"
+        );
+        assert_eq!(
+            new_messages, message_ends,
+            "the returned run delta must equal ordered message_end payloads"
+        );
+        let message_roles: Vec<_> = message_ends.iter().map(AgentMessage::role).collect();
+        assert_eq!(
+            message_roles,
+            ["user", "assistant", "toolResult", "assistant"],
+            "the witness must exercise each run-owned message kind in order"
+        );
+
+        let mut expected_transcript = prior;
+        expected_transcript.extend(message_ends);
+        let transcript = state
+            .lock()
+            .map_err(|_| "agent state mutex poisoned".to_owned())?
+            .messages
+            .clone();
+        assert_eq!(
+            transcript, expected_transcript,
+            "the reducer must append each message_end payload in order"
+        );
         Ok(())
     }
 
