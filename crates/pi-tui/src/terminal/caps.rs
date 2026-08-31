@@ -1,11 +1,10 @@
-//! Terminal capability detection and capability cache.
+//! Terminal capability detection.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{self, Command, Stdio};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +16,28 @@ pub enum ImageProtocol {
     Kitty,
     /// iTerm2 inline images.
     ITerm2,
+}
+
+/// Explicit image capability override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageProtocolOverride {
+    /// Force the Kitty graphics protocol.
+    Kitty,
+    /// Force iTerm2 inline images.
+    ITerm2,
+    /// Disable terminal images.
+    Disabled,
+}
+
+/// Explicit terminal capability overrides.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalCapabilityOverrides {
+    /// Image protocol override.
+    pub images: Option<ImageProtocolOverride>,
+    /// OSC 8 hyperlink override.
+    pub hyperlinks: Option<bool>,
+    /// Truecolor override.
+    pub true_color: Option<bool>,
 }
 
 /// Active terminal keyboard protocol.
@@ -88,15 +109,16 @@ impl TerminalCapabilities {
     /// This probe performs blocking terminal I/O (under tmux it spawns
     /// `tmux display-message` and polls it for up to [`TMUX_PROBE_TIMEOUT`]),
     /// so async callers must offload it with `tokio::task::spawn_blocking`
-    /// instead of running it on a runtime worker. The result is unaffected by
-    /// which thread runs it: the tmux hyperlink answer is cached process-wide
-    /// in [`TMUX_HYPERLINK_CACHE`].
+    /// instead of running it on a runtime worker.
     #[must_use]
     pub fn detect() -> Self {
-        detect_with(
-            |key| env::var(key).ok(),
-            || *TMUX_HYPERLINK_CACHE.get_or_init(probe_tmux_hyperlinks),
-        )
+        Self::detect_with_overrides(TerminalCapabilityOverrides::default())
+    }
+
+    /// Detect capabilities, then apply explicit overrides over the environment.
+    #[must_use]
+    pub fn detect_with_overrides(overrides: TerminalCapabilityOverrides) -> Self {
+        resolve_with(|key| env::var(key).ok(), probe_tmux_hyperlinks, overrides)
     }
 
     /// Apply a Kitty keyboard probe result.
@@ -127,6 +149,7 @@ impl TerminalCapabilities {
     }
 }
 
+#[cfg(test)]
 /// Detect capabilities from an injected environment lookup and tmux
 /// hyperlink probe.
 ///
@@ -139,10 +162,79 @@ where
     E: Fn(&str) -> Option<String>,
     P: Fn() -> bool,
 {
+    resolve_with(
+        env,
+        tmux_forwards_hyperlink,
+        TerminalCapabilityOverrides::default(),
+    )
+}
+
+fn resolve_with<E, P>(
+    env: E,
+    tmux_forwards_hyperlink: P,
+    explicit: TerminalCapabilityOverrides,
+) -> TerminalCapabilities
+where
+    E: Fn(&str) -> Option<String>,
+    P: Fn() -> bool,
+{
+    let environment = TerminalCapabilityOverrides {
+        images: env("PI_IMAGE_PROTOCOL").and_then(|value| {
+            match value.to_ascii_lowercase().as_str() {
+                "kitty" => Some(ImageProtocolOverride::Kitty),
+                "iterm2" => Some(ImageProtocolOverride::ITerm2),
+                "none" | "0" => Some(ImageProtocolOverride::Disabled),
+                _ => None,
+            }
+        }),
+        hyperlinks: parse_boolean_capability_override(env("PI_HYPERLINKS").as_deref()),
+        true_color: parse_boolean_capability_override(env("PI_TRUE_COLOR").as_deref()),
+    };
+    let effective = TerminalCapabilityOverrides {
+        images: explicit.images.or(environment.images),
+        hyperlinks: explicit.hyperlinks.or(environment.hyperlinks),
+        true_color: explicit.true_color.or(environment.true_color),
+    };
+    let mut capabilities = detect_rows(&env, || {
+        effective
+            .hyperlinks
+            .unwrap_or_else(&tmux_forwards_hyperlink)
+    });
+
+    if let Some(images) = effective.images {
+        capabilities.images = match images {
+            ImageProtocolOverride::Kitty => Some(ImageProtocol::Kitty),
+            ImageProtocolOverride::ITerm2 => Some(ImageProtocol::ITerm2),
+            ImageProtocolOverride::Disabled => None,
+        };
+    }
+    if let Some(hyperlinks) = effective.hyperlinks {
+        capabilities.hyperlinks = hyperlinks;
+    }
+    if let Some(true_color) = effective.true_color {
+        capabilities.true_color = true_color;
+    }
+
+    capabilities
+}
+
+fn parse_boolean_capability_override(value: Option<&str>) -> Option<bool> {
+    match value {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+
+fn detect_rows<E, P>(env: E, tmux_forwards_hyperlink: P) -> TerminalCapabilities
+where
+    E: Fn(&str) -> Option<String>,
+    P: Fn() -> bool,
+{
     let mut caps = TerminalCapabilities::default();
-    if env("PI_TUI_NO_SYNC").is_some_and(|v| {
+    if env("PI_TUI_NO_SYNC").is_some_and(|value| {
         matches!(
-            v.as_str(),
+            value.as_str(),
             "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
         )
     }) {
@@ -273,7 +365,6 @@ where
 const TMUX_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const TMUX_FEATURES_MAX_BYTES: u64 = 4096;
 static NEXT_TMUX_PROBE_OUTPUT: AtomicU64 = AtomicU64::new(0);
-static TMUX_HYPERLINK_CACHE: OnceLock<bool> = OnceLock::new();
 
 fn create_tmux_probe_output() -> io::Result<(PathBuf, File)> {
     for _ in 0..16 {
@@ -374,7 +465,9 @@ pub fn kitty_delete_all() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageProtocol, TerminalCapabilities, detect_with, kitty_delete_all, kitty_delete_id,
+        CellDimensions, ImageProtocol, ImageProtocolOverride, KeyboardProtocol,
+        TerminalCapabilities, TerminalCapabilityOverrides, detect_with, kitty_delete_all,
+        kitty_delete_id, resolve_with,
     };
     use std::collections::HashMap;
 
@@ -426,6 +519,106 @@ mod tests {
         let caps = detect_with(env_from(&[("TERM", "xterm-256color")]), || false);
         assert!(!caps.true_color);
         assert!(!caps.hyperlinks);
+        assert_eq!(caps.images, None);
+    }
+
+    #[test]
+    fn environment_overrides_unknown_terminal_capabilities() {
+        let caps = detect_with(
+            env_from(&[
+                ("PI_HYPERLINKS", "1"),
+                ("PI_IMAGE_PROTOCOL", "kitty"),
+                ("PI_TRUE_COLOR", "1"),
+            ]),
+            || false,
+        );
+
+        assert!(caps.hyperlinks);
+        assert_eq!(caps.images, Some(ImageProtocol::Kitty));
+        assert!(caps.true_color);
+    }
+    #[test]
+    fn environment_overrides_known_terminal_capabilities() {
+        let caps = detect_with(
+            env_from(&[
+                ("KITTY_WINDOW_ID", "1"),
+                ("PI_HYPERLINKS", "0"),
+                ("PI_IMAGE_PROTOCOL", "none"),
+                ("PI_TRUE_COLOR", "0"),
+            ]),
+            || false,
+        );
+
+        assert!(!caps.hyperlinks);
+        assert_eq!(caps.images, None);
+        assert!(!caps.true_color);
+    }
+
+    #[test]
+    fn auto_and_invalid_environment_overrides_preserve_detection() {
+        let caps = detect_with(
+            env_from(&[
+                ("KITTY_WINDOW_ID", "1"),
+                ("PI_HYPERLINKS", "auto"),
+                ("PI_IMAGE_PROTOCOL", "auto"),
+                ("PI_TRUE_COLOR", "invalid"),
+            ]),
+            || false,
+        );
+
+        assert!(caps.hyperlinks);
+        assert_eq!(caps.images, Some(ImageProtocol::Kitty));
+        assert!(caps.true_color);
+    }
+
+    #[test]
+    fn environment_hyperlink_override_skips_tmux_probe() {
+        let probed = std::cell::Cell::new(false);
+        let caps = detect_with(
+            env_from(&[
+                ("TMUX", "/tmp/tmux-1000/default,1234,0"),
+                ("PI_HYPERLINKS", "1"),
+            ]),
+            || {
+                probed.set(true);
+                false
+            },
+        );
+
+        assert!(!probed.get());
+        assert!(caps.hyperlinks);
+    }
+
+    #[test]
+    fn explicit_overrides_win_environment_and_preserve_other_capabilities() {
+        let probed = std::cell::Cell::new(false);
+        let caps = resolve_with(
+            env_from(&[
+                ("TMUX", "/tmp/tmux-1000/default,1234,0"),
+                ("PI_TUI_NO_SYNC", "1"),
+                ("PI_HYPERLINKS", "0"),
+                ("PI_IMAGE_PROTOCOL", "kitty"),
+                ("PI_TRUE_COLOR", "0"),
+            ]),
+            || {
+                probed.set(true);
+                false
+            },
+            TerminalCapabilityOverrides {
+                images: Some(ImageProtocolOverride::ITerm2),
+                hyperlinks: Some(true),
+                true_color: Some(true),
+            },
+        );
+
+        assert!(!probed.get());
+        assert_eq!(caps.images, Some(ImageProtocol::ITerm2));
+        assert!(caps.hyperlinks);
+        assert!(caps.true_color);
+        assert!(!caps.sync_output);
+        assert_eq!(caps.keyboard_protocol, KeyboardProtocol::Legacy);
+        assert_eq!(caps.cell, CellDimensions::default());
+        assert_eq!(caps.dark_background, None);
     }
 
     #[test]
