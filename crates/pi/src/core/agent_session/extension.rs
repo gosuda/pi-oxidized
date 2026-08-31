@@ -2242,11 +2242,17 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let cwd = temp.path().join("project");
         let agent_dir = temp.path().join("agent");
+        let base_skill_dir = agent_dir.join("skills").join("base-skill");
         let extension_dir = temp.path().join("extension");
         let skill_dir = extension_dir.join("skills");
         std::fs::create_dir_all(&cwd)?;
         std::fs::create_dir_all(&agent_dir)?;
+        std::fs::create_dir_all(&base_skill_dir)?;
         std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(
+            base_skill_dir.join("SKILL.md"),
+            "---\nname: base-skill\ndescription: base\n---\nbody\n",
+        )?;
         std::fs::write(
             skill_dir.join("SKILL.md"),
             "---\nname: extension-skill\ndescription: extension\n---\nbody\n",
@@ -2297,14 +2303,19 @@ mod tests {
                 .system_prompt
                 .contains("<name>extension-skill</name>")
         );
+        let mut baseline_skills = locked_clone(&session.skills, "skills")?;
         assert!(
-            session
-                .skills
-                .lock()
-                .map_err(|_| io::Error::other("skills mutex poisoned"))?
+            baseline_skills
                 .iter()
                 .any(|skill| skill.name == "extension-skill")
         );
+        assert!(
+            baseline_skills
+                .iter()
+                .any(|skill| skill.name == "base-skill")
+        );
+        baseline_skills.retain(|skill| skill.name != "extension-skill");
+        baseline_skills.sort_unstable_by(|left, right| left.file_path.cmp(&right.file_path));
 
         *runner
             .resource_paths
@@ -2319,14 +2330,9 @@ mod tests {
                 .system_prompt
                 .contains("extension-skill")
         );
-        assert!(
-            session
-                .skills
-                .lock()
-                .map_err(|_| io::Error::other("skills mutex poisoned"))?
-                .iter()
-                .all(|skill| skill.name != "extension-skill")
-        );
+        let mut reloaded_skills = locked_clone(&session.skills, "skills")?;
+        reloaded_skills.sort_unstable_by(|left, right| left.file_path.cmp(&right.file_path));
+        assert_eq!(reloaded_skills, baseline_skills);
         Ok(())
     }
 
