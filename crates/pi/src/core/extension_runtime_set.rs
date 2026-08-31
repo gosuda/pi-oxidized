@@ -4377,18 +4377,22 @@ pub(crate) mod tests {
             Ok(())
         }
 
+        pub(crate) fn correlated_frame(&self, method: &str, id: FrameId) -> Option<Frame> {
+            self.state
+                .frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|frame| frame.method == method && frame.id == id)
+                .cloned()
+        }
+
         async fn wait_for_response(&self, method: &str, id: FrameId) -> TestResult {
             tokio::time::timeout(TEST_TIMEOUT, async {
                 loop {
                     if self
-                        .state
-                        .frames
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .iter()
-                        .any(|frame| {
-                            frame.kind == FrameKind::Res && frame.method == method && frame.id == id
-                        })
+                        .correlated_frame(method, id)
+                        .is_some_and(|frame| frame.kind == FrameKind::Res)
                     {
                         return;
                     }
@@ -4455,15 +4459,9 @@ pub(crate) mod tests {
         }
 
         fn response_payload(&self, method: &str, id: FrameId) -> Option<Value> {
-            self.state
-                .frames
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .find(|frame| {
-                    frame.kind == FrameKind::Res && frame.method == method && frame.id == id
-                })
-                .map(|frame| frame.payload.clone())
+            self.correlated_frame(method, id)
+                .filter(|frame| frame.kind == FrameKind::Res)
+                .map(|frame| frame.payload)
         }
     }
 

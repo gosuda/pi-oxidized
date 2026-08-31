@@ -56,6 +56,47 @@ use super::events::{
 const RELOAD_BUSY: &str = "session replacement in progress";
 const RELOAD_INVALIDATED: &str = "extension runtime was invalidated during reload";
 
+#[derive(Clone, Copy)]
+enum ReloadOrigin {
+    Direct,
+    Bridge { id: protocol::FrameId },
+}
+
+enum ReloadPreAcceptError {
+    Busy,
+    Unreloadable,
+    Prepare(crate::core::extension_host::HostStartError),
+    InstallConflict,
+    Response(pi_ext::client::HostClientError),
+}
+
+enum ReloadPostAcceptError {
+    ReadyLost,
+    StateLost,
+    Invalidated,
+    Resources {
+        diagnostics: Vec<ExtensionSetDiagnostic>,
+        error: ExtensionBindError,
+    },
+}
+
+enum ReloadTransactionError {
+    Pre(ReloadPreAcceptError),
+    Post(ReloadPostAcceptError),
+}
+
+struct ReloadTransaction {
+    host: Arc<ExtensionRuntimeSet>,
+    token: String,
+    ready_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl Drop for ReloadTransaction {
+    fn drop(&mut self) {
+        let _ = self.host.abort_pending(&self.token);
+    }
+}
+
 /// Mode the session is bound to (mirrors `AppMode` minus `Interactive`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExtensionMode {
@@ -360,80 +401,42 @@ impl AgentSession {
         // worker before any branch reads settings-derived state.
         self.reload_settings().await?;
         let host = self.host_extension_runner();
-        let runner = self.hooks.runner();
-        let previous_flag_values = runner.get_flag_values();
 
         if let (Some(host), Some(runtime)) = (host.as_ref(), self.model_runtime()) {
-            let reload_guard = host.reload_lock().lock().await;
-            if host.is_pending_busy() {
-                return Err(ExtensionBindError::HostRestart(RELOAD_BUSY.to_owned()));
-            }
-            let prepared = host
-                .prepare_reload(previous_flag_values)
+            return match self
+                .reload_host_transaction(Arc::clone(host), runtime, ReloadOrigin::Direct)
                 .await
-                .map_err(|error| ExtensionBindError::HostRestart(error.to_string()))?;
-            let token = host.next_replacement_token();
-            let ready_rx = host
-                .install_pending(
-                    token.clone(),
-                    PendingReadyOp::Reload {
-                        prepared,
-                        model_runtime: runtime,
-                    },
-                )
-                .map_err(|_| ExtensionBindError::HostRestart(RELOAD_BUSY.to_owned()))?;
-            drop(reload_guard);
-
-            // Never hold reload_lock across a host callback: a reload hook may
-            // synchronously attempt another session operation.
-            let _ = runner
-                .emit(AgentSessionEvent::SessionShutdown {
-                    reason: SessionShutdownReason::Reload,
-                    target_session_file: None,
-                })
-                .await;
-
-            if !host.complete_ready(&token) {
-                drop(ready_rx);
-                return Err(ExtensionBindError::HostRestart(
+            {
+                Ok(diagnostics) => Ok(diagnostics),
+                Err(ReloadTransactionError::Pre(
+                    ReloadPreAcceptError::Busy | ReloadPreAcceptError::InstallConflict,
+                )) => Err(ExtensionBindError::HostRestart(RELOAD_BUSY.to_owned())),
+                Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Unreloadable)) => {
+                    Err(ExtensionBindError::HostRestart(
+                        "extension runtime is not reloadable".to_owned(),
+                    ))
+                }
+                Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Prepare(error))) => {
+                    Err(ExtensionBindError::HostRestart(error.to_string()))
+                }
+                Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Response(error))) => {
+                    Err(ExtensionBindError::HostRestart(error.to_string()))
+                }
+                Err(ReloadTransactionError::Post(
+                    ReloadPostAcceptError::ReadyLost
+                    | ReloadPostAcceptError::StateLost
+                    | ReloadPostAcceptError::Invalidated,
+                )) => Err(ExtensionBindError::HostRestart(
                     RELOAD_INVALIDATED.to_owned(),
-                ));
-            }
-            drop(ready_rx);
-            let Some((
-                PendingReadyOp::Reload {
-                    prepared,
-                    model_runtime,
-                },
-                _finalize_guard,
-            )) = host.take_finalizing(&token)
-            else {
-                return Err(ExtensionBindError::HostRestart(
-                    RELOAD_INVALIDATED.to_owned(),
-                ));
+                )),
+                Err(ReloadTransactionError::Post(ReloadPostAcceptError::Resources {
+                    error,
+                    ..
+                })) => Err(error),
             };
-            let reload_guard = host.reload_lock().lock().await;
-            let reload = host.commit_reload(&model_runtime, prepared).await;
-            let _ = host.finish_finalize(&token);
-            if !reload.committed {
-                return Err(ExtensionBindError::HostRestart(
-                    RELOAD_INVALIDATED.to_owned(),
-                ));
-            }
-            let diagnostics = reload.diagnostics;
-            drop(reload_guard);
-            self.refresh_tool_registry(&super::tools::RefreshToolRegistryOptions {
-                active_tool_names: None,
-                include_all_extension_tools: true,
-            });
-            self.refresh_selected_model_from_runtime();
-            self.hydrate_replacement_host().await;
-            self.emit_session_start_reload().await;
-            self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
-                .await?;
-            return Ok(diagnostics);
         }
 
+        let runner = self.hooks.runner();
         if host.as_ref().is_some_and(|host| !host.can_reload()) {
             return Err(ExtensionBindError::HostRestart(
                 "extension runtime is not reloadable".to_owned(),
@@ -467,6 +470,138 @@ impl AgentSession {
         self.extend_resources_from_extensions(SessionStartReason::Reload.as_str())
             .await?;
         Ok(Vec::new())
+    }
+
+    async fn reload_host_transaction(
+        self: &Arc<Self>,
+        host: Arc<ExtensionRuntimeSet>,
+        model_runtime: Arc<crate::core::model_runtime::ModelRuntime>,
+        origin: ReloadOrigin,
+    ) -> Result<Vec<ExtensionSetDiagnostic>, ReloadTransactionError> {
+        let reload_guard = host.reload_lock().lock().await;
+        if host.is_pending_busy() {
+            return Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Busy));
+        }
+        if !host.can_reload() {
+            return Err(ReloadTransactionError::Pre(
+                ReloadPreAcceptError::Unreloadable,
+            ));
+        }
+        let runner = self.hooks.runner();
+        let flags = runner.get_flag_values();
+        let prepared = host
+            .prepare_reload(flags)
+            .await
+            .map_err(|error| ReloadTransactionError::Pre(ReloadPreAcceptError::Prepare(error)))?;
+        let token = host.next_replacement_token();
+        let ready_rx = match host.install_pending(
+            token.clone(),
+            PendingReadyOp::Reload {
+                prepared,
+                model_runtime,
+            },
+        ) {
+            Ok(ready_rx) => ready_rx,
+            Err(op) => {
+                drop(op);
+                return Err(ReloadTransactionError::Pre(
+                    ReloadPreAcceptError::InstallConflict,
+                ));
+            }
+        };
+        drop(reload_guard);
+
+        let mut transaction = ReloadTransaction {
+            host: Arc::clone(&host),
+            token,
+            ready_rx: Some(ready_rx),
+        };
+        match origin {
+            ReloadOrigin::Direct => {
+                // Never hold reload_lock across a host callback: a reload hook
+                // may synchronously attempt another session operation.
+                let _ = runner
+                    .emit(AgentSessionEvent::SessionShutdown {
+                        reason: SessionShutdownReason::Reload,
+                        target_session_file: None,
+                    })
+                    .await;
+                if !host.complete_ready(&transaction.token) {
+                    return Err(ReloadTransactionError::Post(
+                        ReloadPostAcceptError::Invalidated,
+                    ));
+                }
+            }
+            ReloadOrigin::Bridge { id } => {
+                if let Err(error) = host.respond_reload(id, Ok(Some(&transaction.token))).await {
+                    return Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Response(
+                        error,
+                    )));
+                }
+            }
+        }
+
+        let Some(ready_rx) = transaction.ready_rx.take() else {
+            return Err(ReloadTransactionError::Post(
+                ReloadPostAcceptError::ReadyLost,
+            ));
+        };
+        if ready_rx.await.is_err() {
+            return Err(ReloadTransactionError::Post(
+                ReloadPostAcceptError::ReadyLost,
+            ));
+        }
+        if matches!(origin, ReloadOrigin::Bridge { .. }) {
+            let _ = runner
+                .emit(AgentSessionEvent::SessionShutdown {
+                    reason: SessionShutdownReason::Reload,
+                    target_session_file: None,
+                })
+                .await;
+        }
+
+        let Some((op, _finalize_guard)) = host.take_finalizing(&transaction.token) else {
+            return Err(ReloadTransactionError::Post(
+                ReloadPostAcceptError::StateLost,
+            ));
+        };
+        let PendingReadyOp::Reload {
+            prepared,
+            model_runtime,
+        } = op
+        else {
+            return Err(ReloadTransactionError::Post(
+                ReloadPostAcceptError::StateLost,
+            ));
+        };
+
+        let reload_guard = host.reload_lock().lock().await;
+        let reload = host.commit_reload(&model_runtime, prepared).await;
+        let _ = host.finish_finalize(&transaction.token);
+        drop(reload_guard);
+        if !reload.committed {
+            return Err(ReloadTransactionError::Post(
+                ReloadPostAcceptError::Invalidated,
+            ));
+        }
+
+        let diagnostics = reload.diagnostics;
+        self.refresh_tool_registry(&super::tools::RefreshToolRegistryOptions {
+            active_tool_names: None,
+            include_all_extension_tools: true,
+        });
+        self.refresh_selected_model_from_runtime();
+        self.hydrate_replacement_host().await;
+        self.emit_session_start_reload().await;
+        if let Err(error) = self
+            .extend_resources_from_extensions(SessionStartReason::Reload.as_str())
+            .await
+        {
+            return Err(ReloadTransactionError::Post(
+                ReloadPostAcceptError::Resources { error, diagnostics },
+            ));
+        }
+        Ok(diagnostics)
     }
 
     /// Emit `session_start{reload}` on the current (post-swap) runner.
@@ -1202,6 +1337,16 @@ impl AgentSession {
                 .await;
             return;
         }
+        if let Err(error) = self.reload_settings().await {
+            self.respond_bridge_error(
+                &host,
+                id,
+                protocol::SESSION_RELOAD_METHOD,
+                &error.to_string(),
+            )
+            .await;
+            return;
+        }
         let Some(model_runtime) = self.model_runtime() else {
             self.respond_bridge_error(
                 &host,
@@ -1212,29 +1357,36 @@ impl AgentSession {
             .await;
             return;
         };
-        let flags = self.hooks.runner().get_flag_values();
-        let reload_guard = host.reload_lock().lock().await;
-        if host.is_pending_busy() {
-            drop(reload_guard);
-            self.respond_bridge_busy(&host, id, protocol::SESSION_RELOAD_METHOD)
-                .await;
-            return;
-        }
-        if !host.can_reload() {
-            drop(reload_guard);
-            self.respond_bridge_error(
-                &host,
-                id,
-                protocol::SESSION_RELOAD_METHOD,
-                "extension runtime is not reloadable",
+
+        match self
+            .reload_host_transaction(
+                Arc::clone(&host),
+                model_runtime,
+                ReloadOrigin::Bridge { id },
             )
-            .await;
-            return;
-        }
-        let prepared = match host.prepare_reload(flags).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                drop(reload_guard);
+            .await
+        {
+            Ok(diagnostics) => {
+                for diagnostic in diagnostics {
+                    self.report_extension_error(diagnostic.to_string());
+                }
+            }
+            Err(ReloadTransactionError::Pre(
+                ReloadPreAcceptError::Busy | ReloadPreAcceptError::InstallConflict,
+            )) => {
+                self.respond_bridge_busy(&host, id, protocol::SESSION_RELOAD_METHOD)
+                    .await;
+            }
+            Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Unreloadable)) => {
+                self.respond_bridge_error(
+                    &host,
+                    id,
+                    protocol::SESSION_RELOAD_METHOD,
+                    "extension runtime is not reloadable",
+                )
+                .await;
+            }
+            Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Prepare(error))) => {
                 self.respond_bridge_error(
                     &host,
                     id,
@@ -1242,29 +1394,33 @@ impl AgentSession {
                     &error.to_string(),
                 )
                 .await;
-                return;
             }
-        };
-        let token = host.next_replacement_token();
-        let Ok(ready_rx) = host.install_pending(
-            token.clone(),
-            PendingReadyOp::Reload {
-                prepared,
-                model_runtime,
-            },
-        ) else {
-            drop(reload_guard);
-            self.respond_bridge_busy(&host, id, protocol::SESSION_RELOAD_METHOD)
-                .await;
-            return;
-        };
-        drop(reload_guard);
-        if let Err(error) = host.respond_reload(id, Ok(Some(&token))).await {
-            let _ = host.abort_pending(&token);
-            self.report_extension_error(format!("reload response: {error}"));
-            return;
+            Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Response(error))) => {
+                self.report_extension_error(format!("reload response: {error}"));
+            }
+            Err(ReloadTransactionError::Post(ReloadPostAcceptError::ReadyLost)) => {
+                self.report_extension_error(
+                    "reload: replacement ready wait ended before completion",
+                );
+            }
+            Err(ReloadTransactionError::Post(ReloadPostAcceptError::StateLost)) => {
+                self.report_extension_error("reload: replacement ready state was lost");
+            }
+            Err(ReloadTransactionError::Post(ReloadPostAcceptError::Invalidated)) => {
+                self.report_extension_error(
+                    "reload: extension runtime was invalidated before commit",
+                );
+            }
+            Err(ReloadTransactionError::Post(ReloadPostAcceptError::Resources {
+                diagnostics,
+                error,
+            })) => {
+                for diagnostic in diagnostics {
+                    self.report_extension_error(diagnostic.to_string());
+                }
+                self.report_extension_error(format!("reload resources: {error}"));
+            }
         }
-        self.await_bridge_reload(host, token, ready_rx).await;
     }
 
     /// Handle a correlated `session.setupEntries` request: validate the
@@ -1359,66 +1515,6 @@ impl AgentSession {
             self.report_extension_error(format!(
                 "{operation}: replacement ready wait ended before completion"
             ));
-        }
-    }
-
-    async fn await_bridge_reload(
-        self: &Arc<Self>,
-        host: Arc<ExtensionRuntimeSet>,
-        token: String,
-        ready_rx: tokio::sync::oneshot::Receiver<()>,
-    ) {
-        if let Ok(()) = ready_rx.await {
-            let Some((
-                PendingReadyOp::Reload {
-                    prepared,
-                    model_runtime,
-                },
-                _finalize_guard,
-            )) = host.take_finalizing(&token)
-            else {
-                self.report_extension_error("reload: replacement ready state was lost");
-                return;
-            };
-            let _ = self
-                .hooks
-                .runner()
-                .emit(AgentSessionEvent::SessionShutdown {
-                    reason: SessionShutdownReason::Reload,
-                    target_session_file: None,
-                })
-                .await;
-            let reload_guard = host.reload_lock().lock().await;
-            let reload = host.commit_reload(&model_runtime, prepared).await;
-            let _ = host.finish_finalize(&token);
-            drop(reload_guard);
-            if !reload.committed {
-                self.report_extension_error(
-                    "reload: extension runtime was invalidated before commit",
-                );
-                return;
-            }
-            self.refresh_tool_registry(&RefreshToolRegistryOptions {
-                active_tool_names: None,
-                include_all_extension_tools: true,
-            });
-            for diagnostic in reload.diagnostics {
-                self.report_extension_error(diagnostic.to_string());
-            }
-            self.refresh_selected_model_from_runtime();
-            self.hydrate_replacement_host().await;
-            self.emit_session_start_reload().await;
-            if let Err(error) = self
-                .extend_resources_from_extensions(SessionStartReason::Reload.as_str())
-                .await
-            {
-                self.report_extension_error(format!("reload resources: {error}"));
-            }
-        } else {
-            // Receiver closed without completion: a dropped readiness frame
-            // aborted the matching pending token.
-            let _ = host.abort_pending(&token);
-            self.report_extension_error("reload: replacement ready wait ended before completion");
         }
     }
 
@@ -1872,6 +1968,56 @@ mod tests {
             .lock()
             .map(|guard| guard.clone())
             .map_err(|_| io::Error::other(format!("{label} mutex poisoned")).into())
+    }
+
+    async fn inject_reload_replacement(
+        runtime_set: &ExtensionRuntimeSet,
+        handlers: &[&str],
+    ) -> TestResult<crate::core::extension_runtime_set::tests::FakeHost> {
+        let (runner, host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "handlers": handlers,
+                "terminalInput": false
+            }))
+            .await?;
+        host.set_response("flags.set", serde_json::json!({"ok": true}));
+        let generation_id = runtime_set
+            .reload_generation()
+            .checked_add(1)
+            .ok_or("reload generation exhausted")?;
+        let (generation, pending) = crate::core::extension_runtime_set::generation_from_endpoints(
+            generation_id,
+            vec![(
+                crate::core::extension_runtime_set::EndpointKind::TsCompat,
+                "<replacement>".to_owned(),
+                runner,
+            )],
+        );
+        runtime_set.inject_prepared_replacement_for_reload(generation, pending);
+        Ok(host)
+    }
+
+    async fn emit_bridge_reload(
+        host: &crate::core::extension_runtime_set::tests::FakeHost,
+        id: pi_ext::protocol::FrameId,
+    ) -> TestResult<pi_ext::protocol::Frame> {
+        host.emit(pi_ext::protocol::Frame {
+            id,
+            kind: pi_ext::protocol::FrameKind::Req,
+            method: protocol::SESSION_RELOAD_METHOD.to_owned(),
+            payload: serde_json::json!({}),
+        })
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(frame) = host.correlated_frame(protocol::SESSION_RELOAD_METHOD, id) {
+                    break frame;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other(format!("bridge reload response {id} was missing")).into())
     }
 
     /// Runner that records an ordered lifecycle log and supports toggling
@@ -2381,6 +2527,274 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn bridge_reload_refreshes_settings_and_waits_without_deadline() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path().join("project");
+        let agent_dir = temp.path().join("agent");
+        std::fs::create_dir_all(&cwd)?;
+        std::fs::create_dir_all(&agent_dir)?;
+        let settings_path = agent_dir.join("settings.json");
+        std::fs::write(&settings_path, r#"{ "terminal": { "hyperlinks": true } }"#)?;
+        let settings = crate::core::settings::SettingsManager::create(
+            &cwd,
+            Some(&agent_dir),
+            crate::core::settings::SettingsManagerCreateOptions::new().project_trusted(true),
+        );
+
+        let (runner, host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "handlers": ["session_shutdown"],
+                "terminalInput": false
+            }))
+            .await?;
+        let runtime_set = ExtensionRuntimeSet::bind(vec![(
+            crate::core::extension_runtime_set::EndpointKind::TsCompat,
+            runner,
+        )]);
+        let model_runtime =
+            Arc::new(crate::core::model_runtime::ModelRuntime::create_in_memory().await?);
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.cwd = cwd.to_string_lossy().into_owned();
+        config.settings_manager = settings;
+        config.extension_runner = Some(runtime_set.clone());
+        config.host_extension_runner = Some(runtime_set.clone());
+        config.model_runtime = Some(model_runtime);
+        let session = AgentSession::new(config)?;
+        session
+            .bind_extensions(ExtensionBindings {
+                mode: Some(ExtensionMode::Rpc),
+                ..Default::default()
+            })
+            .await?;
+
+        let replacement_host = inject_reload_replacement(&runtime_set, &["session_start"]).await?;
+
+        std::fs::write(&settings_path, r#"{ "terminal": { "hyperlinks": false } }"#)?;
+        let response = emit_bridge_reload(&host, 41).await?;
+        assert_eq!(response.kind, pi_ext::protocol::FrameKind::Res);
+        let token = response
+            .payload
+            .get("replacementToken")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or("bridge reload response carried no replacement token")?;
+        tokio::time::advance(std::time::Duration::from_mins(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            runtime_set.is_pending_busy(),
+            "reload must remain pending until the replacement reports ready"
+        );
+        assert_eq!(
+            host.request_count("session_shutdown"),
+            0,
+            "the old host must stay live while the replacement prepares"
+        );
+        let busy = emit_bridge_reload(&host, 42).await?;
+        assert_eq!(busy.kind, pi_ext::protocol::FrameKind::Error);
+        assert_eq!(busy.payload["code"], "replacement_busy");
+        assert_eq!(busy.payload["retryable"], true);
+        assert!(runtime_set.is_pending_busy());
+        assert_eq!(host.request_count("session_shutdown"), 0);
+        host.emit(pi_ext::protocol::Frame {
+            id: 0,
+            kind: pi_ext::protocol::FrameKind::Event,
+            method: protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": token}),
+        })
+        .await;
+        host.wait_for_request("session_shutdown").await?;
+        replacement_host.wait_for_request("session_start").await?;
+        assert_eq!(runtime_set.reload_generation(), 2);
+
+        let hyperlinks = session
+            .lock_settings()
+            .get_terminal_capability_overrides()
+            .hyperlinks;
+        runtime_set.shutdown_once().await;
+        assert_eq!(hyperlinks, Some(false));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_reload_response_failure_rolls_back_pending_generation() -> TestResult {
+        let (runner, host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "handlers": ["session_shutdown"],
+                "terminalInput": false
+            }))
+            .await?;
+        let runtime_set = ExtensionRuntimeSet::bind(vec![(
+            crate::core::extension_runtime_set::EndpointKind::TsCompat,
+            runner,
+        )]);
+        let model_runtime =
+            Arc::new(crate::core::model_runtime::ModelRuntime::create_in_memory().await?);
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(runtime_set.clone());
+        config.host_extension_runner = Some(runtime_set.clone());
+        config.model_runtime = Some(Arc::clone(&model_runtime));
+        let session = AgentSession::new(config)?;
+
+        let replacement_host = inject_reload_replacement(&runtime_set, &[]).await?;
+
+        let outcome = session
+            .reload_host_transaction(
+                Arc::clone(&runtime_set),
+                model_runtime,
+                ReloadOrigin::Bridge { id: 99 },
+            )
+            .await;
+        assert!(matches!(
+            outcome,
+            Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Response(
+                _
+            )))
+        ));
+        assert!(!runtime_set.is_pending_busy());
+        assert_eq!(runtime_set.reload_generation(), 1);
+        assert_eq!(host.request_count("session_shutdown"), 0);
+        replacement_host.wait_for_exit().await?;
+
+        runtime_set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_reload_owner_loss_reports_without_second_response() -> TestResult {
+        let (runner, host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "handlers": ["session_shutdown"],
+                "terminalInput": false
+            }))
+            .await?;
+        let runtime_set = ExtensionRuntimeSet::bind(vec![(
+            crate::core::extension_runtime_set::EndpointKind::TsCompat,
+            runner,
+        )]);
+        let model_runtime =
+            Arc::new(crate::core::model_runtime::ModelRuntime::create_in_memory().await?);
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(runtime_set.clone());
+        config.host_extension_runner = Some(runtime_set.clone());
+        config.model_runtime = Some(model_runtime);
+        let session = AgentSession::new(config)?;
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let captured_errors = Arc::clone(&errors);
+        session
+            .bind_extensions(ExtensionBindings {
+                mode: Some(ExtensionMode::Rpc),
+                on_error: Some(Arc::new(move |message| {
+                    captured_errors
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(message.to_owned());
+                })),
+                ..Default::default()
+            })
+            .await?;
+
+        let replacement_host = inject_reload_replacement(&runtime_set, &[]).await?;
+
+        let response = emit_bridge_reload(&host, 43).await?;
+        assert_eq!(response.kind, pi_ext::protocol::FrameKind::Res);
+
+        host.close().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if errors
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .any(|message| {
+                        message == "reload: replacement ready wait ended before completion"
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "bridge reload owner loss was not reported")?;
+
+        assert_eq!(host.frame_count(protocol::SESSION_RELOAD_METHOD), 1);
+        assert!(!runtime_set.is_pending_busy());
+        replacement_host.wait_for_exit().await?;
+        runtime_set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_snapshots_flags_after_serialization_lock() -> TestResult {
+        let runner = Arc::new(TestRunner::new());
+        runner
+            .flag_values
+            .lock()
+            .map_err(|_| io::Error::other("flag values mutex poisoned"))?
+            .insert("probe".to_owned(), Value::Bool(false));
+        let (host_runner, _host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "handlers": [],
+                "terminalInput": false
+            }))
+            .await?;
+        let runtime_set = ExtensionRuntimeSet::bind(vec![(
+            crate::core::extension_runtime_set::EndpointKind::TsCompat,
+            host_runner,
+        )]);
+        let model_runtime =
+            Arc::new(crate::core::model_runtime::ModelRuntime::create_in_memory().await?);
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), test_model())?;
+        config.extension_runner = Some(runner.clone());
+        config.host_extension_runner = Some(runtime_set.clone());
+        config.model_runtime = Some(Arc::clone(&model_runtime));
+        let session = AgentSession::new(config)?;
+        let replacement_host = inject_reload_replacement(&runtime_set, &[]).await?;
+
+        let serialization_guard = runtime_set.reload_lock().lock().await;
+        let (update_started, update_queued) = tokio::sync::oneshot::channel();
+        let updating_set = Arc::clone(&runtime_set);
+        let updating_runner = Arc::clone(&runner);
+        let update_task = tokio::spawn(async move {
+            let _ = update_started.send(());
+            let _update_guard = updating_set.reload_lock().lock().await;
+            updating_runner
+                .flag_values
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert("probe".to_owned(), Value::Bool(true));
+        });
+        update_queued.await?;
+
+        let (reload_started, reload_queued) = tokio::sync::oneshot::channel();
+        let reloading_session = Arc::clone(&session);
+        let reloading_set = Arc::clone(&runtime_set);
+        let reload_task = tokio::spawn(async move {
+            let _ = reload_started.send(());
+            reloading_session
+                .reload_host_transaction(reloading_set, model_runtime, ReloadOrigin::Direct)
+                .await
+        });
+        reload_queued.await?;
+
+        // Both tasks can yield only at the held FIFO mutex. The update is
+        // therefore ordered before the reload without scheduler timing.
+        drop(serialization_guard);
+        update_task.await?;
+        if reload_task.await?.is_err() {
+            return Err(io::Error::other("serialized reload failed").into());
+        }
+
+        replacement_host.wait_for_request("flags.set").await?;
+        let probe = replacement_host
+            .first_payload("flags.set")
+            .and_then(|payload| payload["values"]["probe"].as_bool());
+        runtime_set.shutdown_once().await;
+        assert_eq!(probe, Some(true));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn reload_emits_shutdown_start_discovery_in_order() -> TestResult {
         let runner = Arc::new(TestRunner::new());
@@ -2691,72 +3105,6 @@ mod tests {
         config.extension_runner = Some(Arc::new(FailingRunner) as Arc<dyn ExtensionRunner>);
         let session = AgentSession::new(config)?;
         session.reload().await?;
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bridge_reload_ready_wait_has_no_hook_deadline() -> TestResult {
-        // Drive the production await_bridge_reload path: the ready wait must
-        // have no hook deadline, so advancing paused time past the old 30s
-        // timeout must not abort the operation. complete_ready must then
-        // finish it successfully.
-        let session = make_session()?;
-        let set = ExtensionRuntimeSet::bind(Vec::new());
-        let runtime = Arc::new(crate::core::model_runtime::ModelRuntime::create_in_memory().await?);
-        let token = set.next_replacement_token();
-        let ready_rx = set
-            .install_pending(
-                token.clone(),
-                PendingReadyOp::Reload {
-                    prepared: crate::core::extension_runtime_set::PreparedReload::empty_for_test(),
-                    model_runtime: Arc::clone(&runtime),
-                },
-            )
-            .map_err(|_| "initial pending install was rejected")?;
-
-        // Spawn the production waiter.
-        let wait_session = Arc::clone(&session);
-        let wait_set = Arc::clone(&set);
-        let wait_token = token.clone();
-        let wait_task = tokio::spawn(async move {
-            wait_session
-                .await_bridge_reload(wait_set, wait_token, ready_rx)
-                .await;
-        });
-
-        // Let the waiter arm any production deadline before virtual time moves.
-        tokio::task::yield_now().await;
-
-        // Advance time well beyond the old 30-second deadline.
-        tokio::time::advance(std::time::Duration::from_mins(1)).await;
-        tokio::task::yield_now().await;
-
-        // The operation must still be pending and the production task
-        // unfinished — no deadline fired.
-        assert!(
-            set.is_pending_busy(),
-            "operation must remain pending past the old deadline"
-        );
-        assert!(
-            !wait_task.is_finished(),
-            "production await_bridge_reload must not finish after advancing time past the old deadline"
-        );
-
-        // Now complete_ready — the production task must finish. A
-        // PreparedReload with generation None causes commit_reload to
-        // return uncommitted, but the waiter still completes.
-        assert!(
-            set.complete_ready(&token),
-            "complete_ready must succeed for the matching token"
-        );
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), wait_task)
-            .await
-            .map_err(|_| "production await_bridge_reload did not finish after complete_ready")??;
-        assert!(
-            !set.is_pending_busy(),
-            "pending slot must be cleared after successful completion"
-        );
         Ok(())
     }
 
