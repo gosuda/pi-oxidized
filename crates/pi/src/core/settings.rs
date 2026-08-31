@@ -201,7 +201,7 @@ impl DoubleEscapeAction {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "fork" => Some(Self::Fork),
             "tree" => Some(Self::Tree),
@@ -3835,6 +3835,60 @@ mod tests {
                 manager.get_theme_mode(),
                 *expected,
                 "theme={theme:?}, mode={mode_str:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn double_escape_action_wire_values_roundtrip() {
+        assert_eq!(
+            DoubleEscapeAction::parse("tree"),
+            Some(DoubleEscapeAction::Tree)
+        );
+        assert_eq!(
+            DoubleEscapeAction::parse("fork"),
+            Some(DoubleEscapeAction::Fork)
+        );
+        assert_eq!(
+            DoubleEscapeAction::parse("none"),
+            Some(DoubleEscapeAction::None)
+        );
+        assert_eq!(DoubleEscapeAction::Tree.as_str(), "tree");
+        assert_eq!(DoubleEscapeAction::Fork.as_str(), "fork");
+        assert_eq!(DoubleEscapeAction::None.as_str(), "none");
+    }
+
+    #[test]
+    fn double_escape_action_rejects_everything_else() {
+        assert_eq!(DoubleEscapeAction::parse(""), None);
+        assert_eq!(DoubleEscapeAction::parse("Tree"), None);
+        assert_eq!(DoubleEscapeAction::parse("bogus"), None);
+    }
+
+    #[test]
+    fn double_escape_action_default_is_tree() {
+        assert_eq!(DoubleEscapeAction::default(), DoubleEscapeAction::Tree);
+    }
+
+    /// Malformed stored values use the typed default instead of becoming a
+    /// second hidden action.
+    #[test]
+    fn double_escape_action_invalid_stored_value_falls_back_to_tree() {
+        for stored in [
+            Value::String("bogus".to_owned()),
+            Value::String(String::new()),
+            Value::from(5),
+        ] {
+            let mut map = Map::new();
+            map.insert("doubleEscapeAction".into(), stored.clone());
+            let manager = SettingsManager::in_memory(
+                &Settings::from_map(&map),
+                SettingsManagerCreateOptions::default(),
+            );
+            assert_eq!(
+                manager.get_double_escape_action(),
+                DoubleEscapeAction::Tree,
+                "stored={stored}"
             );
         }
     }

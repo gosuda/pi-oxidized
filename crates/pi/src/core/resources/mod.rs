@@ -159,10 +159,25 @@ impl ExtensionResourcePath {
     }
 }
 
-/// Source-compatible disabled flag used by resource-loader construction options.
+/// Product-wide resource-discovery policy.
 ///
-/// Loader construction immediately normalizes these flags into one discovery policy.
-pub type ResourceLoadingDisabled = bool;
+/// Each flag suppresses one automatic-discovery category (package and
+/// settings sources). Explicit command-line and additional paths always load.
+/// One value flows unchanged from CLI parsing through service construction
+/// into the loader; there is no second representation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResourceDiscoveryPolicy {
+    /// Skip package/settings extension discovery (CLI still applied).
+    pub no_extensions: bool,
+    /// Skip package/settings skill discovery (CLI still applied).
+    pub no_skills: bool,
+    /// Skip package/settings prompt-template discovery (CLI still applied).
+    pub no_prompt_templates: bool,
+    /// Skip package/settings theme discovery (CLI still applied).
+    pub no_themes: bool,
+    /// Skip AGENTS/CLAUDE context files.
+    pub no_context_files: bool,
+}
 
 /// Options for [`DefaultResourceLoader::new`].
 pub struct DefaultResourceLoaderOptions {
@@ -183,16 +198,8 @@ pub struct DefaultResourceLoaderOptions {
     pub additional_prompt_template_paths: Vec<String>,
     /// Additional CLI theme paths.
     pub additional_theme_paths: Vec<String>,
-    /// Skip package/settings extensions (CLI still applied).
-    pub no_extensions: ResourceLoadingDisabled,
-    /// Skip package/settings skills (CLI still applied).
-    pub no_skills: ResourceLoadingDisabled,
-    /// Skip package/settings prompts (CLI still applied).
-    pub no_prompt_templates: ResourceLoadingDisabled,
-    /// Skip package/settings themes (CLI still applied).
-    pub no_themes: ResourceLoadingDisabled,
-    /// Skip AGENTS/CLAUDE context files.
-    pub no_context_files: ResourceLoadingDisabled,
+    /// Automatic-discovery policy; explicit CLI paths always apply.
+    pub discovery: ResourceDiscoveryPolicy,
     /// Explicit system prompt (file path or literal).
     pub system_prompt: Option<String>,
     /// Explicit append system prompts (file paths or literals).
@@ -209,11 +216,7 @@ impl Default for DefaultResourceLoaderOptions {
             additional_skill_paths: Vec::new(),
             additional_prompt_template_paths: Vec::new(),
             additional_theme_paths: Vec::new(),
-            no_extensions: false,
-            no_skills: false,
-            no_prompt_templates: false,
-            no_themes: false,
-            no_context_files: false,
+            discovery: ResourceDiscoveryPolicy::default(),
             system_prompt: None,
             append_system_prompt: None,
         }
@@ -275,37 +278,6 @@ struct ResourceSnapshot {
     last_theme_paths: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct ResourceDiscoveryPolicy(u8);
-
-impl ResourceDiscoveryPolicy {
-    const EXTENSIONS: u8 = 1 << 0;
-    const SKILLS: u8 = 1 << 1;
-    const PROMPT_TEMPLATES: u8 = 1 << 2;
-    const THEMES: u8 = 1 << 3;
-    const CONTEXT_FILES: u8 = 1 << 4;
-
-    fn from_options(options: &DefaultResourceLoaderOptions) -> Self {
-        let mut bits = 0;
-        for (disabled, flag) in [
-            (options.no_extensions, Self::EXTENSIONS),
-            (options.no_skills, Self::SKILLS),
-            (options.no_prompt_templates, Self::PROMPT_TEMPLATES),
-            (options.no_themes, Self::THEMES),
-            (options.no_context_files, Self::CONTEXT_FILES),
-        ] {
-            if disabled {
-                bits |= flag;
-            }
-        }
-        Self(bits)
-    }
-
-    const fn disables(self, flag: u8) -> bool {
-        self.0 & flag != 0
-    }
-}
-
 #[derive(Default)]
 struct EnabledResourcePaths {
     extensions: Vec<String>,
@@ -359,7 +331,7 @@ impl DefaultResourceLoader {
             Path::new("."),
             PathInputOptions::new(),
         );
-        let discovery = ResourceDiscoveryPolicy::from_options(&options);
+        let discovery = options.discovery;
         Self {
             cwd,
             agent_dir,
@@ -433,17 +405,16 @@ impl DefaultResourceLoader {
         skill_paths: &[String],
         metadata_by_path: Option<&HashMap<String, PathMetadata>>,
     ) {
-        let result =
-            if self.discovery.disables(ResourceDiscoveryPolicy::SKILLS) && skill_paths.is_empty() {
-                LoadSkillsResult::default()
-            } else {
-                load_skills(&LoadSkillsOptions {
-                    cwd: self.cwd.clone(),
-                    agent_dir: self.agent_dir.clone(),
-                    skill_paths: skill_paths.to_vec(),
-                    include_defaults: false,
-                })
-            };
+        let result = if self.discovery.no_skills && skill_paths.is_empty() {
+            LoadSkillsResult::default()
+        } else {
+            load_skills(&LoadSkillsOptions {
+                cwd: self.cwd.clone(),
+                agent_dir: self.agent_dir.clone(),
+                skill_paths: skill_paths.to_vec(),
+                include_defaults: false,
+            })
+        };
         self.snapshot.skills = result
             .skills
             .into_iter()
@@ -467,21 +438,18 @@ impl DefaultResourceLoader {
         prompt_paths: &[String],
         metadata_by_path: Option<&HashMap<String, PathMetadata>>,
     ) {
-        let (prompts, mut diagnostics) = if self
-            .discovery
-            .disables(ResourceDiscoveryPolicy::PROMPT_TEMPLATES)
-            && prompt_paths.is_empty()
-        {
-            (Vec::new(), Vec::new())
-        } else {
-            let all = load_prompt_templates(&LoadPromptTemplatesOptions {
-                cwd: self.cwd.clone(),
-                agent_dir: self.agent_dir.clone(),
-                prompt_paths: prompt_paths.to_vec(),
-                include_defaults: false,
-            });
-            dedupe_prompts(all)
-        };
+        let (prompts, mut diagnostics) =
+            if self.discovery.no_prompt_templates && prompt_paths.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                let all = load_prompt_templates(&LoadPromptTemplatesOptions {
+                    cwd: self.cwd.clone(),
+                    agent_dir: self.agent_dir.clone(),
+                    prompt_paths: prompt_paths.to_vec(),
+                    include_defaults: false,
+                });
+                dedupe_prompts(all)
+            };
         self.snapshot.prompts = prompts
             .into_iter()
             .map(|mut prompt| {
@@ -507,15 +475,14 @@ impl DefaultResourceLoader {
         theme_paths: &[String],
         metadata_by_path: Option<&HashMap<String, PathMetadata>>,
     ) {
-        let result =
-            if self.discovery.disables(ResourceDiscoveryPolicy::THEMES) && theme_paths.is_empty() {
-                LoadThemesResult::default()
-            } else {
-                load_themes(&LoadThemesOptions {
-                    cwd: self.cwd.clone(),
-                    theme_paths: theme_paths.to_vec(),
-                })
-            };
+        let result = if self.discovery.no_themes && theme_paths.is_empty() {
+            LoadThemesResult::default()
+        } else {
+            load_themes(&LoadThemesOptions {
+                cwd: self.cwd.clone(),
+                theme_paths: theme_paths.to_vec(),
+            })
+        };
         self.snapshot.themes = result
             .themes
             .into_iter()
@@ -765,7 +732,7 @@ impl DefaultResourceLoader {
     }
 
     fn load_extension_phase(&mut self, discovery: &ReloadDiscovery) {
-        let paths = if self.discovery.disables(ResourceDiscoveryPolicy::EXTENSIONS) {
+        let paths = if self.discovery.no_extensions {
             discovery.cli.extensions.clone()
         } else {
             self.merge_paths(&discovery.cli.extensions, &discovery.package.extensions)
@@ -800,7 +767,7 @@ impl DefaultResourceLoader {
     }
 
     fn load_skill_phase(&mut self, discovery: &ReloadDiscovery) {
-        let base_paths = if self.discovery.disables(ResourceDiscoveryPolicy::SKILLS) {
+        let base_paths = if self.discovery.no_skills {
             self.merge_paths(&discovery.cli.skills, &self.additional_skill_paths)
         } else {
             let mut primary = discovery.cli.skills.clone();
@@ -833,10 +800,7 @@ impl DefaultResourceLoader {
     }
 
     fn load_prompt_phase(&mut self, discovery: &ReloadDiscovery) {
-        let base_paths = if self
-            .discovery
-            .disables(ResourceDiscoveryPolicy::PROMPT_TEMPLATES)
-        {
+        let base_paths = if self.discovery.no_prompt_templates {
             self.merge_paths(
                 &discovery.cli.prompts,
                 &self.additional_prompt_template_paths,
@@ -872,7 +836,7 @@ impl DefaultResourceLoader {
     }
 
     fn load_theme_phase(&mut self, discovery: &ReloadDiscovery) {
-        let base_paths = if self.discovery.disables(ResourceDiscoveryPolicy::THEMES) {
+        let base_paths = if self.discovery.no_themes {
             self.merge_paths(&discovery.cli.themes, &self.additional_theme_paths)
         } else {
             let mut primary = discovery.cli.themes.clone();
@@ -903,10 +867,7 @@ impl DefaultResourceLoader {
     }
 
     fn load_context_and_prompts_phase(&mut self) {
-        self.snapshot.agents_files = if self
-            .discovery
-            .disables(ResourceDiscoveryPolicy::CONTEXT_FILES)
-        {
+        self.snapshot.agents_files = if self.discovery.no_context_files {
             Vec::new()
         } else {
             load_project_context_files(&self.cwd, &self.agent_dir)
@@ -1408,6 +1369,176 @@ mod tests {
         assert_eq!(untrusted.get_system_prompt(), Some("global\n"));
 
         fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    struct PolicyFixture {
+        root: PathBuf,
+        cwd: PathBuf,
+        agent: PathBuf,
+    }
+
+    fn setup_policy_fixture(label: &str) -> Result<PolicyFixture, Box<dyn std::error::Error>> {
+        let root = temp_root(label)?;
+        let cwd = root.join("project");
+        let agent = root.join("agent");
+        fs::create_dir_all(agent.join("skills").join("demo"))?;
+        fs::create_dir_all(agent.join("prompts"))?;
+        fs::create_dir_all(agent.join("themes"))?;
+        fs::create_dir_all(agent.join("extensions"))?;
+        fs::create_dir_all(&cwd)?;
+        fs::write(
+            agent.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\ndescription: d\n---\nbody\n",
+        )?;
+        fs::write(
+            agent.join("prompts").join("hello.md"),
+            "---\ndescription: hi\n---\nHello $1\n",
+        )?;
+        fs::write(agent.join("themes").join("t.json"), r#"{"name":"t"}"#)?;
+        fs::write(agent.join("extensions").join("auto.ts"), "")?;
+        fs::write(agent.join("AGENTS.md"), "global agents\n")?;
+        Ok(PolicyFixture { root, cwd, agent })
+    }
+
+    fn all_discovery_disabled() -> ResourceDiscoveryPolicy {
+        ResourceDiscoveryPolicy {
+            no_extensions: true,
+            no_skills: true,
+            no_prompt_templates: true,
+            no_themes: true,
+            no_context_files: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_policy_suppresses_configured_discovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = setup_policy_fixture("policy-off")?;
+
+        let mut baseline = DefaultResourceLoader::new(DefaultResourceLoaderOptions {
+            cwd: fixture.cwd.clone(),
+            agent_dir: fixture.agent.clone(),
+            project_trusted: true,
+            ..Default::default()
+        });
+        baseline.reload().await?;
+        assert!(
+            baseline
+                .get_extensions()
+                .paths
+                .iter()
+                .any(|info| info.path.ends_with("auto.ts")),
+            "fixture must produce configured extension discovery"
+        );
+
+        let mut loader = DefaultResourceLoader::new(DefaultResourceLoaderOptions {
+            cwd: fixture.cwd.clone(),
+            agent_dir: fixture.agent.clone(),
+            project_trusted: true,
+            discovery: all_discovery_disabled(),
+            ..Default::default()
+        });
+        loader.reload().await?;
+
+        assert!(loader.get_skills().0.is_empty());
+        assert!(loader.get_prompts().0.is_empty());
+        assert!(loader.get_themes().0.is_empty());
+        assert!(loader.get_agents_files().is_empty());
+        assert!(loader.get_extensions().paths.is_empty());
+
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovery_policy_keeps_explicit_paths_while_discovery_disabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = setup_policy_fixture("policy-explicit")?;
+        let explicit = fixture.root.join("explicit");
+        fs::create_dir_all(explicit.join("skill-dir"))?;
+        fs::write(
+            explicit.join("skill-dir").join("SKILL.md"),
+            "---\nname: picked\ndescription: p\n---\nbody\n",
+        )?;
+        fs::write(
+            explicit.join("prompt.md"),
+            "---\ndescription: p\n---\nExplicit\n",
+        )?;
+        fs::write(explicit.join("theme.json"), r#"{"name":"picked"}"#)?;
+        fs::write(explicit.join("ext.ts"), "")?;
+        let skill_path = path_to_string(&explicit.join("skill-dir"));
+        let prompt_path = path_to_string(&explicit.join("prompt.md"));
+        let theme_path = path_to_string(&explicit.join("theme.json"));
+        let extension_path = path_to_string(&explicit.join("ext.ts"));
+
+        let mut loader = DefaultResourceLoader::new(DefaultResourceLoaderOptions {
+            cwd: fixture.cwd.clone(),
+            agent_dir: fixture.agent.clone(),
+            project_trusted: true,
+            discovery: all_discovery_disabled(),
+            additional_extension_paths: vec![extension_path.clone()],
+            additional_skill_paths: vec![skill_path],
+            additional_prompt_template_paths: vec![prompt_path],
+            additional_theme_paths: vec![theme_path],
+            ..Default::default()
+        });
+        loader.reload().await?;
+
+        assert!(
+            loader
+                .get_extensions()
+                .paths
+                .iter()
+                .any(|info| info.path == extension_path),
+            "explicit -e path must survive no_extensions"
+        );
+        assert!(
+            !loader
+                .get_extensions()
+                .paths
+                .iter()
+                .any(|info| info.path.ends_with("auto.ts"))
+        );
+        assert!(
+            loader
+                .get_skills()
+                .0
+                .iter()
+                .any(|skill| skill.name == "picked")
+        );
+        assert!(
+            !loader
+                .get_skills()
+                .0
+                .iter()
+                .any(|skill| skill.name == "demo")
+        );
+        assert!(
+            loader
+                .get_prompts()
+                .0
+                .iter()
+                .any(|prompt| prompt.name == "prompt")
+        );
+        assert!(
+            !loader
+                .get_prompts()
+                .0
+                .iter()
+                .any(|prompt| prompt.name == "hello")
+        );
+        assert!(
+            loader
+                .get_themes()
+                .0
+                .iter()
+                .any(|theme| theme.name == "picked")
+        );
+        assert!(!loader.get_themes().0.iter().any(|theme| theme.name == "t"));
+        assert!(loader.get_agents_files().is_empty());
+
+        fs::remove_dir_all(fixture.root)?;
         Ok(())
     }
 }

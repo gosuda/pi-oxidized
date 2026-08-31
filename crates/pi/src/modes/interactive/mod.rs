@@ -39,7 +39,7 @@ pub use tool_renderer::{
     CustomToolRenderer, ToolCallView, ToolRenderError, ToolResultView, ToolState,
 };
 
-pub use input::{DoubleEscapeAction, InputMapper, InputState};
+pub use input::{InputMapper, InputState};
 /// Re-export of the pi-tui component contract for downstream callers.
 pub use pi_tui::component::{Component, EventResult, UiEvent};
 pub use runtime::{

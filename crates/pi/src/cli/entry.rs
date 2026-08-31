@@ -59,7 +59,7 @@ use crate::core::model_resolver::{
 };
 use crate::core::model_runtime::ModelRuntime;
 use crate::core::package_manager::{PackageManager, PackageManagerOptions, Scope};
-use crate::core::resources::ResourceLoader;
+use crate::core::resources::{ResourceDiscoveryPolicy, ResourceLoader};
 use crate::core::sessions::SessionManager;
 use crate::core::settings::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::system_prompt::{BuildSystemPromptOptions, build_system_prompt};
@@ -490,11 +490,13 @@ fn extension_flag_values(args: &crate::cli::args::Args) -> BTreeMap<String, Exte
 }
 fn resource_loader_options(args: &crate::cli::args::Args) -> ResourceLoaderServiceOptions {
     ResourceLoaderServiceOptions {
-        no_extensions: args.no_extensions,
-        no_skills: args.no_skills,
-        no_prompt_templates: args.no_prompt_templates,
-        no_themes: args.no_themes,
-        no_context_files: args.no_context_files,
+        discovery: ResourceDiscoveryPolicy {
+            no_extensions: args.no_extensions,
+            no_skills: args.no_skills,
+            no_prompt_templates: args.no_prompt_templates,
+            no_themes: args.no_themes,
+            no_context_files: args.no_context_files,
+        },
         system_prompt: args.system_prompt.clone(),
         append_system_prompt: (!args.append_system_prompt.is_empty())
             .then(|| args.append_system_prompt.clone()),
@@ -1390,11 +1392,13 @@ mod tests {
                 value: "sk-runtime-only".to_owned(),
             }),
             resource_loader_options: ResourceLoaderServiceOptions {
-                no_extensions: true,
-                no_skills: true,
-                no_prompt_templates: true,
-                no_themes: true,
-                no_context_files: true,
+                discovery: ResourceDiscoveryPolicy {
+                    no_extensions: true,
+                    no_skills: true,
+                    no_prompt_templates: true,
+                    no_themes: true,
+                    no_context_files: true,
+                },
                 ..ResourceLoaderServiceOptions::default()
             },
             cli_scope: CliRuntimeScope::default(),
@@ -1589,11 +1593,13 @@ mod tests {
             agent_dir: agent_dir.to_string_lossy().into_owned(),
             api_key,
             resource_loader_options: ResourceLoaderServiceOptions {
-                no_extensions: true,
-                no_skills: true,
-                no_prompt_templates: true,
-                no_themes: true,
-                no_context_files: true,
+                discovery: ResourceDiscoveryPolicy {
+                    no_extensions: true,
+                    no_skills: true,
+                    no_prompt_templates: true,
+                    no_themes: true,
+                    no_context_files: true,
+                },
                 ..ResourceLoaderServiceOptions::default()
             },
             model_pattern: target_model.id.clone(),

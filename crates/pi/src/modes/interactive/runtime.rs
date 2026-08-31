@@ -79,9 +79,9 @@ use pi_ext::protocol::{
 };
 use pi_ext::sanitize::SanitizedSlot;
 
-use crate::core::settings::ThemeMode;
+use crate::core::settings::{DoubleEscapeAction, ThemeMode};
 
-use super::input::{DoubleEscapeAction, InputMapper, InputState};
+use super::input::{InputMapper, InputState};
 use super::messages::{AssistantMessageView, MessageView};
 #[cfg(test)]
 use super::state;
@@ -448,6 +448,13 @@ pub trait SessionHost: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Current `doubleEscapeAction` governing double-Esc on an empty editor.
+    ///
+    /// Read at runtime construction and after every successful
+    /// [`SessionHost::apply_settings_change`]; implementations must serve
+    /// live state rather than a cached startup value.
+    fn double_escape_action(&self) -> DoubleEscapeAction;
+
     /// Persist a completed first-run wizard selection.
     ///
     /// # Errors
@@ -653,8 +660,6 @@ pub struct InteractiveRuntimeOptions {
     pub viewport_height: u16,
     /// Quiet mode suppresses the logo header.
     pub quiet: bool,
-    /// Double-Esc action ("none" / "tree" / "fork").
-    pub double_escape: DoubleEscapeAction,
     /// Show hardware cursor (debug / accessibility).
     pub hardware_cursor: bool,
     /// Override spinner indicator frames for reduced-motion (TUI-T11).
@@ -758,7 +763,6 @@ impl Default for InteractiveRuntimeOptions {
             size: (80, 24),
             viewport_height: 24,
             quiet: false,
-            double_escape: DoubleEscapeAction::None,
             hardware_cursor: false,
             indicator_frames: None,
             pending_ui_events: Vec::new(),
@@ -1526,6 +1530,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         view.messages = project_messages(&session.messages());
         let hide_thinking = session.hide_thinking_block();
         apply_display_preferences(&mut view.messages, false, hide_thinking);
+        let double_escape_action = session.double_escape_action();
         let extension_runner = session.host_extension_runner();
         let extension_events = extension_runner
             .as_ref()
@@ -1568,7 +1573,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             editor,
             view,
             mapper: super::input::InputMapper::with_keybindings(keybindings),
-            input_state: InputState::new(options.double_escape),
+            input_state: InputState::new(double_escape_action),
             events,
             session_rebind_signal,
             session_rebind_rx,
@@ -4015,12 +4020,20 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         Arc::clone(runner).push_theme_update(&update).await;
     }
 
-    /// Apply one settings-row change through the host, then refresh
-    /// theme-derived state when the row affects the theme.
+    /// Apply one settings-row change through the host, then refresh the
+    /// double-Esc action and theme-derived state when the row affects them.
+    ///
+    /// A rejected change refreshes nothing: the input action and any armed
+    /// taps survive until persistence succeeds.
     async fn handle_settings_change(&mut self, id: &str, value: &str) {
         if let Err(error) = self.session.apply_settings_change(id, value) {
             self.last_error = Some(error);
             return;
+        }
+        if id == "doubleEscapeAction" {
+            // Field-scoped refresh: swap the action, keep the tap window.
+            self.input_state
+                .set_double_escape_action(self.session.double_escape_action());
         }
         if matches!(id, "theme" | "themeMode") {
             self.apply_theme_from_settings();
@@ -5995,6 +6008,12 @@ impl SessionHost for AgentSessionHost {
             .set_hide_thinking_block(hide);
         Ok(())
     }
+
+    fn double_escape_action(&self) -> DoubleEscapeAction {
+        self.read_session()
+            .lock_settings()
+            .get_double_escape_action()
+    }
     fn theme_settings(&self) -> (Option<String>, ThemeMode) {
         let session = self.read_session();
         let settings = session.lock_settings();
@@ -6026,13 +6045,8 @@ impl SessionHost for AgentSessionHost {
             "compaction.enabled" => settings.set_compaction_enabled(value == "on"),
             "retry.enabled" => settings.set_retry_enabled(value == "on"),
             "doubleEscapeAction" => {
-                use crate::core::settings::DoubleEscapeAction as Action;
-                let action = match value {
-                    "fork" => Action::Fork,
-                    "tree" => Action::Tree,
-                    "none" => Action::None,
-                    other => return Err(format!("unknown double-escape action: {other}")),
-                };
+                let action = DoubleEscapeAction::parse(value)
+                    .ok_or_else(|| format!("unknown double-escape action: {value}"))?;
                 settings.set_double_escape_action(action);
             }
             "quietStartup" => settings.set_quiet_startup(value == "on"),
@@ -7405,6 +7419,10 @@ mod tests {
         /// Explicit terminal capability overrides served through the
         /// [`SessionHost`] seam (tests set these to drive reload detection).
         capability_overrides: Arc<std::sync::Mutex<TerminalCapabilityOverrides>>,
+        /// Current double-Escape action served through the [`SessionHost`]
+        /// seam; settings changes parse and store through the settings-owned
+        /// parser. Defaults to [`DoubleEscapeAction::Tree`].
+        double_escape_action: Arc<std::sync::Mutex<DoubleEscapeAction>>,
     }
 
     impl FakeHost {
@@ -7432,6 +7450,9 @@ mod tests {
                 capability_overrides: Arc::new(std::sync::Mutex::new(
                     TerminalCapabilityOverrides::default(),
                 )),
+                double_escape_action: Arc::new(
+                    std::sync::Mutex::new(DoubleEscapeAction::default()),
+                ),
             };
             (host, log)
         }
@@ -7495,6 +7516,10 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = overrides;
         }
 
+        fn set_double_escape_action(&self, action: DoubleEscapeAction) {
+            *lock_plain(&self.double_escape_action) = action;
+        }
+
         fn session_file_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
             Arc::clone(&self.session_file_gate)
         }
@@ -7524,6 +7549,10 @@ mod tests {
 
         fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
             self.extension_runner.clone()
+        }
+
+        fn double_escape_action(&self) -> DoubleEscapeAction {
+            *lock_plain(&self.double_escape_action)
         }
 
         fn theme_settings(&self) -> (Option<String>, ThemeMode) {
@@ -7560,6 +7589,10 @@ mod tests {
                     &crate::modes::interactive::theme::theme_selection_to_storage(value),
                     mode,
                 )?;
+            } else if id == "doubleEscapeAction" {
+                let action = DoubleEscapeAction::parse(value)
+                    .ok_or_else(|| format!("unknown double-escape action: {value}"))?;
+                *lock_plain(&self.double_escape_action) = action;
             }
             Ok(())
         }
@@ -8054,12 +8087,22 @@ mod tests {
     fn try_make_runtime_with_caps(
         caps: TerminalCapabilities,
     ) -> Result<(InteractiveRuntime<SharedWriter, FakeHost>, Arc<ActionLog>), String> {
+        let (host, log) = FakeHost::new();
+        try_make_runtime_with(host, log, caps)
+    }
+
+    /// Runtime variant over an explicit host (tests seed host state such as
+    /// the double-Escape action before construction).
+    fn try_make_runtime_with(
+        host: FakeHost,
+        log: Arc<ActionLog>,
+        caps: TerminalCapabilities,
+    ) -> Result<(InteractiveRuntime<SharedWriter, FakeHost>, Arc<ActionLog>), String> {
         let writer = SharedWriter::new();
         let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps.clone())
             .map_err(|error| format!("tui construction: {error}"))?;
         let (_tx, rx) = mpsc::unbounded_channel::<UiEvent>();
         let input = TerminalInput::mock(rx);
-        let (host, log) = FakeHost::new();
         let options = InteractiveRuntimeOptions {
             caps: caps.clone(),
             terminal_theme: detect_terminal_theme(caps.dark_background, None),
@@ -8978,6 +9021,64 @@ mod tests {
         assert!(rt.input_state.last_sigint().is_none());
         assert!(rt.input_state.last_escape().is_none());
         assert_eq!(rt.view.focus, FocusArea::Editor);
+    }
+
+    /// Double-Escape presses routed through the live mapper + input state,
+    /// exactly as [`Self::handle_ui_event`] feeds them on an empty editor.
+    fn press_escape(rt: &mut InteractiveRuntime<SharedWriter, FakeHost>) -> Vec<ViewAction> {
+        let event = key(KeyCode::Esc, KeyModifiers::NONE);
+        rt.mapper
+            .map(&event, &rt.view, "", "", &mut rt.input_state, false)
+    }
+
+    /// Startup behavior is seeded from the host, not an options carrier: a
+    /// host configured for fork opens the fork selector.
+    #[tokio::test]
+    async fn startup_double_escape_comes_from_host() -> TestResult {
+        let (host, log) = FakeHost::new();
+        host.set_double_escape_action(DoubleEscapeAction::Fork);
+        let (mut rt, _log) = try_make_runtime_with(host, log, TerminalCapabilities::default())?;
+        let _ = press_escape(&mut rt);
+        let actions = press_escape(&mut rt);
+        assert_eq!(actions, vec![ViewAction::OpenForkSelector]);
+        Ok(())
+    }
+
+    /// A successful live change swaps the action without touching tap
+    /// timing: the first Esc arms under the host's Tree default, the
+    /// persisted fork change lands, and the next Esc inside the same window
+    /// opens the fork selector.
+    #[tokio::test]
+    async fn successful_settings_change_updates_next_double_escape() -> TestResult {
+        let (mut rt, log) = make_runtime();
+        let _ = press_escape(&mut rt);
+        rt.handle_settings_change("doubleEscapeAction", "fork")
+            .await;
+        assert!(rt.last_error.is_none());
+        assert_eq!(
+            *lock_plain(&log.settings_changes),
+            vec![("doubleEscapeAction".to_owned(), "fork".to_owned())]
+        );
+        let actions = press_escape(&mut rt);
+        assert_eq!(actions, vec![ViewAction::OpenForkSelector]);
+        Ok(())
+    }
+
+    /// A rejected change persists nothing: the prior Tree action and the
+    /// armed tap survive, so the next double-Esc still opens the tree.
+    #[tokio::test]
+    async fn rejected_settings_change_keeps_prior_double_escape() -> TestResult {
+        let (mut rt, _log) = make_runtime();
+        let _ = press_escape(&mut rt);
+        rt.handle_settings_change("doubleEscapeAction", "bogus")
+            .await;
+        assert_eq!(
+            rt.last_error.as_deref(),
+            Some("unknown double-escape action: bogus")
+        );
+        let actions = press_escape(&mut rt);
+        assert_eq!(actions, vec![ViewAction::OpenTreeSelector]);
+        Ok(())
     }
 
     #[tokio::test]

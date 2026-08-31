@@ -22,8 +22,8 @@ use super::model_runtime::{
     CreateModelRuntimeOptions, ModelRuntime, ModelRuntimeError, ProviderConfigInput,
 };
 use super::resources::{
-    DefaultResourceLoader, DefaultResourceLoaderOptions, ExtensionPathInfo, ResourceLoader,
-    SourceInfo,
+    DefaultResourceLoader, DefaultResourceLoaderOptions, ExtensionPathInfo,
+    ResourceDiscoveryPolicy, ResourceLoader, SourceInfo,
 };
 use super::settings::{SettingsManager, SettingsManagerCreateOptions};
 use super::trust::{ProjectTrustStore, ResolveProjectTrustedOptions, resolve_project_trusted};
@@ -157,12 +157,6 @@ pub struct CreateAgentSessionServicesOptions {
     pub registered_extension_flags: BTreeMap<String, ExtensionFlagType>,
 }
 
-/// Source-compatible boolean used by resource-discovery input fields.
-///
-/// Service creation immediately normalizes these flags into one private policy
-/// bitset so internal phases cannot observe an incoherent collection of booleans.
-pub type ResourceDiscoveryDisabled = bool;
-
 /// Resource-loader construction knobs owned by services creation.
 #[derive(Clone, Debug, Default)]
 pub struct ResourceLoaderServiceOptions {
@@ -174,51 +168,12 @@ pub struct ResourceLoaderServiceOptions {
     pub additional_prompt_template_paths: Vec<String>,
     /// Additional theme paths.
     pub additional_theme_paths: Vec<String>,
-    /// Disable extension discovery.
-    pub no_extensions: ResourceDiscoveryDisabled,
-    /// Disable skill discovery.
-    pub no_skills: ResourceDiscoveryDisabled,
-    /// Disable prompt templates.
-    pub no_prompt_templates: ResourceDiscoveryDisabled,
-    /// Disable themes.
-    pub no_themes: ResourceDiscoveryDisabled,
-    /// Disable context files.
-    pub no_context_files: ResourceDiscoveryDisabled,
+    /// Automatic-discovery policy; explicit paths always apply.
+    pub discovery: ResourceDiscoveryPolicy,
     /// Explicit system prompt override.
     pub system_prompt: Option<String>,
     /// Explicit append-system-prompt overrides.
     pub append_system_prompt: Option<Vec<String>>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ResourceDiscoveryPolicy(u8);
-
-impl ResourceDiscoveryPolicy {
-    const EXTENSIONS: u8 = 1 << 0;
-    const SKILLS: u8 = 1 << 1;
-    const PROMPT_TEMPLATES: u8 = 1 << 2;
-    const THEMES: u8 = 1 << 3;
-    const CONTEXT_FILES: u8 = 1 << 4;
-
-    fn from_options(options: &ResourceLoaderServiceOptions) -> Self {
-        let mut bits = 0;
-        for (disabled, flag) in [
-            (options.no_extensions, Self::EXTENSIONS),
-            (options.no_skills, Self::SKILLS),
-            (options.no_prompt_templates, Self::PROMPT_TEMPLATES),
-            (options.no_themes, Self::THEMES),
-            (options.no_context_files, Self::CONTEXT_FILES),
-        ] {
-            if disabled {
-                bits |= flag;
-            }
-        }
-        Self(bits)
-    }
-
-    const fn disables(self, flag: u8) -> bool {
-        self.0 & flag != 0
-    }
 }
 
 /// Pending extension provider registration applied during services creation.
@@ -273,10 +228,10 @@ pub struct AgentSessionServices {
     pub diagnostics: Vec<AgentSessionRuntimeDiagnostic>,
     /// Validated extension flag values applied during creation.
     pub extension_flag_values: BTreeMap<String, ExtensionFlagValue>,
-    /// Concrete host runner when extensions were discovered and loaded.
+    /// Concrete host runner when extension paths were discovered and loaded.
     ///
-    /// `None` when no extension paths were discovered, discovery was disabled,
-    /// or host start failed (degraded to diagnostics only).
+    /// `None` when no extension paths were resolved or host start failed
+    /// (degraded to diagnostics only).
     pub extension_runner: Option<Arc<ExtensionRuntimeSet>>,
 }
 
@@ -486,7 +441,7 @@ pub async fn create_agent_session_services_with_trust(
     foundation
         .settings_manager
         .set_project_trusted(project_trusted);
-    let (resource_loader, discovery) = create_service_resource_loader(
+    let resource_loader = create_service_resource_loader(
         &foundation.cwd,
         &foundation.agent_dir,
         project_trusted,
@@ -497,7 +452,6 @@ pub async fn create_agent_session_services_with_trust(
     let mut diagnostics = extension_discovery_diagnostics(&resource_loader);
     let (mut extension_runner, host_registered_flags) = start_extension_phase(
         &resource_loader,
-        discovery,
         &foundation.cwd,
         &foundation.model_runtime,
         project_trusted,
@@ -609,8 +563,7 @@ async fn create_service_resource_loader(
     agent_dir: &Path,
     project_trusted: bool,
     options: ResourceLoaderServiceOptions,
-) -> Result<(DefaultResourceLoader, ResourceDiscoveryPolicy), AgentSessionServicesError> {
-    let discovery = ResourceDiscoveryPolicy::from_options(&options);
+) -> Result<DefaultResourceLoader, AgentSessionServicesError> {
     let mut loader = DefaultResourceLoader::new(DefaultResourceLoaderOptions {
         cwd: cwd.to_path_buf(),
         agent_dir: agent_dir.to_path_buf(),
@@ -619,11 +572,7 @@ async fn create_service_resource_loader(
         additional_skill_paths: options.additional_skill_paths,
         additional_prompt_template_paths: options.additional_prompt_template_paths,
         additional_theme_paths: options.additional_theme_paths,
-        no_extensions: discovery.disables(ResourceDiscoveryPolicy::EXTENSIONS),
-        no_skills: discovery.disables(ResourceDiscoveryPolicy::SKILLS),
-        no_prompt_templates: discovery.disables(ResourceDiscoveryPolicy::PROMPT_TEMPLATES),
-        no_themes: discovery.disables(ResourceDiscoveryPolicy::THEMES),
-        no_context_files: discovery.disables(ResourceDiscoveryPolicy::CONTEXT_FILES),
+        discovery: options.discovery,
         system_prompt: options.system_prompt,
         append_system_prompt: options.append_system_prompt,
     });
@@ -631,7 +580,7 @@ async fn create_service_resource_loader(
         .reload()
         .await
         .map_err(|error| AgentSessionServicesError::ResourceLoader(error.to_string()))?;
-    Ok((loader, discovery))
+    Ok(loader)
 }
 
 fn extension_discovery_diagnostics(
@@ -668,7 +617,6 @@ fn record_extension_start(
 
 async fn start_extension_phase(
     loader: &DefaultResourceLoader,
-    discovery: ResourceDiscoveryPolicy,
     cwd: &Path,
     model_runtime: &ModelRuntime,
     project_trusted: bool,
@@ -677,9 +625,6 @@ async fn start_extension_phase(
     Option<Arc<ExtensionRuntimeSet>>,
     BTreeMap<String, ExtensionFlagType>,
 ) {
-    if discovery.disables(ResourceDiscoveryPolicy::EXTENSIONS) {
-        return (None, BTreeMap::new());
-    }
     let extension_infos = loader.get_extensions().paths.clone();
     let paths = extension_infos
         .iter()
@@ -1117,6 +1062,16 @@ mod tests {
         value.ok_or_else(|| io::Error::other(context))
     }
 
+    fn all_discovery_disabled() -> ResourceDiscoveryPolicy {
+        ResourceDiscoveryPolicy {
+            no_extensions: true,
+            no_skills: true,
+            no_prompt_templates: true,
+            no_themes: true,
+            no_context_files: true,
+        }
+    }
+
     async fn runtime_with_env_openai() -> TestResult<ModelRuntime> {
         let mut env = pi_ai::auth::ProviderEnv::new();
         env.insert("OPENAI_API_KEY".to_owned(), "sk-test".to_owned());
@@ -1196,6 +1151,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_discovery_attempts_explicit_extension_start() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let cwd = dir.path().join("project");
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(&cwd)?;
+        std::fs::create_dir_all(&agent)?;
+        let extension = cwd.join("explicit.ts");
+        std::fs::write(&extension, "")?;
+        let extension_path = extension.to_string_lossy().into_owned();
+
+        let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+            cwd,
+            agent_dir: Some(agent),
+            model_runtime: Some(ModelRuntime::create_in_memory().await?),
+            resource_loader_options: Some(ResourceLoaderServiceOptions {
+                additional_extension_paths: vec![extension_path.clone()],
+                discovery: ResourceDiscoveryPolicy {
+                    no_extensions: true,
+                    ..ResourceDiscoveryPolicy::default()
+                },
+                ..ResourceLoaderServiceOptions::default()
+            }),
+            ..CreateAgentSessionServicesOptions::default()
+        })
+        .await?;
+
+        let start_attempted = services.extension_runner.is_some()
+            || services
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(&extension_path));
+        assert!(
+            start_attempted,
+            "explicit extension must reach host startup when discovery is disabled"
+        );
+        if let Some(runner) = services.extension_runner {
+            runner.shutdown_once().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn services_creation_order_registers_pending_providers() -> TestResult {
         let dir = tempfile::tempdir()?;
         let cwd = dir.path().join("project");
@@ -1244,11 +1241,7 @@ mod tests {
             extension_flag_values: None,
             settings_manager: None,
             resource_loader_options: Some(ResourceLoaderServiceOptions {
-                no_extensions: true,
-                no_skills: true,
-                no_prompt_templates: true,
-                no_themes: true,
-                no_context_files: true,
+                discovery: all_discovery_disabled(),
                 ..ResourceLoaderServiceOptions::default()
             }),
         })
@@ -1295,11 +1288,7 @@ mod tests {
                 extension_path: "/ext/broken.ts".into(),
             }],
             resource_loader_options: Some(ResourceLoaderServiceOptions {
-                no_extensions: true,
-                no_skills: true,
-                no_prompt_templates: true,
-                no_themes: true,
-                no_context_files: true,
+                discovery: all_discovery_disabled(),
                 ..ResourceLoaderServiceOptions::default()
             }),
             ..CreateAgentSessionServicesOptions::default()
@@ -1436,11 +1425,7 @@ mod tests {
             agent_dir: Some(agent),
             model_runtime: Some(runtime),
             resource_loader_options: Some(ResourceLoaderServiceOptions {
-                no_extensions: true,
-                no_skills: true,
-                no_prompt_templates: true,
-                no_themes: true,
-                no_context_files: true,
+                discovery: all_discovery_disabled(),
                 ..ResourceLoaderServiceOptions::default()
             }),
             ..CreateAgentSessionServicesOptions::default()
@@ -1489,11 +1474,7 @@ mod tests {
             agent_dir: Some(agent),
             model_runtime: Some(runtime),
             resource_loader_options: Some(ResourceLoaderServiceOptions {
-                no_extensions: true,
-                no_skills: true,
-                no_prompt_templates: true,
-                no_themes: true,
-                no_context_files: true,
+                discovery: all_discovery_disabled(),
                 ..ResourceLoaderServiceOptions::default()
             }),
             ..CreateAgentSessionServicesOptions::default()
@@ -1540,11 +1521,7 @@ mod tests {
             agent_dir: Some(agent.clone()),
             model_runtime: Some(runtime.clone()),
             resource_loader_options: Some(ResourceLoaderServiceOptions {
-                no_extensions: true,
-                no_skills: true,
-                no_prompt_templates: true,
-                no_themes: true,
-                no_context_files: true,
+                discovery: all_discovery_disabled(),
                 ..ResourceLoaderServiceOptions::default()
             }),
             ..CreateAgentSessionServicesOptions::default()
@@ -1573,11 +1550,7 @@ mod tests {
             agent_dir: Some(agent),
             model_runtime: Some(runtime),
             resource_loader_options: Some(ResourceLoaderServiceOptions {
-                no_extensions: true,
-                no_skills: true,
-                no_prompt_templates: true,
-                no_themes: true,
-                no_context_files: true,
+                discovery: all_discovery_disabled(),
                 ..ResourceLoaderServiceOptions::default()
             }),
             ..CreateAgentSessionServicesOptions::default()
@@ -1621,11 +1594,7 @@ mod tests {
                     agent_dir: Some(agent),
                     model_runtime: Some(ModelRuntime::create_in_memory().await?),
                     resource_loader_options: Some(ResourceLoaderServiceOptions {
-                        no_extensions: true,
-                        no_skills: true,
-                        no_prompt_templates: true,
-                        no_themes: true,
-                        no_context_files: true,
+                        discovery: all_discovery_disabled(),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1768,11 +1737,7 @@ mod tests {
             agent_dir: Some(agent),
             model_runtime: Some(runtime),
             resource_loader_options: Some(ResourceLoaderServiceOptions {
-                no_extensions: true,
-                no_skills: true,
-                no_prompt_templates: true,
-                no_themes: true,
-                no_context_files: true,
+                discovery: all_discovery_disabled(),
                 ..ResourceLoaderServiceOptions::default()
             }),
             ..CreateAgentSessionServicesOptions::default()

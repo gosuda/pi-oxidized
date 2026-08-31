@@ -24,6 +24,7 @@ use pi_tui::component::UiEvent;
 use pi_tui::keybindings::KeybindingsManager;
 
 use crate::core::keybindings::{app_keybindings_defaults, create_app_keybindings};
+use crate::core::settings::DoubleEscapeAction;
 
 use super::state::{FocusArea, OverlayKind, StatusKind, ViewAction, ViewState};
 
@@ -32,20 +33,6 @@ use super::state::{FocusArea, OverlayKind, StatusKind, ViewAction, ViewState};
 /// Mirrors the TS literal `500` used in `handleCtrlC` and the double-Esc
 /// handler (`interactive-mode.ts:3464` and `:2541`).
 pub const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(500);
-
-/// What double-Esc on an empty editor should do.
-///
-/// Ports `getDoubleEscapeAction()` from settings (`"none" | "tree" | "fork"`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DoubleEscapeAction {
-    /// No double-Esc behaviour (single Esc still clears the editor).
-    #[default]
-    None,
-    /// Open the branch tree (`/tree`) selector.
-    Tree,
-    /// Open the user-message fork (`/fork`) selector.
-    Fork,
-}
 
 /// Mutable state carried across input events for double-tap detection.
 ///
@@ -438,18 +425,6 @@ impl InputMapper {
             out.push(ViewAction::ClearEditor);
         }
         // Otherwise: no-op.
-    }
-}
-
-/// Helper for tests / settings reload: build a state from the wire string.
-///
-/// Mirrors `getDoubleEscapeAction` default mapping (`"none" | "tree" | "fork"`).
-#[must_use]
-pub fn double_escape_action_from_str(s: &str) -> DoubleEscapeAction {
-    match s {
-        "tree" => DoubleEscapeAction::Tree,
-        "fork" => DoubleEscapeAction::Fork,
-        _ => DoubleEscapeAction::None,
     }
 }
 
@@ -1093,9 +1068,19 @@ mod tests {
     }
 
     #[test]
-    fn esc_single_tap_on_empty_when_double_disabled_is_noop() {
+    fn default_state_double_esc_opens_tree() {
         let mapper = mapper();
         let mut state = InputState::default();
+        let view = empty_view();
+        let _ = mapper.map(&plain(KeyCode::Esc), &view, "", "", &mut state, false);
+        let actions = mapper.map(&plain(KeyCode::Esc), &view, "", "", &mut state, false);
+        assert_eq!(actions, vec![ViewAction::OpenTreeSelector]);
+    }
+
+    #[test]
+    fn esc_single_tap_on_empty_when_double_disabled_is_noop() {
+        let mapper = mapper();
+        let mut state = InputState::new(DoubleEscapeAction::None);
         let view = empty_view();
         let actions = mapper.map(&plain(KeyCode::Esc), &view, "", "", &mut state, false);
         assert!(actions.is_empty());
@@ -1145,27 +1130,6 @@ mod tests {
         let view = empty_view();
         let actions = mapper.map(&ctrl('l'), &view, "", "", &mut state, true);
         assert!(actions.is_empty());
-    }
-
-    #[test]
-    fn double_escape_action_from_str_parses() {
-        assert_eq!(
-            double_escape_action_from_str("tree"),
-            DoubleEscapeAction::Tree
-        );
-        assert_eq!(
-            double_escape_action_from_str("fork"),
-            DoubleEscapeAction::Fork
-        );
-        assert_eq!(
-            double_escape_action_from_str("none"),
-            DoubleEscapeAction::None
-        );
-        assert_eq!(double_escape_action_from_str(""), DoubleEscapeAction::None);
-        assert_eq!(
-            double_escape_action_from_str("bogus"),
-            DoubleEscapeAction::None
-        );
     }
 
     #[test]
