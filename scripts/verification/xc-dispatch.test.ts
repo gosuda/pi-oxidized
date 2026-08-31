@@ -12,6 +12,7 @@ import {
 	verifyMutableHookCoverage,
 	verifyToolCallInPlaceComparison,
 	verifyToolCallTerminateForwarding,
+	verifyEventMirrorParity,
 } from "./xc-dispatch.ts";
 
 const INPUTS = loadXcDispatchInputs(REPO_ROOT);
@@ -23,8 +24,8 @@ describe("XC-6 hook-dispatch semantics lattice witnesses", () => {
 
 	// --- Lattice completeness ---
 
-	test("lattice classifies exactly 33 discriminants", () => {
-		expect(ALL_DISCRIMINANTS).toHaveLength(33);
+	test("lattice classifies exactly 35 discriminants", () => {
+		expect(ALL_DISCRIMINANTS).toHaveLength(35);
 	});
 
 	test("lattice discriminants match ALL_EVENT_TYPES in host.ts", () => {
@@ -185,5 +186,41 @@ describe("XC-6 hook-dispatch semantics lattice witnesses", () => {
 
 	test("every mutable-hook class has ≥1 witness in test suites", () => {
 		expect(verifyMutableHookCoverage(INPUTS.hostTestSource, INPUTS.leanTestSource, INPUTS.endpointTestSource)).toEqual([]);
+	});
+});
+
+describe("XC-6 event-type mirror parity (35-entry lattice)", () => {
+	test("host.ts, lean-api.ts, and Rust ALL_EVENT_TYPES are 35-entry mirrors", () => {
+		expect(
+			verifyEventMirrorParity(INPUTS.hostSource, INPUTS.leanApiSource, INPUTS.rustHostSource),
+		).toEqual([]);
+	});
+
+	test("lean mutation: deleting ui_prompt_start fails mirror parity", () => {
+		const mutated = INPUTS.leanApiSource.replace(/"ui_prompt_start",\n/, "");
+		expect(
+			verifyEventMirrorParity(INPUTS.hostSource, mutated, INPUTS.rustHostSource),
+		).not.toEqual([]);
+	});
+
+	test("lean mutation: deleting ui_prompt_end fails mirror parity", () => {
+		const mutated = INPUTS.leanApiSource.replace(/"ui_prompt_end",\n/, "");
+		expect(
+			verifyEventMirrorParity(INPUTS.hostSource, mutated, INPUTS.rustHostSource),
+		).not.toEqual([]);
+	});
+
+	test("Rust mutation: deleting ui_prompt_start fails mirror parity", () => {
+		const mutated = INPUTS.rustHostSource.replace(/"ui_prompt_start",\n/, "");
+		expect(
+			verifyEventMirrorParity(INPUTS.hostSource, INPUTS.leanApiSource, mutated),
+		).not.toEqual([]);
+	});
+
+	test("Rust mutation: deleting ui_prompt_end fails mirror parity", () => {
+		const mutated = INPUTS.rustHostSource.replace(/"ui_prompt_end",\n/, "");
+		expect(
+			verifyEventMirrorParity(INPUTS.hostSource, INPUTS.leanApiSource, mutated),
+		).not.toEqual([]);
 	});
 });

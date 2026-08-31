@@ -143,8 +143,8 @@
 			"evidence": "acceptance: registry snapshot and tool/provider bridges / provider stream api=custom"
 		},
 		{
-			"id": "lifecycle-33",
-			"surface": "33 lifecycle",
+			"id": "lifecycle-35",
+			"surface": "35 lifecycle",
 			"tier": "host",
 			"required": true,
 			"commands": [
@@ -154,7 +154,7 @@
 					"timeoutMs": 600000
 				}
 			],
-			"evidence": "acceptance: all 33 lifecycle events / runner recognizes handlers for all 33 event types"
+			"evidence": "acceptance: all 35 lifecycle events / runner recognizes handlers for all 35 event types"
 		},
 		{
 			"id": "widgets",
@@ -308,7 +308,7 @@
 					"timeoutMs": 600000
 				}
 			],
-			"evidence": "acceptance: all 33 lifecycle events / cancellable session events round-trip cancellation through the host"
+			"evidence": "acceptance: all 35 lifecycle events / cancellable session events round-trip cancellation through the host"
 		},
 		{
 			"id": "product-extension-tests",

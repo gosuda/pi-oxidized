@@ -1,6 +1,6 @@
 /**
  * Acceptance tests: widget slots, stale generation, crash isolation,
- * all 33 lifecycle methods, runtime extension loading, and compiled artifacts.
+ * all 35 lifecycle methods, runtime extension loading, and compiled artifacts.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -17,6 +17,8 @@ import {
 import type {
 	ExtensionFactory,
 	ExtensionContextActions,
+	ExtensionUIContext,
+	ExtensionMode,
 	InlineExtension,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -25,9 +27,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import { builtInExtensions } from "@earendil-works/pi-coding-agent/builtins";
-import { ExtensionHost, createEventBus } from "../src/host.ts";
+import { ExtensionHost, createEventBus, ALL_EVENT_TYPES } from "../src/host.ts";
 import { COMPATIBILITY_VERSION } from "../src/version.ts";
 import { createExtensionJiti } from "../src/virtual-modules.ts";
+import { LEAN_EVENT_TYPES } from "../src/lean-api.ts";
 import { Type } from "@earendil-works/pi-ai";
 
 import allEventsFactory, { ALL_EVENTS } from "../fixtures/extensions/all-events.ts";
@@ -504,19 +507,36 @@ describe("acceptance: crash isolation", () => {
 });
 
 // ===========================================================================
-// 4. All 33 lifecycle methods
+// 4. All 35 lifecycle methods
 // ===========================================================================
 
-describe("acceptance: all 33 lifecycle events", () => {
-	test("runner recognizes handlers for all 33 event types", async () => {
+describe("acceptance: all 35 lifecycle events", () => {
+	test("runner recognizes handlers for all 35 event types", async () => {
 		const { runner } = await makeRunner(allEventsFactory, "all-events.ts");
-		expect(ALL_EVENTS).toHaveLength(33);
+		expect(ALL_EVENTS).toHaveLength(35);
+		expect(ALL_EVENT_TYPES).toEqual(ALL_EVENTS);
+		expect(LEAN_EVENT_TYPES).toEqual(ALL_EVENTS);
 		for (const event of ALL_EVENTS) {
 			expect(runner.hasHandlers(event)).toBe(true);
 		}
 	});
 
-	test("all 33 events can be emitted without error and exactly once", async () => {
+	test("host reports all 35 registered handlers", async () => {
+		const { collector, stdin, host, runPromise } = await connectHost([allEventsFactory]);
+		stdin.push(Buffer.from(encodeFrameString({
+			id: 199,
+			kind: "req",
+			method: "extensions.load",
+			payload: { extensionPaths: [], cwd: process.cwd() },
+		})));
+		const response = await collector.awaitFrame((frame) => frame.id === 199 && frame.kind === "res");
+		expect((response.payload as Record<string, unknown>)["handlers"]).toEqual(ALL_EVENTS);
+		stdin.push(null);
+		host.dispose("test");
+		await runPromise.catch(() => void 0);
+	});
+
+	test("all 35 events can be emitted without error and exactly once", async () => {
 		const calls = new Map<string, number>();
 		const recordingFactory: ExtensionFactory = (pi) => {
 			for (const event of ALL_EVENTS) {
@@ -538,6 +558,112 @@ describe("acceptance: all 33 lifecycle events", () => {
 		for (const event of ALL_EVENTS) {
 			expect(calls.get(event)).toBe(1);
 		}
+	});
+
+	test("UI prompts emit exact lifecycle spans and balance rejection", async () => {
+		const events: unknown[] = [];
+		const complete = Promise.withResolvers<void>();
+		const factory: ExtensionFactory = (pi) => {
+			for (const type of ["ui_prompt_start", "ui_prompt_end"] as const) {
+				pi.on(type, (event) => {
+					events.push(event);
+					if (events.length === 10) complete.resolve();
+				});
+			}
+		};
+		const { runner } = await makeRunner(factory, "ui-prompt-events.ts");
+		runner.setUIContext({
+			select: async () => "choice",
+			confirm: async () => true,
+			input: async () => "text",
+			editor: async () => { throw new Error("editor failed"); },
+			custom: async () => "custom",
+		});
+		const ui = runner.createContext().ui;
+
+		expect(await ui.select("Select title", ["choice"])).toBe("choice");
+		expect(await ui.confirm("Confirm title", "Proceed?")).toBe(true);
+		expect(await ui.input("Input title", "placeholder")).toBe("text");
+		expect(await ui.custom<string>(() => { throw new Error("unused factory"); })).toBe("custom");
+		await expect(ui.editor("Editor title", "draft")).rejects.toThrow("editor failed");
+		await complete.promise;
+		// Flush queued notifications so exact equality also catches duplicates.
+		await Promise.resolve();
+
+		expect(events).toEqual([
+			{ type: "ui_prompt_start", reason: "ui_prompt", kind: "select", title: "Select title" },
+			{ type: "ui_prompt_end", reason: "ui_prompt", kind: "select", title: "Select title" },
+			{ type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm", title: "Confirm title" },
+			{ type: "ui_prompt_end", reason: "ui_prompt", kind: "confirm", title: "Confirm title" },
+			{ type: "ui_prompt_start", reason: "ui_prompt", kind: "input", title: "Input title" },
+			{ type: "ui_prompt_end", reason: "ui_prompt", kind: "input", title: "Input title" },
+			{ type: "ui_prompt_start", reason: "ui_prompt", kind: "custom" },
+			{ type: "ui_prompt_end", reason: "ui_prompt", kind: "custom" },
+			{ type: "ui_prompt_start", reason: "ui_prompt", kind: "editor", title: "Editor title" },
+			{ type: "ui_prompt_end", reason: "ui_prompt", kind: "editor", title: "Editor title" },
+		]);
+	});
+
+	test("synchronous UI failure ends its span and resets prompt depth", async () => {
+		const events: unknown[] = [];
+		const complete = Promise.withResolvers<void>();
+		const factory: ExtensionFactory = (pi) => {
+			for (const type of ["ui_prompt_start", "ui_prompt_end"] as const) {
+				pi.on(type, (event) => {
+					events.push(event);
+					if (events.length === 4) complete.resolve();
+				});
+			}
+		};
+		const { runner } = await makeRunner(factory, "sync-ui-prompt-error.ts");
+		runner.setUIContext({
+			confirm: () => { throw new Error("synchronous prompt failure"); },
+			input: async () => "after failure",
+		});
+		const ui = runner.createContext().ui;
+
+		expect(() => ui.confirm("Failing title", "Proceed?")).toThrow(
+			"synchronous prompt failure",
+		);
+		expect(await ui.input("Next title")).toBe("after failure");
+		await complete.promise;
+		// Flush queued notifications so exact equality also catches duplicates.
+		await Promise.resolve();
+		expect(events).toEqual([
+			{ type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm", title: "Failing title" },
+			{ type: "ui_prompt_end", reason: "ui_prompt", kind: "confirm", title: "Failing title" },
+			{ type: "ui_prompt_start", reason: "ui_prompt", kind: "input", title: "Next title" },
+			{ type: "ui_prompt_end", reason: "ui_prompt", kind: "input", title: "Next title" },
+		]);
+	});
+
+	test("nested UI prompts emit one outer lifecycle span", async () => {
+		const events: unknown[] = [];
+		const complete = Promise.withResolvers<void>();
+		const factory: ExtensionFactory = (pi) => {
+			for (const type of ["ui_prompt_start", "ui_prompt_end"] as const) {
+				pi.on(type, (event) => {
+					events.push(event);
+					if (events.length === 2) complete.resolve();
+				});
+			}
+		};
+		const { runner } = await makeRunner(factory, "nested-ui-prompt-events.ts");
+		let wrapped: ExtensionUIContext;
+		runner.setUIContext({
+			select: async () => await wrapped.input("Inner title", "placeholder"),
+			input: async () => "inner result",
+		});
+		wrapped = runner.createContext().ui;
+
+		expect(await wrapped.select("Outer title", ["choice"])).toBe("inner result");
+		await complete.promise;
+		// Flush queued notifications so exact equality also catches duplicates.
+		await Promise.resolve();
+		expect(events).toEqual([
+			{ type: "ui_prompt_start", reason: "ui_prompt", kind: "select", title: "Outer title" },
+			{ type: "ui_prompt_end", reason: "ui_prompt", kind: "select", title: "Outer title" },
+		]);
 	});
 
 	test("cancellable session events round-trip cancellation through the host", async () => {

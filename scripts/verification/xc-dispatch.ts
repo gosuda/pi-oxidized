@@ -2,7 +2,7 @@
  * XC-6 hook-dispatch semantics lattice witnesses (issue #55).
  *
  * Static witnesses that verify the TypeScript reference code implements the
- * hook-dispatch semantics for all 33 lifecycle discriminants, classifying each
+ * hook-dispatch semantics for all 35 lifecycle discriminants, classifying each
  * into one or more of: notification, chain, fold, cancellable, in-place.
  *
  * Mutations:
@@ -22,7 +22,7 @@ import { join, resolve } from "node:path";
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
 // ============================================================================
-// 33-discriminant dispatch-semantics lattice
+// 35-discriminant dispatch-semantics lattice
 // ============================================================================
 
 /** Dispatch semantics classes for lifecycle hooks. */
@@ -41,7 +41,7 @@ export interface DiscriminantClassification {
 }
 
 /**
- * The canonical classification of all 33 lifecycle discriminants.
+ * The canonical classification of all 35 lifecycle discriminants.
  *
  * - **notification**: handlers fire, results discarded, response `{ ok: true }`
  * - **chain**: last non-null result wins (session_before_* without cancel)
@@ -70,6 +70,8 @@ export const DISCRIMINANT_LATTICE: DiscriminantClassification[] = [
 	{ discriminant: "agent_start", classes: ["notification"] },
 	{ discriminant: "agent_end", classes: ["notification"] },
 	{ discriminant: "agent_settled", classes: ["notification"] },
+	{ discriminant: "ui_prompt_start", classes: ["notification"] },
+	{ discriminant: "ui_prompt_end", classes: ["notification"] },
 	{ discriminant: "turn_start", classes: ["notification"] },
 	{ discriminant: "turn_end", classes: ["notification"] },
 	{ discriminant: "message_start", classes: ["notification"] },
@@ -86,7 +88,7 @@ export const DISCRIMINANT_LATTICE: DiscriminantClassification[] = [
 	{ discriminant: "input", classes: ["fold", "cancellable"] },
 ];
 
-/** All 33 discriminant names in canonical order. */
+/** All 35 discriminant names in canonical order. */
 export const ALL_DISCRIMINANTS = DISCRIMINANT_LATTICE.map((d) => d.discriminant);
 
 /** Discriminants belonging to a given class. */
@@ -113,6 +115,10 @@ export interface XcDispatchInputs {
 	hostTestSource: string;
 	/** Contents of `packages/extension-host/tests/lean.test.ts`. */
 	leanTestSource: string;
+	/** Contents of `packages/extension-host/src/lean-api.ts`. */
+	leanApiSource: string;
+	/** Contents of `crates/pi/src/core/extension_host.rs`. */
+	rustHostSource: string;
 }
 
 export function loadXcDispatchInputs(root: string): XcDispatchInputs {
@@ -124,44 +130,117 @@ export function loadXcDispatchInputs(root: string): XcDispatchInputs {
 		endpointTestSource: read("packages/extension-host/tests/endpoint-conformance.test.ts"),
 		hostTestSource: read("packages/extension-host/tests/host.test.ts"),
 		leanTestSource: read("packages/extension-host/tests/lean.test.ts"),
+		leanApiSource: read("packages/extension-host/src/lean-api.ts"),
+		rustHostSource: read("crates/pi/src/core/extension_host.rs"),
 	};
 }
-
 // ============================================================================
-// Lattice completeness witness: all 33 discriminants classified
+// Shared named-array parsers and list comparator
 // ============================================================================
 
 /**
- * The lattice must classify exactly 33 discriminants matching ALL_EVENT_TYPES.
+ * Parse a TypeScript `export const NAME = [...] as const` string array.
+ * Returns the list of discriminants, or null when the array is not found.
+ */
+function parseTsConstArray(source: string, arrayName: string): string[] | null {
+	const re = new RegExp(`export const ${arrayName} = \\[([\\s\\S]*?)\\] as const`);
+	const match = source.match(re);
+	if (match === null) return null;
+	return (match[1] ?? "")
+		.split(",")
+		.map((s) => s.trim().replace(/["']/g, ""))
+		.filter((s) => s.length > 0);
+}
+
+/**
+ * Parse a Rust `pub const NAME: &[&str] = &[...];` string array.
+ * Returns the list of discriminants, or null when the array is not found.
+ */
+function parseRustConstArray(source: string, arrayName: string): string[] | null {
+	const re = new RegExp(`pub const ${arrayName}: &\\[&str\\] = &\\[([\\s\\S]*?)\\];`);
+	const match = source.match(re);
+	if (match === null) return null;
+	return (match[1] ?? "")
+		.split(",")
+		.map((s) => s.trim().replace(/["']/g, ""))
+		.filter((s) => s.length > 0);
+}
+
+/**
+ * Compare a parsed discriminant list against ALL_DISCRIMINANTS, reporting
+ * length and per-index mismatches. `label` identifies the source in messages.
+ */
+function compareDiscriminantList(label: string, list: string[]): string[] {
+	const violations: string[] = [];
+	if (list.length !== ALL_DISCRIMINANTS.length) {
+		violations.push(
+			`${label} has ${list.length} entries, lattice has ${ALL_DISCRIMINANTS.length}`,
+		);
+	}
+	for (let i = 0; i < list.length; i++) {
+		if (list[i] !== ALL_DISCRIMINANTS[i]) {
+			violations.push(
+				`${label} discriminant mismatch at index ${i}: "${list[i]}", lattice "${ALL_DISCRIMINANTS[i] ?? "<missing>"}"`,
+			);
+		}
+	}
+	return violations;
+}
+
+// ============================================================================
+// Lattice completeness witness: all 35 discriminants classified
+// ============================================================================
+
+/**
+ * The lattice must classify exactly 35 discriminants matching ALL_EVENT_TYPES.
  */
 export function verifyLatticeCompleteness(
 	hostSource: string,
 ): string[] {
-	const violations: string[] = [];
-	const match = hostSource.match(
-		/export const ALL_EVENT_TYPES = \[([\s\S]*?)\] as const/,
-	);
-	if (match === null) {
-		violations.push("ALL_EVENT_TYPES array not found in host.ts");
-		return violations;
+	const host = parseTsConstArray(hostSource, "ALL_EVENT_TYPES");
+	if (host === null) {
+		return ["ALL_EVENT_TYPES array not found in host.ts"];
 	}
-	const hostDiscriminants = (match[1] ?? "")
-		.split(",")
-		.map((s) => s.trim().replace(/["']/g, ""))
-		.filter((s) => s.length > 0);
+	return compareDiscriminantList("host", host);
+}
 
-	if (hostDiscriminants.length !== ALL_DISCRIMINANTS.length) {
-		violations.push(
-			`ALL_EVENT_TYPES has ${hostDiscriminants.length} entries, lattice has ${ALL_DISCRIMINANTS.length}`,
-		);
+// ============================================================================
+// Event-type mirror parity witness (35-entry three-list)
+// ============================================================================
+
+/**
+ * host.ts ALL_EVENT_TYPES, lean-api.ts LEAN_EVENT_TYPES, and the Rust
+ * `pub const ALL_EVENT_TYPES` must each be exact 35-entry ordered mirrors of
+ * ALL_DISCRIMINANTS. Fails closed when a named array cannot be found.
+ */
+export function verifyEventMirrorParity(
+	hostSource: string,
+	leanApiSource: string,
+	rustHostSource: string,
+): string[] {
+	const violations: string[] = [];
+
+	const host = parseTsConstArray(hostSource, "ALL_EVENT_TYPES");
+	if (host === null) {
+		violations.push("ALL_EVENT_TYPES array not found in host.ts");
+	} else {
+		violations.push(...compareDiscriminantList("host", host));
 	}
-	for (let i = 0; i < hostDiscriminants.length; i++) {
-		if (hostDiscriminants[i] !== ALL_DISCRIMINANTS[i]) {
-			violations.push(
-				`discriminant mismatch at index ${i}: host has "${hostDiscriminants[i]}", lattice has "${ALL_DISCRIMINANTS[i] ?? "<missing>"}"`,
-			);
-		}
+
+	const lean = parseTsConstArray(leanApiSource, "LEAN_EVENT_TYPES");
+	if (lean === null) {
+		violations.push("LEAN_EVENT_TYPES array not found in lean-api.ts");
+	} else {
+		violations.push(...compareDiscriminantList("lean", lean));
 	}
+
+	const rust = parseRustConstArray(rustHostSource, "ALL_EVENT_TYPES");
+	if (rust === null) {
+		violations.push("ALL_EVENT_TYPES array not found in extension_host.rs");
+	} else {
+		violations.push(...compareDiscriminantList("Rust", rust));
+	}
+
 	return violations;
 }
 
@@ -447,6 +526,7 @@ export function verifyMutableHookCoverage(
 export function runXcDispatchWitnesses(inputs: XcDispatchInputs): string[] {
 	return [
 		...verifyLatticeCompleteness(inputs.hostSource),
+		...verifyEventMirrorParity(inputs.hostSource, inputs.leanApiSource, inputs.rustHostSource),
 		...verifyToolCallInPlaceComparison(inputs.hostSource, inputs.leanSource),
 		...verifyInputHandledShortCircuit(inputs.hostSource, inputs.leanSource),
 		...verifyBeforeProviderHeadersInPlace(inputs.hostSource, inputs.leanSource),

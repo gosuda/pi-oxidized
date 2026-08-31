@@ -1540,6 +1540,39 @@ describe("lean: lifecycle hooks", () => {
 		expect(cancelled).toEqual({ cancel: true, reason: "stop-from-lean" });
 		await link.finish();
 	});
+	test("ui_prompt_start and ui_prompt_end dispatch exactly, inject type, and disregard return values", async () => {
+		const link = await loadedLink();
+
+		link.request(40, "ui_prompt_start", {
+			reason: "ui_prompt",
+			kind: "select",
+			title: "Pick one",
+		});
+		const startRes = payload(await link.response(40, "ui_prompt_start"));
+		expect(startRes).toEqual({ ok: true });
+
+		link.request(41, "ui_prompt_end", {
+			reason: "ui_prompt",
+			kind: "confirm",
+			title: "Confirm action",
+		});
+		const endRes = payload(await link.response(41, "ui_prompt_end"));
+		expect(endRes).toEqual({ ok: true });
+
+		expect(markerLog()).toContainEqual({
+			name: "hook.ui_prompt_start",
+			value: { type: "ui_prompt_start", reason: "ui_prompt", kind: "select", title: "Pick one" },
+		});
+		expect(markerLog()).toContainEqual({
+			name: "hook.ui_prompt_end",
+			value: { type: "ui_prompt_end", reason: "ui_prompt", kind: "confirm", title: "Confirm action" },
+		});
+
+		expect(markerLog().filter((m) => m.name === "hook.ui_prompt_start")).toHaveLength(1);
+		expect(markerLog().filter((m) => m.name === "hook.ui_prompt_end")).toHaveLength(1);
+
+		await link.finish();
+	});
 });
 
 

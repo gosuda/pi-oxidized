@@ -1,7 +1,7 @@
 //! Fake-host acceptance tests for [`HostExtensionRunner`].
 //!
 //! Drives an in-memory JSONL fake host (no real Bun) through every
-//! [`ExtensionRunner`] hook family, the full 33-event handler-presence set,
+//! [`ExtensionRunner`] hook family, the full 35-event handler-presence set,
 //! host-owned transforms/merge, non-retryable error/crash/timeout isolation
 //! with pending-close / no-replay, registry first-wins dedup, reload
 //! generation + stale-slot invalidation, the HTML renderer, and exactly-once
@@ -253,7 +253,7 @@ fn dispatch(
     })
 }
 
-/// Snapshot carrying every registered surface + all 33 handler types.
+/// Snapshot carrying every registered surface + all 35 handler types.
 fn full_snapshot() -> Value {
     let handlers: Vec<&str> = ALL_EVENT_TYPES.to_vec();
     json!({
@@ -295,12 +295,33 @@ async fn next_item<T: Clone + Send + 'static>(
 }
 
 // ===========================================================================
-// Load + 33-event handler presence + trait hook families
+// Load + 35-event handler presence + trait hook families
 // ===========================================================================
 
 #[tokio::test]
-async fn load_reports_all_33_handlers_and_registry_surfaces() -> R {
+async fn load_reports_all_35_handlers_and_registry_surfaces() -> R {
     let (runner, _host) = make_runner(full_snapshot()).await?;
+
+    let expected_window: &[&str] = &[
+        "agent_settled",
+        "ui_prompt_start",
+        "ui_prompt_end",
+        "turn_start",
+    ];
+    let actual_window = ALL_EVENT_TYPES
+        .windows(expected_window.len())
+        .find(|w| w[0] == "agent_settled")
+        .expect("agent_settled must be present in ALL_EVENT_TYPES");
+    assert_eq!(
+        actual_window, expected_window,
+        "ui_prompt_start and ui_prompt_end must follow agent_settled and precede turn_start"
+    );
+    assert_eq!(
+        ALL_EVENT_TYPES.len(),
+        35,
+        "expected 35 lifecycle event types, got {}",
+        ALL_EVENT_TYPES.len()
+    );
 
     for event in ALL_EVENT_TYPES {
         assert!(runner.has_handlers(event), "expected handler for {event}");

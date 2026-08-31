@@ -75,7 +75,7 @@ pub const MESSAGE_UPDATE_DELTA_METHOD: &str = "message_update_delta";
 /// Open method string: render an extension tool call/result as HTML (export).
 pub const TOOL_RENDER_HTML_METHOD: &str = "tool.renderHtml";
 
-/// The 33 lifecycle event `type` discriminants mirrored from the reference
+/// The 35 lifecycle event `type` discriminants mirrored from the reference
 /// `ExtensionAPI.on()` overloads. The host reports which of these have at
 /// least one handler; Rust gates IPC on that set.
 pub const ALL_EVENT_TYPES: &[&str] = &[
@@ -98,6 +98,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     "agent_start",
     "agent_end",
     "agent_settled",
+    "ui_prompt_start",
+    "ui_prompt_end",
     "turn_start",
     "turn_end",
     "message_start",

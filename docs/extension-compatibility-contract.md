@@ -289,18 +289,19 @@ because those rules are resolved in the TypeScript host before the snapshot
 reaches Rust, and the product layer uses `raw_shortcuts` (not `Registry`)
 for shortcut dispatch. No semantic change is required.
 
-## 7. Canonical 33-hook classification
+## 7. Canonical 35-hook classification
 
-The canonical lifecycle event set is exactly the following 33 discriminants, in
-this exact order, and they are the byte-diff-equal of BOTH
-`ALL_EVENT_TYPES` (`packages/extension-host/src/host.ts`, lines 71-105) and
-`LEAN_EVENT_TYPES` (`packages/extension-host/src/lean-api.ts`, lines 18-52). The
-host classifies a registered handler as a `handlers` item in the registry
-snapshot only for discriminants in this set
-(`packages/extension-host/src/host.ts::buildRegistrySnapshot`, `handlers` field,
-`ALL_EVENT_TYPES.filter(...)`); the lean runner does the same over
-`LEAN_EVENT_TYPES` (`packages/extension-host/src/lean-runner.ts`, `LEAN_EVENT_TYPES.filter`,
-line 1195).
+The canonical lifecycle event set contains the following 35 discriminants in
+this exact order. These three arrays must contain the same values in the same
+order:
+
+- `packages/extension-host/src/host.ts::ALL_EVENT_TYPES`
+- `packages/extension-host/src/lean-api.ts::LEAN_EVENT_TYPES`
+- `crates/pi/src/core/extension_host.rs::ALL_EVENT_TYPES`
+
+The host includes a registered handler in its registry snapshot only when the
+handler's discriminant is in `ALL_EVENT_TYPES`. The lean runner applies the
+same rule with `LEAN_EVENT_TYPES`.
 
 ```text
 project_trust
@@ -322,6 +323,8 @@ before_agent_start
 agent_start
 agent_end
 agent_settled
+ui_prompt_start
+ui_prompt_end
 turn_start
 turn_end
 message_start
@@ -338,23 +341,39 @@ user_bash
 input
 ```
 
-Both arrays are identical and both end at `input`. Any boundary that adds or
-removes a discriminant MUST update both arrays in lockstep and re-verify parity
-(see [Ownership](#ownership)).
+All three arrays end at `input`. A change that adds, removes, renames, or
+reorders a discriminant MUST update all three arrays and the dispatch lattice
+in one change (see [Ownership](#ownership)).
 
-`witness: packages/extension-host/tests/acceptance.test.ts::acceptance: all 33
-lifecycle events` — asserts the canonical list carries exactly 33
+`ui_prompt_start` and `ui_prompt_end` are notifications. Both use this payload:
+`{ type, reason: "ui_prompt", kind: "select" | "confirm" | "input" | "editor" | "custom", title?: string }`.
+The end event repeats the outer prompt's `kind` and optional `title`. An absent
+title is omitted.
+
+The reference TypeScript runner is the sole Mode 1 emitter. It wraps `select`,
+`confirm`, `input`, `editor`, and `custom`. It queues each notification with
+`queueMicrotask` and does not await handlers before it opens or closes the
+prompt. A prompt started while another prompt remains active shares the outer
+prompt's span. The runner emits the matching end event when the outer prompt
+completes, rejects, or throws before it returns a promise. Lean mode receives
+both events through generic notification dispatch. Rust only validates and
+routes the event names; it does not emit a second copy.
+
+`witness: packages/extension-host/tests/acceptance.test.ts::acceptance: all 35
+lifecycle events` — asserts the canonical list carries exactly 35
 discriminants and that handlers for each are recognized by the runner;
 `scripts/verification/xc-dispatch.ts::DISCRIMINANT_LATTICE` (verified by
-`xc-dispatch.test.ts`) classifies exactly 33 discriminants matching
-`ALL_EVENT_TYPES`; the serialized corpus is held to the same set by the
-witness-manifest lockstep (§2). `mutation:` dropping a discriminant from the
-canonical list fails the acceptance suite and the lattice classification
-check.
+`xc-dispatch.test.ts`) classifies exactly 35 discriminants matching
+`ALL_EVENT_TYPES`. Exact event-name order is checked across host
+`ALL_EVENT_TYPES`, lean `LEAN_EVENT_TYPES`, and Rust `ALL_EVENT_TYPES` by
+`scripts/verification/xc-dispatch.ts`; `frames.jsonl` and
+`witness-manifest.json` own method/frame-kind pairs only. `mutation:` dropping
+a discriminant from the canonical list fails the acceptance suite and the
+xc-dispatch lattice and deletion mutation checks.
 
 ### 7.1 Dispatch-semantics lattice (XC-6, issue #55)
 
-Each of the 33 discriminants belongs to one or more dispatch-semantics
+Each of the 35 discriminants belongs to one or more dispatch-semantics
 classes. The lattice is defined in
 `scripts/verification/xc-dispatch.ts::DISCRIMINANT_LATTICE` and verified by
 `scripts/verification/xc-dispatch.test.ts`:
@@ -399,7 +418,7 @@ The full registry snapshot (`RegistrySnapshotWire` consumed by Rust
   / `ProvidersUpdate` mirror fields on the Rust side
   (`crates/pi-ext/src/protocol.rs` typed wire structs, session-action and theme
   open-method sections at lines 1339, 1429).
-- `handlers`: the canonical 33 discriminants with at least one registered handler.
+- `handlers`: the canonical 35 discriminants with at least one registered handler.
 - `terminalInput`: boolean, whether an active terminal-input handler exists.
 
 `witness: packages/extension-host/tests/acceptance.test.ts::acceptance:
@@ -522,14 +541,19 @@ violating this contract:
 This plan (stable ID `XC-1` / issue #52) **solely owns** the declared
 mirror/fixture/mutation-checker surfaces and the A8 audit-record slot:
 
-- The mirror/fixture/mutation-checker surfaces:
-  `packages/pi-tui-protocol/tests/fixtures/frames.jsonl` (the shared cross-language
-  wire witness that cross-locks `Method`, `ALL_EVENT_TYPES`, and the lean lists),
-  `packages/pi-tui-protocol/tests/fixtures/witness-manifest.json` (the single
-  `(method, kind)` witness manifest consumed by name by both language sides —
-  parity does not create a second check), and the mutation checker
-  `scripts/verification/parity.ts` (with `compat-matrix.json`), which verify the
-  mirror cannot become a competing protocol authority.
+- The lifecycle-name mirrors:
+  `packages/extension-host/src/host.ts::ALL_EVENT_TYPES`,
+  `packages/extension-host/src/lean-api.ts::LEAN_EVENT_TYPES`, and
+  `crates/pi/src/core/extension_host.rs::ALL_EVENT_TYPES`.
+  `scripts/verification/xc-dispatch.ts` checks their exact order against its
+  dispatch lattice. Deletion mutations cover both new event names in the lean
+  and Rust mirrors.
+- The wire witnesses:
+  `packages/pi-tui-protocol/tests/fixtures/frames.jsonl` and
+  `packages/pi-tui-protocol/tests/fixtures/witness-manifest.json`. They own
+  method/frame-kind pairs only. `scripts/verification/parity.ts` and
+  `scripts/verification/compat-matrix.json` verify that the TypeScript wire
+  mirror does not become a second protocol authority.
 - The A8 audit-record slot: `docs/PARITY_LEDGER.md` row A8 ("Upstream ./compat
   legacy global provider registry"), status **witnessed**.
 

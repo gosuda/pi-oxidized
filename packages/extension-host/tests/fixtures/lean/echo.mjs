@@ -132,5 +132,12 @@ export default {
 		message_update: (event) => {
 			mark("hook.message_update", event.assistantMessageEvent?.type);
 		},
+		ui_prompt_start: (event) => {
+			mark("hook.ui_prompt_start", event);
+			return { cancel: true };
+		},
+		ui_prompt_end: (event) => {
+			mark("hook.ui_prompt_end", event);
+		},
 	},
 };

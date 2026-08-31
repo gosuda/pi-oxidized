@@ -88,6 +88,8 @@ export const ALL_EVENT_TYPES = [
 	"agent_start",
 	"agent_end",
 	"agent_settled",
+	"ui_prompt_start",
+	"ui_prompt_end",
 	"turn_start",
 	"turn_end",
 	"message_start",

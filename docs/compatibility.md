@@ -123,9 +123,9 @@ A disagreement fails generation.
 			"required": true
 		},
 		{
-			"id": "lifecycle-33",
+			"id": "lifecycle-35",
 			"tier": "host",
-			"surface": "33 lifecycle",
+			"surface": "35 lifecycle",
 			"required": true
 		},
 		{
