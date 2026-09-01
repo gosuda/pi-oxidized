@@ -39,7 +39,7 @@ use tokio::io::AsyncRead;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use pi_ext::client::{HostUiRequest, HostUiResponse};
+use pi_ext::client::{DialogEnd, DialogOutcome, HostUiRequest, HostUiResponse};
 use pi_ext::protocol::{NotifyLevel, SlotPlacement};
 
 use crate::core::agent_session::events::AgentSessionEvent;
@@ -994,6 +994,13 @@ async fn run_extension_dialog_bridge(
     }
 }
 
+#[derive(Clone)]
+enum RpcDialogCompletion {
+    Response(RpcExtensionUiResponse),
+    Cancelled,
+    TimedOut,
+}
+
 async fn bridge_extension_dialog(
     runner: Arc<ExtensionRuntimeSet>,
     request: HostUiRequest,
@@ -1037,60 +1044,74 @@ async fn bridge_extension_dialog(
         rpc_request,
     ))));
 
-    let response = if let Some(timeout_ms) = timeout_ms {
+    let completion = if let Some(timeout_ms) = timeout_ms {
         tokio::select! {
-            () = cancel.cancelled() => None,
+            () = cancel.cancelled() => RpcDialogCompletion::Cancelled,
             result = tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
                 response_rx,
-            ) => result.ok().and_then(Result::ok),
+            ) => match result {
+                Ok(Ok(response)) => RpcDialogCompletion::Response(response),
+                Ok(Err(_)) => RpcDialogCompletion::Cancelled,
+                Err(_) => RpcDialogCompletion::TimedOut,
+            },
         }
     } else {
         tokio::select! {
-            () = cancel.cancelled() => None,
-            result = response_rx => result.ok(),
+            () = cancel.cancelled() => RpcDialogCompletion::Cancelled,
+            result = response_rx => match result {
+                Ok(response) => RpcDialogCompletion::Response(response),
+                Err(_) => RpcDialogCompletion::Cancelled,
+            },
         }
     };
-    if response.is_none() {
+    if matches!(
+        completion,
+        RpcDialogCompletion::Cancelled | RpcDialogCompletion::TimedOut
+    ) {
+        // Not a synthesized client answer: this removes the pending entry so a
+        // cancelled/timed-out dialog cannot leak the proxy's oneshot sender.
         let _ = proxy.route_response(RpcExtensionUiResponse::Cancelled { id: rpc_id });
     }
-    let host_response = map_rpc_ui_response(&request, response);
+    let host_response = map_rpc_ui_response(request, completion);
     let _ = runner.respond_ui(host_response).await;
 }
 
-fn map_rpc_ui_response(
-    request: &HostUiRequest,
-    response: Option<RpcExtensionUiResponse>,
-) -> HostUiResponse {
-    match request {
-        HostUiRequest::Select { id, .. } => HostUiResponse::Select {
-            id: *id,
-            value: match response {
-                Some(RpcExtensionUiResponse::Value { value, .. }) => Some(value),
-                _ => None,
+fn map_rpc_ui_response(request: HostUiRequest, completion: RpcDialogCompletion) -> HostUiResponse {
+    match completion {
+        // System/session teardown, supersession, or internal receiver closure.
+        RpcDialogCompletion::Cancelled => request.end(DialogEnd::Cancelled),
+        RpcDialogCompletion::TimedOut => request.end(DialogEnd::TimedOut),
+        // Accepted user dismissal; the reference implementation calls it
+        // "cancelled".
+        RpcDialogCompletion::Response(RpcExtensionUiResponse::Cancelled { .. }) => {
+            request.end(DialogEnd::Cancelled)
+        }
+        RpcDialogCompletion::Response(RpcExtensionUiResponse::Value { value, .. }) => match request
+        {
+            HostUiRequest::Select { id, .. } => HostUiResponse::Select {
+                id,
+                outcome: DialogOutcome::Answered(value),
             },
-        },
-        HostUiRequest::Confirm { id, .. } => HostUiResponse::Confirm {
-            id: *id,
-            confirmed: match response {
-                Some(RpcExtensionUiResponse::Confirmed { confirmed, .. }) => confirmed,
-                _ => false,
+            HostUiRequest::Input { id, .. } => HostUiResponse::Input {
+                id,
+                outcome: DialogOutcome::Answered(value),
             },
-        },
-        HostUiRequest::Input { id, .. } => HostUiResponse::Input {
-            id: *id,
-            value: match response {
-                Some(RpcExtensionUiResponse::Value { value, .. }) => Some(value),
-                _ => None,
+            HostUiRequest::Editor { id, .. } => HostUiResponse::Editor {
+                id,
+                outcome: DialogOutcome::Answered(value),
             },
+            request @ HostUiRequest::Confirm { .. } => request.end(DialogEnd::Cancelled),
         },
-        HostUiRequest::Editor { id, .. } => HostUiResponse::Editor {
-            id: *id,
-            value: match response {
-                Some(RpcExtensionUiResponse::Value { value, .. }) => Some(value),
-                _ => None,
-            },
-        },
+        RpcDialogCompletion::Response(RpcExtensionUiResponse::Confirmed { confirmed, .. }) => {
+            match request {
+                HostUiRequest::Confirm { id, .. } => HostUiResponse::Confirm {
+                    id,
+                    outcome: DialogOutcome::Answered(confirmed),
+                },
+                request => request.end(DialogEnd::Cancelled),
+            }
+        }
     }
 }
 
@@ -2011,6 +2032,9 @@ mod tests {
     use pi_agent::QueueMode;
     use pi_ai::{ImageContent, Model, ModelThinkingLevel};
     use pi_ext::client::HostClient;
+    use pi_ext::protocol::{
+        ConfirmRequest, DialogOptions, EditorRequest, InputRequest, SelectRequest,
+    };
     use pi_ext::protocol::{Frame, FrameKind, HelloAck, Method, decode_frame_str, encode_frame};
     use std::task::{Context, Poll};
     use tokio::io::ReadBuf;
@@ -3144,6 +3168,185 @@ mod tests {
         )
         .await;
         assert!(sink.stdout_lines().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Extension dialog outcome mapping
+    // -----------------------------------------------------------------------
+
+    fn map_select_request(timeout_ms: Option<u64>) -> HostUiRequest {
+        HostUiRequest::Select {
+            id: 7,
+            request: SelectRequest {
+                title: "Pick".to_owned(),
+                options: vec!["a".to_owned(), "b".to_owned()],
+                options_meta: DialogOptions { timeout_ms },
+            },
+        }
+    }
+
+    #[test]
+    fn map_select_value_is_answered() {
+        let response = map_rpc_ui_response(
+            map_select_request(None),
+            RpcDialogCompletion::Response(RpcExtensionUiResponse::Value {
+                id: "rpc".to_owned(),
+                value: "b".to_owned(),
+            }),
+        );
+        assert_eq!(
+            response,
+            HostUiResponse::Select {
+                id: 7,
+                outcome: DialogOutcome::Answered("b".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn map_external_rpc_cancelled_is_cancelled() {
+        let response = map_rpc_ui_response(
+            map_select_request(None),
+            RpcDialogCompletion::Response(RpcExtensionUiResponse::Cancelled {
+                id: "rpc".to_owned(),
+            }),
+        );
+        assert_eq!(
+            response,
+            HostUiResponse::Select {
+                id: 7,
+                outcome: DialogOutcome::Cancelled
+            }
+        );
+    }
+
+    #[test]
+    fn map_cancel_token_is_cancelled() {
+        let response =
+            map_rpc_ui_response(map_select_request(None), RpcDialogCompletion::Cancelled);
+        assert_eq!(
+            response,
+            HostUiResponse::Select {
+                id: 7,
+                outcome: DialogOutcome::Cancelled
+            }
+        );
+    }
+
+    #[test]
+    fn map_deadline_is_timed_out() {
+        let response = map_rpc_ui_response(map_select_request(None), RpcDialogCompletion::TimedOut);
+        assert_eq!(
+            response,
+            HostUiResponse::Select {
+                id: 7,
+                outcome: DialogOutcome::TimedOut
+            }
+        );
+    }
+
+    #[test]
+    fn map_confirm_confirmed_is_answered() {
+        let request = HostUiRequest::Confirm {
+            id: 8,
+            request: ConfirmRequest {
+                title: "Sure".to_owned(),
+                message: "Go".to_owned(),
+                options_meta: DialogOptions::default(),
+            },
+        };
+        let response = map_rpc_ui_response(
+            request,
+            RpcDialogCompletion::Response(RpcExtensionUiResponse::Confirmed {
+                id: "rpc".to_owned(),
+                confirmed: true,
+            }),
+        );
+        assert_eq!(
+            response,
+            HostUiResponse::Confirm {
+                id: 8,
+                outcome: DialogOutcome::Answered(true)
+            }
+        );
+    }
+
+    #[test]
+    fn map_input_and_editor_values_are_answered() {
+        let input = HostUiRequest::Input {
+            id: 9,
+            request: InputRequest {
+                title: "Name".to_owned(),
+                placeholder: None,
+                options_meta: DialogOptions::default(),
+            },
+        };
+        let editor = HostUiRequest::Editor {
+            id: 10,
+            request: EditorRequest {
+                title: "Note".to_owned(),
+                prefill: None,
+            },
+        };
+        let value_completion = RpcDialogCompletion::Response(RpcExtensionUiResponse::Value {
+            id: "rpc".to_owned(),
+            value: "text".to_owned(),
+        });
+        assert_eq!(
+            map_rpc_ui_response(input, value_completion.clone()),
+            HostUiResponse::Input {
+                id: 9,
+                outcome: DialogOutcome::Answered("text".to_owned())
+            }
+        );
+        assert_eq!(
+            map_rpc_ui_response(editor, value_completion),
+            HostUiResponse::Editor {
+                id: 10,
+                outcome: DialogOutcome::Answered("text".to_owned())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_dialog_timeout_resolves_timed_out() -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, mut peer) = make_rpc_extension_runner().await?;
+        let requests = runner
+            .take_ui_requests()
+            .ok_or("ui request bridge missing")?;
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<WriteMessage>();
+        let bridge = tokio::spawn(run_extension_dialog_bridge(
+            runner.clone(),
+            requests,
+            ExtensionUiProxy::new(),
+            write_tx,
+            CancellationToken::new(),
+        ));
+
+        // The extension host asks for a select dialog with a 50 ms deadline and
+        // no RPC client ever answers. The bridge must map the elapsed deadline
+        // to TimedOut and the endpoint must receive a normal (never Error)
+        // response whose value is null.
+        peer.write_frame(&Frame {
+            id: 7,
+            kind: FrameKind::Req,
+            method: Method::Select.as_str().to_owned(),
+            payload: serde_json::json!({
+                "title": "Pick",
+                "options": ["a", "b"],
+                "timeoutMs": 50
+            }),
+        })
+        .await?;
+        let frame =
+            tokio::time::timeout(std::time::Duration::from_secs(2), peer.read_frame()).await??;
+        assert_eq!(frame.kind, FrameKind::Res);
+        assert_eq!(frame.id, 7);
+        assert_eq!(frame.method, "select");
+        assert_eq!(frame.payload["value"], Value::Null);
+        bridge.abort();
+        runner.shutdown_once().await;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

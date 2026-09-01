@@ -71,7 +71,7 @@ use crate::core::agent_session_runtime::{ForkOutcome, SwitchOutcome};
 use crate::core::extension_host::ExtensionUiEvent;
 use crate::core::extension_runtime_set::ExtensionRuntimeSet;
 use crate::core::platform::external_editor::{EditOutcome, edit_text_in_external_editor};
-use pi_ext::client::{HostUiRequest, HostUiResponse};
+use pi_ext::client::{DialogEnd, DialogOutcome, HostUiRequest, HostUiResponse};
 use pi_ext::protocol::{
     KeyEventKindWire, KeyModifiersWire, NotifyLevel, SlotPlacement, ThemeCatalogEntry,
     ThemeColorValue, ThemeSet, ThemeUpdate, ThemeWire, UiControl, UiEventRequest, UiEventWire,
@@ -1919,7 +1919,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 () = wait_extension_deadline(
                     self.pending_extension_dialog.as_ref().and_then(|dialog| dialog.deadline),
                 ), if self.pending_extension_dialog.as_ref().and_then(|dialog| dialog.deadline).is_some() => {
-                    self.cancel_extension_dialog().await;
+                    self.cancel_extension_dialog(DialogEnd::TimedOut).await;
                 }
                 changed = self.partial.changed(), if !self.session_events_closed_for_rebind => {
                     if changed.is_ok() {
@@ -2122,7 +2122,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
         while self.cancel_rx.try_recv().is_ok() {
             if self.pending_extension_dialog.is_some() {
-                self.cancel_extension_dialog().await;
+                self.cancel_extension_dialog(DialogEnd::Cancelled).await;
             } else {
                 actions.push(ViewAction::SelectCancelled);
             }
@@ -2469,7 +2469,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
         self.reset_extension_ui();
         if self.pending_extension_dialog.is_some() {
-            self.cancel_extension_dialog().await;
+            self.cancel_extension_dialog(DialogEnd::Cancelled).await;
         }
         let reload_result = self.session.reload().await;
         // Re-detect after every reload attempt. Settings refresh runs before
@@ -3025,7 +3025,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     async fn replace_session(&mut self, replacement: SessionReplacement) -> ActionOutcome {
         self.quiesce_prompt_operations().await;
         if self.pending_extension_dialog.is_some() {
-            self.cancel_extension_dialog().await;
+            self.cancel_extension_dialog(DialogEnd::Cancelled).await;
         }
         match replacement {
             SessionReplacement::New => match self.session.new_session().await {
@@ -3068,7 +3068,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 HostUiRequest::Input { id, .. } => {
                     let response = HostUiResponse::Input {
                         id: *id,
-                        value: Some(text),
+                        outcome: DialogOutcome::Answered(text),
                     };
                     self.finish_extension_dialog(response).await;
                     return ActionOutcome::Repaint;
@@ -3076,7 +3076,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 HostUiRequest::Editor { id, .. } => {
                     let response = HostUiResponse::Editor {
                         id: *id,
-                        value: Some(text),
+                        outcome: DialogOutcome::Answered(text),
                     };
                     self.finish_extension_dialog(response).await;
                     return ActionOutcome::Repaint;
@@ -3306,7 +3306,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             super::state::SelectorKind::Session => {
                 self.quiesce_prompt_operations().await;
                 if self.pending_extension_dialog.is_some() {
-                    self.cancel_extension_dialog().await;
+                    self.cancel_extension_dialog(DialogEnd::Cancelled).await;
                 }
                 match self.session.switch_session(&value).await {
                     Ok(outcome) if !outcome.cancelled => {
@@ -3323,7 +3323,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             super::state::SelectorKind::Fork => {
                 self.quiesce_prompt_operations().await;
                 if self.pending_extension_dialog.is_some() {
-                    self.cancel_extension_dialog().await;
+                    self.cancel_extension_dialog(DialogEnd::Cancelled).await;
                 }
                 match self.session.fork(&value).await {
                     Ok(outcome) if !outcome.cancelled => {
@@ -3684,7 +3684,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     async fn begin_extension_dialog(&mut self, request: HostUiRequest) {
         if self.pending_extension_dialog.is_some() {
-            self.cancel_extension_dialog().await;
+            self.cancel_extension_dialog(DialogEnd::Cancelled).await;
         }
         let deadline = dialog_timeout(&request).map(|timeout| Instant::now() + timeout);
         let saved_editor_placeholder = self.view.editor.placeholder.clone();
@@ -3750,32 +3750,45 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let response = match &dialog.request {
             HostUiRequest::Select { id, .. } => HostUiResponse::Select {
                 id: *id,
-                value: Some(value),
+                outcome: DialogOutcome::Answered(value),
             },
             HostUiRequest::Confirm { id, .. } => HostUiResponse::Confirm {
                 id: *id,
-                confirmed: value == "true",
+                outcome: DialogOutcome::Answered(value == "true"),
             },
             HostUiRequest::Input { .. } | HostUiRequest::Editor { .. } => return,
         };
         self.finish_extension_dialog(response).await;
     }
 
-    async fn cancel_extension_dialog(&mut self) {
-        let Some(dialog) = self.pending_extension_dialog.as_ref() else {
+    async fn cancel_extension_dialog(&mut self, end: DialogEnd) {
+        let Some(dialog) = self.pending_extension_dialog.take() else {
             return;
         };
-        let response = default_extension_dialog_response(&dialog.request);
-        self.finish_extension_dialog(response).await;
+        // Clone keeps the dialog struct intact for editor restoration; the
+        // payload is a handful of strings on a user-driven cancel path.
+        let response = dialog.request.clone().end(end);
+        self.deliver_extension_dialog(Some(dialog), response).await;
     }
 
     async fn finish_extension_dialog(&mut self, response: HostUiResponse) {
         let dialog = self.pending_extension_dialog.take();
+        self.deliver_extension_dialog(dialog, response).await;
+    }
+
+    async fn deliver_extension_dialog(
+        &mut self,
+        dialog: Option<PendingExtensionDialog>,
+        response: HostUiResponse,
+    ) {
+        #[cfg(test)]
+        capture_dialog_response(&response);
         if let Some(runner) = &self.extension_runner
             && let Err(error) = runner.respond_ui(response).await
         {
             self.last_error = Some(error.to_string());
         }
+
         if let Some(dialog) = dialog {
             if let Some(saved) = dialog.saved_editor_text {
                 self.editor.set_text(&saved);
@@ -4349,7 +4362,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     async fn rebind_extension_channels(&mut self) {
         if self.pending_extension_dialog.is_some() {
-            self.cancel_extension_dialog().await;
+            self.cancel_extension_dialog(DialogEnd::Cancelled).await;
         }
         self.extension_runner = self.session.host_extension_runner();
         let (registry_changes, shortcuts) =
@@ -7114,6 +7127,31 @@ async fn wait_extension_deadline(deadline: Option<Instant>) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Typed dialog responses captured just before the extension runner
+    /// boundary. The wire collapses every non-`Answered` outcome to default
+    /// response bytes, so this seam is where Closed/Cancelled/TimedOut stay
+    /// distinguishable.
+    static DIALOG_RESPONSE_CAPTURE: std::cell::RefCell<Vec<HostUiResponse>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn capture_dialog_response(response: &HostUiResponse) {
+    DIALOG_RESPONSE_CAPTURE.with(|log| log.borrow_mut().push(response.clone()));
+}
+
+#[cfg(test)]
+fn reset_dialog_response_capture() {
+    DIALOG_RESPONSE_CAPTURE.with(|log| log.borrow_mut().clear());
+}
+
+#[cfg(test)]
+fn dialog_response_capture() -> Vec<HostUiResponse> {
+    DIALOG_RESPONSE_CAPTURE.with(|log| log.borrow().clone())
+}
+
 fn dialog_timeout(request: &HostUiRequest) -> Option<Duration> {
     let timeout_ms = match request {
         HostUiRequest::Select { request, .. } => request.options_meta.timeout_ms,
@@ -7243,27 +7281,6 @@ fn ui_event_wire(event: &UiEvent) -> UiEventWire {
         UiEvent::Resize { width, height } => UiEventWire::Resize {
             width: *width,
             height: *height,
-        },
-    }
-}
-
-fn default_extension_dialog_response(request: &HostUiRequest) -> HostUiResponse {
-    match request {
-        HostUiRequest::Select { id, .. } => HostUiResponse::Select {
-            id: *id,
-            value: None,
-        },
-        HostUiRequest::Confirm { id, .. } => HostUiResponse::Confirm {
-            id: *id,
-            confirmed: false,
-        },
-        HostUiRequest::Input { id, .. } => HostUiResponse::Input {
-            id: *id,
-            value: None,
-        },
-        HostUiRequest::Editor { id, .. } => HostUiResponse::Editor {
-            id: *id,
-            value: None,
         },
     }
 }
@@ -10043,6 +10060,62 @@ mod tests {
             .collect::<String>();
         assert!(visible.contains("Verification confirm prompt"));
         assert!(visible.contains("Choose Yes"));
+    }
+
+    /// The wire collapses every non-`Answered` outcome to identical default
+    /// bytes, so the typed distinction between a fired deadline
+    /// (`TimedOut`, run-loop arm at the `wait_extension_deadline` select
+    /// branch) and a user/system cancel (`Cancelled`, cancel_rx and teardown
+    /// paths) must survive to the capture seam. Both paths share one helper;
+    /// this pins that the dialog end they pass is the only difference.
+    #[tokio::test]
+    async fn extension_dialog_deadline_and_cancel_stay_distinct() -> TestResult {
+        let input_request = || HostUiRequest::Input {
+            id: 31,
+            request: pi_ext::protocol::InputRequest {
+                title: "Deadline probe".to_owned(),
+                placeholder: None,
+                options_meta: pi_ext::protocol::DialogOptions {
+                    timeout_ms: Some(25),
+                },
+            },
+        };
+
+        let (mut rt, _log) = make_runtime();
+        rt.begin_extension_dialog(input_request()).await;
+        assert!(
+            rt.pending_extension_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.deadline)
+                .is_some(),
+            "a request with timeoutMs must arm a deadline"
+        );
+        reset_dialog_response_capture();
+        rt.cancel_extension_dialog(DialogEnd::TimedOut).await;
+        let timed_out = dialog_response_capture();
+        assert_eq!(
+            timed_out,
+            vec![HostUiResponse::Input {
+                id: 31,
+                outcome: DialogOutcome::TimedOut,
+            }],
+            "deadline expiry must report TimedOut, not a default-valued answer"
+        );
+        assert!(rt.pending_extension_dialog.is_none());
+
+        rt.begin_extension_dialog(input_request()).await;
+        reset_dialog_response_capture();
+        rt.cancel_extension_dialog(DialogEnd::Cancelled).await;
+        let cancelled = dialog_response_capture();
+        assert_eq!(
+            cancelled,
+            vec![HostUiResponse::Input {
+                id: 31,
+                outcome: DialogOutcome::Cancelled,
+            }],
+            "user/system cancellation must report Cancelled, distinct from TimedOut"
+        );
+        Ok(())
     }
 
     #[tokio::test]

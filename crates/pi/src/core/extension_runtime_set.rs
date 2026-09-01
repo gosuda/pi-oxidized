@@ -12,7 +12,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use pi_agent::{AfterToolCallResult, AgentMessage, AgentTool, BeforeToolCallResult};
 use pi_ai::{AssistantMessageEvent, ToolResultContent};
 use pi_ext::adapters::{ExtensionProvider, Registry, RendererKind, ShortcutRegistration};
-use pi_ext::client::{HostClient, HostClientError, HostUiRequest, HostUiResponse};
+use pi_ext::client::{DialogEnd, HostClient, HostClientError, HostUiRequest, HostUiResponse};
 use pi_ext::host::{self, HostSource, HostSpec};
 use pi_ext::protocol::{
     self, ExtensionErrorEvent, FlagValueWire, FrameId, ProviderEvent, SessionSetupEntriesResponse,
@@ -33,7 +33,7 @@ use super::agent_session_runtime::{CreateAgentSessionRuntimeResult, spawn_runtim
 use super::agent_session_services::ExtensionFlagType;
 use super::extension_host::{
     EVENT_CHANNEL_CAPACITY, ExtensionUiEvent, HOOK_TIMEOUT, HostExtensionRunner, HostStartError,
-    SessionBridgeEvent, ToolRenderPhase, default_ui_response,
+    SessionBridgeEvent, ToolRenderPhase,
 };
 use super::extension_manifest::{ClassifiedExtension, ExtensionRuntime, classify};
 use super::model_runtime::{ModelRuntime, ModelRuntimeError};
@@ -1746,14 +1746,10 @@ impl ExtensionRuntimeSet {
     ///
     /// Returns an error when the response route is stale or missing, or its host rejects it.
     pub async fn respond_ui(&self, response: HostUiResponse) -> Result<(), HostClientError> {
-        let Some((_lease, endpoint, local)) = self.state().claim_route(ui_response_id(&response))
-        else {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(response.id()) else {
             return Err(HostClientError::NotRunning);
         };
-        endpoint
-            .runner
-            .respond_ui(map_ui_response_id(response, local))
-            .await
+        endpoint.runner.respond_ui(response.with_id(local)).await
     }
 
     /// Whether this facade has at least one active endpoint.
@@ -3261,27 +3257,47 @@ fn spawn_ui_relays(
         let runner = Arc::clone(&context.endpoint.runner);
         handles.push(tokio::spawn(async move {
             while let Some(request) = requests.recv().await {
-                let fallback = request.clone();
+                let local_id = request.id();
                 let Some(state) = request_state.upgrade() else {
-                    break;
+                    // Unclaimed state self-answers Closed; keep draining the source.
+                    let _ = runner.respond_ui(request.end(DialogEnd::Closed)).await;
+                    continue;
                 };
-                let send_failed = {
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let routed_id = {
                     state
-                        .allocate_route(endpoint, request.id())
-                        .map(|routed_id| {
-                            let routed = map_ui_request_id(request, routed_id);
-                            let failed = request_channels.ui_requests_tx.try_send(routed).is_err();
-                            if failed {
-                                state.release_route(routed_id);
-                            }
-                            failed
-                        })
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .allocate_route(endpoint, local_id)
                 };
-                if send_failed.unwrap_or(true) {
-                    let _ = runner.respond_ui(default_ui_response(&fallback)).await;
+                let Some(routed_id) = routed_id else {
+                    // Endpoint no longer accepts relays: self-answer Closed.
+                    let _ = runner.respond_ui(request.end(DialogEnd::Closed)).await;
+                    continue;
+                };
+                match request_channels
+                    .ui_requests_tx
+                    .try_send(request.with_id(routed_id))
+                {
+                    Ok(()) => {}
+                    // A bounded facade queue is Full, not failed delivery: self-answer Full.
+                    Err(mpsc::error::TrySendError::Full(error)) => {
+                        state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .release_route(routed_id);
+                        let _ = runner
+                            .respond_ui(error.with_id(local_id).end(DialogEnd::Full))
+                            .await;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(error)) => {
+                        state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .release_route(routed_id);
+                        let _ = runner
+                            .respond_ui(error.with_id(local_id).end(DialogEnd::Closed))
+                            .await;
+                    }
                 }
             }
         }));
@@ -3703,33 +3719,6 @@ fn encode_flags(
         .collect()
 }
 
-fn map_ui_request_id(request: HostUiRequest, id: FrameId) -> HostUiRequest {
-    match request {
-        HostUiRequest::Select { request, .. } => HostUiRequest::Select { id, request },
-        HostUiRequest::Confirm { request, .. } => HostUiRequest::Confirm { id, request },
-        HostUiRequest::Input { request, .. } => HostUiRequest::Input { id, request },
-        HostUiRequest::Editor { request, .. } => HostUiRequest::Editor { id, request },
-    }
-}
-
-fn ui_response_id(response: &HostUiResponse) -> FrameId {
-    match response {
-        HostUiResponse::Select { id, .. }
-        | HostUiResponse::Confirm { id, .. }
-        | HostUiResponse::Input { id, .. }
-        | HostUiResponse::Editor { id, .. } => *id,
-    }
-}
-
-fn map_ui_response_id(response: HostUiResponse, id: FrameId) -> HostUiResponse {
-    match response {
-        HostUiResponse::Select { value, .. } => HostUiResponse::Select { id, value },
-        HostUiResponse::Confirm { confirmed, .. } => HostUiResponse::Confirm { id, confirmed },
-        HostUiResponse::Input { value, .. } => HostUiResponse::Input { id, value },
-        HostUiResponse::Editor { value, .. } => HostUiResponse::Editor { id, value },
-    }
-}
-
 async fn answer_unclaimed_session(runner: &HostExtensionRunner, event: SessionBridgeEvent) {
     match event {
         SessionBridgeEvent::SetModel { id, .. } => {
@@ -3901,6 +3890,7 @@ pub(crate) mod tests {
     use std::io::{BufRead, Write};
     use std::sync::atomic::AtomicUsize;
 
+    use pi_ext::client::DialogOutcome;
     use pi_ext::protocol::{Frame, FrameKind, HelloAck, SessionCommand, SessionCommandEnvelope};
     use pi_ext::sanitize::{SanitizedRun, SanitizedSlot};
     use serde_json::json;
@@ -5775,12 +5765,12 @@ pub(crate) mod tests {
         assert_ne!(first_request.id(), second_request.id());
         set.respond_ui(HostUiResponse::Select {
             id: first_request.id(),
-            value: Some("ack".to_owned()),
+            outcome: DialogOutcome::Answered("ack".to_owned()),
         })
         .await?;
         set.respond_ui(HostUiResponse::Select {
             id: second_request.id(),
-            value: Some("ack".to_owned()),
+            outcome: DialogOutcome::Answered("ack".to_owned()),
         })
         .await?;
         first_host.wait_for_response("select", 3).await?;
@@ -6313,8 +6303,11 @@ pub(crate) mod tests {
         assert!(session.try_recv().is_err());
         assert!(tools.try_recv().is_err());
         assert!(matches!(
-            set.respond_ui(HostUiResponse::Select { id: 1, value: None })
-                .await,
+            set.respond_ui(HostUiResponse::Select {
+                id: 1,
+                outcome: DialogOutcome::Closed,
+            })
+            .await,
             Err(HostClientError::NotRunning)
         ));
 
@@ -6367,7 +6360,7 @@ pub(crate) mod tests {
         assert!(matches!(
             set.respond_ui(HostUiResponse::Select {
                 id: old_route,
-                value: None
+                outcome: DialogOutcome::Closed,
             })
             .await,
             Err(HostClientError::NotRunning)
@@ -6724,6 +6717,115 @@ pub(crate) mod tests {
             published.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+        for handle in handles {
+            handle.abort();
+        }
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    fn select_request(id: FrameId) -> HostUiRequest {
+        HostUiRequest::Select {
+            id,
+            request: protocol::SelectRequest {
+                title: "Pick".to_owned(),
+                options: vec!["a".to_owned()],
+                options_meta: protocol::DialogOptions::default(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_relay_answers_closed_and_keeps_draining_when_state_is_gone() -> TestResult {
+        let (runner, host) = make_runner(snapshot(&[])).await?;
+        let (generation, _pending) = generation_from_endpoints(
+            1,
+            vec![(
+                EndpointKind::TsCompat,
+                "<weak>".to_owned(),
+                Arc::clone(&runner),
+            )],
+        );
+        let endpoint = generation.endpoints[0].clone();
+        let dead_state = Arc::new(StdMutex::new(PublishedRuntimeState::new(Arc::new(
+            generation,
+        ))));
+        let context = EndpointRelayContext {
+            state: Arc::downgrade(&dead_state),
+            channels: Arc::new(FacadeChannels::new()),
+            endpoint,
+            replacement_ready_drop: Arc::downgrade(&Arc::new(StdMutex::new(
+                PendingReadyState::None,
+            ))),
+        };
+        drop(dead_state);
+        let (_ui_tx, ui_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (requests_tx, requests_rx) = mpsc::channel(4);
+        let handles = spawn_ui_relays(&context, ui_rx, Some(requests_rx));
+
+        requests_tx.send(select_request(9)).await?;
+        host.wait_for_response("select", 9).await?;
+        // The relay must survive the failed upgrade and answer later requests too.
+        requests_tx.send(select_request(10)).await?;
+        host.wait_for_response("select", 10).await?;
+
+        for handle in handles {
+            handle.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ui_relay_releases_route_and_answers_full_when_facade_queue_is_full() -> TestResult {
+        let (runner, host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+        let endpoint = set.state().generation.endpoints[0].clone();
+        let context = EndpointRelayContext {
+            state: Arc::downgrade(&set.state),
+            channels: Arc::clone(&set.channels),
+            endpoint,
+            replacement_ready_drop: set.pending_ready_weak(),
+        };
+        let (_ui_tx, ui_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (requests_tx, requests_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY + 1);
+        let handles = spawn_ui_relays(&context, ui_rx, Some(requests_rx));
+
+        for id in 1..=EVENT_CHANNEL_CAPACITY {
+            requests_tx.send(select_request(id as FrameId)).await?;
+        }
+        let overflow_id = EVENT_CHANNEL_CAPACITY as FrameId + 1;
+        requests_tx.send(select_request(overflow_id)).await?;
+        host.wait_for_response("select", overflow_id).await?;
+        // Only the failed delivery releases its route; accepted ones stay claimed.
+        assert_eq!(set.state().routes.len(), EVENT_CHANNEL_CAPACITY);
+
+        for handle in handles {
+            handle.abort();
+        }
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ui_relay_releases_route_and_answers_closed_when_facade_queue_closes() -> TestResult {
+        let (runner, host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+        let endpoint = set.state().generation.endpoints[0].clone();
+        let context = EndpointRelayContext {
+            state: Arc::downgrade(&set.state),
+            channels: Arc::clone(&set.channels),
+            endpoint,
+            replacement_ready_drop: set.pending_ready_weak(),
+        };
+        drop(set.take_ui_requests().ok_or("ui bridge missing")?);
+        let (_ui_tx, ui_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (requests_tx, requests_rx) = mpsc::channel(4);
+        let handles = spawn_ui_relays(&context, ui_rx, Some(requests_rx));
+
+        requests_tx.send(select_request(7)).await?;
+        host.wait_for_response("select", 7).await?;
+        assert!(set.state().routes.is_empty());
+
         for handle in handles {
             handle.abort();
         }

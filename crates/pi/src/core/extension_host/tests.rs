@@ -2393,6 +2393,63 @@ async fn session_command_and_set_model_route_through_claimed_bridge() -> R {
 }
 
 #[tokio::test]
+async fn inbound_ui_select_request_flows_through_take_ui_requests() -> R {
+    use pi_ext::client::{DialogOutcome, HostUiRequest, HostUiResponse};
+
+    let (runner, host) = make_runner(json!({})).await?;
+    let mut dialogs = runner
+        .take_ui_requests()
+        .ok_or("first claim must yield the dialog receiver")?;
+    assert!(
+        runner.take_ui_requests().is_none(),
+        "second claim must be rejected"
+    );
+
+    host.emit(Frame {
+        id: 41,
+        kind: FrameKind::Req,
+        method: "select".to_owned(),
+        payload: json!({"title": "Pick one", "options": ["opt-a", "opt-b"]}),
+    })
+    .await;
+    let request = tokio::time::timeout(Duration::from_millis(500), dialogs.recv())
+        .await?
+        .ok_or("dialog receiver closed")?;
+    assert_eq!(request.id(), 41);
+    let HostUiRequest::Select {
+        request: select, ..
+    } = &request
+    else {
+        return Err(format!("expected Select dialog, got {request:?}").into());
+    };
+    assert_eq!(select.title, "Pick one");
+
+    runner
+        .respond_ui(HostUiResponse::Select {
+            id: request.id(),
+            outcome: DialogOutcome::Answered("opt-b".to_owned()),
+        })
+        .await?;
+    host.wait_for_request("select").await?;
+    let response = host
+        .requests
+        .lock()
+        .ok()
+        .and_then(|requests| {
+            requests
+                .iter()
+                .find(|frame| frame.method == "select" && frame.kind == FrameKind::Res)
+                .cloned()
+        })
+        .ok_or("select response missing")?;
+    assert_eq!(response.id, 41);
+    assert_eq!(response.payload["value"], "opt-b");
+
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn scoped_command_precedes_replacement_ready_on_claimed_bridge() -> R {
     use crate::core::extension_host::SessionBridgeEvent;
     let (runner, host) = make_runner(json!({})).await?;

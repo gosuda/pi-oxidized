@@ -60,6 +60,12 @@ pub const EVENT_CAPACITY: usize = 256;
 /// silently dropped; when this capacity is exceeded the host receives an
 /// explicit error response instead of a timeout.
 pub const CORRELATED_REQUEST_CAPACITY: usize = 64;
+/// Default bounded capacity for the ordered session-control channel. Control
+/// frames (session.command, replacement ready/abort) can burst around
+/// replacement finalization, so this bound is wider than the correlated
+/// request capacity; saturation still fails the transport rather than
+/// dropping or reordering.
+pub const SESSION_CONTROL_CAPACITY: usize = 1024;
 /// Capacity of each per-stream provider event channel (bounded, lossless
 /// until saturated; saturation fails with an error, never silently drops).
 pub const STREAM_EVENT_CAPACITY: usize = 64;
@@ -76,6 +82,14 @@ pub const CANCEL_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 /// real-time delay or the `tokio/test-util` `start_paused` feature.
 #[cfg(test)]
 pub const CANCEL_QUEUE_TIMEOUT: Duration = Duration::from_millis(50);
+
+// Test-only log of dialogs the client self-answered; see
+// `record_self_answered`.
+#[cfg(test)]
+thread_local! {
+    static SELF_ANSWERED: std::cell::RefCell<Vec<(FrameId, DialogEnd)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// Result type for host client operations.
 pub type HostResult<T> = Result<T, HostClientError>;
@@ -109,6 +123,48 @@ enum CancellationStart {
     Closed,
     NotRunning,
     AlreadyCancelling,
+}
+
+/// Outcome of a host-initiated dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialogOutcome<T> {
+    /// The dialog completed with a user-supplied answer.
+    Answered(T),
+    /// The dialog ended because the bounded request channel was saturated.
+    Full,
+    /// The dialog closed without a value (unclaimed queue or closed channel).
+    Closed,
+    /// The dialog was cancelled (user dismissal or supersession).
+    Cancelled,
+    /// The dialog missed its deadline.
+    TimedOut,
+}
+
+/// Terminal state of a dialog, one-to-one with [`DialogOutcome`].
+///
+/// `Full` and `Closed` report bounded request-channel delivery failure before
+/// consumer acceptance; `Cancelled` and `TimedOut` report post-acceptance ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogEnd {
+    /// Bounded request channel was saturated; the request never reached a consumer.
+    Full,
+    /// Request channel was closed or unclaimed; the request never reached a consumer.
+    Closed,
+    /// User dismissed the dialog, or the system tore it down (reload, rebind, supersession).
+    Cancelled,
+    /// The dialog's configured deadline elapsed.
+    TimedOut,
+}
+
+impl<T> From<DialogEnd> for DialogOutcome<T> {
+    fn from(end: DialogEnd) -> Self {
+        match end {
+            DialogEnd::Full => Self::Full,
+            DialogEnd::Closed => Self::Closed,
+            DialogEnd::Cancelled => Self::Cancelled,
+            DialogEnd::TimedOut => Self::TimedOut,
+        }
+    }
 }
 
 /// A typed, correlated UI request initiated by the TypeScript host.
@@ -155,77 +211,197 @@ impl HostUiRequest {
             | Self::Editor { id, .. } => *id,
         }
     }
+
+    /// Replace the host correlation id.
+    #[must_use]
+    pub fn with_id(mut self, new_id: FrameId) -> Self {
+        match &mut self {
+            Self::Select { id, .. }
+            | Self::Confirm { id, .. }
+            | Self::Input { id, .. }
+            | Self::Editor { id, .. } => *id = new_id,
+        }
+        self
+    }
+
+    /// Build the correctly typed response for a dialog ending in `end`.
+    #[must_use]
+    pub fn end(self, end: DialogEnd) -> HostUiResponse {
+        let id = self.id();
+        match self {
+            Self::Select { .. } => HostUiResponse::Select {
+                id,
+                outcome: end.into(),
+            },
+            Self::Confirm { .. } => HostUiResponse::Confirm {
+                id,
+                outcome: end.into(),
+            },
+            Self::Input { .. } => HostUiResponse::Input {
+                id,
+                outcome: end.into(),
+            },
+            Self::Editor { .. } => HostUiResponse::Editor {
+                id,
+                outcome: end.into(),
+            },
+        }
+    }
 }
 
 /// Typed response to a host-initiated UI request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostUiResponse {
-    /// Selected value, or dismissal.
+    /// Selected value or terminal outcome.
     Select {
         /// Original host correlation id.
         id: FrameId,
-        /// Selected value, or `None` when dismissed.
-        value: Option<String>,
+        /// Selected value, or a terminal outcome.
+        outcome: DialogOutcome<String>,
     },
-    /// Confirmation result.
+    /// Confirmation result or terminal outcome.
     Confirm {
         /// Original host correlation id.
         id: FrameId,
-        /// Whether the user confirmed.
-        confirmed: bool,
+        /// Confirmation value, or a terminal outcome.
+        outcome: DialogOutcome<bool>,
     },
-    /// Entered value, or dismissal.
+    /// Entered value or terminal outcome.
     Input {
         /// Original host correlation id.
         id: FrameId,
-        /// Entered value, or `None` when dismissed.
-        value: Option<String>,
+        /// Entered value, or a terminal outcome.
+        outcome: DialogOutcome<String>,
     },
-    /// Edited value, or dismissal.
+    /// Edited value or terminal outcome.
     Editor {
         /// Original host correlation id.
         id: FrameId,
-        /// Edited value, or `None` when dismissed.
-        value: Option<String>,
+        /// Edited value, or a terminal outcome.
+        outcome: DialogOutcome<String>,
     },
+}
+
+impl HostUiResponse {
+    /// Original host correlation id.
+    #[must_use]
+    pub const fn id(&self) -> FrameId {
+        match self {
+            Self::Select { id, .. }
+            | Self::Confirm { id, .. }
+            | Self::Input { id, .. }
+            | Self::Editor { id, .. } => *id,
+        }
+    }
+
+    /// Replace the host correlation id.
+    #[must_use]
+    pub fn with_id(mut self, new_id: FrameId) -> Self {
+        match &mut self {
+            Self::Select { id, .. }
+            | Self::Confirm { id, .. }
+            | Self::Input { id, .. }
+            | Self::Editor { id, .. } => *id = new_id,
+        }
+        self
+    }
+}
+
+/// Correlated `session.*` request from the host, awaiting its typed response.
+#[derive(Debug, Clone)]
+pub enum HostSessionRequest {
+    /// Correlated `session.setModel` request.
+    SetModel {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Requested model payload.
+        request: crate::protocol::SessionSetModelRequest,
+    },
+    /// Correlated `session.compact` request.
+    Compact {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Compact request payload.
+        request: crate::protocol::SessionCompactRequest,
+    },
+    /// Correlated `session.newSession` request.
+    NewSession {
+        /// Original host correlation id.
+        id: FrameId,
+        /// New-session request payload.
+        request: crate::protocol::SessionNewSessionRequest,
+    },
+    /// Correlated `session.fork` request.
+    Fork {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Fork request payload.
+        request: crate::protocol::SessionForkRequest,
+    },
+    /// Correlated `session.navigateTree` request.
+    NavigateTree {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Navigate-tree request payload.
+        request: crate::protocol::SessionNavigateTreeRequest,
+    },
+    /// Correlated `session.switchSession` request.
+    SwitchSession {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Switch-session request payload.
+        request: crate::protocol::SessionSwitchSessionRequest,
+    },
+    /// Correlated `session.reload` request (empty payload).
+    Reload {
+        /// Original host correlation id.
+        id: FrameId,
+    },
+    /// Correlated `session.setupEntries` request.
+    SetupEntries {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Setup-entries request payload.
+        request: crate::protocol::SessionSetupEntriesRequest,
+    },
+}
+
+impl HostSessionRequest {
+    /// Original host correlation id.
+    #[must_use]
+    pub const fn id(&self) -> FrameId {
+        match self {
+            Self::SetModel { id, .. }
+            | Self::Compact { id, .. }
+            | Self::NewSession { id, .. }
+            | Self::Fork { id, .. }
+            | Self::NavigateTree { id, .. }
+            | Self::SwitchSession { id, .. }
+            | Self::Reload { id }
+            | Self::SetupEntries { id, .. } => *id,
+        }
+    }
 }
 
 /// Cross-task shared state.
 struct Shared {
     /// id → pending call. `std::sync::Mutex` because critical sections never await.
     pending: StdMutex<HashMap<FrameId, PendingEntry>>,
-    /// Runtime that owns background cancellation sends, including drops made
-    /// from threads that are not currently entered into Tokio.
+    /// Runtime that owns background cancellation sends.
     runtime: tokio::runtime::Handle,
-    /// Optional direct sink that preserves session-control frame order.
-    session_control_handler: StdMutex<Option<HostSessionControlHandler>>,
-    /// slot key → latest accepted generation. Stale pushes are discarded.
     slot_generations: StdMutex<HashMap<String, u64>>,
-    /// Unsolicited event fan-out (lossy broadcast).
-    events: broadcast::Sender<HostEvent>,
-    /// Latest complete provider snapshot, delivered losslessly with watch semantics.
+    notifications: broadcast::Sender<HostNotification>,
     providers_update: watch::Sender<crate::protocol::ProvidersUpdate>,
-    /// Outbound frame sender mirror, so `dispatch` can send explicit error
-    /// responses for correlated requests that cannot be delivered losslessly.
     outbound: StdMutex<Option<mpsc::Sender<Frame>>>,
-    /// Bounded lossless channel for correlated host requests (setModel,
-    /// compact, newSession, fork, navigateTree, switchSession, reload,
-    /// setupEntries). Unlike the lossy `events` broadcast, every accepted
-    /// request must reach exactly one consumer or receive an explicit error
-    /// response when delivery is unavailable/full/closed.
-    correlated_requests: mpsc::Sender<HostEvent>,
-    /// Monotonic request id allocator.
+    ui_requests: mpsc::Sender<HostUiRequest>,
+    ui_requests_claimed: AtomicBool,
+    session_requests: mpsc::Sender<HostSessionRequest>,
+    session_requests_claimed: AtomicBool,
+    session_control: mpsc::Sender<HostSessionControlEvent>,
     next_id: AtomicU64,
-    /// Monotonic generation stamped onto each `PendingEntry` so a delayed
-    /// background cancel cleanup cannot remove a newer same-id entry.
     next_pending_generation: AtomicU64,
-    /// Retained stderr tail (most recent `STDERR_TAIL_BYTES` bytes).
     stderr: StdMutex<String>,
-    /// Cleared once the reader or writer observes end-of-stream.
     running: AtomicBool,
-    /// Test-only: signaled once a background cancel cleanup completes so
-    /// regression tests await the real cleanup rather than guessing with
-    /// yield loops.
     #[cfg(test)]
     cancel_cleanup_done: Notify,
 }
@@ -247,14 +423,9 @@ pub enum HostSessionControlEvent {
     },
 }
 
-/// Synchronous sink for ordered session-control events.
-pub type HostSessionControlHandler = Arc<dyn Fn(HostSessionControlEvent) + Send + Sync>;
-
-/// Typed unsolicited event delivered to subscribers.
+/// Typed unsolicited notification delivered to subscribers.
 #[derive(Debug, Clone)]
-pub enum HostEvent {
-    /// Host requested a correlated native UI interaction.
-    UiRequest(HostUiRequest),
+pub enum HostNotification {
     /// Fire-and-forget host notification.
     Notify(NotifyRequest),
     /// Host pushed a UI slot (generation-filtered).
@@ -269,72 +440,6 @@ pub enum HostEvent {
     ExtensionError(crate::protocol::ExtensionErrorEvent),
     /// Extension `setTheme` application request.
     ThemeSet(crate::protocol::ThemeSet),
-    /// Extension fire-and-forget session action (`pi.setSessionName`, …).
-    SessionCommand(crate::protocol::SessionCommandEnvelope),
-    /// Correlated `pi.setModel` request awaiting [`HostClient::respond_set_model`].
-    SetModelRequest {
-        /// Original host correlation id.
-        id: FrameId,
-        /// Requested model payload.
-        request: crate::protocol::SessionSetModelRequest,
-    },
-    /// Correlated `ctx.compact` request awaiting [`HostClient::respond_compact`].
-    CompactRequest {
-        /// Original host correlation id.
-        id: FrameId,
-        /// Compact request payload.
-        request: crate::protocol::SessionCompactRequest,
-    },
-    /// Correlated `ctx.newSession` request awaiting [`HostClient::respond_new_session`].
-    NewSessionRequest {
-        /// Original host correlation id.
-        id: FrameId,
-        /// New-session request payload.
-        request: crate::protocol::SessionNewSessionRequest,
-    },
-    /// Correlated `ctx.fork` request awaiting [`HostClient::respond_fork`].
-    ForkRequest {
-        /// Original host correlation id.
-        id: FrameId,
-        /// Fork request payload.
-        request: crate::protocol::SessionForkRequest,
-    },
-    /// Correlated `ctx.navigateTree` request awaiting [`HostClient::respond_navigate_tree`].
-    NavigateTreeRequest {
-        /// Original host correlation id.
-        id: FrameId,
-        /// Navigate-tree request payload.
-        request: crate::protocol::SessionNavigateTreeRequest,
-    },
-    /// Correlated `ctx.switchSession` request awaiting [`HostClient::respond_switch_session`].
-    SwitchSessionRequest {
-        /// Original host correlation id.
-        id: FrameId,
-        /// Switch-session request payload.
-        request: crate::protocol::SessionSwitchSessionRequest,
-    },
-    /// Correlated `ctx.reload` request awaiting [`HostClient::respond_reload`].
-    ReloadRequest {
-        /// Original host correlation id.
-        id: FrameId,
-    },
-    /// Correlated `session.setupEntries` request awaiting [`HostClient::respond_setup_entries`].
-    SetupEntriesRequest {
-        /// Original host correlation id.
-        id: FrameId,
-        /// Setup-entries request payload.
-        request: crate::protocol::SessionSetupEntriesRequest,
-    },
-    /// Host finished a ready-gated replacement (`session.replacementReady`).
-    ReplacementReady {
-        /// Token previously returned on a replacement response.
-        token: String,
-    },
-    /// Host abandoned a ready-gated replacement (`session.replacementAbort`).
-    ReplacementAbort {
-        /// Token previously returned on a replacement response.
-        token: String,
-    },
     /// Extension fire-and-forget UI control (`ui.setStatus`, …).
     UiControl(crate::protocol::UiControl),
     /// Untyped / unrecognized frame.
@@ -419,10 +524,9 @@ pub struct HostClient {
     shared: Arc<Shared>,
     child: Mutex<Option<Child>>,
     reader_handle: Mutex<Option<JoinHandle<()>>>,
-    /// Sole lossless receiver for correlated host requests, taken once by the
-    /// event pump. Stored outside `Shared` so only the owning client can claim it.
-    correlated_requests_rx: StdMutex<Option<mpsc::Receiver<HostEvent>>>,
-    /// Sole receiver for lossless latest-state provider snapshots.
+    ui_requests_rx: StdMutex<Option<mpsc::Receiver<HostUiRequest>>>,
+    session_requests_rx: StdMutex<Option<mpsc::Receiver<HostSessionRequest>>>,
+    session_control_rx: StdMutex<Option<mpsc::Receiver<HostSessionControlEvent>>>,
     providers_update_rx: StdMutex<Option<watch::Receiver<crate::protocol::ProvidersUpdate>>>,
 }
 
@@ -472,21 +576,25 @@ impl HostClient {
         stderr: Box<dyn AsyncRead + Unpin + Send>,
         child: Option<Child>,
     ) -> Self {
-        let (events_tx, _) = broadcast::channel(EVENT_CAPACITY);
+        let (notifications_tx, _) = broadcast::channel(EVENT_CAPACITY);
         let (providers_update_tx, providers_update_rx) =
             watch::channel(crate::protocol::ProvidersUpdate::default());
         let (cmd_tx, cmd_rx) = mpsc::channel::<Frame>(OUTBOUND_CAPACITY);
-        let (correlated_tx, correlated_rx) =
-            mpsc::channel::<HostEvent>(CORRELATED_REQUEST_CAPACITY);
+        let (ui_requests_tx, ui_requests_rx) = mpsc::channel(CORRELATED_REQUEST_CAPACITY);
+        let (session_requests_tx, session_requests_rx) = mpsc::channel(CORRELATED_REQUEST_CAPACITY);
+        let (session_control_tx, session_control_rx) = mpsc::channel(SESSION_CONTROL_CAPACITY);
         let shared = Arc::new(Shared {
             pending: StdMutex::new(HashMap::new()),
             runtime: tokio::runtime::Handle::current(),
-            session_control_handler: StdMutex::new(None),
             slot_generations: StdMutex::new(HashMap::new()),
-            events: events_tx,
+            notifications: notifications_tx,
             providers_update: providers_update_tx,
             outbound: StdMutex::new(Some(cmd_tx.clone())),
-            correlated_requests: correlated_tx,
+            ui_requests: ui_requests_tx,
+            ui_requests_claimed: AtomicBool::new(false),
+            session_requests: session_requests_tx,
+            session_requests_claimed: AtomicBool::new(false),
+            session_control: session_control_tx,
             next_id: AtomicU64::new(1),
             next_pending_generation: AtomicU64::new(1),
             stderr: StdMutex::new(String::new()),
@@ -513,7 +621,9 @@ impl HostClient {
             shared,
             child: Mutex::new(child),
             reader_handle: Mutex::new(Some(reader_handle)),
-            correlated_requests_rx: StdMutex::new(Some(correlated_rx)),
+            ui_requests_rx: StdMutex::new(Some(ui_requests_rx)),
+            session_requests_rx: StdMutex::new(Some(session_requests_rx)),
+            session_control_rx: StdMutex::new(Some(session_control_rx)),
             providers_update_rx: StdMutex::new(Some(providers_update_rx)),
         }
     }
@@ -539,20 +649,63 @@ impl HostClient {
         stderr_of(&self.shared)
     }
 
-    /// Subscribe to the unsolicited event stream.
+    /// Subscribe to lossy unsolicited notifications.
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<HostEvent> {
-        self.shared.events.subscribe()
+    pub fn subscribe_notifications(&self) -> broadcast::Receiver<HostNotification> {
+        self.shared.notifications.subscribe()
     }
 
-    /// Claim the sole lossless receiver for correlated host requests.
+    /// Claim the sole lossless receiver for typed host-initiated UI dialogs.
     ///
-    /// The event pump calls this exactly once. Subsequent callers receive
-    /// `None`. While unclaimed, correlated requests receive an explicit error
-    /// response (the host observes a failure instead of a timeout).
+    /// Claim-once: later callers receive `None`. While unclaimed or closed,
+    /// valid UI requests self-answer with [`DialogOutcome::Closed`]; a
+    /// saturated queue self-answers with [`DialogOutcome::Full`] — always a
+    /// normal response, never a timeout or Error frame.
     #[must_use]
-    pub fn take_correlated_requests(&self) -> Option<mpsc::Receiver<HostEvent>> {
-        self.correlated_requests_rx
+    pub fn take_ui_requests(&self) -> Option<mpsc::Receiver<HostUiRequest>> {
+        let receiver = self
+            .ui_requests_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if receiver.is_some() {
+            self.shared
+                .ui_requests_claimed
+                .store(true, Ordering::Release);
+        }
+        receiver
+    }
+
+    /// Claim the sole lossless receiver for typed host-initiated session requests.
+    ///
+    /// Claim-once: later callers receive `None`. While unclaimed, full, or
+    /// closed, valid session requests are answered non-blockingly with an
+    /// explicit `FrameKind::Error` response so the host observes a failure
+    /// instead of a timeout.
+    #[must_use]
+    pub fn take_session_requests(&self) -> Option<mpsc::Receiver<HostSessionRequest>> {
+        let receiver = self
+            .session_requests_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if receiver.is_some() {
+            self.shared
+                .session_requests_claimed
+                .store(true, Ordering::Release);
+        }
+        receiver
+    }
+
+    /// Claim the sole lossless receiver for ordered session-control events.
+    ///
+    /// Claim-once: later callers receive `None`. Frames enqueue to the ordered
+    /// channel regardless of claim; saturation or closure fails the transport
+    /// and emits [`HostNotification::ProtocolError`] instead of dropping or
+    /// reordering control events.
+    #[must_use]
+    pub fn take_session_control(&self) -> Option<mpsc::Receiver<HostSessionControlEvent>> {
+        self.session_control_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
@@ -571,18 +724,6 @@ impl HostClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
-    }
-
-    /// Install or clear the ordered session-control sink.
-    ///
-    /// The reader invokes the sink without holding client locks. Without a sink,
-    /// these events retain their ordinary broadcast behavior.
-    pub fn set_session_control_handler(&self, handler: Option<HostSessionControlHandler>) {
-        *self
-            .shared
-            .session_control_handler
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = handler;
     }
 
     fn next_id(&self) -> FrameId {
@@ -730,31 +871,7 @@ impl HostClient {
     ///
     /// Returns a payload or transport error when the response cannot be encoded or sent.
     pub async fn respond_ui(&self, response: HostUiResponse) -> HostResult<()> {
-        let (id, method, payload) = match response {
-            HostUiResponse::Select { id, value } => (
-                id,
-                Method::Select,
-                serde_json::to_value(SelectResponse { value }),
-            ),
-            HostUiResponse::Confirm { id, confirmed } => (
-                id,
-                Method::Confirm,
-                serde_json::to_value(ConfirmResponse { confirmed }),
-            ),
-            HostUiResponse::Input { id, value } => (
-                id,
-                Method::Input,
-                serde_json::to_value(InputResponse { value }),
-            ),
-            HostUiResponse::Editor { id, value } => (
-                id,
-                Method::Editor,
-                serde_json::to_value(EditorResponse { value }),
-            ),
-        };
-        let payload = payload
-            .map_err(|error| HostClientError::Payload(format!("encode UI response: {error}")))?;
-        self.send_frame(Frame::response(id, method, payload)).await
+        self.send_frame(ui_response_frame(response)?).await
     }
 
     /// Answer a correlated `session.setModel` request from the host.
@@ -1405,7 +1522,7 @@ async fn reader_task(stdout: Box<dyn AsyncRead + Unpin + Send>, shared: Arc<Shar
                 // Clear `running` BEFORE broadcasting: a subscriber that
                 // misses this send must observe the flag when it probes.
                 shared.running.store(false, Ordering::Relaxed);
-                let _ = shared.events.send(HostEvent::Eof);
+                let _ = shared.notifications.send(HostNotification::Eof);
                 break;
             }
             Ok(n) => match decoder.push(&buf[..n]) {
@@ -1425,7 +1542,9 @@ async fn reader_task(stdout: Box<dyn AsyncRead + Unpin + Send>, shared: Arc<Shar
                         },
                     );
                     shared.running.store(false, Ordering::Relaxed);
-                    let _ = shared.events.send(HostEvent::ProtocolError(e.to_string()));
+                    let _ = shared
+                        .notifications
+                        .send(HostNotification::ProtocolError(e.to_string()));
                     break;
                 }
             },
@@ -1441,8 +1560,10 @@ async fn reader_task(stdout: Box<dyn AsyncRead + Unpin + Send>, shared: Arc<Shar
                 // exactly like EOF / protocol death.
                 shared.running.store(false, Ordering::Relaxed);
                 let _ = shared
-                    .events
-                    .send(HostEvent::ProtocolError(format!("stdout read error: {e}")));
+                    .notifications
+                    .send(HostNotification::ProtocolError(format!(
+                        "stdout read error: {e}"
+                    )));
                 break;
             }
         }
@@ -1605,7 +1726,9 @@ fn cancel_pending(
 #[allow(clippy::too_many_lines)]
 async fn dispatch(shared: &Shared, frame: Frame) -> bool {
     if let Err(e) = frame.validate(false) {
-        let _ = shared.events.send(HostEvent::ProtocolError(e.to_string()));
+        let _ = shared
+            .notifications
+            .send(HostNotification::ProtocolError(e.to_string()));
         return true;
     }
     let id = frame.id;
@@ -1619,7 +1742,7 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
         }
         FrameKind::Error => {
             if id == 0 {
-                let _ = shared.events.send(HostEvent::Raw(frame));
+                let _ = shared.notifications.send(HostNotification::Raw(frame));
             } else {
                 let err = remote_error(&frame);
                 if let Some(entry) = take_active_pending(shared, id)
@@ -1645,310 +1768,46 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
                 forward_stream_event(shared, frame);
             }
         }
-        FrameKind::Req => {
-            if frame.method == crate::protocol::SESSION_SET_MODEL_METHOD {
-                match from_payload::<crate::protocol::SessionSetModelRequest>(&frame.payload) {
-                    Ok(request) => {
-                        forward_correlated_request(
-                            shared,
-                            HostEvent::SetModelRequest {
-                                id: frame.id,
-                                request,
-                            },
-                            frame.id,
-                            crate::protocol::SESSION_SET_MODEL_METHOD,
-                        );
-                    }
-                    Err(_) => {
-                        let _ = shared.events.send(HostEvent::Raw(frame));
-                    }
-                }
-            } else if frame.method == crate::protocol::SESSION_COMPACT_METHOD {
-                match from_payload::<crate::protocol::SessionCompactRequest>(&frame.payload) {
-                    Ok(request) => {
-                        forward_correlated_request(
-                            shared,
-                            HostEvent::CompactRequest {
-                                id: frame.id,
-                                request,
-                            },
-                            frame.id,
-                            crate::protocol::SESSION_COMPACT_METHOD,
-                        );
-                    }
-                    Err(_) => {
-                        let _ = shared.events.send(HostEvent::Raw(frame));
-                    }
-                }
-            } else if frame.method == crate::protocol::SESSION_NEW_SESSION_METHOD {
-                match from_payload::<crate::protocol::SessionNewSessionRequest>(&frame.payload) {
-                    Ok(request) => {
-                        forward_correlated_request(
-                            shared,
-                            HostEvent::NewSessionRequest {
-                                id: frame.id,
-                                request,
-                            },
-                            frame.id,
-                            crate::protocol::SESSION_NEW_SESSION_METHOD,
-                        );
-                    }
-                    Err(_) => {
-                        let _ = shared.events.send(HostEvent::Raw(frame));
-                    }
-                }
-            } else if frame.method == crate::protocol::SESSION_FORK_METHOD {
-                match from_payload::<crate::protocol::SessionForkRequest>(&frame.payload) {
-                    Ok(request) => {
-                        forward_correlated_request(
-                            shared,
-                            HostEvent::ForkRequest {
-                                id: frame.id,
-                                request,
-                            },
-                            frame.id,
-                            crate::protocol::SESSION_FORK_METHOD,
-                        );
-                    }
-                    Err(_) => {
-                        let _ = shared.events.send(HostEvent::Raw(frame));
-                    }
-                }
-            } else if frame.method == crate::protocol::SESSION_NAVIGATE_TREE_METHOD {
-                match from_payload::<crate::protocol::SessionNavigateTreeRequest>(&frame.payload) {
-                    Ok(request) => {
-                        forward_correlated_request(
-                            shared,
-                            HostEvent::NavigateTreeRequest {
-                                id: frame.id,
-                                request,
-                            },
-                            frame.id,
-                            crate::protocol::SESSION_NAVIGATE_TREE_METHOD,
-                        );
-                    }
-                    Err(_) => {
-                        let _ = shared.events.send(HostEvent::Raw(frame));
-                    }
-                }
-            } else if frame.method == crate::protocol::SESSION_SWITCH_SESSION_METHOD {
-                match from_payload::<crate::protocol::SessionSwitchSessionRequest>(&frame.payload) {
-                    Ok(request) => {
-                        forward_correlated_request(
-                            shared,
-                            HostEvent::SwitchSessionRequest {
-                                id: frame.id,
-                                request,
-                            },
-                            frame.id,
-                            crate::protocol::SESSION_SWITCH_SESSION_METHOD,
-                        );
-                    }
-                    Err(_) => {
-                        let _ = shared.events.send(HostEvent::Raw(frame));
-                    }
-                }
-            } else if frame.method == crate::protocol::SESSION_RELOAD_METHOD {
-                match from_payload::<crate::protocol::SessionReloadRequest>(&frame.payload) {
-                    Ok(_request) => {
-                        forward_correlated_request(
-                            shared,
-                            HostEvent::ReloadRequest { id: frame.id },
-                            frame.id,
-                            crate::protocol::SESSION_RELOAD_METHOD,
-                        );
-                    }
-                    Err(_) => {
-                        let _ = shared.events.send(HostEvent::Raw(frame));
-                    }
-                }
-            } else if frame.method == crate::protocol::SESSION_SETUP_ENTRIES_METHOD {
-                match from_payload::<crate::protocol::SessionSetupEntriesRequest>(&frame.payload) {
-                    Ok(request) => {
-                        forward_correlated_request(
-                            shared,
-                            HostEvent::SetupEntriesRequest {
-                                id: frame.id,
-                                request,
-                            },
-                            frame.id,
-                            crate::protocol::SESSION_SETUP_ENTRIES_METHOD,
-                        );
-                    }
-                    Err(_) => {
-                        let _ = shared.events.send(HostEvent::Raw(frame));
-                    }
-                }
-            } else if let Some(request) = decode_ui_request(&frame) {
-                let _ = shared.events.send(HostEvent::UiRequest(request));
-            } else {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
-        }
+        FrameKind::Req => return dispatch_request(shared, frame),
     }
     true
 }
 
-fn forward_event(shared: &Shared, frame: Frame) -> bool {
-    let method = frame.method.as_str();
-    if method == Method::UiSlot.as_str() {
-        match from_payload::<crate::protocol::UiSlot>(&frame.payload) {
-            Ok(slot) => {
-                if accept_generation(shared, &slot.key, slot.generation) {
-                    let _ = shared.events.send(HostEvent::UiSlot(slot));
-                }
-            }
-            Err(_) => {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
+fn dispatch_request(shared: &Shared, frame: Frame) -> bool {
+    match decode_session_request(&frame) {
+        Decoded::Valid(request) => {
+            forward_session_request(shared, request, &frame.method);
+            return true;
         }
-    } else if method == Method::DisposeSlot.as_str() {
-        match from_payload::<crate::protocol::DisposeSlot>(&frame.payload) {
-            Ok(dispose) => {
-                if accept_dispose(shared, &dispose.key, dispose.generation) {
-                    let _ = shared.events.send(HostEvent::DisposeSlot(dispose));
-                }
-            }
-            Err(_) => {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
+        Decoded::Malformed => {
+            send_correlated_error(
+                shared,
+                frame.id,
+                &frame.method,
+                "malformed correlated request",
+            );
+            return true;
         }
-    } else if method == Method::ToolUpdate.as_str() {
-        match from_payload::<crate::protocol::ToolUpdate>(&frame.payload) {
-            Ok(t) => {
-                let _ = shared.events.send(HostEvent::ToolUpdate(t));
-            }
-            Err(_) => {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
-        }
-    } else if method == Method::ProviderEvent.as_str() {
-        match from_payload::<crate::protocol::ProviderEvent>(&frame.payload) {
-            Ok(p) => {
-                let _ = shared.events.send(HostEvent::ProviderEvent(p));
-            }
-            Err(_) => {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
-        }
-    } else if method == Method::ExtensionError.as_str() {
-        match from_payload::<crate::protocol::ExtensionErrorEvent>(&frame.payload) {
-            Ok(e) => {
-                let _ = shared.events.send(HostEvent::ExtensionError(e));
-            }
-            Err(_) => {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
-        }
-    } else if method == Method::Notify.as_str() {
-        match from_payload::<NotifyRequest>(&frame.payload) {
-            Ok(notification) => {
-                let _ = shared.events.send(HostEvent::Notify(notification));
-            }
-            Err(_) => {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
-        }
-    } else if method == crate::protocol::THEME_SET_METHOD {
-        match from_payload::<crate::protocol::ThemeSet>(&frame.payload) {
-            Ok(set) => {
-                let _ = shared.events.send(HostEvent::ThemeSet(set));
-            }
-            Err(_) => {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
-        }
-    } else if method == crate::protocol::UI_CONTROL_METHOD {
-        match from_payload::<crate::protocol::UiControl>(&frame.payload) {
-            Ok(control) => {
-                let _ = shared.events.send(HostEvent::UiControl(control));
-            }
-            Err(_) => {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
-        }
-    } else if method == crate::protocol::PROVIDERS_UPDATE_METHOD {
-        match from_payload::<crate::protocol::ProvidersUpdate>(&frame.payload) {
-            Ok(update) => {
-                let _ = shared.providers_update.send(update);
-            }
-            Err(_) => {
-                let _ = shared.events.send(HostEvent::Raw(frame));
-            }
-        }
-    } else if method == crate::protocol::SESSION_COMMAND_METHOD
-        || method == crate::protocol::SESSION_REPLACEMENT_READY_METHOD
-        || method == crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD
-    {
-        return forward_session_control_frame(shared, frame);
-    } else {
-        let _ = shared.events.send(HostEvent::Raw(frame));
+        Decoded::Unrecognized => {}
     }
-    true
-}
-
-fn forward_session_control_frame(shared: &Shared, frame: Frame) -> bool {
-    let event = match frame.method.as_str() {
-        crate::protocol::SESSION_COMMAND_METHOD => {
-            from_payload::<crate::protocol::SessionCommandEnvelope>(&frame.payload)
-                .map(HostSessionControlEvent::Command)
+    match decode_ui_request(&frame) {
+        Decoded::Valid(request) => {
+            forward_ui_request(shared, request);
+            true
         }
-        crate::protocol::SESSION_REPLACEMENT_READY_METHOD => {
-            from_payload::<crate::protocol::SessionReplacementReadyEvent>(&frame.payload)
-                .map(|ready| HostSessionControlEvent::ReplacementReady { token: ready.token })
+        Decoded::Malformed => {
+            send_correlated_error(shared, frame.id, &frame.method, "malformed UI request");
+            true
         }
-        crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD => {
-            from_payload::<crate::protocol::SessionReplacementAbortEvent>(&frame.payload)
-                .map(|abort| HostSessionControlEvent::ReplacementAbort { token: abort.token })
+        Decoded::Unrecognized => {
+            let _ = shared.notifications.send(HostNotification::Raw(frame));
+            true
         }
-        _ => unreachable!("caller accepts only session-control methods"),
-    };
-    if let Ok(event) = event {
-        forward_session_control(shared, event)
-    } else {
-        let _ = shared.events.send(HostEvent::Raw(frame));
-        true
     }
 }
 
-fn forward_session_control(shared: &Shared, event: HostSessionControlEvent) -> bool {
-    let handler = shared
-        .session_control_handler
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    let Some(handler) = handler else {
-        let event = match event {
-            HostSessionControlEvent::Command(envelope) => HostEvent::SessionCommand(envelope),
-            HostSessionControlEvent::ReplacementReady { token } => {
-                HostEvent::ReplacementReady { token }
-            }
-            HostSessionControlEvent::ReplacementAbort { token } => {
-                HostEvent::ReplacementAbort { token }
-            }
-        };
-        let _ = shared.events.send(event);
-        return true;
-    };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        handler(event);
-    }));
-    if result.is_ok() {
-        return true;
-    }
-    let message = "session-control handler panicked".to_owned();
-    fail_all(
-        shared,
-        &HostClientError::Protocol {
-            message: message.clone(),
-            stderr: stderr_of(shared),
-        },
-    );
-    shared.running.store(false, Ordering::Relaxed);
-    let _ = shared.events.send(HostEvent::ProtocolError(message));
-    false
-}
-
+/// Forward a per-call stream event (tool updates, …) lossily: a full channel
+/// drops the stale event so the reader never blocks on a saturated consumer.
 fn forward_stream_event(shared: &Shared, frame: Frame) {
     let id = frame.id;
     let stream = if let Ok(pending) = shared.pending.lock() {
@@ -1960,50 +1819,7 @@ fn forward_stream_event(shared: &Shared, frame: Frame) {
         None
     };
     if let Some(stream) = stream {
-        // Non-blocking: a full channel drops the stale event (backpressure).
         let _ = stream.try_send(frame);
-    }
-}
-
-/// Forward a correlated host request through the bounded lossless channel.
-///
-/// Unlike the lossy `events` broadcast, every accepted request must reach
-/// exactly one consumer. When the channel is full or closed (consumer not yet
-/// claimed or teardown in progress), an explicit error frame is sent back to
-/// the host so the extension observes a failure instead of a timeout. The
-/// `try_send` never blocks the reader loop; teardown and cancellation can
-/// never block on a saturated queue.
-fn forward_correlated_request(shared: &Shared, event: HostEvent, id: FrameId, method: &str) {
-    match shared.correlated_requests.try_send(event) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            send_correlated_error(shared, id, method, "correlated request channel full");
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            send_correlated_error(shared, id, method, "no active session");
-        }
-    }
-}
-
-/// Send an error frame for a correlated request that could not be delivered.
-fn send_correlated_error(shared: &Shared, id: FrameId, method: &str, message: &str) {
-    let frame = Frame {
-        id,
-        kind: FrameKind::Error,
-        method: method.to_owned(),
-        payload: serde_json::to_value(crate::protocol::ErrorPayload::new(
-            "extension_error",
-            message,
-        ))
-        .unwrap_or(serde_json::Value::Null),
-    };
-    let outbound = shared
-        .outbound
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    if let Some(tx) = outbound {
-        let _ = tx.try_send(frame);
     }
 }
 
@@ -2011,10 +1827,9 @@ fn send_correlated_error(shared: &Shared, id: FrameId, method: &str, message: &s
 /// delivery. Unlike [`forward_stream_event`], this awaits channel capacity so
 /// no provider event is silently dropped before the stream terminates. The
 /// per-stream cancellation token unblocks the await when the call is cancelled
-/// or failed, so the reader loop never deadlocks on a slow consumer.
-///
-/// The pending mutex is released before awaiting so cancel/fail/terminal
-/// dispatch can proceed concurrently.
+/// or failed, so the reader loop never deadlocks on a slow consumer. The
+/// pending mutex is released before awaiting so cancel/fail/terminal dispatch
+/// can proceed concurrently.
 async fn forward_provider_event(shared: &Shared, frame: Frame) {
     let id = frame.id;
     let (stream, cancel) = if let Ok(pending) = shared.pending.lock() {
@@ -2026,9 +1841,6 @@ async fn forward_provider_event(shared: &Shared, frame: Frame) {
         return;
     };
     if let Some(stream) = stream {
-        // Await capacity so every provider event is delivered in order.
-        // Race against the per-stream cancellation token so cancel/fail
-        // wakes a blocked send instead of waiting for the consumer.
         tokio::select! {
             biased;
             () = cancel.cancelled() => {}
@@ -2039,6 +1851,356 @@ async fn forward_provider_event(shared: &Shared, frame: Frame) {
                 }
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn forward_event(shared: &Shared, frame: Frame) -> bool {
+    let method = frame.method.as_str();
+    if method == Method::UiSlot.as_str() {
+        match from_payload::<crate::protocol::UiSlot>(&frame.payload) {
+            Ok(slot) => {
+                if accept_generation(shared, &slot.key, slot.generation) {
+                    let _ = shared.notifications.send(HostNotification::UiSlot(slot));
+                }
+            }
+            Err(_) => {
+                let _ = shared.notifications.send(HostNotification::Raw(frame));
+            }
+        }
+    } else if method == Method::DisposeSlot.as_str() {
+        match from_payload::<crate::protocol::DisposeSlot>(&frame.payload) {
+            Ok(dispose) => {
+                if accept_dispose(shared, &dispose.key, dispose.generation) {
+                    let _ = shared
+                        .notifications
+                        .send(HostNotification::DisposeSlot(dispose));
+                }
+            }
+            Err(_) => {
+                let _ = shared.notifications.send(HostNotification::Raw(frame));
+            }
+        }
+    } else if method == Method::ToolUpdate.as_str() {
+        match from_payload::<crate::protocol::ToolUpdate>(&frame.payload) {
+            Ok(t) => {
+                let _ = shared.notifications.send(HostNotification::ToolUpdate(t));
+            }
+            Err(_) => {
+                let _ = shared.notifications.send(HostNotification::Raw(frame));
+            }
+        }
+    } else if method == Method::ProviderEvent.as_str() {
+        match from_payload::<crate::protocol::ProviderEvent>(&frame.payload) {
+            Ok(p) => {
+                let _ = shared
+                    .notifications
+                    .send(HostNotification::ProviderEvent(p));
+            }
+            Err(_) => {
+                let _ = shared.notifications.send(HostNotification::Raw(frame));
+            }
+        }
+    } else if method == Method::ExtensionError.as_str() {
+        match from_payload::<crate::protocol::ExtensionErrorEvent>(&frame.payload) {
+            Ok(e) => {
+                let _ = shared
+                    .notifications
+                    .send(HostNotification::ExtensionError(e));
+            }
+            Err(_) => {
+                let _ = shared.notifications.send(HostNotification::Raw(frame));
+            }
+        }
+    } else if method == Method::Notify.as_str() {
+        match from_payload::<NotifyRequest>(&frame.payload) {
+            Ok(notification) => {
+                let _ = shared
+                    .notifications
+                    .send(HostNotification::Notify(notification));
+            }
+            Err(_) => {
+                let _ = shared.notifications.send(HostNotification::Raw(frame));
+            }
+        }
+    } else if method == crate::protocol::THEME_SET_METHOD {
+        match from_payload::<crate::protocol::ThemeSet>(&frame.payload) {
+            Ok(set) => {
+                let _ = shared.notifications.send(HostNotification::ThemeSet(set));
+            }
+            Err(_) => {
+                let _ = shared.notifications.send(HostNotification::Raw(frame));
+            }
+        }
+    } else if method == crate::protocol::UI_CONTROL_METHOD {
+        match from_payload::<crate::protocol::UiControl>(&frame.payload) {
+            Ok(control) => {
+                let _ = shared
+                    .notifications
+                    .send(HostNotification::UiControl(control));
+            }
+            Err(_) => {
+                let _ = shared.notifications.send(HostNotification::Raw(frame));
+            }
+        }
+    } else if method == crate::protocol::PROVIDERS_UPDATE_METHOD {
+        match from_payload::<crate::protocol::ProvidersUpdate>(&frame.payload) {
+            Ok(update) => {
+                let _ = shared.providers_update.send(update);
+            }
+            Err(_) => {
+                let _ = shared.notifications.send(HostNotification::Raw(frame));
+            }
+        }
+    } else if method == crate::protocol::SESSION_COMMAND_METHOD
+        || method == crate::protocol::SESSION_REPLACEMENT_READY_METHOD
+        || method == crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD
+    {
+        return forward_session_control_frame(shared, frame);
+    } else {
+        let _ = shared.notifications.send(HostNotification::Raw(frame));
+    }
+    true
+}
+
+fn forward_session_control_frame(shared: &Shared, frame: Frame) -> bool {
+    let event = match frame.method.as_str() {
+        crate::protocol::SESSION_COMMAND_METHOD => {
+            from_payload(&frame.payload).map(HostSessionControlEvent::Command)
+        }
+        crate::protocol::SESSION_REPLACEMENT_READY_METHOD => {
+            from_payload::<crate::protocol::SessionReplacementReadyEvent>(&frame.payload)
+                .map(|ready| HostSessionControlEvent::ReplacementReady { token: ready.token })
+        }
+        crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD => {
+            from_payload::<crate::protocol::SessionReplacementAbortEvent>(&frame.payload)
+                .map(|abort| HostSessionControlEvent::ReplacementAbort { token: abort.token })
+        }
+        _ => return true,
+    };
+    let Ok(event) = event else {
+        let _ = shared.notifications.send(HostNotification::Raw(frame));
+        return true;
+    };
+    match shared.session_control.try_send(event) {
+        Ok(()) => true,
+        Err(error) => fail_session_control_delivery(shared, &error.to_string()),
+    }
+}
+
+fn fail_session_control_delivery(shared: &Shared, detail: &str) -> bool {
+    let message = format!("session-control delivery failed: {detail}");
+    fail_all(
+        shared,
+        &HostClientError::Protocol {
+            message: message.clone(),
+            stderr: stderr_of(shared),
+        },
+    );
+    shared.running.store(false, Ordering::Relaxed);
+    let _ = shared
+        .notifications
+        .send(HostNotification::ProtocolError(message));
+    false
+}
+
+fn forward_session_request(shared: &Shared, request: HostSessionRequest, method: &str) {
+    let id = request.id();
+    if !shared.session_requests_claimed.load(Ordering::Acquire) {
+        send_correlated_error(shared, id, method, "no active session");
+        return;
+    }
+    if let Err(error) = shared.session_requests.try_send(request) {
+        let message = match error {
+            mpsc::error::TrySendError::Full(_) => "correlated request channel full",
+            mpsc::error::TrySendError::Closed(_) => "no active session",
+        };
+        send_correlated_error(shared, id, method, message);
+    }
+}
+
+fn forward_ui_request(shared: &Shared, request: HostUiRequest) {
+    if !shared.ui_requests_claimed.load(Ordering::Acquire) {
+        let end = DialogEnd::Closed;
+        #[cfg(test)]
+        record_self_answered(request.id(), end);
+        send_ui_response(shared, request.end(end));
+        return;
+    }
+    if let Err(error) = shared.ui_requests.try_send(request) {
+        let (request, end) = match error {
+            mpsc::error::TrySendError::Full(request) => (request, DialogEnd::Full),
+            mpsc::error::TrySendError::Closed(request) => (request, DialogEnd::Closed),
+        };
+        #[cfg(test)]
+        record_self_answered(request.id(), end);
+        send_ui_response(shared, request.end(end));
+    }
+}
+
+/// Test-only record of dialogs the client answered itself because delivery was
+/// unavailable. The wire collapses every non-`Answered` outcome to identical
+/// default bytes, so the typed Full/Closed classification of a self-answer is
+/// observable only here.
+#[cfg(test)]
+fn record_self_answered(id: FrameId, end: DialogEnd) {
+    SELF_ANSWERED.with(|log| log.borrow_mut().push((id, end)));
+}
+
+fn send_ui_response(shared: &Shared, response: HostUiResponse) {
+    let id = response.id();
+    match ui_response_frame(response) {
+        Ok(frame) => try_send_outbound(shared, frame),
+        Err(error) => send_correlated_error(shared, id, "ui.response", &error.to_string()),
+    }
+}
+
+fn try_send_outbound(shared: &Shared, frame: Frame) {
+    let outbound = shared
+        .outbound
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(tx) = outbound {
+        let _ = tx.try_send(frame);
+    }
+}
+
+/// Send an error frame for a correlated request that could not be delivered.
+/// Uses [`crate::protocol::ErrorPayload`] so the emitted bytes (including
+/// `retryable: false`) stay identical to the pre-refactor wire contract.
+fn send_correlated_error(shared: &Shared, id: FrameId, method: &str, message: &str) {
+    let payload = serde_json::to_value(crate::protocol::ErrorPayload::new(
+        "extension_error",
+        message,
+    ))
+    .unwrap_or(serde_json::Value::Null);
+    try_send_outbound(
+        shared,
+        Frame {
+            id,
+            kind: FrameKind::Error,
+            method: method.to_owned(),
+            payload,
+        },
+    );
+}
+
+enum Decoded<T> {
+    Valid(T),
+    Malformed,
+    Unrecognized,
+}
+
+fn decode_session_request(frame: &Frame) -> Decoded<HostSessionRequest> {
+    macro_rules! decode {
+        ($ty:ty, $variant:ident) => {
+            match from_payload::<$ty>(&frame.payload) {
+                Ok(request) => Decoded::Valid(HostSessionRequest::$variant {
+                    id: frame.id,
+                    request,
+                }),
+                Err(_) => Decoded::Malformed,
+            }
+        };
+    }
+    match frame.method.as_str() {
+        crate::protocol::SESSION_SET_MODEL_METHOD => {
+            decode!(crate::protocol::SessionSetModelRequest, SetModel)
+        }
+        crate::protocol::SESSION_COMPACT_METHOD => {
+            decode!(crate::protocol::SessionCompactRequest, Compact)
+        }
+        crate::protocol::SESSION_NEW_SESSION_METHOD => {
+            decode!(crate::protocol::SessionNewSessionRequest, NewSession)
+        }
+        crate::protocol::SESSION_FORK_METHOD => decode!(crate::protocol::SessionForkRequest, Fork),
+        crate::protocol::SESSION_NAVIGATE_TREE_METHOD => {
+            decode!(crate::protocol::SessionNavigateTreeRequest, NavigateTree)
+        }
+        crate::protocol::SESSION_SWITCH_SESSION_METHOD => {
+            decode!(crate::protocol::SessionSwitchSessionRequest, SwitchSession)
+        }
+        crate::protocol::SESSION_RELOAD_METHOD => {
+            match from_payload::<crate::protocol::SessionReloadRequest>(&frame.payload) {
+                Ok(_) => Decoded::Valid(HostSessionRequest::Reload { id: frame.id }),
+                Err(_) => Decoded::Malformed,
+            }
+        }
+        crate::protocol::SESSION_SETUP_ENTRIES_METHOD => {
+            decode!(crate::protocol::SessionSetupEntriesRequest, SetupEntries)
+        }
+        _ => Decoded::Unrecognized,
+    }
+}
+
+fn decode_ui_request(frame: &Frame) -> Decoded<HostUiRequest> {
+    let Some(method) = Method::parse(&frame.method) else {
+        return Decoded::Unrecognized;
+    };
+    macro_rules! decode {
+        ($ty:ty, $variant:ident) => {
+            match from_payload::<$ty>(&frame.payload) {
+                Ok(request) => Decoded::Valid(HostUiRequest::$variant {
+                    id: frame.id,
+                    request,
+                }),
+                Err(_) => Decoded::Malformed,
+            }
+        };
+    }
+    match method {
+        Method::Select => decode!(SelectRequest, Select),
+        Method::Confirm => decode!(ConfirmRequest, Confirm),
+        Method::Input => decode!(InputRequest, Input),
+        Method::Editor => decode!(EditorRequest, Editor),
+        _ => Decoded::Unrecognized,
+    }
+}
+
+fn ui_response_frame(response: HostUiResponse) -> HostResult<Frame> {
+    let (id, method, payload) = match response {
+        HostUiResponse::Select { id, outcome } => (
+            id,
+            Method::Select,
+            serde_json::to_value(SelectResponse {
+                value: outcome_value(outcome),
+            }),
+        ),
+        HostUiResponse::Confirm { id, outcome } => (
+            id,
+            Method::Confirm,
+            serde_json::to_value(ConfirmResponse {
+                confirmed: outcome_value(outcome).unwrap_or(false),
+            }),
+        ),
+        HostUiResponse::Input { id, outcome } => (
+            id,
+            Method::Input,
+            serde_json::to_value(InputResponse {
+                value: outcome_value(outcome),
+            }),
+        ),
+        HostUiResponse::Editor { id, outcome } => (
+            id,
+            Method::Editor,
+            serde_json::to_value(EditorResponse {
+                value: outcome_value(outcome),
+            }),
+        ),
+    };
+    let payload = payload
+        .map_err(|error| HostClientError::Payload(format!("encode UI response: {error}")))?;
+    Ok(Frame::response(id, method, payload))
+}
+
+fn outcome_value<T>(outcome: DialogOutcome<T>) -> Option<T> {
+    match outcome {
+        DialogOutcome::Answered(value) => Some(value),
+        DialogOutcome::Full
+        | DialogOutcome::Closed
+        | DialogOutcome::Cancelled
+        | DialogOutcome::TimedOut => None,
     }
 }
 
@@ -2084,38 +2246,6 @@ fn remote_error(frame: &Frame) -> HostClientError {
             code: "unknown".to_owned(),
             message: format!("unparseable error frame for method {}", frame.method),
         },
-    }
-}
-
-fn decode_ui_request(frame: &Frame) -> Option<HostUiRequest> {
-    match Method::parse(&frame.method)? {
-        Method::Select => from_payload(&frame.payload)
-            .ok()
-            .map(|request| HostUiRequest::Select {
-                id: frame.id,
-                request,
-            }),
-        Method::Confirm => {
-            from_payload(&frame.payload)
-                .ok()
-                .map(|request| HostUiRequest::Confirm {
-                    id: frame.id,
-                    request,
-                })
-        }
-        Method::Input => from_payload(&frame.payload)
-            .ok()
-            .map(|request| HostUiRequest::Input {
-                id: frame.id,
-                request,
-            }),
-        Method::Editor => from_payload(&frame.payload)
-            .ok()
-            .map(|request| HostUiRequest::Editor {
-                id: frame.id,
-                request,
-            }),
-        _ => None,
     }
 }
 
@@ -2224,7 +2354,7 @@ mod tests {
     #[tokio::test]
     async fn theme_set_event_is_typed_and_send_event_writes_id_zero() -> R {
         let (client, mut host) = make_pair().await;
-        let mut events = client.subscribe();
+        let mut events = client.subscribe_notifications();
 
         // Host → client: theme.set arrives typed, not as a fatal Raw frame.
         host.write_frame(&Frame {
@@ -2235,7 +2365,7 @@ mod tests {
         })
         .await?;
         let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
-        let HostEvent::ThemeSet(set) = event else {
+        let HostNotification::ThemeSet(set) = event else {
             return Err(format!("expected typed theme.set, got {event:?}").into());
         };
         assert_eq!(set.name.as_deref(), Some("m3-light"));
@@ -2258,7 +2388,8 @@ mod tests {
     #[tokio::test]
     async fn host_ui_requests_and_notifications_are_typed_and_correlated() -> R {
         let (client, mut host) = make_pair().await;
-        let mut events = client.subscribe();
+        let mut events = client.subscribe_notifications();
+        let mut ui_requests = client.take_ui_requests().ok_or("ui receiver missing")?;
         host.write_frame(&Frame {
             id: 77,
             kind: FrameKind::Req,
@@ -2271,8 +2402,11 @@ mod tests {
         })
         .await?;
 
-        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
-        let HostEvent::UiRequest(HostUiRequest::Select { id, request }) = event else {
+        let request = tokio::time::timeout(Duration::from_secs(1), ui_requests.recv())
+            .await
+            .map_err(|_| "typed select request not delivered")?
+            .ok_or("ui request channel closed")?;
+        let HostUiRequest::Select { id, request } = request else {
             return Err("expected typed select request".into());
         };
         assert_eq!(id, 77);
@@ -2280,13 +2414,26 @@ mod tests {
         client
             .respond_ui(HostUiResponse::Select {
                 id,
-                value: Some("b".to_owned()),
+                outcome: DialogOutcome::Answered("b".to_owned()),
             })
             .await?;
         let response = host.read_frame().await.ok_or("no UI response")?;
         assert_eq!(response.kind, FrameKind::Res);
         assert_eq!(response.id, 77);
         assert_eq!(response.payload["value"], "b");
+
+        // The correlated UI request must never surface on the lossy
+        // notification broadcast.
+        match tokio::time::timeout(Duration::from_millis(150), events.recv()).await {
+            Err(_) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(error)) => return Err(format!("notification stream failed: {error}").into()),
+            Ok(Ok(event)) => {
+                assert!(
+                    !format!("{event:?}").contains("Pick"),
+                    "UI request leaked into notifications: {event:?}"
+                );
+            }
+        }
 
         host.write_frame(&Frame::event(
             0,
@@ -2295,7 +2442,7 @@ mod tests {
         ))
         .await?;
         let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
-        let HostEvent::Notify(notification) = event else {
+        let HostNotification::Notify(notification) = event else {
             return Err("expected typed notification".into());
         };
         assert_eq!(notification.message, "hello");
@@ -2774,7 +2921,7 @@ mod tests {
     #[tokio::test]
     async fn generation_filter_discards_stale_slot() -> R {
         let (client, mut host) = make_pair().await;
-        let mut sub = client.subscribe();
+        let mut sub = client.subscribe_notifications();
         // Drive a trivial exchange so the reader task runs.
         let client_task = tokio::spawn(async move {
             client
@@ -2811,7 +2958,7 @@ mod tests {
         let mut seen = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
         while let Ok(Ok(ev)) = tokio::time::timeout_at(deadline, sub.recv()).await {
-            if let HostEvent::UiSlot(s) = ev {
+            if let HostNotification::UiSlot(s) = ev {
                 seen.push(s.generation);
             }
         }
@@ -2824,7 +2971,7 @@ mod tests {
     #[tokio::test]
     async fn reordered_stale_dispose_does_not_kill_live_slot() -> R {
         let (client, mut host) = make_pair().await;
-        let mut sub = client.subscribe();
+        let mut sub = client.subscribe_notifications();
         let client_task = tokio::spawn(async move {
             client
                 .request(
@@ -2886,8 +3033,8 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
         while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, sub.recv()).await {
             match event {
-                HostEvent::UiSlot(slot) => slots.push(slot.generation),
-                HostEvent::DisposeSlot(dispose) => disposes.push(dispose.generation),
+                HostNotification::UiSlot(slot) => slots.push(slot.generation),
+                HostNotification::DisposeSlot(dispose) => disposes.push(dispose.generation),
                 _ => {}
             }
         }
@@ -2921,9 +3068,9 @@ mod tests {
             Box::new(client_err),
             None,
         );
-        let mut events = client.subscribe();
+        let mut events = client.subscribe_notifications();
         let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
-        let HostEvent::ProtocolError(message) = event else {
+        let HostNotification::ProtocolError(message) = event else {
             return Err(format!("expected ProtocolError, got {event:?}").into());
         };
         assert!(
@@ -3303,7 +3450,7 @@ mod tests {
     #[tokio::test]
     async fn tool_update_stream_stays_lossy_under_backpressure() -> R {
         let (client, mut host) = make_pair().await;
-        let mut events = client.subscribe();
+        let mut events = client.subscribe_notifications();
         let mut stream = client
             .open_stream_raw("tool.execute", serde_json::json!({}), 2)
             .await?;
@@ -3321,7 +3468,7 @@ mod tests {
         ))
         .await?;
         let barrier = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
-        assert!(matches!(barrier, HostEvent::Notify(_)));
+        assert!(matches!(barrier, HostNotification::Notify(_)));
 
         let mut received = Vec::new();
         while let Some(frame) = stream.next_event().await {
@@ -3388,46 +3535,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_ready_handler_bypasses_broadcast_lag() -> R {
-        let (client, mut host) = make_pair().await;
-        let _lagged = client.subscribe();
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let ready_tx = StdMutex::new(Some(ready_tx));
-        client.set_session_control_handler(Some(Arc::new(move |event| {
-            let HostSessionControlEvent::ReplacementReady { token } = event else {
-                return;
-            };
-            if let Some(sender) = ready_tx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                let _ = sender.send(token);
-            }
-        })));
-
-        for index in 0..=EVENT_CAPACITY {
-            host.write_frame(&Frame::event(
-                0,
-                Method::Notify,
-                serde_json::json!({"message": index}),
-            ))
-            .await?;
-        }
-        host.write_frame(&Frame {
-            id: 0,
-            kind: FrameKind::Event,
-            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
-            payload: serde_json::json!({"token": "ready-after-lag"}),
-        })
-        .await?;
-
-        let token = tokio::time::timeout(Duration::from_secs(1), ready_rx).await??;
-        assert_eq!(token, "ready-after-lag");
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn providers_update_watch_bypasses_broadcast_lag() -> R {
         let (client, mut host) = make_pair().await;
         let mut providers = client
@@ -3439,7 +3546,7 @@ mod tests {
         );
 
         // Subscribe to the lossy general broadcast *before* flooding it.
-        let mut general = client.subscribe();
+        let mut general = client.subscribe_notifications();
         for index in 0..(EVENT_CAPACITY + 10) {
             host.write_frame(&Frame::event(
                 0,
@@ -3489,125 +3596,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_ready_without_handler_uses_broadcast() -> R {
-        let (client, mut host) = make_pair().await;
-        let mut events = client.subscribe();
-        host.write_frame(&Frame {
-            id: 0,
-            kind: FrameKind::Event,
-            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
-            payload: serde_json::json!({"token": "broadcast-ready"}),
-        })
-        .await?;
-
-        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
-        assert!(
-            matches!(event, HostEvent::ReplacementReady { token } if token == "broadcast-ready")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn session_control_handler_preserves_command_before_ready() -> R {
-        let (client, mut host) = make_pair().await;
-        let (done_tx, done_rx) = oneshot::channel();
-        let done_tx = StdMutex::new(Some(done_tx));
-        let observed = Arc::new(StdMutex::new(Vec::new()));
-        let handler_observed = Arc::clone(&observed);
-        client.set_session_control_handler(Some(Arc::new(move |event| {
-            let label = match event {
-                HostSessionControlEvent::Command(envelope) => {
-                    assert_eq!(envelope.replacement_token.as_deref(), Some("ordered-token"));
-                    "command"
-                }
-                HostSessionControlEvent::ReplacementReady { token } => {
-                    assert_eq!(token, "ordered-token");
-                    if let Some(sender) = done_tx
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take()
-                    {
-                        let _ = sender.send(());
-                    }
-                    "ready"
-                }
-                HostSessionControlEvent::ReplacementAbort { .. } => "abort",
-            };
-            handler_observed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(label);
-        })));
-
-        host.write_frame(&Frame {
-            id: 0,
-            kind: FrameKind::Event,
-            method: crate::protocol::SESSION_COMMAND_METHOD.to_owned(),
-            payload: serde_json::json!({
-                "replacementToken": "ordered-token",
-                "action": "setSessionName",
-                "name": "candidate",
-            }),
-        })
-        .await?;
-        host.write_frame(&Frame {
-            id: 0,
-            kind: FrameKind::Event,
-            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
-            payload: serde_json::json!({"token": "ordered-token"}),
-        })
-        .await?;
-
-        tokio::time::timeout(Duration::from_secs(1), done_rx).await??;
-        assert_eq!(
-            *observed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec!["command", "ready"]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[allow(clippy::panic)] // The contract under test is containment of callback panics.
-    async fn replacement_ready_handler_panic_fails_transport() -> R {
-        let (client, mut host) = make_pair().await;
-        let mut events = client.subscribe();
-        client.set_session_control_handler(Some(Arc::new(|_| {
-            panic!("session-control test panic");
-        })));
-
-        let client = Arc::new(client);
-        let requester = Arc::clone(&client);
-        let request_task = tokio::spawn(async move {
-            requester
-                .request(
-                    Method::Notify,
-                    serde_json::json!({"pending": true}),
-                    Duration::from_secs(2),
-                )
-                .await
-        });
-        let _request = host.read_frame().await.ok_or("no pending request")?;
-        host.write_frame(&Frame {
-            id: 0,
-            kind: FrameKind::Event,
-            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
-            payload: serde_json::json!({"token": "panic-ready"}),
-        })
-        .await?;
-
-        let result = tokio::time::timeout(Duration::from_secs(1), request_task).await??;
-        assert!(matches!(result, Err(HostClientError::Protocol { .. })));
-        assert!(!client.is_running());
-        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
-        assert!(
-            matches!(event, HostEvent::ProtocolError(message) if message.contains("handler panicked"))
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn shutdown_wakes_blocked_provider_event_send() -> R {
         let (client, mut host) = make_pair().await;
         let stream = client
@@ -3645,39 +3633,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_abort_handler_preserves_order() -> R {
-        let (client, mut host) = make_pair().await;
-        let (done_tx, done_rx) = oneshot::channel();
-        let done_tx = StdMutex::new(Some(done_tx));
-        client.set_session_control_handler(Some(Arc::new(move |event| {
-            if let HostSessionControlEvent::ReplacementAbort { token } = event {
-                assert_eq!(token, "abort-token");
-                if let Some(sender) = done_tx
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                {
-                    let _ = sender.send(());
-                }
-            }
-        })));
-
-        host.write_frame(&Frame {
-            id: 0,
-            kind: FrameKind::Event,
-            method: crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD.to_owned(),
-            payload: serde_json::json!({"token": "abort-token"}),
-        })
-        .await?;
-
-        tokio::time::timeout(Duration::from_secs(1), done_rx).await??;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn malformed_session_control_payloads_fail_closed() -> R {
         let (client, mut host) = make_pair().await;
-        let mut events = client.subscribe();
+        let mut events = client.subscribe_notifications();
 
         for method in [
             crate::protocol::SESSION_COMMAND_METHOD,
@@ -3696,7 +3654,7 @@ mod tests {
         for _ in 0..3 {
             let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
             assert!(
-                matches!(event, HostEvent::Raw(_)),
+                matches!(event, HostNotification::Raw(_)),
                 "malformed control frame should fail closed as Raw: {event:?}"
             );
         }
@@ -3709,7 +3667,7 @@ mod tests {
     async fn correlated_request_reaches_exactly_one_consumer() -> R {
         let (client, _host) = make_pair().await;
         let mut correlated = client
-            .take_correlated_requests()
+            .take_session_requests()
             .ok_or("correlated receiver missing")?;
 
         // Simulate the host sending a session.setModel request.
@@ -3726,7 +3684,7 @@ mod tests {
             .await
             .map_err(|_| "correlated request timed out")?
             .ok_or("correlated channel closed")?;
-        let HostEvent::SetModelRequest { id, .. } = event else {
+        let HostSessionRequest::SetModel { id, .. } = event else {
             return Err(format!("expected SetModelRequest, got {event:?}").into());
         };
         assert_eq!(id, 42);
@@ -3737,7 +3695,7 @@ mod tests {
     async fn correlated_request_gets_error_when_channel_closed() -> R {
         let (client, mut host) = make_pair().await;
         // Drop the receiver without claiming it — simulates no event pump.
-        drop(client.take_correlated_requests());
+        drop(client.take_session_requests());
 
         // Send a session.setModel request from the host side.
         host.write_frame(&Frame {
@@ -3764,7 +3722,7 @@ mod tests {
         let (client, mut host) = make_pair().await;
         // Claim the receiver but never drain it — fills the bounded channel.
         let _correlated = client
-            .take_correlated_requests()
+            .take_session_requests()
             .ok_or("correlated receiver missing")?;
 
         // Send more correlated requests than CORRELATED_REQUEST_CAPACITY.
@@ -3800,11 +3758,12 @@ mod tests {
     async fn broadcast_lag_does_not_lose_correlated_requests() -> R {
         let (client, mut host) = make_pair().await;
         let mut correlated = client
-            .take_correlated_requests()
+            .take_session_requests()
             .ok_or("correlated receiver missing")?;
+        let mut ui_requests = client.take_ui_requests().ok_or("ui receiver missing")?;
 
         // Flood the lossy broadcast with notifications to force a Lagged event.
-        // Correlated requests must still arrive through the lossless channel.
+        // Correlated requests must still arrive through the lossless channels.
         for _ in 0..(EVENT_CAPACITY + 10) {
             host.write_frame(&Frame {
                 id: 0,
@@ -3815,7 +3774,8 @@ mod tests {
             .await?;
         }
 
-        // Now send a correlated request — it must arrive despite broadcast lag.
+        // Now send a correlated session request and a direct UI request — both
+        // must arrive on their typed channels despite broadcast lag.
         host.write_frame(&Frame {
             id: 77,
             kind: FrameKind::Req,
@@ -3824,14 +3784,451 @@ mod tests {
         })
         .await?;
 
-        let event = tokio::time::timeout(Duration::from_secs(2), correlated.recv())
+        host.write_frame(&Frame {
+            id: 78,
+            kind: FrameKind::Req,
+            method: Method::Select.as_str().to_owned(),
+            payload: serde_json::json!({
+                "title": "Pick",
+                "options": ["a", "b"]
+            }),
+        })
+        .await?;
+
+        let request = tokio::time::timeout(Duration::from_secs(2), correlated.recv())
             .await
             .map_err(|_| "correlated request lost during broadcast lag")?
             .ok_or("correlated channel closed during broadcast lag")?;
-        let HostEvent::CompactRequest { id, .. } = event else {
-            return Err(format!("expected CompactRequest, got {event:?}").into());
+        let HostSessionRequest::Compact { id, .. } = request else {
+            return Err(format!("expected Compact, got {request:?}").into());
         };
         assert_eq!(id, 77);
+        let request = tokio::time::timeout(Duration::from_secs(2), ui_requests.recv())
+            .await
+            .map_err(|_| "dialog request lost during broadcast lag")?
+            .ok_or("ui channel closed during dialog delivery")?;
+        let HostUiRequest::Select { id, .. } = request else {
+            return Err(format!("expected UiRequest, got {request:?}").into());
+        };
+        assert_eq!(id, 78);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unclaimed_ui_requests_self_answer_closed() -> R {
+        let (_client, mut host) = make_pair().await;
+        SELF_ANSWERED.with(|log| log.borrow_mut().clear());
+
+        host.write_frame(&Frame {
+            id: 5,
+            kind: FrameKind::Req,
+            method: Method::Select.as_str().to_owned(),
+            payload: serde_json::json!({"title": "Pick", "options": ["a"]}),
+        })
+        .await?;
+        host.write_frame(&Frame {
+            id: 6,
+            kind: FrameKind::Req,
+            method: Method::Confirm.as_str().to_owned(),
+            payload: serde_json::json!({"title": "Sure?", "message": "go"}),
+        })
+        .await?;
+
+        // Valid UI requests must get normal (non-Error) responses when no
+        // consumer ever claims the UI channel.
+        let response = tokio::time::timeout(Duration::from_secs(1), host.read_frame())
+            .await?
+            .ok_or("no select response")?;
+        assert_eq!(response.kind, FrameKind::Res);
+        assert_eq!(response.id, 5);
+        assert_eq!(response.method, Method::Select.as_str());
+        assert!(response.payload["value"].is_null());
+        let response = tokio::time::timeout(Duration::from_secs(1), host.read_frame())
+            .await?
+            .ok_or("no confirm response")?;
+        assert_eq!(response.kind, FrameKind::Res);
+        assert_eq!(response.id, 6);
+        assert_eq!(response.method, Method::Confirm.as_str());
+        assert_eq!(response.payload["confirmed"], false);
+        let answers = SELF_ANSWERED.with(|log| log.borrow().clone());
+        assert_eq!(
+            answers,
+            vec![(5, DialogEnd::Closed), (6, DialogEnd::Closed)],
+            "unclaimed delivery must classify as Closed, not another terminal end"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saturated_ui_requests_self_answer_full() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut ui_requests = client.take_ui_requests().ok_or("ui receiver missing")?;
+        SELF_ANSWERED.with(|log| log.borrow_mut().clear());
+
+        let total = CORRELATED_REQUEST_CAPACITY + 2;
+        for i in 1..=total as u64 {
+            host.write_frame(&Frame {
+                id: i,
+                kind: FrameKind::Req,
+                method: Method::Select.as_str().to_owned(),
+                payload: serde_json::json!({"title": "Pick", "options": ["a"]}),
+            })
+            .await?;
+        }
+
+        // The overflow beyond capacity self-answers with normal responses.
+        for _ in 0..2 {
+            let response = tokio::time::timeout(Duration::from_secs(1), host.read_frame())
+                .await?
+                .ok_or("missing overflow response")?;
+            assert_eq!(response.kind, FrameKind::Res);
+            assert!(response.payload["value"].is_null());
+        }
+        let answers = SELF_ANSWERED.with(|log| log.borrow().clone());
+        assert_eq!(
+            answers,
+            vec![
+                (CORRELATED_REQUEST_CAPACITY as u64 + 1, DialogEnd::Full),
+                (total as u64, DialogEnd::Full),
+            ],
+            "saturated delivery must classify as Full, not another terminal end"
+        );
+
+        // The first `CORRELATED_REQUEST_CAPACITY` requests stay queued for the
+        // consumer, in order.
+        for i in 1..=CORRELATED_REQUEST_CAPACITY as u64 {
+            let request = tokio::time::timeout(Duration::from_secs(1), ui_requests.recv())
+                .await?
+                .ok_or("ui request channel closed")?;
+            assert_eq!(request.id(), i);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closed_ui_requests_self_answer_closed() -> R {
+        let (client, mut host) = make_pair().await;
+        drop(client.take_ui_requests());
+        SELF_ANSWERED.with(|log| log.borrow_mut().clear());
+
+        host.write_frame(&Frame {
+            id: 9,
+            kind: FrameKind::Req,
+            method: Method::Select.as_str().to_owned(),
+            payload: serde_json::json!({"title": "Pick", "options": ["a"]}),
+        })
+        .await?;
+
+        let response = tokio::time::timeout(Duration::from_secs(1), host.read_frame())
+            .await?
+            .ok_or("no response after ui channel closed")?;
+        assert_eq!(response.kind, FrameKind::Res);
+        assert_eq!(response.id, 9);
+        assert!(response.payload["value"].is_null());
+        let answers = SELF_ANSWERED.with(|log| log.borrow().clone());
+        assert_eq!(
+            answers,
+            vec![(9, DialogEnd::Closed)],
+            "closed-channel delivery must classify as Closed, not another terminal end"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unclaimed_session_request_gets_error_response() -> R {
+        let (_client, mut host) = make_pair().await;
+
+        host.write_frame(&Frame {
+            id: 21,
+            kind: FrameKind::Req,
+            method: crate::protocol::SESSION_RELOAD_METHOD.to_owned(),
+            payload: serde_json::json!({}),
+        })
+        .await?;
+
+        // No consumer ever claims the session-request channel; the host must
+        // observe an explicit error, not a silent drop or timeout.
+        let response = tokio::time::timeout(Duration::from_secs(1), host.read_frame())
+            .await?
+            .ok_or("no error response for unclaimed session request")?;
+        assert_eq!(response.kind, FrameKind::Error);
+        assert_eq!(response.id, 21);
+        assert_eq!(response.method, crate::protocol::SESSION_RELOAD_METHOD);
+        assert_eq!(response.payload["retryable"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_ui_request_gets_error_response() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut ui_requests = client.take_ui_requests().ok_or("ui receiver missing")?;
+
+        host.write_frame(&Frame {
+            id: 11,
+            kind: FrameKind::Req,
+            method: Method::Select.as_str().to_owned(),
+            payload: serde_json::json!({"unexpected": "shape"}),
+        })
+        .await?;
+
+        let response = tokio::time::timeout(Duration::from_secs(1), host.read_frame())
+            .await?
+            .ok_or("no malformed-response frame")?;
+        assert_eq!(response.kind, FrameKind::Error);
+        assert_eq!(response.id, 11);
+        assert_eq!(response.method, Method::Select.as_str());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), ui_requests.recv())
+                .await
+                .is_err(),
+            "malformed UI request must not be delivered"
+        );
+        assert!(client.is_running());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_session_request_gets_error_response() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut session_requests = client
+            .take_session_requests()
+            .ok_or("session receiver missing")?;
+
+        host.write_frame(&Frame {
+            id: 12,
+            kind: FrameKind::Req,
+            method: crate::protocol::SESSION_COMPACT_METHOD.to_owned(),
+            payload: serde_json::json!({"customInstructions": 7}),
+        })
+        .await?;
+
+        let response = tokio::time::timeout(Duration::from_secs(1), host.read_frame())
+            .await?
+            .ok_or("no malformed-session frame")?;
+        assert_eq!(response.kind, FrameKind::Error);
+        assert_eq!(response.id, 12);
+        assert_eq!(response.method, crate::protocol::SESSION_COMPACT_METHOD);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), session_requests.recv())
+                .await
+                .is_err(),
+            "malformed session request must not be delivered"
+        );
+        assert!(client.is_running());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_ready_reaches_control_channel_despite_notification_lag() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe_notifications();
+        let mut control = client
+            .take_session_control()
+            .ok_or("session-control receiver missing")?;
+
+        for index in 0..=EVENT_CAPACITY {
+            host.write_frame(&Frame::event(
+                0,
+                Method::Notify,
+                serde_json::json!({"message": index}),
+            ))
+            .await?;
+        }
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "ready-after-lag"}),
+        })
+        .await?;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), control.recv())
+            .await?
+            .ok_or("session-control channel closed")?;
+        let HostSessionControlEvent::ReplacementReady { token } = event else {
+            return Err(format!("expected ReplacementReady, got {event:?}").into());
+        };
+        assert_eq!(token, "ready-after-lag");
+
+        // Session control must never enter the notification broadcast, even
+        // while that broadcast is lagging.
+        match tokio::time::timeout(Duration::from_millis(150), events.recv()).await {
+            Err(_) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(error)) => return Err(format!("notification stream failed: {error}").into()),
+            Ok(Ok(event)) => {
+                assert!(
+                    !format!("{event:?}").contains("ready-after-lag"),
+                    "session-control event leaked into notifications: {event:?}"
+                );
+            }
+        }
+        assert!(client.is_running());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_control_enqueues_while_unclaimed() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe_notifications();
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "claimed-late"}),
+        })
+        .await?;
+
+        // Unclaimed control frames still enqueue to the ordered channel; they
+        // are neither broadcast nor dropped.
+        let mut control = client
+            .take_session_control()
+            .ok_or("session-control receiver missing")?;
+        let event = tokio::time::timeout(Duration::from_secs(1), control.recv())
+            .await?
+            .ok_or("session-control channel closed")?;
+        let HostSessionControlEvent::ReplacementReady { token } = event else {
+            return Err(format!("expected ReplacementReady, got {event:?}").into());
+        };
+        assert_eq!(token, "claimed-late");
+        assert!(client.is_running());
+        match tokio::time::timeout(Duration::from_millis(150), events.recv()).await {
+            Err(_) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(error)) => return Err(format!("notification stream failed: {error}").into()),
+            Ok(Ok(event)) => {
+                assert!(
+                    !format!("{event:?}").contains("claimed-late"),
+                    "session-control event leaked into notifications: {event:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_control_channel_preserves_command_before_ready() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut control = client
+            .take_session_control()
+            .ok_or("session-control receiver missing")?;
+
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_COMMAND_METHOD.to_owned(),
+            payload: serde_json::json!({
+                "replacementToken": "ordered-token",
+                "action": "setSessionName",
+                "name": "candidate",
+            }),
+        })
+        .await?;
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "ordered-token"}),
+        })
+        .await?;
+
+        let command = tokio::time::timeout(Duration::from_secs(1), control.recv())
+            .await?
+            .ok_or("session-control channel closed")?;
+        let HostSessionControlEvent::Command(envelope) = command else {
+            return Err(format!("expected Command first, got {command:?}").into());
+        };
+        assert_eq!(envelope.replacement_token.as_deref(), Some("ordered-token"));
+        let ready = tokio::time::timeout(Duration::from_secs(1), control.recv())
+            .await?
+            .ok_or("session-control channel closed")?;
+        let HostSessionControlEvent::ReplacementReady { token } = ready else {
+            return Err(format!("expected ReplacementReady second, got {ready:?}").into());
+        };
+        assert_eq!(token, "ordered-token");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saturated_session_control_fails_transport() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe_notifications();
+        let _control = client
+            .take_session_control()
+            .ok_or("session-control receiver missing")?;
+
+        // The extra event beyond capacity saturates the ordered channel and
+        // must fail the transport instead of dropping or broadcasting.
+        for _ in 0..=(SESSION_CONTROL_CAPACITY) {
+            host.write_frame(&Frame {
+                id: 0,
+                kind: FrameKind::Event,
+                method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+                payload: serde_json::json!({"token": "saturate"}),
+            })
+            .await?;
+        }
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+        assert!(
+            matches!(
+                &event,
+                HostNotification::ProtocolError(message)
+                    if message.contains("session-control delivery failed")
+            ),
+            "expected ProtocolError, got {event:?}"
+        );
+        assert!(!client.is_running());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closed_session_control_fails_transport() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut events = client.subscribe_notifications();
+        drop(client.take_session_control());
+
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_READY_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "closed-control"}),
+        })
+        .await?;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv()).await??;
+        assert!(
+            matches!(
+                &event,
+                HostNotification::ProtocolError(message)
+                    if message.contains("session-control delivery failed")
+            ),
+            "expected ProtocolError, got {event:?}"
+        );
+        assert!(!client.is_running());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacement_abort_reaches_control_channel() -> R {
+        let (client, mut host) = make_pair().await;
+        let mut control = client
+            .take_session_control()
+            .ok_or("session-control receiver missing")?;
+
+        host.write_frame(&Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: crate::protocol::SESSION_REPLACEMENT_ABORT_METHOD.to_owned(),
+            payload: serde_json::json!({"token": "abort-token"}),
+        })
+        .await?;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), control.recv())
+            .await?
+            .ok_or("session-control channel closed")?;
+        let HostSessionControlEvent::ReplacementAbort { token } = event else {
+            return Err(format!("expected ReplacementAbort, got {event:?}").into());
+        };
+        assert_eq!(token, "abort-token");
         Ok(())
     }
 }

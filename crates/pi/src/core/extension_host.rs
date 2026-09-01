@@ -29,7 +29,8 @@ use pi_ext::adapters::{
     ToolRegistration,
 };
 use pi_ext::client::{
-    HostClient, HostClientError, HostEvent, HostSessionControlEvent, HostUiRequest, HostUiResponse,
+    HostClient, HostClientError, HostNotification, HostSessionControlEvent, HostSessionRequest,
+    HostUiRequest, HostUiResponse,
 };
 use pi_ext::host::{self, HostError, HostSpec};
 use pi_ext::protocol::{
@@ -707,9 +708,6 @@ struct Inner {
     provider_events_tx: broadcast::Sender<ProviderEvent>,
     errors_tx: broadcast::Sender<ExtensionErrorEvent>,
     ui_tx: broadcast::Sender<ExtensionUiEvent>,
-    ui_requests_tx: mpsc::Sender<HostUiRequest>,
-    ui_requests_rx: StdMutex<Option<mpsc::Receiver<HostUiRequest>>>,
-    ui_requests_claimed: AtomicBool,
     session_bridge_tx: mpsc::Sender<SessionBridgeEvent>,
     session_bridge_rx: StdMutex<Option<mpsc::Receiver<SessionBridgeEvent>>>,
     session_bridge_claimed: AtomicBool,
@@ -756,7 +754,6 @@ impl Inner {
         let (provider_events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (errors_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (ui_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let (ui_requests_tx, ui_requests_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (session_bridge_tx, session_bridge_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let flag_values = snapshot.flag_values.clone();
         Self {
@@ -768,9 +765,6 @@ impl Inner {
             provider_events_tx,
             errors_tx,
             ui_tx,
-            ui_requests_tx,
-            ui_requests_rx: StdMutex::new(Some(ui_requests_rx)),
-            ui_requests_claimed: AtomicBool::new(false),
             session_bridge_tx,
             session_bridge_rx: StdMutex::new(Some(session_bridge_rx)),
             session_bridge_claimed: AtomicBool::new(false),
@@ -1623,18 +1617,7 @@ impl HostExtensionRunner {
     /// receive `None`, preventing two modes from racing responses.
     #[must_use]
     pub fn take_ui_requests(&self) -> Option<mpsc::Receiver<HostUiRequest>> {
-        let receiver = self
-            .inner
-            .ui_requests_rx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if receiver.is_some() {
-            self.inner
-                .ui_requests_claimed
-                .store(true, Ordering::Release);
-        }
-        receiver
+        self.inner.client.take_ui_requests()
     }
 
     /// Answer a correlated host-initiated dialog request.
@@ -2120,20 +2103,15 @@ fn clone_registry(source: &Registry) -> Registry {
 /// subscribers; on fatal host conditions marks the runner disabled and emits a
 /// single non-retryable `extension_error`.
 ///
-/// Install-before-subscribe keeps every session-control frame on one ordered
-/// path. Valid replacement traffic cannot exist before this runner is published.
+/// Three explicit input classes, drained biased in this order: lossless
+/// correlated session requests, ordered session control, then lossy
+/// notifications. Valid replacement traffic cannot exist before this runner is
+/// published.
 #[allow(clippy::too_many_lines)]
 fn spawn_event_pump(inner: Arc<Inner>) {
-    let control_inner = Arc::downgrade(&inner);
-    inner
-        .client
-        .set_session_control_handler(Some(Arc::new(move |event| {
-            if let Some(inner) = control_inner.upgrade() {
-                deliver_session_control(&inner, event);
-            }
-        })));
-    let mut rx = inner.client.subscribe();
-    let mut correlated = inner.client.take_correlated_requests();
+    let mut notifications = inner.client.subscribe_notifications();
+    let mut session_requests = inner.client.take_session_requests();
+    let mut session_control = inner.client.take_session_control();
     tokio::spawn(async move {
         if !inner.client.is_running() {
             inner.disabled.store(true, Ordering::Relaxed);
@@ -2142,65 +2120,63 @@ fn spawn_event_pump(inner: Arc<Inner>) {
             return;
         }
         loop {
-            // Correlated requests use a bounded lossless mpsc so every accepted
-            // request reaches exactly one consumer; notifications and slot
-            // updates stay on the lossy broadcast. The `select!` is biased so
-            // the lossless channel is drained before polling the broadcast,
-            // preserving request ordering relative to notifications.
             tokio::select! {
                 biased;
-                correlated_event = async { match &mut correlated {
+                // Lossless correlated session requests: every accepted request
+                // must reach exactly one consumer or receive an explicit error
+                // response, so this class drains first.
+                request = async { match &mut session_requests {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }} => {
-                    match correlated_event {
-                        Some(HostEvent::SetModelRequest { id, request }) => {
+                    match request {
+                        Some(HostSessionRequest::SetModel { id, request }) => {
                             forward_session_bridge(
                                 &inner,
                                 SessionBridgeEvent::SetModel { id, request },
                             )
                             .await;
                         }
-                        Some(HostEvent::CompactRequest { id, request }) => {
+                        Some(HostSessionRequest::Compact { id, request }) => {
                             forward_session_bridge(
                                 &inner,
                                 SessionBridgeEvent::Compact { id, request },
                             )
                             .await;
                         }
-                        Some(HostEvent::NewSessionRequest { id, request }) => {
+                        Some(HostSessionRequest::NewSession { id, request }) => {
                             forward_session_bridge(
                                 &inner,
                                 SessionBridgeEvent::NewSession { id, request },
                             )
                             .await;
                         }
-                        Some(HostEvent::ForkRequest { id, request }) => {
+                        Some(HostSessionRequest::Fork { id, request }) => {
                             forward_session_bridge(
                                 &inner,
                                 SessionBridgeEvent::Fork { id, request },
                             )
                             .await;
                         }
-                        Some(HostEvent::NavigateTreeRequest { id, request }) => {
+                        Some(HostSessionRequest::NavigateTree { id, request }) => {
                             forward_session_bridge(
                                 &inner,
                                 SessionBridgeEvent::NavigateTree { id, request },
                             )
                             .await;
                         }
-                        Some(HostEvent::SwitchSessionRequest { id, request }) => {
+                        Some(HostSessionRequest::SwitchSession { id, request }) => {
                             forward_session_bridge(
                                 &inner,
                                 SessionBridgeEvent::SwitchSession { id, request },
                             )
                             .await;
                         }
-                        Some(HostEvent::ReloadRequest { id }) => {
+                        Some(HostSessionRequest::Reload { id }) => {
                             forward_session_bridge(&inner, SessionBridgeEvent::Reload { id })
                                 .await;
                         }
-                        Some(HostEvent::SetupEntriesRequest { id, request }) => {
+                        Some(HostSessionRequest::SetupEntries { id, request }) => {
                             forward_session_bridge(
                                 &inner,
                                 SessionBridgeEvent::SetupEntries {
@@ -2211,76 +2187,71 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                             )
                             .await;
                         }
-                        Some(_) => {
-                            // Non-correlated events on the lossless channel are
-                            // unexpected but harmless; the broadcast path handles them.
-                        }
                         None => {
-                            // Consumer not yet claimed or dropped; the client
-                            // already sent an error response for any pending request.
-                            correlated = None;
+                            // Channel closed (client gone); park this class.
+                            session_requests = None;
                         }
                     }
                 }
-                broadcast_event = rx.recv() => match broadcast_event {
-                    Ok(HostEvent::UiRequest(request)) => {
-                        if !inner.active()
-                            || !inner.ui_requests_claimed.load(Ordering::Acquire)
-                        {
-                            let _ = inner.client.respond_ui(default_ui_response(&request)).await;
-                        } else if let Err(error) = inner.ui_requests_tx.send(request).await {
-                            let _ = inner.client.respond_ui(default_ui_response(&error.0)).await;
+                // Ordered session control: must not be lost or reordered.
+                control = async { match &mut session_control {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }} => {
+                    match control {
+                        Some(event) => deliver_session_control(&inner, event),
+                        None => {
+                            session_control = None;
                         }
                     }
-                    Ok(HostEvent::Notify(notification)) => {
+                }
+                notification = notifications.recv() => match notification {
+                    Ok(HostNotification::Notify(notification)) => {
                         inner.notify_send(notification);
                     }
-                    Ok(HostEvent::ThemeSet(set)) => {
+                    Ok(HostNotification::ThemeSet(set)) => {
                         inner.theme_set_send(set);
                     }
-                    Ok(HostEvent::UiControl(control)) => {
+                    Ok(HostNotification::UiControl(control)) => {
                         inner.ui_control_send(control);
                     }
-                    Ok(HostEvent::SessionCommand(envelope)) => {
-                        deliver_session_control(
-                            &inner,
-                            HostSessionControlEvent::Command(envelope),
-                        );
-                    }
-                    Ok(HostEvent::ReplacementAbort { token }) => {
-                        deliver_session_control(
-                            &inner,
-                            HostSessionControlEvent::ReplacementAbort { token },
-                        );
-                    }
-                    Ok(HostEvent::ReplacementReady { token }) => {
-                        deliver_session_control(
-                            &inner,
-                            HostSessionControlEvent::ReplacementReady { token },
-                        );
-                    }
-                    Ok(HostEvent::UiSlot(slot)) => {
+                    Ok(HostNotification::UiSlot(slot)) => {
                         forward_slot(&inner, &slot);
                     }
-                    Ok(HostEvent::DisposeSlot(d)) => {
+                    Ok(HostNotification::DisposeSlot(d)) => {
                         forward_dispose(&inner, &d);
                     }
-                    Ok(HostEvent::ToolUpdate(update)) => {
+                    Ok(HostNotification::ToolUpdate(update)) => {
                         let _ = inner.tool_updates_tx.send(update);
                     }
-                    Ok(HostEvent::ProviderEvent(event)) => {
+                    Ok(HostNotification::ProviderEvent(event)) => {
                         let _ = inner.provider_events_tx.send(event);
                     }
-                    Ok(HostEvent::ExtensionError(event)) => {
+                    Ok(HostNotification::ExtensionError(event)) => {
                         let _ = inner.errors_tx.send(event);
                     }
-                    Ok(HostEvent::Raw(frame)) => {
+                    Ok(HostNotification::Raw(frame)) => {
                         inner.disabled.store(true, Ordering::Relaxed);
                         inner.publish_error(
                             "extension_protocol",
                             &format!("unhandled host frame: {} {}", frame.kind, frame.method),
                             None,
                         );
+                        HostExtensionRunner::shutdown_once_with_inner(&inner).await;
+                        break;
+                    }
+                    Ok(HostNotification::Eof) => {
+                        // Host stdout closed: fatal. Disable once, report, then
+                        // shut down / reap the transport exactly once before exit.
+                        inner.disabled.store(true, Ordering::Relaxed);
+                        inner
+                            .publish_error("extension_closed", "extension host stream closed", None);
+                        HostExtensionRunner::shutdown_once_with_inner(&inner).await;
+                        break;
+                    }
+                    Ok(HostNotification::ProtocolError(message)) => {
+                        inner.disabled.store(true, Ordering::Relaxed);
+                        inner.publish_error("extension_protocol", &message, None);
                         HostExtensionRunner::shutdown_once_with_inner(&inner).await;
                         break;
                     }
@@ -2291,34 +2262,6 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                             None,
                         );
                     }
-                    Ok(HostEvent::Eof) => {
-                        // Host stdout closed: fatal. Disable once, report, then
-                        // shut down / reap the transport exactly once before exit.
-                        inner.disabled.store(true, Ordering::Relaxed);
-                        inner
-                            .publish_error("extension_closed", "extension host stream closed", None);
-                        HostExtensionRunner::shutdown_once_with_inner(&inner).await;
-                        break;
-                    }
-                    Ok(HostEvent::ProtocolError(message)) => {
-                        inner.disabled.store(true, Ordering::Relaxed);
-                        inner.publish_error("extension_protocol", &message, None);
-                        HostExtensionRunner::shutdown_once_with_inner(&inner).await;
-                        break;
-                    }
-                    // Correlated request variants no longer arrive through the
-                    // broadcast (they use the lossless mpsc). Match them to keep
-                    // the match exhaustive without `_ =>` masking new variants.
-                    Ok(
-                        HostEvent::SetModelRequest { .. }
-                        | HostEvent::CompactRequest { .. }
-                        | HostEvent::NewSessionRequest { .. }
-                        | HostEvent::ForkRequest { .. }
-                        | HostEvent::NavigateTreeRequest { .. }
-                        | HostEvent::SwitchSessionRequest { .. }
-                        | HostEvent::ReloadRequest { .. }
-                        | HostEvent::SetupEntriesRequest { .. },
-                    ) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -2485,27 +2428,6 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
                 .respond_reload(id, Err("no active session".to_owned()))
                 .await;
         }
-    }
-}
-
-pub(crate) fn default_ui_response(request: &HostUiRequest) -> HostUiResponse {
-    match request {
-        HostUiRequest::Select { id, .. } => HostUiResponse::Select {
-            id: *id,
-            value: None,
-        },
-        HostUiRequest::Confirm { id, .. } => HostUiResponse::Confirm {
-            id: *id,
-            confirmed: false,
-        },
-        HostUiRequest::Input { id, .. } => HostUiResponse::Input {
-            id: *id,
-            value: None,
-        },
-        HostUiRequest::Editor { id, .. } => HostUiResponse::Editor {
-            id: *id,
-            value: None,
-        },
     }
 }
 
@@ -3139,7 +3061,6 @@ impl HostExtensionRunner {
         // Order matters for the slot_send/slot_dispose teardown gate: the
         // flag must be set before dispose_all_slots takes the slots lock.
         inner.disabled.store(true, Ordering::Relaxed);
-        inner.client.set_session_control_handler(None);
         inner.dispose_all_slots();
         let _ = inner.client.shutdown().await;
     }

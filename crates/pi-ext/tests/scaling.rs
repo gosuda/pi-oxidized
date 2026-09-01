@@ -10,7 +10,7 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 
 use pi_ext::adapters::SlotComponent;
-use pi_ext::client::{HostClient, HostEvent, HostResult};
+use pi_ext::client::{HostClient, HostNotification, HostResult};
 use pi_ext::protocol::{
     Frame, FrameKind, HelloAck, Method, SlotPlacement, StyledRun, TerminalInputResult, UiSlot,
     decode_frame_str, encode_frame, from_payload, to_payload,
@@ -211,7 +211,7 @@ async fn idle_extensions_do_not_inflate_native_paint() -> R {
 #[tokio::test]
 async fn active_widget_burst_drops_stale_and_stays_responsive() -> R {
     let (client, mut host) = make_pair();
-    let mut sub = client.subscribe();
+    let mut sub = client.subscribe_notifications();
 
     let client_task = tokio::spawn(async move {
         client.handshake().await?;
@@ -253,7 +253,7 @@ async fn active_widget_burst_drops_stale_and_stays_responsive() -> R {
     )
     .await
     {
-        if let HostEvent::UiSlot(slot) = ev {
+        if let HostNotification::UiSlot(slot) = ev {
             seen.push((slot.key, slot.generation));
         }
     }
