@@ -19,6 +19,7 @@ import {
 	METHODS,
 	PROTOCOL_VERSION,
 } from "../src/types.ts";
+import { verifyWitness, type WitnessManifest } from "./witness-check.ts";
 
 const fixturesPath = join(
 	dirname(fileURLToPath(import.meta.url)),
@@ -272,59 +273,73 @@ describe("shared fixtures", () => {
 });
 
 describe("witness manifest lockstep", () => {
-	// The single (method, kind) witness-manifest lockstep test (XC-2).
-	// Both language sides consume witness-manifest.json by name — parity
-	// does not create a second check.  Deleting any fixture line or
-	// mutating a modifier-combo key event kind breaks this test.
+	// The single (method, kind) witness-manifest lockstep test (XC-2, ARC11).
+	// Both language sides consume witness-manifest.json by name — parity does
+	// not create a second check. All rules live in verifyWitness; the tests
+	// below assert the identity holds and that every mutation operator is
+	// killed with a specific, named violation.
 	const manifestPath = join(
 		dirname(fileURLToPath(import.meta.url)),
 		"fixtures",
 		"witness-manifest.json",
 	);
-	const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-		totalLines: number;
-		methodKindPairs: [string, string][];
-		modifierComboKeyEvents: {
-			code: string;
-			modifiers: Record<string, boolean>;
-			kind: string;
-		}[];
-	};
+	const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as WitnessManifest;
+	const fixturesText = () => readFileSync(fixturesPath, "utf8");
 
-	test("total non-blank line count matches manifest", () => {
-		const text = readFileSync(fixturesPath, "utf8");
-		let count = 0;
-		for (const line of text.split("\n")) {
-			if (line.trim() === "" || line.trimStart().startsWith("#")) {
-				continue;
-			}
-			count += 1;
-		}
-		expect(count).toBe(manifest.totalLines);
+	test("verifyWitness reports no violations for the committed artifacts", () => {
+		expect(verifyWitness(fixturesText(), manifest)).toEqual([]);
 	});
 
-	test("every manifest (method, kind) pair is witnessed in frames.jsonl", () => {
-		const text = readFileSync(fixturesPath, "utf8");
-		const seen = new Set<string>();
-		for (const line of text.split("\n")) {
-			if (line.trim() === "" || line.trimStart().startsWith("#")) {
-				continue;
-			}
-			const frame = decodeFrameStr(line);
-			seen.add(`${frame.method}:${frame.kind}`);
-		}
-		for (const [method, kind] of manifest.methodKindPairs) {
-			expect(seen).toContain(`${method}:${kind}`);
-		}
-		// Every seen pair must also be in the manifest (no untracked fixtures).
-		for (const key of seen) {
-			const [method, kind] = key.split(":");
-			expect(manifest.methodKindPairs).toContainEqual([method, kind]);
-		}
+	test("M1: flipping one payload byte yields a named violation", () => {
+		const mutated = fixturesText().replace('"title"', '"titel"');
+		expect(mutated).not.toBe(fixturesText());
+		const violations = verifyWitness(mutated, manifest);
+		expect(violations.some((v) => v.startsWith("fixtureSha256 mismatch"))).toBe(true);
 	});
 
-	test("modifier-combo key events match manifest exactly", () => {
-		const text = readFileSync(fixturesPath, "utf8");
+	test("M2: dropping one line breaks totalLines and a pair", () => {
+		const lines = fixturesText().split("\n").filter((line) => line.trim() !== "");
+		const index = lines.findIndex((line) => line.includes('"method":"tool.cancel"'));
+		expect(index).toBeGreaterThanOrEqual(0);
+		lines.splice(index, 1);
+		const violations = verifyWitness(lines.join("\n"), manifest);
+		expect(violations.some((v) => v.startsWith("totalLines mismatch"))).toBe(true);
+		expect(violations.some((v) => v.startsWith("missing pair"))).toBe(true);
+	});
+
+	test("M3: swapping two lifecycle discriminants fails at a named index", () => {
+		const swapped: WitnessManifest = {
+			...manifest,
+			lifecycleDiscriminants: [...manifest.lifecycleDiscriminants],
+		};
+		const [a] = swapped.lifecycleDiscriminants;
+		swapped.lifecycleDiscriminants[0] = swapped.lifecycleDiscriminants[1];
+		swapped.lifecycleDiscriminants[1] = a;
+		const violations = verifyWitness(fixturesText(), swapped);
+		expect(violations.some((v) => v.includes("discriminant mismatch at index 0"))).toBe(true);
+	});
+
+	test("M5: an untracked appended frame is rejected by name", () => {
+		const untracked =
+			'{"id":900,"kind":"req","method":"who.is","payload":{}}';
+		const violations = verifyWitness(`${fixturesText()}\n${untracked}\n`, {
+			...manifest,
+			totalLines: manifest.totalLines + 1,
+		});
+		expect(
+			violations.some((v) => v.startsWith("untracked pair not in manifest")),
+		).toBe(true);
+	});
+
+	test("M6: duplicating one line breaks totalLines", () => {
+		const lines = fixturesText().split("\n").filter((line) => line.trim() !== "");
+		lines.push(lines[lines.length - 1]);
+		const violations = verifyWitness(lines.join("\n"), manifest);
+		expect(violations.some((v) => v.startsWith("totalLines mismatch"))).toBe(true);
+	});
+
+	test("modifier-combo key events still match manifest exactly", () => {
+		const text = fixturesText();
 		const keyEvents: typeof manifest.modifierComboKeyEvents = [];
 		for (const line of text.split("\n")) {
 			if (line.trim() === "" || line.trimStart().startsWith("#")) {

@@ -33,6 +33,8 @@
 		"verify:extension-scaling": "bun run scripts/bench-extension-scaling.ts",
 		"gen:compat-docs": "bun run scripts/verification/generate-compat-docs.ts",
 		"verify:compat-docs": "bun run scripts/verification/generate-compat-docs.ts",
+		"gen:witness": "bun run scripts/verification/gen-witness.ts",
+		"verify:witness": "bun run scripts/verification/gen-witness.ts --check",
 		"gen:execution-map": "bun run scripts/verification/fetch-map-source.ts | bun run scripts/verification/publish-map.ts"
 	},
 	"devDependencies": {

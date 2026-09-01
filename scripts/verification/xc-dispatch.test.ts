@@ -13,6 +13,8 @@ import {
 	verifyToolCallInPlaceComparison,
 	verifyToolCallTerminateForwarding,
 	verifyEventMirrorParity,
+	verifyWitnessLifecycleParity,
+	verifyWitnessMethodCoverage,
 } from "./xc-dispatch.ts";
 
 const INPUTS = loadXcDispatchInputs(REPO_ROOT);
@@ -183,6 +185,61 @@ describe("XC-6 hook-dispatch semantics lattice witnesses", () => {
 	});
 
 	// --- Mutable-hook class coverage ---
+
+	// --- ARC11 witness gates ---
+
+	test("witness manifest lifecycle parity holds for the real repository", () => {
+		expect(
+			verifyWitnessLifecycleParity(INPUTS.rustHostSource, INPUTS.witnessManifestSource),
+		).toEqual([]);
+	});
+
+	test("M4: mutating the Rust ALL_EVENT_TYPES source fails the parity witness by index", () => {
+		const mutated = INPUTS.rustHostSource.replace(
+			/"project_trust",\n/,
+			'"input",\n\t"project_trust",\n',
+		);
+		expect(mutated).not.toBe(INPUTS.rustHostSource);
+		const violations = verifyWitnessLifecycleParity(
+			mutated,
+			INPUTS.witnessManifestSource,
+		);
+		expect(
+			violations.some((v) => v.includes('discriminant mismatch at index 0')),
+		).toBe(true);
+	});
+
+	test("witness method coverage holds for the real repository", () => {
+		expect(
+			verifyWitnessMethodCoverage(
+				INPUTS.witnessManifestSource,
+				INPUTS.protocolSource,
+				INPUTS.serverSource,
+				INPUTS.adaptersSource,
+			),
+		).toEqual([]);
+	});
+
+	test("method coverage scanner: a constant the manifest lacks is named", () => {
+		const manifest = JSON.parse(INPUTS.witnessManifestSource) as {
+			methodKindPairs: [string, string][];
+		};
+		const stripped = {
+			...manifest,
+			methodKindPairs: manifest.methodKindPairs.filter(
+				([method]) => method !== "tool.cancel",
+			),
+		};
+		const violations = verifyWitnessMethodCoverage(
+			JSON.stringify(stripped),
+			INPUTS.protocolSource,
+			INPUTS.serverSource,
+			INPUTS.adaptersSource,
+		);
+		expect(
+			violations.some((v) => v.includes('"tool.cancel" has no witnessed fixture pair')),
+		).toBe(true);
+	});
 
 	test("every mutable-hook class has ≥1 witness in test suites", () => {
 		expect(verifyMutableHookCoverage(INPUTS.hostTestSource, INPUTS.leanTestSource, INPUTS.endpointTestSource)).toEqual([]);

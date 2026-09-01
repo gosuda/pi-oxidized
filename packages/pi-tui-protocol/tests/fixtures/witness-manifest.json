@@ -1,74 +1,562 @@
 {
-	"totalLines": 80,
+	"generator": "scripts/verification/gen-witness.ts",
+	"totalLines": 147,
 	"methodKindPairs": [
-		["confirm", "req"],
-		["confirm", "res"],
-		["disposeSlot", "event"],
-		["editor", "req"],
-		["editor", "res"],
-		["extensionError", "event"],
-		["flags.set", "req"],
-		["flags.set", "res"],
-		["hello", "req"],
-		["hello", "res"],
-		["input", "req"],
-		["input", "res"],
-		["measure", "req"],
-		["measure", "res"],
-		["notify", "req"],
-		["notify", "res"],
-		["providerEvent", "event"],
-		["providers.update", "event"],
-		["render", "error"],
-		["render", "req"],
-		["render", "res"],
-		["select", "req"],
-		["select", "res"],
-		["session.command", "event"],
-		["session.compact", "error"],
-		["session.compact", "req"],
-		["session.compact", "res"],
-		["session.fork", "error"],
-		["session.fork", "req"],
-		["session.fork", "res"],
-		["session.navigateTree", "error"],
-		["session.navigateTree", "req"],
-		["session.navigateTree", "res"],
-		["session.newSession", "error"],
-		["session.newSession", "req"],
-		["session.newSession", "res"],
-		["session.reload", "error"],
-		["session.reload", "req"],
-		["session.reload", "res"],
-		["session.replacementAbort", "event"],
-		["session.replacementReady", "event"],
-		["session.setModel", "error"],
-		["session.setModel", "req"],
-		["session.setModel", "res"],
-		["session.setupEntries", "error"],
-		["session.setupEntries", "req"],
-		["session.setupEntries", "res"],
-		["session.switchSession", "error"],
-		["session.switchSession", "req"],
-		["session.switchSession", "res"],
-		["session.update", "event"],
-		["shortcut.execute", "req"],
-		["shortcut.execute", "res"],
-		["terminalInput", "req"],
-		["terminalInput", "res"],
-		["theme.set", "event"],
-		["theme.update", "event"],
-		["toolUpdate", "event"],
-		["ui.control", "event"],
-		["ui.state", "event"],
-		["uiEvent", "req"],
-		["uiSlot", "event"]
+		[
+			"after_provider_response",
+			"req"
+		],
+		[
+			"agent_end",
+			"req"
+		],
+		[
+			"agent_settled",
+			"req"
+		],
+		[
+			"agent_start",
+			"req"
+		],
+		[
+			"before_agent_start",
+			"req"
+		],
+		[
+			"before_provider_headers",
+			"req"
+		],
+		[
+			"before_provider_request",
+			"req"
+		],
+		[
+			"command.execute",
+			"req"
+		],
+		[
+			"command.execute",
+			"res"
+		],
+		[
+			"confirm",
+			"req"
+		],
+		[
+			"confirm",
+			"res"
+		],
+		[
+			"context",
+			"req"
+		],
+		[
+			"disposeSlot",
+			"event"
+		],
+		[
+			"editor",
+			"req"
+		],
+		[
+			"editor",
+			"res"
+		],
+		[
+			"extensionError",
+			"event"
+		],
+		[
+			"extensions.load",
+			"req"
+		],
+		[
+			"extensions.load",
+			"res"
+		],
+		[
+			"flags.set",
+			"req"
+		],
+		[
+			"flags.set",
+			"res"
+		],
+		[
+			"hello",
+			"req"
+		],
+		[
+			"hello",
+			"res"
+		],
+		[
+			"input",
+			"req"
+		],
+		[
+			"input",
+			"res"
+		],
+		[
+			"measure",
+			"req"
+		],
+		[
+			"measure",
+			"res"
+		],
+		[
+			"message_end",
+			"req"
+		],
+		[
+			"message_end",
+			"res"
+		],
+		[
+			"message_start",
+			"req"
+		],
+		[
+			"message_update",
+			"error"
+		],
+		[
+			"message_update",
+			"req"
+		],
+		[
+			"message_update_delta",
+			"req"
+		],
+		[
+			"message_update_delta",
+			"res"
+		],
+		[
+			"model_select",
+			"req"
+		],
+		[
+			"notify",
+			"req"
+		],
+		[
+			"notify",
+			"res"
+		],
+		[
+			"project_trust",
+			"req"
+		],
+		[
+			"project_trust",
+			"res"
+		],
+		[
+			"provider.cancel",
+			"event"
+		],
+		[
+			"provider.stream",
+			"error"
+		],
+		[
+			"provider.stream",
+			"req"
+		],
+		[
+			"provider.stream",
+			"res"
+		],
+		[
+			"providerEvent",
+			"event"
+		],
+		[
+			"providers.update",
+			"event"
+		],
+		[
+			"render",
+			"error"
+		],
+		[
+			"render",
+			"req"
+		],
+		[
+			"render",
+			"res"
+		],
+		[
+			"resources_discover",
+			"req"
+		],
+		[
+			"select",
+			"req"
+		],
+		[
+			"select",
+			"res"
+		],
+		[
+			"session.command",
+			"event"
+		],
+		[
+			"session.compact",
+			"error"
+		],
+		[
+			"session.compact",
+			"req"
+		],
+		[
+			"session.compact",
+			"res"
+		],
+		[
+			"session.fork",
+			"error"
+		],
+		[
+			"session.fork",
+			"req"
+		],
+		[
+			"session.fork",
+			"res"
+		],
+		[
+			"session.navigateTree",
+			"error"
+		],
+		[
+			"session.navigateTree",
+			"req"
+		],
+		[
+			"session.navigateTree",
+			"res"
+		],
+		[
+			"session.newSession",
+			"error"
+		],
+		[
+			"session.newSession",
+			"req"
+		],
+		[
+			"session.newSession",
+			"res"
+		],
+		[
+			"session.reload",
+			"error"
+		],
+		[
+			"session.reload",
+			"req"
+		],
+		[
+			"session.reload",
+			"res"
+		],
+		[
+			"session.replacementAbort",
+			"event"
+		],
+		[
+			"session.replacementReady",
+			"event"
+		],
+		[
+			"session.setModel",
+			"error"
+		],
+		[
+			"session.setModel",
+			"req"
+		],
+		[
+			"session.setModel",
+			"res"
+		],
+		[
+			"session.setupEntries",
+			"error"
+		],
+		[
+			"session.setupEntries",
+			"req"
+		],
+		[
+			"session.setupEntries",
+			"res"
+		],
+		[
+			"session.switchSession",
+			"error"
+		],
+		[
+			"session.switchSession",
+			"req"
+		],
+		[
+			"session.switchSession",
+			"res"
+		],
+		[
+			"session.update",
+			"event"
+		],
+		[
+			"session_before_compact",
+			"req"
+		],
+		[
+			"session_before_fork",
+			"req"
+		],
+		[
+			"session_before_switch",
+			"req"
+		],
+		[
+			"session_before_tree",
+			"req"
+		],
+		[
+			"session_compact",
+			"req"
+		],
+		[
+			"session_info_changed",
+			"req"
+		],
+		[
+			"session_shutdown",
+			"req"
+		],
+		[
+			"session_start",
+			"req"
+		],
+		[
+			"session_tree",
+			"req"
+		],
+		[
+			"shortcut.execute",
+			"req"
+		],
+		[
+			"shortcut.execute",
+			"res"
+		],
+		[
+			"terminalInput",
+			"req"
+		],
+		[
+			"terminalInput",
+			"res"
+		],
+		[
+			"theme.set",
+			"event"
+		],
+		[
+			"theme.update",
+			"event"
+		],
+		[
+			"thinking_level_select",
+			"req"
+		],
+		[
+			"tool.cancel",
+			"event"
+		],
+		[
+			"tool.execute",
+			"error"
+		],
+		[
+			"tool.execute",
+			"req"
+		],
+		[
+			"tool.execute",
+			"res"
+		],
+		[
+			"tool.prepare",
+			"req"
+		],
+		[
+			"tool.prepare",
+			"res"
+		],
+		[
+			"tool.renderHtml",
+			"req"
+		],
+		[
+			"tool.renderHtml",
+			"res"
+		],
+		[
+			"tool.validate",
+			"req"
+		],
+		[
+			"tool.validate",
+			"res"
+		],
+		[
+			"toolUpdate",
+			"event"
+		],
+		[
+			"tool_call",
+			"req"
+		],
+		[
+			"tool_call",
+			"res"
+		],
+		[
+			"tool_execution_end",
+			"req"
+		],
+		[
+			"tool_execution_start",
+			"req"
+		],
+		[
+			"tool_execution_update",
+			"req"
+		],
+		[
+			"tool_result",
+			"req"
+		],
+		[
+			"turn_end",
+			"req"
+		],
+		[
+			"turn_start",
+			"req"
+		],
+		[
+			"ui.control",
+			"event"
+		],
+		[
+			"ui.state",
+			"event"
+		],
+		[
+			"uiEvent",
+			"req"
+		],
+		[
+			"uiSlot",
+			"event"
+		],
+		[
+			"ui_prompt_end",
+			"req"
+		],
+		[
+			"ui_prompt_start",
+			"req"
+		],
+		[
+			"user_bash",
+			"req"
+		]
+	],
+	"lifecycleDiscriminants": [
+		"project_trust",
+		"resources_discover",
+		"session_start",
+		"session_info_changed",
+		"session_before_switch",
+		"session_before_fork",
+		"session_before_compact",
+		"session_compact",
+		"session_shutdown",
+		"session_before_tree",
+		"session_tree",
+		"context",
+		"before_provider_request",
+		"before_provider_headers",
+		"after_provider_response",
+		"before_agent_start",
+		"agent_start",
+		"agent_end",
+		"agent_settled",
+		"ui_prompt_start",
+		"ui_prompt_end",
+		"turn_start",
+		"turn_end",
+		"message_start",
+		"message_update",
+		"message_end",
+		"tool_execution_start",
+		"tool_execution_update",
+		"tool_execution_end",
+		"model_select",
+		"thinking_level_select",
+		"tool_call",
+		"tool_result",
+		"user_bash",
+		"input"
 	],
 	"modifierComboKeyEvents": [
-		{"code": "enter", "modifiers": {"ctrl": true}, "kind": "press"},
-		{"code": "a", "modifiers": {"shift": true}, "kind": "press"},
-		{"code": "b", "modifiers": {"alt": true}, "kind": "release"},
-		{"code": "c", "modifiers": {"superKey": true}, "kind": "repeat"},
-		{"code": "d", "modifiers": {"ctrl": true, "shift": true}, "kind": "release"}
-	]
+		{
+			"code": "enter",
+			"modifiers": {
+				"ctrl": true
+			},
+			"kind": "press"
+		},
+		{
+			"code": "a",
+			"modifiers": {
+				"shift": true
+			},
+			"kind": "press"
+		},
+		{
+			"code": "b",
+			"modifiers": {
+				"alt": true
+			},
+			"kind": "release"
+		},
+		{
+			"code": "c",
+			"modifiers": {
+				"superKey": true
+			},
+			"kind": "repeat"
+		},
+		{
+			"code": "d",
+			"modifiers": {
+				"ctrl": true,
+				"shift": true
+			},
+			"kind": "release"
+		}
+	],
+	"fixtureSha256": "e75b821c271c708d4d9f282298bf7f1968276bce3b0845879ff9445da78b4677"
 }

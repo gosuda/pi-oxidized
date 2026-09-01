@@ -345,6 +345,31 @@ async fn load_reports_all_35_handlers_and_registry_surfaces() -> R {
     Ok(())
 }
 
+/// ARC11: the generated cross-language witness manifest is bound to the Rust
+/// lifecycle authority by ordered, exact equality. The generator parses
+/// `ALL_EVENT_TYPES` from this crate's source, so this test proves the
+/// committed artifact cannot drift from the authority — a reordered, added,
+/// or dropped discriminant fails here by name and index.
+#[test]
+fn witness_manifest_matches_all_event_types() {
+    const WITNESS_MANIFEST: &str = include_str!(
+        "../../../../../packages/pi-tui-protocol/tests/fixtures/witness-manifest.json"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(WITNESS_MANIFEST).expect("witness-manifest.json must parse");
+    let declared = manifest["lifecycleDiscriminants"]
+        .as_array()
+        .expect("lifecycleDiscriminants array");
+    let declared: Vec<&str> = declared
+        .iter()
+        .map(|name| name.as_str().expect("discriminant must be a string"))
+        .collect();
+    assert_eq!(
+        declared, ALL_EVENT_TYPES,
+        "witness manifest lifecycle discriminants drifted from ALL_EVENT_TYPES"
+    );
+}
+
 #[tokio::test]
 async fn native_boolean_flag_default_decodes_and_preserves_typed_fallback() -> R {
     let snapshot = json!({

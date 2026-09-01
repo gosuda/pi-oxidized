@@ -119,6 +119,12 @@ export interface XcDispatchInputs {
 	leanApiSource: string;
 	/** Contents of `crates/pi/src/core/extension_host.rs`. */
 	rustHostSource: string;
+	/** Generated witness manifest JSON. */
+	witnessManifestSource: string;
+	/** pi-ext protocol, server, and adapter sources. */
+	protocolSource: string;
+	serverSource: string;
+	adaptersSource: string;
 }
 
 export function loadXcDispatchInputs(root: string): XcDispatchInputs {
@@ -132,6 +138,10 @@ export function loadXcDispatchInputs(root: string): XcDispatchInputs {
 		leanTestSource: read("packages/extension-host/tests/lean.test.ts"),
 		leanApiSource: read("packages/extension-host/src/lean-api.ts"),
 		rustHostSource: read("crates/pi/src/core/extension_host.rs"),
+		witnessManifestSource: read("packages/pi-tui-protocol/tests/fixtures/witness-manifest.json"),
+		protocolSource: read("crates/pi-ext/src/protocol.rs"),
+		serverSource: read("crates/pi-ext/src/server.rs"),
+		adaptersSource: read("crates/pi-ext/src/adapters.rs"),
 	};
 }
 // ============================================================================
@@ -156,7 +166,7 @@ function parseTsConstArray(source: string, arrayName: string): string[] | null {
  * Parse a Rust `pub const NAME: &[&str] = &[...];` string array.
  * Returns the list of discriminants, or null when the array is not found.
  */
-function parseRustConstArray(source: string, arrayName: string): string[] | null {
+export function parseRustConstArray(source: string, arrayName: string): string[] | null {
 	const re = new RegExp(`pub const ${arrayName}: &\\[&str\\] = &\\[([\\s\\S]*?)\\];`);
 	const match = source.match(re);
 	if (match === null) return null;
@@ -165,12 +175,7 @@ function parseRustConstArray(source: string, arrayName: string): string[] | null
 		.map((s) => s.trim().replace(/["']/g, ""))
 		.filter((s) => s.length > 0);
 }
-
-/**
- * Compare a parsed discriminant list against ALL_DISCRIMINANTS, reporting
- * length and per-index mismatches. `label` identifies the source in messages.
- */
-function compareDiscriminantList(label: string, list: string[]): string[] {
+export function compareDiscriminantList(label: string, list: string[]): string[] {
 	const violations: string[] = [];
 	if (list.length !== ALL_DISCRIMINANTS.length) {
 		violations.push(
@@ -518,6 +523,77 @@ export function verifyMutableHookCoverage(
 	return violations;
 }
 
+/**
+ * ARC11: the generated witness manifest's ordered `lifecycleDiscriminants`
+ * must equal the Rust `ALL_EVENT_TYPES` authority, index by index. Binds the
+ * manifest into the existing mirror-parity lattice without creating a fourth
+ * copy of the list.
+ */
+export function verifyWitnessLifecycleParity(
+	rustHostSource: string,
+	witnessManifestSource: string,
+): string[] {
+	const rustList = parseRustConstArray(rustHostSource, "ALL_EVENT_TYPES");
+	if (rustList === null) {
+		return ["ALL_EVENT_TYPES not found in crates/pi/src/core/extension_host.rs"];
+	}
+	const manifest = JSON.parse(witnessManifestSource) as {
+		lifecycleDiscriminants?: string[];
+	};
+	const declared = manifest.lifecycleDiscriminants;
+	if (!Array.isArray(declared)) {
+		return ["witness manifest missing lifecycleDiscriminants array"];
+	}
+	return [
+		...compareDiscriminantList("witness-manifest", declared),
+		...compareDiscriminantList("rust-host", rustList),
+	];
+}
+
+/**
+ * ARC11 Layer 2: every `pub const NAME: &str = "value";` method constant
+ * declared across protocol.rs, server.rs, and adapters.rs must be covered by
+ * the manifest's methodKindPairs. A newly added constant without a witnessed
+ * fixture pair fails here by name. The reverse direction needs no gate: the
+ * bijection rules in both language checkers already reject any manifest or
+ * fixture method the other side does not track.
+ */
+export function verifyWitnessMethodCoverage(
+	witnessManifestSource: string,
+	protocolSource: string,
+	serverSource: string,
+	adaptersSource: string,
+): string[] {
+	const violations: string[] = [];
+	const declared = new Set<string>();
+	// Method constants follow two conventions: `*_METHOD` at file scope, and
+	// bare names inside adapters.rs's `pub mod methods` block. Version and
+	// capacity constants are not wire methods and must not be witnessed.
+	const methodPattern = /pub const [A-Z][A-Z0-9_]*_METHOD: &str = "([^"]+)";/g;
+	const methodsModule = /pub mod methods \{[\s\S]*?\n\}/;
+	for (const source of [protocolSource, serverSource, adaptersSource]) {
+		for (const match of source.matchAll(methodPattern)) {
+			declared.add(match[1] as string);
+		}
+	}
+	const methodsBlock = adaptersSource.match(methodsModule)?.[0] ?? "";
+	for (const match of methodsBlock.matchAll(/pub const [A-Z][A-Z0-9_]*: &str = "([^"]+)";/g)) {
+		declared.add(match[1] as string);
+	}
+	const manifest = JSON.parse(witnessManifestSource) as {
+		methodKindPairs?: [string, string][];
+	};
+	const covered = new Set(
+		(manifest.methodKindPairs ?? []).map(([method]) => method),
+	);
+	for (const method of declared) {
+		if (!covered.has(method)) {
+			violations.push(`method constant "${method}" has no witnessed fixture pair`);
+		}
+	}
+	return violations;
+}
+
 // ============================================================================
 // Orchestration
 // ============================================================================
@@ -527,6 +603,13 @@ export function runXcDispatchWitnesses(inputs: XcDispatchInputs): string[] {
 	return [
 		...verifyLatticeCompleteness(inputs.hostSource),
 		...verifyEventMirrorParity(inputs.hostSource, inputs.leanApiSource, inputs.rustHostSource),
+		...verifyWitnessLifecycleParity(inputs.rustHostSource, inputs.witnessManifestSource),
+		...verifyWitnessMethodCoverage(
+			inputs.witnessManifestSource,
+			inputs.protocolSource,
+			inputs.serverSource,
+			inputs.adaptersSource,
+		),
 		...verifyToolCallInPlaceComparison(inputs.hostSource, inputs.leanSource),
 		...verifyInputHandledShortCircuit(inputs.hostSource, inputs.leanSource),
 		...verifyBeforeProviderHeadersInPlace(inputs.hostSource, inputs.leanSource),

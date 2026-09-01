@@ -2669,6 +2669,11 @@ mod tests {
 #[cfg(test)]
 mod bridge_tests {
     use super::*;
+    use crate::adapters::methods;
+    use crate::server::{
+        COMMAND_EXECUTE_METHOD, EXTENSIONS_LOAD_METHOD, MESSAGE_UPDATE_DELTA_METHOD,
+        RegistrySnapshot, TOOL_RENDER_HTML_METHOD,
+    };
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -3078,41 +3083,50 @@ mod bridge_tests {
         Ok(())
     }
 
-    /// Witness manifest (XC-2): the single (method, kind) lockstep check
-    /// that consumes `witness-manifest.json` by name — parity does not
-    /// create a second check.  Deleting any fixture line or mutating a
-    /// modifier-combo key event kind breaks this test on the Rust side,
-    /// mirroring the TypeScript `witness manifest lockstep` describe block.
+    /// Witness manifest (XC-2, ARC11): the (method, kind) + lifecycle +
+    /// payload-digest lockstep consumed by name — parity does not create a
+    /// second check. All rules live in [`verify_witness`]; the lockstep test
+    /// asserts the identity holds and the mutation tests prove each rule can
+    /// actually fail. Mirrors the TypeScript `witness-check.ts` verifier.
     const WITNESS_MANIFEST: &str =
         include_str!("../../../packages/pi-tui-protocol/tests/fixtures/witness-manifest.json");
 
-    #[test]
-    fn witness_manifest_lockstep() -> TestResult {
-        let manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST)?;
-        let expected_count = manifest["totalLines"]
-            .as_u64()
-            .ok_or("manifest missing totalLines")?;
-        let expected_pairs = manifest["methodKindPairs"]
-            .as_array()
-            .ok_or("manifest missing methodKindPairs")?;
-        let expected_key_events = manifest["modifierComboKeyEvents"]
-            .as_array()
-            .ok_or("manifest missing modifierComboKeyEvents")?;
+    /// Pure violation list for the fixture/manifest lockstep. Empty means the
+    /// artifacts agree on line count, (method, kind) bijection, ordered
+    /// lifecycle discriminants, modifier-combo key events, and the payload
+    /// digest. Never reads files and never mutates its inputs, so the
+    /// mutation tests can drive it directly.
+    fn verify_witness(fixtures: &str, manifest: &serde_json::Value) -> Vec<String> {
+        use sha2::Digest;
+        use std::collections::HashSet;
+        let mut violations = Vec::new();
 
-        // 1. Total non-blank line count must match.
         let mut count = 0usize;
-        let mut seen: std::collections::HashSet<(String, FrameKind)> =
-            std::collections::HashSet::new();
+        let mut seen: HashSet<(String, FrameKind)> = HashSet::new();
         let mut key_events: Vec<serde_json::Value> = Vec::new();
-        for line in FIXTURES.lines() {
+        let mut observed_lifecycle: Vec<String> = Vec::new();
+        let manifest_lifecycle: Vec<String> = manifest["lifecycleDiscriminants"]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_owned))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        for line in fixtures.lines() {
             if line.trim().is_empty() || line.trim_start().starts_with('#') {
                 continue;
             }
-            let frame = decode_frame_str(line)?;
-            seen.insert((frame.method.clone(), frame.kind));
+            // totalLines counts non-blank, non-comment lines whether or not
+            // they decode — the TypeScript verifier defines it identically.
             count += 1;
+            let Ok(frame) = decode_frame_str(line) else {
+                violations.push(format!("fixture line is not a decodable frame: {line}"));
+                continue;
+            };
+            seen.insert((frame.method.clone(), frame.kind));
 
-            // Collect key events with modifiers for the modifier-combo check.
             if frame.method == Method::UiEvent.as_str() && frame.kind == FrameKind::Req {
                 if let Some(event) = frame.payload.get("event") {
                     if event.get("type").and_then(|v| v.as_str()) == Some("key") {
@@ -3133,61 +3147,327 @@ mod bridge_tests {
                     }
                 }
             }
+
+            // Lifecycle witness frames carry payload.type == method (fixture
+            // convention) AND name a manifest-declared discriminant: hooks
+            // share the open-method namespace with dialogs and gap surfaces
+            // like message_update_delta also carry a type field.
+            if frame.kind == FrameKind::Req
+                && manifest_lifecycle.iter().any(|name| name == &frame.method)
+                && frame.payload.get("type").and_then(|v| v.as_str()) == Some(frame.method.as_str())
+            {
+                observed_lifecycle.push(frame.method.clone());
+            }
         }
 
-        assert_eq!(
-            count, expected_count as usize,
-            "fixture line count drifted from manifest"
-        );
+        if count != manifest["totalLines"].as_u64().unwrap_or(0) as usize {
+            violations.push(format!(
+                "totalLines mismatch: fixture has {count}, manifest declares {}",
+                manifest["totalLines"].as_u64().unwrap_or(0)
+            ));
+        }
 
-        // 2. Every manifest (method, kind) pair must be witnessed.
-        for pair in expected_pairs {
-            let method = pair[0].as_str().ok_or("manifest pair missing method")?;
-            let kind_str = pair[1].as_str().ok_or("manifest pair missing kind")?;
-            let kind = match kind_str {
+        let pair_of = |entry: &serde_json::Value| -> Option<(String, FrameKind)> {
+            let method = entry[0].as_str()?;
+            let kind = match entry[1].as_str()? {
                 "req" => FrameKind::Req,
                 "res" => FrameKind::Res,
                 "event" => FrameKind::Event,
                 "error" => FrameKind::Error,
-                _ => panic!("unknown frame kind in manifest: {kind_str}"),
+                _ => return None,
             };
-            assert!(
-                seen.contains(&(method.to_owned(), kind)),
-                "fixture missing {method} {kind_str} frame"
-            );
+            Some((method.to_owned(), kind))
+        };
+        let declared_pairs = manifest["methodKindPairs"].as_array();
+        if declared_pairs.is_none() {
+            violations.push("methodKindPairs missing from manifest".to_owned());
         }
-
-        // Every seen pair must also be in the manifest (no untracked fixtures).
+        let mut expected_pairs: Vec<(String, FrameKind)> = Vec::new();
+        for entry in declared_pairs.into_iter().flatten() {
+            match pair_of(entry) {
+                Some(pair) => expected_pairs.push(pair),
+                None => violations.push(format!("manifest pair entry is malformed: {entry}")),
+            }
+        }
+        for (method, kind) in &expected_pairs {
+            if !seen.contains(&(method.clone(), *kind)) {
+                violations.push(format!("missing pair {method}:{}", kind_str(*kind)));
+            }
+        }
         for (method, kind) in &seen {
-            let kind_str = match kind {
-                FrameKind::Req => "req",
-                FrameKind::Res => "res",
-                FrameKind::Event => "event",
-                FrameKind::Error => "error",
-            };
-            let found = expected_pairs
-                .iter()
-                .any(|p| p[0].as_str() == Some(method.as_str()) && p[1].as_str() == Some(kind_str));
+            if !expected_pairs.contains(&(method.clone(), *kind)) {
+                violations.push(format!(
+                    "untracked pair not in manifest: {method}:{}",
+                    kind_str(*kind)
+                ));
+            }
+        }
+        // manifest_lifecycle (parsed above the frame loop) is the expected
+        // ordering; observed_lifecycle was collected during the loop.
+        let expected_lifecycle = &manifest_lifecycle;
+        let lifecycle_len = observed_lifecycle.len().max(expected_lifecycle.len());
+        for index in 0..lifecycle_len {
+            let observed = observed_lifecycle.get(index).map(String::as_str);
+            let expected = expected_lifecycle.get(index).map(String::as_str);
+            if observed != expected {
+                violations.push(format!(
+                    "lifecycle discriminant mismatch at index {index}: fixture has {}, manifest has {}",
+                    observed.unwrap_or("<missing>"),
+                    expected.unwrap_or("<missing>")
+                ));
+                break;
+            }
+        }
+
+        let expected_key_events = manifest["modifierComboKeyEvents"].as_array();
+        let expected_len = expected_key_events.map_or(0, Vec::len);
+        if key_events.len() != expected_len {
+            violations.push(format!(
+                "modifierComboKeyEvents length mismatch: fixture has {}, manifest declares {expected_len}",
+                key_events.len()
+            ));
+        } else if let Some(expected) = expected_key_events {
+            for (index, (actual, expected)) in key_events.iter().zip(expected.iter()).enumerate() {
+                if actual != expected {
+                    violations.push(format!("modifierComboKeyEvents mismatch at index {index}"));
+                    break;
+                }
+            }
+        }
+
+        // Payload-byte pin: rejects any single flipped byte even when every
+        // envelope rule above still holds.
+        let digest = sha2::Sha256::digest(fixtures.as_bytes());
+        let digest_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        if let Some(declared) = manifest["fixtureSha256"].as_str() {
+            if digest_hex != declared {
+                violations.push(format!(
+                    "fixtureSha256 mismatch: fixture hashes to {digest_hex}, manifest declares {declared}"
+                ));
+            }
+        } else {
+            violations.push("fixtureSha256 missing from manifest".to_owned());
+        }
+
+        violations
+    }
+
+    fn kind_str(kind: FrameKind) -> &'static str {
+        match kind {
+            FrameKind::Req => "req",
+            FrameKind::Res => "res",
+            FrameKind::Event => "event",
+            FrameKind::Error => "error",
+        }
+    }
+
+    #[test]
+    fn witness_manifest_lockstep() -> TestResult {
+        let manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST)?;
+        let violations = verify_witness(FIXTURES, &manifest);
+        assert!(
+            violations.is_empty(),
+            "witness lockstep violations: {violations:?}"
+        );
+        Ok(())
+    }
+
+    /// Every declared open-method constant must have a witnessed
+    /// (method, kind) pair. References the constants BY SYMBOL so the
+    /// fixture can never drift from the Rust spelling.
+    #[test]
+    fn witness_covers_every_open_method_constant() -> TestResult {
+        let manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST)?;
+        let covered: Vec<String> = manifest["methodKindPairs"]
+            .as_array()
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .filter_map(|pair| pair[0].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for method in [
+            crate::server::EXTENSIONS_LOAD_METHOD,
+            crate::server::COMMAND_EXECUTE_METHOD,
+            crate::server::TOOL_RENDER_HTML_METHOD,
+            crate::server::MESSAGE_UPDATE_DELTA_METHOD,
+            methods::TOOL_EXECUTE,
+            methods::TOOL_PREPARE,
+            methods::TOOL_VALIDATE,
+            methods::TOOL_CANCEL,
+            methods::PROVIDER_STREAM,
+            methods::PROVIDER_CANCEL,
+        ] {
             assert!(
-                found,
-                "fixture contains untracked {method} {kind_str} pair not in manifest"
+                covered.iter().any(|m| m == method),
+                "open method constant {method} has no witnessed fixture pair"
             );
         }
+        Ok(())
+    }
 
-        // 3. Modifier-combo key events must match the manifest exactly.
-        assert_eq!(
-            key_events.len(),
-            expected_key_events.len(),
-            "key event count drifted from manifest"
-        );
-        for (i, (actual, expected)) in key_events
-            .iter()
-            .zip(expected_key_events.iter())
-            .enumerate()
-        {
-            assert_eq!(actual, expected, "key event {i} drifted from manifest");
+    /// The new fixture surfaces decode into their real Rust types: the
+    /// registry snapshot carries every section, streaming updates and
+    /// provider events decode correlated, and the error variant carries the
+    /// non-retryable ErrorPayload shape.
+    #[test]
+    fn witness_gap_surfaces_decode_typed() -> TestResult {
+        let mut snapshot: Option<RegistrySnapshot> = None;
+        let mut tool_update: Option<ToolUpdate> = None;
+        let mut provider_event: Option<ProviderEvent> = None;
+        let mut delta_error: Option<ErrorPayload> = None;
+        let mut correlated_update_ids: Vec<FrameId> = Vec::new();
+
+        for line in FIXTURES.lines() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let frame = decode_frame_str(line)?;
+            if frame.kind == FrameKind::Res && frame.method == crate::server::EXTENSIONS_LOAD_METHOD
+            {
+                snapshot = Some(from_payload::<RegistrySnapshot>(&frame.payload)?);
+            } else if frame.kind == FrameKind::Event && frame.method == Method::ToolUpdate.as_str()
+            {
+                tool_update = Some(from_payload::<ToolUpdate>(&frame.payload)?);
+                if frame.id != 0 {
+                    correlated_update_ids.push(frame.id);
+                }
+            } else if frame.kind == FrameKind::Event && frame.method == "providerEvent" {
+                provider_event = Some(from_payload::<ProviderEvent>(&frame.payload)?);
+            } else if frame.kind == FrameKind::Error
+                && frame.payload.get("code").and_then(|v| v.as_str()) == Some("timeout")
+            {
+                delta_error = Some(from_payload::<ErrorPayload>(&frame.payload)?);
+            }
         }
 
+        let snapshot =
+            snapshot.ok_or("witness has no extensions.load RegistrySnapshot response")?;
+        assert!(!snapshot.tools.is_empty(), "snapshot must witness tools");
+        assert!(
+            !snapshot.commands.is_empty(),
+            "snapshot must witness commands"
+        );
+        assert!(
+            !snapshot.providers.is_empty(),
+            "snapshot must witness providers"
+        );
+        assert!(
+            !snapshot.handlers.is_empty(),
+            "snapshot must witness lifecycle handlers"
+        );
+        assert!(
+            snapshot.terminal_input,
+            "snapshot must witness terminalInput"
+        );
+        assert!(
+            tool_update.is_some(),
+            "witness has no toolUpdate event frame"
+        );
+        assert!(
+            provider_event.is_some(),
+            "witness has no providerEvent frame"
+        );
+        assert!(
+            !correlated_update_ids.is_empty(),
+            "witness never exercises correlated (non-zero id) streaming updates"
+        );
+        let error = delta_error.ok_or("witness has no message_update_delta error frame")?;
+        assert_eq!(error.code, "timeout");
+        assert!(!error.retryable);
         Ok(())
+    }
+
+    #[test]
+    fn witness_mutation_m1_payload_byte_is_rejected() {
+        let manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST).unwrap();
+        let mutated = FIXTURES.replacen("\"title\"", "\"titel\"", 1);
+        assert_ne!(mutated, FIXTURES);
+        let violations = verify_witness(&mutated, &manifest);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.starts_with("fixtureSha256 mismatch")),
+            "payload byte flip must be rejected by the digest rule, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn witness_mutation_m2_dropped_line_is_rejected() {
+        let manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST).unwrap();
+        let mut lines: Vec<&str> = FIXTURES
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .collect();
+        let index = lines
+            .iter()
+            .position(|line| line.contains("\"method\":\"tool.cancel\""))
+            .expect("tool.cancel fixture line");
+        lines.remove(index);
+        let mutated = lines.join("\n");
+        let violations = verify_witness(&mutated, &manifest);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.starts_with("totalLines mismatch")),
+            "dropped line must break totalLines, got {violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.starts_with("missing pair")),
+            "dropped line must break a pair, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn witness_mutation_m3_lifecycle_swap_is_rejected_at_named_index() {
+        let mut manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST).unwrap();
+        let mut names = manifest["lifecycleDiscriminants"]
+            .as_array()
+            .cloned()
+            .expect("lifecycleDiscriminants");
+        names.swap(0, 1);
+        manifest["lifecycleDiscriminants"] = serde_json::Value::Array(names);
+        let violations = verify_witness(FIXTURES, &manifest);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("lifecycle discriminant mismatch at index 0")),
+            "swapped discriminants must fail at a named index, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn witness_mutation_m5_untracked_frame_is_rejected_by_name() {
+        let manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST).unwrap();
+        let mutated = format!(
+            "{FIXTURES}\n{{\"id\":900,\"kind\":\"req\",\"method\":\"who.is\",\"payload\":{{}}}}\n"
+        );
+        let violations = verify_witness(&mutated, &manifest);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.starts_with("untracked pair not in manifest")),
+            "untracked frame must be rejected by name, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn witness_mutation_m6_duplicated_line_is_rejected() {
+        let manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST).unwrap();
+        let lines: Vec<&str> = FIXTURES
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .collect();
+        let mut duplicated = lines.clone();
+        duplicated.push(lines.last().copied().expect("fixture line"));
+        let mutated = duplicated.join("\n");
+        let violations = verify_witness(&mutated, &manifest);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.starts_with("totalLines mismatch")),
+            "duplicated line must break totalLines, got {violations:?}"
+        );
     }
 }
