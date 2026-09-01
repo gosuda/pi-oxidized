@@ -2247,7 +2247,7 @@ export default function flagObserver(pi) {{
 
 #[tokio::test]
 async fn theme_set_event_forwards_typed_and_keeps_runner_alive() -> R {
-    use crate::core::extension_host::ExtensionUiEvent;
+    use crate::core::extension_host::{ExtensionThemeRequest, ExtensionUiEvent};
 
     let (runner, host) = make_runner(json!({})).await?;
     let mut ui = runner.subscribe_ui();
@@ -2261,12 +2261,11 @@ async fn theme_set_event_forwards_typed_and_keeps_runner_alive() -> R {
     .await;
 
     let event = tokio::time::timeout(Duration::from_millis(500), ui.recv()).await??;
-    let ExtensionUiEvent::ThemeSet(set) = event else {
-        return Err(format!("expected ThemeSet, got {event:?}").into());
+    let ExtensionUiEvent::ThemeSet(ExtensionThemeRequest::Named { name, persist }) = event else {
+        return Err(format!("expected named ThemeSet, got {event:?}").into());
     };
-    assert_eq!(set.name.as_deref(), Some("classic-light"));
-    assert!(set.persist);
-    assert_eq!(set.theme, None);
+    assert_eq!(name, "classic-light");
+    assert!(persist);
 
     // An unknown open method would have tripped the fatal Raw path and shut
     // the pump down; prove the pump is still routing by receiving a second
@@ -2281,11 +2280,9 @@ async fn theme_set_event_forwards_typed_and_keeps_runner_alive() -> R {
     })
     .await;
     let event = tokio::time::timeout(Duration::from_millis(500), ui.recv()).await??;
-    let ExtensionUiEvent::ThemeSet(object_form) = event else {
+    let ExtensionUiEvent::ThemeSet(ExtensionThemeRequest::Instance(wire)) = event else {
         return Err(format!("expected object-form ThemeSet, got {event:?}").into());
     };
-    assert!(!object_form.persist);
-    let wire = object_form.theme.ok_or("object form must carry a theme")?;
     assert_eq!(wire.color_mode, "truecolor");
 
     runner.shutdown_once().await;
@@ -2649,8 +2646,7 @@ async fn unexpected_direct_session_control_reports_and_continues() -> R {
 
 #[tokio::test]
 async fn ui_control_event_forwards_typed_to_ui_subscribers() -> R {
-    use crate::core::extension_host::ExtensionUiEvent;
-    use pi_ext::protocol::UiControl;
+    use crate::core::extension_host::{ExtensionUiControl, ExtensionUiEvent};
 
     let (runner, host) = make_runner(json!({})).await?;
     let mut ui = runner.subscribe_ui();
@@ -2664,7 +2660,7 @@ async fn ui_control_event_forwards_typed_to_ui_subscribers() -> R {
     .await;
 
     let event = tokio::time::timeout(Duration::from_millis(500), ui.recv()).await??;
-    let ExtensionUiEvent::UiControl(UiControl::SetEditorText { text }) = event else {
+    let ExtensionUiEvent::UiControl(ExtensionUiControl::SetEditorText { text }) = event else {
         return Err(format!("expected SetEditorText, got {event:?}").into());
     };
     assert_eq!(text, "draft");
@@ -3094,5 +3090,98 @@ async fn runtime_set_shutdown_event_reaches_every_endpoint_without_reap_duplicat
         });
         assert_eq!(count, 1);
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Invariant: malformed theme.set publishes nothing, runner stays alive
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn theme_set_without_name_or_theme_publishes_no_ui_event() -> R {
+    use crate::core::extension_host::ExtensionUiEvent;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let (runner, host) = make_runner(json!({})).await?;
+    let mut ui = runner.subscribe_ui();
+
+    // Neither `name` nor `theme`: the pump's TryFrom rejects it and
+    // publishes nothing on the UI bus.
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "theme.set".to_owned(),
+        payload: json!({"persist": true}),
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(matches!(ui.try_recv(), Err(TryRecvError::Empty)));
+
+    // The runner must still route a follow-up typed event — the malformed
+    // drop must not have torn down the pump.
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "theme.set".to_owned(),
+        payload: json!({"name": "classic-light", "persist": false}),
+    })
+    .await;
+    let event = tokio::time::timeout(Duration::from_millis(500), ui.recv()).await??;
+    assert!(
+        matches!(&event, ExtensionUiEvent::ThemeSet(_)),
+        "expected ThemeSet after malformed drop, got {event:?}"
+    );
+
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Invariant: notify event forwards typed ExtensionNotice to UI subscribers
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn notify_event_forwards_typed_to_ui_subscribers() -> R {
+    use crate::core::extension_host::{ExtensionNotice, ExtensionNoticeLevel, ExtensionUiEvent};
+
+    let (runner, host) = make_runner(json!({})).await?;
+    let mut ui = runner.subscribe_ui();
+
+    host.emit(Frame {
+        id: 0,
+        kind: FrameKind::Event,
+        method: "notify".to_owned(),
+        payload: json!({"message": "hello world", "type": "info"}),
+    })
+    .await;
+
+    let event = tokio::time::timeout(Duration::from_millis(500), ui.recv()).await??;
+    let ExtensionUiEvent::Notify(ExtensionNotice { message, level }) = event else {
+        return Err(format!("expected Notify, got {event:?}").into());
+    };
+    assert_eq!(message, "hello world");
+    assert_eq!(level, ExtensionNoticeLevel::Info);
+
+    // The pump must forward every severity through the conversion impl, not
+    // a hardcoded level: emit warning and error and assert the forwarded
+    // levels survive the seam.
+    for (wire_type, expected) in [
+        ("warning", ExtensionNoticeLevel::Warning),
+        ("error", ExtensionNoticeLevel::Error),
+    ] {
+        host.emit(Frame {
+            id: 0,
+            kind: FrameKind::Event,
+            method: "notify".to_owned(),
+            payload: json!({"message": "leveled", "type": wire_type}),
+        })
+        .await;
+        let event = tokio::time::timeout(Duration::from_millis(500), ui.recv()).await??;
+        let ExtensionUiEvent::Notify(ExtensionNotice { level, .. }) = event else {
+            return Err(format!("expected Notify for {wire_type}, got {event:?}").into());
+        };
+        assert_eq!(level, expected, "notify {wire_type} must forward its level");
+    }
+    runner.shutdown_once().await;
     Ok(())
 }

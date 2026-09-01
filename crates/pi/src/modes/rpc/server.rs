@@ -40,14 +40,14 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use pi_ext::client::{DialogEnd, DialogOutcome, HostUiRequest, HostUiResponse};
-use pi_ext::protocol::{NotifyLevel, SlotPlacement};
+use pi_ext::protocol::SlotPlacement;
 
 use crate::core::agent_session::events::AgentSessionEvent;
 use crate::core::agent_session::extension::{ExtensionBindings, ExtensionMode};
 use crate::core::agent_session::prompt::PreflightCallback;
 use crate::core::agent_session_runtime::{ForkOutcome, ForkPosition};
 use crate::core::compaction::CompactionResult;
-use crate::core::extension_host::ExtensionUiEvent;
+use crate::core::extension_host::{ExtensionNoticeLevel, ExtensionUiControl, ExtensionUiEvent};
 use crate::core::extension_runtime_set::ExtensionRuntimeSet;
 use crate::core::output_guard as output_guard_mod;
 use crate::core::sessions::SessionEntry;
@@ -1152,9 +1152,9 @@ fn map_extension_ui_event(event: ExtensionUiEvent) -> Option<RpcExtensionUiReque
         ExtensionUiEvent::Notify(notification) => ExtensionUiProxy::notify(
             &notification.message,
             Some(match notification.level {
-                NotifyLevel::Info => super::types::NotifyType::Info,
-                NotifyLevel::Warning => super::types::NotifyType::Warning,
-                NotifyLevel::Error => super::types::NotifyType::Error,
+                ExtensionNoticeLevel::Info => super::types::NotifyType::Info,
+                ExtensionNoticeLevel::Warning => super::types::NotifyType::Warning,
+                ExtensionNoticeLevel::Error => super::types::NotifyType::Error,
             }),
         ),
         ExtensionUiEvent::Slot(slot) => {
@@ -1179,16 +1179,17 @@ fn map_extension_ui_event(event: ExtensionUiEvent) -> Option<RpcExtensionUiReque
         // interactive-only controls (working indicator, thinking label,
         // paste, tool expansion) have no RPC counterpart.
         ExtensionUiEvent::UiControl(control) => match control {
-            pi_ext::protocol::UiControl::SetStatus { key, text } => {
+            ExtensionUiControl::SetStatus { key, text } => {
                 ExtensionUiProxy::set_status(&key, text.as_deref())
             }
-            pi_ext::protocol::UiControl::SetTitle { title } => {
-                ExtensionUiProxy::set_title(title.as_deref().unwrap_or_default())
-            }
-            pi_ext::protocol::UiControl::SetEditorText { text } => {
-                ExtensionUiProxy::set_editor_text(&text)
-            }
-            _ => return None,
+            ExtensionUiControl::SetTitle { title } => ExtensionUiProxy::set_title(&title),
+            ExtensionUiControl::SetEditorText { text } => ExtensionUiProxy::set_editor_text(&text),
+            ExtensionUiControl::SetWorkingMessage { .. }
+            | ExtensionUiControl::SetWorkingVisible { .. }
+            | ExtensionUiControl::SetWorkingIndicator { .. }
+            | ExtensionUiControl::SetHiddenThinkingLabel { .. }
+            | ExtensionUiControl::PasteToEditor { .. }
+            | ExtensionUiControl::SetToolsExpanded { .. } => return None,
         },
     })
 }
@@ -4033,5 +4034,118 @@ mod tests {
         let mut data = serde_json::json!({"state": "idle"});
         normalize_response_data(&mut data, Some("get_state"));
         assert_eq!(data, serde_json::json!({"state": "idle"}));
+    }
+
+    // -----------------------------------------------------------------------
+    // Invariant: dialog correlation — response id echoes request id
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_rpc_ui_response_correlates_ids_for_all_dialog_types() {
+        let value_completion = RpcDialogCompletion::Response(RpcExtensionUiResponse::Value {
+            id: "rpc".to_owned(),
+            value: "v".to_owned(),
+        });
+
+        // Select
+        let select = HostUiRequest::Select {
+            id: 101,
+            request: SelectRequest {
+                title: "s".to_owned(),
+                options: vec!["a".to_owned()],
+                options_meta: DialogOptions { timeout_ms: None },
+            },
+        };
+        assert_eq!(
+            map_rpc_ui_response(select, value_completion.clone()).id(),
+            101
+        );
+
+        // Input
+        let input = HostUiRequest::Input {
+            id: 202,
+            request: InputRequest {
+                title: "i".to_owned(),
+                placeholder: None,
+                options_meta: DialogOptions { timeout_ms: None },
+            },
+        };
+        assert_eq!(
+            map_rpc_ui_response(input, value_completion.clone()).id(),
+            202
+        );
+
+        // Editor
+        let editor = HostUiRequest::Editor {
+            id: 303,
+            request: EditorRequest {
+                title: "e".to_owned(),
+                prefill: None,
+            },
+        };
+        assert_eq!(map_rpc_ui_response(editor, value_completion).id(), 303);
+
+        // Confirm (Confirmed path carries the request id)
+        let confirm = HostUiRequest::Confirm {
+            id: 404,
+            request: ConfirmRequest {
+                title: "c".to_owned(),
+                message: "m".to_owned(),
+                options_meta: DialogOptions { timeout_ms: None },
+            },
+        };
+        let confirmed_completion =
+            RpcDialogCompletion::Response(RpcExtensionUiResponse::Confirmed {
+                id: "rpc".to_owned(),
+                confirmed: true,
+            });
+        assert_eq!(map_rpc_ui_response(confirm, confirmed_completion).id(), 404);
+    }
+
+    // -----------------------------------------------------------------------
+    // Invariant: map_extension_ui_event Notify maps all three levels;
+    //             SetStatus with Some("") forwards verbatim
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_extension_ui_event_notify_maps_all_three_levels() {
+        use crate::core::extension_host::{ExtensionNotice, ExtensionNoticeLevel};
+        use crate::modes::rpc::types::NotifyType;
+
+        for (level, expected) in [
+            (ExtensionNoticeLevel::Info, NotifyType::Info),
+            (ExtensionNoticeLevel::Warning, NotifyType::Warning),
+            (ExtensionNoticeLevel::Error, NotifyType::Error),
+        ] {
+            let request = map_extension_ui_event(ExtensionUiEvent::Notify(ExtensionNotice {
+                message: "m".to_owned(),
+                level,
+            }))
+            .expect("Notify must map to a request");
+            match request {
+                RpcExtensionUiRequest::Notify { notify_type, .. } => {
+                    assert_eq!(notify_type, Some(expected));
+                }
+                other => panic!("expected Notify, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn map_extension_ui_event_set_status_with_empty_string_forwards_verbatim() {
+        use crate::core::extension_host::ExtensionUiControl;
+
+        let request =
+            map_extension_ui_event(ExtensionUiEvent::UiControl(ExtensionUiControl::SetStatus {
+                key: "k".to_owned(),
+                text: Some("".to_owned()),
+            }))
+            .expect("SetStatus must map to a request");
+        match request {
+            RpcExtensionUiRequest::SetStatus { status_text, .. } => {
+                assert_eq!(status_text, Some("".to_owned()));
+            }
+            other => panic!("expected SetStatus, got {other:?}"),
+        }
     }
 }

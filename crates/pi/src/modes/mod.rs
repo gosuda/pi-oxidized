@@ -4,3 +4,6 @@ pub mod interactive;
 pub mod print;
 pub mod rpc;
 pub mod run;
+
+#[cfg(test)]
+mod wire_boundary;

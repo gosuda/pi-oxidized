@@ -35,11 +35,11 @@ use pi_ext::client::{
 use pi_ext::host::{self, HostError, HostSpec};
 use pi_ext::protocol::{
     self, DisposeSlot, ExtensionErrorEvent, FlagValueWire, FlagsSetRequest, FlagsSetResponse,
-    FrameId, NotifyRequest, ProviderEvent, SessionCommandEnvelope, SessionCompactRequest,
-    SessionForkRequest, SessionNavigateTreeRequest, SessionNewSessionRequest,
-    SessionSetModelRequest, SessionSetupEntriesRequest, SessionStateWire,
-    SessionSwitchSessionRequest, ShortcutExecuteRequest, ShortcutExecuteResponse, ThemeSet,
-    ThemeUpdate, ToolUpdate, UiControl, UiEventRequest, UiEventResponse, UiSlot, UiStateWire,
+    FrameId, ProviderEvent, SessionCommandEnvelope, SessionCompactRequest, SessionForkRequest,
+    SessionNavigateTreeRequest, SessionNewSessionRequest, SessionSetModelRequest,
+    SessionSetupEntriesRequest, SessionStateWire, SessionSwitchSessionRequest,
+    ShortcutExecuteRequest, ShortcutExecuteResponse, ThemeUpdate, ToolUpdate, UiEventRequest,
+    UiEventResponse, UiSlot, UiStateWire,
 };
 use pi_ext::sanitize::{SanitizedSlot, sanitize_slot};
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,13 @@ use super::model_runtime::{
     ModelRuntime, ModelRuntimeError, ProviderConfigInput, ProviderModelDefinition,
 };
 use super::resources::{ExtensionResourcePath, ResourceExtensionPaths};
+
+mod ui_event;
+
+pub use ui_event::{
+    ExtensionNotice, ExtensionNoticeLevel, ExtensionThemeRequest, ExtensionUiControl,
+    ExtensionUiEvent, MalformedThemeSet,
+};
 
 /// Lifecycle hook deadline (control RPC).
 pub const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -133,24 +140,6 @@ impl ToolRenderPhase {
             Self::Result => "result",
         }
     }
-}
-
-/// Sanitized extension UI activity delivered to an active product mode.
-#[derive(Debug, Clone)]
-pub enum ExtensionUiEvent {
-    /// Fire-and-forget notification.
-    Notify(NotifyRequest),
-    /// Sanitized keyed slot update.
-    Slot(SanitizedSlot),
-    /// Keyed slot disposal.
-    Dispose {
-        /// Stable extension widget key to remove.
-        key: String,
-    },
-    /// Extension `setTheme` application request (string or object form).
-    ThemeSet(ThemeSet),
-    /// Extension fire-and-forget UI control (`ui.setStatus`, `ui.setEditorText`, …).
-    UiControl(UiControl),
 }
 
 /// One item on the claimed session-action bridge.
@@ -895,7 +884,7 @@ impl Inner {
         });
     }
 
-    fn theme_set_send(&self, set: ThemeSet) {
+    fn theme_set_send(&self, request: ExtensionThemeRequest) {
         // Same lock discipline as notify_send: serialize against teardown.
         let Ok(_slots) = self.slots.write() else {
             return;
@@ -903,10 +892,10 @@ impl Inner {
         if !self.active() {
             return;
         }
-        let _ = self.ui_tx.send(ExtensionUiEvent::ThemeSet(set));
+        let _ = self.ui_tx.send(ExtensionUiEvent::ThemeSet(request));
     }
 
-    fn ui_control_send(&self, control: UiControl) {
+    fn ui_control_send(&self, control: ExtensionUiControl) {
         // Same lock discipline as notify_send: serialize against teardown.
         let Ok(_slots) = self.slots.write() else {
             return;
@@ -917,7 +906,7 @@ impl Inner {
         let _ = self.ui_tx.send(ExtensionUiEvent::UiControl(control));
     }
 
-    fn notify_send(&self, notification: NotifyRequest) {
+    fn notify_send(&self, notice: ExtensionNotice) {
         // Same lock discipline as slot_send/slot_dispose: the active check
         // and the synchronous publish serialize against teardown so a Notify
         // can never land after the teardown Dispose.
@@ -927,7 +916,7 @@ impl Inner {
         if !self.active() {
             return;
         }
-        let _ = self.ui_tx.send(ExtensionUiEvent::Notify(notification));
+        let _ = self.ui_tx.send(ExtensionUiEvent::Notify(notice));
     }
 
     fn dispose_all_slots(&self) {
@@ -2207,13 +2196,17 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                 }
                 notification = notifications.recv() => match notification {
                     Ok(HostNotification::Notify(notification)) => {
-                        inner.notify_send(notification);
+                        inner.notify_send(notification.into());
                     }
                     Ok(HostNotification::ThemeSet(set)) => {
-                        inner.theme_set_send(set);
+                        // Exactly-one-of violation: dropped at the seam, as
+                        // the mode did before.
+                        if let Ok(request) = ExtensionThemeRequest::try_from(set) {
+                            inner.theme_set_send(request);
+                        }
                     }
                     Ok(HostNotification::UiControl(control)) => {
-                        inner.ui_control_send(control);
+                        inner.ui_control_send(control.into());
                     }
                     Ok(HostNotification::UiSlot(slot)) => {
                         forward_slot(&inner, &slot);

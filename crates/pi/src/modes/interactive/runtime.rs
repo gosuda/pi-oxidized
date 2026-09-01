@@ -68,14 +68,15 @@ use crate::core::agent_session::events::AgentSessionEvent;
 use crate::core::agent_session::extension_runner::ExtensionRunner;
 use crate::core::agent_session::prompt::{PromptOptions, StreamingBehavior};
 use crate::core::agent_session_runtime::{ForkOutcome, SwitchOutcome};
-use crate::core::extension_host::ExtensionUiEvent;
+use crate::core::extension_host::{
+    ExtensionNoticeLevel, ExtensionThemeRequest, ExtensionUiControl, ExtensionUiEvent,
+};
 use crate::core::extension_runtime_set::ExtensionRuntimeSet;
 use crate::core::platform::external_editor::{EditOutcome, edit_text_in_external_editor};
 use pi_ext::client::{DialogEnd, DialogOutcome, HostUiRequest, HostUiResponse};
 use pi_ext::protocol::{
-    KeyEventKindWire, KeyModifiersWire, NotifyLevel, SlotPlacement, ThemeCatalogEntry,
-    ThemeColorValue, ThemeSet, ThemeUpdate, ThemeWire, UiControl, UiEventRequest, UiEventWire,
-    UiStateWire,
+    KeyEventKindWire, KeyModifiersWire, SlotPlacement, ThemeCatalogEntry, ThemeColorValue,
+    ThemeUpdate, ThemeWire, UiEventRequest, UiEventWire,
 };
 use pi_ext::sanitize::SanitizedSlot;
 
@@ -1950,8 +1951,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     }
                 }
                 extension_result = self.extension_action_rx.recv() => {
-                    if let Some(Err(error)) = extension_result {
-                        self.last_error = Some(error);
+                    if let Some(result) = extension_result {
+                        self.record_extension_action(result);
                     }
                 }
             }
@@ -3808,12 +3809,24 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
     }
 
+    /// Record the outcome of an extension action onto the status indicator.
+    ///
+    /// Only `Err` mutates state — the typed error string is preserved verbatim
+    /// so callers can assert exact messages. `Ok` leaves a prior error untouched.
+    fn record_extension_action(&mut self, result: Result<(), String>) {
+        if let Err(error) = result {
+            self.last_error = Some(error);
+        }
+    }
+
     async fn handle_extension_event(&mut self, event: ExtensionUiEvent) {
         match event {
             ExtensionUiEvent::Notify(notification) => {
                 let severity = match notification.level {
-                    NotifyLevel::Info | NotifyLevel::Warning => DiagnosticSeverity::Warning,
-                    NotifyLevel::Error => DiagnosticSeverity::Error,
+                    ExtensionNoticeLevel::Info | ExtensionNoticeLevel::Warning => {
+                        DiagnosticSeverity::Warning
+                    }
+                    ExtensionNoticeLevel::Error => DiagnosticSeverity::Error,
                 };
                 self.view.diagnostics.entries.push(StartupDiagnostic {
                     severity,
@@ -3832,9 +3845,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     /// Apply a fire-and-forget extension UI control (`ui.setStatus`, …).
-    async fn handle_extension_ui_control(&mut self, control: UiControl) {
+    async fn handle_extension_ui_control(&mut self, control: ExtensionUiControl) {
         match control {
-            UiControl::SetStatus { key, text } => match text {
+            ExtensionUiControl::SetStatus { key, text } => match text {
                 Some(text) if !text.is_empty() => {
                     self.view.footer.extension_statuses.insert(key, text);
                 }
@@ -3842,7 +3855,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     self.view.footer.extension_statuses.remove(&key);
                 }
             },
-            UiControl::SetWorkingMessage { message } => {
+            ExtensionUiControl::SetWorkingMessage { message } => {
                 self.view.working_message.clone_from(&message);
                 if let Some(status) = self.view.status.as_mut()
                     && status.kind == StatusKind::Working
@@ -3850,7 +3863,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     status.message = message.unwrap_or_else(|| DEFAULT_WORKING_MESSAGE.to_owned());
                 }
             }
-            UiControl::SetWorkingVisible { visible } => {
+            ExtensionUiControl::SetWorkingVisible { visible } => {
                 self.view.working_visible = visible;
                 if visible {
                     // Surface only while streaming; never spuriously while idle.
@@ -3882,14 +3895,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     self.view.status = None;
                 }
             }
-            UiControl::SetWorkingIndicator { options } => {
-                // Upstream: empty `frames` hides the indicator. Custom frames
-                // are not portable to the native braille spinner (ledgered).
-                let hide = options
-                    .as_ref()
-                    .and_then(|value| value.get("frames"))
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(Vec::is_empty);
+            ExtensionUiControl::SetWorkingIndicator { hide } => {
                 if hide
                     && self
                         .view
@@ -3900,7 +3906,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     self.view.status = None;
                 }
             }
-            UiControl::SetHiddenThinkingLabel { label } => {
+            ExtensionUiControl::SetHiddenThinkingLabel { label } => {
                 let label = label.unwrap_or_else(|| "Thinking…".to_owned());
                 for message in &mut self.view.messages {
                     if let MessageView::Assistant(view) = message {
@@ -3909,20 +3915,20 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 }
                 self.chat_dirty = true;
             }
-            UiControl::SetTitle { title } => {
-                let sequence = encode_osc0_set_title(title.as_deref().unwrap_or(""));
+            ExtensionUiControl::SetTitle { title } => {
+                let sequence = encode_osc0_set_title(&title);
                 if let Err(error) = self.tui.outer_mut().write_all(&sequence) {
                     self.last_error = Some(format!("write terminal title: {error}"));
                 }
             }
-            UiControl::PasteToEditor { text } => {
+            ExtensionUiControl::PasteToEditor { text } => {
                 let _ = self.paste_text(&text);
             }
-            UiControl::SetEditorText { text } => {
+            ExtensionUiControl::SetEditorText { text } => {
                 self.editor.set_text(&text);
                 self.view.editor.text = text;
             }
-            UiControl::SetToolsExpanded { expanded } => {
+            ExtensionUiControl::SetToolsExpanded { expanded } => {
                 self.display.tools_expanded = expanded;
                 let _ = self.reapply_display_preferences();
             }
@@ -3935,11 +3941,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let Some(runner) = self.extension_runner.as_ref() else {
             return;
         };
-        let state = UiStateWire {
-            editor_text: self.editor.get_expanded_text(),
-            tools_expanded: self.display.tools_expanded,
-        };
-        Arc::clone(runner).push_ui_state(&state).await;
+        Arc::clone(runner)
+            .push_ui_state(self.editor.get_expanded_text(), self.display.tools_expanded)
+            .await;
     }
 
     /// Render depth derived from the terminal's truecolor capability.
@@ -3989,28 +3993,25 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// inferred polarity mode, then resolve through the theme engine. The
     /// host's failure fallback (`persist == false`) and the `Theme`-object
     /// form apply without persistence (upstream `setThemeInstance`).
-    async fn handle_extension_theme_set(&mut self, set: ThemeSet) {
-        if let Some(wire) = set.theme {
-            self.apply_theme(Arc::new(resolved_theme_from_wire(&wire)));
-            self.push_theme_to_host().await;
-            return;
-        }
-        let Some(name) = set.name else {
-            return;
-        };
-        let resolved = if set.persist {
-            let mode = theme_mode_for_name(&name);
-            if let Err(error) = self.session.persist_theme(&name, mode) {
-                self.last_error = Some(error);
+    async fn handle_extension_theme_set(&mut self, request: ExtensionThemeRequest) {
+        let resolved = match request {
+            ExtensionThemeRequest::Instance(wire) => Arc::new(resolved_theme_from_wire(&wire)),
+            ExtensionThemeRequest::Named { name, persist } => {
+                if persist {
+                    let mode = theme_mode_for_name(&name);
+                    if let Err(error) = self.session.persist_theme(&name, mode) {
+                        self.last_error = Some(error);
+                    }
+                    super::theme::resolve_active_theme(
+                        Some(&name),
+                        mode,
+                        self.terminal_theme,
+                        self.color_mode(),
+                    )
+                } else {
+                    super::theme::load_or_dark(&name, self.color_mode())
+                }
             }
-            super::theme::resolve_active_theme(
-                Some(&name),
-                mode,
-                self.terminal_theme,
-                self.color_mode(),
-            )
-        } else {
-            super::theme::load_or_dark(&name, self.color_mode())
         };
         self.apply_theme(resolved);
         self.push_theme_to_host().await;
@@ -8193,9 +8194,8 @@ mod tests {
         let generation = rt.theme_generation;
 
         // String form with persist: applies, persists name + inferred mode.
-        rt.handle_extension_event(ExtensionUiEvent::ThemeSet(ThemeSet {
-            name: Some("classic-light".to_owned()),
-            theme: None,
+        rt.handle_extension_event(ExtensionUiEvent::ThemeSet(ExtensionThemeRequest::Named {
+            name: "classic-light".to_owned(),
             persist: true,
         }))
         .await;
@@ -8218,17 +8218,15 @@ mod tests {
             "text".to_owned(),
             pi_ext::protocol::ThemeColorValue::Text("#010203".to_owned()),
         );
-        rt.handle_extension_event(ExtensionUiEvent::ThemeSet(ThemeSet {
-            name: None,
-            theme: Some(ThemeWire {
+        rt.handle_extension_event(ExtensionUiEvent::ThemeSet(ExtensionThemeRequest::Instance(
+            ThemeWire {
                 name: Some("inmem".to_owned()),
                 source_path: None,
                 color_mode: "truecolor".to_owned(),
                 fg,
                 bg: std::collections::BTreeMap::new(),
-            }),
-            persist: false,
-        }))
+            },
+        )))
         .await;
         assert_eq!(rt.view.theme.name, "inmem");
         assert_eq!(
@@ -8238,9 +8236,8 @@ mod tests {
         assert_eq!(rt.theme_generation, generation + 2);
 
         // Host failure fallback: literal dark, still no new persistence.
-        rt.handle_extension_event(ExtensionUiEvent::ThemeSet(ThemeSet {
-            name: Some("dark".to_owned()),
-            theme: None,
+        rt.handle_extension_event(ExtensionUiEvent::ThemeSet(ExtensionThemeRequest::Named {
+            name: "dark".to_owned(),
             persist: false,
         }))
         .await;
@@ -12108,7 +12105,7 @@ mod tests {
             elapsed_secs: 0,
             message: "Working…".to_owned(),
         });
-        rt.handle_extension_ui_control(UiControl::SetWorkingVisible { visible: false })
+        rt.handle_extension_ui_control(ExtensionUiControl::SetWorkingVisible { visible: false })
             .await;
         assert!(!rt.view.working_visible);
         assert!(rt.view.status.is_none());
@@ -12120,7 +12117,7 @@ mod tests {
     #[tokio::test]
     async fn set_working_message_does_not_spawn_idle_status() {
         let (mut rt, _log) = make_runtime();
-        rt.handle_extension_ui_control(UiControl::SetWorkingMessage {
+        rt.handle_extension_ui_control(ExtensionUiControl::SetWorkingMessage {
             message: Some("Deploying…".to_owned()),
         })
         .await;
@@ -12208,8 +12205,8 @@ mod tests {
         };
         let mut rt = InteractiveRuntime::new(tui, input, Arc::new(host), &options);
         let before = sink.snapshot().len();
-        rt.handle_extension_ui_control(UiControl::SetTitle {
-            title: Some("safe\x07\x1b]1;evil\x07\u{009b}ok".to_owned()),
+        rt.handle_extension_ui_control(ExtensionUiControl::SetTitle {
+            title: "safe\x07\x1b]1;evil\x07\u{009b}ok".to_owned(),
         })
         .await;
         let written = &sink.snapshot()[before..];
@@ -12726,5 +12723,103 @@ mod tests {
         // at row 24-8=16. This is the correct anchored behavior.
         assert_eq!(rt.tui.viewport_height(), 8);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Invariant: slot update → dispose → re-update ordering
+    // -----------------------------------------------------------------------
+
+    fn make_slot(key: &str, placement: SlotPlacement, generation: u64) -> SanitizedSlot {
+        pi_ext::sanitize::sanitize_slot(&pi_ext::protocol::UiSlot {
+            key: key.to_owned(),
+            generation,
+            placement,
+            height: 1,
+            runs: vec![vec![pi_ext::protocol::StyledRun {
+                text: "x".to_owned(),
+                style: pi_ext::protocol::Style::default(),
+            }]],
+            focusable: false,
+            cursor: None,
+            overlay_options: None,
+        })
+    }
+
+    #[test]
+    fn slot_update_dispose_reupdate_leaves_final_slot_exactly_once() {
+        let (mut rt, _log) = make_runtime();
+
+        // Slot(k, AboveEditor) → Dispose(k) → Slot(k, AboveEditor)
+        rt.project_extension_slot(make_slot("k", SlotPlacement::AboveEditor, 1));
+        assert_eq!(rt.view.widgets_above.len(), 1);
+        assert!(rt.extension_slots.contains_key("k"));
+
+        rt.dispose_extension_slot("k");
+        assert!(rt.view.widgets_above.is_empty());
+        assert!(!rt.extension_slots.contains_key("k"));
+
+        // Re-update: the final state must reflect exactly one slot for k.
+        rt.project_extension_slot(make_slot("k", SlotPlacement::AboveEditor, 2));
+        assert_eq!(rt.view.widgets_above.len(), 1);
+        assert_eq!(rt.extension_slots.get("k").map(|s| s.generation), Some(2));
+        assert_eq!(
+            rt.view
+                .widgets_above
+                .iter()
+                .filter(|w| w.slot.key == "k")
+                .count(),
+            1
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Invariant: record_extension_action preserves typed errors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn record_extension_action_preserves_typed_error_and_leaves_ok_untouched() {
+        let (mut rt, _log) = make_runtime();
+        assert!(rt.last_error.is_none());
+
+        rt.record_extension_action(Err("extension host is not running".to_owned()));
+        assert_eq!(
+            rt.last_error,
+            Some("extension host is not running".to_owned())
+        );
+
+        // Ok(()) must not clear a prior error.
+        rt.record_extension_action(Ok(()));
+        assert_eq!(
+            rt.last_error,
+            Some("extension host is not running".to_owned())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Invariant: notify severity projection survives the mode seam
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn extension_notify_levels_project_to_matching_diagnostics() {
+        use crate::core::extension_host::{ExtensionNotice, ExtensionNoticeLevel};
+
+        for (level, expected) in [
+            (ExtensionNoticeLevel::Info, DiagnosticSeverity::Warning),
+            (ExtensionNoticeLevel::Warning, DiagnosticSeverity::Warning),
+            (ExtensionNoticeLevel::Error, DiagnosticSeverity::Error),
+        ] {
+            let (mut rt, _log) = make_runtime();
+            rt.handle_extension_event(ExtensionUiEvent::Notify(ExtensionNotice {
+                message: format!("level {level:?}"),
+                level,
+            }))
+            .await;
+            let Some(diagnostic) = rt.view.diagnostics.entries.last() else {
+                panic!("notify must append a diagnostic for {level:?}");
+            };
+            assert_eq!(diagnostic.severity, expected, "level {level:?}");
+            assert_eq!(diagnostic.source, "extension");
+            assert_eq!(diagnostic.message, format!("level {level:?}"));
+        }
     }
 }

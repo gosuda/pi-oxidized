@@ -2186,11 +2186,15 @@ impl ExtensionRuntimeSet {
     }
 
     /// Broadcast mirrored UI state.
-    pub async fn push_ui_state(&self, state: &UiStateWire) {
+    pub async fn push_ui_state(&self, editor_text: String, tools_expanded: bool) {
+        let state = UiStateWire {
+            editor_text,
+            tools_expanded,
+        };
         let lease = self.lease();
         let mut sends = FuturesUnordered::new();
         for endpoint in lease.live_endpoints() {
-            sends.push(endpoint.runner.push_ui_state(state));
+            sends.push(endpoint.runner.push_ui_state(&state));
         }
         while sends.next().await.is_some() {}
     }
@@ -7920,10 +7924,7 @@ pub(crate) mod tests {
         let broadcast_set = Arc::clone(&set);
         let broadcast = tokio::spawn(async move {
             broadcast_set
-                .push_ui_state(&UiStateWire {
-                    editor_text: "broadcast".to_owned(),
-                    tools_expanded: false,
-                })
+                .push_ui_state("broadcast".to_owned(), false)
                 .await;
         });
         second_host.wait_for_frame("ui.state").await?;
