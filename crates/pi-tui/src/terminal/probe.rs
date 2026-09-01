@@ -668,7 +668,13 @@ fn parse_hex_component(component: &str) -> Option<u8> {
     u8::try_from(scaled).ok()
 }
 
-/// Convert reinjected raw bytes into coarse UI events (printable keys + enter).
+/// Convert reinjected raw bytes into coarse UI events (printable keys, enter,
+/// and the common CSI/SS3 navigation keys).
+///
+/// Keys typed while a probe owns stdin must survive reinjection with their
+/// meaning intact: an arrow key mangled into `Esc`, `[`, `B` would cancel
+/// overlays and corrupt editors. Sequences this parser does not recognize are
+/// dropped whole rather than leaking their bytes as printable keys.
 #[must_use]
 pub fn reinject_bytes_as_events(bytes: &[u8]) -> Vec<UiEvent> {
     let mut events = Vec::new();
@@ -677,46 +683,141 @@ pub fn reinject_bytes_as_events(bytes: &[u8]) -> Vec<UiEvent> {
         let b = bytes[i];
         match b {
             b'\r' | b'\n' => {
-                events.push(UiEvent::Key(KeyEvent::new(
-                    KeyCode::Enter,
-                    KeyModifiers::NONE,
-                )));
+                events.push(key(KeyCode::Enter, KeyModifiers::NONE));
                 // Collapse CRLF.
                 if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
                     i += 1;
                 }
             }
             b'\t' => {
-                events.push(UiEvent::Key(KeyEvent::new(
-                    KeyCode::Tab,
-                    KeyModifiers::NONE,
-                )));
+                events.push(key(KeyCode::Tab, KeyModifiers::NONE));
             }
             0x7f | 0x08 => {
-                events.push(UiEvent::Key(KeyEvent::new(
-                    KeyCode::Backspace,
-                    KeyModifiers::NONE,
-                )));
+                events.push(key(KeyCode::Backspace, KeyModifiers::NONE));
             }
             0x1b => {
-                // Leave complex escapes alone as individual Esc keys; EventStream
-                // owns full parsing after probes complete.
-                events.push(UiEvent::Key(KeyEvent::new(
-                    KeyCode::Esc,
-                    KeyModifiers::NONE,
-                )));
+                match parse_escape(&bytes[i + 1..]) {
+                    Some((Some(event), consumed)) => {
+                        events.push(event);
+                        i += consumed;
+                    }
+                    Some((None, consumed)) => {
+                        // Unrecognized sequence: consume it whole, emit nothing.
+                        i += consumed;
+                    }
+                    None => events.push(key(KeyCode::Esc, KeyModifiers::NONE)),
+                }
             }
             b if b.is_ascii_graphic() || b == b' ' => {
-                events.push(UiEvent::Key(KeyEvent::new(
-                    KeyCode::Char(char::from(b)),
-                    KeyModifiers::NONE,
-                )));
+                events.push(key(KeyCode::Char(char::from(b)), KeyModifiers::NONE));
             }
             _ => {}
         }
         i += 1;
     }
     events
+}
+
+fn key(code: KeyCode, modifiers: KeyModifiers) -> UiEvent {
+    UiEvent::Key(KeyEvent::new(code, modifiers))
+}
+
+/// Parse one escape sequence following a leading `\x1b`.
+///
+/// Returns the mapped event (if any) and how many bytes after the `\x1b` the
+/// sequence consumed. `None` means the `\x1b` stands alone as Esc.
+fn parse_escape(rest: &[u8]) -> Option<(Option<UiEvent>, usize)> {
+    match rest.first()? {
+        b'[' => parse_csi(&rest[1..]).map(|(event, consumed)| (event, consumed + 1)),
+        b'O' => parse_ss3(&rest[1..]).map(|(event, consumed)| (event, consumed + 1)),
+        &b if b.is_ascii_graphic() || b == b' ' => Some((
+            Some(key(KeyCode::Char(char::from(b)), KeyModifiers::ALT)),
+            1,
+        )),
+        _ => None,
+    }
+}
+
+/// CSI: `\x1b[` + params `0-9;` + final byte in `@..~`.
+fn parse_csi(rest: &[u8]) -> Option<(Option<UiEvent>, usize)> {
+    let mut end = 0;
+    while rest
+        .get(end)
+        .is_some_and(|b| b.is_ascii_digit() || *b == b';')
+    {
+        end += 1;
+    }
+    let final_byte = *rest.get(end)?;
+    let params: Vec<u32> = std::str::from_utf8(&rest[..end])
+        .ok()?
+        .split(';')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect();
+    let modifiers = modifier_from_params(&params);
+    let code = match final_byte {
+        b'A' => KeyCode::Up,
+        b'B' => KeyCode::Down,
+        b'C' => KeyCode::Right,
+        b'D' => KeyCode::Left,
+        b'H' => KeyCode::Home,
+        b'F' => KeyCode::End,
+        b'Z' => {
+            return Some((Some(key(KeyCode::BackTab, modifiers)), end + 1));
+        }
+        b'~' => match params.first().copied().unwrap_or(0) {
+            1 | 7 => KeyCode::Home,
+            2 => KeyCode::Insert,
+            3 => KeyCode::Delete,
+            4 | 8 => KeyCode::End,
+            5 => KeyCode::PageUp,
+            6 => KeyCode::PageDown,
+            _ => return Some((None, end + 1)),
+        },
+        // Unrecognized CSI: consume the whole sequence, emit nothing.
+        b'@'..=b'~' => return Some((None, end + 1)),
+        _ => return None,
+    };
+    Some((Some(key(code, modifiers)), end + 1))
+}
+
+/// SS3: `\x1bO` + one final letter (application-mode arrows and friends).
+fn parse_ss3(rest: &[u8]) -> Option<(Option<UiEvent>, usize)> {
+    let code = match rest.first()? {
+        b'A' => KeyCode::Up,
+        b'B' => KeyCode::Down,
+        b'C' => KeyCode::Right,
+        b'D' => KeyCode::Left,
+        b'H' => KeyCode::Home,
+        b'F' => KeyCode::End,
+        // Other SS3 finals (function keys, keypad) are rare mid-probe; drop
+        // them whole rather than leaking their letters as printable keys.
+        b'P'..=b'S' => return Some((None, 1)),
+        _ => return None,
+    };
+    Some((Some(key(code, KeyModifiers::NONE)), 1))
+}
+
+/// XTerm modifier param: `m = 1 + bitmask` where bit 0 = shift, 1 = alt,
+/// 2 = ctrl, 3 = super (crossterm uses the same encoding).
+fn modifier_from_params(params: &[u32]) -> KeyModifiers {
+    let Some(&m) = params.get(1) else {
+        return KeyModifiers::NONE;
+    };
+    let bits = m.saturating_sub(1);
+    let mut modifiers = KeyModifiers::empty();
+    if bits & 0b0001 != 0 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if bits & 0b0010 != 0 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if bits & 0b0100 != 0 {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    if bits & 0b1000 != 0 {
+        modifiers |= KeyModifiers::SUPER;
+    }
+    modifiers
 }
 
 /// Read pending probe bytes, blocking at most `timeout` for readiness.
@@ -893,6 +994,75 @@ mod tests {
         assert!(matches!(
             &events[1],
             UiEvent::Key(k) if k.code == KeyCode::Char('b')
+        ));
+    }
+
+    #[test]
+    fn reinject_preserves_arrow_and_navigation_keys() {
+        let events = reinject_bytes_as_events(b"\x1b[B\r\x1b[A\x1b[C\x1b[D");
+        let codes: Vec<KeyCode> = events
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::Key(key) => Some(key.code),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                KeyCode::Down,
+                KeyCode::Enter,
+                KeyCode::Up,
+                KeyCode::Right,
+                KeyCode::Left
+            ]
+        );
+    }
+
+    #[test]
+    fn reinject_preserves_modified_and_ss3_keys() {
+        let events = reinject_bytes_as_events(b"\x1b[1;5C\x1bOB\x1b[3~\x1b[Z");
+        let observed: Vec<(KeyCode, KeyModifiers)> = events
+            .iter()
+            .filter_map(|event| match event {
+                UiEvent::Key(key) => Some((key.code, key.modifiers)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                (KeyCode::Right, KeyModifiers::CONTROL),
+                (KeyCode::Down, KeyModifiers::NONE),
+                (KeyCode::Delete, KeyModifiers::NONE),
+                (KeyCode::BackTab, KeyModifiers::NONE),
+            ]
+        );
+    }
+
+    #[test]
+    fn reinject_maps_alt_and_bare_escape() {
+        let events = reinject_bytes_as_events(b"\x1bx\x1b");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            UiEvent::Key(k) if k.code == KeyCode::Char('x') && k.modifiers == KeyModifiers::ALT
+        ));
+        assert!(matches!(
+            &events[1],
+            UiEvent::Key(k) if k.code == KeyCode::Esc
+        ));
+    }
+
+    #[test]
+    fn reinject_drops_unknown_sequences_whole() {
+        // Unknown CSI with params and SS3 function keys must not leak their
+        // bytes as printable keys.
+        let events = reinject_bytes_as_events(b"\x1b[999;1R\x1bOPq");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            UiEvent::Key(k) if k.code == KeyCode::Char('q')
         ));
     }
 
