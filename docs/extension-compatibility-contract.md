@@ -260,7 +260,7 @@ later-override-unless-reserved rules?
    RegistrySnapshot.raw_shortcuts` (line 466) preserves *every* shortcut
    registration in order, and dispatch iterates endpoints last-first and
    matches keys against `raw_shortcuts` membership
-   (`crates/pi/src/core/extension_runtime_set.rs` shortcut dispatch); within
+   (`crates/pi/src/core/extension_runtime_set` shortcut dispatch); within
    an endpoint the host applies last-wins. The
    `Registry` shortcut list is a first-wins legacy/superset view, not the
    dispatch source.

@@ -291,7 +291,10 @@ impl RawPeer {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
+#[expect(
+    clippy::struct_field_names,
+    reason = "renaming would change serde camelCase output keys"
+)]
 struct ProtocolProvenance {
     compiled_protocol_version: u32,
     compiled_compatibility_version: &'static str,
@@ -361,7 +364,7 @@ struct CorpusHasher {
 impl CorpusHasher {
     fn seeded() -> Self {
         let mut hasher = Self {
-            hash: 0xcbf29ce484222325,
+            hash: 0xcbf2_9ce4_8422_2325,
         };
         hasher.field("identity", CORPUS_IDENTITY.as_bytes());
         hasher.number("measuredRounds", MEASURED_ROUNDS);
@@ -388,6 +391,10 @@ impl CorpusHasher {
         self.field("data", data.as_bytes());
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "usize→u64 is lossless on 64-bit targets; this binary targets only 64-bit"
+    )]
     fn number(&mut self, name: &'static str, value: usize) {
         let value = u64::try_from(value).expect("corpus values fit in u64");
         self.field(name, &value.to_le_bytes());
@@ -398,6 +405,10 @@ impl CorpusHasher {
         self.bytes(value);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "slice length fits in u64 on 64-bit targets; this binary targets only 64-bit"
+    )]
     fn bytes(&mut self, value: &[u8]) {
         let length = u64::try_from(value.len()).expect("corpus fields fit in u64");
         self.update(&length.to_le_bytes());
@@ -407,7 +418,7 @@ impl CorpusHasher {
     fn update(&mut self, value: &[u8]) {
         for &byte in value {
             self.hash ^= u64::from(byte);
-            self.hash = self.hash.wrapping_mul(0x100000001b3);
+            self.hash = self.hash.wrapping_mul(0x0100_0000_01b3);
         }
     }
 
@@ -416,6 +427,10 @@ impl CorpusHasher {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "benchmark helper; grouping args would add ceremony without clarity"
+)]
 async fn recorded_terminal_input(
     peer: &mut RawPeer,
     corpus: &mut CorpusHasher,
@@ -649,7 +664,10 @@ async fn measure_regular_scenario(
         observed_ack.ok_or_else(|| io_error("no serve_io rounds were measured"))?,
     ))
 }
-
+#[expect(
+    clippy::too_many_lines,
+    reason = "benchmark scenario with sequential phases; splitting would obscure the measurement flow"
+)]
 async fn measure_slow_scenario(corpus: &mut CorpusHasher) -> Result<(ScenarioReport, HelloAck)> {
     let mut normalized_samples_ms = Vec::with_capacity(MEASURED_ROUNDS);
     let mut timeout_samples_ms = Vec::with_capacity(MEASURED_ROUNDS);

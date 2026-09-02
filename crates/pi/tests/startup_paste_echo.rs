@@ -1,5 +1,5 @@
 //! Regression: input written after the first frame must paint through the
-//! production EventStream parser (issue: post-first-frame paint stall).
+//! production `EventStream` parser (issue: post-first-frame paint stall).
 //!
 //! The startup capability probe once owned stdin past the first frame: a
 //! bracketed paste written as soon as the first frame was observed landed in
@@ -40,6 +40,14 @@ fn pi_binary() -> Result<PathBuf, DriverError> {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test setup and assertions: binary, sandbox, PTY session, frame reads, and settle policies must all succeed"
+)]
+#[expect(
+    clippy::panic,
+    reason = "test assertion: paste echo read failure is a test failure signal"
+)]
 #[test]
 fn paste_after_first_frame_paints_label_as_synchronized_text() {
     let binary = pi_binary().expect("pi binary");
@@ -48,7 +56,7 @@ fn paste_after_first_frame_paints_label_as_synchronized_text() {
     let agent = sandbox.path().join("agent");
     let sessions = sandbox.path().join("sessions");
     for directory in [&home, &agent, &sessions] {
-        fs::create_dir_all(&directory).expect("sandbox dirs");
+        fs::create_dir_all(directory).expect("sandbox dirs");
     }
 
     let mut env = BTreeMap::new();

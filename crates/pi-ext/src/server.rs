@@ -1055,6 +1055,36 @@ where
     serve_io_inner(reader, writer, Arc::new(runtime), out_rx).await
 }
 
+/// Spawns a task that drains rejected frames back into the outbound channel,
+/// racing writer death so it never blocks on a dead peer.
+fn spawn_rejection_flusher(
+    out_tx: &mpsc::Sender<OutboundFrame>,
+    mut rejection_rx: mpsc::Receiver<Frame>,
+    writer_dead: &CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let out_tx = out_tx.clone();
+    let writer_dead = writer_dead.clone();
+    tokio::spawn(async move {
+        loop {
+            let frame = tokio::select! {
+                biased;
+                () = writer_dead.cancelled() => return,
+                frame = rejection_rx.recv() => frame,
+            };
+            let Some(frame) = frame else {
+                return;
+            };
+            let sent = tokio::select! {
+                biased;
+                () = writer_dead.cancelled() => return,
+                sent = out_tx.send(frame.into()) => sent,
+            };
+            if sent.is_err() {
+                return;
+            }
+        }
+    })
+}
 /// Shared driver behind [`serve_io`]. Tests construct the runtime directly
 /// so they can observe in-flight bookkeeping.
 async fn serve_io_inner<R, W, E>(
@@ -1070,32 +1100,9 @@ where
 {
     let writer_dead = CancellationToken::new();
     let mut tasks: JoinSet<()> = JoinSet::new();
-    let (rejection_tx, mut rejection_rx) = mpsc::channel::<Frame>(runtime.out_tx.max_capacity());
+    let (rejection_tx, rejection_rx) = mpsc::channel::<Frame>(runtime.out_tx.max_capacity());
 
-    let rejection_flusher = {
-        let out_tx = runtime.out_tx.clone();
-        let writer_dead = writer_dead.clone();
-        tokio::spawn(async move {
-            loop {
-                let frame = tokio::select! {
-                    biased;
-                    () = writer_dead.cancelled() => return,
-                    frame = rejection_rx.recv() => frame,
-                };
-                let Some(frame) = frame else {
-                    return;
-                };
-                let sent = tokio::select! {
-                    biased;
-                    () = writer_dead.cancelled() => return,
-                    sent = out_tx.send(frame.into()) => sent,
-                };
-                if sent.is_err() {
-                    return;
-                }
-            }
-        })
-    };
+    let rejection_flusher = spawn_rejection_flusher(&runtime.out_tx, rejection_rx, &writer_dead);
 
     let writer_shutdown = CancellationToken::new();
     let writer_task = {

@@ -14,6 +14,10 @@ use std::process::Command;
 
 use serde_json::Value;
 
+#[expect(
+    clippy::panic,
+    reason = "test helper: bench binary spawn failure is irrecoverable"
+)]
 fn run_bench(label: &str, extra: &[&str]) -> Value {
     let binary = env!("CARGO_BIN_EXE_pi_tool_dispatch_bench");
     // Unique per test: cargo runs tests in parallel threads that share a pid.
@@ -49,13 +53,20 @@ fn run_bench(label: &str, extra: &[&str]) -> Value {
     let _ = std::fs::remove_dir_all(&session_dir);
     report
 }
-
+#[expect(
+    clippy::panic,
+    reason = "test helper: missing event key means bench output is malformed"
+)]
 fn events(report: &Value, key: &str) -> i64 {
     report["events"][key]
         .as_i64()
         .unwrap_or_else(|| panic!("events.{key} missing in {report}"))
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: bench report fields must be present and valid"
+)]
 #[test]
 fn valid_dispatch_satisfies_the_shared_protocol() {
     let report = run_bench("valid", &[]);

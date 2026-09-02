@@ -4,16 +4,16 @@
 //! produce schema-v1 transcripts and binary per-probe verdicts:
 //!
 //! - `railed`         — real `Rail` + `paint_lines` rows, closing `│`
-//!                      sentinel at the contract-computed column
+//!   sentinel at the contract-computed column
 //! - `table-1..3`     — real `Markdown` tables with probe cells; right
-//!                      border aligned across header and every row
+//!   border aligned across header and every row
 //! - `editor-Pxx`     — focused `Input`; cursor at `2 + contract width`
-//!                      after each probe (hardware cursor oracle)
+//!   after each probe (hardware cursor oracle)
 //! - `overlay`        — base rows plus `write_overlay_cells` overlay
-//!                      rows; base sentinel beyond overlay + overlay
-//!                      sentinel both at contract columns
+//!   rows; base sentinel beyond overlay + overlay
+//!   sentinel both at contract columns
 //! - `paste`          — multiline `Editor` paste (verbatim, atomic undo,
-//!                      large-paste marker); body-line sentinels aligned
+//!   large-paste marker); body-line sentinels aligned
 //!
 //! The 13-probe corpus comes from `docs/TUI-R2-terminal-width-table-divergence.md`.
 //! Each probe has a contract column count from `pi_tui::text::visible_width`.
@@ -298,10 +298,13 @@ fn avt_column_of_substr(line: &str, needle: &str) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
     }
+    let Some(first) = needle.chars().next() else {
+        return Some(0);
+    };
     let mut col = 0usize;
     let mut chars = line.chars();
     while let Some(ch) = chars.next() {
-        if ch == needle.chars().next().expect("needle has at least one char") {
+        if ch == first {
             let mut trial = chars.clone();
             let mut matched = 1usize;
             for need in needle.chars().skip(1) {
@@ -626,8 +629,7 @@ fn assert_rail_alignment(
     // The rail glyph must sit at column 0 in every railed row; the child
     // content starts at column 2 (Rail::RAIL_WIDTH = glyph + one skip cell).
     const RAIL_OFFSET: usize = 2;
-    for index in 0..CORPUS.len() {
-        let (label, _probe) = CORPUS[index];
+    for (index, &(label, _probe)) in CORPUS.iter().enumerate() {
         let line = find_probe_line(&frame.snapshot.lines, label)?;
         // Left rail glyph.
         let left = avt_column_of_first(line, '\u{2502}')
@@ -669,6 +671,11 @@ fn assert_table_alignment(
     }
     // The top or bottom border is all box-drawing; its right corner's
     // contract position is the end of the whole string (all width-1 chars).
+    // bounded: the `is_empty` guard above proves `last()` is `Some`.
+    #[expect(
+        clippy::expect_used,
+        reason = "bounded: is_empty guard proves table_lines is non-empty"
+    )]
     let border = table_lines.last().expect("table has lines");
     let contract_right = border.chars().map(avt_char_width).sum::<usize>() - 1;
     for index in table_indices {
@@ -742,8 +749,7 @@ fn assert_overlay_alignment(
     frame: &pi_tui::testkit::driver::SettledFrame,
     verdicts: &mut Vec<(String, &'static str)>,
 ) -> Result<(), CorpusError> {
-    for index in 0..CORPUS.len() {
-        let (label, _probe) = CORPUS[index];
+    for (index, &(label, _probe)) in CORPUS.iter().enumerate() {
         let line = find_probe_line(&frame.snapshot.lines, label)?;
         // Base sentinel `B9` must survive right of the overlay region.
         let base_col = avt_column_of_substr(line, "B9").ok_or_else(|| {
@@ -780,11 +786,8 @@ fn assert_overlay_alignment(
             format!("overlay/{label}"),
             if pass { "match" } else { "diverge" },
         ));
-        if !pass {
-            // Record divergence but don't hard-fail — AVT/contract width
-            // disagreements are the gauntlet's subject, not a test failure.
-            continue;
-        }
+        // Divergences are recorded above and not hard-failed: AVT/contract
+        // width disagreements are the gauntlet's subject, not a test failure.
     }
     Ok(())
 }
@@ -793,40 +796,29 @@ fn assert_paste_alignment(
     frame: &pi_tui::testkit::driver::SettledFrame,
     verdicts: &mut Vec<(String, &'static str)>,
     phase_label: &str,
-) -> Result<(), CorpusError> {
-    for index in 0..CORPUS.len() {
-        let (label, _probe) = CORPUS[index];
-        let line = match find_probe_line(&frame.snapshot.lines, label) {
-            Ok(line) => line,
-            Err(_) => {
-                // Scrolled lines may not all be visible; non-visible probes
-                // are recorded as `not-visible` rather than failing.
-                verdicts.push((format!("{phase_label}/{label}"), "not-visible"));
-                continue;
-            }
+) {
+    for (index, &(label, _probe)) in CORPUS.iter().enumerate() {
+        let Ok(line) = find_probe_line(&frame.snapshot.lines, label) else {
+            // Scrolled lines may not all be visible; non-visible probes
+            // are recorded as `not-visible` rather than failing.
+            verdicts.push((format!("{phase_label}/{label}"), "not-visible"));
+            continue;
         };
         let prefix = gauntlet_row_prefix(index);
         let expected = row_closing_col(&prefix);
-        let right = match avt_column_of_last(line, '\u{2502}') {
-            Some(col) => col,
-            None => {
-                // Missing closing border — record as diverge, don't hard-fail.
-                verdicts.push((format!("{phase_label}/{label}"), "diverge"));
-                continue;
-            }
+        let Some(right) = avt_column_of_last(line, '\u{2502}') else {
+            // Missing closing border — record as diverge, don't hard-fail.
+            verdicts.push((format!("{phase_label}/{label}"), "diverge"));
+            continue;
         };
         let pass = right == expected;
         verdicts.push((
             format!("{phase_label}/{label}"),
             if pass { "match" } else { "diverge" },
         ));
-        if !pass {
-            // Record divergence but don't hard-fail — AVT/contract width
-            // disagreements are the gauntlet's subject, not a test failure.
-            continue;
-        }
+        // Divergences are recorded above and not hard-failed: AVT/contract
+        // width disagreements are the gauntlet's subject, not a test failure.
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -871,8 +863,8 @@ fn run_unicode_gauntlet(
     }
 
     // editor-P01..P13
-    for index in 0..CORPUS.len() {
-        let marker = format!("PI_TUI_UG={}", CORPUS[index].0);
+    for (index, &(label, _probe)) in CORPUS.iter().enumerate() {
+        let marker = format!("PI_TUI_UG={label}");
         let frame = run.settle_frame(|bytes| contains_bytes(bytes, marker.as_bytes()))?;
         assert_editor_cursor(
             &frame,
@@ -895,7 +887,7 @@ fn run_unicode_gauntlet(
         &frame,
         verdicts.entry("paste-verbatim-1".to_owned()).or_default(),
         "paste-verbatim-1",
-    )?;
+    );
     run.write_step()?;
 
     // paste-verbatim-2
@@ -905,7 +897,7 @@ fn run_unicode_gauntlet(
         &frame,
         verdicts.entry("paste-verbatim-2".to_owned()).or_default(),
         "paste-verbatim-2",
-    )?;
+    );
     run.write_step()?;
 
     // paste-atomic
@@ -915,7 +907,7 @@ fn run_unicode_gauntlet(
         &frame,
         verdicts.entry("paste-atomic".to_owned()).or_default(),
         "paste-atomic",
-    )?;
+    );
     run.write_step()?;
 
     // paste-marker

@@ -388,6 +388,7 @@ pub fn push_raw_region(region: RawRegion) {
 /// Returns `None` outside a frame; inside, `Some(PriorLine { matched, linked })`
 /// where `matched` licenses skipping the repaint for that row span and
 /// `linked` reports whether the prior claim carried hyperlink regions.
+#[must_use]
 pub fn probe_line(y: u16, x: u16, width: u16, key: u128) -> Option<PriorLine> {
     with_current_annotations(|annotations| {
         annotations.row_claims_mut().probe_line(y, x, width, key)
@@ -399,7 +400,7 @@ pub fn record_line(y: u16, x: u16, width: u16, key: u128, linked: bool) {
     let _ = with_current_annotations(|annotations| {
         annotations
             .row_claims_mut()
-            .record_line(y, x, width, key, linked)
+            .record_line(y, x, width, key, linked);
     });
 }
 

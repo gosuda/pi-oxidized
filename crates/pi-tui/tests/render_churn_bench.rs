@@ -49,7 +49,10 @@ macro_rules! require_bench_binary {
 }
 
 /// Run the benchmark binary and parse the `__BENCH_JSON__` output.
-#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test-only code")]
+#[expect(
+    clippy::panic,
+    reason = "test-only code: benchmark spawn and parse failures are irrecoverable"
+)]
 fn run_bench() -> Value {
     let binary = bench_binary();
     let output = Command::new(&binary)
@@ -179,7 +182,12 @@ fn editor_scenario_allocates_more_than_static() {
 
 /// Run the benchmark binary in `--probe` mode and parse `__PROBE_JSON__`
 /// (PERF-T11 iteration 7 floor-probe contract).
-#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test-only code")]
+#[expect(
+    clippy::panic,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test-only code: probe spawn and parse failures are irrecoverable"
+)]
 fn run_probe() -> Value {
     let output = Command::new(bench_binary())
         .arg("--probe")

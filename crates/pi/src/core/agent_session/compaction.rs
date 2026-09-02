@@ -31,16 +31,16 @@ use regex::Regex;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::compaction::{
-    self, BeforeCompactResult, CompactOptions, CompactionError, CompactionResult,
-    CompactionSettings, SummarizationRetryCallbacks, SummarizationRetryPolicy, SummarizeStreamFn,
-    preparation_none_error, prepare_compaction, should_compact,
+    self, BeforeCompactResult, CompactOptions, CompactionError, CompactionPreparation,
+    CompactionResult, CompactionSettings, SummarizationRetryCallbacks, SummarizationRetryPolicy,
+    SummarizeStreamFn, preparation_none_error, prepare_compaction, should_compact,
 };
 use crate::core::model_runtime::ModelRuntimeAuthOverrides;
 use crate::core::sessions::{CompactionEntry, SessionEntry, get_latest_compaction_entry};
 use crate::core::settings::ResolvedCompactionSettings;
 use pi_agent::AgentContext;
 use pi_agent::telemetry::{
-    AiOperation, AiRequestStart, HarnessCompactionStart, SpanStatus, contained,
+    AiOperation, AiRequestStart, HarnessCompactionStart, SpanStatus, TelemetrySpan, contained,
     start_ai_request_span, start_harness_compaction_span,
 };
 
@@ -458,97 +458,49 @@ impl AgentSession {
         should_continue
     }
 
-    // -- shared compaction core -------------------------------------------
-
-    /// Resolve preparation, dispatch extension `before_compact`, run the pure
-    /// engine, persist the summary, and rebuild the agent transcript.
-    ///
-    /// Returns `Ok(Some(result))` on success, `Ok(None)` when preparation
-    /// yields nothing (session too small / already compacted), and `Err` on
-    /// cancellation or summarisation failure.
-    ///
-    /// `is_manual` controls only the extension-hook path (manual passes
-    /// `custom_instructions`; auto passes `None`). The pure engine itself is
-    /// identical for both paths.
-    async fn run_compaction_core(
+    /// Run the extension `before_compact` hook. Returns `Ok(Some(result))`
+    /// when the extension provides a full replacement (persisted + finalized),
+    /// `Ok(None)` when no hook or the hook did not short-circuit, and `Err`
+    /// on cancellation or hook failure.
+    async fn try_extension_before_compact(
         &self,
+        runner: &Arc<dyn ExtensionRunner>,
         reason: CompactionReason,
-        custom_instructions: Option<&str>,
+        abort_token: &CancellationToken,
         will_retry: bool,
-        abort_token: CancellationToken,
-        is_manual: bool,
+        compaction_span: &dyn TelemetrySpan,
     ) -> Result<Option<CompactionResult>, CompactionError> {
-        let model = self.model();
-        let settings = self.compaction_settings();
-        let (session_id, path_entries) = {
-            let sm = tokio::select! {
-                biased;
-                () = abort_token.cancelled() => return Err(CompactionError::Cancelled),
-                sm = self.session_manager.lock() => sm,
-            };
-            let entries: Vec<SessionEntry> = sm.get_branch(None).into_iter().cloned().collect();
-            (sm.get_session_id().to_owned(), entries)
-        };
-
-        // Start a pi.harness.compaction span through the session telemetry
-        // context. The span is contained: a panicking telemetry backend
-        // degrades to a no-op span and never affects the compaction outcome.
-        let compaction_span = start_harness_compaction_span(
-            self.telemetry.as_ref(),
-            HarnessCompactionStart {
-                session_id,
-                lane_name: "main".to_owned(),
-                operation_id: format!("compaction-{}", reason.as_str()),
-                recovery: will_retry,
-            },
-        );
-        let pure_settings = settings_to_pure(settings);
-
-        let path_refs: Vec<&SessionEntry> = path_entries.iter().collect();
-        let preparation = prepare_compaction(&path_refs, pure_settings).map_err(|err| {
-            contained(
-                || {
-                    compaction_span.set_status(SpanStatus::Error {
-                        name: None,
-                        message: Some(err.to_string()),
-                    });
-                },
-                || (),
-            );
-            err
-        })?;
-        let Some(preparation) = preparation else {
-            drop(compaction_span);
+        if !runner.has_handlers("session_before_compact") {
             return Ok(None);
-        };
-
-        // Resolve auth + stream inputs.
-        let inputs = tokio::select! {
-            biased;
-            () = abort_token.cancelled() => Err(CompactionError::Cancelled),
-            result = self.resolve_compaction_inputs() => result,
         }
-        .map_err(|err| {
-            contained(
-                || {
-                    compaction_span.set_status(SpanStatus::Error {
-                        name: None,
-                        message: Some(err.to_string()),
-                    });
-                },
-                || (),
-            );
-            err
-        })?;
-
-        // Extension before_compact hook (cancellable).
-        let runner = self.hooks.runner();
-        if runner.has_handlers("session_before_compact") {
-            let event = AgentSessionEvent::CompactionStart { reason };
-            let cancel = self
-                .extension_before_compact(&runner, event, &abort_token)
+        let event = AgentSessionEvent::CompactionStart { reason };
+        let cancel = self
+            .extension_before_compact(runner, event, abort_token)
+            .await
+            .inspect_err(|err| {
+                contained(
+                    || {
+                        compaction_span.set_status(SpanStatus::Error {
+                            name: None,
+                            message: Some(err.to_string()),
+                        });
+                    },
+                    || (),
+                );
+            })?;
+        if cancel.cancel {
+            return Err(CompactionError::Cancelled);
+        }
+        if let Some(replacement) = cancel.compaction {
+            // Extension provided the full result — persist + emit without
+            // invoking the pure summariser. The span stays open across
+            // finalize so persist/rebuild failures record Error status.
+            let mut replacement = replacement;
+            replacement.from_hook = Some(true);
+            return self
+                .finalize_compaction_result(replacement, true, reason, will_retry, abort_token)
                 .await
-                .map_err(|err| {
+                .inspect_err(|err| {
                     contained(
                         || {
                             compaction_span.set_status(SpanStatus::Error {
@@ -558,74 +510,20 @@ impl AgentSession {
                         },
                         || (),
                     );
-                    err
-                })?;
-            if cancel.cancel {
-                drop(compaction_span);
-                return Err(CompactionError::Cancelled);
-            }
-            if let Some(replacement) = cancel.compaction {
-                // Extension provided the full result — persist + emit without
-                // invoking the pure summariser. The span stays open across
-                // finalize so persist/rebuild failures record Error status.
-                let mut replacement = replacement;
-                replacement.from_hook = Some(true);
-                return self
-                    .finalize_compaction_result(replacement, true, reason, will_retry, &abort_token)
-                    .await
-                    .map_err(|err| {
-                        contained(
-                            || {
-                                compaction_span.set_status(SpanStatus::Error {
-                                    name: None,
-                                    message: Some(err.to_string()),
-                                });
-                            },
-                            || (),
-                        );
-                        err
-                    })
-                    .map(Some);
-            }
+                })
+                .map(Some);
         }
+        Ok(None)
+    }
 
-        // Run the pure engine.
-        let thinking_level = thinking_level_str(self.thinking_level());
-        let retry = self.summarization_retry_policy();
-        let retry_callbacks =
-            self.summarization_retry_callbacks(SummarizationRetrySource::Compaction { reason });
-
-        let ai_span = start_ai_request_span(
-            compaction_span.as_ref(),
-            AiRequestStart {
-                operation: AiOperation::Stream,
-                provider: model.provider.clone(),
-                model: model.id.clone(),
-                api: model.api.clone(),
-                streaming: true,
-                deferred: None,
-            },
-        );
-
-        let result = compaction::compact(
-            &preparation,
-            CompactOptions {
-                model: &model,
-                api_key: inputs.api_key.clone(),
-                headers: inputs.headers.clone(),
-                custom_instructions: if is_manual { custom_instructions } else { None },
-                signal: Some(abort_token.clone()),
-                thinking_level: thinking_level.as_deref(),
-                stream_fn: inputs.stream_fn.clone(),
-                env: inputs.env.clone(),
-                retry: Some(retry),
-                retry_callbacks: Some(retry_callbacks),
-                hooks: None,
-            },
-        )
-        .await;
-
-        match &result {
+    /// Record span status for the pure-engine result: `Ok` on the AI span,
+    /// `Error` on both the AI and compaction spans on failure.
+    fn record_compaction_result_status(
+        result: &Result<CompactionResult, CompactionError>,
+        ai_span: &dyn TelemetrySpan,
+        compaction_span: &dyn TelemetrySpan,
+    ) {
+        match result {
             Ok(_) => {
                 contained(|| ai_span.set_status(SpanStatus::Ok), || ());
             }
@@ -652,7 +550,164 @@ impl AgentSession {
                 );
             }
         }
+    }
+
+    // -- shared compaction core -------------------------------------------
+
+    /// Run the pure compaction engine and record span status for the result.
+    async fn run_pure_compaction_engine(
+        &self,
+        preparation: &CompactionPreparation,
+        inputs: &CompactionInputs,
+        abort_token: &CancellationToken,
+        custom_instructions: Option<&str>,
+        retry_callbacks: SummarizationRetryCallbacks,
+        compaction_span: &dyn TelemetrySpan,
+    ) -> Result<CompactionResult, CompactionError> {
+        let model = self.model();
+        let thinking_level = thinking_level_str(self.thinking_level());
+        let retry = self.summarization_retry_policy();
+
+        let ai_span = start_ai_request_span(
+            compaction_span,
+            AiRequestStart {
+                operation: AiOperation::Stream,
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                api: model.api.clone(),
+                streaming: true,
+                deferred: None,
+            },
+        );
+
+        let result = compaction::compact(
+            preparation,
+            CompactOptions {
+                model: &model,
+                api_key: inputs.api_key.clone(),
+                headers: inputs.headers.clone(),
+                custom_instructions,
+                signal: Some(abort_token.clone()),
+                thinking_level: thinking_level.as_deref(),
+                stream_fn: inputs.stream_fn.clone(),
+                env: inputs.env.clone(),
+                retry: Some(retry),
+                retry_callbacks: Some(retry_callbacks),
+                hooks: None,
+            },
+        )
+        .await;
+
+        Self::record_compaction_result_status(&result, &*ai_span, compaction_span);
         drop(ai_span);
+        result
+    }
+
+    /// Resolve preparation, dispatch extension `before_compact`, run the pure
+    /// engine, persist the summary, and rebuild the agent transcript.
+    ///
+    /// Returns `Ok(Some(result))` on success, `Ok(None)` when preparation
+    /// yields nothing (session too small / already compacted), and `Err` on
+    /// cancellation or summarisation failure.
+    ///
+    /// `is_manual` controls only the extension-hook path (manual passes
+    /// `custom_instructions`; auto passes `None`). The pure engine itself is
+    /// identical for both paths.
+    async fn run_compaction_core(
+        &self,
+        reason: CompactionReason,
+        custom_instructions: Option<&str>,
+        will_retry: bool,
+        abort_token: CancellationToken,
+        is_manual: bool,
+    ) -> Result<Option<CompactionResult>, CompactionError> {
+        let settings = self.compaction_settings();
+        let (session_id, path_entries) = {
+            let sm = tokio::select! {
+                biased;
+                () = abort_token.cancelled() => return Err(CompactionError::Cancelled),
+                sm = self.session_manager.lock() => sm,
+            };
+            let entries: Vec<SessionEntry> = sm.get_branch(None).into_iter().cloned().collect();
+            (sm.get_session_id().to_owned(), entries)
+        };
+
+        // Start a pi.harness.compaction span through the session telemetry
+        // context. The span is contained: a panicking telemetry backend
+        // degrades to a no-op span and never affects the compaction outcome.
+        let compaction_span = start_harness_compaction_span(
+            self.telemetry.as_ref(),
+            HarnessCompactionStart {
+                session_id,
+                lane_name: "main".to_owned(),
+                operation_id: format!("compaction-{}", reason.as_str()),
+                recovery: will_retry,
+            },
+        );
+        let pure_settings = settings_to_pure(settings);
+
+        let path_refs: Vec<&SessionEntry> = path_entries.iter().collect();
+        let preparation = prepare_compaction(&path_refs, pure_settings).inspect_err(|err| {
+            contained(
+                || {
+                    compaction_span.set_status(SpanStatus::Error {
+                        name: None,
+                        message: Some(err.to_string()),
+                    });
+                },
+                || (),
+            );
+        })?;
+        let Some(preparation) = preparation else {
+            drop(compaction_span);
+            return Ok(None);
+        };
+
+        // Resolve auth + stream inputs.
+        let inputs = tokio::select! {
+            biased;
+            () = abort_token.cancelled() => Err(CompactionError::Cancelled),
+            result = self.resolve_compaction_inputs() => result,
+        }
+        .inspect_err(|err| {
+            contained(
+                || {
+                    compaction_span.set_status(SpanStatus::Error {
+                        name: None,
+                        message: Some(err.to_string()),
+                    });
+                },
+                || (),
+            );
+        })?;
+
+        // Extension before_compact hook (cancellable).
+        let runner = self.hooks.runner();
+        if let Some(result) = self
+            .try_extension_before_compact(
+                &runner,
+                reason,
+                &abort_token,
+                will_retry,
+                &*compaction_span,
+            )
+            .await?
+        {
+            return Ok(Some(result));
+        }
+        let retry_callbacks =
+            self.summarization_retry_callbacks(SummarizationRetrySource::Compaction { reason });
+
+        let result = self
+            .run_pure_compaction_engine(
+                &preparation,
+                &inputs,
+                &abort_token,
+                if is_manual { custom_instructions } else { None },
+                retry_callbacks,
+                &*compaction_span,
+            )
+            .await;
 
         let result = result?;
 
@@ -660,7 +715,7 @@ impl AgentSession {
         // across finalize so persist/rebuild failures record Error status.
         self.finalize_compaction_result(result, false, reason, will_retry, &abort_token)
             .await
-            .map_err(|err| {
+            .inspect_err(|err| {
                 contained(
                     || {
                         compaction_span.set_status(SpanStatus::Error {
@@ -670,7 +725,6 @@ impl AgentSession {
                     },
                     || (),
                 );
-                err
             })
             .map(Some)
     }
@@ -2570,11 +2624,11 @@ mod tests {
     fn scripted_assistant(
         build: impl FnOnce(&mut AssistantMessage),
         reason: DoneReason,
-    ) -> Result<AssistantMessageEvent, ProviderError> {
+    ) -> AssistantMessageEvent {
         let mut message =
             AssistantMessage::new("test-api", "test-provider", "m", pi_agent::now_millis());
         build(&mut message);
-        Ok(AssistantMessageEvent::Done { reason, message })
+        AssistantMessageEvent::Done { reason, message }
     }
 
     impl Provider for ToolThenFinalProvider {
@@ -2599,7 +2653,7 @@ mod tests {
                             pi_agent::now_millis(),
                         )),
                     }),
-                    scripted_assistant(
+                    Ok(scripted_assistant(
                         |message| {
                             message.content = vec![AssistantContent::ToolCall(
                                 pi_ai::ToolCall::new("tc-1", "bulky", Map::new()),
@@ -2608,7 +2662,7 @@ mod tests {
                             message.usage.total_tokens = 8_000;
                         },
                         DoneReason::ToolUse,
-                    ),
+                    )),
                 ]
             } else {
                 vec![
@@ -2620,7 +2674,7 @@ mod tests {
                             pi_agent::now_millis(),
                         )),
                     }),
-                    scripted_assistant(
+                    Ok(scripted_assistant(
                         |message| {
                             message.content =
                                 vec![AssistantContent::Text(TextContent::new("final answer"))];
@@ -2628,7 +2682,7 @@ mod tests {
                             message.usage.total_tokens = 500;
                         },
                         DoneReason::Stop,
-                    ),
+                    )),
                 ]
             };
             Box::pin(stream::iter(events))

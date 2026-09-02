@@ -1,6 +1,6 @@
-#![cfg(all(unix, feature = "testkit"))]
-
 //! Two-tier state-matrix conformance corpus (TUI-V1, issue #76).
+
+#![cfg(all(unix, feature = "testkit"))]
 //!
 //! Drives the `pi_tui_state_matrix_fixture` binary through the PTY harness
 //! to produce validator-clean schema-v1 transcripts proving the full state

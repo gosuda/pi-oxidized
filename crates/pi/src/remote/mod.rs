@@ -14,7 +14,7 @@
 //! [`transport::EndpointSpecError::UnsupportedOnPlatform`].
 //!
 //! R4 adds the multi-session [`server`] (portable core, zero `cfg`
-//! branches) with its AgentSession hosting seam and the
+//! branches) with its `AgentSession` hosting seam and the
 //! `#[cfg(unix)]` Unix listener preset, which shares the same typed
 //! [`transport::EndpointSpecError`] owner for platform-gated listen
 //! specs.

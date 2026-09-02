@@ -2136,7 +2136,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_cancels_stalled_stream_item() {
+    async fn compact_cancels_stalled_stream_item() -> Result<(), Box<dyn std::error::Error>> {
         let model = test_model(2_048, 128_000);
         let prep = CompactionPreparation {
             first_kept_entry_id: "k".into(),
@@ -2185,14 +2185,15 @@ mod tests {
 
         tokio::select! {
             () = entered.notified() => {}
-            result = run.as_mut() => panic!("stalled stream returned early: {result:?}"),
+            result = run.as_mut() => {
+                return Err(format!("stalled stream returned early: {result:?}").into());
+            }
         }
         cancel.cancel();
 
-        let result = tokio::time::timeout(Duration::from_secs(1), run.as_mut())
-            .await
-            .expect("cancellation timed out");
+        let result = tokio::time::timeout(Duration::from_secs(1), run.as_mut()).await?;
         assert!(matches!(result, Err(CompactionError::Cancelled)));
+        Ok(())
     }
 
     #[tokio::test]

@@ -195,7 +195,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             });
             println!(
                 "{}",
-                serde_json::to_string(&summary).expect("serialize summary")
+                serde_json::to_string(&summary).map_err(|e| format!("serialize summary: {e}"))?
             );
         } else {
             eprintln!(
@@ -264,7 +264,7 @@ fn measure_append(config: &Config) -> Result<Vec<f64>, String> {
             });
             println!(
                 "{}",
-                serde_json::to_string(&record).expect("serialize record")
+                serde_json::to_string(&record).map_err(|e| format!("serialize record: {e}"))?
             );
         }
 
@@ -312,7 +312,7 @@ fn measure_reopen(config: &Config, session_path: &PathBuf) -> Result<Vec<f64>, S
             });
             println!(
                 "{}",
-                serde_json::to_string(&record).expect("serialize record")
+                serde_json::to_string(&record).map_err(|e| format!("serialize record: {e}"))?
             );
         }
 
@@ -327,8 +327,7 @@ fn append_entries(path: &PathBuf, count: usize) -> Result<(), String> {
     // (which initializes a v3 header on empty files), and append message entries.
     let dir = path
         .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".".to_string());
+        .map_or_else(|| ".".to_string(), |p| p.to_string_lossy().into_owned());
     fs::write(path, "").map_err(|e| format!("create empty file: {e}"))?;
     let mut sm = SessionManager::open(&path.to_string_lossy(), Some(&dir), None)
         .map_err(|e| format!("open empty file for append: {e}"))?;
@@ -361,21 +360,22 @@ fn fresh_session_path(config: &Config, label: &str) -> PathBuf {
 }
 
 fn sha256_prefix(path: &PathBuf) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
     use std::io::Read;
     let mut file = fs::File::open(path).map_err(|e| format!("open for hash: {e}"))?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)
         .map_err(|e| format!("read for hash: {e}"))?;
 
-    use sha2::{Digest, Sha256};
     let hash = Sha256::digest(&buf);
     Ok(hex_encode(&hash[..8]))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
     }
     s
 }
@@ -385,7 +385,7 @@ fn peak_rss_bytes() -> u64 {
     if let Ok(content) = fs::read_to_string("/proc/self/status") {
         for line in content.lines() {
             if let Some(rest) = line.strip_prefix("VmHWM:") {
-                let num: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+                let num: String = rest.chars().filter(char::is_ascii_digit).collect();
                 if let Ok(kb) = num.parse::<u64>() {
                     return kb * 1024;
                 }
@@ -402,6 +402,10 @@ struct DistStats {
     relative_spread: f64,
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "bench binary: sample counts are small and f64 precision is sufficient for timing statistics"
+)]
 fn distribution(values: &[f64]) -> DistStats {
     let count = values.len();
     if count == 0 {
@@ -416,8 +420,8 @@ fn distribution(values: &[f64]) -> DistStats {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    let median = if count % 2 == 0 {
-        (sorted[count / 2 - 1] + sorted[count / 2]) / 2.0
+    let median = if count.is_multiple_of(2) {
+        f64::midpoint(sorted[count / 2 - 1], sorted[count / 2])
     } else {
         sorted[count / 2]
     };

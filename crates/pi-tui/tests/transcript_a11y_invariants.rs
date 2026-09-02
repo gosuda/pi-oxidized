@@ -1,6 +1,6 @@
-#![cfg(all(unix, feature = "testkit"))]
-
 //! Automated accessibility-invariant lane (TUI-V6, issue #72).
+
+#![cfg(all(unix, feature = "testkit"))]
 //!
 //! Drives the `pi_tui_a11y_fixture` binary through the PTY harness to
 //! produce validator-clean schema-v1 transcripts, then computes the three

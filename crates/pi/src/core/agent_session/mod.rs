@@ -229,8 +229,8 @@ pub(super) struct AgentSessionInner {
     pub(super) agent_end_notify: Arc<Notify>,
     /// Cancels prompt lifecycle barriers when the event pump disconnects.
     pub(super) agent_end_wait_cancel: CancellationToken,
-    /// Persistence epoch, advanced on every `AgentStart` observed by the
-    /// FIFO pump. The TurnEnd counters below are scoped to it so a stale
+    /// Persistence epoch, advanced on every [`AgentStart`] observed by the
+    /// FIFO pump. The `TurnEnd` counters below are scoped to it so a stale
     /// terminal marker from a previous run can never release a later run.
     pub(super) persistence_epoch: u64,
     /// `TurnEnd` events fully processed (extension → public → persistence)
@@ -239,7 +239,7 @@ pub(super) struct AgentSessionInner {
     /// `TurnEnd` events claimed by the prepare-next-turn callback within
     /// the current epoch.
     pub(super) claimed_turn_ends: u64,
-    /// Wakes TurnEnd barrier waiters after a fully persisted `TurnEnd`.
+    /// Wakes `TurnEnd` barrier waiters after a fully persisted `TurnEnd`.
     pub(super) turn_end_notify: Arc<Notify>,
     /// Scoped models list.
     pub(super) scoped_models: Vec<ScopedModel>,
@@ -464,6 +464,42 @@ pub enum AgentSessionError {
     Session(#[from] crate::core::sessions::SessionError),
 }
 
+/// Build a default [`AgentLoopConfig`] with all optional hooks disabled.
+fn default_agent_loop_config(
+    model: Model,
+    convert_to_llm: pi_agent::ConvertToLlm,
+    telemetry: Arc<dyn pi_agent::telemetry::TelemetryContext>,
+) -> AgentLoopConfig {
+    AgentLoopConfig {
+        model,
+        reasoning: None,
+        temperature: None,
+        max_tokens: None,
+        session_id: None,
+        transport: None,
+        cache_retention: None,
+        thinking_budgets: None,
+        max_retry_delay_ms: None,
+        metadata: None,
+        headers: None,
+        env: None,
+        stream_extra: serde_json::Map::new(),
+        tool_execution: pi_agent::ToolExecutionMode::Parallel,
+        convert_to_llm,
+        transform_context: None,
+        get_api_key: None,
+        should_stop_after_turn: None,
+        prepare_next_turn: None,
+        get_steering_messages: None,
+        get_follow_up_messages: None,
+        before_tool_call: None,
+        after_tool_call: None,
+        on_payload: None,
+        on_response: None,
+        telemetry,
+    }
+}
+
 impl AgentSession {
     /// Construct a session, install hooks, and spawn the event pump.
     ///
@@ -499,34 +535,9 @@ impl AgentSession {
                 crate::core::telemetry::resolve_session_telemetry(&config.settings_manager);
             let base = match config.base_config {
                 Some(base) => base,
-                None => AgentLoopConfig {
-                    model: model.clone(),
-                    reasoning: None,
-                    temperature: None,
-                    max_tokens: None,
-                    session_id: None,
-                    transport: None,
-                    cache_retention: None,
-                    thinking_budgets: None,
-                    max_retry_delay_ms: None,
-                    metadata: None,
-                    headers: None,
-                    env: None,
-                    stream_extra: serde_json::Map::new(),
-                    tool_execution: pi_agent::ToolExecutionMode::Parallel,
-                    convert_to_llm: Arc::clone(&convert_to_llm),
-                    transform_context: None,
-                    get_api_key: None,
-                    should_stop_after_turn: None,
-                    prepare_next_turn: None,
-                    get_steering_messages: None,
-                    get_follow_up_messages: None,
-                    before_tool_call: None,
-                    after_tool_call: None,
-                    on_payload: None,
-                    on_response: None,
-                    telemetry,
-                },
+                None => {
+                    default_agent_loop_config(model.clone(), Arc::clone(&convert_to_llm), telemetry)
+                }
             };
             Agent::new(AgentOptions {
                 system_prompt: config.system_prompt.clone(),
@@ -1908,7 +1919,7 @@ mod tests {
     /// A tool that blocks indefinitely until the scheduler aborts it.
     /// Used to prove cancellation determinism through concrete pi tool
     /// plumbing: the observable session-level behavior (exactly one
-    /// agent_end, no task leak, queue preservation) is the witness.
+    /// `agent_end`, no task leak, queue preservation) is the witness.
     struct CancelSensitiveTool {
         name: String,
     }
@@ -1935,7 +1946,7 @@ mod tests {
         }
 
         fn parameters(&self) -> &Value {
-            &*EMPTY_PARAMS
+            &EMPTY_PARAMS
         }
 
         fn validate_arguments(
@@ -2046,16 +2057,11 @@ mod tests {
         let mut events = Vec::new();
         let mut tool_started = false;
         let _deadline = timeout(Duration::from_secs(5), async {
-            loop {
-                match timeout(Duration::from_millis(100), rx.recv()).await {
-                    Ok(Some(name)) => {
-                        events.push(name.clone());
-                        if name == "tool_execution_start" {
-                            tool_started = true;
-                            break;
-                        }
-                    }
-                    _ => break,
+            while let Ok(Some(name)) = timeout(Duration::from_millis(100), rx.recv()).await {
+                events.push(name.clone());
+                if name == "tool_execution_start" {
+                    tool_started = true;
+                    break;
                 }
             }
         })

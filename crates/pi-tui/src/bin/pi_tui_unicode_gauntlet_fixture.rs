@@ -7,26 +7,27 @@
 //! the cursor drift-free:
 //!
 //! - `railed`           — real `Rail` + `paint_lines` rows, one per probe,
-//!                        closing `│` sentinel per row
+//!   closing `│` sentinel per row
 //! - `table-1..3`       — real `Markdown` tables with probe cells (grid
-//!                        borders are the alignment oracle); P02 (tab) is
-//!                        excluded here because GFM table parsing consumes
-//!                        raw tabs as cell separators
+//!   borders are the alignment oracle); P02 (tab) is
+//!   excluded here because GFM table parsing consumes
+//!   raw tabs as cell separators
 //! - `editor-Pxx`       — real focused `Input`, cursor parked directly
-//!                        after each probe (hardware cursor oracle)
+//!   after each probe (hardware cursor oracle)
 //! - `overlay`          — production `write_overlay_cells` compositing
-//!                        probe rows over base rows with a fixed base
-//!                        sentinel beyond the overlay region
+//!   probe rows over base rows with a fixed base
+//!   sentinel beyond the overlay region
 //! - `paste-*`          — real multiline `Editor` paste events: verbatim
-//!                        atomic multi-line paste, whole-paste undo
-//!                        (atomicity self-check stamped on screen), and
-//!                        the large-paste `[paste #N +N lines]` marker
+//!   atomic multi-line paste, whole-paste undo
+//!   (atomicity self-check stamped on screen), and
+//!   the large-paste `[paste #N +N lines]` marker
 //!
 //! Every rendered hint derives from the keybinding registry; stage-3
 //! writes are wrapped with OSC transaction markers identical to the other
 //! stepped fixtures so the harness recovers write boundaries.
 
 use std::env;
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -44,7 +45,6 @@ use pi_tui::terminal::{
 };
 use pi_tui::text::{normalize_terminal_output, visible_width};
 use ratatui::buffer::Buffer;
-use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Rect, Size};
 
 const DRAW_DEADLINE: Duration = Duration::from_secs(8);
@@ -171,6 +171,10 @@ impl Component for LinesChild {
     fn invalidate(&mut self) {}
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "fixture binary: single-instance root; boxing would add indirection without benefit"
+)]
 enum Surface {
     None,
     Rail(Rail),
@@ -224,11 +228,12 @@ impl GauntletRoot {
         );
         for index in selected {
             let (label, _probe) = CORPUS[index];
-            doc.push_str(&format!(
-                "| {label} {} | {} |\n",
+            let _ = writeln!(
+                doc,
+                "| {label} {} | {} |",
                 normalized_probe(index),
                 index + 1
-            ));
+            );
         }
         doc
     }
@@ -259,7 +264,7 @@ impl GauntletRoot {
             }
             Phase::Overlay => {
                 let mut base = Vec::with_capacity(CORPUS.len());
-                for index in 0..CORPUS.len() {
+                for (index, _) in CORPUS.iter().enumerate() {
                     let (label, _probe) = CORPUS[index];
                     let probe = normalized_probe(index);
                     let prefix = format!("{label} {probe} {FILLER}");
@@ -278,15 +283,15 @@ impl GauntletRoot {
                 editor.focused = true;
                 Surface::Editor(editor)
             }
-            Phase::PasteVerbatim(_) | Phase::PasteAtomic => match self.surface {
-                Surface::Editor(_) => return,
-                _ => {
-                    let mut editor = Editor::with_defaults();
-                    editor.set_terminal_rows(24);
-                    editor.focused = true;
-                    Surface::Editor(editor)
+            Phase::PasteVerbatim(_) | Phase::PasteAtomic => {
+                if let Surface::Editor(_) = self.surface {
+                    return;
                 }
-            },
+                let mut editor = Editor::with_defaults();
+                editor.set_terminal_rows(24);
+                editor.focused = true;
+                Surface::Editor(editor)
+            }
             Phase::Done => Surface::None,
         };
     }
@@ -344,10 +349,6 @@ impl Component for GauntletRoot {
         VIEWPORT_HEIGHT
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one sequential gauntlet walk; splitting would scatter the checkpoint order"
-    )]
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -446,16 +447,16 @@ fn put_line(line: &str, buf: &mut Buffer, row: &mut u16, width: usize, bottom: u
             break;
         }
         let x = u16::try_from(col).unwrap_or(u16::MAX);
-        let symbol = if grapheme.chars().any(|c| c.is_control()) {
+        let symbol = if grapheme.chars().any(char::is_control) {
             " "
         } else {
             grapheme
         };
         buf[(x, *row)].set_symbol(symbol);
-        if gw == 2 {
-            if let Some(cell) = buf.cell_mut((x.saturating_add(1), *row)) {
-                cell.set_symbol("");
-            }
+        if gw == 2
+            && let Some(cell) = buf.cell_mut((x.saturating_add(1), *row))
+        {
+            cell.set_symbol("");
         }
         col += gw;
     }
@@ -463,7 +464,9 @@ fn put_line(line: &str, buf: &mut Buffer, row: &mut u16, width: usize, bottom: u
     // row span (reset-buffer parity) and claim it.
     for tail in col..width {
         let x = u16::try_from(tail).unwrap_or(u16::MAX);
-        buf.cell_mut((x, *row)).map_or((), Cell::reset);
+        if let Some(cell) = buf.cell_mut((x, *row)) {
+            cell.reset();
+        }
     }
     pi_tui::frame::claim_opaque_span(ratatui::layout::Rect {
         x: 0,

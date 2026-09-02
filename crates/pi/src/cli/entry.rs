@@ -202,6 +202,10 @@ impl Io {
 /// prints `VERSION` and exits 0 — never pay runtime construction. Everything
 /// else continues on the runtime through the bootstrap + dispatch pipeline.
 #[must_use]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "public entry-point signature: owned args are the stable contract since first release"
+)]
 pub fn run(args: Vec<String>, io: Io) -> ExitCode {
     let inputs = BootstrapInputs {
         args,

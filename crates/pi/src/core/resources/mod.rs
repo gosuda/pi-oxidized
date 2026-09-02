@@ -166,6 +166,10 @@ impl ExtensionResourcePath {
 /// One value flows unchanged from CLI parsing through service construction
 /// into the loader; there is no second representation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag suppresses one independent discovery category; grouping would obscure the 1:1 CLI mapping"
+)]
 pub struct ResourceDiscoveryPolicy {
     /// Skip package/settings extension discovery (CLI still applied).
     pub no_extensions: bool,

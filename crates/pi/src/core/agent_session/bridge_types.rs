@@ -355,6 +355,14 @@ impl ExtensionHostError {
     }
 }
 
+impl std::fmt::Display for ExtensionHostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for ExtensionHostError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,11 +378,3 @@ mod tests {
         assert_eq!(state.thinking_level, ModelThinkingLevel::Off);
     }
 }
-
-impl std::fmt::Display for ExtensionHostError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message())
-    }
-}
-
-impl std::error::Error for ExtensionHostError {}

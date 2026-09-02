@@ -3,7 +3,7 @@
 //!
 //! Drives the production `pi_ext::server::serve_io` over an in-memory tokio
 //! duplex pair, replaying the frame shapes and id layout of the corpus in
-//! `scripts/bench-extension-scaling.ts` (hello, session_start,
+//! `scripts/bench-extension-scaling.ts` (hello, `session_start`,
 //! zero/100-idle/20-active, 300-request fast stream, slow/fast queue
 //! locality) and passing the same correctness assertions through the
 //! production server: protocolVersion handshake, id correlation, timeout
@@ -141,9 +141,9 @@ impl NativeExtension for ScalingAdapter {
         self.handles.snapshot_calls.fetch_add(1, Ordering::SeqCst);
 
         let (tool_count, handlers, terminal_input) = match self.profile {
-            LoadProfile::Zero => (0, Vec::new(), false),
-            LoadProfile::Idle100 => (100, vec!["session_start".to_owned()], false),
-            LoadProfile::Active20 => (20, vec!["session_start".to_owned()], true),
+            LoadProfile::Zero => (0u64, Vec::new(), false),
+            LoadProfile::Idle100 => (100u64, vec!["session_start".to_owned()], false),
+            LoadProfile::Active20 => (20u64, vec!["session_start".to_owned()], true),
         };
 
         RegistrySnapshot {
@@ -157,7 +157,7 @@ impl NativeExtension for ScalingAdapter {
             providers: Vec::new(),
             handlers,
             terminal_input,
-            extensions: tool_count as u64,
+            extensions: tool_count,
             errors: Vec::new(),
         }
     }
@@ -210,7 +210,7 @@ impl NativeExtension for ScalingAdapter {
             .handles
             .tool_cancel_token
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(cancel.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel.clone());
         Box::pin(async move {
             let _ = updates.send(json!({ "stage": "running" }));
 
@@ -235,7 +235,7 @@ impl NativeExtension for ScalingAdapter {
         let call_count = Arc::clone(&self.handles.terminal_call_count);
         Box::pin(async move {
             seen.lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(data.clone());
 
             let is_slow = match mode {
@@ -282,7 +282,7 @@ impl NativeExtension for ScalingAdapter {
         Box::pin(async move {
             lifecycle
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(event_type.clone());
 
             for i in 0..widget_count {
@@ -448,10 +448,10 @@ async fn collect_ui_slot_keys(peer: &mut RawPeer, deadline: Duration) -> Vec<Str
     let mut keys = Vec::new();
 
     for frame in peer.pending_events.drain(..) {
-        if frame.method == "uiSlot" {
-            if let Some(key) = frame.payload.get("key").and_then(Value::as_str) {
-                keys.push(key.to_owned());
-            }
+        if frame.method == "uiSlot"
+            && let Some(key) = frame.payload.get("key").and_then(Value::as_str)
+        {
+            keys.push(key.to_owned());
         }
     }
 
@@ -463,10 +463,10 @@ async fn collect_ui_slot_keys(peer: &mut RawPeer, deadline: Duration) -> Vec<Str
         }
         match tokio::time::timeout(remaining, peer.recv()).await {
             Ok(Ok(frame)) => {
-                if frame.method == "uiSlot" {
-                    if let Some(key) = frame.payload.get("key").and_then(Value::as_str) {
-                        keys.push(key.to_owned());
-                    }
+                if frame.method == "uiSlot"
+                    && let Some(key) = frame.payload.get("key").and_then(Value::as_str)
+                {
+                    keys.push(key.to_owned());
                 }
             }
             _ => break,
@@ -601,8 +601,8 @@ async fn extensions_load_zero_idle_active_id_correlation() -> R {
     Ok(())
 }
 
-/// Session_start lifecycle: the adapter emits uiSlot events for Active20,
-/// and the session_start response must correlate by id.
+/// `Session_start` lifecycle: the adapter emits uiSlot events for Active20,
+/// and the `session_start` response must correlate by id.
 #[tokio::test]
 async fn session_start_active20_emits_widget_slots() -> R {
     let (ext, handles) = ScalingAdapter::new(LoadProfile::Active20, TerminalInputMode::Fast);
@@ -630,14 +630,16 @@ async fn session_start_active20_emits_widget_slots() -> R {
     sorted.dedup();
     assert_eq!(sorted.len(), 20, "widget keys must be unique");
 
-    let events = handles
-        .lifecycle_events
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    assert!(
-        events.contains(&"session_start".to_owned()),
-        "session_start lifecycle must be recorded"
-    );
+    {
+        let events = handles
+            .lifecycle_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            events.contains(&"session_start".to_owned()),
+            "session_start lifecycle must be recorded"
+        );
+    }
 
     drop(peer);
     let result = tokio::time::timeout(TIMEOUT, server).await??;
@@ -698,15 +700,22 @@ async fn fast_terminal_input_stream_300_requests_id_correlation() -> R {
         }
     }
 
-    let inputs = handles
-        .terminal_inputs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    assert_eq!(
-        inputs.len(),
-        REQUESTS as usize,
-        "adapter must receive all 300 terminal inputs"
-    );
+    {
+        let inputs = handles
+            .terminal_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "REQUESTS is 300, fits in usize on all targets"
+        )]
+        let expected = REQUESTS as usize;
+        assert_eq!(
+            inputs.len(),
+            expected,
+            "adapter must receive all 300 terminal inputs"
+        );
+    }
 
     drop(peer);
     let result = tokio::time::timeout(TIMEOUT, server).await??;
@@ -888,8 +897,8 @@ async fn cooperative_cancellation_tool_execute() -> R {
     Ok(())
 }
 
-/// Full corpus replay: hello → session_start → 300 fast terminal inputs
-/// in a single serve_io session, verifying id correlation throughout.
+/// Full corpus replay: hello → `session_start` → 300 fast terminal inputs
+/// in a single `serve_io` session, verifying id correlation throughout.
 #[tokio::test]
 async fn full_corpus_replay_id_correlation() -> R {
     const FAST_REQUESTS: u64 = 300;
@@ -939,11 +948,18 @@ async fn full_corpus_replay_id_correlation() -> R {
         assert_eq!(response.kind, FrameKind::Res);
     }
 
-    let inputs = handles
-        .terminal_inputs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    assert_eq!(inputs.len(), FAST_REQUESTS as usize);
+    {
+        let inputs = handles
+            .terminal_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "FAST_REQUESTS is 300, fits in usize on all targets"
+        )]
+        let expected = FAST_REQUESTS as usize;
+        assert_eq!(inputs.len(), expected);
+    }
 
     drop(peer);
     let result = tokio::time::timeout(TIMEOUT, server).await??;
@@ -1022,6 +1038,13 @@ async fn prepare_validate_fixed_results_id_correlation() -> R {
     Ok(())
 }
 
+type ServeIoFn = fn(
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    ScalingAdapter,
+    ServerConfig,
+) -> BoxFuture<Result<(), ServerError>>;
+
 /// Grep / import audit: verify the test contains zero benchmark-specific
 /// frame decoding, server loop construction, or protocol method registry.
 ///
@@ -1036,13 +1059,7 @@ async fn no_benchmark_specific_code_audit() -> R {
     // The test file itself is the audit artifact. Verify at runtime that
     // the production entry points are used (not custom reimplementations).
 
-    // 1. serve_io is the production function (re-exported from server module)
-    let serve_io_fn: fn(
-        tokio::io::DuplexStream,
-        tokio::io::DuplexStream,
-        ScalingAdapter,
-        ServerConfig,
-    ) -> BoxFuture<Result<(), ServerError>> = |r, w, e, c| Box::pin(serve_io(r, w, e, c));
+    let serve_io_fn: ServeIoFn = |r, w, e, c| Box::pin(serve_io(r, w, e, c));
     let _ = serve_io_fn;
 
     // 2. encode_frame / decode_frame_str are the production codec
@@ -1120,7 +1137,7 @@ fn run_timed_round() -> (u64, Vec<u64>, Vec<u64>, Vec<u64>) {
         let inputs = handles
             .terminal_inputs
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             inputs.len(),
             REQUESTS as usize,

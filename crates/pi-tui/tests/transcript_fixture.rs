@@ -1,3 +1,7 @@
+//! Deterministic fixture transcript corpus via shared `RecordingSession`.
+//!
+//! Checkpoints use content predicates then quiescence — never timer-only waits.
+//! Artifacts land under `target/verification/tui-transcripts/<row>/<scenario>/run-{1,2,3}/`.
 #![cfg(all(unix, feature = "testkit"))]
 #![allow(
     clippy::expect_used,
@@ -5,10 +9,6 @@
     clippy::unwrap_used,
     clippy::too_many_lines
 )]
-//! Deterministic fixture transcript corpus via shared `RecordingSession`.
-//!
-//! Checkpoints use content predicates then quiescence — never timer-only waits.
-//! Artifacts land under `target/verification/tui-transcripts/<row>/<scenario>/run-{1,2,3}/`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -120,7 +120,7 @@ impl From<std::io::Error> for CorpusError {
 
 type HostSession = <PosixPtyDriver as TerminalDriver>::Session;
 
-/// Scenario driver holding the shared RecordingSession (not a local recorder wrapper).
+/// Scenario driver holding the shared `RecordingSession` (not a local recorder wrapper).
 struct FixtureRun {
     recording: RecordingSession<HostSession>,
     context: NormalizationContext,
@@ -349,16 +349,16 @@ fn fixture_binary() -> Result<PathBuf, CorpusError> {
 
 fn host_row_id() -> RowId {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => RowId::GnuX64,
         ("linux", "aarch64") => RowId::GnuArm64,
         ("macos", "x86_64") => RowId::DarwinX64,
         ("macos", "aarch64") => RowId::DarwinArm64,
         ("windows", _) => RowId::WindowsX64,
+        // Unknown hosts (including linux/x86_64) fall back to the gnu x64 row.
         _ => RowId::GnuX64,
     }
 }
 
-/// Row directory label + RunnerRow. Absent `PI_TUI_TIER_ROW` ⇒ `local` (never Tier N).
+/// Row directory label + `RunnerRow`. Absent `PI_TUI_TIER_ROW` ⇒ `local` (never Tier N).
 fn resolve_row() -> Result<(String, RunnerRow), CorpusError> {
     match std::env::var("PI_TUI_TIER_ROW") {
         Ok(value) if !value.trim().is_empty() => {

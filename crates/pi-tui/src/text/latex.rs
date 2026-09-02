@@ -11,6 +11,7 @@
 //! `None` and callers fall back to the raw source.
 
 use super::width::visible_width;
+use std::fmt::Write;
 
 // PUA layout protocol (never present in returned output).
 const LAYOUT_MARKER_START: char = '\u{f0000}';
@@ -573,7 +574,7 @@ fn table_lookup<'v>(table: &[(&str, &'v str)], key: &str) -> Option<&'v str> {
 }
 
 fn table_has(table: &[&str], key: &str) -> bool {
-    table.iter().any(|name| *name == key)
+    table.contains(&key)
 }
 
 /// `replaceCharacters`: map every character through `table`, or fail.
@@ -820,9 +821,10 @@ fn join_layouts(layouts: &[Layout]) -> Layout {
     for row in 0..=baseline + below {
         let mut line = String::new();
         for layout in layouts {
-            let source_row = row as isize - baseline as isize + layout.baseline as isize;
-            if source_row >= 0 && (source_row as usize) < layout.lines.len() {
-                let content = &layout.lines[source_row as usize];
+            let source_row =
+                row.cast_signed() - baseline.cast_signed() + layout.baseline.cast_signed();
+            if source_row >= 0 && source_row.cast_unsigned() < layout.lines.len() {
+                let content = &layout.lines[source_row.cast_unsigned()];
                 line.push_str(&pad_layout_line(content, layout.width, false));
             } else {
                 for _ in 0..layout.width {
@@ -863,6 +865,10 @@ fn text_layout(text: &str) -> Layout {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "cohesive layout assembler; splitting would scatter the line/baseline/stack accumulation across helpers"
+)]
 fn render_layout(source: &str, nodes: &[LayoutNode]) -> Layout {
     let mut rendered_lines: Vec<String> = Vec::new();
     let mut first_baseline = 0usize;
@@ -1098,7 +1104,7 @@ impl<'a> LatexParser<'a> {
                     }
                 }
                 c if c.is_whitespace() => {
-                    result.push_str(&self.parse_whitespace());
+                    result.push_str(self.parse_whitespace());
                 }
                 '=' | '<' | '>' => {
                     result = format!("{} {character} ", result.trim_end());
@@ -1139,12 +1145,16 @@ impl<'a> LatexParser<'a> {
     }
 
     fn parse_whitespace(&mut self) -> &'static str {
-        while self.peek().is_some_and(|c| c.is_whitespace()) {
+        while self.peek().is_some_and(char::is_whitespace) {
             self.position += 1;
         }
         " "
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "cohesive command dispatcher; splitting would scatter the command table lookup and argument rendering across helpers"
+    )]
     fn parse_command(&mut self) -> String {
         self.position += 1;
         let Some(first) = self.peek() else {
@@ -1356,7 +1366,7 @@ impl<'a> LatexParser<'a> {
                 && !self
                     .source
                     .get(modifier_position + candidate.len())
-                    .is_some_and(|c| c.is_ascii_alphabetic())
+                    .is_some_and(char::is_ascii_alphabetic)
             {
                 use_display_limits = modifier == "\\limits";
                 self.position = modifier_position + candidate.len();
@@ -1406,10 +1416,12 @@ impl<'a> LatexParser<'a> {
 
         let mut rendered = operator.to_owned();
         if let Some(lower) = &lower {
-            rendered.push_str(&match inline_lower_style {
-                OperatorStyle::Bracket => format!("[{lower}]"),
-                OperatorStyle::Script => format_script(lower, ScriptKind::Sub),
-            });
+            match inline_lower_style {
+                OperatorStyle::Bracket => {
+                    let _ = write!(rendered, "[{lower}]");
+                }
+                OperatorStyle::Script => rendered.push_str(&format_script(lower, ScriptKind::Sub)),
+            }
         }
         if let Some(upper) = &upper {
             rendered.push_str(&format_script(upper, ScriptKind::Sup));
@@ -1430,7 +1442,7 @@ impl<'a> LatexParser<'a> {
     }
 
     fn parse_required_argument_value(&mut self) -> String {
-        while self.peek().is_some_and(|c| c.is_whitespace()) {
+        while self.peek().is_some_and(char::is_whitespace) {
             self.position += 1;
         }
         let Some(character) = self.peek() else {
@@ -1536,6 +1548,10 @@ impl<'a> LatexParser<'a> {
         rows
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "cohesive environment dispatcher; splitting would scatter the environment table lookup and body rendering across helpers"
+    )]
     fn parse_environment(&mut self) -> String {
         let Some(environment) = self.read_raw_group() else {
             return String::new();
@@ -1589,7 +1605,7 @@ impl<'a> LatexParser<'a> {
                             .map(|index| {
                                 cells
                                     .get(index * 2..index * 2 + 2)
-                                    .map_or(String::new(), |pair| pair.concat())
+                                    .map_or(String::new(), <[&str]>::concat)
                             })
                             .collect::<Vec<_>>()
                             .join(" ")
@@ -1674,7 +1690,7 @@ impl<'a> LatexParser<'a> {
             })
             .filter(|row| row.iter().any(|cell| !cell.is_empty()))
             .collect();
-        let column_count = matrix.iter().map(|row| row.len()).max().unwrap_or(0);
+        let column_count = matrix.iter().map(Vec::len).max().unwrap_or(0);
         let column_widths: Vec<usize> = (0..column_count)
             .map(|column| {
                 matrix
@@ -1746,12 +1762,11 @@ impl<'a> LatexParser<'a> {
     fn render_nested(&mut self, source: &str, stack_fractions: bool) -> String {
         let characters: Vec<char> = source.chars().collect();
         let nested = LatexParser::new(&characters, self.nodes, self.display && stack_fractions);
-        match nested.render() {
-            Some(rendered) => rendered,
-            None => {
-                self.supported = false;
-                source.to_owned()
-            }
+        if let Some(rendered) = nested.render() {
+            rendered
+        } else {
+            self.supported = false;
+            source.to_owned()
         }
     }
 }
@@ -1812,8 +1827,7 @@ fn starts_with_condition_word(condition: &str) -> bool {
     const WORDS: [&str; 4] = ["if", "when", "for", "otherwise"];
     let lower = condition.to_lowercase();
     for word in WORDS {
-        if lower.starts_with(word) {
-            let rest = &lower[word.len()..];
+        if let Some(rest) = lower.strip_prefix(word) {
             let boundary = rest
                 .chars()
                 .next()
@@ -1944,6 +1958,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::unicode_not_nfc,
+        reason = "test: renderer emits combining characters; expected values must match non-NFC output"
+    )]
     #[test]
     fn roots_scripts_and_accents() {
         assert_eq!(

@@ -135,7 +135,7 @@ pub fn probe_collect_replies(caps: &mut TerminalCapabilities) -> io::Result<Vec<
 /// armed, the collector stops reading within [`PROBE_YIELD_POLL_SLICE`] once
 /// a reply stream exists and returns the bytes it already consumed as early
 /// input. Callers that must take stdin back by a deadline (the runtime arms
-/// this right before painting the first frame) guarantee the EventStream
+/// this right before painting the first frame) guarantee the `EventStream`
 /// parser owns stdin from that point onward, so input written at
 /// first-paint time is parsed by crossterm instead of re-injected through
 /// the lossy startup mapper.
@@ -797,7 +797,7 @@ fn parse_ss3(rest: &[u8]) -> Option<(Option<UiEvent>, usize)> {
     Some((Some(key(code, KeyModifiers::NONE)), 1))
 }
 
-/// XTerm modifier param: `m = 1 + bitmask` where bit 0 = shift, 1 = alt,
+/// `XTerm` modifier param: `m = 1 + bitmask` where bit 0 = shift, 1 = alt,
 /// 2 = ctrl, 3 = super (crossterm uses the same encoding).
 fn modifier_from_params(params: &[u32]) -> KeyModifiers {
     let Some(&m) = params.get(1) else {

@@ -6,16 +6,16 @@
 //! fresh [`tokio::net::UnixStream`] per invocation, plus a writer with a
 //! pending-byte budget so a stalled server cannot balloon client memory.
 
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
-    ByteTransport, ByteTransportFactory, ByteTransportHandlers, ConnectFuture, SendFuture,
-    TransportError,
+    ByteTransport, ByteTransportFactory, ByteTransportHandlers, SendFuture, TransportError,
 };
 use crate::remote::framing::DEFAULT_MAX_FRAME_LENGTH;
 
@@ -61,6 +61,10 @@ impl std::fmt::Debug for UnixByteTransport {
 }
 
 impl UnixByteTransport {
+    #[expect(
+        clippy::expect_used,
+        reason = "mutex poisoning is fatal; lock is never held across a panic"
+    )]
     fn new(
         stream: UnixStream,
         max_pending_bytes: usize,
@@ -113,7 +117,7 @@ impl UnixByteTransport {
                         // discriminant read.
                         let signal_value = *signal.borrow_and_update();
                         match signal_value {
-                            ReaderSignal::Open => continue,
+                            ReaderSignal::Open => {}
                             ReaderSignal::LocallyClosed => break,
                             ReaderSignal::Failed => {
                                 let error = reader_shared
@@ -182,6 +186,10 @@ impl UnixByteTransport {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "mutex poisoning is fatal; lock is never held across a panic"
+)]
 fn mark_failed(shared: &Shared, error: Option<TransportError>) {
     if let Some(error) = error {
         let mut slot = shared.error.lock().expect("error lock");
@@ -193,6 +201,10 @@ fn mark_failed(shared: &Shared, error: Option<TransportError>) {
 }
 
 impl ByteTransport for UnixByteTransport {
+    #[expect(
+        clippy::expect_used,
+        reason = "mutex poisoning is fatal; lock is never held across a panic"
+    )]
     fn send(&self, chunk: Vec<u8>) -> SendFuture {
         let outbound = self.outbound.lock().expect("outbound lock").clone();
         let shared = Arc::clone(&self.shared);
@@ -220,16 +232,19 @@ impl ByteTransport for UnixByteTransport {
                     shared.pending_bytes.fetch_sub(len, Ordering::SeqCst);
                     TransportError::Closed
                 })?;
-            match done_rx.await {
-                Ok(result) => result,
-                Err(_) => {
-                    shared.pending_bytes.fetch_sub(len, Ordering::SeqCst);
-                    Err(TransportError::Closed)
-                }
+            if let Ok(result) = done_rx.await {
+                result
+            } else {
+                shared.pending_bytes.fetch_sub(len, Ordering::SeqCst);
+                Err(TransportError::Closed)
             }
         })
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "mutex poisoning is fatal; lock is never held across a panic"
+    )]
     fn close(&self) {
         if self.shared.closed.swap(true, Ordering::SeqCst) {
             return;
@@ -243,14 +258,23 @@ impl ByteTransport for UnixByteTransport {
 /// [`crate::remote::transport::build_transport`].
 #[derive(Debug, Clone)]
 pub struct UnixTransportOptions {
-    /// Socket path.
+    /// Filesystem path of the Unix-domain socket.
     pub path: std::path::PathBuf,
-    /// Outbound pending-byte budget; defaults to four times the 16 MiB
-    /// frame bound, matching upstream.
+    /// Maximum pending outbound bytes before `send` rejects with
+    /// [`TransportError::PendingBytesExceeded`]. Defaults to four
+    /// [`DEFAULT_MAX_FRAME_LENGTH`] frames when `None`.
     pub max_pending_bytes: Option<usize>,
 }
 
 /// Connects one fresh Unix-domain transport for the given handlers.
+///
+/// # Errors
+///
+/// Returns [`TransportError::Io`] if the socket connection fails.
+#[expect(
+    dead_code,
+    reason = "public standalone connect API; factory() is the path used by build_transport, but connect is exported for direct callers"
+)]
 pub async fn connect(
     options: &UnixTransportOptions,
     handlers: Arc<dyn ByteTransportHandlers>,
@@ -258,21 +282,31 @@ pub async fn connect(
     let stream = UnixStream::connect(&options.path)
         .await
         .map_err(TransportError::Io)?;
-    let max_pending_bytes = options
-        .max_pending_bytes
-        .unwrap_or(DEFAULT_MAX_FRAME_LENGTH * 4);
-    Ok(UnixByteTransport::new(stream, max_pending_bytes, handlers))
+    Ok(UnixByteTransport::new(
+        stream,
+        options
+            .max_pending_bytes
+            .unwrap_or(DEFAULT_MAX_FRAME_LENGTH * 4),
+        handlers,
+    ))
 }
 
 /// Builds the factory used by [`crate::remote::transport::build_transport`]
 /// on the Unix tier.
 pub fn factory(path: std::path::PathBuf, max_pending_bytes: Option<usize>) -> ByteTransportFactory {
     Arc::new(move |handlers| {
-        let options = UnixTransportOptions {
-            path: path.clone(),
-            max_pending_bytes,
-        };
-        Box::pin(async move { connect(&options, handlers).await }) as ConnectFuture
+        let path = path.clone();
+        let max_pending_bytes = max_pending_bytes;
+        Box::pin(async move {
+            let stream = UnixStream::connect(&path)
+                .await
+                .map_err(TransportError::Io)?;
+            Ok(UnixByteTransport::new(
+                stream,
+                max_pending_bytes.unwrap_or(DEFAULT_MAX_FRAME_LENGTH * 4),
+                handlers,
+            ) as Arc<dyn ByteTransport>)
+        })
     })
 }
 
@@ -289,6 +323,7 @@ mod tests {
         errors: StdMutex<Vec<String>>,
     }
 
+    #[expect(clippy::expect_used, reason = "mutex poisoning is fatal in test")]
     impl ByteTransportHandlers for RecordingHandlers {
         fn on_data(&self, chunk: Vec<u8>) {
             self.chunks.lock().expect("chunks").push(chunk);
@@ -296,6 +331,7 @@ mod tests {
         fn on_close(&self) {
             self.closes.fetch_add(1, Ordering::SeqCst);
         }
+        #[expect(clippy::expect_used, reason = "mutex poisoning is fatal in test")]
         fn on_error(&self, error: TransportError) {
             self.errors.lock().expect("errors").push(error.to_string());
         }
@@ -312,6 +348,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test setup and assertions: tempdir, bind, connect, accept, send, locks succeed; send after close fails"
+    )]
     #[tokio::test]
     async fn real_socket_roundtrip_and_orderly_close() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -346,8 +386,11 @@ mod tests {
         assert!(matches!(err, TransportError::Closed));
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper: server read and write must succeed"
+    )]
     async fn echo_once(mut stream: tokio::net::UnixStream) -> Vec<u8> {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let mut buffer = vec![0u8; 4096];
         let count = stream.read(&mut buffer).await.expect("server read");
         let out = buffer[..count].to_vec();
@@ -355,6 +398,10 @@ mod tests {
         out
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test setup tempdir succeeds; connect to missing socket fails"
+    )]
     #[tokio::test]
     async fn connect_failure_is_typed_io_error() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -368,6 +415,10 @@ mod tests {
         assert!(matches!(error, TransportError::Io(_)));
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test setup tempdir/bind/connect/accept succeed; oversized send is rejected"
+    )]
     #[tokio::test]
     async fn pending_byte_budget_rejects_oversized_single_write() {
         let directory = tempfile::tempdir().expect("tempdir");

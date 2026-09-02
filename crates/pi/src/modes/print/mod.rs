@@ -106,9 +106,9 @@ impl PrintSink for OutputGuardSink {
         write_raw_stdout(text).await.map_err(io::Error::other)
     }
 
-    async fn write_stderr(&self, text: &str) -> io::Result<()> {
+    fn write_stderr(&self, text: &str) -> impl Future<Output = io::Result<()>> + Send {
         ProductOutput::write(text);
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     async fn flush(&self) -> io::Result<()> {
@@ -154,18 +154,18 @@ fn lock_buffer(buf: &Mutex<Vec<u8>>) -> std::sync::MutexGuard<'_, Vec<u8>> {
 }
 
 impl PrintSink for BufferSink {
-    async fn write_stdout(&self, text: &str) -> io::Result<()> {
+    fn write_stdout(&self, text: &str) -> impl Future<Output = io::Result<()>> + Send {
         lock_buffer(&self.stdout).extend_from_slice(text.as_bytes());
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
-    async fn write_stderr(&self, text: &str) -> io::Result<()> {
+    fn write_stderr(&self, text: &str) -> impl Future<Output = io::Result<()>> + Send {
         lock_buffer(&self.stderr).extend_from_slice(text.as_bytes());
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
-    async fn flush(&self) -> io::Result<()> {
-        Ok(())
+    fn flush(&self) -> impl Future<Output = io::Result<()>> + Send {
+        std::future::ready(Ok(()))
     }
 }
 

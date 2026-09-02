@@ -542,7 +542,7 @@ thread_local! {
 /// Install `enabled` as the thread-local hyperlink capability for the
 /// duration of `f`. Re-entrant; restores the prior value on drop.
 pub fn with_hyperlinks<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
-    let prior = HYPERLINKS.with(|cell| cell.get());
+    let prior = HYPERLINKS.with(Cell::get);
     HYPERLINKS.with(|cell| cell.set(enabled));
     let r = f();
     HYPERLINKS.with(|cell| cell.set(prior));
@@ -1013,7 +1013,7 @@ pub fn user_markdown_options() -> MarkdownOptions {
     MarkdownOptions {
         preserve_ordered_list_markers: true,
         preserve_backslash_escapes: true,
-        hyperlinks: HYPERLINKS.with(|cell| cell.get()),
+        hyperlinks: HYPERLINKS.with(Cell::get),
         render_latex: true,
     }
 }

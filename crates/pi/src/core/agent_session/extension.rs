@@ -471,6 +471,42 @@ impl AgentSession {
         Ok(Vec::new())
     }
 
+    /// Dispatch the reload origin: emit shutdown + complete ready for direct,
+    /// or respond to the bridge request.
+    async fn dispatch_reload_origin(
+        &self,
+        runner: &Arc<dyn super::extension_runner::ExtensionRunner>,
+        host: &Arc<ExtensionRuntimeSet>,
+        origin: ReloadOrigin,
+        transaction: &ReloadTransaction,
+    ) -> Result<(), ReloadTransactionError> {
+        match origin {
+            ReloadOrigin::Direct => {
+                // Never hold reload_lock across a host callback: a reload hook
+                // may synchronously attempt another session operation.
+                let _ = runner
+                    .emit(AgentSessionEvent::SessionShutdown {
+                        reason: SessionShutdownReason::Reload,
+                        target_session_file: None,
+                    })
+                    .await;
+                if !host.complete_ready(&transaction.token) {
+                    return Err(ReloadTransactionError::Post(
+                        ReloadPostAcceptError::Invalidated,
+                    ));
+                }
+            }
+            ReloadOrigin::Bridge { id } => {
+                if let Err(error) = host.respond_reload(id, Ok(Some(&transaction.token))).await {
+                    return Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Response(
+                        error,
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn reload_host_transaction(
         self: &Arc<Self>,
         host: Arc<ExtensionRuntimeSet>,
@@ -515,30 +551,8 @@ impl AgentSession {
             token,
             ready_rx: Some(ready_rx),
         };
-        match origin {
-            ReloadOrigin::Direct => {
-                // Never hold reload_lock across a host callback: a reload hook
-                // may synchronously attempt another session operation.
-                let _ = runner
-                    .emit(AgentSessionEvent::SessionShutdown {
-                        reason: SessionShutdownReason::Reload,
-                        target_session_file: None,
-                    })
-                    .await;
-                if !host.complete_ready(&transaction.token) {
-                    return Err(ReloadTransactionError::Post(
-                        ReloadPostAcceptError::Invalidated,
-                    ));
-                }
-            }
-            ReloadOrigin::Bridge { id } => {
-                if let Err(error) = host.respond_reload(id, Ok(Some(&transaction.token))).await {
-                    return Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Response(
-                        error,
-                    )));
-                }
-            }
-        }
+        self.dispatch_reload_origin(&runner, &host, origin, &transaction)
+            .await?;
 
         let Some(ready_rx) = transaction.ready_rx.take() else {
             return Err(ReloadTransactionError::Post(

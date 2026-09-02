@@ -26,7 +26,7 @@
 //! `EVIDENCE:` so the test harness can parse them.
 //!
 //! Run:
-//!   cargo run -p pi-tui --bin pi_tui_static_frame_fixture
+//!   cargo run -p pi-tui --bin `pi_tui_static_frame_fixture`
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -92,6 +92,10 @@ fn status_message(kind: &str, elapsed_secs: u64) -> String {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "fixture binary: single sequential setup and tick loop; splitting would scatter the evidence order"
+)]
 fn main() -> ExitCode {
     let frames_len = pi_tui::components::DEFAULT_LOADER_FRAMES.len();
 
@@ -139,7 +143,8 @@ fn main() -> ExitCode {
         }
 
         // Compute the new elapsed seconds.
-        let new_elapsed = (tick + 1) as u64 * SPINNER_TICK.as_millis() as u64 / 1000;
+        let new_elapsed =
+            (tick + 1) as u64 * u64::try_from(SPINNER_TICK.as_millis()).unwrap_or(u64::MAX) / 1000;
 
         // Capture the previous elapsed before any mutation, mirroring the
         // real tick_status_indicator's per-status elapsed_secs.
@@ -185,7 +190,8 @@ fn main() -> ExitCode {
     static_loader.stop();
     animated_loader.stop();
 
-    let total_elapsed_secs = TICK_COUNT as u64 * SPINNER_TICK.as_millis() as u64 / 1000;
+    let total_elapsed_secs =
+        TICK_COUNT as u64 * u64::try_from(SPINNER_TICK.as_millis()).unwrap_or(u64::MAX) / 1000;
 
     // Emit evidence markers to stdout.
     let stdout = std::io::stdout();

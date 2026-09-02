@@ -48,7 +48,7 @@ Statuses are evidence-bearing: `landed` names an existing owner seam; `folded` r
 | C3 | Print mode | pi | modes/print/ | print runtime | landed | Noninteractive product behavior stays in pi. |
 | C4 | JSONL RPC mode and rpc-entry | pi | modes/rpc/ | RPC frames | landed | This is distinct from the remote session stack R1-R4. |
 | C5 | Built-in tools | pi | core/tools/ | tool registry | landed | Read, write, edit, bash, find, grep, ls, mutation queue, truncation, and path utilities share one owner. |
-| C6 | Extension product wiring | pi | core/extension_host.rs, extension_runtime_set.rs, extension_manifest.rs | ExtensionRunner | landed | AgentSession never depends on pi-ext directly. |
+| C6 | Extension product wiring | pi | core/extension_host.rs, extension_runtime_set/, extension_manifest.rs | ExtensionRunner | landed | AgentSession never depends on pi-ext directly. |
 | C7 | Settings | pi | core/settings.rs | settings manager | landed | Product configuration remains product-owned. pi owns the settings/runtime adapter for terminal capability overrides: `SettingsManager::get_terminal_capability_overrides()` returns `pi_tui::terminal::TerminalCapabilityOverrides`, JSON settings (`terminal.hyperlinks`, `terminal.images`, `terminal.trueColor`) override `PI_*` environment values, which override terminal detection. Runtime reload replaces only images, hyperlinks, and true_color, preserving sync_output, keyboard_protocol, cell, and dark_background. |
 | C8 | Project trust | pi | core/trust.rs | trust store | landed | Trust decisions do not leak into lower crates. |
 | C9 | Session manager and tree navigation | pi | core/sessions/, core/agent_session/tree.rs | session manager | landed | Product sessions stay in pi. |

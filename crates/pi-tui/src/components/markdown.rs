@@ -153,7 +153,10 @@ impl Default for MarkdownTheme {
 }
 
 /// Markdown parse options.
-#[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent feature toggles; collapsing into enums would widen the public API without clarifying intent"
+)]
 pub struct MarkdownOptions {
     /// Preserve source ordered-list markers (best-effort with pulldown-cmark).
     pub preserve_ordered_list_markers: bool,
@@ -372,7 +375,7 @@ impl Component for Markdown {
 /// Code fences and inline code spans are excluded — math delimiters inside
 /// them stay literal. Escaped `\$` is consumed as a markdown escape before
 /// the math path sees it.
-/// A CommonMark fence line: up to three leading spaces then ``` or ~~~
+/// A `CommonMark` fence line: up to three leading spaces then `` ``` `` or `~~~`
 /// (at least three markers, optionally followed by an info string).
 fn is_fence_line(line: &str) -> bool {
     let stripped = line.strip_prefix("   ").or_else(|| line.strip_prefix("  "));
@@ -431,7 +434,7 @@ fn preprocess_math(source: &str) -> String {
 }
 
 /// Try to match block math starting at the given lines.
-/// Returns (rendered_text, lines_consumed) if matched, None otherwise.
+/// Returns (`rendered_text`, `lines_consumed`) if matched, None otherwise.
 fn try_block_math(lines: &[&str]) -> Option<(String, usize)> {
     let first = lines.first()?;
 
@@ -610,30 +613,36 @@ fn process_inline_math(line: &str) -> String {
         }
 
         // Check for $$ inline
-        if i + 1 < chars.len() && chars[i] == '$' && chars[i + 1] == '$' {
-            if let Some((rendered, end)) = match_inline_dollar_dollar(&chars, i) {
-                result.push_str(&rendered);
-                i = end;
-                continue;
-            }
+        if i + 1 < chars.len()
+            && chars[i] == '$'
+            && chars[i + 1] == '$'
+            && let Some((rendered, end)) = match_inline_dollar_dollar(&chars, i)
+        {
+            result.push_str(&rendered);
+            i = end;
+            continue;
         }
 
         // Check for \( inline
-        if i + 1 < chars.len() && chars[i] == '\\' && chars[i + 1] == '(' {
-            if let Some((rendered, end)) = match_inline_paren(&chars, i) {
-                result.push_str(&rendered);
-                i = end;
-                continue;
-            }
+        if i + 1 < chars.len()
+            && chars[i] == '\\'
+            && chars[i + 1] == '('
+            && let Some((rendered, end)) = match_inline_paren(&chars, i)
+        {
+            result.push_str(&rendered);
+            i = end;
+            continue;
         }
 
         // Check for \[ inline (single-line only)
-        if i + 1 < chars.len() && chars[i] == '\\' && chars[i + 1] == '[' {
-            if let Some((rendered, end)) = match_inline_bracket(&chars, i) {
-                result.push_str(&rendered);
-                i = end;
-                continue;
-            }
+        if i + 1 < chars.len()
+            && chars[i] == '\\'
+            && chars[i + 1] == '['
+            && let Some((rendered, end)) = match_inline_bracket(&chars, i)
+        {
+            result.push_str(&rendered);
+            i = end;
+            continue;
         }
 
         // Check for single $ inline
@@ -671,7 +680,7 @@ fn process_inline_math(line: &str) -> String {
     result
 }
 
-/// Match $$...$$ inline math. Returns (rendered, end_index).
+/// Match $$...$$ inline math. Returns (rendered, `end_index`).
 fn match_inline_dollar_dollar(chars: &[char], start: usize) -> Option<(String, usize)> {
     let mut i = start + 2;
     while i + 1 < chars.len() {
@@ -697,7 +706,7 @@ fn match_inline_dollar_dollar(chars: &[char], start: usize) -> Option<(String, u
     None
 }
 
-/// Match \(...\) inline math. Returns (rendered, end_index).
+/// Match \(...\) inline math. Returns (rendered, `end_index`).
 fn match_inline_paren(chars: &[char], start: usize) -> Option<(String, usize)> {
     let mut i = start + 2;
     while i + 1 < chars.len() {
@@ -721,7 +730,7 @@ fn match_inline_paren(chars: &[char], start: usize) -> Option<(String, usize)> {
     Some((format!("\\({body}"), chars.len()))
 }
 
-/// Match \[...\] inline math (single-line). Returns (rendered, end_index).
+/// Match \[...\] inline math (single-line). Returns (rendered, `end_index`).
 fn match_inline_bracket(chars: &[char], start: usize) -> Option<(String, usize)> {
     let mut i = start + 2;
     while i + 1 < chars.len() {
@@ -746,7 +755,7 @@ fn match_inline_bracket(chars: &[char], start: usize) -> Option<(String, usize)>
 }
 
 /// Match single $...$ inline math with four rejection rules.
-/// Returns (rendered, end_index).
+/// Returns (rendered, `end_index`).
 fn match_single_dollar(chars: &[char], start: usize) -> Option<(String, usize)> {
     let mut i = start + 1;
     while i < chars.len() {
@@ -2636,7 +2645,7 @@ mod tests {
     fn link_hyperlink_capped_falls_back_on_oversized_uri() {
         let long_uri = format!("https://example.com/{}", "x".repeat(2048));
         let mut m = Markdown::new(
-            &format!("[label]({long_uri})"),
+            format!("[label]({long_uri})"),
             0,
             0,
             MarkdownTheme::default(),
@@ -2656,6 +2665,10 @@ mod tests {
         assert!(!plain_text.contains(&long_uri));
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test: 'label' is 5 bytes, well within u16"
+    )]
     #[test]
     fn link_hyperlink_emits_osc8_raw_region_on_wire_channel() {
         use crate::frame::{FrameAnnotations, with_annotations};

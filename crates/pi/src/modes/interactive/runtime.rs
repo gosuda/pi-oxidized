@@ -1356,6 +1356,10 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     settings_change_rx: mpsc::UnboundedReceiver<(String, String)>,
     settings_change_tx: mpsc::UnboundedSender<(String, String)>,
     /// Pending live previews from the `/theme` selector.
+    #[expect(
+        dead_code,
+        reason = "receiver is held for lifecycle management; previews are polled via try_recv in the theme selector event loop"
+    )]
     theme_preview_rx: mpsc::UnboundedReceiver<String>,
     theme_preview_tx: mpsc::UnboundedSender<String>,
     /// Theme snapshot restored when the `/theme` selector is cancelled.
@@ -1664,7 +1668,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         view.height = options.size.1;
         view.quiet = options.quiet;
         view.hyperlinks = options.caps.hyperlinks;
-        view.indicator_frames = options.indicator_frames.clone();
+        view.indicator_frames.clone_from(&options.indicator_frames);
         view.resize(options.size.0, options.size.1);
         view
     }
@@ -1833,6 +1837,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// [`InteractiveRuntime::run`] with the startup sequence (theme push +
     /// first paint) conditional: the speculative-first-paint startup paints
     /// that frame itself, inside the probe window.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "main event loop: the startup-conditional branch and the poll/select/dispatch cycle are one cohesive control-flow unit"
+    )]
     async fn run_with_startup(&mut self, startup: bool) -> io::Result<InteractiveExit> {
         if startup && !self.initialize_run().await {
             return Ok(self.exit_kind);
@@ -2064,6 +2072,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     // Event handlers
     // -----------------------------------------------------------------------
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "UI event dispatch: the match over UiEvent variants is inherently one switch; splitting per-variant handlers would fragment the dispatch table"
+    )]
     async fn handle_ui_event(&mut self, event: UiEvent) -> io::Result<()> {
         let Some(event) = self.intercept_terminal_input(event).await else {
             return Ok(());
@@ -2164,8 +2176,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 Some(_) if self.session_delete_hint_restore.is_none() => {
                     // First arm: save the real placeholder, show the delete hint.
                     self.session_delete_hint_restore = Some(self.view.editor.placeholder.clone());
-                    self.view.editor.placeholder =
-                        "Delete session? <enter> confirm \u{b7} <esc> cancel".to_owned();
+                    "Delete session? <enter> confirm \u{b7} <esc> cancel"
+                        .clone_into(&mut self.view.editor.placeholder);
                 }
                 None => {
                     if let Some(placeholder) = self.session_delete_hint_restore.take() {
@@ -4052,8 +4064,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
         self.arm_coalescer();
     }
-
-    /// Preview a highlighted `/theme` selection without persisting.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only called from tests; retained as a production-grade preview helper"
+        )
+    )]
     fn preview_theme_selection(&mut self, selection: &str) {
         let storage = super::theme::theme_selection_to_storage(selection);
         let (_, mode) = self.session.theme_settings();
@@ -6678,7 +6695,7 @@ fn session_entry_is_bookkeeping(entry: &crate::core::sessions::SessionEntry) -> 
     )
 }
 
-/// True for `toolResult` transcript messages (hidden by the NoTools filter).
+/// True for `toolResult` transcript messages (hidden by the `NoTools` filter).
 fn session_entry_is_tool_result(entry: &crate::core::sessions::SessionEntry) -> bool {
     matches!(entry, crate::core::sessions::SessionEntry::Message(message) if message.message.role() == "toolResult")
 }
@@ -8074,14 +8091,14 @@ mod tests {
 
     fn try_make_runtime()
     -> Result<(InteractiveRuntime<SharedWriter, FakeHost>, Arc<ActionLog>), String> {
-        try_make_runtime_with_caps(TerminalCapabilities::default())
+        try_make_runtime_with_caps(&TerminalCapabilities::default())
     }
 
     /// Runtime variant with explicit startup capabilities; reload tests pin
     /// the probe-owned fields (sync output, kitty keyboard, cell, polarity)
     /// against these.
     fn try_make_runtime_with_caps(
-        caps: TerminalCapabilities,
+        caps: &TerminalCapabilities,
     ) -> Result<(InteractiveRuntime<SharedWriter, FakeHost>, Arc<ActionLog>), String> {
         let (host, log) = FakeHost::new();
         try_make_runtime_with(host, log, caps)
@@ -8092,7 +8109,7 @@ mod tests {
     fn try_make_runtime_with(
         host: FakeHost,
         log: Arc<ActionLog>,
-        caps: TerminalCapabilities,
+        caps: &TerminalCapabilities,
     ) -> Result<(InteractiveRuntime<SharedWriter, FakeHost>, Arc<ActionLog>), String> {
         let writer = SharedWriter::new();
         let tui = Tui::new(writer, Size::new(80, 24), Position::ORIGIN, 8, caps.clone())
@@ -8110,6 +8127,10 @@ mod tests {
         Ok((rt, log))
     }
 
+    #[expect(
+        clippy::type_complexity,
+        reason = "test helper return type bundles guard + runtime + action log; a type alias would be used only here"
+    )]
     /// Runtime under the shared app-keybinding lock (T-G7 chord tests).
     fn try_make_g7_runtime() -> Result<
         (
@@ -8444,9 +8465,9 @@ mod tests {
     }
 
     #[test]
-    fn editor_border_color_maps_semantic_states_to_existing_tokens() {
-        super::super::theme::set_current(super::super::theme::dark());
+    fn editor_border_colors_match_theme() {
         const PROBE: &str = "─";
+        super::super::theme::set_current(super::super::theme::dark());
         let expect = |color: ThemeColor| super::super::theme::make_fg(color)(PROBE);
 
         assert_eq!(
@@ -9029,7 +9050,7 @@ mod tests {
     async fn startup_double_escape_comes_from_host() -> TestResult {
         let (host, log) = FakeHost::new();
         host.set_double_escape_action(DoubleEscapeAction::Fork);
-        let (mut rt, _log) = try_make_runtime_with(host, log, TerminalCapabilities::default())?;
+        let (mut rt, _log) = try_make_runtime_with(host, log, &TerminalCapabilities::default())?;
         let _ = press_escape(&mut rt);
         let actions = press_escape(&mut rt);
         assert_eq!(actions, vec![ViewAction::OpenForkSelector]);
@@ -9641,7 +9662,7 @@ mod tests {
                     "every tool view must expand after ctrl+o"
                 ),
                 MessageView::Bash(view) => {
-                    assert!(view.expanded, "bash view must expand after ctrl+o")
+                    assert!(view.expanded, "bash view must expand after ctrl+o");
                 }
                 _ => {}
             }
@@ -10040,7 +10061,7 @@ mod tests {
     /// The wire collapses every non-`Answered` outcome to identical default
     /// bytes, so the typed distinction between a fired deadline
     /// (`TimedOut`, run-loop arm at the `wait_extension_deadline` select
-    /// branch) and a user/system cancel (`Cancelled`, cancel_rx and teardown
+    /// branch) and a user/system cancel (`Cancelled`, `cancel_rx` and teardown
     /// paths) must survive to the capture seam. Both paths share one helper;
     /// this pins that the dialog end they pass is the only difference.
     #[tokio::test]
@@ -10987,7 +11008,7 @@ mod tests {
     /// explicit override lands in the live capability set.
     #[tokio::test]
     async fn reload_observes_changed_override_through_host_seam() -> TestResult {
-        let (mut rt, log) = try_make_runtime_with_caps(probe_owned_caps())?;
+        let (mut rt, log) = try_make_runtime_with_caps(&probe_owned_caps())?;
         assert!(!rt.tui.capabilities().hyperlinks);
         rt.session
             .set_capability_overrides(enabled_terminal_override());
@@ -11006,7 +11027,7 @@ mod tests {
     /// Capability settings become live even when a later reload stage fails.
     #[tokio::test]
     async fn reload_applies_capability_changes_after_host_error() -> TestResult {
-        let (mut rt, log) = try_make_runtime_with_caps(probe_owned_caps())?;
+        let (mut rt, log) = try_make_runtime_with_caps(&probe_owned_caps())?;
         rt.session
             .set_capability_overrides(enabled_terminal_override());
         rt.session.set_reload_error("host reload failed");
@@ -11027,7 +11048,7 @@ mod tests {
     /// serve fresh lower-layer detection again.
     #[tokio::test]
     async fn reload_restores_fresh_detection_when_override_returns_to_default() -> TestResult {
-        let (mut rt, _log) = try_make_runtime_with_caps(probe_owned_caps())?;
+        let (mut rt, _log) = try_make_runtime_with_caps(&probe_owned_caps())?;
         rt.session
             .set_capability_overrides(enabled_terminal_override());
         let _ = rt.dispatch_action(ViewAction::Reload).await;
@@ -11053,7 +11074,7 @@ mod tests {
     /// true-color mode, and the resolved theme re-apply from the merged set.
     #[tokio::test]
     async fn reload_updates_live_hyperlink_flag_and_true_color_theme() -> TestResult {
-        let (mut rt, _log) = try_make_runtime_with_caps(probe_owned_caps())?;
+        let (mut rt, _log) = try_make_runtime_with_caps(&probe_owned_caps())?;
         assert!(!rt.view.hyperlinks);
         assert!(!rt.true_color);
         assert_eq!(
@@ -11092,7 +11113,7 @@ mod tests {
     /// startup escape probes' ownership.
     #[tokio::test]
     async fn reload_preserves_probe_owned_capability_fields() -> TestResult {
-        let (mut rt, _log) = try_make_runtime_with_caps(probe_owned_caps())?;
+        let (mut rt, _log) = try_make_runtime_with_caps(&probe_owned_caps())?;
         rt.session
             .set_capability_overrides(enabled_terminal_override());
 
@@ -11197,7 +11218,10 @@ mod tests {
         assert!(visible.contains("esc to cancel"));
         Ok(())
     }
-
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertion: cwd confirm selector must exist after import dialog"
+    )]
     #[tokio::test]
     async fn import_cwd_confirm_shows_consequence_labels_and_false_cancels() -> TestResult {
         let (mut rt, log) = try_make_runtime()?;
@@ -12254,7 +12278,7 @@ mod tests {
         Ok(())
     }
 
-    /// The Tui size cache and ViewState dimensions track the raw reported size
+    /// The Tui size cache and `ViewState` dimensions track the raw reported size
     /// at all times — the floor is a render-time gate, not a stored clamp.
     #[tokio::test]
     async fn floor_tracks_raw_dimensions() -> TestResult {
@@ -12375,7 +12399,7 @@ mod tests {
         Ok(())
     }
 
-    /// InteractiveRoot::measure returns 0 below the floor — no content height
+    /// `InteractiveRoot::measure` returns 0 below the floor — no content height
     /// is allocated, so the commit path writes zero rows.
     #[tokio::test]
     async fn floor_measure_returns_zero_below_20() -> TestResult {
@@ -12417,7 +12441,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Build a runtime with a live input sender so tests can pre-load
-    /// events into the channel before calling `step_ui`.
+    #[expect(
+        clippy::type_complexity,
+        reason = "test helper return type bundles runtime + log + sender + sink; a type alias would be used only here"
+    )]
     fn try_make_runtime_with_channel() -> Result<
         (
             InteractiveRuntime<SharedWriter, FakeHost>,
@@ -12671,7 +12698,7 @@ mod tests {
     }
 
     /// V4-6: a 160→30→160 storm settles to the final size with the viewport
-    /// anchored at the bottom (viewport_top = height - viewport_height).
+    /// anchored at the bottom (`viewport_top` = `height` - `viewport_height`).
     #[tokio::test]
     async fn resize_storm_settles_with_bottom_anchored_viewport() -> TestResult {
         let (mut rt, _log, tx, _sink) = try_make_runtime_with_channel()?;
@@ -12777,6 +12804,10 @@ mod tests {
     // Invariant: notify severity projection survives the mode seam
     // -----------------------------------------------------------------------
 
+    #[expect(
+        clippy::panic,
+        reason = "test assertion: notify must append a diagnostic; let-else panic is the failure signal"
+    )]
     #[tokio::test]
     async fn extension_notify_levels_project_to_matching_diagnostics() {
         use crate::core::extension_host::{ExtensionNotice, ExtensionNoticeLevel};

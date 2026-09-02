@@ -1,3 +1,9 @@
+//! Extension-UI gauntlet transcript corpus (TUI-P3, issue #70).
+//!
+//! Drives the `pi_tui_ext_fixture` binary through the PTY harness to produce
+//! validator-clean schema-v1 transcripts proving sanitization floors hold:
+//! - Custom railed messages
+//! - Widget slots
 #![cfg(all(unix, feature = "testkit"))]
 #![allow(
     clippy::expect_used,
@@ -5,15 +11,6 @@
     clippy::unwrap_used,
     clippy::too_many_lines
 )]
-//! Extension-UI gauntlet transcript corpus (TUI-P3, issue #70).
-//!
-//! Drives the `pi_tui_ext_fixture` binary through the PTY harness to produce
-//! validator-clean schema-v1 transcripts proving sanitization floors hold:
-//! - Custom railed messages
-//! - Widget slots
-//! - Stacked overlays with focus restore
-//! - HostUiRequest confirm/select/input dialogs
-//! - Extension shortcuts in the footer
 //! - Hostile setTheme (bad hex, contrast < 4.5, hue swaps)
 //! - OSC 0 title injection with C0/C1 and >256 UTF-8 bytes
 //!
@@ -291,11 +288,11 @@ fn fixture_binary() -> Result<PathBuf, CorpusError> {
 
 fn host_row_id() -> RowId {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => RowId::GnuX64,
         ("linux", "aarch64") => RowId::GnuArm64,
         ("macos", "x86_64") => RowId::DarwinX64,
         ("macos", "aarch64") => RowId::DarwinArm64,
         ("windows", _) => RowId::WindowsX64,
+        // Unknown hosts (including linux/x86_64) fall back to the gnu x64 row.
         _ => RowId::GnuX64,
     }
 }

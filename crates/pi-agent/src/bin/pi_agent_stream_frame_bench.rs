@@ -296,6 +296,11 @@ fn bench_config() -> AgentLoopConfig {
 
 /// One measured funnel round: provider -> drain -> reduce, end to end.
 /// Returns `(elapsed_ns, message_update_count)`.
+#[expect(
+    clippy::panic,
+    clippy::expect_used,
+    reason = "bench: runtime creation and funnel failure are irrecoverable in a benchmark binary"
+)]
 fn bench_funnel(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -355,6 +360,10 @@ fn bench_funnel(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
 /// lossless mpsc), no reduce leg. Uses the same `rematerialize` map as
 /// `FrameProvider` so the `funnel - drain` delta is exactly the reduce leg.
 /// Returns `(elapsed_ns, delivered_items)`.
+#[expect(
+    clippy::panic,
+    reason = "bench: runtime creation failure is irrecoverable in a benchmark binary"
+)]
 fn bench_drain(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -415,6 +424,10 @@ fn event_partial(event: &AssistantMessageEvent) -> Option<&Arc<AssistantMessage>
 /// One measured source round: the drain loop's stream poll + per-frame
 /// rematerialization (`Arc::new(inner.clone())`) with both channel legs
 /// disabled. Returns `(elapsed_ns, events_pulled)`.
+#[expect(
+    clippy::panic,
+    reason = "bench: runtime creation failure is irrecoverable in a benchmark binary"
+)]
 fn bench_source(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -444,6 +457,10 @@ fn bench_source(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
 /// (refcount-only publish identical to `drain.rs::publish_partial`, watcher
 /// task identical to `bench_drain`'s) with the mpsc forward disabled.
 /// Returns `(elapsed_ns, events_pulled)`.
+#[expect(
+    clippy::panic,
+    reason = "bench: runtime creation failure is irrecoverable in a benchmark binary"
+)]
 fn bench_source_watch(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -487,6 +504,10 @@ fn bench_source_watch(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
 /// (boxed `DrainItem` forward under the `send_item`-shaped cancellation
 /// select, receiver loop identical to `bench_drain`'s) with the watch leg
 /// disabled. Returns `(elapsed_ns, delivered_items)`.
+#[expect(
+    clippy::panic,
+    reason = "bench: runtime creation failure is irrecoverable in a benchmark binary"
+)]
 fn bench_source_forward(script: &Arc<Vec<FrameTemplate>>) -> (u64, u64) {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -554,6 +575,10 @@ fn warmup_rounds() -> usize {
 }
 
 /// rs: sample standard deviation / mean, in percent (noise-gate input).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "bench: nanosecond timings and round counts are bounded well within f64 mantissa range"
+)]
 fn rs_pct(values: &[u64]) -> f64 {
     let n = values.len();
     if n < 2 {
@@ -579,6 +604,94 @@ fn median(values: &mut [u64]) -> u64 {
     values[values.len() / 2]
 }
 
+#[expect(
+    clippy::struct_field_names,
+    reason = "bench: all fields are ns/frame vectors; the _ns suffix is semantically meaningful"
+)]
+struct BenchResults {
+    funnel_ns: Vec<u64>,
+    drain_ns: Vec<u64>,
+    source_ns: Vec<u64>,
+    source_watch_ns: Vec<u64>,
+    source_forward_ns: Vec<u64>,
+}
+
+/// Runs interleaved warmup + measured rounds and returns per-scenario
+/// `ns / FRAMES` vectors for the measured rounds only.
+fn run_measured_rounds(
+    script: &Arc<Vec<FrameTemplate>>,
+    rounds: usize,
+    warmups: usize,
+) -> BenchResults {
+    let mut funnel_ns = Vec::with_capacity(rounds);
+    let mut drain_ns = Vec::with_capacity(rounds);
+    let mut source_ns = Vec::with_capacity(rounds);
+    let mut source_watch_ns = Vec::with_capacity(rounds);
+    let mut source_forward_ns = Vec::with_capacity(rounds);
+
+    for round in 0..warmups + rounds {
+        let measured = round >= warmups;
+
+        let (ns, updates) = bench_funnel(script);
+        assert_eq!(
+            updates,
+            (FRAMES + 2) as u64,
+            "funnel must emit one MessageUpdate per non-start partial event"
+        );
+        if measured {
+            funnel_ns.push(ns / FRAMES as u64);
+        }
+
+        let (ns, items) = bench_drain(script);
+        assert_eq!(
+            items,
+            (FRAMES + 4) as u64,
+            "drain must forward every scripted event losslessly"
+        );
+        if measured {
+            drain_ns.push(ns / FRAMES as u64);
+        }
+
+        let (ns, events) = bench_source(script);
+        assert_eq!(
+            events,
+            (FRAMES + 4) as u64,
+            "source must pull every scripted event"
+        );
+        if measured {
+            source_ns.push(ns / FRAMES as u64);
+        }
+
+        let (ns, events) = bench_source_watch(script);
+        assert_eq!(
+            events,
+            (FRAMES + 4) as u64,
+            "source-watch must pull every scripted event"
+        );
+        if measured {
+            source_watch_ns.push(ns / FRAMES as u64);
+        }
+
+        let (ns, items) = bench_source_forward(script);
+        assert_eq!(
+            items,
+            (FRAMES + 4) as u64,
+            "source-forward must deliver every scripted event"
+        );
+        if measured {
+            source_forward_ns.push(ns / FRAMES as u64);
+        }
+    }
+
+    BenchResults {
+        funnel_ns,
+        drain_ns,
+        source_ns,
+        source_watch_ns,
+        source_forward_ns,
+    }
+}
+
 fn main() {
     let script = Arc::new(frame_script());
     let final_len = script.last().map_or(0, |frame| match &frame.kind {
@@ -591,71 +704,19 @@ fn main() {
     let rounds = measured_rounds();
     let warmups = warmup_rounds();
 
-    let mut funnel_ns = Vec::with_capacity(rounds);
-    let mut drain_ns = Vec::with_capacity(rounds);
-    let mut source_ns = Vec::with_capacity(rounds);
-    let mut source_watch_ns = Vec::with_capacity(rounds);
-    let mut source_forward_ns = Vec::with_capacity(rounds);
+    let BenchResults {
+        mut funnel_ns,
+        mut drain_ns,
+        mut source_ns,
+        mut source_watch_ns,
+        mut source_forward_ns,
+    } = run_measured_rounds(&script, rounds, warmups);
 
-    for round in 0..warmups + rounds {
-        let measured = round >= warmups;
-
-        let (ns, updates) = bench_funnel(&script);
-        assert_eq!(
-            updates,
-            (FRAMES + 2) as u64,
-            "funnel must emit one MessageUpdate per non-start partial event"
-        );
-        if measured {
-            funnel_ns.push(ns / FRAMES as u64);
-        }
-
-        let (ns, items) = bench_drain(&script);
-        assert_eq!(
-            items,
-            (FRAMES + 4) as u64,
-            "drain must forward every scripted event losslessly"
-        );
-        if measured {
-            drain_ns.push(ns / FRAMES as u64);
-        }
-
-        let (ns, events) = bench_source(&script);
-        assert_eq!(
-            events,
-            (FRAMES + 4) as u64,
-            "source must pull every scripted event"
-        );
-        if measured {
-            source_ns.push(ns / FRAMES as u64);
-        }
-
-        let (ns, events) = bench_source_watch(&script);
-        assert_eq!(
-            events,
-            (FRAMES + 4) as u64,
-            "source-watch must pull every scripted event"
-        );
-        if measured {
-            source_watch_ns.push(ns / FRAMES as u64);
-        }
-
-        let (ns, items) = bench_source_forward(&script);
-        assert_eq!(
-            items,
-            (FRAMES + 4) as u64,
-            "source-forward must deliver every scripted event"
-        );
-        if measured {
-            source_forward_ns.push(ns / FRAMES as u64);
-        }
-    }
-
-    let funnel_rs = rs_pct(&funnel_ns);
-    let drain_rs = rs_pct(&drain_ns);
-    let source_rs = rs_pct(&source_ns);
-    let source_watch_rs = rs_pct(&source_watch_ns);
-    let source_forward_rs = rs_pct(&source_forward_ns);
+    let funnel_rel_stddev = rs_pct(&funnel_ns);
+    let drain_rel_stddev = rs_pct(&drain_ns);
+    let source_rel_stddev = rs_pct(&source_ns);
+    let source_watch_rel_stddev = rs_pct(&source_watch_ns);
+    let source_forward_rel_stddev = rs_pct(&source_forward_ns);
     let drain_samples: Vec<u64> = drain_ns.clone();
     let source_samples: Vec<u64> = source_ns.clone();
     let source_watch_samples: Vec<u64> = source_watch_ns.clone();
@@ -667,10 +728,10 @@ fn main() {
     let source_watch_ns = median(&mut source_watch_ns);
     let source_forward_ns = median(&mut source_forward_ns);
     let reduce_ns = funnel_ns.saturating_sub(drain_ns);
-    let watch_leg = source_watch_ns as i64 - source_ns as i64;
-    let forward_leg = source_forward_ns as i64 - source_ns as i64;
-    let interaction = drain_ns as i64 - source_watch_ns as i64 - forward_leg;
-    let attributed_sum = source_ns as i64 + watch_leg + forward_leg + interaction;
+    let watch_leg = source_watch_ns.cast_signed() - source_ns.cast_signed();
+    let forward_leg = source_forward_ns.cast_signed() - source_ns.cast_signed();
+    let interaction = drain_ns.cast_signed() - source_watch_ns.cast_signed() - forward_leg;
+    let attributed_sum = source_ns.cast_signed() + watch_leg + forward_leg + interaction;
 
     println!(
         "stream-frame-pipeline bench (pinned: {FRAMES} x verification-chunk frames, final text {final_len} B)"
@@ -678,11 +739,15 @@ fn main() {
     println!("protocol: release, medians of {rounds} interleaved rounds after {warmups} warmups");
     println!();
     println!("scenario | median ns/frame | rs");
-    println!("funnel (decode+forward+reduce)   | {funnel_ns} | {funnel_rs:.2}%");
-    println!("drain (decode+forward only)      | {drain_ns} | {drain_rs:.2}%");
-    println!("source (materialization+poll)    | {source_ns} | {source_rs:.2}%");
-    println!("source-watch (source+lossy leg)  | {source_watch_ns} | {source_watch_rs:.2}%");
-    println!("source-forward (source+lossless) | {source_forward_ns} | {source_forward_rs:.2}%");
+    println!("funnel (decode+forward+reduce)   | {funnel_ns} | {funnel_rel_stddev:.2}%");
+    println!("drain (decode+forward only)      | {drain_ns} | {drain_rel_stddev:.2}%");
+    println!("source (materialization+poll)    | {source_ns} | {source_rel_stddev:.2}%");
+    println!(
+        "source-watch (source+lossy leg)  | {source_watch_ns} | {source_watch_rel_stddev:.2}%"
+    );
+    println!(
+        "source-forward (source+lossless) | {source_forward_ns} | {source_forward_rel_stddev:.2}%"
+    );
     println!("reduce (funnel - drain)          | {reduce_ns}");
     println!();
     println!("E1 stage attribution (stage disabling; sums to the drain median by construction):");

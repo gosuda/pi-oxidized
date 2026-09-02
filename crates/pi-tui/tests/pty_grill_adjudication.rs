@@ -18,7 +18,7 @@
 //!   bytes outside frame annotations (host-tier evidence).
 //! - T9: Terminal interfaces — all output flows through the Tui stage-3 writer
 //!   (sole stdout owner), transaction markers present, cursor show on exit.
-//! - OSC52: Clipboard OSC 52 encoder adjudicated in crates/pi/tests/pty_grill_osc52.rs
+//! - OSC52: Clipboard OSC 52 encoder adjudicated in `crates/pi/tests/pty_grill_osc52.rs`
 //!   (unit-level; the PTY fixture does not exercise clipboard actions).
 //! - T4 (math): InlineMath/DisplayMath events are silently dropped — the
 //!   raw-literal fallback path is NOT implemented; ruled **unverified** and
@@ -34,7 +34,9 @@ use std::time::{Duration, Instant};
 use avt::Vt;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
-use pi_tui::image::{KittyEncodeOptions, encode_iterm2, encode_kitty, image_fallback};
+use pi_tui::image::{
+    ITerm2EncodeOptions, KittyEncodeOptions, encode_iterm2, encode_kitty, image_fallback,
+};
 use pi_tui::keys::{
     MODIFY_OTHER_KEYS_OMISSION, is_kitty_protocol_active, key_matches, key_press,
     set_kitty_protocol_active,
@@ -102,6 +104,10 @@ fn grill_t1_differential_rendering_no_clears_continuous_content() {
 /// disable) is emitted before any synchronized output, Kitty keyboard
 /// protocol flag toggles correctly, and emergency restore bytes are present
 /// on exit.
+#[expect(
+    clippy::expect_used,
+    reason = "test assertion: probe batch and sync marker must be present on the wire"
+)]
 #[test]
 fn grill_t2_terminal_state_probes_before_sync_kitty_flag_emergency_restore() {
     let report = drive_fixture("success", true);
@@ -210,7 +216,7 @@ fn grill_t3_kitty_graphics_encoder() {
 /// OSC 1337 File= sequences.
 #[test]
 fn grill_t3_iterm2_encoder() {
-    let encoded = encode_iterm2("AAAA", Default::default());
+    let encoded = encode_iterm2("AAAA", ITerm2EncodeOptions::default());
     assert!(
         encoded.starts_with("\u{1b}]1337;File="),
         "T3: iTerm2 encode must start with OSC 1337 File="
@@ -248,12 +254,12 @@ fn grill_t3_no_raw_image_bytes_on_pty_wire() {
     let report = drive_fixture("success", true);
     // Kitty graphics: ESC _G ... ST
     assert!(
-        !find_subslice(&report.raw, b"\x1b_G").is_some(),
+        find_subslice(&report.raw, b"\x1b_G").is_none(),
         "T3: fixture must not emit raw Kitty graphics sequences on the PTY wire"
     );
     // iTerm2: OSC 1337 File=
     assert!(
-        !find_subslice(&report.raw, b"\x1b]1337;File=").is_some(),
+        find_subslice(&report.raw, b"\x1b]1337;File=").is_none(),
         "T3: fixture must not emit raw iTerm2 image sequences on the PTY wire"
     );
 }
@@ -304,9 +310,11 @@ fn grill_t9_terminal_interfaces_sole_stdout_owner() {
 /// PAR-CLOSE). The original gap witness asserted delimiters and LaTeX
 /// commands survive as literal text; this re-adjudicated witness pins
 /// the landed contract — math renders to Unicode, delimiters do not
-/// survive, and unsupported input falls back to raw source. See
 /// docs/PAR-PTY-GRILL-verdict.md for the full re-adjudication record.
-
+#[expect(
+    dead_code,
+    reason = "re-adjudicated witness: kept as living documentation of the T4 math parity gap"
+)]
 fn grill_t4_math_rendering_landed() {
     use pi_tui::component::Component;
     use pi_tui::components::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
@@ -374,6 +382,10 @@ fn grill_t4_math_rendering_landed() {
 // PTY driver (shared harness)
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "test report struct: each bool is an independent PTY wire assertion"
+)]
 struct GrillReport {
     raw: Vec<u8>,
     final_vt_text: Vec<String>,
@@ -389,7 +401,8 @@ struct GrillReport {
 
 #[expect(
     clippy::too_many_lines,
-    reason = "PTY harness requires sequential setup, resize, and drain"
+    clippy::panic,
+    reason = "PTY harness: setup failures are irrecoverable in test; sequential setup, resize, and drain"
 )]
 fn drive_fixture(exit: &str, sync: bool) -> GrillReport {
     let binary = fixture_binary();
@@ -708,6 +721,10 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+#[expect(
+    clippy::panic,
+    reason = "test helper: build failure is irrecoverable in test"
+)]
 fn fixture_binary() -> PathBuf {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_pi_tui_pty_fixture") {
         return PathBuf::from(path);

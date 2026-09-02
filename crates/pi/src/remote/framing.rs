@@ -23,7 +23,12 @@ pub enum FrameError {
     IncompleteHeader,
     /// The declared frame length exceeds the configured limit.
     #[error("Frame length {declared} exceeds configured limit of {limit}")]
-    Oversized { declared: u64, limit: u64 },
+    Oversized {
+        /// Declared payload length from the frame header.
+        declared: u64,
+        /// Configured maximum payload length.
+        limit: u64,
+    },
     /// The buffer does not contain exactly one complete payload.
     #[error("Frame must contain exactly one complete payload")]
     NotOneCompletePayload,
@@ -57,6 +62,10 @@ impl FrameDecoderOptions {
         }
     }
     /// Create options with a custom max frame length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::InvalidLimit`] if `max_frame_length` exceeds `u32::MAX`.
     pub fn with_max(max_frame_length: usize) -> Result<Self, FrameError> {
         if u64::try_from(max_frame_length).is_ok_and(|v| v <= MAX_UINT32) {
             Ok(Self { max_frame_length })
@@ -82,6 +91,7 @@ fn resolve_max(options: Option<FrameDecoderOptions>) -> Result<usize, FrameError
 }
 
 /// Prefixes a payload with its unsigned 32-bit big-endian byte length.
+#[must_use]
 pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
     let length = u32::try_from(payload.len()).unwrap_or(u32::MAX);
     let mut frame = Vec::with_capacity(FRAME_HEADER_LENGTH + payload.len());
@@ -91,6 +101,17 @@ pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
 }
 
 /// Validates that `frame` contains exactly one complete frame within the configured limit.
+///
+/// # Errors
+///
+/// Returns [`FrameError::IncompleteHeader`] if the frame is shorter than the
+/// 4-byte header, [`FrameError::Oversized`] if the declared length exceeds the
+/// limit, or [`FrameError::NotOneCompletePayload`] if the frame does not
+/// contain exactly one complete payload.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "bounded by preceding length > max check where max is a usize"
+)]
 pub fn assert_complete_frame(
     frame: &[u8],
     options: Option<FrameDecoderOptions>,
@@ -98,7 +119,7 @@ pub fn assert_complete_frame(
     if frame.len() < FRAME_HEADER_LENGTH {
         return Err(FrameError::IncompleteHeader);
     }
-    let length = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as u64;
+    let length = u64::from(u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]));
     let max = resolve_max(options)? as u64;
     if length > max {
         return Err(FrameError::Oversized {
@@ -132,6 +153,11 @@ pub struct FrameDecoder {
 
 impl FrameDecoder {
     /// Create a decoder with the given options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::InvalidLimit`] if the configured max frame length
+    /// exceeds `u32::MAX`.
     pub fn new(options: Option<FrameDecoderOptions>) -> Result<Self, FrameError> {
         Ok(Self {
             header: [0; FRAME_HEADER_LENGTH],
@@ -143,6 +169,10 @@ impl FrameDecoder {
         })
     }
     /// Create a decoder with default options (16 MiB max).
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "const-fn alternative to Default::default; impl Default delegates here"
+    )]
     #[must_use]
     pub fn default() -> Self {
         Self::new(None).unwrap_or_else(|_| Self {
@@ -155,6 +185,26 @@ impl FrameDecoder {
         })
     }
     /// Feed a chunk; returns all complete payloads decoded from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::Ended`] if called after `end`, [`FrameError::Failed`]
+    /// if called after a prior failure, [`FrameError::Oversized`] if a frame
+    /// header declares a length exceeding the configured limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `expected_payload_len` is `None` after the
+    /// `is_none` branch — an unreachable invariant guarded by the preceding
+    /// branch that always sets it or continues.
+    #[expect(
+        clippy::expect_used,
+        reason = "invariant: expected_payload_len is set to Some in the is_none branch above, which either continues or sets it"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded by preceding frame_length > max_frame_length check where max_frame_length is a usize"
+    )]
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, FrameError> {
         match self.state {
             DecoderState::Ended => return Err(FrameError::Ended),
@@ -175,7 +225,7 @@ impl FrameDecoder {
                 if self.header_len < FRAME_HEADER_LENGTH {
                     continue;
                 }
-                let frame_length = u32::from_be_bytes(self.header) as u64;
+                let frame_length = u64::from(u32::from_be_bytes(self.header));
                 self.header_len = 0;
                 if frame_length > self.max_frame_length as u64 {
                     self.fail();
@@ -208,6 +258,12 @@ impl FrameDecoder {
         Ok(frames)
     }
     /// Assert no partial frame remains; transitions to the ended state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::Ended`] if already ended, [`FrameError::Failed`]
+    /// if previously failed, or [`FrameError::Truncated`] if a partial frame
+    /// remains buffered.
     pub fn end(&mut self) -> Result<(), FrameError> {
         match self.state {
             DecoderState::Ended => return Err(FrameError::Ended),
@@ -233,6 +289,7 @@ impl FrameDecoder {
 mod tests {
     use super::*;
 
+    #[expect(clippy::expect_used, reason = "test assertion: decode must succeed")]
     #[test]
     fn roundtrip_single_frame() {
         let payload = b"hello world";
@@ -244,6 +301,10 @@ mod tests {
         dec.end().expect("end");
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertion: incremental decode must succeed"
+    )]
     #[test]
     fn incremental_split_byte_by_byte() {
         let payload = b"abcdefgh";
@@ -258,6 +319,10 @@ mod tests {
         dec.end().expect("end");
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertion: multi-frame decode must succeed"
+    )]
     #[test]
     fn multiple_frames_in_one_chunk() {
         let f1 = encode_frame(b"one");
@@ -276,6 +341,10 @@ mod tests {
         dec.end().expect("end");
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "asserting that oversized frames are rejected"
+    )]
     #[test]
     fn oversized_frame_rejected() {
         let mut prefix = [0u8; 4];
@@ -291,6 +360,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: header decode succeeds and truncated frames are rejected"
+    )]
     #[test]
     fn truncated_at_end() {
         let payload = b"abc";
@@ -301,6 +374,10 @@ mod tests {
         assert_eq!(err, FrameError::Truncated);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertion: zero-length frame decode must succeed"
+    )]
     #[test]
     fn zero_length_frame() {
         let frame = encode_frame(&[]);
@@ -311,6 +388,10 @@ mod tests {
         dec.end().expect("end");
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: valid frame passes and incomplete headers are rejected"
+    )]
     #[test]
     fn assert_complete_frame_validates() {
         let payload = b"test";

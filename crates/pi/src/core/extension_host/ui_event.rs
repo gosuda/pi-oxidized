@@ -212,6 +212,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::panic,
+        reason = "assertion: expected SetWorkingIndicator variant"
+    )]
     fn ui_control_hides_only_on_empty_frames_array() {
         let convert = |options: Option<serde_json::Value>| {
             let control: ExtensionUiControl = UiControl::SetWorkingIndicator { options }.into();
@@ -273,13 +277,14 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test setup: valid input must resolve")]
     fn theme_set_object_form_wins_over_name() {
         let theme = ThemeWire {
             name: None,
             source_path: None,
             color_mode: "truecolor".to_owned(),
-            fg: Default::default(),
-            bg: Default::default(),
+            fg: std::collections::BTreeMap::default(),
+            bg: std::collections::BTreeMap::default(),
         };
         let request = ExtensionThemeRequest::try_from(ThemeSet {
             name: Some("named".to_owned()),
@@ -291,6 +296,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test setup: valid input must resolve")]
     fn theme_set_named_carries_persist() {
         for persist in [false, true] {
             let request = ExtensionThemeRequest::try_from(ThemeSet {

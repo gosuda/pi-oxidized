@@ -309,7 +309,7 @@ async fn load_reports_all_35_handlers_and_registry_surfaces() -> R {
     let actual_window = ALL_EVENT_TYPES
         .windows(expected_window.len())
         .find(|w| w[0] == "agent_settled")
-        .expect("agent_settled must be present in ALL_EVENT_TYPES");
+        .ok_or_else(|| "agent_settled must be present in ALL_EVENT_TYPES".to_owned())?;
     assert_eq!(
         actual_window, expected_window,
         "ui_prompt_start and ui_prompt_end must follow agent_settled and precede turn_start"
@@ -349,6 +349,10 @@ async fn load_reports_all_35_handlers_and_registry_surfaces() -> R {
 /// committed artifact cannot drift from the authority — a reordered, added,
 /// or dropped discriminant fails here by name and index.
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "include_str parse of committed fixture bytes"
+)]
 fn witness_manifest_matches_all_event_types() {
     const WITNESS_MANIFEST: &str = include_str!(
         "../../../../../packages/pi-tui-protocol/tests/fixtures/witness-manifest.json"

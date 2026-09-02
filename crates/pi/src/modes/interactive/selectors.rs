@@ -863,6 +863,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test setup: tmp dir, file write, and symlink are irrecoverable preconditions"
+    )]
     fn same_session_path_matches_symlink_and_falls_back() {
         let tmp = tempfile::tempdir().expect("tmp");
         let real = tmp.path().join("real.jsonl");

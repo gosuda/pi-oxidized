@@ -103,6 +103,7 @@ impl Serializer for CborValueSerializer {
     fn serialize_i32(self, v: i32) -> Result<CborValue, SerError> {
         self.serialize_i64(i64::from(v))
     }
+    #[expect(clippy::cast_sign_loss, reason = "bounded by preceding v >= 0 check")]
     fn serialize_i64(self, v: i64) -> Result<CborValue, SerError> {
         if v >= 0 {
             Ok(CborValue::UInt(v as u64))
@@ -125,6 +126,11 @@ impl Serializer for CborValueSerializer {
     fn serialize_f32(self, v: f32) -> Result<CborValue, SerError> {
         self.serialize_f64(f64::from(v))
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded by preceding fract == 0 and abs < 2^53 check"
+    )]
+    #[expect(clippy::cast_sign_loss, reason = "bounded by preceding i >= 0 check")]
     fn serialize_f64(self, v: f64) -> Result<CborValue, SerError> {
         let neg_zero = v == 0.0 && v.is_sign_negative();
         if v.is_finite() && v.fract() == 0.0 && !neg_zero && v.abs() < 2f64.powi(53) {
@@ -295,9 +301,8 @@ impl SerializeMap for MapSer {
             .take()
             .ok_or_else(|| SerError::custom("value without key"))?;
         let v = value.serialize(CborValueSerializer)?;
-        let ks = match k {
-            CborValue::Text(s) => s,
-            _ => return Err(SerError::custom("map keys must be strings")),
+        let CborValue::Text(ks) = k else {
+            return Err(SerError::custom("map keys must be strings"));
         };
         self.entries.push((ks, v));
         Ok(())
@@ -426,12 +431,16 @@ impl<'de> serde::de::EnumAccess<'de> for EnumAccess {
 impl<'de> Deserializer<'de> for CborValueDeserializer {
     type Error = SerError;
 
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "bounded by preceding i64::try_from check"
+    )]
     fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, SerError> {
         match self.value {
             CborValue::Null => visitor.visit_unit(),
             CborValue::Bool(b) => visitor.visit_bool(b),
             CborValue::UInt(n) => {
-                if n <= i64::MAX as u64 {
+                if i64::try_from(n).is_ok() {
                     visitor.visit_i64(n as i64)
                 } else {
                     visitor.visit_u64(n)
@@ -472,9 +481,13 @@ impl<'de> Deserializer<'de> for CborValueDeserializer {
     fn deserialize_i32<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, SerError> {
         self.deserialize_i64(v)
     }
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "bounded by preceding i64::try_from guard"
+    )]
     fn deserialize_i64<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, SerError> {
         match self.value {
-            CborValue::UInt(n) if n <= i64::MAX as u64 => v.visit_i64(n as i64),
+            CborValue::UInt(n) if i64::try_from(n).is_ok() => v.visit_i64(n as i64),
             CborValue::NInt(n) => v.visit_i64(n),
             _ => Err(SerError::custom("expected i64")),
         }
@@ -497,6 +510,10 @@ impl<'de> Deserializer<'de> for CborValueDeserializer {
     fn deserialize_f32<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, SerError> {
         self.deserialize_f64(v)
     }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "inherent in u64/i64 to f64 conversion; CBOR spec allows this"
+    )]
     fn deserialize_f64<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, SerError> {
         match self.value {
             CborValue::Float(f) => v.visit_f64(f),

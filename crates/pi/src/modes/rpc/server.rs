@@ -4138,12 +4138,12 @@ mod tests {
         let request =
             map_extension_ui_event(ExtensionUiEvent::UiControl(ExtensionUiControl::SetStatus {
                 key: "k".to_owned(),
-                text: Some("".to_owned()),
+                text: Some(String::new()),
             }))
             .expect("SetStatus must map to a request");
         match request {
             RpcExtensionUiRequest::SetStatus { status_text, .. } => {
-                assert_eq!(status_text, Some("".to_owned()));
+                assert_eq!(status_text, Some(String::new()));
             }
             other => panic!("expected SetStatus, got {other:?}"),
         }

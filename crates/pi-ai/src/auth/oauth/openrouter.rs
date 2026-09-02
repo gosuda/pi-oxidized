@@ -1,4 +1,4 @@
-//! OpenRouter OAuth PKCE flow.
+//! `OpenRouter` OAuth PKCE flow.
 //!
 //! Ports `.references/pi/packages/ai/src/auth/oauth/openrouter.ts`: PKCE
 //! browser flow with an ephemeral callback server on a random UUID path,
@@ -36,16 +36,16 @@ pub const TOKEN_URL: &str = "https://openrouter.ai/api/v1/auth/keys";
 /// Login timeout (5 minutes).
 pub const LOGIN_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
-/// Display name for the OpenRouter OAuth handler.
+/// Display name for the `OpenRouter` OAuth handler.
 pub const OAUTH_NAME: &str = "OpenRouter OAuth";
 
 /// Selector label for the subscription login option.
 pub const OAUTH_LOGIN_LABEL: &str = "Sign in with OpenRouter";
 
-/// `Number.MAX_SAFE_INTEGER` from JavaScript — OpenRouter keys never expire.
+/// `Number.MAX_SAFE_INTEGER` from JavaScript — `OpenRouter` keys never expire.
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
-/// OpenRouter OAuth handler.
+/// `OpenRouter` OAuth handler.
 #[derive(Clone, Debug)]
 pub struct OpenRouterOAuth {
     http: AuthHttpClient,
@@ -180,113 +180,13 @@ impl OAuthAuth for OpenRouterOAuth {
                 }
             });
 
-            let callback_path_clone = callback_path.clone();
-            let callback_claimed = claimed.clone();
-            let callback_code_tx = code_tx.clone();
-            let callback_shutdown = shutdown.clone();
-
-            let server_handle = tokio::spawn(async move {
-                use axum::Router;
-                use axum::extract::{Query, State};
-                use axum::http::StatusCode;
-                use axum::response::{Html, IntoResponse, Response};
-                use axum::routing::any;
-
-                #[derive(Deserialize)]
-                struct CallbackQuery {
-                    code: Option<String>,
-                    error: Option<String>,
-                    error_description: Option<String>,
-                }
-
-                #[derive(Clone)]
-                struct CbState {
-                    code_tx: Arc<Mutex<Option<oneshot::Sender<Option<String>>>>>,
-                    claimed: Arc<Mutex<bool>>,
-                    shutdown: CancellationToken,
-                }
-
-                async fn handle_callback(
-                    State(state): State<CbState>,
-                    Query(query): Query<CallbackQuery>,
-                ) -> Response {
-                    if let Some(error) = query.error {
-                        let description = query
-                            .error_description
-                            .unwrap_or_else(|| format!("Error: {error}"));
-                        if let Some(tx) = state.code_tx.lock().await.take() {
-                            let _ = tx.send(None);
-                        }
-                        state.shutdown.cancel();
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Html(oauth_error_html(
-                                "OpenRouter authorization was denied.",
-                                Some(&description),
-                            )),
-                        )
-                            .into_response();
-                    }
-
-                    let Some(code) = query.code.filter(|value| !value.is_empty()) else {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Html(oauth_error_html(
-                                "OpenRouter returned no authorization code.",
-                                None,
-                            )),
-                        )
-                            .into_response();
-                    };
-
-                    let mut claimed = state.claimed.lock().await;
-                    if *claimed {
-                        return (
-                            StatusCode::CONFLICT,
-                            Html(oauth_error_html(
-                                "This OAuth callback has already been used.",
-                                None,
-                            )),
-                        )
-                            .into_response();
-                    }
-                    *claimed = true;
-                    drop(claimed);
-
-                    if let Some(tx) = state.code_tx.lock().await.take() {
-                        let _ = tx.send(Some(code));
-                    }
-                    state.shutdown.cancel();
-                    (
-                        StatusCode::OK,
-                        Html(oauth_success_html(
-                            "Signed in to OpenRouter. You may now close this page.",
-                        )),
-                    )
-                        .into_response()
-                }
-
-                let app = Router::new()
-                    .route(&callback_path_clone, any(handle_callback))
-                    .fallback(|| async {
-                        (
-                            StatusCode::NOT_FOUND,
-                            Html(oauth_error_html("OAuth callback route not found.", None)),
-                        )
-                    })
-                    .with_state(CbState {
-                        code_tx: callback_code_tx,
-                        claimed: callback_claimed,
-                        shutdown: callback_shutdown,
-                    });
-
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        shutdown.cancelled().await;
-                    })
-                    .await
-                    .ok();
-            });
+            let server_handle = spawn_callback_server(
+                listener,
+                callback_path.clone(),
+                code_tx.clone(),
+                claimed.clone(),
+                shutdown.clone(),
+            );
 
             interaction.notify(AuthEvent::Progress {
                 message: format!("Listening for OpenRouter OAuth callback on {callback_url}"),
@@ -308,14 +208,13 @@ impl OAuthAuth for OpenRouterOAuth {
             let manual_cancel = CancellationToken::new();
             let manual_cancel_clone = manual_cancel.clone();
             let manual = async {
-                let result = interaction
+                interaction
                     .prompt(AuthPrompt::ManualCode {
                         message: "Complete sign-in in your browser, or paste the authorization code / redirect URL here:".to_owned(),
                         placeholder: Some(callback_url.clone()),
                         signal: Some(manual_cancel_clone),
                     })
-                    .await;
-                result
+                    .await
             };
 
             let callback_result = tokio::select! {
@@ -394,6 +293,123 @@ async fn wait_for_cancel(signal: Option<CancellationToken>) {
     }
 }
 
+/// Serve the ephemeral OAuth callback endpoint until `shutdown` fires.
+///
+/// Spawns the browser-facing server task that receives the authorization
+/// redirect: the first valid callback claims the one-shot sender and delivers
+/// the code (or `None` on an error response), then cancels `shutdown` so
+/// [`axum::serve`] drains and the task exits.
+fn spawn_callback_server(
+    listener: TcpListener,
+    callback_path: String,
+    code_tx: Arc<Mutex<Option<oneshot::Sender<Option<String>>>>>,
+    claimed: Arc<Mutex<bool>>,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use axum::Router;
+        use axum::extract::{Query, State};
+        use axum::http::StatusCode;
+        use axum::response::{Html, IntoResponse, Response};
+        use axum::routing::any;
+
+        #[derive(Deserialize)]
+        struct CallbackQuery {
+            code: Option<String>,
+            error: Option<String>,
+            error_description: Option<String>,
+        }
+
+        #[derive(Clone)]
+        struct CbState {
+            code_tx: Arc<Mutex<Option<oneshot::Sender<Option<String>>>>>,
+            claimed: Arc<Mutex<bool>>,
+            shutdown: CancellationToken,
+        }
+
+        async fn handle_callback(
+            State(state): State<CbState>,
+            Query(query): Query<CallbackQuery>,
+        ) -> Response {
+            if let Some(error) = query.error {
+                let description = query
+                    .error_description
+                    .unwrap_or_else(|| format!("Error: {error}"));
+                if let Some(tx) = state.code_tx.lock().await.take() {
+                    let _ = tx.send(None);
+                }
+                state.shutdown.cancel();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Html(oauth_error_html(
+                        "OpenRouter authorization was denied.",
+                        Some(&description),
+                    )),
+                )
+                    .into_response();
+            }
+
+            let Some(code) = query.code.filter(|value| !value.is_empty()) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Html(oauth_error_html(
+                        "OpenRouter returned no authorization code.",
+                        None,
+                    )),
+                )
+                    .into_response();
+            };
+
+            let mut claimed = state.claimed.lock().await;
+            if *claimed {
+                return (
+                    StatusCode::CONFLICT,
+                    Html(oauth_error_html(
+                        "This OAuth callback has already been used.",
+                        None,
+                    )),
+                )
+                    .into_response();
+            }
+            *claimed = true;
+            drop(claimed);
+
+            if let Some(tx) = state.code_tx.lock().await.take() {
+                let _ = tx.send(Some(code));
+            }
+            state.shutdown.cancel();
+            (
+                StatusCode::OK,
+                Html(oauth_success_html(
+                    "Signed in to OpenRouter. You may now close this page.",
+                )),
+            )
+                .into_response()
+        }
+
+        let app = Router::new()
+            .route(&callback_path, any(handle_callback))
+            .fallback(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    Html(oauth_error_html("OAuth callback route not found.", None)),
+                )
+            })
+            .with_state(CbState {
+                code_tx,
+                claimed,
+                shutdown: shutdown.clone(),
+            });
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.cancelled().await;
+            })
+            .await
+            .ok();
+    })
+}
+
 /// Parse a pasted authorization redirect URL, query string, or bare code.
 fn parse_authorization_input(input: &str) -> String {
     let value = input.trim();
@@ -401,32 +417,30 @@ fn parse_authorization_input(input: &str) -> String {
         return String::new();
     }
 
-    if let Ok(url) = reqwest::Url::parse(value) {
-        if let Some(code) = url
+    if let Ok(url) = reqwest::Url::parse(value)
+        && let Some(code) = url
             .query_pairs()
             .find(|(key, _)| key == "code")
             .map(|(_, v)| v.to_string())
-        {
-            return code;
-        }
+    {
+        return code;
     }
 
-    if value.contains("code=") {
-        if let Ok(url) = reqwest::Url::parse(&format!("http://localhost/?{value}")) {
-            if let Some(code) = url
-                .query_pairs()
-                .find(|(key, _)| key == "code")
-                .map(|(_, v)| v.to_string())
-            {
-                return code;
-            }
-        }
+    if value.contains("code=")
+        && let Ok(url) = reqwest::Url::parse(&format!("http://localhost/?{value}"))
+        && let Some(code) = url
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, v)| v.to_string())
+    {
+        return code;
     }
 
     value.to_owned()
 }
 
 fn urlencode(input: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
     for byte in input.bytes() {
         match byte {
@@ -434,7 +448,7 @@ fn urlencode(input: &str) -> String {
                 out.push(byte as char);
             }
             _ => {
-                out.push_str(&format!("%{byte:02X}"));
+                let _ = write!(out, "%{byte:02X}");
             }
         }
     }

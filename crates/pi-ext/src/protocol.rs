@@ -2670,10 +2670,7 @@ mod tests {
 mod bridge_tests {
     use super::*;
     use crate::adapters::methods;
-    use crate::server::{
-        COMMAND_EXECUTE_METHOD, EXTENSIONS_LOAD_METHOD, MESSAGE_UPDATE_DELTA_METHOD,
-        RegistrySnapshot, TOOL_RENDER_HTML_METHOD,
-    };
+    use crate::server::RegistrySnapshot;
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -3096,9 +3093,14 @@ mod bridge_tests {
     /// lifecycle discriminants, modifier-combo key events, and the payload
     /// digest. Never reads files and never mutates its inputs, so the
     /// mutation tests can drive it directly.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "witness verifier is one cohesive lockstep check; splitting would obscure rule ordering"
+    )]
     fn verify_witness(fixtures: &str, manifest: &serde_json::Value) -> Vec<String> {
         use sha2::Digest;
         use std::collections::HashSet;
+        use std::fmt::Write;
         let mut violations = Vec::new();
 
         let mut count = 0usize;
@@ -3127,25 +3129,25 @@ mod bridge_tests {
             };
             seen.insert((frame.method.clone(), frame.kind));
 
-            if frame.method == Method::UiEvent.as_str() && frame.kind == FrameKind::Req {
-                if let Some(event) = frame.payload.get("event") {
-                    if event.get("type").and_then(|v| v.as_str()) == Some("key") {
-                        let code = event.get("code").and_then(|v| v.as_str()).unwrap_or("");
-                        let modifiers = event
-                            .get("modifiers")
-                            .cloned()
-                            .unwrap_or(serde_json::json!({}));
-                        let kind = event
-                            .get("kind")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("press");
-                        key_events.push(serde_json::json!({
-                            "code": code,
-                            "modifiers": modifiers,
-                            "kind": kind,
-                        }));
-                    }
-                }
+            if frame.method == Method::UiEvent.as_str()
+                && frame.kind == FrameKind::Req
+                && let Some(event) = frame.payload.get("event")
+                && event.get("type").and_then(|v| v.as_str()) == Some("key")
+            {
+                let code = event.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                let modifiers = event
+                    .get("modifiers")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                let kind = event
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("press");
+                key_events.push(serde_json::json!({
+                    "code": code,
+                    "modifiers": modifiers,
+                    "kind": kind,
+                }));
             }
 
             // Lifecycle witness frames carry payload.type == method (fixture
@@ -3160,10 +3162,10 @@ mod bridge_tests {
             }
         }
 
-        if count != manifest["totalLines"].as_u64().unwrap_or(0) as usize {
+        let declared_total = manifest["totalLines"].as_u64().unwrap_or(0);
+        if count != usize::try_from(declared_total).unwrap_or(0) {
             violations.push(format!(
-                "totalLines mismatch: fixture has {count}, manifest declares {}",
-                manifest["totalLines"].as_u64().unwrap_or(0)
+                "totalLines mismatch: fixture has {count}, manifest declares {declared_total}"
             ));
         }
 
@@ -3238,7 +3240,10 @@ mod bridge_tests {
         // Payload-byte pin: rejects any single flipped byte even when every
         // envelope rule above still holds.
         let digest = sha2::Sha256::digest(fixtures.as_bytes());
-        let digest_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let mut digest_hex = String::with_capacity(digest.len() * 2);
+        for b in &digest {
+            let _ = write!(digest_hex, "{b:02x}");
+        }
         if let Some(declared) = manifest["fixtureSha256"].as_str() {
             if digest_hex != declared {
                 violations.push(format!(
@@ -3310,7 +3315,7 @@ mod bridge_tests {
     /// The new fixture surfaces decode into their real Rust types: the
     /// registry snapshot carries every section, streaming updates and
     /// provider events decode correlated, and the error variant carries the
-    /// non-retryable ErrorPayload shape.
+    /// non-retryable `ErrorPayload` shape.
     #[test]
     fn witness_gap_surfaces_decode_typed() -> TestResult {
         let mut snapshot: Option<RegistrySnapshot> = None;
@@ -3380,6 +3385,10 @@ mod bridge_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "WITNESS_MANIFEST is include_str! of a committed JSON fixture; parse failure is a build-time contract violation"
+    )]
     fn witness_mutation_m1_payload_byte_is_rejected() {
         let manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST).unwrap();
         let mutated = FIXTURES.replacen("\"title\"", "\"titel\"", 1);
@@ -3394,6 +3403,14 @@ mod bridge_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "WITNESS_MANIFEST is include_str! of a committed JSON fixture; parse failure is a build-time contract violation"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "tool.cancel fixture line is committed in include_str! bytes; absence is a build-time contract violation"
+    )]
     fn witness_mutation_m2_dropped_line_is_rejected() {
         let manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST).unwrap();
         let mut lines: Vec<&str> = FIXTURES
@@ -3420,6 +3437,14 @@ mod bridge_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "WITNESS_MANIFEST is include_str! of a committed JSON fixture; parse failure is a build-time contract violation"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "lifecycleDiscriminants array is committed in WITNESS_MANIFEST; absence is a build-time contract violation"
+    )]
     fn witness_mutation_m3_lifecycle_swap_is_rejected_at_named_index() {
         let mut manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST).unwrap();
         let mut names = manifest["lifecycleDiscriminants"]
@@ -3438,6 +3463,10 @@ mod bridge_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "WITNESS_MANIFEST is include_str! of a committed JSON fixture; parse failure is a build-time contract violation"
+    )]
     fn witness_mutation_m5_untracked_frame_is_rejected_by_name() {
         let manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST).unwrap();
         let mutated = format!(
@@ -3453,6 +3482,14 @@ mod bridge_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "WITNESS_MANIFEST is include_str! of a committed JSON fixture; parse failure is a build-time contract violation"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "fixture lines are committed in include_str! bytes; absence is a build-time contract violation"
+    )]
     fn witness_mutation_m6_duplicated_line_is_rejected() {
         let manifest: serde_json::Value = serde_json::from_str(WITNESS_MANIFEST).unwrap();
         let lines: Vec<&str> = FIXTURES

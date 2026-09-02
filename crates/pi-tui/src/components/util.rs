@@ -42,12 +42,14 @@ struct DerivedLine {
 // key makes a content collision (two lines, same key) a ~2^-128 accident,
 // so a hit validates without re-comparing the full line.
 thread_local! {
-    static PAINT_CACHE: RefCell<HashMap<u128, (Box<str>, DerivedLine), BuildHasherDefault<IdHasher>>> =
-        RefCell::new(HashMap::default());
+    static PAINT_CACHE: RefCell<PaintCacheMap> = RefCell::new(HashMap::default());
 }
 
+/// Memo map type for [`PAINT_CACHE`]: `u128` paint key → `(line, derived)`.
+type PaintCacheMap = HashMap<u128, (Box<str>, DerivedLine), BuildHasherDefault<IdHasher>>;
+
 /// Identity hasher for the memo's `u128` keys: the composite key is already
-/// a well-mixed digest of the line content, so re-hashing it with SipHash
+/// a well-mixed digest of the line content, so re-hashing it with `SipHash`
 /// only costs time (PERF-T11 Design E). The map only ever hashes `u128`s;
 /// the truncated `finish` value merely picks a bucket — full keys are
 /// compared for equality on lookup.
@@ -64,6 +66,10 @@ impl Hasher for IdHasher {
     fn write_u64(&mut self, key: u64) {
         self.0 = key;
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded: low 64 bits select a bucket; full u128 keys are compared on lookup"
+    )]
     fn write_u128(&mut self, key: u128) {
         self.0 = key as u64;
     }
@@ -438,7 +444,7 @@ fn paint_line_with_key(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line:
         crate::frame::record_line(y, x, width, key, false);
         return;
     }
-    let claim_matched = prior.map_or(false, |prior| prior.matched);
+    let claim_matched = prior.is_some_and(|prior| prior.matched);
     let (hit, linked) = PAINT_CACHE.with(|cache| {
         let cache = cache.borrow();
         let Some((hit_line, derived)) = cache.get(&key) else {
@@ -464,7 +470,7 @@ fn paint_line_with_key(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line:
     let linked = !derived.regions.is_empty();
     // Byte ranges index into the validated line; lines beyond `u32::MAX`
     // bytes cannot carry faithful records and stay uncached.
-    if line.len() <= u32::MAX as usize {
+    if u32::try_from(line.len()).is_ok() {
         PAINT_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             if cache.len() >= PAINT_CACHE_CAP {
@@ -595,7 +601,7 @@ fn derive_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str) -
     let mut style = PaintStyle::default();
     // Open OSC 8 hyperlink: (byte offset of the open sequence, first painted
     // column, SGR context active when the link opened).
-    let mut link: Option<(usize, usize, String)> = None;
+    let mut open_link: Option<(usize, usize, String)> = None;
     // Visible graphemes are gated by `max_width`, but the trailing ANSI tail
     // is always consumed: wrapped rows that fill the line exactly to the
     // margin carry their OSC 8 close at `col == max_width` and must still
@@ -605,17 +611,17 @@ fn derive_line(x: u16, y: u16, max_width: usize, buf: &mut Buffer, line: &str) -
             match parse_osc8_hyperlink(ansi.code) {
                 Some(Some(_)) => {
                     let prefix = style.sgr_prefix();
-                    link = Some((i, col, prefix));
+                    open_link = Some((i, col, prefix));
                 }
                 Some(None) => {
-                    if let Some((open_at, start_col, prefix)) = link.take()
+                    if let Some((open_at, start_col, prefix)) = open_link.take()
                         && col > start_col
                     {
                         let width = u16::try_from(col - start_col).unwrap_or(u16::MAX);
                         let region_x =
                             x.saturating_add(u16::try_from(start_col).unwrap_or(u16::MAX));
                         let mut bytes = prefix.into_bytes();
-                        bytes.extend_from_slice(line[open_at..i + ansi.len].as_bytes());
+                        bytes.extend_from_slice(&line.as_bytes()[open_at..i + ansi.len]);
                         // Reset guard: the verbatim span may set SGR without
                         // restoring it, and the replayed bytes must not leak
                         // attributes into subsequent payload writes.
@@ -834,10 +840,14 @@ mod tests {
             "label text rides in the region"
         );
         // Label cells are still painted for non-raw consumers (tests, fallback).
-        assert_eq!(buf.cell((9, 2)).map(|c| c.symbol()), Some("e"));
-        assert_eq!(buf.cell((15, 2)).map(|c| c.symbol()), Some("e"));
+        assert_eq!(buf.cell((9, 2)).map(Cell::symbol), Some("e"));
+        assert_eq!(buf.cell((15, 2)).map(Cell::symbol), Some("e"));
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test setup: format_link_open_bel always succeeds with a valid URL"
+    )]
     #[test]
     fn paint_line_records_hyperlink_region_bel_terminator() {
         let line = format!(
@@ -875,8 +885,8 @@ mod tests {
         let line = hyperlink_capped("example", "https://example.com", None);
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
         paint_line(0, 0, 80, &mut buf, &line);
-        assert_eq!(buf.cell((0, 0)).map(|c| c.symbol()), Some("e"));
-        assert_eq!(buf.cell((6, 0)).map(|c| c.symbol()), Some("e"));
+        assert_eq!(buf.cell((0, 0)).map(Cell::symbol), Some("e"));
+        assert_eq!(buf.cell((6, 0)).map(Cell::symbol), Some("e"));
     }
 
     #[test]
@@ -971,9 +981,9 @@ mod tests {
         let (wide, _) = paint_with_annotations(0, 0, 10, &line);
         let (narrow, _) = paint_with_annotations(0, 0, 4, &line);
         let (narrow_again, _) = paint_with_annotations(0, 0, 4, &line);
-        assert_eq!(wide.cell((9, 0)).map(|c| c.symbol()), Some("j"));
+        assert_eq!(wide.cell((9, 0)).map(Cell::symbol), Some("j"));
         assert_eq!(
-            narrow.cell((4, 0)).map(|c| c.symbol()),
+            narrow.cell((4, 0)).map(Cell::symbol),
             Some(" "),
             "cut at width 4"
         );

@@ -138,33 +138,17 @@ async fn run_loop(
             // over and this iteration starts a real subsequent provider
             // request; decide continuation before touching provider state.
             if let Some(completed_turn) = last_completed_turn.take() {
-                if cancel.is_cancelled() {
-                    emit_agent_end(io.sink, new_messages);
-                    return Ok(());
-                }
-
-                apply_prepare_next_turn(
+                if prepare_continuation(
                     current_context,
                     &mut config,
+                    &mut pending_messages,
                     completed_turn,
                     cancel.clone(),
                 )
-                .await?;
-
-                if cancel.is_cancelled() {
+                .await?
+                {
                     emit_agent_end(io.sink, new_messages);
                     return Ok(());
-                }
-
-                // Messages queued while preparation ran join this same next
-                // request; a pending poll delivery keeps one-at-a-time
-                // semantics and skips the extra poll.
-                if pending_messages.is_empty() {
-                    pending_messages = poll_messages(config.get_steering_messages.as_ref()).await?;
-                    if cancel.is_cancelled() {
-                        emit_agent_end(io.sink, new_messages);
-                        return Ok(());
-                    }
                 }
 
                 io.sink.emit(AgentEvent::TurnStart);
@@ -253,6 +237,45 @@ async fn run_loop(
 
     emit_agent_end(io.sink, new_messages);
     Ok(())
+}
+
+/// Applies `prepare_next_turn` for a completed turn and re-polls steering
+/// messages if none were queued during preparation.
+///
+/// Returns `true` when the run was cancelled (caller should emit `AgentEnd`
+/// and return), `false` to continue the inner loop.
+///
+/// # Errors
+///
+/// Propagates [`AgentLoopError`] from the `prepare_next_turn` hook or the
+/// steering-messages poll.
+async fn prepare_continuation(
+    current_context: &mut AgentContext,
+    config: &mut AgentLoopConfig,
+    pending_messages: &mut Vec<AgentMessage>,
+    completed_turn: PrepareNextTurnContext,
+    cancel: CancellationToken,
+) -> Result<bool, AgentLoopError> {
+    if cancel.is_cancelled() {
+        return Ok(true);
+    }
+
+    apply_prepare_next_turn(current_context, config, completed_turn, cancel.clone()).await?;
+
+    if cancel.is_cancelled() {
+        return Ok(true);
+    }
+
+    // Messages queued while preparation ran join this same next request;
+    // a pending poll delivery keeps one-at-a-time semantics and skips
+    // the extra poll.
+    if pending_messages.is_empty() {
+        *pending_messages = poll_messages(config.get_steering_messages.as_ref()).await?;
+        if cancel.is_cancelled() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn stream_assistant_response(

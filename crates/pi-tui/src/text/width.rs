@@ -232,7 +232,7 @@ pub fn normalize_terminal_output(s: &str) -> String {
             i += ansi.len;
             continue;
         }
-        let ch = normalized[i..].chars().next().map_or('\0', |c| c);
+        let ch = normalized[i..].chars().next().unwrap_or('\0');
         if ch == '\t' {
             result.push_str("   ");
             i += 1;

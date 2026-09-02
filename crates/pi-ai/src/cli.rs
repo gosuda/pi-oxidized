@@ -69,8 +69,7 @@ impl AuthInteraction for StdinInteraction {
                         .parse::<usize>()
                         .ok()
                         .filter(|n| *n >= 1 && *n <= count)
-                        .map(|n| n - 1)
-                        .unwrap_or(usize::MAX);
+                        .map_or(usize::MAX, |n| n - 1);
                     let selected = options.get(choice);
                     match selected {
                         Some(option) => Ok(option.id.clone()),
@@ -133,10 +132,7 @@ impl AuthInteraction for StdinInteraction {
                 println!("\nOpen this URL in your browser:\n{verification_uri}");
                 println!("Enter code: {user_code}");
             }
-            AuthEvent::Info { message, .. } => {
-                println!("{message}");
-            }
-            AuthEvent::Progress { message } => {
+            AuthEvent::Info { message, .. } | AuthEvent::Progress { message } => {
                 println!("{message}");
             }
         }

@@ -347,7 +347,6 @@ fn launch_env(sandbox: &Sandbox, opts: &LaunchOpts) -> Result<LaunchEnv, CorpusE
 
 fn host_row_id() -> RowId {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => RowId::GnuX64,
         ("linux", "aarch64") => RowId::GnuArm64,
         ("macos", "x86_64") => RowId::DarwinX64,
         ("macos", "aarch64") => RowId::DarwinArm64,
@@ -364,7 +363,7 @@ fn host_driver_kind() -> DriverKind {
     }
 }
 
-/// Row directory label + RunnerRow. Absent `PI_TUI_TIER_ROW` ⇒ `local`.
+/// Row directory label + `RunnerRow`. Absent `PI_TUI_TIER_ROW` ⇒ `local`.
 fn resolve_row() -> Result<(String, RunnerRow), CorpusError> {
     match std::env::var("PI_TUI_TIER_ROW") {
         Ok(value) if !value.trim().is_empty() => {
@@ -1251,18 +1250,25 @@ fn write_verdict(
     Ok(path)
 }
 
-fn hard_fail(error: CorpusError) -> ! {
+#[expect(
+    clippy::panic,
+    reason = "test hard-fail: gauntlet failure is irrecoverable"
+)]
+fn hard_fail(error: &CorpusError) -> ! {
     panic!("tui keyboard gauntlet hard-fail: {error}");
 }
-
+#[expect(
+    clippy::type_complexity,
+    reason = "scenario table type is inherently complex; a type alias would be used only in this test"
+)]
 #[test]
 fn tui_keyboard_gauntlet_wizard_slash_ctrl_d_streaming_overlay_rebind() {
     if let Err(error) = require_prerequisites() {
-        hard_fail(error);
+        hard_fail(&error);
     }
     let (row_label, row) = match resolve_row() {
         Ok(value) => value,
-        Err(error) => hard_fail(error),
+        Err(error) => hard_fail(&error),
     };
     if row_label == "local" {
         assert_eq!(
@@ -1299,12 +1305,12 @@ fn tui_keyboard_gauntlet_wizard_slash_ctrl_d_streaming_overlay_rebind() {
                 verdicts.push((scenario_dir, "pass"));
                 final_digest = digest;
             }
-            Err(error) => hard_fail(error),
+            Err(error) => hard_fail(&error),
         }
     }
 
     // Per-row verdict record: all six scenarios settled pass with k=3.
     if let Err(error) = write_verdict(&row_label, &row, &final_digest, &verdicts) {
-        hard_fail(error);
+        hard_fail(&error);
     }
 }

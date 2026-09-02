@@ -526,7 +526,7 @@ mod tests {
                     .then_some(value.trim())
             });
             let content_length = content_length
-                .map(|value| value.parse::<usize>())
+                .map(str::parse::<usize>)
                 .transpose()
                 .ok()?
                 .unwrap_or(0);
@@ -612,6 +612,65 @@ mod tests {
                 .map(|guard| guard.clone())
                 .map_err(|_| err("requests lock poisoned"))
         }
+    }
+
+    /// Verify the scripted server's own transport contract: an unknown route
+    /// answers 404, and a request that never completes its headers is dropped
+    /// at the read deadline instead of hanging the poll loop.
+    async fn probe_scripted_server_transport(server: &ScriptedServer) -> TestResult {
+        let address = server
+            .base
+            .strip_prefix("http://")
+            .ok_or_else(|| err("scripted server base must use http"))?;
+        let mut probe = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|error| err(error.to_string()))?;
+        probe
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .map_err(|error| err(error.to_string()))?;
+        let mut probe_response = String::new();
+        probe
+            .read_to_string(&mut probe_response)
+            .await
+            .map_err(|error| err(error.to_string()))?;
+        assert!(
+            probe_response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "unexpected route response: {probe_response:?}"
+        );
+
+        let mut stalled_probe = tokio::net::TcpStream::connect(address)
+            .await
+            .map_err(|error| err(error.to_string()))?;
+        stalled_probe
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .map_err(|error| err(error.to_string()))?;
+        let (mut stalled_reader, mut stalled_writer) = stalled_probe.into_split();
+        let drip = tokio::spawn(async move {
+            loop {
+                if stalled_writer.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let mut stalled_response = String::new();
+        let stalled_read = tokio::time::timeout(
+            Duration::from_secs(3),
+            stalled_reader.read_to_string(&mut stalled_response),
+        )
+        .await;
+        drip.abort();
+        let _ = drip.await;
+        stalled_read
+            .map_err(|_| err("scripted server did not enforce the request deadline"))?
+            .map_err(|error| err(error.to_string()))?;
+        assert!(
+            stalled_response.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "unexpected incomplete request response: {stalled_response:?}"
+        );
+        Ok(())
     }
 
     fn http_json(status: u16, body: &str) -> String {
@@ -755,57 +814,7 @@ mod tests {
             ),
         ])?;
 
-        let address = server
-            .base
-            .strip_prefix("http://")
-            .ok_or_else(|| err("scripted server base must use http"))?;
-        let mut probe = tokio::net::TcpStream::connect(address)
-            .await
-            .map_err(|error| err(error.to_string()))?;
-        probe
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await
-            .map_err(|error| err(error.to_string()))?;
-        let mut probe_response = String::new();
-        probe
-            .read_to_string(&mut probe_response)
-            .await
-            .map_err(|error| err(error.to_string()))?;
-        assert!(
-            probe_response.starts_with("HTTP/1.1 404 Not Found\r\n"),
-            "unexpected route response: {probe_response:?}"
-        );
-        let mut stalled_probe = tokio::net::TcpStream::connect(address)
-            .await
-            .map_err(|error| err(error.to_string()))?;
-        stalled_probe
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
-            .await
-            .map_err(|error| err(error.to_string()))?;
-        let (mut stalled_reader, mut stalled_writer) = stalled_probe.into_split();
-        let drip = tokio::spawn(async move {
-            loop {
-                if stalled_writer.write_all(b"x").await.is_err() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        });
-        let mut stalled_response = String::new();
-        let stalled_read = tokio::time::timeout(
-            Duration::from_secs(3),
-            stalled_reader.read_to_string(&mut stalled_response),
-        )
-        .await;
-        drip.abort();
-        let _ = drip.await;
-        stalled_read
-            .map_err(|_| err("scripted server did not enforce the request deadline"))?
-            .map_err(|error| err(error.to_string()))?;
-        assert!(
-            stalled_response.starts_with("HTTP/1.1 404 Not Found\r\n"),
-            "unexpected incomplete request response: {stalled_response:?}"
-        );
+        probe_scripted_server_transport(&server).await?;
 
         let flow = XaiOAuth::with_endpoints(
             AuthHttpClient::new().map_err(|e| err(e.to_string()))?,

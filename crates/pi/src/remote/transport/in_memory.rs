@@ -58,6 +58,10 @@ struct PairCore {
 
 /// Reads one side's inbound channel until a terminal condition and delivers
 /// exactly one terminal handler call (close or error), never both.
+#[expect(
+    clippy::expect_used,
+    reason = "mutex poisoning is fatal; lock is never held across a panic"
+)]
 async fn read_loop(core: Arc<PairCore>, index: usize) {
     let side = &core.sides[index];
     let Some(mut inbound) = side.inbound.lock().expect("inbound lock").take() else {
@@ -99,7 +103,7 @@ async fn read_loop(core: Arc<PairCore>, index: usize) {
                 // read-lock temporary must not outlive the discriminant read.
                 let signal_value = *signal.borrow_and_update();
                 match signal_value {
-                    SideSignal::Open => continue,
+                    SideSignal::Open => {},
                     SideSignal::LocallyClosed => break,
                     SideSignal::PeerFailed => {
                         let error = side
@@ -113,17 +117,22 @@ async fn read_loop(core: Arc<PairCore>, index: usize) {
                     }
                 }
             }
-            chunk = inbound.recv() => match chunk {
-                Some(bytes) => handlers.on_data(bytes),
-                None => {
+            chunk = inbound.recv() => {
+                if let Some(bytes) = chunk {
+                    handlers.on_data(bytes);
+                } else {
                     handlers.on_close();
                     break;
                 }
-            },
+            }
         }
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "mutex poisoning is fatal; lock is never held across a panic"
+)]
 fn start_reader(core: &Arc<PairCore>, index: usize, handlers: Arc<dyn ByteTransportHandlers>) {
     {
         let side = &core.sides[index];
@@ -152,6 +161,14 @@ impl std::fmt::Debug for InMemoryTransport {
 impl InMemoryTransport {
     /// Closes this end idempotently: the local reader stops without a
     /// terminal handler and the peer observes an orderly EOF.
+    /// # Panics
+    ///
+    /// Panics if the outbound mutex is poisoned — this is fatal and never
+    /// held across a panic.
+    #[expect(
+        clippy::expect_used,
+        reason = "mutex poisoning is fatal; lock is never held across a panic"
+    )]
     pub fn close(&self) {
         let side = &self.core.sides[self.index];
         if side.closed.swap(true, Ordering::SeqCst) {
@@ -165,6 +182,14 @@ impl InMemoryTransport {
 
     /// Injects a typed terminal failure into the peer's handlers (mirrors
     /// upstream test affordance `server.error(error)`).
+    /// # Panics
+    ///
+    /// Panics if the peer error mutex is poisoned — this is fatal and never
+    /// held across a panic.
+    #[expect(
+        clippy::expect_used,
+        reason = "mutex poisoning is fatal; lock is never held across a panic"
+    )]
     pub fn fail_peer(&self, error: TransportError) {
         self.close();
         let peer = &self.core.sides[1 - self.index];
@@ -174,6 +199,10 @@ impl InMemoryTransport {
 }
 
 impl ByteTransport for InMemoryTransport {
+    #[expect(
+        clippy::expect_used,
+        reason = "mutex poisoning is fatal; lock is never held across a panic"
+    )]
     fn send(&self, chunk: Vec<u8>) -> SendFuture {
         let outbound = self.outbound.lock().expect("outbound lock").clone();
         let closed = self.core.sides[self.index].closed.load(Ordering::SeqCst);
@@ -269,6 +298,10 @@ impl InMemoryListener {
     /// Waits for the next dialed connection and installs `handlers` on the
     /// accepted end. Bytes sent before the accept are buffered by the
     /// bounded pipe channel.
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Message`] if the listener was closed before
+    /// a connection arrived.
     pub async fn accept(
         &self,
         handlers: Arc<dyn ByteTransportHandlers>,
@@ -318,17 +351,23 @@ mod tests {
     }
 
     impl ByteTransportHandlers for RecordingHandlers {
+        #[expect(clippy::expect_used, reason = "test handler: mutex poisoning is fatal")]
         fn on_data(&self, chunk: Vec<u8>) {
             self.chunks.lock().expect("chunks").push(chunk);
         }
         fn on_close(&self) {
             self.closes.fetch_add(1, Ordering::SeqCst);
         }
+        #[expect(clippy::expect_used, reason = "test handler: mutex poisoning is fatal")]
         fn on_error(&self, error: TransportError) {
             self.errors.lock().expect("errors").push(error.to_string());
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test setup: dial and accept must succeed"
+    )]
     async fn accepted_pair() -> (
         Arc<dyn ByteTransport>,
         InMemoryTransport,
@@ -349,6 +388,10 @@ mod tests {
         (client, server, client_handlers, server_handlers)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: in-memory transport operations must succeed"
+    )]
     #[tokio::test]
     async fn pair_delivers_ordered_chunks_both_ways() {
         let (client, server, client_handlers, server_handlers) = accepted_pair().await;
@@ -367,6 +410,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: in-memory transport operations must succeed"
+    )]
     #[tokio::test]
     async fn peer_close_delivers_exactly_one_on_close() {
         let (client, server, client_handlers, _server_handlers) = accepted_pair().await;
@@ -393,6 +440,10 @@ mod tests {
         assert!(matches!(err, TransportError::Closed));
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: in-memory transport operations must succeed"
+    )]
     #[tokio::test]
     async fn fail_peer_delivers_exactly_one_typed_on_error() {
         let (_client, server, client_handlers, _server_handlers) = accepted_pair().await;
@@ -405,6 +456,10 @@ mod tests {
         assert_eq!(client_handlers.closes.load(Ordering::SeqCst), 0);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: in-memory transport operations must succeed"
+    )]
     #[tokio::test]
     async fn buffered_sends_before_accept_are_delivered_in_order() {
         let (listener, endpoint) = InMemoryListener::new();
@@ -426,6 +481,7 @@ mod tests {
         );
     }
 
+    #[expect(clippy::expect_used, reason = "test helper: mutex poisoning is fatal")]
     async fn await_chunks(handlers: &RecordingHandlers, count: usize) {
         await_condition(|| handlers.chunks.lock().expect("chunks").len() >= count).await;
     }

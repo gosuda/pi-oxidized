@@ -392,36 +392,7 @@ impl<W: Write> Tui<W> {
             // `area.y .. area.y + height`.
             self.prior_claims = vec![Vec::new(); usize::from(frame_area.bottom())];
         }
-
-        let mut row_claims = RowClaims::default();
-        // Design F: the frame-side claim table is pooled across frames —
-        // rows are cleared in place (capacity retained), so steady-state
-        // composition allocates nothing for claim bookkeeping. A geometry
-        // change (or first frame) rebuilds the pool at the new row count.
-        // Terminal-paint Design B pools the changed-column table the same
-        // way (slots reset to `None` in place).
-        let rows_needed = usize::from(frame_area.bottom());
-        let mut frame_table = std::mem::take(&mut self.scratch_claims);
-        if frame_table.len() == rows_needed {
-            for row in &mut frame_table {
-                row.clear();
-            }
-        } else {
-            frame_table = vec![Vec::new(); rows_needed];
-        }
-        let mut changes_table = std::mem::take(&mut self.changes_scratch);
-        if changes_table.len() == rows_needed {
-            for slot in &mut changes_table {
-                *slot = None;
-            }
-        } else {
-            changes_table = vec![None; rows_needed];
-        }
-        row_claims.install_pooled(
-            std::mem::take(&mut self.prior_claims),
-            frame_table,
-            changes_table,
-        );
+        let row_claims = self.prepare_pooled_claims(frame_area);
         annotations.borrow_mut().install_row_claims(row_claims);
         {
             let terminal = &mut self.terminal;
@@ -448,9 +419,7 @@ impl<W: Write> Tui<W> {
             row.clear();
         }
         self.scratch_claims = prior_table;
-        for slot in &mut changes_table {
-            *slot = None;
-        }
+        changes_table.fill(None);
         self.changes_scratch = changes_table;
         let paint_t1 = paint_timed.then(Instant::now);
 
@@ -498,6 +467,33 @@ impl<W: Write> Tui<W> {
             PAINT_FRAMES.fetch_add(1, Ordering::Relaxed);
         }
         result
+    }
+
+    /// Build pooled `RowClaims` for the frame, reusing scratch tables when
+    /// the row count matches and rebuilding them on geometry change.
+    fn prepare_pooled_claims(&mut self, frame_area: Rect) -> RowClaims {
+        let rows_needed = usize::from(frame_area.bottom());
+        let mut frame_table = std::mem::take(&mut self.scratch_claims);
+        if frame_table.len() == rows_needed {
+            for row in &mut frame_table {
+                row.clear();
+            }
+        } else {
+            frame_table = vec![Vec::new(); rows_needed];
+        }
+        let mut changes_table = std::mem::take(&mut self.changes_scratch);
+        if changes_table.len() == rows_needed {
+            changes_table.fill(None);
+        } else {
+            changes_table = vec![None; rows_needed];
+        }
+        let mut row_claims = RowClaims::default();
+        row_claims.install_pooled(
+            std::mem::take(&mut self.prior_claims),
+            frame_table,
+            changes_table,
+        );
+        row_claims
     }
 
     /// Append raw regions and Kitty-image bookkeeping to the frame payload.
@@ -1746,10 +1742,12 @@ mod tests {
             text.contains(&format!("\u{1b}7\u{1b}[1;1H{open}")),
             "region replay must be cursor-saved, positioned, and open-first: {text:?}"
         );
-        let open_at = text.find(open).expect("OSC 8 open reaches the payload");
+        let open_at = text
+            .find(open)
+            .ok_or_else(|| io::Error::other("OSC 8 open missing from payload"))?;
         let close_at = text[open_at..]
             .find(close)
-            .expect("OSC 8 close reaches the payload")
+            .ok_or_else(|| io::Error::other("OSC 8 close missing from payload"))?
             + open_at;
         assert!(
             text[open_at..close_at].contains("label"),

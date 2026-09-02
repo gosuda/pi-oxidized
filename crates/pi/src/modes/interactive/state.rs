@@ -26,7 +26,10 @@ use super::theme::ResolvedTheme;
 /// Named `ViewState` at the public boundary (re-exported from
 /// [`super`]); internally aliased `InteractiveMode` would collide with the
 /// reference class name, so this struct is `ViewState`.
-#[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "view-model mirrors the reference UI state; splitting would obscure the 1:1 mapping"
+)]
 pub struct ViewState {
     /// Resolved theme used for this frame.
     pub theme: Arc<ResolvedTheme>,

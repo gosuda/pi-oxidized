@@ -6,7 +6,7 @@
 //! - Custom railed messages (user, assistant, tool, custom-message)
 //! - Widget slots (status bar, sidebar, footer)
 //! - Stacked overlays with focus restore
-//! - HostUiRequest confirm/select/input dialog surfaces
+//! - `HostUiRequest` confirm/select/input dialog surfaces
 //! - Extension shortcuts in the footer
 //! - Hostile setTheme: bad hex, contrast below the pinned 4.5 rule, hue swaps
 //! - OSC 0 title injection with C0/C1 controls and >256 UTF-8 bytes

@@ -12,9 +12,13 @@ use std::path::{Path, PathBuf};
 
 const MODES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/modes");
 
-/// (relative file path, &[(pi_ext module, symbol, reason)]) — the complete,
+/// (relative file path, `&[(pi_ext module, symbol, reason)]`) — the complete,
 /// bidirectionally-checked allowance per mode file. Built by scanning the
 /// real tree; every entry must be observed and every observation must be here.
+#[expect(
+    clippy::type_complexity,
+    reason = "ledger entry shape is inherent to the bidirectional scan; a type alias would obscure the const initializer"
+)]
 const LEDGER: &[(&str, &[(&str, &str, &str)])] = &[
     (
         "interactive/runtime.rs",
@@ -169,7 +173,6 @@ fn is_ident_byte(b: u8) -> bool {
 /// is skipped. Whitespace around path separators is tolerated —
 /// `pi_ext :: protocol :: ThemeWire` is valid Rust and must not bypass the
 /// ledger. De-duplicates.
-
 fn strip_lexical_noise(source: &str) -> String {
     let bytes = source.as_bytes();
     let mut out = bytes.to_vec();
@@ -271,6 +274,10 @@ fn strip_lexical_noise(source: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| source.to_owned())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass scanner: splitting would duplicate the byte-level cursor logic or require re-walking the source"
+)]
 fn parse_pi_ext_pairs(source: &str) -> Vec<(String, String)> {
     let text = &strip_lexical_noise(source);
     let bytes = text.as_bytes();
@@ -524,18 +531,15 @@ fn forbidden_violations(source: &str) -> Vec<(String, usize)> {
 }
 
 fn collect_rs_files(dir: &Path, base: &Path, out: &mut Vec<String>) {
-    let rd = match fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return,
-    };
+    let Ok(rd) = fs::read_dir(dir) else { return };
     for entry in rd.flatten() {
         let path = entry.path();
         if path.is_dir() {
             collect_rs_files(&path, base, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            if let Ok(rel) = path.strip_prefix(base) {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
-            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+            && let Ok(rel) = path.strip_prefix(base)
+        {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
         }
     }
 }
@@ -573,6 +577,10 @@ fn find_pi_ext_alias(source: &str) -> Option<usize> {
 }
 
 #[test]
+#[expect(
+    clippy::panic,
+    reason = "test setup: reading a modes/*.rs file that fails to read is an irrecoverable test precondition"
+)]
 fn modes_consume_only_ledgered_pi_ext_symbols() {
     let base = PathBuf::from(MODES_DIR);
     let mut files: Vec<String> = Vec::new();
@@ -594,8 +602,7 @@ fn modes_consume_only_ledgered_pi_ext_symbols() {
             let remedy = FORBIDDEN
                 .iter()
                 .find(|(n, _)| *n == name)
-                .map(|(_, r)| *r)
-                .unwrap_or("");
+                .map_or("", |(_, r)| *r);
             failures.push(format!(
                 "{rel}:{line}: FORBIDDEN `{name}` in mode code — {remedy}"
             ));

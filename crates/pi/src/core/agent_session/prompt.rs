@@ -527,7 +527,7 @@ impl AgentSession {
         {
             let mut inner = self.lock_inner();
             if !inner.pending_next_turn_messages.is_empty() {
-                let pending: Vec<_> = inner.pending_next_turn_messages.drain(..).collect();
+                let pending = std::mem::take(&mut inner.pending_next_turn_messages);
                 messages.extend(pending);
             }
         }

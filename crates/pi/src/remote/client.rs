@@ -256,7 +256,7 @@ impl PiClientError {
     }
 }
 
-fn to_disconnected(error: TransportError) -> PiClientError {
+fn to_disconnected(error: &TransportError) -> PiClientError {
     PiClientError::disconnected(error.to_string())
 }
 
@@ -379,7 +379,7 @@ struct Notifications {
 }
 
 impl Notifications {
-    fn deliver(&self, on_listener_error: &Option<ListenerErrorHandler>) {
+    fn deliver(&self, on_listener_error: Option<&ListenerErrorHandler>) {
         for (listener, value) in self
             .snapshot_listeners
             .iter()
@@ -410,12 +410,12 @@ impl Notifications {
 fn invoke_isolated<T>(
     listener: &Arc<dyn Fn(&T) + Send + Sync>,
     value: &T,
-    on_error: &Option<ListenerErrorHandler>,
+    on_error: Option<&ListenerErrorHandler>,
 ) {
-    if catch_unwind(AssertUnwindSafe(|| listener(value))).is_err() {
-        if let Some(report) = on_error {
-            catch_unwind(AssertUnwindSafe(|| report("listener panicked"))).ok();
-        }
+    if catch_unwind(AssertUnwindSafe(|| listener(value))).is_err()
+        && let Some(report) = on_error
+    {
+        catch_unwind(AssertUnwindSafe(|| report("listener panicked"))).ok();
     }
 }
 
@@ -508,15 +508,15 @@ impl ClientState {
             .collect::<Vec<_>>();
         notifications.event_listeners.extend(global_listeners);
         notifications.event_values.push(event.clone());
-        if let Some(session_id) = event_session_id(event) {
-            if let Some(listeners) = self.session_event_listeners.get(session_id) {
-                let listeners = listeners
-                    .iter()
-                    .map(|(_, listener)| Arc::clone(listener))
-                    .collect::<Vec<_>>();
-                notifications.session_event_listeners.extend(listeners);
-                notifications.session_event_values.push(event.clone());
-            }
+        if let Some(session_id) = event_session_id(event)
+            && let Some(listeners) = self.session_event_listeners.get(session_id)
+        {
+            let listeners = listeners
+                .iter()
+                .map(|(_, listener)| Arc::clone(listener))
+                .collect::<Vec<_>>();
+            notifications.session_event_listeners.extend(listeners);
+            notifications.session_event_values.push(event.clone());
         }
     }
 
@@ -525,10 +525,10 @@ impl ClientState {
         snapshot: &ServerSnapshot,
         notifications: &mut Notifications,
     ) {
-        if let Some(current) = &self.snapshot {
-            if snapshot.revision < current.revision {
-                return;
-            }
+        if let Some(current) = &self.snapshot
+            && snapshot.revision < current.revision
+        {
+            return;
         }
         self.snapshot = Some(snapshot.clone());
         let listeners = self
@@ -546,10 +546,11 @@ impl ClientState {
         force: bool,
         notifications: &mut Notifications,
     ) {
-        if let Some(current) = self.session_snapshots.get(&snapshot.session_id) {
-            if !force && snapshot.revision < current.revision {
-                return;
-            }
+        if let Some(current) = self.session_snapshots.get(&snapshot.session_id)
+            && !force
+            && snapshot.revision < current.revision
+        {
+            return;
         }
         // Upstream derives attachment from the snapshot's `attached` field;
         // the landed schema has no such field, so attachment follows the
@@ -634,7 +635,7 @@ impl CommandKind {
         }
     }
 
-    fn session_id_of(self, command: &Command) -> Option<String> {
+    fn session_id_of(command: &Command) -> Option<String> {
         match command {
             Command::Attach { session_id }
             | Command::Detach { session_id }
@@ -682,7 +683,7 @@ fn result_kind(result: &CommandResult) -> CommandKind {
 fn map_server_error(error: ProtocolError, pending: &PendingRequest) -> PiClientError {
     if error.code == ProtocolErrorCode::SessionLocked {
         PiClientError::Ownership(PiSessionOwnershipError {
-            session_id: pending.kind.session_id_of(&pending.command),
+            session_id: CommandKind::session_id_of(&pending.command),
             message: error.message,
         })
     } else {
@@ -783,15 +784,11 @@ impl Inner {
         matches!(self.conn, ConnState::Connected { .. })
     }
 
-    fn notify_connection_state(
-        &self,
-        change: ConnectionStateChange,
-        notifications: &mut Notifications,
-    ) {
+    fn notify_connection_state(change: ConnectionStateChange, notifications: &mut Notifications) {
         notifications.connection_state.push(change);
     }
 
-    fn reject_pending(&mut self, error: PiClientError) {
+    fn reject_pending(&mut self, error: &PiClientError) {
         let pending = std::mem::take(&mut self.pending_requests);
         for (_, request) in pending {
             let _ = request.resolve.send(Err(error.clone()));
@@ -822,8 +819,8 @@ impl Inner {
         self.conn = ConnState::Disconnected;
         self.state.clear_attachments();
         self.invalidate_all_session_leases();
-        self.reject_pending(error.clone());
-        self.notify_connection_state(
+        self.reject_pending(&error);
+        Inner::notify_connection_state(
             ConnectionStateChange {
                 state: ConnectionState::Disconnected,
                 error: Some(error),
@@ -957,6 +954,7 @@ struct ConnHandlers {
 
 impl PiClient {
     /// Validates options and constructs a disconnected client.
+    /// # Errors
     pub fn new(options: PiClientOptions) -> Result<Self, PiClientOptionsError> {
         let max_frame_length = options.max_frame_length.unwrap_or(DEFAULT_MAX_FRAME_LENGTH);
         let value = u64::try_from(max_frame_length).unwrap_or(u64::MAX);
@@ -978,6 +976,7 @@ impl PiClient {
 
     /// Opens a connection and completes the protocol handshake, returning
     /// the server snapshot.
+    /// # Errors
     pub async fn connect(&self) -> Result<ServerSnapshot, PiClientError> {
         let (receiver, id) = {
             let mut inner = lock(&self.core.inner);
@@ -1007,8 +1006,7 @@ impl PiClient {
         {
             let mut notifications = Notifications::default();
             {
-                let inner = lock(&self.core.inner);
-                inner.notify_connection_state(
+                Inner::notify_connection_state(
                     ConnectionStateChange {
                         state: ConnectionState::Connecting,
                         error: None,
@@ -1032,16 +1030,19 @@ impl PiClient {
     }
 
     /// Reconnects after a disconnection.
+    /// # Errors
     pub async fn reconnect(&self) -> Result<ServerSnapshot, PiClientError> {
         self.connect().await
     }
 
     /// Whether the handshake has completed on the current connection.
+    #[must_use]
     pub fn connected(&self) -> bool {
         lock(&self.core.inner).is_connected()
     }
 
     /// Current connection lifecycle state.
+    #[must_use]
     pub fn connection_state(&self) -> ConnectionState {
         match &lock(&self.core.inner).conn {
             ConnState::Disconnected => ConnectionState::Disconnected,
@@ -1051,11 +1052,13 @@ impl PiClient {
     }
 
     /// Latest server snapshot, if connected.
+    #[must_use]
     pub fn snapshot(&self) -> Option<ServerSnapshot> {
         lock(&self.core.inner).state.snapshot.clone()
     }
 
     /// Subscribes to server snapshots.
+    /// # Errors
     pub fn subscribe(
         &self,
         listener: ServerSnapshotListener,
@@ -1076,6 +1079,7 @@ impl PiClient {
     }
 
     /// Subscribes to unsolicited server events.
+    /// # Errors
     pub fn on_event(&self, listener: ServerEventListener) -> Result<Subscription, PiClientError> {
         let mut inner = lock(&self.core.inner);
         if inner.disposed {
@@ -1093,6 +1097,7 @@ impl PiClient {
     }
 
     /// Subscribes to connection-state transitions.
+    /// # Errors
     pub fn on_connection_state_change(
         &self,
         listener: ConnectionStateListener,
@@ -1112,6 +1117,7 @@ impl PiClient {
     }
 
     /// Lists sessions known to the server.
+    /// # Errors
     pub async fn list_sessions(&self) -> Result<Vec<SessionMetadata>, PiClientError> {
         let result = request(&self.core, Command::List).await?;
         match result {
@@ -1121,6 +1127,7 @@ impl PiClient {
     }
 
     /// Creates a session and returns an exclusive lease on it.
+    /// # Errors
     pub async fn create_session(
         &self,
         options: CreateSessionOptions,
@@ -1144,12 +1151,14 @@ impl PiClient {
     }
 
     /// Attaches to a session with a shared lease.
+    /// # Errors
     pub async fn attach_session(&self, session_id: &str) -> Result<PiSessionHandle, PiClientError> {
         self.acquire_session(session_id, SessionLeaseMode::Shared)
             .await
     }
 
     /// Attaches to a session under the requested lease mode.
+    /// # Errors
     pub async fn acquire_session(
         &self,
         session_id: &str,
@@ -1182,7 +1191,7 @@ impl PiClient {
                 return;
             }
             inner.disposed = true;
-            inner.reject_pending(PiClientError::Disposed(PiClientDisposedError));
+            inner.reject_pending(&PiClientError::Disposed(PiClientDisposedError));
             inner.fail_and_close(
                 PiClientError::Disposed(PiClientDisposedError),
                 &mut notifications,
@@ -1213,7 +1222,7 @@ async fn open_transport(
     let transport = match factory(handlers).await {
         Ok(transport) => transport,
         Err(error) => {
-            fail_if_current(&core, connect_id, to_disconnected(error)).await;
+            fail_if_current(&core, connect_id, to_disconnected(&error)).await;
             return;
         }
     };
@@ -1252,10 +1261,14 @@ async fn open_transport(
         }
     };
     if let Err(error) = transport.send(frame).await {
-        fail_if_current(&core, connect_id, to_disconnected(error)).await;
+        fail_if_current(&core, connect_id, to_disconnected(&error)).await;
     }
 }
 
+#[expect(
+    clippy::unused_async,
+    reason = "async for API symmetry with the connection lifecycle; callers .await for consistent error propagation ordering"
+)]
 async fn fail_if_current(core: &Arc<ClientCore>, connect_id: u64, error: PiClientError) {
     let mut notifications = Notifications::default();
     {
@@ -1342,7 +1355,7 @@ impl ByteTransportHandlers for ConnHandlers {
             if matches!(inner.conn, ConnState::Disconnected) {
                 return;
             }
-            inner.fail_and_close(to_disconnected(error), &mut notifications);
+            inner.fail_and_close(to_disconnected(&error), &mut notifications);
         }
         deliver_all(&self.core, &mut notifications);
     }
@@ -1388,7 +1401,7 @@ fn handle_server_message(
                     }
                 };
                 inner.state.apply_server_snapshot(&snapshot, notifications);
-                inner.notify_connection_state(
+                Inner::notify_connection_state(
                     ConnectionStateChange {
                         state: ConnectionState::Connected,
                         error: None,
@@ -1417,7 +1430,7 @@ fn handle_server_message(
                 result,
                 error,
             } => {
-                handle_response(inner, id, ok, result, error, notifications);
+                handle_response(inner, &id, ok, result, error, notifications);
             }
             ServerMessage::Event { event } => {
                 if let ServerEvent::SessionRemoved { ref session_id } = event {
@@ -1432,14 +1445,14 @@ fn handle_server_message(
 
 fn handle_response(
     inner: &mut Inner,
-    id: String,
+    id: &str,
     ok: bool,
     result: Option<CommandResult>,
     error: Option<ProtocolError>,
     notifications: &mut Notifications,
 ) {
-    let Some(pending) = inner.pending_requests.remove(&id) else {
-        let violation = PiClientError::protocol("Response has no matching request");
+    let violation = PiClientError::protocol("Response has no matching request");
+    let Some(pending) = inner.pending_requests.remove(id) else {
         inner.fail_and_close(violation, notifications);
         return;
     };
@@ -1489,13 +1502,17 @@ async fn send_frame(core: &Arc<ClientCore>, frame: Vec<u8>) -> Result<(), PiClie
     match transport.send(frame).await {
         Ok(()) => Ok(()),
         Err(error) => {
-            let error = to_disconnected(error);
+            let error = to_disconnected(&error);
             fail_if_current_by_transport(core, &transport, error.clone()).await;
             Err(error)
         }
     }
 }
 
+#[expect(
+    clippy::unused_async,
+    reason = "async for API symmetry with the connection lifecycle; callers .await for consistent error propagation ordering"
+)]
 async fn fail_if_current_by_transport(
     core: &Arc<ClientCore>,
     transport: &Arc<dyn ByteTransport>,
@@ -1507,8 +1524,8 @@ async fn fail_if_current_by_transport(
         let current = match &inner.conn {
             ConnState::Connected {
                 transport: current, ..
-            } => Arc::ptr_eq(current, transport),
-            ConnState::Connecting {
+            }
+            | ConnState::Connecting {
                 transport: Some(current),
                 ..
             } => Arc::ptr_eq(current, transport),
@@ -1591,13 +1608,13 @@ fn deliver_all(core: &Arc<ClientCore>, notifications: &mut Notifications) {
         .collect();
     for change in std::mem::take(&mut notifications.connection_state) {
         for listener in &state_listeners {
-            invoke_isolated(listener, &change, &core.on_listener_error);
+            invoke_isolated(listener, &change, core.on_listener_error.as_ref());
         }
     }
     if let Some(send) = notifications.handshake.take() {
         send();
     }
-    notifications.deliver(&core.on_listener_error);
+    notifications.deliver(core.on_listener_error.as_ref());
 }
 
 // ---------------------------------------------------------------------------
@@ -1973,21 +1990,25 @@ impl fmt::Debug for PiSessionHandle {
 
 impl PiSessionHandle {
     /// Session identifier.
+    #[must_use]
     pub fn id(&self) -> &str {
         &self.lease.session_id
     }
 
     /// Whether the lease is active and the session attached.
+    #[must_use]
     pub fn attached(&self) -> bool {
         lease_is_active(&self.core, &self.lease)
     }
 
     /// Alias of [`PiSessionHandle::attached`].
+    #[must_use]
     pub fn active(&self) -> bool {
         self.attached()
     }
 
     /// Latest session snapshot while the lease is active.
+    #[must_use]
     pub fn snapshot(&self) -> Option<SessionSnapshot> {
         if lease_is_active(&self.core, &self.lease) {
             lock(&self.core.inner)
@@ -2001,6 +2022,7 @@ impl PiSessionHandle {
     }
 
     /// Subscribes to snapshots for this session while the lease is active.
+    /// # Errors
     pub fn subscribe(
         &self,
         listener: SessionSnapshotListener,
@@ -2036,6 +2058,7 @@ impl PiSessionHandle {
 
     /// Subscribes to events for this session while the lease is active;
     /// `session_removed` is always delivered.
+    /// # Errors
     pub fn on_event(&self, listener: SessionEventListener) -> Result<Subscription, PiClientError> {
         assert_lease_active(&self.core, &self.lease)?;
         let core = Arc::clone(&self.core);
@@ -2070,17 +2093,25 @@ impl PiSessionHandle {
     /// Releases the lease; the server detaches once the final lease for the
     /// session is released. Detach is **not** disconnect: the client stays
     /// connected.
+    /// # Errors
+    #[must_use = "the lease is only released once the returned future is awaited"]
     pub fn detach(&self) -> BoxFuture<'static, Result<(), PiClientError>> {
         release_lease(&self.core, &self.lease, false)
     }
 
     /// Releases the lease, relinquishing it even when the protocol detach
     /// fails (marking the session for cleanup on reacquire).
+    /// # Errors
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "returns a BoxFuture that must be awaited; not annotating with #[must_use] because Drop impls call dispose without awaiting"
+    )]
     pub fn dispose(&self) -> BoxFuture<'static, Result<(), PiClientError>> {
         release_lease(&self.core, &self.lease, true)
     }
 
     /// Sends a prompt and returns the resulting snapshot.
+    /// # Errors
     pub async fn prompt(&self, text: String) -> Result<SessionSnapshot, PiClientError> {
         let result = self
             .session_request(Command::Prompt {
@@ -2095,6 +2126,7 @@ impl PiSessionHandle {
     }
 
     /// Steers an in-flight prompt.
+    /// # Errors
     pub async fn steer(&self, text: String) -> Result<SessionSnapshot, PiClientError> {
         let result = self
             .session_request(Command::Steer {
@@ -2109,6 +2141,7 @@ impl PiSessionHandle {
     }
 
     /// Aborts the in-flight prompt.
+    /// # Errors
     pub async fn abort(&self) -> Result<SessionSnapshot, PiClientError> {
         let result = self
             .session_request(Command::Abort {
@@ -2122,6 +2155,7 @@ impl PiSessionHandle {
     }
 
     /// Switches the session model.
+    /// # Errors
     pub async fn set_model(&self, model: ModelRef) -> Result<SessionSnapshot, PiClientError> {
         let result = self
             .session_request(Command::SetModel {
@@ -2136,6 +2170,7 @@ impl PiSessionHandle {
     }
 
     /// Switches the session thinking level.
+    /// # Errors
     pub async fn set_thinking(
         &self,
         thinking_level: ThinkingLevel,
@@ -2210,6 +2245,7 @@ mod tests {
     }
 
     impl ServerCore {
+        #[expect(clippy::expect_used, reason = "test helper: new must succeed")]
         fn new() -> Self {
             Self {
                 messages: StdMutex::new(Vec::new()),
@@ -2251,7 +2287,7 @@ mod tests {
                 loop {
                     match core.next_message().await {
                         ClientMessage::Request { id, request } => return (id, request),
-                        ClientMessage::Hello { .. } => continue,
+                        ClientMessage::Hello { .. } => {}
                     }
                 }
             })
@@ -2277,6 +2313,7 @@ mod tests {
     }
 
     impl TestServer {
+        #[expect(clippy::expect_used, reason = "test helper: send must succeed")]
         async fn send(&self, message: ServerMessage) {
             let frame = encode_server_message(&message, None).expect("encode server message");
             self.transport.send(frame).await.expect("server send");
@@ -2306,6 +2343,7 @@ mod tests {
             .await;
         }
 
+        #[expect(clippy::expect_used, reason = "test helper: send_raw must succeed")]
         async fn send_raw(&self, bytes: Vec<u8>) {
             self.transport.send(bytes).await.expect("server raw send");
         }
@@ -2358,6 +2396,7 @@ mod tests {
         }
     }
 
+    #[expect(clippy::expect_used, reason = "test helper: make_client must succeed")]
     fn make_client(factory: ByteTransportFactory) -> PiClient {
         PiClient::new(PiClientOptions {
             transport_factory: factory,
@@ -2367,6 +2406,10 @@ mod tests {
         .expect("client options")
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper: connect_scripted must succeed"
+    )]
     async fn connect_scripted() -> (PiClient, TestServer) {
         let (listener, endpoint) = InMemoryListener::new();
         let core = Arc::new(ServerCore::new());
@@ -2402,6 +2445,8 @@ mod tests {
 
     /// Accepts one connection, answers the client hello, and returns the
     /// scripted server.
+    #[expect(dead_code, reason = "test utility: retained for future tests")]
+    #[expect(clippy::expect_used, reason = "test helper: accept_hello must succeed")]
     async fn accept_hello(listener: Arc<InMemoryListener>, connection_id: &str) -> TestServer {
         let core = Arc::new(ServerCore::new());
         let accept_core = Arc::clone(&core);
@@ -2424,6 +2469,7 @@ mod tests {
     /// Attaches with a scripted attach round trip. Rust futures are lazy, so
     /// the client future and the server message wait must be polled
     /// concurrently.
+    #[expect(clippy::expect_used, reason = "test helper: attach must succeed")]
     async fn attach(client: &PiClient, server: &TestServer, session_id: &str) -> PiSessionHandle {
         // Rust futures are lazy and join! only completes when every branch
         // does, so the scripted response must be sent from a branch inside
@@ -2447,6 +2493,11 @@ mod tests {
     // disconnect
     // -----------------------------------------------------------------------
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
+    #[expect(clippy::panic, reason = "test assertion: unexpected protocol state")]
     #[tokio::test]
     async fn lease_conflicts_are_typed_ownership_errors() {
         let (client, server) = connect_scripted().await;
@@ -2495,6 +2546,10 @@ mod tests {
     }
 
     /// Detaches every handle, answering each protocol detach request.
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper: detach_leases must succeed"
+    )]
     async fn detach_leases(
         handles: &[PiSessionHandle],
         server: &TestServer,
@@ -2518,6 +2573,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
     #[tokio::test]
     async fn shared_lease_detaches_only_after_final_release() {
         let (client, server) = connect_scripted().await;
@@ -2532,7 +2591,7 @@ mod tests {
         assert!(second.attached());
 
         // First release must NOT send a protocol detach.
-        let (outcome, _) = tokio::join!(first.detach(), async {
+        let (outcome, ()) = tokio::join!(first.detach(), async {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         });
         outcome.expect("first detach");
@@ -2555,6 +2614,11 @@ mod tests {
         assert!(!second.attached());
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
+    #[expect(clippy::panic, reason = "test assertion: unexpected protocol state")]
     #[tokio::test]
     async fn detach_is_not_disconnect_and_reattach_works() {
         let (client, server) = connect_scripted().await;
@@ -2581,6 +2645,11 @@ mod tests {
         assert!(reattached.attached());
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
+    #[expect(clippy::panic, reason = "test assertion: unexpected protocol state")]
     #[tokio::test]
     async fn typed_mid_request_disconnect_on_orderly_close() {
         let (client, server) = connect_scripted().await;
@@ -2594,6 +2663,11 @@ mod tests {
         assert_eq!(client.connection_state(), ConnectionState::Disconnected);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
+    #[expect(clippy::panic, reason = "test assertion: unexpected protocol state")]
     #[tokio::test]
     async fn typed_mid_request_disconnect_on_transport_error() {
         let (client, server) = connect_scripted().await;
@@ -2611,6 +2685,11 @@ mod tests {
     // Acceptance: pinned transport-failure mapping table
     // -----------------------------------------------------------------------
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
+    #[expect(clippy::panic, reason = "test assertion: unexpected protocol state")]
     #[tokio::test]
     async fn transport_failure_table_maps_to_exactly_one_variant() {
         // Row 1: transport open failure → Disconnected.
@@ -2696,6 +2775,11 @@ mod tests {
         assert_eq!(client.connection_state(), ConnectionState::Disconnected);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
+    #[expect(clippy::panic, reason = "test assertion: unexpected protocol state")]
     #[tokio::test]
     async fn hello_error_maps_to_server_class() {
         let (listener, endpoint) = InMemoryListener::new();
@@ -2733,6 +2817,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
     #[tokio::test]
     async fn request_on_closed_transport_maps_to_disconnected() {
         let (client, server) = connect_scripted().await;
@@ -2749,6 +2837,10 @@ mod tests {
     // Correlation and protocol invariants
     // -----------------------------------------------------------------------
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
     #[tokio::test]
     async fn request_ids_are_monotonic() {
         let (client, server) = connect_scripted().await;
@@ -2773,6 +2865,10 @@ mod tests {
         assert!(attached.expect("attach").attached());
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
     #[tokio::test]
     async fn coalesced_out_of_order_responses_correlate() {
         let (client, server) = connect_scripted().await;
@@ -2817,6 +2913,11 @@ mod tests {
         assert!(handle.attached());
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
+    #[expect(clippy::panic, reason = "test assertion: unexpected protocol state")]
     #[tokio::test]
     async fn mismatched_response_command_fails_the_connection() {
         let (client, server) = connect_scripted().await;
@@ -2841,6 +2942,10 @@ mod tests {
     // Listener subscription
     // -----------------------------------------------------------------------
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
     #[tokio::test]
     async fn listener_subscription_delivers_while_active_and_gates_after_detach() {
         let (client, server) = connect_scripted().await;
@@ -2908,6 +3013,10 @@ mod tests {
         assert_eq!(events.load(AtomicOrdering::SeqCst), 2);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
     #[tokio::test]
     async fn session_removed_invalidates_leases() {
         let (client, server) = connect_scripted().await;
@@ -2932,6 +3041,10 @@ mod tests {
     // Lifecycle: disposal, invalidation, detach retry
     // -----------------------------------------------------------------------
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
     #[tokio::test]
     async fn dispose_rejects_pending_and_invalidates_handles() {
         let (client, server) = connect_scripted().await;
@@ -2952,6 +3065,10 @@ mod tests {
         assert!(!client.connected());
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
     #[tokio::test]
     async fn invalidated_leases_dispose_without_protocol_cleanup() {
         let (client, server) = connect_scripted().await;
@@ -2962,6 +3079,11 @@ mod tests {
         let _ = server;
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
+    #[expect(clippy::panic, reason = "test assertion: unexpected protocol state")]
     #[tokio::test]
     async fn detach_failure_restores_active_lease_and_retry_succeeds() {
         let (client, server) = connect_scripted().await;
@@ -3007,6 +3129,10 @@ mod tests {
         assert!(!handle.active());
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
     #[tokio::test]
     async fn reacquisition_serializes_behind_final_detachment() {
         let (client, server) = connect_scripted().await;
@@ -3041,6 +3167,10 @@ mod tests {
         assert_eq!(second.snapshot().map(|s| s.revision), Some(2));
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
     #[tokio::test]
     async fn create_session_takes_exclusive_lease() {
         let (client, server) = connect_scripted().await;
@@ -3068,6 +3198,10 @@ mod tests {
         detach_leases(&[handle], &server, &[("fresh", "created")]).await;
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
     #[tokio::test]
     async fn lower_revision_is_accepted_after_reacquire() {
         let (client, server) = connect_scripted().await;
@@ -3097,6 +3231,10 @@ mod tests {
         assert_eq!(reopened.snapshot().map(|s| s.revision), Some(0));
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client operations must succeed or fail as expected"
+    )]
     #[tokio::test]
     async fn max_frame_length_is_validated_at_construction() {
         let (_listener, endpoint) = InMemoryListener::new();

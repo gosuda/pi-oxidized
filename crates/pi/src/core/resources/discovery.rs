@@ -2205,9 +2205,7 @@ fn matches_any_exact_pattern(file_path: &str, patterns: &[String], base_dir: &Pa
 }
 
 fn glob_match(value: &str, pattern: &str) -> bool {
-    Glob::new(pattern)
-        .ok()
-        .is_some_and(|glob| glob.compile_matcher().is_match(value))
+    Glob::new(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(value))
 }
 
 fn to_posix_path(path: &Path) -> String {

@@ -1415,6 +1415,11 @@ mod tests {
         let audits_before = value.output_audits.clone();
         let applied_before = value.applied.clone();
         value.force_next_seq_for_test(u32::MAX - 1);
+        // The panic on `Ok` IS the assertion: overflow must be rejected.
+        #[expect(
+            clippy::expect_used,
+            reason = "panic is the assertion: overflow at u32::MAX-1 must be rejected"
+        )]
         let error = value
             .output_and_snapshot(
                 &[b"/home/alice/ready"],
@@ -1446,6 +1451,11 @@ mod tests {
         let audits_before = value.output_audits.clone();
         let applied_before = value.applied.clone();
         value.force_next_seq_for_test(u32::MAX);
+        // The panic on `Ok` IS the assertion: overflow must be rejected.
+        #[expect(
+            clippy::expect_used,
+            reason = "panic is the assertion: overflow at u32::MAX must be rejected"
+        )]
         let error = value
             .output_and_snapshot(
                 &[b"/home/alice/ready"],
@@ -1518,6 +1528,11 @@ mod tests {
         )?;
         value.force_next_seq_for_test(u32::MAX);
         let before = snapshot_recorder_state(&value);
+        // The panic on `Ok` IS the assertion: overflow must be rejected.
+        #[expect(
+            clippy::expect_used,
+            reason = "panic is the assertion: output must reject sequence overflow"
+        )]
         let error = value
             .output(
                 &[b"/home/alice/project/ready"],
@@ -1542,6 +1557,11 @@ mod tests {
         assert!(value.resize_storm(&[Geometry { cols: 80, rows: 24 }])?);
         value.force_next_seq_for_test(u32::MAX);
         let before = snapshot_recorder_state(&value);
+        // The panic on `Ok` IS the assertion: overflow must be rejected.
+        #[expect(
+            clippy::expect_used,
+            reason = "panic is the assertion: resize_storm must reject sequence overflow"
+        )]
         let error = value
             .resize_storm(&[
                 Geometry { cols: 40, rows: 12 },

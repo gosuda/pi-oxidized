@@ -8,6 +8,10 @@ use pi::core::platform::clipboard::osc52_encode;
 
 /// OSC52 VERIFIED (unit-level): encoder produces correct ESC ]52;c;...BEL
 /// sequences with base64 payload.
+#[expect(
+    clippy::expect_used,
+    reason = "test assertion: OSC52 must encode small text"
+)]
 #[test]
 fn grill_osc52_encoder_correct_sequence() {
     let encoded = osc52_encode("hello").expect("OSC52 must encode small text");

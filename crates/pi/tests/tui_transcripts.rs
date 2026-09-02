@@ -13,7 +13,7 @@
 //! Named limitation: production interactive boot path passes `ui: None` into
 //! `resolve_project_trusted`, so the interactive [`TrustUi`] prompt is absent.
 //! This corpus records `/trust` selector + boot trust observations and does not
-//! implement TrustUi dialog coverage.
+//! implement `TrustUi` dialog coverage.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -55,7 +55,7 @@ const READY_MARKERS: &[&[u8]] = &[
 const KEY_ENTER: &[u8] = b"\r";
 const KEY_ESCAPE: &[u8] = b"\x1b";
 
-/// Absent production interactive TrustUi prompt (boot path uses `ui: None`).
+/// Absent production interactive `TrustUi` prompt (boot path uses `ui: None`).
 const LIMITATION_ABSENT_PRODUCTION_TRUST_UI: &str =
     "limitation:absent-production-interactive-TrustUi-prompt";
 
@@ -71,7 +71,7 @@ const RESIZE_LADDER: [(u16, u16); 8] = [
     (1, 1),
 ];
 
-/// Atomic 24-size storm matching `pi_tui_pty_fixture` resize_plan.
+/// Atomic 24-size storm matching `pi_tui_pty_fixture` `resize_plan`.
 const RESIZE_STORM: [(u16, u16); 24] = [
     (80, 24),
     (40, 12),
@@ -363,7 +363,6 @@ fn launch_env(
 
 fn host_row_id() -> RowId {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => RowId::GnuX64,
         ("linux", "aarch64") => RowId::GnuArm64,
         ("macos", "x86_64") => RowId::DarwinX64,
         ("macos", "aarch64") => RowId::DarwinArm64,
@@ -380,7 +379,7 @@ fn host_driver_kind() -> DriverKind {
     }
 }
 
-/// Row directory label + RunnerRow. Absent `PI_TUI_TIER_ROW` ⇒ `local` (never Tier N).
+/// Row directory label + `RunnerRow`. Absent `PI_TUI_TIER_ROW` ⇒ `local` (never Tier N).
 fn resolve_row() -> Result<(String, RunnerRow), CorpusError> {
     match std::env::var("PI_TUI_TIER_ROW") {
         Ok(value) if !value.trim().is_empty() => {
@@ -1001,18 +1000,26 @@ fn run_product_resize_storm(
     Ok(artifact)
 }
 
-fn hard_fail(error: CorpusError) -> ! {
+#[expect(
+    clippy::panic,
+    reason = "test hard-fail: corpus failure is irrecoverable"
+)]
+fn hard_fail(error: &CorpusError) -> ! {
     panic!("tui product transcript corpus hard-fail: {error}");
 }
 
+#[expect(
+    clippy::type_complexity,
+    reason = "scenario table type is inherently complex; a type alias would be used only in this test"
+)]
 #[test]
 fn tui_product_transcript_corpus_cold_wizard_trust_stream_selectors_overlays_resize() {
     if let Err(error) = require_prerequisites() {
-        hard_fail(error);
+        hard_fail(&error);
     }
     let (row_label, row) = match resolve_row() {
         Ok(value) => value,
-        Err(error) => hard_fail(error),
+        Err(error) => hard_fail(&error),
     };
     if row_label == "local" {
         assert_eq!(
@@ -1042,7 +1049,7 @@ fn tui_product_transcript_corpus_cold_wizard_trust_stream_selectors_overlays_res
         if let Err(error) = run_scenario_k(scenario_dir, move |iteration| {
             runner(iteration, &label, &row_clone)
         }) {
-            hard_fail(error);
+            hard_fail(&error);
         }
     }
 }

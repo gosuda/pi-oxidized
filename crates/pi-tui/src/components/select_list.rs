@@ -531,6 +531,10 @@ mod tests {
         assert!(strip_ansi(&snap[0]).contains("No matching commands"));
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertion: hint row must exist in snapshot"
+    )]
     #[test]
     fn hint_appends_once_in_empty_and_nonempty_and_grows_height() {
         let mut with_hint = SelectList::new(vec![], 5, SelectListTheme::default())
@@ -556,6 +560,10 @@ mod tests {
         assert!(strip_ansi(snap.last().expect("hint row")).contains("esc to cancel"));
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test: single-threaded Mutex lock never poisons"
+    )]
     #[test]
     fn escape_still_cancels_with_hint_set() {
         use std::sync::{Arc, Mutex};

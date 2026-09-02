@@ -263,11 +263,14 @@ impl Write for SharedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.inner
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).flush()
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush()
     }
 }
 /// One chunk, or a terminal reader failure that must not validate as settle.
@@ -791,6 +794,12 @@ mod tests {
     }
 
     #[test]
+    // The panic arm IS the assertion: it fires only when the recorder emitted
+    // a canonical event other than the expected Output boundary.
+    #[expect(
+        clippy::panic,
+        reason = "panic is the assertion: rejects a non-Output canonical event at index 2"
+    )]
     fn driver_only_fake_records_exact_base_sequence() -> Result<(), RecordingError> {
         let context = NormalizationContext::default();
         let mut session = RecordingSession::from_recorder(
@@ -900,6 +909,12 @@ mod tests {
     }
 
     #[test]
+    // The panic arm IS the assertion: it fires only when the recorder emitted
+    // a canonical event other than the expected collapsed ResizeStorm.
+    #[expect(
+        clippy::panic,
+        reason = "panic is the assertion: rejects a non-ResizeStorm canonical event at index 5"
+    )]
     fn render_fake_records_exact_event_sequence() -> Result<(), RecordingError> {
         let context = NormalizationContext::default();
         let mut session = RecordingSession::new(
@@ -1113,7 +1128,9 @@ mod tests {
         assert_eq!(&collected[..], &input[..]);
 
         // Two DSR replies were written.
-        let replies = received.lock().unwrap_or_else(|e| e.into_inner());
+        let replies = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             &replies[..],
             b"\x1b[1;1R\x1b[1;1R",
@@ -1164,7 +1181,9 @@ mod tests {
 
         assert_eq!(&collected[..], b"abc\x1b[6ndef");
 
-        let replies = received.lock().unwrap_or_else(|e| e.into_inner());
+        let replies = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             &replies[..],
             b"\x1b[1;1R",
@@ -1178,7 +1197,7 @@ mod tests {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .extend_from_slice(buf);
             Ok(buf.len())
         }

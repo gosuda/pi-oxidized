@@ -922,10 +922,10 @@ mod tests {
     }
     impl UpdateRunner for FailingRunner {
         fn run(&mut self, _step: &CommandStep) -> Result<(), UpdateError> {
-            Err(self.error.take().map_or(
-                UpdateError::Command("no error configured".to_owned()),
-                |err| err,
-            ))
+            Err(self
+                .error
+                .take()
+                .unwrap_or(UpdateError::Command("no error configured".to_owned())))
         }
     }
 

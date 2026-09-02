@@ -20,10 +20,18 @@ use crate::remote::serde_cbor::{CborValue, CborValueDeserializer, CborValueSeria
 const DEFAULT_MAX_CBOR_CONTAINER_LENGTH: usize = 1_000_000;
 const DEFAULT_MAX_CBOR_DEPTH: usize = 64;
 
+/// Configuration limits for CBOR encoding and decoding.
 #[derive(Debug, Clone, Copy)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "all limits are maxima; prefix is intentional"
+)]
 struct CborOptions {
+    /// Maximum total byte length for a CBOR payload.
     max_byte_length: usize,
+    /// Maximum number of elements in an array or map.
     max_container_length: usize,
+    /// Maximum nesting depth.
     max_depth: usize,
 }
 
@@ -38,49 +46,88 @@ impl CborOptions {
 }
 
 // ---------------------------------------------------------------------------
-// CBOR byte-level error (private)
+// CBOR byte-level error (exposed via CodecError::Cbor)
 // ---------------------------------------------------------------------------
 
+/// Byte-level CBOR encoding or decoding error.
 #[derive(Debug, Clone, PartialEq, Error)]
-pub(crate) enum CborError {
-    #[error("CBOR byte length exceeds configured limit of {limit}")]
-    ByteLengthExceeded { limit: usize },
-    #[error("CBOR text string length exceeds configured limit of {limit}")]
-    TextLengthExceeded { limit: usize },
-    #[error("CBOR byte string length exceeds configured limit of {limit}")]
-    ByteStringLengthExceeded { limit: usize },
-    #[error("CBOR array length exceeds configured limit of {limit}")]
-    ArrayLengthExceeded { limit: usize },
-    #[error("CBOR map length exceeds configured limit of {limit}")]
-    MapLengthExceeded { limit: usize },
-    #[error("CBOR nesting depth exceeds configured limit of {limit}")]
-    DepthExceeded { limit: usize },
+pub enum CborError {
+    /// CBOR byte length exceeds the configured limit.
+    #[error("byte length {limit} exceeds configured limit")]
+    ByteLengthExceeded {
+        /// Maximum byte length configured when the error was raised.
+        limit: usize,
+    },
+    /// CBOR text string length exceeds the configured limit.
+    #[error("text length {limit} exceeds configured limit")]
+    TextLengthExceeded {
+        /// Maximum text length configured when the error was raised.
+        limit: usize,
+    },
+    /// CBOR byte string length exceeds the configured limit.
+    #[error("byte-string length {limit} exceeds configured limit")]
+    ByteStringLengthExceeded {
+        /// Maximum byte-string length configured when the error was raised.
+        limit: usize,
+    },
+    /// CBOR array length exceeds the configured limit.
+    #[error("array length {limit} exceeds configured limit")]
+    ArrayLengthExceeded {
+        /// Maximum array length configured when the error was raised.
+        limit: usize,
+    },
+    /// CBOR map length exceeds the configured limit.
+    #[error("map length {limit} exceeds configured limit")]
+    MapLengthExceeded {
+        /// Maximum map length configured when the error was raised.
+        limit: usize,
+    },
+    /// CBOR nesting depth exceeds the configured limit.
+    #[error("nesting depth {limit} exceeds configured limit")]
+    DepthExceeded {
+        /// Maximum nesting depth configured when the error was raised.
+        limit: usize,
+    },
+    /// CBOR numbers must be finite (NaN/Infinity rejected).
     #[error("CBOR numbers must be finite")]
     NonFinite,
+    /// CBOR payload was truncated mid-item.
     #[error("Truncated CBOR payload")]
     Truncated,
+    /// CBOR payload has trailing bytes after the top-level item.
     #[error("CBOR payload contains trailing data")]
     TrailingData,
+    /// CBOR tags (major type 6) are not supported.
     #[error("CBOR tags are not supported")]
     TagsNotSupported,
+    /// CBOR break marker (0xFF) is not supported.
     #[error("CBOR break marker is not supported")]
     BreakNotSupported,
+    /// Indefinite-length CBOR items are not supported.
     #[error("Indefinite-length CBOR {0}s are not supported")]
     IndefiniteLength(&'static str),
+    /// Unsupported CBOR simple value or floating-point width.
     #[error("Unsupported CBOR simple value or floating-point width")]
     UnsupportedSimple,
+    /// Malformed CBOR major type bits.
     #[error("Malformed CBOR major type")]
     MalformedMajorType,
+    /// Malformed CBOR additional information field.
     #[error("Malformed CBOR additional information")]
     MalformedAdditionalInfo,
+    /// Decoded CBOR integer is outside the safe `i64` range.
     #[error("Decoded CBOR integer is outside the safe range")]
     DecodedUnsafeInteger,
+    /// Decoded CBOR floating-point value is not finite.
     #[error("Decoded CBOR number must be finite")]
     DecodedNonFinite,
+    /// CBOR map contains a duplicate key.
     #[error("CBOR map contains a duplicate key")]
     DuplicateKey,
+    /// CBOR map key is not a text string.
     #[error("CBOR map keys must be strings")]
     NonStringKey,
+    /// CBOR text string contains invalid UTF-8.
     #[error("CBOR text string contains invalid UTF-8")]
     InvalidUtf8,
 }
@@ -111,21 +158,25 @@ impl<'a> CborEncoder<'a> {
         self.buf.extend_from_slice(b);
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded by preceding <= 0xff/0xffff/0xffff_ffff checks"
+    )]
     fn write_argument(&mut self, major_type: u8, value: u64) {
         let p = major_type << 5;
         if value < 24 {
             self.write_byte(p | value as u8);
         } else if value <= 0xff {
-            self.write_byte(p | 24);
+            self.write_byte(p | 0x18);
             self.write_byte(value as u8);
         } else if value <= 0xffff {
-            self.write_byte(p | 25);
+            self.write_byte(p | 0x19);
             self.buf.extend_from_slice(&(value as u16).to_be_bytes());
         } else if value <= 0xffff_ffff {
-            self.write_byte(p | 26);
+            self.write_byte(p | 0x1a);
             self.buf.extend_from_slice(&(value as u32).to_be_bytes());
         } else {
-            self.write_byte(p | 27);
+            self.write_byte(p | 0x1b);
             self.buf.extend_from_slice(&value.to_be_bytes());
         }
     }
@@ -142,6 +193,10 @@ impl<'a> CborEncoder<'a> {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "CBOR negative integers are encoded as -1-n in u64 space"
+    )]
     fn encode_value(&mut self, value: &CborValue, depth: usize) -> Result<(), CborError> {
         if depth > self.options.max_depth {
             return Err(CborError::DepthExceeded {
@@ -267,6 +322,10 @@ impl<'a> CborDecoder<'a> {
             _ => Err(CborError::MalformedAdditionalInfo),
         }
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded by preceding len > limit check; usize is >= 32 bits on all targets"
+    )]
     fn read_length(
         &mut self,
         ai: u8,
@@ -299,6 +358,10 @@ impl<'a> CborDecoder<'a> {
             _ => Err(CborError::UnsupportedSimple),
         }
     }
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "bounded by preceding n > i64::MAX check"
+    )]
     fn read_item(&mut self, depth: usize) -> Result<CborValue, CborError> {
         if depth > self.options.max_depth {
             return Err(CborError::DepthExceeded {
@@ -343,9 +406,8 @@ impl<'a> CborDecoder<'a> {
                 let mut seen = std::collections::HashSet::with_capacity(len);
                 for _ in 0..len {
                     let k = self.read_item(depth + 1)?;
-                    let ks = match k {
-                        CborValue::Text(s) => s,
-                        _ => return Err(CborError::NonStringKey),
+                    let CborValue::Text(ks) = k else {
+                        return Err(CborError::NonStringKey);
                     };
                     if !seen.insert(ks.clone()) {
                         return Err(CborError::DuplicateKey);
@@ -379,18 +441,30 @@ fn decode_cbor_value(bytes: &[u8], options: &CborOptions) -> Result<CborValue, C
 // Public codec error
 // ---------------------------------------------------------------------------
 
+/// Error returned by any codec operation (CBOR encode/decode or framing).
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
+    /// Wrapped CBOR byte-level error.
     #[error("CBOR error: {0}")]
     Cbor(#[from] CborError),
+    /// Wrapped frame-layer error.
     #[error("{0}")]
     Frame(#[from] FrameError),
+    /// Client message failed validation.
     #[error("Invalid client protocol message: {0}")]
     InvalidClient(String),
+    /// Server message failed validation.
     #[error("Invalid server protocol message: {0}")]
     InvalidServer(String),
+    /// Protocol version mismatch between client and server.
     #[error("Protocol version mismatch: expected {expected}, got {got}")]
-    VersionMismatch { expected: u64, got: u64 },
+    VersionMismatch {
+        /// Expected protocol version.
+        expected: u64,
+        /// Actual protocol version received.
+        got: u64,
+    },
+    /// Unknown message discriminant encountered.
     #[error("Unknown discriminant: {0}")]
     UnknownDiscriminant(String),
 }
@@ -422,12 +496,12 @@ fn check_discriminant(
     allowed: &[&str],
     kind: &str,
 ) -> Result<(), CodecError> {
-    if let Some(disc) = extract_discriminant(value, tag) {
-        if !allowed.contains(&disc.as_str()) {
-            return Err(CodecError::UnknownDiscriminant(format!(
-                "{kind} discriminant `{disc}`"
-            )));
-        }
+    if let Some(disc) = extract_discriminant(value, tag)
+        && !allowed.contains(&disc.as_str())
+    {
+        return Err(CodecError::UnknownDiscriminant(format!(
+            "{kind} discriminant `{disc}`"
+        )));
     }
     Ok(())
 }
@@ -441,25 +515,25 @@ fn check_server_discriminant(value: &CborValue) -> Result<(), CodecError> {
 }
 
 fn validate_client_message(msg: &ClientMessage) -> Result<(), CodecError> {
-    if let ClientMessage::Hello { version } = msg {
-        if *version != PROTOCOL_VERSION {
-            return Err(CodecError::VersionMismatch {
-                expected: PROTOCOL_VERSION as u64,
-                got: *version as u64,
-            });
-        }
+    if let ClientMessage::Hello { version } = msg
+        && *version != PROTOCOL_VERSION
+    {
+        return Err(CodecError::VersionMismatch {
+            expected: u64::from(PROTOCOL_VERSION),
+            got: u64::from(*version),
+        });
     }
     Ok(())
 }
 
 fn validate_server_message(msg: &ServerMessage) -> Result<(), CodecError> {
-    if let ServerMessage::Hello { version, .. } = msg {
-        if *version != PROTOCOL_VERSION {
-            return Err(CodecError::VersionMismatch {
-                expected: PROTOCOL_VERSION as u64,
-                got: *version as u64,
-            });
-        }
+    if let ServerMessage::Hello { version, .. } = msg
+        && *version != PROTOCOL_VERSION
+    {
+        return Err(CodecError::VersionMismatch {
+            expected: u64::from(PROTOCOL_VERSION),
+            got: u64::from(*version),
+        });
     }
     Ok(())
 }
@@ -468,11 +542,19 @@ fn validate_server_message(msg: &ServerMessage) -> Result<(), CodecError> {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Returns `true` if the given protocol version is supported.
 #[must_use]
 pub fn is_supported_protocol_version(version: u64) -> bool {
-    version == PROTOCOL_VERSION as u64
+    version == u64::from(PROTOCOL_VERSION)
 }
 
+/// Encodes a [`ClientMessage`] into a framed byte buffer.
+///
+/// # Errors
+///
+/// Returns [`CodecError::InvalidClient`] if serialization fails,
+/// [`CodecError::Cbor`] if CBOR encoding fails, or
+/// [`CodecError::Frame`] if the frame exceeds the configured limit.
 pub fn encode_client_message(
     msg: &ClientMessage,
     options: Option<FrameDecoderOptions>,
@@ -487,6 +569,13 @@ pub fn encode_client_message(
     Ok(frame)
 }
 
+/// Encodes a [`ServerMessage`] into a framed byte buffer.
+///
+/// # Errors
+///
+/// Returns [`CodecError::InvalidServer`] if serialization fails,
+/// [`CodecError::Cbor`] if CBOR encoding fails, or
+/// [`CodecError::Frame`] if the frame exceeds the configured limit.
 pub fn encode_server_message(
     msg: &ServerMessage,
     options: Option<FrameDecoderOptions>,
@@ -501,6 +590,14 @@ pub fn encode_server_message(
     Ok(frame)
 }
 
+/// Decodes a framed byte buffer into a [`ClientMessage`].
+///
+/// # Errors
+///
+/// Returns [`CodecError::Frame`] if the frame is malformed,
+/// [`CodecError::Cbor`] if CBOR decoding fails,
+/// [`CodecError::UnknownDiscriminant`] if the message type is unrecognized, or
+/// [`CodecError::InvalidClient`] if the message fails validation.
 pub fn decode_client_message(
     frame: &[u8],
     options: Option<FrameDecoderOptions>,
@@ -520,6 +617,14 @@ pub fn decode_client_message(
     Ok(msg)
 }
 
+/// Decodes a framed byte buffer into a [`ServerMessage`].
+///
+/// # Errors
+///
+/// Returns [`CodecError::Frame`] if the frame is malformed,
+/// [`CodecError::Cbor`] if CBOR decoding fails,
+/// [`CodecError::UnknownDiscriminant`] if the message type is unrecognized, or
+/// [`CodecError::InvalidServer`] if the message fails validation.
 pub fn decode_server_message(
     frame: &[u8],
     options: Option<FrameDecoderOptions>,
@@ -547,6 +652,11 @@ pub struct ClientMessageDecoder {
 }
 
 impl ClientMessageDecoder {
+    /// Creates a new decoder with the given frame options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError`] if the frame decoder cannot be initialized.
     pub fn new(options: Option<FrameDecoderOptions>) -> Result<Self, FrameError> {
         Ok(Self {
             frames: FrameDecoder::new(options)?,
@@ -554,6 +664,13 @@ impl ClientMessageDecoder {
             failed: false,
         })
     }
+    /// Pushes a chunk of bytes and returns any complete messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if frame decoding, CBOR decoding, or message
+    /// validation fails. Once an error occurs the decoder is permanently
+    /// failed and subsequent calls return immediately.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<ClientMessage>, CodecError> {
         if self.failed {
             return Err(CodecError::InvalidClient(
@@ -579,6 +696,12 @@ impl ClientMessageDecoder {
         }
         Ok(msgs)
     }
+    /// Signals end of input; returns an error if data remains buffered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if the decoder has failed or if buffered
+    /// data remains incomplete.
     pub fn end(&mut self) -> Result<(), CodecError> {
         if self.failed {
             return Err(CodecError::InvalidClient(
@@ -598,6 +721,11 @@ pub struct ServerMessageDecoder {
 }
 
 impl ServerMessageDecoder {
+    /// Creates a new decoder with the given frame options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError`] if the frame decoder cannot be initialized.
     pub fn new(options: Option<FrameDecoderOptions>) -> Result<Self, FrameError> {
         Ok(Self {
             frames: FrameDecoder::new(options)?,
@@ -605,6 +733,13 @@ impl ServerMessageDecoder {
             failed: false,
         })
     }
+    /// Pushes a chunk of bytes and returns any complete messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if frame decoding, CBOR decoding, or message
+    /// validation fails. Once an error occurs the decoder is permanently
+    /// failed and subsequent calls return immediately.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<ServerMessage>, CodecError> {
         if self.failed {
             return Err(CodecError::InvalidServer(
@@ -630,6 +765,12 @@ impl ServerMessageDecoder {
         }
         Ok(msgs)
     }
+    /// Signals end of input; returns an error if data remains buffered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if the decoder has failed or if buffered
+    /// data remains incomplete.
     pub fn end(&mut self) -> Result<(), CodecError> {
         if self.failed {
             return Err(CodecError::InvalidServer(
@@ -641,12 +782,22 @@ impl ServerMessageDecoder {
     }
 }
 
+/// Creates a [`ClientMessageDecoder`] with the given frame options.
+///
+/// # Errors
+///
+/// Returns [`FrameError`] if the frame decoder cannot be initialized.
 pub fn create_client_message_decoder(
     options: Option<FrameDecoderOptions>,
 ) -> Result<ClientMessageDecoder, FrameError> {
     ClientMessageDecoder::new(options)
 }
 
+/// Creates a [`ServerMessageDecoder`] with the given frame options.
+///
+/// # Errors
+///
+/// Returns [`FrameError`] if the frame decoder cannot be initialized.
 pub fn create_server_message_decoder(
     options: Option<FrameDecoderOptions>,
 ) -> Result<ServerMessageDecoder, FrameError> {

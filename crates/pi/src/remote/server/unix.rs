@@ -437,7 +437,7 @@ impl ListenerRunner {
     async fn run(&self, listener: TokioUnixListener) {
         loop {
             let accepted = tokio::select! {
-                _ = self.stop.notified() => break,
+                () = self.stop.notified() => break,
                 accepted = listener.accept() => accepted,
             };
             let Ok((stream, _)) = accepted else { break };
@@ -449,14 +449,14 @@ impl ListenerRunner {
         for connection in connections {
             connection.close(None).await.ok();
         }
-        self.cleanup_owned_socket().await;
+        self.cleanup_owned_socket();
         *lock(&self.closed) = true;
     }
 
     /// Unlinks the socket only while its identity still matches the
     /// bound one (port of `cleanupOwnedSocket`, simplified to a
     /// guarded unlink).
-    async fn cleanup_owned_socket(&self) {
+    fn cleanup_owned_socket(&self) {
         let identity = *lock(&self.identity_tx.0);
         let Some((dev, ino)) = identity else { return };
         let path = &self.options.path;
@@ -620,9 +620,8 @@ impl ByteConnection for UnixServerConnection {
         self.closed.load(Ordering::SeqCst)
     }
     fn send(&self, chunk: Vec<u8>) -> BoxFuture<'static, Result<(), TransportError>> {
-        let write_tx = match lock(&self.write_tx).clone() {
-            Some(tx) => tx,
-            None => return futures::future::ready(Err(TransportError::Closed)).boxed(),
+        let Some(write_tx) = lock(&self.write_tx).clone() else {
+            return futures::future::ready(Err(TransportError::Closed)).boxed();
         };
         let pending_bytes = Arc::clone(&self.pending_bytes);
         let max_pending_bytes = self.max_pending_bytes;
@@ -717,6 +716,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: tempdir, socket bind, client connect/attach/prompt/detach, and cleanup verification must all succeed"
+    )]
     #[tokio::test]
     async fn real_unix_socket_roundtrip_and_cleanup() {
         let temp_dir = tempfile::tempdir().expect("tempdir created");
@@ -794,7 +797,7 @@ mod tests {
             prompt_snapshot.transcript.iter().any(|item| match item {
                 crate::remote::schemas::TranscriptItem::User(u) => u.type_field == "assistant",
                 crate::remote::schemas::TranscriptItem::Assistant(a) => a.type_field == "assistant",
-                _ => false,
+                crate::remote::schemas::TranscriptItem::Tool(_) => false,
             }),
             "should have assistant reply in returned prompt snapshot, got: {:?}",
             prompt_snapshot.transcript

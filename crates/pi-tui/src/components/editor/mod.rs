@@ -2796,6 +2796,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertion: border cells must exist after render"
+    )]
     #[test]
     fn expanded_paste_content_still_reveals_full_text_with_borders() {
         let mut editor = Editor::with_defaults();

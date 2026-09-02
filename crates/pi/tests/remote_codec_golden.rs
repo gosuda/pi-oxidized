@@ -8,7 +8,6 @@
 use std::fs;
 
 use serde::Deserialize;
-use serde_json::Value as Json;
 
 use pi::remote::codec::{
     ClientMessageDecoder, CodecError, ServerMessageDecoder, create_client_message_decoder,
@@ -24,9 +23,21 @@ struct CorpusRow {
     kind: String,
     #[serde(rename = "frameHex")]
     frame_hex: String,
+    #[expect(
+        dead_code,
+        reason = "corpus schema field: present in JSONL for documentation, not read by tests"
+    )]
     note: String,
 }
 
+#[expect(
+    clippy::panic,
+    reason = "test fixture: corpus file is committed; read failure is irrecoverable"
+)]
+#[expect(
+    clippy::expect_used,
+    reason = "test fixture: corpus rows are committed valid JSONL"
+)]
 fn load_corpus() -> Vec<CorpusRow> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../packages/pi-remote-protocol/tests/fixtures/par-wire-corpus.jsonl");
@@ -38,6 +49,10 @@ fn load_corpus() -> Vec<CorpusRow> {
         .collect()
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test fixture: hex strings are committed valid hex"
+)]
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     (0..hex.len())
         .step_by(2)
@@ -49,6 +64,11 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 // Byte-exact decode of every golden frame
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
+#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
 #[test]
 fn golden_client_hello_decodes_byte_exact() {
     let row = load_corpus()
@@ -61,10 +81,15 @@ fn golden_client_hello_decodes_byte_exact() {
         ClientMessage::Hello { version } => {
             assert_eq!(version, PROTOCOL_VERSION);
         }
-        other => panic!("expected Hello, got {other:?}"),
+        other @ ClientMessage::Request { .. } => panic!("expected Hello, got {other:?}"),
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
+#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
 #[test]
 fn golden_server_hello_decodes_byte_exact() {
     let row = load_corpus()
@@ -91,6 +116,11 @@ fn golden_server_hello_decodes_byte_exact() {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
+#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
 #[test]
 fn golden_server_hello_error_decodes_byte_exact() {
     let row = load_corpus()
@@ -108,6 +138,11 @@ fn golden_server_hello_error_decodes_byte_exact() {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
+#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
 #[test]
 fn golden_response_ok_decodes_byte_exact() {
     let row = load_corpus()
@@ -132,6 +167,11 @@ fn golden_response_ok_decodes_byte_exact() {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
+#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
 #[test]
 fn golden_response_error_decodes_byte_exact() {
     let row = load_corpus()
@@ -158,6 +198,11 @@ fn golden_response_error_decodes_byte_exact() {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
+#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
 #[test]
 fn golden_event_envelope_decodes_byte_exact() {
     let row = load_corpus()
@@ -181,6 +226,10 @@ fn golden_event_envelope_decodes_byte_exact() {
 // Over-limit rejection
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
 #[test]
 fn golden_over_limit_rejection() {
     let row = load_corpus()
@@ -204,6 +253,10 @@ fn golden_over_limit_rejection() {
 // Encode → decode roundtrip produces identical bytes
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
 #[test]
 fn roundtrip_client_hello_byte_exact() {
     let row = load_corpus()
@@ -219,6 +272,10 @@ fn roundtrip_client_hello_byte_exact() {
     );
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
 #[test]
 fn roundtrip_server_hello_byte_exact() {
     let row = load_corpus()
@@ -234,6 +291,10 @@ fn roundtrip_server_hello_byte_exact() {
     );
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
 #[test]
 fn roundtrip_server_hello_error_byte_exact() {
     let row = load_corpus()
@@ -249,6 +310,10 @@ fn roundtrip_server_hello_error_byte_exact() {
     );
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
 #[test]
 fn roundtrip_response_ok_byte_exact() {
     let row = load_corpus()
@@ -264,6 +329,10 @@ fn roundtrip_response_ok_byte_exact() {
     );
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
 #[test]
 fn roundtrip_response_error_byte_exact() {
     let row = load_corpus()
@@ -279,6 +348,10 @@ fn roundtrip_response_error_byte_exact() {
     );
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
 #[test]
 fn roundtrip_event_envelope_byte_exact() {
     let row = load_corpus()
@@ -298,6 +371,11 @@ fn roundtrip_event_envelope_byte_exact() {
 // Incremental decoder
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
+#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
 #[test]
 fn incremental_client_decoder_byte_by_byte() {
     let row = load_corpus()
@@ -314,10 +392,14 @@ fn incremental_client_decoder_byte_by_byte() {
     assert_eq!(msgs.len(), 1);
     match &msgs[0] {
         ClientMessage::Hello { version } => assert_eq!(*version, PROTOCOL_VERSION),
-        other => panic!("expected Hello, got {other:?}"),
+        other @ ClientMessage::Request { .. } => panic!("expected Hello, got {other:?}"),
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
 #[test]
 fn incremental_server_decoder_multiple_frames() {
     let corpus = load_corpus();
@@ -347,6 +429,10 @@ fn incremental_server_decoder_multiple_frames() {
 // Typed error conditions
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
 #[test]
 fn truncated_frame_errors() {
     let row = load_corpus()
@@ -363,6 +449,10 @@ fn truncated_frame_errors() {
     );
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
 #[test]
 fn unknown_discriminant_errors() {
     // Construct a frame with an unknown `type` discriminant.
@@ -376,7 +466,7 @@ fn unknown_discriminant_errors() {
         0x01, // 1
     ];
     let mut frame = Vec::new();
-    frame.extend_from_slice(&(cbor.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&u32::try_from(cbor.len()).unwrap_or(0).to_be_bytes());
     frame.extend_from_slice(cbor);
     let err = decode_client_message(&frame, None).expect_err("expected error");
     assert!(
@@ -385,6 +475,10 @@ fn unknown_discriminant_errors() {
     );
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
 #[test]
 fn version_mismatch_errors() {
     // Client hello with version 99.

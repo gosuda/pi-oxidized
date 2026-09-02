@@ -234,19 +234,13 @@ impl InMemoryTelemetryContext {
     fn start_recorded_span(
         &self,
         options: SpanOptions,
-        parent: Option<(u64, Arc<AtomicBool>)>,
+        parent: Option<&(u64, Arc<AtomicBool>)>,
     ) -> Option<InMemorySpan> {
-        if parent
-            .as_ref()
-            .is_some_and(|(_, settled)| settled.load(Ordering::Acquire))
-        {
+        if parent.is_some_and(|(_, settled)| settled.load(Ordering::Acquire)) {
             return None;
         }
         let mut state = self.state.lock().ok()?;
-        if parent
-            .as_ref()
-            .is_some_and(|(_, settled)| settled.load(Ordering::Acquire))
-        {
+        if parent.is_some_and(|(_, settled)| settled.load(Ordering::Acquire)) {
             return None;
         }
         state.next_id = state.next_id.saturating_add(1);
@@ -254,7 +248,7 @@ impl InMemoryTelemetryContext {
         let index = state.spans.len();
         state.spans.push(RecordedSpan {
             id,
-            parent_id: parent.as_ref().map(|(parent_id, _)| *parent_id),
+            parent_id: parent.map(|(parent_id, _)| *parent_id),
             name: options.name,
             attributes: options.attributes,
             events: Vec::new(),
@@ -334,7 +328,7 @@ impl TelemetryContext for InMemorySpan {
         contained(
             || {
                 self.context
-                    .start_recorded_span(options, Some((self.id, Arc::clone(&self.settled))))
+                    .start_recorded_span(options, Some(&(self.id, Arc::clone(&self.settled))))
                     .map_or_else(
                         || Box::new(NoopSpan) as Box<dyn TelemetrySpan>,
                         |span| Box::new(span),
@@ -1454,6 +1448,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "start_recorded_span with no settled parent only fails on mutex poison — irrecoverable in test"
+    )]
     fn in_memory_records_nesting_and_settles_once() {
         let context = InMemoryTelemetryContext::new();
         let parent = context
@@ -1480,6 +1478,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "start_recorded_span with no settled parent only fails on mutex poison — irrecoverable in test"
+    )]
     fn settled_span_rejects_mutations_and_children() {
         let context = InMemoryTelemetryContext::new();
         let span = context
@@ -1505,6 +1507,10 @@ mod tests {
 
     struct PanickingContext;
     impl TelemetryContext for PanickingContext {
+        #[expect(
+            clippy::panic,
+            reason = "hostile impl: panics are the behavior under test"
+        )]
         fn start_span(&self, _options: SpanOptions) -> Box<dyn TelemetrySpan> {
             panic!("telemetry panic")
         }
@@ -1519,20 +1525,36 @@ mod tests {
     }
 
     impl TelemetrySpan for DropPanickingSpan {
+        #[expect(
+            clippy::panic,
+            reason = "hostile impl: panics are the behavior under test"
+        )]
         fn add_event(&self, _name: &str, _attributes: SpanAttributes) {
             panic!("event panic")
         }
 
+        #[expect(
+            clippy::panic,
+            reason = "hostile impl: panics are the behavior under test"
+        )]
         fn set_attributes(&self, _attributes: SpanAttributes) {
             panic!("attribute panic")
         }
 
+        #[expect(
+            clippy::panic,
+            reason = "hostile impl: panics are the behavior under test"
+        )]
         fn set_status(&self, _status: SpanStatus) {
             panic!("status panic")
         }
     }
 
     impl Drop for DropPanickingSpan {
+        #[expect(
+            clippy::panic,
+            reason = "hostile impl: panics are the behavior under test"
+        )]
         fn drop(&mut self) {
             panic!("drop panic")
         }
@@ -1641,9 +1663,12 @@ mod tests {
             ]
         );
         assert_eq!(ai.start[0].values, AI_OPERATIONS);
-        assert_eq!(ai.end[2].values, STOP_REASONS);
+    }
 
-        let expected = [
+    /// Expected `(name, start_attrs, end_attrs)` for each harness span.
+    fn expected_harness_span_attributes()
+    -> [(&'static str, Vec<&'static str>, Vec<&'static str>); 11] {
+        [
             (
                 "pi.harness.run",
                 vec![
@@ -1741,7 +1766,12 @@ mod tests {
                 ],
                 vec!["pi.session.seq"],
             ),
-        ];
+        ]
+    }
+
+    #[test]
+    fn harness_schemas_pin_attribute_names_and_value_enums() {
+        let expected = expected_harness_span_attributes();
         for (span, (name, start, end)) in HARNESS_TELEMETRY_SCHEMA.spans.iter().zip(expected) {
             assert_eq!(span.name, name);
             assert_eq!(
@@ -1759,6 +1789,10 @@ mod tests {
                 end
             );
         }
+    }
+
+    #[test]
+    fn harness_schemas_pin_value_enums() {
         assert_eq!(
             HARNESS_TELEMETRY_SCHEMA.spans[0].end[0].values,
             RUN_OUTCOMES
@@ -1857,12 +1891,12 @@ mod tests {
         }
         assert_eq!(literals.len(), 5);
         for (i, literal) in literals.iter().enumerate() {
-            if !literal.contains("telemetry:")
-                && !literal.contains("telemetry,")
-                && !literal.contains("telemetry }")
-            {
-                panic!("literal {i} missing telemetry:\n{literal}");
-            }
+            assert!(
+                literal.contains("telemetry:")
+                    || literal.contains("telemetry,")
+                    || literal.contains("telemetry }"),
+                "literal {i} missing telemetry:\n{literal}"
+            );
         }
     }
 }

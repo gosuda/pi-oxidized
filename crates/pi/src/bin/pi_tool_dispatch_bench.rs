@@ -19,9 +19,8 @@
 //! call to the session (before the slice), mirroring what the product does
 //! per tool call; the append is identical work on both implementations.
 //!
-//! Run:
-//!   cargo run -p pi --release --bin pi_tool_dispatch_bench -- \
-//!     --calls 3000 --warmup 300 --blocks 1 --session-dir <dir> [--arguments invalid]
+//! Run: `cargo run -p pi --release --bin pi_tool_dispatch_bench -- \
+//!   --calls 3000 --warmup 300 --blocks 1 --session-dir <dir> [--arguments invalid]`
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -31,8 +30,7 @@ use std::time::Instant;
 use pi::core::sessions::SessionManager;
 use pi_agent::{
     AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool, AgentToolResult,
-    EmitAgentEvent, ToolError, ToolExecutionMode, ToolUpdates, default_convert_to_llm_hook,
-    execute_tool_calls, noop_context, now_millis,
+    EmitAgentEvent, ToolError, ToolUpdates, execute_tool_calls, now_millis,
 };
 use pi_ai::{
     AssistantContent, AssistantMessage, Message, Model, ModelCost, ModelInput, StopReason,
@@ -69,12 +67,12 @@ fn parse_noop_input(args: &Map<String, Value>) -> Result<NoopInput, ToolError> {
             "noop tool input is invalid. path must be non-empty",
         ));
     }
-    if let Some(count) = input.count {
-        if !(1..=64).contains(&count) {
-            return Err(ToolError::new(
-                "noop tool input is invalid. count must be between 1 and 64",
-            ));
-        }
+    if let Some(count) = input.count
+        && !(1..=64).contains(&count)
+    {
+        return Err(ToolError::new(
+            "noop tool input is invalid. count must be between 1 and 64",
+        ));
     }
     Ok(input)
 }
@@ -86,15 +84,15 @@ struct NoopTool {
 }
 
 impl AgentTool for NoopTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "noop"
     }
 
-    fn label(&self) -> &str {
+    fn label(&self) -> &'static str {
         "noop"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Benchmark no-op tool; validates arguments, emits one update, returns a fixed result."
     }
 
@@ -219,6 +217,10 @@ impl EmitAgentEvent for Sink {
                     }
                     self.appends.set(self.appends.get() + 1);
                     if let Some(t0) = self.t0.take() {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "Instant::elapsed nanos fit in u64 for any realistic bench duration"
+                        )]
                         self.slices
                             .borrow_mut()
                             .push(t0.elapsed().as_nanos() as u64);
@@ -241,7 +243,7 @@ impl EmitAgentEvent for Sink {
 mod cpu {
     /// User + system CPU of the whole process in microseconds.
     ///
-    /// `clk_tck` is the kernel clock-tick rate (`getconf CLK_TCK`, USER_HZ);
+    /// `clk_tck` is the kernel clock-tick rate (`getconf CLK_TCK`, `USER_HZ`);
     /// the orchestrator passes it in. Granularity is one tick (typically
     /// 10 ms), so measured blocks must be large enough to average it out.
     pub fn cpu_micros(clk_tck: u64) -> Option<u128> {
@@ -344,7 +346,7 @@ fn parse_args() -> Result<Args, String> {
         };
         match flag.as_str() {
             "--clk-tck" => {
-                args.clk_tck = value()?.parse().map_err(|e| format!("--clk-tck: {e}"))?
+                args.clk_tck = value()?.parse().map_err(|e| format!("--clk-tck: {e}"))?;
             }
             "--calls" => args.calls = value()?.parse().map_err(|e| format!("--calls: {e}"))?,
             "--warmup" => args.warmup = value()?.parse().map_err(|e| format!("--warmup: {e}"))?,
@@ -388,6 +390,14 @@ struct BlockResult {
     cpu_ms_per_call: Option<f64>,
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "bench binary: u128/usize to f64 for timing statistics; f64 precision is sufficient for benchmark reporting"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "bench harness: all parameters are used directly in the timed dispatch loop; grouping would obscure the benchmark's flat structure"
+)]
 fn run_block(
     sink: &Sink,
     context: &AgentContext,
@@ -458,6 +468,10 @@ fn run_block(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "bench binary main: linear setup-to-report flow; extracting sub-functions would obscure the sequential benchmark lifecycle"
+)]
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(args) => args,

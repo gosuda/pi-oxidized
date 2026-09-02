@@ -390,9 +390,19 @@ pub type ServerErrorHandler = Arc<dyn Fn(&str) + Send + Sync>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PiServerOptionsError {
     /// `max_frame_length` was zero or beyond the u32 frame bound.
-    InvalidMaxFrameLength { value: u64, max: u64 },
+    InvalidMaxFrameLength {
+        /// The invalid value that was provided.
+        value: u64,
+        /// The maximum allowed value.
+        max: u64,
+    },
     /// `handshake_timeout_ms` was zero or beyond the timer-delay bound.
-    InvalidHandshakeTimeout { value: u64, max: u64 },
+    InvalidHandshakeTimeout {
+        /// The invalid value that was provided.
+        value: u64,
+        /// The maximum allowed value.
+        max: u64,
+    },
 }
 
 impl fmt::Display for PiServerOptionsError {
@@ -621,6 +631,10 @@ struct ServerHandler {
 }
 
 impl ServerHandler {
+    #[expect(
+        clippy::expect_used,
+        reason = "default decoder options are always valid; fallback is unreachable"
+    )]
     fn new(core: &Arc<ServerCore>, connection: Arc<dyn ByteConnection>) -> Self {
         let id = Uuid::new_v4().to_string();
         let decoder = ClientMessageDecoder::new(Some(FrameDecoderOptions {
@@ -1115,7 +1129,10 @@ async fn close_server_state(core: &Arc<ServerCore>) {
     }
 
     // Await in-flight openings so their runtimes are observable.
-    let openings: Vec<OpeningFuture> = lock(&core.shared).opening.values().cloned().collect();
+    let openings: Vec<OpeningFuture> = {
+        let shared = lock(&core.shared);
+        shared.opening.values().cloned().collect()
+    };
     for opening in openings {
         let _ = opening.await;
     }
@@ -1124,7 +1141,11 @@ async fn close_server_state(core: &Arc<ServerCore>) {
         shared.live.values().cloned().collect()
     };
     for live in lives {
-        if let Some(disposing) = lock(&live.disposing).clone() {
+        let disposing = {
+            let guard = lock(&live.disposing);
+            guard.clone()
+        };
+        if let Some(disposing) = disposing {
             disposing.await;
             continue;
         }
@@ -1170,6 +1191,10 @@ async fn sessions_disconnect(core: &Arc<ServerCore>, conn: &Arc<ServerConnection
 
 /// Executes one command for one connection (port of
 /// command execution).
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per command variant; splitting would obscure the dispatch"
+)]
 async fn execute_command(
     core: &Arc<ServerCore>,
     conn: &Arc<ServerConnection>,
@@ -1449,10 +1474,8 @@ fn handle_runtime_event(
             let core = Arc::clone(core);
             let live = Arc::clone(live);
             tokio::spawn(async move {
-                if let Err(failure) = terminate(&core, &live, error).await {
-                    if let Failure::Op(op) = failure {
-                        report_error(&core, &op.to_string());
-                    }
+                if let Err(Failure::Op(op)) = terminate(&core, &live, error).await {
+                    report_error(&core, &op.to_string());
                 }
             });
         }
@@ -1634,11 +1657,9 @@ async fn maybe_dispose(core: &Arc<ServerCore>, live: &Arc<LiveSession>) -> Resul
     let to_await: DisposeFuture = {
         let mut disposing = lock(&live.disposing);
         match (eligible, disposing.clone()) {
-            (false, Some(existing)) => existing,
             (false, None) => return Ok(()),
-            // Eligible but a concurrent caller already started the
-            // disposal: join it.
-            (true, Some(existing)) => existing,
+            // Join an existing disposal future (whether eligible or not).
+            (_, Some(existing)) => existing,
             (true, None) => {
                 // Unsubscribe before disposing so late events cannot
                 // re-enter.
@@ -1866,9 +1887,9 @@ impl InMemoryConnection {
         }
     }
 
-    fn fill(&self, transport: Arc<dyn ByteTransport>) {
+    fn fill(&self, transport: &Arc<dyn ByteTransport>) {
         // send_replace always notifies, waking parked senders.
-        self.slot_tx.send_replace(Some(Arc::clone(&transport)));
+        self.slot_tx.send_replace(Some(Arc::clone(transport)));
         if self.closed.load(Ordering::SeqCst) {
             transport.close();
         }
@@ -1980,12 +2001,13 @@ impl ServerListener for InMemoryServerListener {
                     connection: Arc::clone(&connection),
                 });
                 let accepted = tokio::select! {
-                    _ = stop.notified() => break,
+                    () = stop.notified() => break,
                     accepted = listener.accept(handlers) => accepted,
                 };
                 match accepted {
                     Ok(transport) => {
-                        connection.fill(Arc::new(transport) as Arc<dyn ByteTransport>);
+                        let transport = Arc::new(transport) as Arc<dyn ByteTransport>;
+                        connection.fill(&transport);
                     }
                     Err(_) => break,
                 }
@@ -2240,9 +2262,9 @@ impl SessionRuntime for AgentSessionRuntime {
 
     fn set_model(&self, model: ModelRef) -> BoxFuture<'static, Result<(), ServerError>> {
         let session = Arc::clone(&self.session);
-        let resolver = Arc::clone(&self.model_resolver);
+        let model_resolver = Arc::clone(&self.model_resolver);
         Box::pin(async move {
-            let resolved = resolver(&model).ok_or_else(|| {
+            let resolved = model_resolver(&model).ok_or_else(|| {
                 ServerError::new(
                     ServerOperationCode::NotFound,
                     format!("Unknown model: {}/{}", model.provider, model.id),
@@ -2615,7 +2637,11 @@ pub(crate) mod test_support {
             }
         }
 
-        pub(crate) fn emit_progress(&self, progress: TranscriptProgress) {
+        #[expect(
+            dead_code,
+            reason = "test support affordance; may be used by future test cases"
+        )]
+        pub(crate) fn emit_progress(&self, progress: &TranscriptProgress) {
             let listeners: Vec<SessionRuntimeListener> = lock(&self.listeners)
                 .iter()
                 .map(|(_, l)| Arc::clone(l))
@@ -2826,6 +2852,10 @@ pub(crate) mod test_support {
             lock(&self.sessions).insert(id.to_string(), Arc::new(StdMutex::new(snapshot)));
         }
 
+        #[expect(
+            clippy::expect_used,
+            reason = "test support: caller guarantees runtime was seeded"
+        )]
         pub(crate) fn latest_runtime(&self, id: &str) -> Arc<ScriptedSession> {
             let runtimes = lock(&self.runtimes);
             runtimes
@@ -2977,6 +3007,10 @@ mod tests {
     use crate::remote::client::{PiClient, PiClientOptions, SessionLeaseMode};
     use crate::remote::transport::InMemoryListener;
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test setup: server options and start are always valid"
+    )]
     async fn setup_in_memory_server(
         service: Arc<dyn ServerService>,
     ) -> (PiServer, Arc<InMemoryListener>) {
@@ -2995,6 +3029,10 @@ mod tests {
         (server, listener)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test setup: in-memory factory and client options are always valid"
+    )]
     fn client_for_listener(listener: &Arc<InMemoryListener>) -> PiClient {
         let endpoint = listener.endpoint();
         let factory = build_transport(&EndpointSpec::InMemory { endpoint })
@@ -3007,6 +3045,10 @@ mod tests {
         .expect("client options valid")
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client connect/attach/detach must succeed"
+    )]
     #[tokio::test]
     async fn two_client_exclusive_lease_rejection_over_in_memory() {
         let service = Arc::new(ScriptedService::new());
@@ -3043,6 +3085,10 @@ mod tests {
         server.close().await;
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client connect/attach/detach must succeed"
+    )]
     #[tokio::test]
     async fn reattach_after_detach() {
         let service = Arc::new(ScriptedService::new());
@@ -3085,6 +3131,10 @@ mod tests {
         server.close().await;
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client connect/attach and broadcast must succeed"
+    )]
     #[tokio::test]
     async fn broadcast_exactly_once_per_attached_listener() {
         let service = Arc::new(ScriptedService::new());
@@ -3148,6 +3198,10 @@ mod tests {
         server.close().await;
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: client connect/attach/disconnect must succeed"
+    )]
     #[tokio::test]
     async fn mid_request_disconnect_and_idle_disposal() {
         let service = Arc::new(ScriptedService::new());
@@ -3206,6 +3260,10 @@ mod tests {
         server.close().await;
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions: session hosting and model resolution must succeed"
+    )]
     #[tokio::test]
     async fn agent_session_hosting_roundtrip() {
         use super::mod_tests_helper::{

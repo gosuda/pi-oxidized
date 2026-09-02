@@ -116,18 +116,24 @@ fn polarity_detection_reports_numbers_not_inferences() {
         if verdict == "fallback-dark" {
             // Fallback case: no luminance, no classification — by design.
             assert!(
-                v.get("detectedDark").and_then(|d| d.as_bool()).is_none(),
+                v.get("detectedDark")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_none(),
                 "fallback case {source} must not classify"
             );
         } else {
             // Classified cases must report detectedDark as a bool and
             // bt601Luminance as a number.
             assert!(
-                v.get("detectedDark").and_then(|d| d.as_bool()).is_some(),
+                v.get("detectedDark")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_some(),
                 "classified case {source} must report detectedDark as bool"
             );
             assert!(
-                v.get("bt601Luminance").and_then(|l| l.as_u64()).is_some(),
+                v.get("bt601Luminance")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
                 "classified case {source} must report bt601Luminance as number"
             );
         }
@@ -136,19 +142,22 @@ fn polarity_detection_reports_numbers_not_inferences() {
     let classified = report
         .summary()
         .get("polarityClassified")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .expect("polarityClassified");
     let total = report
         .summary()
         .get("polarityTotal")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .expect("polarityTotal");
     assert_eq!(
         classified,
         u64::try_from(
             verdicts
                 .iter()
-                .filter(|v| v.get("detectedDark").and_then(|d| d.as_bool()).is_some())
+                .filter(|v| v
+                    .get("detectedDark")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_some())
                 .count()
         )
         .unwrap(),
@@ -167,11 +176,11 @@ fn thinking_ramp_verdicts_report_numbers_against_thresholds() {
 
     let de_threshold = thresholds
         .get("de2000")
-        .and_then(|v| v.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .expect("de2000 threshold");
     let ratio_threshold = thresholds
         .get("de2000Ratio")
-        .and_then(|v| v.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .expect("de2000Ratio threshold");
 
     assert!(
@@ -197,13 +206,13 @@ fn thinking_ramp_verdicts_report_numbers_against_thresholds() {
 
         let de = v
             .get("deltaE2000")
-            .and_then(|d| d.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or_else(|| {
                 panic!("{lower}→{upper} {polarity}/{color_mode}: deltaE2000 must be a number")
             });
         let ratio = v
             .get("wcagRatio")
-            .and_then(|r| r.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or_else(|| {
                 panic!("{lower}→{upper} {polarity}/{color_mode}: wcagRatio must be a number")
             });
@@ -215,15 +224,15 @@ fn thinking_ramp_verdicts_report_numbers_against_thresholds() {
 
         let actual_passes_de = v
             .get("passesDe2000")
-            .and_then(|b| b.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let actual_passes_ratio = v
             .get("passesRatio")
-            .and_then(|b| b.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let actual_passes_both = v
             .get("passesBoth")
-            .and_then(|b| b.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         assert_eq!(
@@ -252,7 +261,7 @@ fn rail_hue_collisions_report_wcag_ratios_against_minimum() {
 
     let min_threshold = thresholds
         .get("wcagMinimum")
-        .and_then(|v| v.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .expect("wcagMinimum threshold");
     assert!(
         (min_threshold - 1.3).abs() < 1e-9,
@@ -279,7 +288,7 @@ fn rail_hue_collisions_report_wcag_ratios_against_minimum() {
 
         let ratio = v
             .get("wcagRatio")
-            .and_then(|r| r.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or_else(|| {
                 panic!("{fg} vs {rail} {polarity}/{color_mode}: wcagRatio must be a number")
             });
@@ -287,7 +296,7 @@ fn rail_hue_collisions_report_wcag_ratios_against_minimum() {
         let passes = ratio >= min_threshold;
         let actual_passes = v
             .get("passesWcag")
-            .and_then(|b| b.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         assert_eq!(
@@ -322,7 +331,7 @@ fn sgr_inspection_reports_both_modes_with_delta_e() {
             .unwrap_or_else(|| panic!("{slot} {polarity}: forced256Sgr must be present"));
         let de = v
             .get("deltaE2000")
-            .and_then(|d| d.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or_else(|| panic!("{slot} {polarity}: deltaE2000 must be a number"));
 
         // Truecolor SGR must use 24-bit form.
@@ -362,7 +371,7 @@ fn slash_pair_fallback_resolves_every_case() {
             .unwrap_or("unknown");
         let fallback = v
             .get("fallbackUsed")
-            .and_then(|b| b.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         // Every case must resolve to a named member.
@@ -392,7 +401,7 @@ fn slash_pair_fallback_resolves_every_case() {
     let fallback_count = report
         .summary()
         .get("pairFallbackCount")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .expect("pairFallbackCount");
     assert_eq!(
         fallback_count, 2,

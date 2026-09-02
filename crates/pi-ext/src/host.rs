@@ -352,7 +352,7 @@ mod tests {
             },
             _ => false,
         };
-        std::process::exit(if ok { 0 } else { 1 });
+        std::process::exit(i32::from(!ok));
     }
 
     /// Re-runs only `test_name` in a child process with `dir` prepended to
@@ -385,10 +385,7 @@ mod tests {
         for (key, value) in extra_env {
             command.env(key, value);
         }
-        command
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        command.status().is_ok_and(|status| status.success())
     }
 
     /// Writes `bytes` and marks the file executable so a PATH-search

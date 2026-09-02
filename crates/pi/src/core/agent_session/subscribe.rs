@@ -113,18 +113,32 @@ impl AgentSession {
         self.store_pump(pump);
     }
 
+    /// Advance the persistence epoch and reset `TurnEnd` counters so terminal
+    /// markers from a previous run can never release a later run.
+    fn reset_persistence_epoch(&self) {
+        let mut inner = self.lock_inner();
+        inner.persistence_epoch = inner.persistence_epoch.wrapping_add(1);
+        inner.processed_turn_ends = 0;
+        inner.claimed_turn_ends = 0;
+    }
+
+    /// Publish the terminal `TurnEnd` marker after the full extension →
+    /// public → persistence sequence completes.
+    fn publish_turn_end_marker(&self) {
+        let notify = {
+            let mut inner = self.lock_inner();
+            inner.processed_turn_ends = inner.processed_turn_ends.saturating_add(1);
+            Arc::clone(&inner.turn_end_notify)
+        };
+        notify.notify_one();
+    }
+
     /// Process one agent event through extension → public → persistence.
     async fn process_agent_event(self: &Arc<Self>, event: AgentEvent) {
         let is_agent_end = matches!(&event, AgentEvent::AgentEnd { .. });
         let is_turn_end = matches!(&event, AgentEvent::TurnEnd { .. });
         if matches!(&event, AgentEvent::AgentStart) {
-            // New persistence epoch: reset the TurnEnd counters before any
-            // handler work so terminal markers from a previous run can never
-            // release a later run.
-            let mut inner = self.lock_inner();
-            inner.persistence_epoch = inner.persistence_epoch.wrapping_add(1);
-            inner.processed_turn_ends = 0;
-            inner.claimed_turn_ends = 0;
+            self.reset_persistence_epoch();
         }
 
         if matches!(&event, AgentEvent::MessageStart { message } if message.role() == "user")
@@ -211,16 +225,7 @@ impl AgentSession {
         }
 
         if is_turn_end {
-            // The TurnEnd has now run its full extension → public →
-            // persistence sequence: publish the terminal marker. `notify_one`
-            // stores a permit when no waiter is registered yet, so a waiter
-            // racing between its locked check and registration is still woken.
-            let notify = {
-                let mut inner = self.lock_inner();
-                inner.processed_turn_ends = inner.processed_turn_ends.saturating_add(1);
-                Arc::clone(&inner.turn_end_notify)
-            };
-            notify.notify_one();
+            self.publish_turn_end_marker();
         }
 
         if is_agent_end {
@@ -586,10 +591,9 @@ mod tests {
             "processed TurnEnd must be claimable after the pump"
         );
 
-        let at_public = marker_at_public
+        let at_public = *marker_at_public
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             at_public,
             Some(0),

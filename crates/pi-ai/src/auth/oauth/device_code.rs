@@ -353,19 +353,19 @@ mod tests {
     }
 
     impl DeviceCodeSleeper for RecordingSleeper {
-        async fn sleep(
+        fn sleep(
             &self,
             duration: Duration,
             cancellation: Option<&CancellationToken>,
-        ) -> Result<(), AuthError> {
+        ) -> impl Future<Output = Result<(), AuthError>> + Send {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return Err(AuthError::Cancelled);
+                return std::future::ready(Err(AuthError::Cancelled));
             }
             let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
             self.sleeps_ms.fetch_add(ms, Ordering::SeqCst);
             self.last_sleep_ms.store(ms, Ordering::SeqCst);
             self.clock.advance(ms);
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
 

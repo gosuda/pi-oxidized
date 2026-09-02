@@ -189,7 +189,7 @@ pub(crate) enum PrepareReplacementOutcome {
 /// The `result` field is an [`Option`] so that [`Drop`] can tell whether the
 /// replacement was consumed by finalize / abort. If neither path runs (early
 /// return, `?`, panic-unwind), `Drop` reaps the live session on a background
-/// task — matching the `PreparedReload` guard in `extension_runtime_set.rs`.
+/// task — matching the `PreparedReload` guard in `extension_runtime_set/planning.rs`.
 pub(crate) struct PreparedReplacement {
     pub(crate) result: Option<CreateAgentSessionRuntimeResult>,
     pub(crate) reason: SessionShutdownReason,

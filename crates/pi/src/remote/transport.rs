@@ -223,6 +223,13 @@ const MAX_UNIX_SOCKET_PATH_BYTES: usize = if cfg!(target_os = "linux") { 107 } e
 /// non-Unix tier returns the typed
 /// [`EndpointSpecError::UnsupportedOnPlatform`] instead of panicking or
 /// leaking an untyped string.
+///
+/// # Errors
+///
+/// Returns [`EndpointSpecError::EmptyPath`] if the Unix path is empty,
+/// [`EndpointSpecError::PathTooLong`] if the path exceeds the platform limit,
+/// [`EndpointSpecError::InvalidMaxPendingBytes`] if the budget is zero, or
+/// [`EndpointSpecError::UnsupportedOnPlatform`] on non-Unix tiers.
 pub fn build_transport(spec: &EndpointSpec) -> Result<ByteTransportFactory, EndpointSpecError> {
     match spec {
         EndpointSpec::InMemory { endpoint } => Ok(endpoint.factory()),
@@ -263,6 +270,10 @@ pub fn build_transport(spec: &EndpointSpec) -> Result<ByteTransportFactory, Endp
 mod tests {
     use super::*;
 
+    #[expect(
+        clippy::expect_used,
+        reason = "asserting that build_transport rejects an empty path"
+    )]
     #[test]
     fn build_transport_rejects_empty_unix_path() {
         let error = build_transport(&EndpointSpec::Unix {
@@ -274,6 +285,10 @@ mod tests {
         assert_eq!(error, EndpointSpecError::EmptyPath);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "asserting that build_transport rejects an over-long path"
+    )]
     #[test]
     fn build_transport_rejects_over_long_unix_path() {
         let max = if cfg!(target_os = "linux") { 107 } else { 103 };
@@ -287,6 +302,10 @@ mod tests {
         assert_eq!(error, EndpointSpecError::PathTooLong { max });
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "asserting that build_transport rejects a zero byte budget"
+    )]
     #[test]
     fn build_transport_rejects_zero_pending_bytes() {
         let error = build_transport(&EndpointSpec::Unix {
@@ -318,6 +337,10 @@ mod tests {
     /// Pins the typed non-Unix result: no panic, no untyped string. Compiled
     /// (and run) only off the Unix tier; the Windows-target compile check
     /// keeps this test compiling with the unix module absent.
+    #[expect(
+        clippy::expect_used,
+        reason = "asserting that build_transport returns UnsupportedOnPlatform off-Unix"
+    )]
     #[cfg(not(unix))]
     #[test]
     fn build_transport_returns_typed_unsupported_on_platform_off_unix() {

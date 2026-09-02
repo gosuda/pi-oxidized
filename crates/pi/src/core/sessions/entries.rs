@@ -689,10 +689,7 @@ pub fn parse_session_entries(content: &str) -> Vec<FileEntry> {
 /// a string `id`). Malformed mid-file lines are skipped.
 #[must_use]
 pub fn load_entries_from_file(file_path: &Path) -> Vec<FileEntry> {
-    match load_file_entries_from_file(file_path) {
-        Ok(entries) => entries,
-        Err(_) => Vec::new(),
-    }
+    load_file_entries_from_file(file_path).unwrap_or_default()
 }
 
 /// Load file entries from a session file via the direct typed parse fast path.
@@ -1508,7 +1505,7 @@ not valid json
     }
 
     #[test]
-    fn escaped_tag_header_and_tagless_lines_load() {
+    fn escaped_tag_header_and_tagless_lines_load() -> TestResult {
         let content = concat!(
             r#"{"type":"sess"#,
             "\\u0069",
@@ -1519,9 +1516,9 @@ not valid json
             r#"{"foo":"untagged"}"#,
         );
         let dir = std::env::temp_dir().join("pi-entries-escaped-tag-test");
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::create_dir_all(&dir)?;
         let file = dir.join("escaped-tag.jsonl");
-        std::fs::write(&file, content).expect("write session");
+        std::fs::write(&file, content)?;
         let entries = load_entries_from_file(&file);
         std::fs::remove_file(&file).ok();
         assert_eq!(entries.len(), 3, "all three lines must load");
@@ -1540,5 +1537,6 @@ not valid json
             entries[2],
             FileEntry::Entry(SessionEntry::Unknown(_))
         ));
+        Ok(())
     }
 }

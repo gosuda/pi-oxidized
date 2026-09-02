@@ -1,5 +1,5 @@
-#![cfg(all(unix, feature = "testkit"))]
 //! Two-tier musl release-row lane (TUI-V1, issue #76).
+#![cfg(all(unix, feature = "testkit"))]
 //!
 //! The two mandatory musl release rows (`x86_64-unknown-linux-musl`,
 //! `aarch64-unknown-linux-musl`) assert ONLY their four packaging/protocol

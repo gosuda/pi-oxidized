@@ -205,10 +205,10 @@ impl KimiCodingOAuth {
                 let delay = std::time::Duration::from_secs(1 << (attempt - 1));
                 tokio::time::sleep(delay).await;
             }
-            if let Some(sig) = signal {
-                if sig.is_cancelled() {
-                    return Err(AuthError::message("Kimi Code token refresh aborted"));
-                }
+            if let Some(sig) = signal
+                && sig.is_cancelled()
+            {
+                return Err(AuthError::message("Kimi Code token refresh aborted"));
             }
 
             let mut fields = BTreeMap::new();
