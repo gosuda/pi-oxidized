@@ -3146,38 +3146,24 @@ pub(crate) mod tests {
         })
     }
 
+    /// Link the shared immutable `startup_host` fixture into `directory` as
+    /// `replacement` and write `snapshot.json` with the given payload. The
+    /// fixture's `native-snapshot` behavior reads `snapshot.json` from its
+    /// own directory at runtime. WHY: hard link instead of copy — the fixture
+    /// is immutable, so sharing the inode is safe and avoids ETXTBSY.
     #[cfg(unix)]
-    fn write_native_snapshot_host(directory: &std::path::Path, snapshot: Value) -> TestResult {
+    fn native_snapshot_host(directory: &std::path::Path, snapshot: &Value) -> TestResult {
         let executable = directory.join("replacement");
-        let hello = String::from_utf8(pi_ext::protocol::encode_frame(&Frame {
-            id: 1,
-            kind: FrameKind::Res,
-            method: "hello".to_owned(),
-            payload: serde_json::to_value(HelloAck::local())?,
-        })?)?;
-        let load = String::from_utf8(pi_ext::protocol::encode_frame(&Frame {
-            id: 2,
-            kind: FrameKind::Res,
-            method: "extensions.load".to_owned(),
-            payload: snapshot,
-        })?)?;
-        std::fs::write(
-            &executable,
-            format!(
-                "#!/bin/sh\n\
-                 IFS= read -r request || exit 10\n\
-                 printf '%s' '{hello}'\n\
-                 IFS= read -r request || exit 11\n\
-                 printf '%s' '{load}'\n\
-                 while IFS= read -r request; do :; done\n"
-            ),
-        )?;
-        let mut permissions = std::fs::metadata(&executable)?.permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-        std::fs::set_permissions(executable, permissions)?;
+        let fixture = crate::core::extension_host::tests::startup_host();
+        std::fs::hard_link(&fixture, &executable).or_else(|_| {
+            // WHY: hard links can fail across filesystem boundaries (tmpdir
+            // mount points); fall back to a copy which is still safe because
+            // the fixture is never written to after first creation.
+            std::fs::copy(&fixture, &executable).map(|_| ())
+        })?;
+        std::fs::write(directory.join("snapshot.json"), snapshot.to_string())?;
         Ok(())
     }
-
     fn slot_frame(key: &str, text: &str) -> Frame {
         Frame {
             id: 0,
@@ -4049,34 +4035,13 @@ pub(crate) mod tests {
 
         let directory = tempfile::tempdir()?;
         let executable = directory.path().join("native-jsonl-host");
-        let hello = String::from_utf8(pi_ext::protocol::encode_frame(&Frame {
-            id: 1,
-            kind: FrameKind::Res,
-            method: "hello".to_owned(),
-            payload: serde_json::to_value(HelloAck::local())?,
-        })?)?;
-        let load = String::from_utf8(pi_ext::protocol::encode_frame(&Frame {
-            id: 2,
-            kind: FrameKind::Res,
-            method: "extensions.load".to_owned(),
-            payload: json!({
-                "commands": [{"name": COMMAND}],
-            }),
-        })?)?;
+        let fixture = crate::core::extension_host::tests::startup_host();
+        std::fs::hard_link(&fixture, &executable)
+            .or_else(|_| std::fs::copy(&fixture, &executable).map(|_| ()))?;
         std::fs::write(
-            &executable,
-            format!(
-                "#!/bin/sh\n\
-                 IFS= read -r request || exit 10\n\
-                 printf '%s' '{hello}'\n\
-                 IFS= read -r request || exit 11\n\
-                 printf '%s' '{load}'\n\
-                 while IFS= read -r request; do :; done\n"
-            ),
+            directory.path().join("snapshot.json"),
+            json!({"commands": [{"name": COMMAND}]}).to_string(),
         )?;
-        let mut permissions = std::fs::metadata(&executable)?.permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-        std::fs::set_permissions(&executable, permissions)?;
 
         let executable_path = executable.to_string_lossy().into_owned();
         let load_cwd = directory.path().to_string_lossy().into_owned();
@@ -5083,7 +5048,7 @@ pub(crate) mod tests {
     async fn native_manifest_builds_multi_endpoint_replacement_without_publication() -> TestResult {
         let (old, old_host) = make_runner(snapshot(&["input"])).await?;
         let directory = tempfile::tempdir()?;
-        write_native_snapshot_host(directory.path(), snapshot(&[]))?;
+        native_snapshot_host(directory.path(), &snapshot(&[]))?;
         std::fs::write(
             directory.path().join("pi-extension.json"),
             r#"{"runtime":"native","entry":"replacement"}"#,
@@ -5142,9 +5107,9 @@ pub(crate) mod tests {
         }))
         .await?;
         let directory = tempfile::tempdir()?;
-        write_native_snapshot_host(
+        native_snapshot_host(
             directory.path(),
-            json!({
+            &json!({
                 "providers": [
                     {
                         "name": "replacement-provider",
@@ -5952,7 +5917,7 @@ pub(crate) mod tests {
         let old_generation = set.reload_generation();
 
         let directory = tempfile::tempdir()?;
-        write_native_snapshot_host(directory.path(), snapshot(&[]))?;
+        native_snapshot_host(directory.path(), &snapshot(&[]))?;
         let healthy = directory.path().join("replacement");
         let failing = directory.path().join("failing");
         let marker = directory.path().join("spawned");

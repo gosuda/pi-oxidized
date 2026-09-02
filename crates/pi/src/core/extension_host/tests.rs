@@ -9,11 +9,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-#[cfg(unix)]
-use std::fmt::Write as _;
 #[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
@@ -22,6 +17,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pi_agent::{
     AfterToolCallContext, AgentContext, AgentMessage, AgentToolResult, BeforeToolCallContext,
@@ -1179,114 +1176,171 @@ async fn tool_update_and_provider_event_pumps_forward() -> R {
 }
 
 // ===========================================================================
-// Invalidate + shutdown exactly once
+// Immutable process fixture + reap helper
 // ===========================================================================
 
+/// One immutable `/bin/sh` fixture written per test process into a
+/// process-unique tempdir. All behavioral variability is carried by argv[1]
+/// (behavior selector) and a co-located `snapshot.json` file (for
+/// `native-snapshot`). The fixture file itself is never rewritten or
+/// truncated, eliminating the ETXTBSY write-then-execute race that mutable
+/// per-test scripts produced under parallel scheduling.
+///
+/// Behaviors (argv[1]):
+/// - `reject-handshake` — hello with `protocolVersion` 999 (handshake failure)
+/// - `reject-load` — hello ok, `extensions.load` → null (load failure)
+/// - `ready` — hello ok, load with `session_shutdown` handler, then drain
+/// - `exit-after-load` — hello ok, load ok, then exit 0 (stdout EOF)
+/// - `native-snapshot` — hello ok + load payload from `snapshot.json` in the
+///   same directory as the invoked path, then drain (used by `runtime_set`
+///   native-endpoint tests via hard link)
+/// - `hang` — hello ok, load ok, then drain until stdin EOF
+///
+/// argv[2] = pid file path (startup tests), argv[3] = shutdown file path.
+/// When omitted (native-snapshot via `build_generation`), the script
+/// defaults to `native-snapshot` and skips pid/shutdown bookkeeping.
 #[cfg(unix)]
-#[derive(Clone, Copy)]
-enum StartupBehavior {
-    RejectHandshake,
-    RejectLoad,
-    Ready,
-    /// Answer hello + load, then exit immediately (stdout EOF mid-session).
-    ExitAfterLoad,
-}
+const STARTUP_HOST_SCRIPT: &str = r#"#!/bin/sh
+behavior="${1:-native-snapshot}"
+pid_file="$2"
+shutdown_file="$3"
+if [ -n "$pid_file" ]; then
+  printf '%s\n' "$$" > "$pid_file"
+fi
+IFS= read -r request || exit 10
+case "$behavior" in
+  reject-handshake)
+    printf '%s\n' '{"id":1,"kind":"res","method":"hello","payload":{"protocolVersion":999,"compatibilityVersion":"rejected"}}'
+    ;;
+  *)
+    printf '%s\n' '{"id":1,"kind":"res","method":"hello","payload":{"protocolVersion":1,"compatibilityVersion":"0.80.10"}}'
+    ;;
+esac
+case "$behavior" in
+  reject-handshake)
+    :
+    ;;
+  reject-load)
+    IFS= read -r request || exit 11
+    printf '%s\n' '{"id":2,"kind":"res","method":"extensions.load","payload":null}'
+    ;;
+  ready|exit-after-load|hang)
+    IFS= read -r request || exit 11
+    printf '%s\n' '{"id":2,"kind":"res","method":"extensions.load","payload":{"handlers":["session_shutdown"]}}'
+    ;;
+  native-snapshot)
+    IFS= read -r request || exit 11
+    snapshot=$(cat "$(dirname "$0")/snapshot.json")
+    printf '{"id":2,"kind":"res","method":"extensions.load","payload":%s}\n' "$snapshot"
+    ;;
+esac
+case "$behavior" in
+  exit-after-load)
+    exit 0
+    ;;
+  native-snapshot|hang)
+    while IFS= read -r request; do :; done
+    exit 0
+    ;;
+esac
+while IFS= read -r request; do
+  case "$request" in
+    *'"method":"session_shutdown"'*)
+      if [ -n "$shutdown_file" ]; then
+        printf '%s\n' "$request" >> "$shutdown_file"
+      fi
+      printf '%s\n' '{"id":3,"kind":"res","method":"session_shutdown","payload":{}}'
+      ;;
+  esac
+done
+if [ -n "$shutdown_file" ]; then
+  printf '%s\n' shutdown >> "$shutdown_file"
+fi
+"#;
 
 #[cfg(unix)]
-fn write_startup_host(
-    directory: &Path,
-    behavior: StartupBehavior,
-) -> Result<(HostSpec, PathBuf, PathBuf), BoxErr> {
-    let script_path = directory.join("startup-host");
-    let pid_path = directory.join("host.pid");
-    let shutdown_path = directory.join("shutdown");
-    let hello_payload = match behavior {
-        StartupBehavior::RejectHandshake => {
-            r#"{"protocolVersion":999,"compatibilityVersion":"rejected"}"#
-        }
-        StartupBehavior::RejectLoad | StartupBehavior::Ready | StartupBehavior::ExitAfterLoad => {
-            r#"{"protocolVersion":1,"compatibilityVersion":"0.80.10"}"#
-        }
-    };
-    let mut script = String::from(
-        "#!/bin/sh\n\
-         pid_file=\"$1\"\n\
-         shutdown_file=\"$2\"\n\
-         printf '%s\\n' \"$$\" > \"$pid_file\"\n\
-         IFS= read -r request || exit 10\n",
-    );
-    writeln!(
-        script,
-        "printf '%s\\n' '{{\"id\":1,\"kind\":\"res\",\"method\":\"hello\",\"payload\":{hello_payload}}}'"
-    )?;
-    match behavior {
-        StartupBehavior::RejectHandshake => {}
-        StartupBehavior::RejectLoad => script.push_str(
-            "IFS= read -r request || exit 11\n\
-             printf '%s\\n' '{\"id\":2,\"kind\":\"res\",\"method\":\"extensions.load\",\"payload\":null}'\n",
-        ),
-        StartupBehavior::Ready => script.push_str(
-            "IFS= read -r request || exit 11\n\
-             printf '%s\\n' '{\"id\":2,\"kind\":\"res\",\"method\":\"extensions.load\",\"payload\":{\"handlers\":[\"session_shutdown\"]}}'\n",
-        ),
-        StartupBehavior::ExitAfterLoad => {
-            script.push_str(
-                "IFS= read -r request || exit 11\n\
-                 printf '%s\\n' '{\"id\":2,\"kind\":\"res\",\"method\":\"extensions.load\",\"payload\":{\"handlers\":[\"session_shutdown\"]}}'\n\
-                 exit 0\n",
-            );
-        }
-    }
-    script.push_str(
-        "while IFS= read -r request; do\n\
-           case \"$request\" in\n\
-             *'\"method\":\"session_shutdown\"'*)\n\
-               printf '%s\\n' \"$request\" >> \"$shutdown_file\"\n\
-               printf '%s\\n' '{\"id\":3,\"kind\":\"res\",\"method\":\"session_shutdown\",\"payload\":{}}'\n\
-               ;;\n\
-           esac\n\
-         done\n\
-         printf '%s\\n' shutdown >> \"$shutdown_file\"\n",
-    );
-    fs::write(&script_path, script)?;
-    let mut permissions = fs::metadata(&script_path)?.permissions();
+#[expect(
+    clippy::expect_used,
+    reason = "fixture creation is irrecoverable; a broken test environment must abort"
+)]
+static STARTUP_HOST_FIXTURE: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+    let directory = tempfile::tempdir().expect("create fixture tempdir");
+    let script_path = directory.path().join("startup-host");
+    fs::write(&script_path, STARTUP_HOST_SCRIPT).expect("write fixture script");
+    let mut permissions = fs::metadata(&script_path)
+        .expect("stat fixture")
+        .permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, permissions)?;
-    let spec = HostSpec {
-        source: HostSource::Env(script_path.clone()),
-        program: script_path,
+    fs::set_permissions(&script_path, permissions).expect("chmod fixture");
+    // Prevent TempDir cleanup so the fixture persists for the process lifetime.
+    let _ = directory.keep();
+    script_path
+});
+
+/// Return the path to the shared immutable startup-host fixture, writing it
+/// once per process on first call.
+#[cfg(unix)]
+pub(crate) fn startup_host() -> PathBuf {
+    STARTUP_HOST_FIXTURE.clone()
+}
+
+/// Build a [`HostSpec`] for the shared fixture with the given behavior and
+/// per-test pid/shutdown paths.
+#[cfg(unix)]
+fn startup_host_spec(behavior: &str, pid_path: &Path, shutdown_path: &Path) -> HostSpec {
+    let fixture = startup_host();
+    HostSpec {
+        source: HostSource::Env(fixture.clone()),
+        program: fixture,
         args: vec![
+            behavior.to_owned(),
             pid_path.to_string_lossy().into_owned(),
             shutdown_path.to_string_lossy().into_owned(),
         ],
-    };
-    Ok((spec, pid_path, shutdown_path))
+    }
 }
 
+/// Poll `kill -0` until the process is reaped (no longer alive), with a
+/// 30-second timeout. Replaces both `assert_host_reaped` and the inline
+/// polling loop in `pump_eof_shuts_down_and_reaps_exactly_once`.
 #[cfg(unix)]
-fn assert_host_shutdown_and_reaped(pid_path: &Path, shutdown_path: &Path) -> R {
-    assert_eq!(fs::read_to_string(shutdown_path)?, "shutdown\n");
-    assert_host_reaped(pid_path)
-}
-
-#[cfg(unix)]
-fn assert_host_reaped(pid_path: &Path) -> R {
-    let pid = fs::read_to_string(pid_path)?;
-    let status = std::process::Command::new("/bin/kill")
-        .args(["-0", pid.trim()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    assert!(!status.success(), "host process {pid:?} was not reaped");
+async fn wait_until_reaped(pid: u32) -> R {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let alive = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| -> BoxErr { format!("host process {pid} was not reaped within 30s").into() })?;
     Ok(())
+}
+
+/// Read the pid file and wait for the process to be reaped.
+#[cfg(unix)]
+async fn wait_pidfile_reaped(pid_path: &Path) -> R {
+    let pid: u32 = fs::read_to_string(pid_path)?
+        .trim()
+        .parse()
+        .map_err(|e| -> BoxErr { format!("invalid pid: {e}").into() })?;
+    wait_until_reaped(pid).await
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn failed_handshake_startup_shuts_down_and_reaps() -> R {
     let directory = tempfile::tempdir()?;
-    let (spec, pid_path, shutdown_path) =
-        write_startup_host(directory.path(), StartupBehavior::RejectHandshake)?;
+    let pid_path = directory.path().join("host.pid");
+    let shutdown_path = directory.path().join("shutdown");
+    let spec = startup_host_spec("reject-handshake", &pid_path, &shutdown_path);
     let error = match HostExtensionRunner::spawn_from(&spec, Vec::new()).await {
         Ok(runner) => {
             runner.shutdown_once().await;
@@ -1298,15 +1352,17 @@ async fn failed_handshake_startup_shuts_down_and_reaps() -> R {
         matches!(error, HostStartError::Handshake(_)),
         "unexpected startup error: {error}"
     );
-    assert_host_shutdown_and_reaped(&pid_path, &shutdown_path)
+    assert_eq!(fs::read_to_string(&shutdown_path)?, "shutdown\n");
+    wait_pidfile_reaped(&pid_path).await
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn failed_load_startup_shuts_down_and_reaps() -> R {
     let directory = tempfile::tempdir()?;
-    let (spec, pid_path, shutdown_path) =
-        write_startup_host(directory.path(), StartupBehavior::RejectLoad)?;
+    let pid_path = directory.path().join("host.pid");
+    let shutdown_path = directory.path().join("shutdown");
+    let spec = startup_host_spec("reject-load", &pid_path, &shutdown_path);
     let error = match HostExtensionRunner::spawn_from(&spec, Vec::new()).await {
         Ok(runner) => {
             runner.shutdown_once().await;
@@ -1318,15 +1374,17 @@ async fn failed_load_startup_shuts_down_and_reaps() -> R {
         matches!(error, HostStartError::Load(_)),
         "unexpected startup error: {error}"
     );
-    assert_host_shutdown_and_reaped(&pid_path, &shutdown_path)
+    assert_eq!(fs::read_to_string(&shutdown_path)?, "shutdown\n");
+    wait_pidfile_reaped(&pid_path).await
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn explicit_process_shutdown_reaps_and_remains_idempotent() -> R {
     let directory = tempfile::tempdir()?;
-    let (spec, pid_path, shutdown_path) =
-        write_startup_host(directory.path(), StartupBehavior::Ready)?;
+    let pid_path = directory.path().join("host.pid");
+    let shutdown_path = directory.path().join("shutdown");
+    let spec = startup_host_spec("ready", &pid_path, &shutdown_path);
     let runner = HostExtensionRunner::spawn_from(&spec, Vec::new()).await?;
     runner.shutdown_once().await;
     runner.shutdown_once().await;
@@ -1340,15 +1398,17 @@ async fn explicit_process_shutdown_reaps_and_remains_idempotent() -> R {
     )
     .await?;
     assert!(!runner.is_running());
-    assert_host_shutdown_and_reaped(&pid_path, &shutdown_path)
+    assert_eq!(fs::read_to_string(&shutdown_path)?, "shutdown\n");
+    wait_pidfile_reaped(&pid_path).await
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn pump_eof_shuts_down_and_reaps_exactly_once() -> R {
     let directory = tempfile::tempdir()?;
-    let (spec, pid_path, shutdown_path) =
-        write_startup_host(directory.path(), StartupBehavior::ExitAfterLoad)?;
+    let pid_path = directory.path().join("host.pid");
+    let shutdown_path = directory.path().join("shutdown");
+    let spec = startup_host_spec("exit-after-load", &pid_path, &shutdown_path);
     let runner = HostExtensionRunner::spawn_from(&spec, Vec::new()).await?;
     let mut errors = runner.subscribe_errors();
 
@@ -1380,23 +1440,7 @@ async fn pump_eof_shuts_down_and_reaps_exactly_once() -> R {
         }
     })
     .await?;
-    // Reap is asynchronous relative to the error broadcast; poll kill -0.
-    let pid = fs::read_to_string(&pid_path)?.trim().to_owned();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let alive = std::process::Command::new("/bin/kill")
-                .args(["-0", &pid])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-            if !alive {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await?;
+    wait_pidfile_reaped(&pid_path).await?;
 
     // Second shutdown is a no-op: the exactly-once latch already fired and
     // the dead transport recorded no session_shutdown hook delivery.
@@ -1430,6 +1474,7 @@ async fn load_request_carries_both_project_trust_values() -> R {
     }
     Ok(())
 }
+
 #[test]
 fn compact_message_updates_omit_growing_snapshot_content() {
     let mut partial = AssistantMessage::new("test-api", "test-provider", "m", 1);
@@ -1636,8 +1681,9 @@ async fn cancelled_after_tool_hook_returns_without_waiting_for_host_timeout() ->
 #[tokio::test]
 async fn shutdown_hook_runs_once_before_transport_reap() -> R {
     let directory = tempfile::tempdir()?;
-    let (spec, pid_path, shutdown_path) =
-        write_startup_host(directory.path(), StartupBehavior::Ready)?;
+    let pid_path = directory.path().join("host.pid");
+    let shutdown_path = directory.path().join("shutdown");
+    let spec = startup_host_spec("ready", &pid_path, &shutdown_path);
     let runner = HostExtensionRunner::spawn_from(&spec, Vec::new()).await?;
     ExtensionRunner::emit(
         runner.as_ref(),
@@ -1662,7 +1708,7 @@ async fn shutdown_hook_runs_once_before_transport_reap() -> R {
     assert_eq!(request.payload["reason"], "quit");
     assert_eq!(request.payload["targetSessionFile"], "/tmp/next.jsonl");
     assert_eq!(lines[1], "shutdown");
-    assert_host_reaped(&pid_path)
+    wait_pidfile_reaped(&pid_path).await
 }
 
 #[tokio::test]
@@ -1718,172 +1764,75 @@ fn real_host_path() -> std::result::Result<std::path::PathBuf, BoxErr> {
         .join("dist")
         .join("pi-extension-host"))
 }
+/// Spawn the compiled JS host through the production `HostClient` spawn path
+/// and verify the real cross-language lifecycle: hello handshake,
+/// extensions.load, registry surfaces via `getAllRegisteredTools` (the load
+/// payload itself is an empty snapshot), plus the specialized hook shapes
+/// that the host maps from `extensions.load`'s `extensionPaths` (the fixtures
+/// register handlers).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn real_host_lifecycle_and_dispatch() -> R {
+    use pi_ext::client::HostNotification;
+    use pi_ext::protocol::Method;
 
-/// RAII guard to ensure the child process and tasks are killed/aborted on exit.
-struct HostGuard {
-    child: tokio::process::Child,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-}
+    let host_path = real_host_path()?;
+    assert!(
+        host_path.is_file(),
+        "compiled host artifact missing: {}",
+        host_path.display()
+    );
 
-impl Drop for HostGuard {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
-}
-
-impl HostGuard {
-    async fn teardown(mut self) {
-        let _ = self.child.kill().await;
-        let _ = self.child.wait().await;
-        for task in self.tasks.drain(..) {
-            task.abort();
-            let _ = task.await;
-        }
-    }
-}
-
-/// In-memory frame collector driven by a channel.
-struct FrameCollector {
-    rx: tokio::sync::mpsc::UnboundedReceiver<Frame>,
-    pending: Vec<Frame>,
-}
-
-impl FrameCollector {
-    fn new(stdout: tokio::process::ChildStdout) -> (Self, tokio::task::JoinHandle<()>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(frame) = decode_frame_str(&line)
-                    && tx.send(frame).is_err()
-                {
-                    break;
-                }
-            }
-        });
-        (
-            Self {
-                rx,
-                pending: Vec::new(),
-            },
-            task,
-        )
-    }
-
-    async fn await_frame_timeout(
-        &mut self,
-        predicate: impl Fn(&Frame) -> bool,
-        timeout: Duration,
-    ) -> std::result::Result<Frame, BoxErr> {
-        if let Some(idx) = self.pending.iter().position(&predicate) {
-            return Ok(self.pending.remove(idx));
-        }
-        let sleep = tokio::time::sleep(timeout);
-        tokio::pin!(sleep);
-
-        loop {
-            tokio::select! {
-                () = &mut sleep => return Err("frame waiter timed out".into()),
-                opt = self.rx.recv() => match opt {
-                    Some(frame) => {
-                        if predicate(&frame) {
-                            return Ok(frame);
-                        }
-                        self.pending.push(frame);
-                    }
-                    None => return Err("frame stream closed".into()),
-                }
-            }
-        }
-    }
-}
-
-/// Write one frame and read lines until a matcher returns Some.
-async fn round_trip(
-    child_stdin: &mut tokio::process::ChildStdin,
-    collector: &mut FrameCollector,
-    request: &Frame,
-) -> std::result::Result<Frame, BoxErr> {
-    let bytes = encode_frame(request)?;
-    child_stdin.write_all(&bytes).await?;
-    child_stdin.flush().await?;
-    collector
-        .await_frame_timeout(
-            |f| f.id == request.id && matches!(f.kind, FrameKind::Res | FrameKind::Error),
-            Duration::from_secs(5),
-        )
-        .await
-}
-
-/// Phase 1: hello handshake — protocol + compatibility version round-trip.
-async fn assert_hello_handshake(
-    stdin: &mut tokio::process::ChildStdin,
-    collector: &mut FrameCollector,
-) -> R {
-    let req = Frame {
-        id: 1,
-        kind: FrameKind::Req,
-        method: "hello".to_owned(),
-        payload: json!({
-            "protocolVersion": pi_ext::protocol::PROTOCOL_VERSION,
-            "compatibilityVersion": pi_ext::protocol::COMPATIBILITY_VERSION,
-        }),
+    let spec = HostSpec {
+        source: HostSource::Env(host_path.clone()),
+        program: host_path,
+        args: vec!["--cwd".to_owned(), ".".to_owned()],
     };
-    let resp = round_trip(stdin, collector, &req).await?;
-    assert_eq!(resp.kind, FrameKind::Res);
-    assert_eq!(resp.method, "hello");
-    let payload = resp.payload.as_object().ok_or("hello payload not object")?;
-    assert_eq!(
-        payload.get("protocolVersion").and_then(Value::as_u64),
-        Some(u64::from(pi_ext::protocol::PROTOCOL_VERSION))
-    );
-    assert_eq!(
-        payload.get("compatibilityVersion").and_then(Value::as_str),
-        Some(pi_ext::protocol::COMPATIBILITY_VERSION)
-    );
-    Ok(())
-}
+    let client =
+        HostClient::spawn(&spec).map_err(|e| -> BoxErr { format!("spawn: {e}").into() })?;
 
-/// Phase 2: extensions.load — hostile + tool fixtures register and report errors.
-async fn assert_extensions_load(
-    stdin: &mut tokio::process::ChildStdin,
-    collector: &mut FrameCollector,
-    workspace_root: &std::path::Path,
-) -> R {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or("workspace root")?;
     let fixtures_root = workspace_root
         .join("packages")
         .join("extension-host")
         .join("fixtures")
         .join("extensions");
-    let req = Frame {
-        id: 2,
-        kind: FrameKind::Req,
-        method: "extensions.load".to_owned(),
-        payload: json!({
-            "extensionPaths": [
-                fixtures_root.join("hostile.ts").to_string_lossy(),
-                fixtures_root.join("all-events.ts").to_string_lossy(),
-                fixtures_root.join("hooks.ts").to_string_lossy(),
-                fixtures_root.join("tool.ts").to_string_lossy(),
-            ],
-            "cwd": workspace_root.to_string_lossy(),
-        }),
-    };
-    let resp = round_trip(stdin, collector, &req).await?;
-    assert_eq!(resp.kind, FrameKind::Res);
-    assert_eq!(resp.method, "extensions.load");
-    let payload = resp.payload.as_object().ok_or("load payload not object")?;
-    let extensions_loaded = payload
+
+    // Phase 1: hello handshake — protocol + compatibility version round-trip
+    // through the production client path.
+    client.handshake().await?;
+
+    // Phase 2: extensions.load — hostile + tool fixtures register and report
+    // errors.
+    let load_resp = client
+        .request_raw(
+            "extensions.load",
+            json!({
+                "extensionPaths": [
+                    fixtures_root.join("hostile.ts").to_string_lossy(),
+                    fixtures_root.join("all-events.ts").to_string_lossy(),
+                    fixtures_root.join("hooks.ts").to_string_lossy(),
+                    fixtures_root.join("tool.ts").to_string_lossy(),
+                ],
+                "cwd": workspace_root.to_string_lossy(),
+            }),
+            Duration::from_secs(10),
+        )
+        .await?;
+    assert_eq!(load_resp.kind, FrameKind::Res);
+    assert_eq!(load_resp.method, "extensions.load");
+    let load_payload = load_resp
+        .payload
+        .as_object()
+        .ok_or("load payload not object")?;
+    let extensions_loaded = load_payload
         .get("extensions")
         .and_then(Value::as_u64)
         .ok_or("extensions.load payload missing `extensions: number`")?;
-    let load_errors = payload
+    let load_errors = load_payload
         .get("errors")
         .and_then(Value::as_array)
         .ok_or("extensions.load payload missing `errors: array`")?;
@@ -1895,63 +1844,47 @@ async fn assert_extensions_load(
         load_errors.iter().all(Value::is_object),
         "errors array must contain objects, got: {load_errors:?}"
     );
-    Ok(())
-}
 
-/// Phases 3–5: `session_start` uiSlot push, sanitized render, integer measure.
-async fn assert_ui_slot_lifecycle(
-    stdin: &mut tokio::process::ChildStdin,
-    collector: &mut FrameCollector,
-) -> R {
-    let session_req = Frame {
-        id: 3,
-        kind: FrameKind::Req,
-        method: "session_start".to_owned(),
-        payload: json!({"type": "session_start", "reason": "startup"}),
-    };
-    let resp = round_trip(stdin, collector, &session_req).await?;
-    assert_eq!(resp.kind, FrameKind::Res);
-    assert_eq!(resp.method, "session_start");
-
-    let slot = collector
-        .await_frame_timeout(
-            |f| {
-                f.method == "uiSlot"
-                    && f.payload.get("key").and_then(Value::as_str) == Some("widget.hostile")
-            },
-            Duration::from_secs(3),
+    // Phase 3: session_start + uiSlot push (unsolicited notification).
+    let mut notifications = client.subscribe_notifications();
+    let session_resp = client
+        .request_raw(
+            "session_start",
+            json!({"type": "session_start", "reason": "startup"}),
+            Duration::from_secs(5),
         )
         .await?;
-    let slot_payload = slot
-        .payload
-        .as_object()
-        .ok_or("uiSlot payload not object")?;
-    assert_eq!(
-        slot_payload.get("placement").and_then(Value::as_str),
-        Some("aboveEditor")
-    );
+    assert_eq!(session_resp.kind, FrameKind::Res);
+    assert_eq!(session_resp.method, "session_start");
+
+    // Wait for the hostile widget's uiSlot push.
+    let slot = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match notifications.recv().await {
+                Ok(HostNotification::UiSlot(slot)) if slot.key == "widget.hostile" => {
+                    return Ok::<_, BoxErr>(slot);
+                }
+                Ok(_) => {}
+                Err(_) => return Err("notification stream closed".into()),
+            }
+        }
+    })
+    .await??;
+    assert_eq!(slot.placement, pi_ext::protocol::SlotPlacement::AboveEditor);
+    assert!(slot.generation > 0);
     assert!(
-        slot_payload
-            .get("generation")
-            .and_then(Value::as_u64)
-            .is_some()
-    );
-    let runs = slot_payload
-        .get("runs")
-        .and_then(Value::as_array)
-        .ok_or("runs missing")?;
-    assert!(
-        !runs.is_empty(),
+        !slot.runs.is_empty(),
         "hostile widget must push at least one sanitized run"
     );
 
-    let render_req = Frame {
-        id: 4,
-        kind: FrameKind::Req,
-        method: "render".to_owned(),
-        payload: json!({"key": "widget.hostile", "width": 80}),
-    };
-    let render_resp = round_trip(stdin, collector, &render_req).await?;
+    // Phase 4: render — sanitized runs must not contain raw ESC.
+    let render_resp = client
+        .request(
+            Method::Render,
+            json!({"key": "widget.hostile", "width": 80}),
+            Duration::from_secs(5),
+        )
+        .await?;
     assert_eq!(render_resp.kind, FrameKind::Res);
     let render_runs = render_resp
         .payload
@@ -1969,13 +1902,14 @@ async fn assert_ui_slot_lifecycle(
         }
     }
 
-    let measure_req = Frame {
-        id: 5,
-        kind: FrameKind::Req,
-        method: "measure".to_owned(),
-        payload: json!({"key": "widget.hostile", "width": 80}),
-    };
-    let measure_resp = round_trip(stdin, collector, &measure_req).await?;
+    // Phase 5: measure — integer height > 0.
+    let measure_resp = client
+        .request(
+            Method::Measure,
+            json!({"key": "widget.hostile", "width": 80}),
+            Duration::from_secs(5),
+        )
+        .await?;
     assert_eq!(measure_resp.kind, FrameKind::Res);
     let height = measure_resp
         .payload
@@ -1984,38 +1918,29 @@ async fn assert_ui_slot_lifecycle(
         .and_then(Value::as_u64)
         .ok_or("measure missing height: u64")?;
     assert!(height > 0, "measure height must be > 0");
-    Ok(())
-}
 
-/// Phases 6–10: `input`, `resources_discover`, `command.execute`, `message_end`, `agent_start`.
-async fn assert_hook_sequence(
-    stdin: &mut tokio::process::ChildStdin,
-    collector: &mut FrameCollector,
-) -> R {
-    let input_req = Frame {
-        id: 6,
-        kind: FrameKind::Req,
-        method: "input".to_owned(),
-        payload: json!({"text": "hi", "source": "interactive"}),
-    };
-    let input_resp = round_trip(stdin, collector, &input_req).await?;
+    // Phase 6: input hook — action must be "continue".
+    let input_resp = client
+        .request_raw(
+            "input",
+            json!({"text": "hi", "source": "interactive"}),
+            Duration::from_secs(5),
+        )
+        .await?;
     assert_eq!(input_resp.kind, FrameKind::Res);
-    let input_payload = input_resp
-        .payload
-        .as_object()
-        .ok_or("input payload not object")?;
     assert_eq!(
-        input_payload.get("action").and_then(Value::as_str),
+        input_resp.payload.get("action").and_then(Value::as_str),
         Some("continue")
     );
 
-    let res_req = Frame {
-        id: 7,
-        kind: FrameKind::Req,
-        method: "resources_discover".to_owned(),
-        payload: json!({"cwd": "/tmp", "reason": "startup"}),
-    };
-    let res_resp = round_trip(stdin, collector, &res_req).await?;
+    // Phase 7: resources_discover — must contain skill/prompt/theme paths.
+    let res_resp = client
+        .request_raw(
+            "resources_discover",
+            json!({"cwd": "/tmp", "reason": "startup"}),
+            Duration::from_secs(5),
+        )
+        .await?;
     assert_eq!(res_resp.kind, FrameKind::Res);
     let res_payload = res_resp
         .payload
@@ -2025,121 +1950,62 @@ async fn assert_hook_sequence(
     assert!(res_payload.contains_key("promptPaths"));
     assert!(res_payload.contains_key("themePaths"));
 
-    let cmd_req = Frame {
-        id: 8,
-        kind: FrameKind::Req,
-        method: "command.execute".to_owned(),
-        payload: json!({"command": "does-not-exist", "args": ""}),
-    };
-    let cmd_resp = round_trip(stdin, collector, &cmd_req).await?;
-    assert_eq!(cmd_resp.kind, FrameKind::Error);
-    assert_eq!(cmd_resp.method, "command.execute");
-    let cmd_err = cmd_resp
-        .payload
-        .as_object()
-        .ok_or("command error not object")?;
-    assert_eq!(
-        cmd_err.get("code").and_then(Value::as_str),
-        Some("not_found")
-    );
-    assert_eq!(
-        cmd_err.get("retryable").and_then(Value::as_bool),
-        Some(false)
-    );
-
-    let msg_req = Frame {
-        id: 9,
-        kind: FrameKind::Req,
-        method: "message_end".to_owned(),
-        payload: json!({"type": "message_end", "message": {"role": "assistant", "content": []}}),
-    };
-    let msg_resp = round_trip(stdin, collector, &msg_req).await?;
+    // Phase 8: command.execute — unknown command must return a not_found
+    // error. The HostClient converts error frames into HostClientError::Remote.
+    match client
+        .request_raw(
+            "command.execute",
+            json!({"command": "does-not-exist", "args": ""}),
+            Duration::from_secs(5),
+        )
+        .await
+    {
+        Ok(_) => return Err("command.execute unexpectedly succeeded".into()),
+        Err(pi_ext::client::HostClientError::Remote { code, message }) => {
+            assert_eq!(
+                code, "not_found",
+                "unexpected error code: {code}: {message}"
+            );
+        }
+        Err(error) => return Err(format!("unexpected error type: {error}").into()),
+    }
+    // Phase 9: message_end — must contain a message field.
+    let msg_resp = client
+        .request_raw(
+            "message_end",
+            json!({"type": "message_end", "message": {"role": "assistant", "content": []}}),
+            Duration::from_secs(5),
+        )
+        .await?;
     assert_eq!(msg_resp.kind, FrameKind::Res);
-    let msg_payload = msg_resp
-        .payload
-        .as_object()
-        .ok_or("message_end payload not object")?;
-    assert!(msg_payload.contains_key("message"));
-
-    let agent_req = Frame {
-        id: 10,
-        kind: FrameKind::Req,
-        method: "agent_start".to_owned(),
-        payload: json!({"type": "agent_start"}),
-    };
-    let agent_resp = round_trip(stdin, collector, &agent_req).await?;
-    assert_eq!(agent_resp.kind, FrameKind::Res);
-    assert_eq!(
-        agent_resp
+    assert!(
+        msg_resp
             .payload
             .as_object()
-            .and_then(|o| o.get("ok"))
-            .and_then(Value::as_bool),
+            .is_some_and(|o| o.contains_key("message"))
+    );
+
+    // Phase 10: agent_start — ok must be true.
+    let agent_resp = client
+        .request_raw(
+            "agent_start",
+            json!({"type": "agent_start"}),
+            Duration::from_secs(5),
+        )
+        .await?;
+    assert_eq!(agent_resp.kind, FrameKind::Res);
+    assert_eq!(
+        agent_resp.payload.get("ok").and_then(Value::as_bool),
         Some(true)
     );
-    Ok(())
-}
 
-/// Spawn the compiled JS host against an empty extension set and verify the
-/// real cross-language lifecycle: hello handshake, extensions.load, registry
-/// surfaces via `getAllRegisteredTools` (the load payload itself is an empty
-/// snapshot), plus the specialized hook shapes that the host maps from
-/// `extensions.load`'s `extensionPaths` (the fixtures register handlers).
-#[tokio::test]
-async fn real_host_lifecycle_and_dispatch() -> R {
-    use tokio::process::Command;
-
-    let host_path = real_host_path()?;
-    assert!(
-        host_path.is_file(),
-        "compiled host artifact missing: {}",
-        host_path.display()
-    );
-
-    let mut command = Command::new(&host_path);
-    command.arg("--cwd").arg(".");
-    command.stdin(std::process::Stdio::piped());
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|e| -> BoxErr { format!("spawn: {e}").into() })?;
-    let mut stdin = child.stdin.take().ok_or("missing stdin")?;
-    let stdout = child.stdout.take().ok_or("missing stdout")?;
-    let stderr = child.stderr.take().ok_or("missing stderr")?;
-
-    let (mut collector, collector_task) = FrameCollector::new(stdout);
-    let stderr_task = tokio::spawn(async move {
-        let mut reader = tokio::io::BufReader::new(stderr).lines();
-        // Drain host stderr without echoing: no logging framework is available
-        // in this crate's test build, and `eprintln!` is disallowed in lib code.
-        while let Ok(Some(_line)) = reader.next_line().await {}
-    });
-
-    let guard = HostGuard {
-        child,
-        tasks: vec![collector_task, stderr_task],
-    };
-
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or("workspace root")?;
-
-    assert_hello_handshake(&mut stdin, &mut collector).await?;
-    assert_extensions_load(&mut stdin, &mut collector, workspace_root).await?;
-    assert_ui_slot_lifecycle(&mut stdin, &mut collector).await?;
-    assert_hook_sequence(&mut stdin, &mut collector).await?;
-
-    // Teardown.
-    guard.teardown().await;
-
+    // Graceful shutdown through the production client path.
+    client.shutdown().await?;
     Ok(())
 }
 
 /// Minimal in-repo reproduction of the E2E `rust-extension-flag-session-start`
 /// marker bug: a real extension must observe the CLI-applied flag value inside
-/// its `session_start` handler, and `resources_discover` must follow it.
 ///
 /// Fails on pre-lifecycle HEAD with an empty log (no emission at bind time).
 #[tokio::test]
