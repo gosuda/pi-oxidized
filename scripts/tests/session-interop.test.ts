@@ -10,7 +10,7 @@ import {
 } from "../verification/session-interop.ts";
 
 const ROOT = resolve(import.meta.dir, "../..");
-const FIXTURES = join(ROOT, ".agent-tasks/pi-rust-rewrite/fixtures/sessions");
+const FIXTURES = join(ROOT, "crates/pi/tests/fixtures/sessions");
 
 test("source-pinned TypeScript pi reopens every generated fixture", async () => {
 	const generated = Bun.spawnSync(["bun", "scripts/generate-session-fixtures.ts"], {

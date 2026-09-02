@@ -1,0 +1,14 @@
+{
+  "count": 9,
+  "fixtures": [
+    "v1/linear-with-compaction.jsonl",
+    "v2/branched.jsonl",
+    "v3/basic.jsonl",
+    "v3/branched-labels.jsonl",
+    "v3/compacted-twice.jsonl",
+    "v3/unknown-entries.jsonl",
+    "v3/forked-header.jsonl",
+    "v3/custom-messages.jsonl",
+    "v3/branched-session.jsonl"
+  ]
+}

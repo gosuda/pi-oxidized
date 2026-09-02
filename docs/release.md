@@ -178,10 +178,10 @@ is a byte-stable no-op when the source has not changed:
 - `scripts/generate-builtin-models.ts` — `crates/pi-ai/data/builtin-models.json`
   from `.references/pi-2.0/packages/ai/src/models.generated.ts`.
 - `scripts/generate-session-fixtures.ts` —
-  `.agent-tasks/pi-rust-rewrite/fixtures/sessions/` from the reference
+  `crates/pi/tests/fixtures/sessions/` from the reference
   `SessionManager` in `.references/pi-2.0`.
 - `scripts/generate-tool-schemas.ts` —
-  `.agent-tasks/pi-rust-rewrite/fixtures/tool-schemas/` from the reference
+  `crates/pi/tests/fixtures/tool-schemas/` from the reference
   tool registry in `.references/pi-2.0`.
 
 ```bash

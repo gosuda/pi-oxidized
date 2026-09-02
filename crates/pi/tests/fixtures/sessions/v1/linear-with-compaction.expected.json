@@ -1,0 +1,576 @@
+{
+  "fixture": "v1/linear-with-compaction",
+  "formatVersion": 1,
+  "normalization": {
+    "sessionId": "00000000-0000-7000-8000-000000000001",
+    "entryIdScheme": "e + 7-digit zero-padded 1-based position among non-header lines",
+    "timestampBase": "2025-01-01T00:00:00.000Z",
+    "timestampScheme": "header = base; non-header line k = base + k seconds; message.timestamp ms = same instant",
+    "cwd": "/tmp/pi-fixtures/cwd",
+    "parentSession": null
+  },
+  "sessionId": "00000000-0000-7000-8000-000000000001",
+  "originalLines": [
+    "{\"type\":\"session\",\"id\":\"00000000-0000-7000-8000-000000000001\",\"timestamp\":\"2025-01-01T00:00:00.000Z\",\"cwd\":\"/tmp/pi-fixtures/cwd\"}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"V1 U1.\",\"timestamp\":1735689601000}}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"V1 A1.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689602000}}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:03.000Z\",\"message\":{\"role\":\"user\",\"content\":\"V1 U2.\",\"timestamp\":1735689603000}}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:04.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"V1 A2.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689604000}}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:05.000Z\",\"message\":{\"role\":\"user\",\"content\":\"V1 U3 kept.\",\"timestamp\":1735689605000}}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:06.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"V1 A3 kept.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689606000}}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:07.000Z\",\"message\":{\"role\":\"user\",\"content\":\"V1 U4 kept.\",\"timestamp\":1735689607000}}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:08.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"V1 A4 kept.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689608000}}",
+    "{\"type\":\"compaction\",\"timestamp\":\"2025-01-01T00:00:09.000Z\",\"summary\":\"V1 linear compaction summary of early turns.\",\"tokensBefore\":54321,\"firstKeptEntryIndex\":5}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:10.000Z\",\"message\":{\"role\":\"user\",\"content\":\"V1 U5 post-compact.\",\"timestamp\":1735689610000}}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:11.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"V1 A5 post-compact.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689611000}}"
+  ],
+  "rewrittenLines": [
+    "{\"type\":\"session\",\"id\":\"00000000-0000-7000-8000-000000000001\",\"timestamp\":\"2025-01-01T00:00:00.000Z\",\"cwd\":\"/tmp/pi-fixtures/cwd\",\"version\":3}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"V1 U1.\",\"timestamp\":1735689601000},\"id\":\"e0000001\",\"parentId\":null}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"V1 A1.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689602000},\"id\":\"e0000002\",\"parentId\":\"e0000001\"}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:03.000Z\",\"message\":{\"role\":\"user\",\"content\":\"V1 U2.\",\"timestamp\":1735689603000},\"id\":\"e0000003\",\"parentId\":\"e0000002\"}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:04.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"V1 A2.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689604000},\"id\":\"e0000004\",\"parentId\":\"e0000003\"}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:05.000Z\",\"message\":{\"role\":\"user\",\"content\":\"V1 U3 kept.\",\"timestamp\":1735689605000},\"id\":\"e0000005\",\"parentId\":\"e0000004\"}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:06.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"V1 A3 kept.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689606000},\"id\":\"e0000006\",\"parentId\":\"e0000005\"}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:07.000Z\",\"message\":{\"role\":\"user\",\"content\":\"V1 U4 kept.\",\"timestamp\":1735689607000},\"id\":\"e0000007\",\"parentId\":\"e0000006\"}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:08.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"V1 A4 kept.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689608000},\"id\":\"e0000008\",\"parentId\":\"e0000007\"}",
+    "{\"type\":\"compaction\",\"timestamp\":\"2025-01-01T00:00:09.000Z\",\"summary\":\"V1 linear compaction summary of early turns.\",\"tokensBefore\":54321,\"id\":\"e0000009\",\"parentId\":\"e0000008\",\"firstKeptEntryId\":\"e0000005\"}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:10.000Z\",\"message\":{\"role\":\"user\",\"content\":\"V1 U5 post-compact.\",\"timestamp\":1735689610000},\"id\":\"e0000010\",\"parentId\":\"e0000009\"}",
+    "{\"type\":\"message\",\"timestamp\":\"2025-01-01T00:00:11.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"V1 A5 post-compact.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689611000},\"id\":\"e0000011\",\"parentId\":\"e0000010\"}"
+  ],
+  "header": {
+    "type": "session",
+    "id": "00000000-0000-7000-8000-000000000001",
+    "timestamp": "2025-01-01T00:00:00.000Z",
+    "cwd": "/tmp/pi-fixtures/cwd",
+    "version": 3
+  },
+  "entries": [
+    {
+      "type": "message",
+      "timestamp": "2025-01-01T00:00:01.000Z",
+      "message": {
+        "role": "user",
+        "content": "V1 U1.",
+        "timestamp": 1735689601000
+      },
+      "id": "e0000001",
+      "parentId": null
+    },
+    {
+      "type": "message",
+      "timestamp": "2025-01-01T00:00:02.000Z",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "V1 A1."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689602000
+      },
+      "id": "e0000002",
+      "parentId": "e0000001"
+    },
+    {
+      "type": "message",
+      "timestamp": "2025-01-01T00:00:03.000Z",
+      "message": {
+        "role": "user",
+        "content": "V1 U2.",
+        "timestamp": 1735689603000
+      },
+      "id": "e0000003",
+      "parentId": "e0000002"
+    },
+    {
+      "type": "message",
+      "timestamp": "2025-01-01T00:00:04.000Z",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "V1 A2."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689604000
+      },
+      "id": "e0000004",
+      "parentId": "e0000003"
+    },
+    {
+      "type": "message",
+      "timestamp": "2025-01-01T00:00:05.000Z",
+      "message": {
+        "role": "user",
+        "content": "V1 U3 kept.",
+        "timestamp": 1735689605000
+      },
+      "id": "e0000005",
+      "parentId": "e0000004"
+    },
+    {
+      "type": "message",
+      "timestamp": "2025-01-01T00:00:06.000Z",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "V1 A3 kept."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689606000
+      },
+      "id": "e0000006",
+      "parentId": "e0000005"
+    },
+    {
+      "type": "message",
+      "timestamp": "2025-01-01T00:00:07.000Z",
+      "message": {
+        "role": "user",
+        "content": "V1 U4 kept.",
+        "timestamp": 1735689607000
+      },
+      "id": "e0000007",
+      "parentId": "e0000006"
+    },
+    {
+      "type": "message",
+      "timestamp": "2025-01-01T00:00:08.000Z",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "V1 A4 kept."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689608000
+      },
+      "id": "e0000008",
+      "parentId": "e0000007"
+    },
+    {
+      "type": "compaction",
+      "timestamp": "2025-01-01T00:00:09.000Z",
+      "summary": "V1 linear compaction summary of early turns.",
+      "tokensBefore": 54321,
+      "id": "e0000009",
+      "parentId": "e0000008",
+      "firstKeptEntryId": "e0000005"
+    },
+    {
+      "type": "message",
+      "timestamp": "2025-01-01T00:00:10.000Z",
+      "message": {
+        "role": "user",
+        "content": "V1 U5 post-compact.",
+        "timestamp": 1735689610000
+      },
+      "id": "e0000010",
+      "parentId": "e0000009"
+    },
+    {
+      "type": "message",
+      "timestamp": "2025-01-01T00:00:11.000Z",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "V1 A5 post-compact."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689611000
+      },
+      "id": "e0000011",
+      "parentId": "e0000010"
+    }
+  ],
+  "tree": [
+    {
+      "entry": {
+        "type": "message",
+        "timestamp": "2025-01-01T00:00:01.000Z",
+        "message": {
+          "role": "user",
+          "content": "V1 U1.",
+          "timestamp": 1735689601000
+        },
+        "id": "e0000001",
+        "parentId": null
+      },
+      "children": [
+        {
+          "entry": {
+            "type": "message",
+            "timestamp": "2025-01-01T00:00:02.000Z",
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "V1 A1."
+                }
+              ],
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "model": "claude-sonnet-4-5",
+              "usage": {
+                "input": 10,
+                "output": 5,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              },
+              "stopReason": "stop",
+              "timestamp": 1735689602000
+            },
+            "id": "e0000002",
+            "parentId": "e0000001"
+          },
+          "children": [
+            {
+              "entry": {
+                "type": "message",
+                "timestamp": "2025-01-01T00:00:03.000Z",
+                "message": {
+                  "role": "user",
+                  "content": "V1 U2.",
+                  "timestamp": 1735689603000
+                },
+                "id": "e0000003",
+                "parentId": "e0000002"
+              },
+              "children": [
+                {
+                  "entry": {
+                    "type": "message",
+                    "timestamp": "2025-01-01T00:00:04.000Z",
+                    "message": {
+                      "role": "assistant",
+                      "content": [
+                        {
+                          "type": "text",
+                          "text": "V1 A2."
+                        }
+                      ],
+                      "api": "anthropic-messages",
+                      "provider": "anthropic",
+                      "model": "claude-sonnet-4-5",
+                      "usage": {
+                        "input": 10,
+                        "output": 5,
+                        "cacheRead": 0,
+                        "cacheWrite": 0
+                      },
+                      "stopReason": "stop",
+                      "timestamp": 1735689604000
+                    },
+                    "id": "e0000004",
+                    "parentId": "e0000003"
+                  },
+                  "children": [
+                    {
+                      "entry": {
+                        "type": "message",
+                        "timestamp": "2025-01-01T00:00:05.000Z",
+                        "message": {
+                          "role": "user",
+                          "content": "V1 U3 kept.",
+                          "timestamp": 1735689605000
+                        },
+                        "id": "e0000005",
+                        "parentId": "e0000004"
+                      },
+                      "children": [
+                        {
+                          "entry": {
+                            "type": "message",
+                            "timestamp": "2025-01-01T00:00:06.000Z",
+                            "message": {
+                              "role": "assistant",
+                              "content": [
+                                {
+                                  "type": "text",
+                                  "text": "V1 A3 kept."
+                                }
+                              ],
+                              "api": "anthropic-messages",
+                              "provider": "anthropic",
+                              "model": "claude-sonnet-4-5",
+                              "usage": {
+                                "input": 10,
+                                "output": 5,
+                                "cacheRead": 0,
+                                "cacheWrite": 0
+                              },
+                              "stopReason": "stop",
+                              "timestamp": 1735689606000
+                            },
+                            "id": "e0000006",
+                            "parentId": "e0000005"
+                          },
+                          "children": [
+                            {
+                              "entry": {
+                                "type": "message",
+                                "timestamp": "2025-01-01T00:00:07.000Z",
+                                "message": {
+                                  "role": "user",
+                                  "content": "V1 U4 kept.",
+                                  "timestamp": 1735689607000
+                                },
+                                "id": "e0000007",
+                                "parentId": "e0000006"
+                              },
+                              "children": [
+                                {
+                                  "entry": {
+                                    "type": "message",
+                                    "timestamp": "2025-01-01T00:00:08.000Z",
+                                    "message": {
+                                      "role": "assistant",
+                                      "content": [
+                                        {
+                                          "type": "text",
+                                          "text": "V1 A4 kept."
+                                        }
+                                      ],
+                                      "api": "anthropic-messages",
+                                      "provider": "anthropic",
+                                      "model": "claude-sonnet-4-5",
+                                      "usage": {
+                                        "input": 10,
+                                        "output": 5,
+                                        "cacheRead": 0,
+                                        "cacheWrite": 0
+                                      },
+                                      "stopReason": "stop",
+                                      "timestamp": 1735689608000
+                                    },
+                                    "id": "e0000008",
+                                    "parentId": "e0000007"
+                                  },
+                                  "children": [
+                                    {
+                                      "entry": {
+                                        "type": "compaction",
+                                        "timestamp": "2025-01-01T00:00:09.000Z",
+                                        "summary": "V1 linear compaction summary of early turns.",
+                                        "tokensBefore": 54321,
+                                        "id": "e0000009",
+                                        "parentId": "e0000008",
+                                        "firstKeptEntryId": "e0000005"
+                                      },
+                                      "children": [
+                                        {
+                                          "entry": {
+                                            "type": "message",
+                                            "timestamp": "2025-01-01T00:00:10.000Z",
+                                            "message": {
+                                              "role": "user",
+                                              "content": "V1 U5 post-compact.",
+                                              "timestamp": 1735689610000
+                                            },
+                                            "id": "e0000010",
+                                            "parentId": "e0000009"
+                                          },
+                                          "children": [
+                                            {
+                                              "entry": {
+                                                "type": "message",
+                                                "timestamp": "2025-01-01T00:00:11.000Z",
+                                                "message": {
+                                                  "role": "assistant",
+                                                  "content": [
+                                                    {
+                                                      "type": "text",
+                                                      "text": "V1 A5 post-compact."
+                                                    }
+                                                  ],
+                                                  "api": "anthropic-messages",
+                                                  "provider": "anthropic",
+                                                  "model": "claude-sonnet-4-5",
+                                                  "usage": {
+                                                    "input": 10,
+                                                    "output": 5,
+                                                    "cacheRead": 0,
+                                                    "cacheWrite": 0
+                                                  },
+                                                  "stopReason": "stop",
+                                                  "timestamp": 1735689611000
+                                                },
+                                                "id": "e0000011",
+                                                "parentId": "e0000010"
+                                              },
+                                              "children": []
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "context": {
+    "messages": [
+      {
+        "role": "compactionSummary",
+        "summary": "V1 linear compaction summary of early turns.",
+        "tokensBefore": 54321,
+        "timestamp": 1735689609000
+      },
+      {
+        "role": "user",
+        "content": "V1 U3 kept.",
+        "timestamp": 1735689605000
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "V1 A3 kept."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689606000
+      },
+      {
+        "role": "user",
+        "content": "V1 U4 kept.",
+        "timestamp": 1735689607000
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "V1 A4 kept."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689608000
+      },
+      {
+        "role": "user",
+        "content": "V1 U5 post-compact.",
+        "timestamp": 1735689610000
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "V1 A5 post-compact."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689611000
+      }
+    ],
+    "thinkingLevel": "off",
+    "model": {
+      "provider": "anthropic",
+      "modelId": "claude-sonnet-4-5"
+    }
+  },
+  "labels": {},
+  "name": null,
+  "leaf": "e0000011"
+}

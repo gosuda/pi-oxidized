@@ -1,0 +1,297 @@
+{
+  "fixture": "v3/unknown-entries",
+  "formatVersion": 3,
+  "normalization": {
+    "sessionId": "00000000-0000-7000-8000-000000000006",
+    "entryIdScheme": "e + 7-digit zero-padded 1-based position among non-header lines",
+    "timestampBase": "2025-01-01T00:00:00.000Z",
+    "timestampScheme": "header = base; non-header line k = base + k seconds; message.timestamp ms = same instant",
+    "cwd": "/tmp/pi-fixtures/cwd",
+    "parentSession": null
+  },
+  "sessionId": "00000000-0000-7000-8000-000000000006",
+  "originalLines": [
+    "{\"type\":\"session\",\"version\":3,\"id\":\"00000000-0000-7000-8000-000000000006\",\"timestamp\":\"2025-01-01T00:00:00.000Z\",\"cwd\":\"/tmp/pi-fixtures/cwd\"}",
+    "{\"type\":\"message\",\"id\":\"e0000001\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"Before unknown entry.\",\"timestamp\":1735689601000}}",
+    "{\"type\":\"message\",\"id\":\"e0000002\",\"parentId\":\"e0000001\",\"timestamp\":\"2025-01-01T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Reply before unknown.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689602000}}",
+    "{\"type\":\"future_thing\",\"id\":\"e0000003\",\"parentId\":\"e0000002\",\"timestamp\":\"2025-01-01T00:00:03.000Z\",\"payload\":{\"kind\":\"quantum-annotations\",\"nested\":{\"values\":[1,2,3],\"flag\":true}},\"enabled\":true}",
+    "{\"type\":\"message\",\"id\":\"e0000004\",\"parentId\":\"e0000003\",\"timestamp\":\"2025-01-01T00:00:04.000Z\",\"message\":{\"role\":\"user\",\"content\":\"After unknown entry.\",\"timestamp\":1735689604000}}",
+    "{\"type\":\"message\",\"id\":\"e0000005\",\"parentId\":\"e0000004\",\"timestamp\":\"2025-01-01T00:00:05.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Reply after unknown.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689605000}}"
+  ],
+  "header": {
+    "type": "session",
+    "version": 3,
+    "id": "00000000-0000-7000-8000-000000000006",
+    "timestamp": "2025-01-01T00:00:00.000Z",
+    "cwd": "/tmp/pi-fixtures/cwd"
+  },
+  "entries": [
+    {
+      "type": "message",
+      "id": "e0000001",
+      "parentId": null,
+      "timestamp": "2025-01-01T00:00:01.000Z",
+      "message": {
+        "role": "user",
+        "content": "Before unknown entry.",
+        "timestamp": 1735689601000
+      }
+    },
+    {
+      "type": "message",
+      "id": "e0000002",
+      "parentId": "e0000001",
+      "timestamp": "2025-01-01T00:00:02.000Z",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Reply before unknown."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689602000
+      }
+    },
+    {
+      "type": "future_thing",
+      "id": "e0000003",
+      "parentId": "e0000002",
+      "timestamp": "2025-01-01T00:00:03.000Z",
+      "payload": {
+        "kind": "quantum-annotations",
+        "nested": {
+          "values": [
+            1,
+            2,
+            3
+          ],
+          "flag": true
+        }
+      },
+      "enabled": true
+    },
+    {
+      "type": "message",
+      "id": "e0000004",
+      "parentId": "e0000003",
+      "timestamp": "2025-01-01T00:00:04.000Z",
+      "message": {
+        "role": "user",
+        "content": "After unknown entry.",
+        "timestamp": 1735689604000
+      }
+    },
+    {
+      "type": "message",
+      "id": "e0000005",
+      "parentId": "e0000004",
+      "timestamp": "2025-01-01T00:00:05.000Z",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Reply after unknown."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689605000
+      }
+    }
+  ],
+  "tree": [
+    {
+      "entry": {
+        "type": "message",
+        "id": "e0000001",
+        "parentId": null,
+        "timestamp": "2025-01-01T00:00:01.000Z",
+        "message": {
+          "role": "user",
+          "content": "Before unknown entry.",
+          "timestamp": 1735689601000
+        }
+      },
+      "children": [
+        {
+          "entry": {
+            "type": "message",
+            "id": "e0000002",
+            "parentId": "e0000001",
+            "timestamp": "2025-01-01T00:00:02.000Z",
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Reply before unknown."
+                }
+              ],
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "model": "claude-sonnet-4-5",
+              "usage": {
+                "input": 10,
+                "output": 5,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              },
+              "stopReason": "stop",
+              "timestamp": 1735689602000
+            }
+          },
+          "children": [
+            {
+              "entry": {
+                "type": "future_thing",
+                "id": "e0000003",
+                "parentId": "e0000002",
+                "timestamp": "2025-01-01T00:00:03.000Z",
+                "payload": {
+                  "kind": "quantum-annotations",
+                  "nested": {
+                    "values": [
+                      1,
+                      2,
+                      3
+                    ],
+                    "flag": true
+                  }
+                },
+                "enabled": true
+              },
+              "children": [
+                {
+                  "entry": {
+                    "type": "message",
+                    "id": "e0000004",
+                    "parentId": "e0000003",
+                    "timestamp": "2025-01-01T00:00:04.000Z",
+                    "message": {
+                      "role": "user",
+                      "content": "After unknown entry.",
+                      "timestamp": 1735689604000
+                    }
+                  },
+                  "children": [
+                    {
+                      "entry": {
+                        "type": "message",
+                        "id": "e0000005",
+                        "parentId": "e0000004",
+                        "timestamp": "2025-01-01T00:00:05.000Z",
+                        "message": {
+                          "role": "assistant",
+                          "content": [
+                            {
+                              "type": "text",
+                              "text": "Reply after unknown."
+                            }
+                          ],
+                          "api": "anthropic-messages",
+                          "provider": "anthropic",
+                          "model": "claude-sonnet-4-5",
+                          "usage": {
+                            "input": 10,
+                            "output": 5,
+                            "cacheRead": 0,
+                            "cacheWrite": 0
+                          },
+                          "stopReason": "stop",
+                          "timestamp": 1735689605000
+                        }
+                      },
+                      "children": []
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "context": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Before unknown entry.",
+        "timestamp": 1735689601000
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Reply before unknown."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689602000
+      },
+      {
+        "role": "user",
+        "content": "After unknown entry.",
+        "timestamp": 1735689604000
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Reply after unknown."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689605000
+      }
+    ],
+    "thinkingLevel": "off",
+    "model": {
+      "provider": "anthropic",
+      "modelId": "claude-sonnet-4-5"
+    }
+  },
+  "labels": {},
+  "name": null,
+  "leaf": "e0000005"
+}

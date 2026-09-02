@@ -7,7 +7,7 @@
  * fetches are forbidden; runtime Rust never needs Bun.
  *
  * Emits:
- *   .agent-tasks/pi-rust-rewrite/fixtures/sessions/
+ *   crates/pi/tests/fixtures/sessions/
  *     v1/linear-with-compaction.jsonl
  *     v2/branched.jsonl
  *     v3/{basic,branched-labels,compacted-twice,unknown-entries,
@@ -36,7 +36,7 @@
  * Usage: bun scripts/generate-session-fixtures.ts
  */
 
-import { access, mkdir, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import {
 	appendFileSync,
 	constants as fsConstants,
@@ -66,7 +66,7 @@ const REF_SESSION_MANAGER = join(
 const REF_UUID = join(REF_ROOT, "packages/ai/src/utils/uuid.ts");
 const OUT_DIR = join(
 	REPO_ROOT,
-	".agent-tasks/pi-rust-rewrite/fixtures/sessions",
+	"crates/pi/tests/fixtures/sessions",
 );
 
 // ---------------------------------------------------------------------------
@@ -1750,12 +1750,22 @@ export interface GenerateSessionFixturesOptions {
 	outDir?: string;
 	/** Fixture set override (tests); defaults to the nine scenarios. */
 	fixtures?: BuiltFixture[];
+	/**
+	 * Check mode: compare on-disk files against generated content without
+	 * writing to the repository. Candidate derivation still runs the
+	 * session-manager pipeline in its own temp scratch directory (that
+	 * roundtrip is how fixture content is produced); the output tree is
+	 * read-only in this mode.
+	 */
+	check?: boolean;
 }
 
 export interface GenerateSessionFixturesResult {
 	outDir: string;
 	results: WriteResult[];
 	pruned: string[];
+	/** Stale file list (check mode only). */
+	stale?: string[];
 }
 
 function buildDefaultFixtures(workRoot: string): BuiltFixture[] {
@@ -1794,6 +1804,7 @@ export async function generateSessionFixtures(
 	const outDir = options.outDir ?? OUT_DIR;
 	const workRoot = mkdtempSync(join(tmpdir(), "pi-session-fixtures-"));
 	const results: WriteResult[] = [];
+	const stale: string[] = [];
 
 	try {
 		const fixtures = options.fixtures ?? buildDefaultFixtures(workRoot);
@@ -1824,9 +1835,19 @@ export async function generateSessionFixtures(
 				outDir,
 				built.rel.replace(/\.jsonl$/, ".expected.json"),
 			);
+			const jsonlContent = `${built.lines.join("\n")}\n`;
+			const expectedContent = encodeExpected(expected);
 
-			await writeAtomically(jsonlPath, `${built.lines.join("\n")}\n`);
-			await writeAtomically(expectedPath, encodeExpected(expected));
+			if (options.check) {
+				const jsonlOnDisk = await readFile(jsonlPath, "utf8").catch(() => null);
+				const expectedOnDisk = await readFile(expectedPath, "utf8").catch(() => null);
+				if (jsonlOnDisk !== jsonlContent) stale.push(built.rel);
+				if (expectedOnDisk !== expectedContent)
+					stale.push(built.rel.replace(/\.jsonl$/, ".expected.json"));
+			} else {
+				await writeAtomically(jsonlPath, jsonlContent);
+				await writeAtomically(expectedPath, expectedContent);
+			}
 
 			results.push({
 				rel: built.rel,
@@ -1844,6 +1865,21 @@ export async function generateSessionFixtures(
 		}
 	}
 
+	const manifest = {
+		count: results.length,
+		fixtures: results.map((r) => r.rel),
+	};
+	const manifestContent = `${JSON.stringify(manifest, null, 2)}\n`;
+
+	if (options.check) {
+		const manifestOnDisk = await readFile(
+			join(outDir, FIXTURE_MANIFEST_NAME),
+			"utf8",
+		).catch(() => null);
+		if (manifestOnDisk !== manifestContent) stale.push(FIXTURE_MANIFEST_NAME);
+		return { outDir, results, pruned: [], stale };
+	}
+
 	// Prune stale generator-owned pairs only after every current pair was
 	// written successfully; publish the manifest only after pruning. OUT_DIR
 	// is never deleted: a failed run leaves the previous complete tree and
@@ -1856,20 +1892,28 @@ export async function generateSessionFixtures(
 	// Authoritative manifest: the Rust interop test reads this at runtime
 	// instead of scraping the generator source, so the expected fixture
 	// count always reflects what was actually written to disk.
-	const manifest = {
-		count: results.length,
-		fixtures: results.map((r) => r.rel),
-	};
 	await writeAtomically(
 		join(outDir, FIXTURE_MANIFEST_NAME),
-		`${JSON.stringify(manifest, null, 2)}\n`,
+		manifestContent,
 	);
 
 	return { outDir, results, pruned };
 }
 
 async function main(): Promise<void> {
-	const { outDir, results, pruned } = await generateSessionFixtures();
+	const check = process.argv.includes("--check");
+	const { outDir, results, pruned, stale } = await generateSessionFixtures({ check });
+
+	if (check) {
+		if (stale && stale.length > 0) {
+			process.stderr.write(
+				`stale session fixtures under ${outDir}:\n${stale.map((f) => `  ${f}`).join("\n")}\n`,
+			);
+			process.exit(1);
+		}
+		process.stdout.write(`SESSION_FIXTURES_FRESH ${outDir}\n`);
+		return;
+	}
 
 	// Summary
 	const totalJsonl = results.length;

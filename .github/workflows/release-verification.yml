@@ -171,6 +171,12 @@ jobs:
 
       # The full correctness and same-machine performance signal runs once;
       # the remaining four jobs stay focused on target-specific packaging.
+      # Freshness gate first: it must see the committed bytes, before any
+      # generator step could repair a stale checkout in the CI workspace.
+      - name: Verify fixtures are fresh
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: bun run check:fixtures
+
       - name: Generate session fixtures
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: bun run scripts/generate-session-fixtures.ts

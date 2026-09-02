@@ -2482,8 +2482,7 @@ mod tests {
                 }
             }
         }
-        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.agent-tasks/pi-rust-rewrite/fixtures/sessions");
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sessions");
         // The verification harness sets PI_SESSION_INTEROP_OUTPUT so TypeScript
         // can reopen the Rust-produced files afterwards. When unset (plain
         // `cargo test`), fall back to a fresh per-run directory under the crate

@@ -425,9 +425,7 @@ mod tests {
     use tokio::sync::Barrier;
 
     fn fixture_schema() -> Result<Value, serde_json::Error> {
-        let text = include_str!(
-            "../../../../../.agent-tasks/pi-rust-rewrite/fixtures/tool-schemas/edit.json"
-        );
+        let text = include_str!("../../../tests/fixtures/tool-schemas/edit.json");
         serde_json::from_str(text)
     }
 

@@ -124,8 +124,8 @@ Do not hand-edit generated files. Always regenerate them using their owning scri
 | Generated File | Owning Script | Source of Truth |
 | --- | --- | --- |
 | `crates/pi-ai/data/builtin-models.json` | `scripts/generate-builtin-models.ts` | `.references/pi-2.0/packages/ai/src/models.generated.ts` |
-| `.agent-tasks/pi-rust-rewrite/fixtures/tool-schemas/*.json` | `scripts/generate-tool-schemas.ts` | `.references/pi-2.0/packages/coding-agent/src/core/tools/index.ts` |
-| `.agent-tasks/pi-rust-rewrite/fixtures/sessions/**` | `scripts/generate-session-fixtures.ts` | `.references/pi-2.0/packages/coding-agent/src/core/session-manager.ts` |
+| `crates/pi/tests/fixtures/tool-schemas/*.json` | `scripts/generate-tool-schemas.ts` | `.references/pi-2.0/packages/coding-agent/src/core/tools/index.ts` |
+| `crates/pi/tests/fixtures/sessions/**` | `scripts/generate-session-fixtures.ts` | `.references/pi-2.0/packages/coding-agent/src/core/session-manager.ts` |
 
 Run a generator with Bun:
 ```bash

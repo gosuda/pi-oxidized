@@ -14,7 +14,7 @@ import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-i
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
 const FIXTURES = join(
 	REPO_ROOT,
-	".agent-tasks/pi-rust-rewrite/fixtures/sessions",
+	"crates/pi/tests/fixtures/sessions",
 );
 const OUTPUT = join(REPO_ROOT, "target/verification/session-interop");
 // Canonical pi-2.0 module map — what canonical session-manager.ts actually pulls in:

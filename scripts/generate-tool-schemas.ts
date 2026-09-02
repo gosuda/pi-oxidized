@@ -9,7 +9,7 @@
  * (read, bash, edit, write, grep, find, ls). The generator selects those seven
  * from the canonical registry, fails when any required tool is absent, and
  * tolerates reference-only platform tools such as `powershell`. Output lands in
- * `.agent-tasks/pi-rust-rewrite/fixtures/tool-schemas/<tool>.json`.
+ * `crates/pi/tests/fixtures/tool-schemas/<tool>.json`.
  *
  * The TypeBox version determines the emitted JSON, so bare `typebox` imports are
  * pinned via a Bun resolve plugin to the exact version declared by the reference
@@ -55,7 +55,7 @@ const REFERENCE_TYPEBOX_DIRS = [
 	join(REFERENCE_ROOT, "packages/coding-agent/node_modules/typebox"),
 	join(REFERENCE_ROOT, "node_modules/typebox"),
 ] as const;
-const OUTPUT_DIR = join(REPO_ROOT, ".agent-tasks/pi-rust-rewrite/fixtures/tool-schemas");
+const OUTPUT_DIR = join(REPO_ROOT, "crates/pi/tests/fixtures/tool-schemas");
 
 /** The Rust surface owns these portable tools even when the reference adds platform-only tools. */
 export const REQUIRED_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
@@ -445,9 +445,32 @@ async function writeAtomically(path: string, contents: string, counter: number):
 }
 
 async function main(): Promise<void> {
+	const check = process.argv.includes("--check");
 	const { definitions, typeboxPin, typeboxEntry } = await loadCanonicalToolRegistry();
 	const parametersByTool = selectPortableToolParameters(definitions);
 	const { encodedByTool, strippedTotals } = buildEncodedSchemas(parametersByTool);
+
+	if (check) {
+		const stale: string[] = [];
+		for (const name of REQUIRED_TOOL_NAMES) {
+			const encoded = encodedByTool[name];
+			if (encoded === undefined) {
+				fail(`internal error: missing encoded schema for ${name}`);
+			}
+			const onDisk = await readFile(join(OUTPUT_DIR, `${name}.json`), "utf8").catch(
+				() => null,
+			);
+			if (onDisk !== encoded) stale.push(`${name}.json`);
+		}
+		if (stale.length > 0) {
+			process.stderr.write(
+				`stale tool schemas under ${OUTPUT_DIR}:\n${stale.map((f) => `  ${f}`).join("\n")}\n`,
+			);
+			process.exit(1);
+		}
+		process.stdout.write(`TOOL_SCHEMAS_FRESH ${OUTPUT_DIR}\n`);
+		return;
+	}
 
 	await mkdir(OUTPUT_DIR, { recursive: true });
 	const summaryLines: string[] = [];
@@ -474,7 +497,7 @@ async function main(): Promise<void> {
 	const strippedReport = Object.keys(strippedTotals)
 		.sort()
 		.map((key) => `${key}=${strippedTotals[key]}`)
-	.join(" ");
+		.join(" ");
 	process.stdout.write(
 		[
 			`Wrote ${REQUIRED_TOOL_NAMES.length} tool schemas to ${OUTPUT_DIR}`,

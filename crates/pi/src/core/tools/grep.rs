@@ -710,9 +710,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn fixture_schema() -> Result<Value, serde_json::Error> {
-        let text = include_str!(
-            "../../../../../.agent-tasks/pi-rust-rewrite/fixtures/tool-schemas/grep.json"
-        );
+        let text = include_str!("../../../tests/fixtures/tool-schemas/grep.json");
         serde_json::from_str(text)
     }
 

@@ -1,0 +1,256 @@
+{
+  "fixture": "v3/basic",
+  "formatVersion": 3,
+  "normalization": {
+    "sessionId": "00000000-0000-7000-8000-000000000003",
+    "entryIdScheme": "e + 7-digit zero-padded 1-based position among non-header lines",
+    "timestampBase": "2025-01-01T00:00:00.000Z",
+    "timestampScheme": "header = base; non-header line k = base + k seconds; message.timestamp ms = same instant",
+    "cwd": "/tmp/pi-fixtures/cwd",
+    "parentSession": null
+  },
+  "sessionId": "00000000-0000-7000-8000-000000000003",
+  "originalLines": [
+    "{\"type\":\"session\",\"version\":3,\"id\":\"00000000-0000-7000-8000-000000000003\",\"timestamp\":\"2025-01-01T00:00:00.000Z\",\"cwd\":\"/tmp/pi-fixtures/cwd\"}",
+    "{\"type\":\"message\",\"id\":\"e0000001\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"What is 2+2?\",\"timestamp\":1735689601000}}",
+    "{\"type\":\"message\",\"id\":\"e0000002\",\"parentId\":\"e0000001\",\"timestamp\":\"2025-01-01T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"2+2 = 4.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689602000}}",
+    "{\"type\":\"message\",\"id\":\"e0000003\",\"parentId\":\"e0000002\",\"timestamp\":\"2025-01-01T00:00:03.000Z\",\"message\":{\"role\":\"user\",\"content\":\"And 3+3?\",\"timestamp\":1735689603000}}",
+    "{\"type\":\"message\",\"id\":\"e0000004\",\"parentId\":\"e0000003\",\"timestamp\":\"2025-01-01T00:00:04.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"3+3 = 6.\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":5,\"cacheRead\":0,\"cacheWrite\":0},\"stopReason\":\"stop\",\"timestamp\":1735689604000}}"
+  ],
+  "header": {
+    "type": "session",
+    "version": 3,
+    "id": "00000000-0000-7000-8000-000000000003",
+    "timestamp": "2025-01-01T00:00:00.000Z",
+    "cwd": "/tmp/pi-fixtures/cwd"
+  },
+  "entries": [
+    {
+      "type": "message",
+      "id": "e0000001",
+      "parentId": null,
+      "timestamp": "2025-01-01T00:00:01.000Z",
+      "message": {
+        "role": "user",
+        "content": "What is 2+2?",
+        "timestamp": 1735689601000
+      }
+    },
+    {
+      "type": "message",
+      "id": "e0000002",
+      "parentId": "e0000001",
+      "timestamp": "2025-01-01T00:00:02.000Z",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "2+2 = 4."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689602000
+      }
+    },
+    {
+      "type": "message",
+      "id": "e0000003",
+      "parentId": "e0000002",
+      "timestamp": "2025-01-01T00:00:03.000Z",
+      "message": {
+        "role": "user",
+        "content": "And 3+3?",
+        "timestamp": 1735689603000
+      }
+    },
+    {
+      "type": "message",
+      "id": "e0000004",
+      "parentId": "e0000003",
+      "timestamp": "2025-01-01T00:00:04.000Z",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "3+3 = 6."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689604000
+      }
+    }
+  ],
+  "tree": [
+    {
+      "entry": {
+        "type": "message",
+        "id": "e0000001",
+        "parentId": null,
+        "timestamp": "2025-01-01T00:00:01.000Z",
+        "message": {
+          "role": "user",
+          "content": "What is 2+2?",
+          "timestamp": 1735689601000
+        }
+      },
+      "children": [
+        {
+          "entry": {
+            "type": "message",
+            "id": "e0000002",
+            "parentId": "e0000001",
+            "timestamp": "2025-01-01T00:00:02.000Z",
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "2+2 = 4."
+                }
+              ],
+              "api": "anthropic-messages",
+              "provider": "anthropic",
+              "model": "claude-sonnet-4-5",
+              "usage": {
+                "input": 10,
+                "output": 5,
+                "cacheRead": 0,
+                "cacheWrite": 0
+              },
+              "stopReason": "stop",
+              "timestamp": 1735689602000
+            }
+          },
+          "children": [
+            {
+              "entry": {
+                "type": "message",
+                "id": "e0000003",
+                "parentId": "e0000002",
+                "timestamp": "2025-01-01T00:00:03.000Z",
+                "message": {
+                  "role": "user",
+                  "content": "And 3+3?",
+                  "timestamp": 1735689603000
+                }
+              },
+              "children": [
+                {
+                  "entry": {
+                    "type": "message",
+                    "id": "e0000004",
+                    "parentId": "e0000003",
+                    "timestamp": "2025-01-01T00:00:04.000Z",
+                    "message": {
+                      "role": "assistant",
+                      "content": [
+                        {
+                          "type": "text",
+                          "text": "3+3 = 6."
+                        }
+                      ],
+                      "api": "anthropic-messages",
+                      "provider": "anthropic",
+                      "model": "claude-sonnet-4-5",
+                      "usage": {
+                        "input": 10,
+                        "output": 5,
+                        "cacheRead": 0,
+                        "cacheWrite": 0
+                      },
+                      "stopReason": "stop",
+                      "timestamp": 1735689604000
+                    }
+                  },
+                  "children": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "context": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?",
+        "timestamp": 1735689601000
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "2+2 = 4."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689602000
+      },
+      {
+        "role": "user",
+        "content": "And 3+3?",
+        "timestamp": 1735689603000
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "3+3 = 6."
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "usage": {
+          "input": 10,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "stopReason": "stop",
+        "timestamp": 1735689604000
+      }
+    ],
+    "thinkingLevel": "off",
+    "model": {
+      "provider": "anthropic",
+      "modelId": "claude-sonnet-4-5"
+    }
+  },
+  "labels": {},
+  "name": null,
+  "leaf": "e0000004"
+}
