@@ -37,7 +37,7 @@ use crate::terminal::probe::{probe_collect_replies_with_yield, probe_write_batch
 /// `EventStream` reader.
 ///
 /// The caller creates and activates the [`TerminalGuard`] (installing a
-/// product-specific panic hook first), then hands it to [`begin`]. The
+/// product-specific panic hook first), then hands it to [`Self::begin`]. The
 /// session takes ownership and drives the probe → input handoff, editor
 /// suspend/resume, and shutdown restore.
 /// The probe collector's join result: discovered capabilities plus any
@@ -103,7 +103,7 @@ impl<W: Write> TerminalSession<W> {
     /// capabilities and probe-window keystroke events for product adoption.
     ///
     /// Does NOT start the reader — the caller must queue the pending events
-    /// into its own reinject queue first, then call [`start_input`].
+    /// into its own reinject queue first, then call [`Self::start_input`].
     /// `fallback_caps` is returned when no probe task was spawned (stdin
     /// is not a terminal).
     ///
@@ -126,7 +126,7 @@ impl<W: Write> TerminalSession<W> {
         }
     }
 
-    /// Start the `EventStream` reader. Call only after [`finish_probe`] and
+    /// Start the `EventStream` reader. Call only after [`Self::finish_probe`] and
     /// after the product has queued probe-window events into its reinject
     /// queue — the reader becomes the sole stdin owner from this point.
     pub fn start_input(&mut self, input: &mut TerminalInput) {
@@ -135,7 +135,7 @@ impl<W: Write> TerminalSession<W> {
 
     /// Pause the input reader and restore terminal modes for an external
     /// editor. The product runs the editor between this and
-    /// [`resume_from_editor`].
+    /// [`Self::resume_from_editor`].
     ///
     /// # Errors
     ///

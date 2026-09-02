@@ -67,7 +67,7 @@ impl KeyEventType {
 /// Whether a key event should be delivered to a focused component.
 ///
 /// Release events are filtered unless the focused component registered for
-/// them (TS `wantsKeyRelease` / `FocusManager` `subscribe_release`).
+/// them (TS `wantsKeyRelease` / host focus-manager `subscribe_release`).
 #[must_use]
 pub fn should_dispatch_key_event(event: &KeyEvent, wants_key_release: bool) -> bool {
     match event.kind {

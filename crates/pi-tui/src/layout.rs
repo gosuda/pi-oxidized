@@ -235,7 +235,7 @@ impl<'de> Deserialize<'de> for OverlayMargin {
 /// Serializable overlay layout specification (Phase 6 `uiSlot` value type).
 ///
 /// Field names are camelCase on the wire. The host-side `visible` callback is
-/// **not** part of this type — see [`crate::overlay::OverlayOptions`].
+/// not part of this type; hosts decide visibility before sending a slot.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct OverlaySpec {
