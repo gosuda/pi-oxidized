@@ -3934,9 +3934,12 @@ mod tests {
     #[test]
     fn extension_production_has_no_pi_ext_symbols() {
         let source = include_str!("extension.rs");
-        // A missing marker scans the whole file — the test module's wire
-        // emitters then fail the assertion, so strictness is preserved.
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        // No #[cfg(test)] marker: the test module is then inside the
+        // scanned region, so its wire emitters must fail the assert.
+        let production = match source.split_once("#[cfg(test)]") {
+            Some((before, _)) => before,
+            None => source,
+        };
         assert!(
             !production.contains("pi_ext"),
             "ARC13 violation: agent_session/extension.rs production code \
