@@ -5,6 +5,7 @@ pub mod caps;
 pub mod guard;
 pub mod input;
 pub mod probe;
+pub mod session;
 pub mod sink;
 pub mod writer;
 
@@ -24,8 +25,9 @@ pub use probe::{
     PROBE_FRAGMENT_TIMEOUT, ProbeFeed, ProbeReply, ProbeSession, TerminalTheme,
     background_from_replies, classify_background, detect_terminal_theme, osc_11_query,
     probe_background, probe_background_from_chunks, probe_collect_replies, probe_query_batch,
-    probe_write_batch, reinject_bytes_as_events,
+    reinject_bytes_as_events,
 };
+pub use session::TerminalSession;
 pub use sink::FrameSink;
 pub use writer::{
     COALESCE_WINDOW, Coalescer, ReanchorCause, SettledBlock, SimulatedTxn, TransactionRecorder,

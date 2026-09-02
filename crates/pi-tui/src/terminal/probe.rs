@@ -105,7 +105,7 @@ pub fn detect_terminal_theme(osc_dark: Option<bool>, colorfgbg: Option<&str>) ->
 /// # Errors
 ///
 /// Returns [`io::Error`] when writing or flushing the probe batch fails.
-pub fn probe_write_batch<W: Write>(output: &mut W) -> io::Result<bool> {
+pub(crate) fn probe_write_batch<W: Write>(output: &mut W) -> io::Result<bool> {
     if !io::stdin().is_terminal() {
         return Ok(false);
     }
@@ -143,7 +143,7 @@ pub fn probe_collect_replies(caps: &mut TerminalCapabilities) -> io::Result<Vec<
 /// # Errors
 ///
 /// Returns [`io::Error`] when reading stdin fails.
-pub fn probe_collect_replies_with_yield(
+pub(crate) fn probe_collect_replies_with_yield(
     caps: &mut TerminalCapabilities,
     yield_now: &AtomicBool,
 ) -> io::Result<Vec<UiEvent>> {

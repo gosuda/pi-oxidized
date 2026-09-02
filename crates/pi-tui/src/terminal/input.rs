@@ -56,7 +56,7 @@ impl TerminalInput {
     /// back with this handle. [`Self::pause`] and [`Self::resume`] must not
     /// be called before `start`.
     #[must_use]
-    pub fn deferred() -> Self {
+    pub(crate) fn deferred() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         Self {
@@ -72,7 +72,7 @@ impl TerminalInput {
     /// No-op when the reader is already running. Only one reader may exist
     /// for the process while interactive; call only once nothing else reads
     /// stdin (after the probe collector joined).
-    pub fn start(&mut self) {
+    pub(crate) fn start(&mut self) {
         if let Some(control_rx) = self.control_rx.take() {
             tokio::spawn(input_task(self.tx.clone(), control_rx));
         }

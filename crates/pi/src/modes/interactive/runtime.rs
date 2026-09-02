@@ -21,7 +21,7 @@
 //!    On `settle`: emits [`Txn::Settle`] containing the scrollback block and
 //!    the inline redraw in one stage-3 write.
 //! 6. On `Suspend` / `Exit` / fatal I/O failure: restores terminal modes via
-//!    the [`TerminalGuard`] (owned by the caller) and returns.
+//!    the [`TerminalSession`] (owned by the caller) and returns.
 //!
 //! The runtime is generic over the writer `W` (so tests can inject a
 //! [`std::io::Cursor`]`<`[`Vec`]`<u8>>` or
@@ -53,9 +53,7 @@ use pi_tui::keys::{
 };
 use pi_tui::terminal::caps::{TerminalCapabilities, TerminalCapabilityOverrides};
 use pi_tui::terminal::input::TerminalInput;
-use pi_tui::terminal::probe::{
-    TerminalTheme, detect_terminal_theme, probe_collect_replies_with_yield, probe_write_batch,
-};
+use pi_tui::terminal::probe::{TerminalTheme, detect_terminal_theme};
 use pi_tui::terminal::writer::{ReanchorCause, SettledBlock, Tui, Txn};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -637,8 +635,8 @@ pub enum InteractiveExit {
     /// The session ended (host signaled shutdown).
     SessionEnded,
     /// Process suspension requested (`Ctrl+Z`). The caller (`run_interactive_mode`)
-    /// drives the actual SIGTSTP via the [`pi_tui::terminal::guard::TerminalGuard`]
-    /// then loops `run()` to resume.
+    /// drives the actual SIGTSTP via [`TerminalSession::suspend`] then loops
+    /// `run()` to resume.
     Suspend,
     /// Temporarily restore the terminal and run the configured external editor.
     ExternalEditor,
@@ -1199,9 +1197,8 @@ struct DisplayPreferences {
 /// - `partial` — the partial-assistant watch receiver.
 /// - `shutdown` — notify for graceful exit.
 ///
-/// The caller owns the [`pi_tui::terminal::guard::TerminalGuard`] so it can
-/// outlive the runtime and write restore bytes on process exit even if the
-/// runtime itself panics.
+/// The caller owns the [`TerminalSession`] so it can outlive the runtime
+/// and write restore bytes on process exit even if the runtime panics.
 struct SessionRebindSignal {
     next_generation: AtomicU64,
     pending_generation: AtomicU64,
@@ -1505,9 +1502,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// Construct the runtime around an already-active [`Tui`] and
     /// [`TerminalInput`].
     ///
-    /// The caller is responsible for activating the
-    /// [`pi_tui::terminal::guard::TerminalGuard`] before this call and dropping
-    /// it after the runtime exits.
+    /// The caller is responsible for the [`TerminalSession`] lifecycle
+    /// (guard activation, probe, input start, and shutdown) around this
+    /// runtime.
     ///
     /// # Panics
     ///
@@ -1820,8 +1817,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     /// Run the main event loop until shutdown is requested or stdin closes.
     ///
-    /// Returns the exit reason; the caller drops the runtime and the
-    /// [`pi_tui::terminal::guard::TerminalGuard`] in that order.
+    /// Returns the exit reason; the caller drops the runtime and calls
+    /// [`TerminalSession::shutdown`] in that order.
     ///
     /// # Errors
     ///
@@ -5772,7 +5769,7 @@ use crate::core::agent_session_runtime::{
     SwitchSessionOptions,
 };
 use pi_tui::terminal::{
-    TerminalGuard, install_panic_emergency_hook, write_emergency_restore_bytes,
+    TerminalGuard, TerminalSession, install_panic_emergency_hook, write_emergency_restore_bytes,
 };
 
 /// Production [`SessionHost`] over a live `Arc<AgentSession>` and the
@@ -6757,19 +6754,19 @@ where
 /// Wires (in order):
 /// 1. `io::stdout()` handle + initial ioctl size.
 /// 2. Panic emergency-restore hook and [`TerminalGuard`] viewport/activation.
-/// 3. Startup probe batch write; reply collection offloaded to a blocking
-///    task that owns stdin during first-frame construction.
-/// 4. [`Tui<Stdout>`] construction with the default capabilities + size, and
-///    a deferred [`TerminalInput`] (no stdin reader yet).
+/// 3. [`TerminalSession::begin`] — probe batch write, blocking reply
+///    collector spawn, deferred [`TerminalInput`] creation (no stdin reader
+///    yet).
+/// 4. [`Tui<Stdout>`] construction with the default capabilities + size.
 /// 5. [`AgentSessionHost`] wrapping the runtime, then the speculative first
 ///    frame painted inside the probe window.
-/// 6. Probe replies joined; capability/theme refinements merged with a
-///    repaint when they changed the first frame's basis; the input reader
-///    starts (sole `EventStream` owner from here on).
+/// 6. [`TerminalSession::finish_probe`] joins the collector; capability/theme
+///    refinements merged; the product queues probe-window events; then
+///    [`TerminalSession::start_input`] starts the sole `EventStream` reader.
 /// 7. [`InteractiveRuntime::run`] to completion.
 ///
-/// On exit the runtime is dropped, then the guard (which writes the restore
-/// bytes via its `Drop` impl). Returns the process exit code.
+/// On exit the runtime is dropped, then [`TerminalSession::shutdown`] restores
+/// terminal modes. Returns the process exit code.
 ///
 /// # Errors
 ///
@@ -6795,24 +6792,13 @@ pub async fn run_interactive_mode(
     guard
         .activate(enable_kitty)
         .map_err(|e| format!("terminal activation failed: {e}"))?;
-
-    // Startup probe: write the query batch, then collect replies on a
-    // blocking task while this task constructs the UI. The collector owns
-    // stdin until it is joined; the TerminalInput reader starts only after
-    // the join, so there is never more than one stdin reader. The collector
-    // honors the yield flag (polled on its wait loop) so the runtime can
-    // take stdin back promptly when the first frame is due.
-    let probe_written = probe_write_batch(guard.writer_mut())
+    // Startup probe: TerminalSession takes ownership of the activated
+    // guard, writes the probe batch, spawns the blocking reply collector,
+    // and creates the deferred input handle. The collector owns stdin
+    // until finish_probe joins it; the input reader starts only after
+    // start_input, so there is never more than one stdin reader.
+    let (mut session, input) = TerminalSession::begin(guard, enable_kitty, options.caps.clone())
         .map_err(|error| format!("terminal probe failed: {error}"))?;
-    let probe_yield = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let probe_task = probe_written.then(|| {
-        let mut probe_caps = options.caps.clone();
-        let yield_now = Arc::clone(&probe_yield);
-        tokio::task::spawn_blocking(move || {
-            probe_collect_replies_with_yield(&mut probe_caps, &yield_now)
-                .map(|pending| (probe_caps, pending))
-        })
-    });
     let colorfgbg = std::env::var("COLORFGBG").ok();
     options.terminal_theme =
         detect_terminal_theme(options.caps.dark_background, colorfgbg.as_deref());
@@ -6831,12 +6817,7 @@ pub async fn run_interactive_mode(
         options.caps.clone(),
     )
     .map_err(|e| format!("tui initialization failed: {e}"))?;
-
-    // 3. Deferred input handle: no stdin reader yet — the probe collector
-    //    still owns stdin. The reader starts after the join.
-    let input = TerminalInput::deferred();
-
-    // 4. Wire the host and runtime. Session replacement rebinds the host's
+    // 3. Wire the host and runtime. Session replacement rebinds the host's
     //    cached session Arc; InteractiveRuntime also rebinds events/partial
     //    via an interior rebind signal.
     let host = AgentSessionHost::new(Arc::clone(&runtime));
@@ -6908,34 +6889,30 @@ pub async fn run_interactive_mode(
     }
 
     // Arm the collector yield and take stdin back BEFORE the first frame
-    // paints. The collector is the sole stdin reader until it joins; painting
-    // the frame while it still owned stdin made input written at first-paint
-    // time land in the byte-level collector and get re-injected through the
-    // lossy startup mapper — bracketed pastes and escape sequences were
-    // corrupted (an early paste could even clear the editor via the ESC in
-    // its 201~ marker). The collector honors the arm within its poll slice
-    // (only after replies started flowing; a silent terminal still ends at
-    // its 25 ms first-byte window), so the join adds at most a few
-    // milliseconds over host binding, which dominates startup. Input
+    // paints. The collector is the sole stdin reader until it joins;
+    // painting the frame while it still owned stdin made input written at
+    // first-paint time land in the byte-level collector and get re-injected
+    // through the lossy startup mapper — bracketed pastes and escape
+    // sequences were corrupted (an early paste could even clear the editor
+    // via the ESC in its 201~ marker). The collector honors the arm within
+    // its poll slice (only after replies started flowing; a silent terminal
+    // still ends at its 25 ms first-byte window), so the join adds at most
+    // a few milliseconds over host binding, which dominates startup. Input
     // observed from the first frame onward always reaches the production
     // EventStream parser.
-    probe_yield.store(true, std::sync::atomic::Ordering::Relaxed);
-    let (probe_caps, pending_events) = match probe_task {
-        Some(handle) => match handle.await {
-            Ok(Ok(joined)) => joined,
-            Ok(Err(error)) => return Err(format!("terminal probe failed: {error}")),
-            Err(error) => return Err(format!("terminal probe task failed: {error}")),
-        },
-        None => (options.caps.clone(), Vec::new()),
-    };
+    let (probe_caps, pending_events) = session.finish_probe(options.caps.clone()).await?;
     // Merge capability/theme refinements before painting: the first frame
     // already uses the final capabilities, so no post-paint repaint is
     // needed. Then queue probe-window keystrokes and hand stdin to the
     // EventStream reader; from here on crossterm owns input parsing.
+    // finish_probe returns the events but does NOT start the reader — the
+    // product must queue them into its own reinject queue first (the run
+    // loop drains that queue before pulling from the input channel), then
+    // start_input spawns the sole EventStream owner.
     rt.adopt_probe_caps(probe_caps);
     set_kitty_protocol_active(rt.tui.capabilities().kitty_keyboard());
     rt.queue_pending_events(pending_events);
-    rt.input_mut().start();
+    session.start_input(rt.input_mut());
 
     // 5. First frame: run the startup sequence (theme push + first paint)
     //    with the final capabilities, after stdin ownership returned to the
@@ -6951,8 +6928,11 @@ pub async fn run_interactive_mode(
         let exit = rt.run_with_startup(!startup_already_painted).await;
         startup_already_painted = true;
         // Resize events update the runtime view while the guard remains owned
-        // here. Synchronize before every path that can restore terminal modes.
-        guard.set_viewport_bottom_row(rt.viewport_bottom_row());
+        // by the session here. Synchronize before every path that can restore
+        // terminal modes.
+        session
+            .guard_mut()
+            .set_viewport_bottom_row(rt.viewport_bottom_row());
         let exit = exit.map_err(|e| format!("runtime loop: {e}"))?;
         match exit {
             InteractiveExit::Suspend => {
@@ -6960,13 +6940,15 @@ pub async fn run_interactive_mode(
                 rt.close_selector_for_suspend();
                 // Restore modes, suspend the process, then re-activate using
                 // the terminal dimensions observed after SIGCONT.
-                guard
+                session
                     .suspend()
                     .map_err(|e| format!("terminal suspend failed: {e}"))?;
                 let size = initial_terminal_size();
-                guard.set_viewport_bottom_row(size.1.saturating_sub(1));
-                guard
-                    .resume(enable_kitty)
+                session
+                    .guard_mut()
+                    .set_viewport_bottom_row(size.1.saturating_sub(1));
+                session
+                    .resume()
                     .map_err(|e| format!("terminal resume failed: {e}"))?;
                 // Reanchor without a clear and retain the runtime's clamped
                 // view row as the source for the next normal restore.
@@ -6976,14 +6958,16 @@ pub async fn run_interactive_mode(
                         height: size.1,
                     })
                     .await;
-                guard.set_viewport_bottom_row(rt.viewport_bottom_row());
+                session
+                    .guard_mut()
+                    .set_viewport_bottom_row(rt.viewport_bottom_row());
                 // Rebind channels in case a replacement happened while we
                 // were suspended (defensive; replacement normally rebinds
                 // via the host callback + next action).
                 rt.rebind_session_channels().await;
             }
             InteractiveExit::ExternalEditor => {
-                run_external_editor_handoff(&mut rt, &mut guard, enable_kitty).await?;
+                run_external_editor_handoff(&mut rt, &mut session).await?;
             }
             other => break other,
         }
@@ -6994,7 +6978,8 @@ pub async fn run_interactive_mode(
     runtime.set_rebind_session(None);
     runtime.set_before_session_invalidate(None);
     runtime.set_before_session_replacement(None);
-    // 8. Guard restores on Drop. Convert exit kind to a process exit code.
+    // 8. Session restores terminal modes. Convert exit kind to a process
+    //    exit code.
     let code = match exit {
         InteractiveExit::Clean
         | InteractiveExit::SessionEnded
@@ -7003,7 +6988,7 @@ pub async fn run_interactive_mode(
         InteractiveExit::IoFailure | InteractiveExit::DrawDeadlock => 1u8,
     };
 
-    guard.restore();
+    session.shutdown();
     Ok(code)
 }
 
@@ -7011,8 +6996,7 @@ pub async fn run_interactive_mode(
 /// interactive session and apply the edited prompt text.
 async fn run_external_editor_handoff<W, G, S>(
     rt: &mut InteractiveRuntime<W, S>,
-    guard: &mut TerminalGuard<G>,
-    enable_kitty: bool,
+    session: &mut TerminalSession<G>,
 ) -> Result<(), String>
 where
     W: Write,
@@ -7021,11 +7005,7 @@ where
 {
     let initial = rt.editor.get_expanded_text();
     let editor_command = rt.session.external_editor_command();
-    rt.input
-        .pause()
-        .await
-        .map_err(|e| format!("pause terminal input for editor: {e}"))?;
-    guard.restore();
+    session.suspend_for_editor(&rt.input).await?;
 
     let cancel = CancellationToken::new();
     let cancel_on_shutdown = cancel.clone();
@@ -7039,13 +7019,7 @@ where
         .map_err(|error| error.to_string());
     watcher.abort();
 
-    guard
-        .resume(enable_kitty)
-        .map_err(|e| format!("terminal resume after editor failed: {e}"))?;
-    rt.input
-        .resume(Vec::new())
-        .await
-        .map_err(|e| format!("resume terminal input after editor: {e}"))?;
+    session.resume_from_editor(&rt.input).await?;
     rt.exited = false;
     rt.exit_kind = InteractiveExit::Clean;
     match edited {
@@ -7057,14 +7031,18 @@ where
         Err(error) => rt.last_error = Some(error),
     }
     let size = initial_terminal_size();
-    guard.set_viewport_bottom_row(size.1.saturating_sub(1));
+    session
+        .guard_mut()
+        .set_viewport_bottom_row(size.1.saturating_sub(1));
     let _ = rt
         .step_ui(UiEvent::Resize {
             width: size.0,
             height: size.1,
         })
         .await;
-    guard.set_viewport_bottom_row(rt.viewport_bottom_row());
+    session
+        .guard_mut()
+        .set_viewport_bottom_row(rt.viewport_bottom_row());
     Ok(())
 }
 
