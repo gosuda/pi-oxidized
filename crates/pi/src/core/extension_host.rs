@@ -35,25 +35,30 @@ use pi_ext::client::{
 use pi_ext::host::{self, HostError, HostSpec};
 use pi_ext::protocol::{
     self, DisposeSlot, ExtensionErrorEvent, FlagValueWire, FlagsSetRequest, FlagsSetResponse,
-    FrameId, ProviderEvent, SessionCommandEnvelope, SessionCompactRequest, SessionForkRequest,
-    SessionNavigateTreeRequest, SessionNewSessionRequest, SessionSetModelRequest,
-    SessionSetupEntriesRequest, SessionStateWire, SessionSwitchSessionRequest,
-    ShortcutExecuteRequest, ShortcutExecuteResponse, ThemeUpdate, ToolUpdate, UiEventRequest,
-    UiEventResponse, UiSlot, UiStateWire,
+    ProviderEvent, SessionCommandInfoWire, SessionScopedModelWire, SessionStateWire,
+    SessionToolWire, ShortcutExecuteRequest, ShortcutExecuteResponse, ThemeUpdate, ToolUpdate,
+    UiEventRequest, UiEventResponse, UiSlot, UiStateWire,
 };
 use pi_ext::sanitize::{SanitizedSlot, sanitize_slot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 
+use super::agent_session::bridge_types::{
+    BridgeMethod, BridgeRequestId, CommandCatalogEntry, CompactRequest, ExtensionHostError,
+    ForkRequest, NavigateTreeRequest, NewSessionRequest, SessionCommand, SessionCommandEnvelope,
+    SessionState, SetModelRequest, SetupEntriesRequest, SwitchSessionRequest,
+};
 use super::agent_session::events::AgentSessionEvent;
 use super::agent_session::extension_runner::{
     BeforeAgentStartResult, CancelResult, ExtensionRunner, InputTransformResult,
 };
+use super::agent_session::tree::NavigateTreeResult;
 use super::extension_runtime_set::EndpointId;
 use super::model_runtime::{
     ModelRuntime, ModelRuntimeError, ProviderConfigInput, ProviderModelDefinition,
 };
+use super::resources::source_info::{SourceInfo, SourceOrigin, SourceScope};
 use super::resources::{ExtensionResourcePath, ResourceExtensionPaths};
 
 mod ui_event;
@@ -159,56 +164,56 @@ pub(crate) enum SessionBridgeEvent {
     /// Correlated `pi.setModel` request.
     SetModel {
         /// Host correlation id (echo into `respond_set_model`).
-        id: FrameId,
+        id: BridgeRequestId,
         /// Requested model payload.
-        request: SessionSetModelRequest,
+        request: SetModelRequest,
     },
     /// Correlated `ctx.compact` request.
     Compact {
         /// Host correlation id (echo into `respond_compact`).
-        id: FrameId,
+        id: BridgeRequestId,
         /// Compact request payload.
-        request: SessionCompactRequest,
+        request: CompactRequest,
     },
     /// Correlated `ctx.newSession` request.
     NewSession {
         /// Host correlation id (echo into `respond_new_session`).
-        id: FrameId,
+        id: BridgeRequestId,
         /// New-session request payload.
-        request: SessionNewSessionRequest,
+        request: NewSessionRequest,
     },
     /// Correlated `ctx.fork` request.
     Fork {
         /// Host correlation id (echo into `respond_fork`).
-        id: FrameId,
+        id: BridgeRequestId,
         /// Fork request payload.
-        request: SessionForkRequest,
+        request: ForkRequest,
     },
     /// Correlated `ctx.navigateTree` request.
     NavigateTree {
         /// Host correlation id (echo into `respond_navigate_tree`).
-        id: FrameId,
+        id: BridgeRequestId,
         /// Navigate-tree request payload.
-        request: SessionNavigateTreeRequest,
+        request: NavigateTreeRequest,
     },
     /// Correlated `ctx.switchSession` request.
     SwitchSession {
         /// Host correlation id (echo into `respond_switch_session`).
-        id: FrameId,
+        id: BridgeRequestId,
         /// Switch-session request payload.
-        request: SessionSwitchSessionRequest,
+        request: SwitchSessionRequest,
     },
     /// Correlated `ctx.reload` request.
     Reload {
         /// Host correlation id (echo into `respond_reload`).
-        id: FrameId,
+        id: BridgeRequestId,
     },
     /// Correlated `session.setupEntries` request (host → Rust).
     SetupEntries {
         /// Host correlation id (echo into `respond_setup_entries`).
-        id: FrameId,
+        id: BridgeRequestId,
         /// Setup-entries request payload.
-        request: SessionSetupEntriesRequest,
+        request: SetupEntriesRequest,
         /// Endpoint that requested the candidate snapshot.
         origin: Option<EndpointId>,
     },
@@ -255,6 +260,242 @@ impl From<HostClientError> for HostStartError {
             HostClientError::Handshake { message } => Self::Handshake(message),
             other => Self::Load(other.to_string()),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire → product conversions (owned at the host adapter seam)
+// ---------------------------------------------------------------------------
+
+impl From<HostClientError> for ExtensionHostError {
+    fn from(value: HostClientError) -> Self {
+        match value {
+            HostClientError::Handshake { message } => Self::Handshake { message },
+            HostClientError::Timeout { id, timeout } => Self::Timeout {
+                message: format!("host request {id} timed out after {timeout:?}"),
+            },
+            HostClientError::Cancelled { .. } => Self::Cancelled {
+                message: "request cancelled".to_owned(),
+            },
+            HostClientError::Closed { message, stderr } => Self::Closed { message, stderr },
+            HostClientError::Protocol { message, stderr } => Self::Protocol { message, stderr },
+            HostClientError::Remote { code, message } => Self::Remote { code, message },
+            HostClientError::Spawn { message } => Self::Spawn { message },
+            HostClientError::NotRunning => Self::NotRunning,
+            HostClientError::Payload(message) => Self::Payload { message },
+        }
+    }
+}
+
+impl From<pi_ext::protocol::SessionCommandEnvelope> for SessionCommandEnvelope {
+    fn from(wire: pi_ext::protocol::SessionCommandEnvelope) -> Self {
+        Self {
+            replacement_token: wire.replacement_token,
+            command: wire.command.into(),
+        }
+    }
+}
+
+impl From<pi_ext::protocol::SessionCommand> for SessionCommand {
+    fn from(wire: pi_ext::protocol::SessionCommand) -> Self {
+        match wire {
+            pi_ext::protocol::SessionCommand::SendMessage { message, options } => {
+                Self::SendMessage { message, options }
+            }
+            pi_ext::protocol::SessionCommand::SendUserMessage { content, options } => {
+                Self::SendUserMessage { content, options }
+            }
+            pi_ext::protocol::SessionCommand::AppendEntry { custom_type, data } => {
+                Self::AppendEntry { custom_type, data }
+            }
+            pi_ext::protocol::SessionCommand::SetSessionName { name } => {
+                Self::SetSessionName { name }
+            }
+            pi_ext::protocol::SessionCommand::SetLabel { entry_id, label } => {
+                Self::SetLabel { entry_id, label }
+            }
+            pi_ext::protocol::SessionCommand::SetActiveTools { tool_names } => {
+                Self::SetActiveTools { tool_names }
+            }
+            pi_ext::protocol::SessionCommand::RefreshTools => Self::RefreshTools,
+            pi_ext::protocol::SessionCommand::SetThinkingLevel { level } => {
+                Self::SetThinkingLevel { level }
+            }
+            pi_ext::protocol::SessionCommand::Abort => Self::Abort,
+            pi_ext::protocol::SessionCommand::Shutdown => Self::Shutdown,
+        }
+    }
+}
+
+impl From<pi_ext::protocol::SessionSetModelRequest> for SetModelRequest {
+    fn from(wire: pi_ext::protocol::SessionSetModelRequest) -> Self {
+        Self { model: wire.model }
+    }
+}
+
+impl From<pi_ext::protocol::SessionCompactRequest> for CompactRequest {
+    fn from(wire: pi_ext::protocol::SessionCompactRequest) -> Self {
+        Self {
+            custom_instructions: wire.custom_instructions,
+        }
+    }
+}
+
+impl From<pi_ext::protocol::SessionNewSessionRequest> for NewSessionRequest {
+    fn from(wire: pi_ext::protocol::SessionNewSessionRequest) -> Self {
+        Self {
+            parent_session: wire.parent_session,
+        }
+    }
+}
+
+impl From<pi_ext::protocol::SessionForkRequest> for ForkRequest {
+    fn from(wire: pi_ext::protocol::SessionForkRequest) -> Self {
+        Self {
+            entry_id: wire.entry_id,
+            position: wire.position.map(|p| match p {
+                pi_ext::protocol::SessionForkPosition::Before => {
+                    crate::core::agent_session_runtime::ForkPosition::Before
+                }
+                pi_ext::protocol::SessionForkPosition::At => {
+                    crate::core::agent_session_runtime::ForkPosition::At
+                }
+            }),
+        }
+    }
+}
+
+impl From<pi_ext::protocol::SessionSwitchSessionRequest> for SwitchSessionRequest {
+    fn from(wire: pi_ext::protocol::SessionSwitchSessionRequest) -> Self {
+        Self {
+            session_path: wire.session_path,
+        }
+    }
+}
+
+impl From<pi_ext::protocol::SessionNavigateTreeRequest> for NavigateTreeRequest {
+    fn from(wire: pi_ext::protocol::SessionNavigateTreeRequest) -> Self {
+        Self {
+            target_id: wire.target_id,
+            options: super::agent_session::tree::NavigateTreeOptions {
+                summarize: wire.summarize.unwrap_or(false),
+                custom_instructions: wire.custom_instructions,
+                replace_instructions: wire.replace_instructions.unwrap_or(false),
+                label: wire.label,
+            },
+        }
+    }
+}
+
+impl From<pi_ext::protocol::SessionSetupEntriesRequest> for SetupEntriesRequest {
+    fn from(wire: pi_ext::protocol::SessionSetupEntriesRequest) -> Self {
+        Self {
+            replacement_token: wire.replacement_token,
+        }
+    }
+}
+
+/// Convert the pi-ext wire `CommandSourceInfo` into the product `SourceInfo`.
+///
+/// Moved here from `agent_session/extension.rs:695-701` — the host adapter
+/// owns every pi-ext ↔ product conversion.
+impl From<CommandSourceInfo> for SourceInfo {
+    fn from(info: CommandSourceInfo) -> Self {
+        Self {
+            path: info.path,
+            source: info.source,
+            scope: match info.scope {
+                pi_ext::adapters::CommandSourceScope::User => SourceScope::User,
+                pi_ext::adapters::CommandSourceScope::Project => SourceScope::Project,
+                pi_ext::adapters::CommandSourceScope::Temporary => SourceScope::Temporary,
+            },
+            origin: match info.origin {
+                pi_ext::adapters::CommandSourceOrigin::Package => SourceOrigin::Package,
+                pi_ext::adapters::CommandSourceOrigin::TopLevel => SourceOrigin::TopLevel,
+            },
+            base_dir: info.base_dir,
+        }
+    }
+}
+
+/// Map a [`BridgeMethod`] to its wire method string.
+fn bridge_method_to_wire(method: BridgeMethod) -> &'static str {
+    match method {
+        BridgeMethod::NewSession => protocol::SESSION_NEW_SESSION_METHOD,
+        BridgeMethod::Fork => protocol::SESSION_FORK_METHOD,
+        BridgeMethod::SwitchSession => protocol::SESSION_SWITCH_SESSION_METHOD,
+        BridgeMethod::NavigateTree => protocol::SESSION_NAVIGATE_TREE_METHOD,
+        BridgeMethod::Reload => protocol::SESSION_RELOAD_METHOD,
+        BridgeMethod::SetupEntries => protocol::SESSION_SETUP_ENTRIES_METHOD,
+        BridgeMethod::SetModel => protocol::SESSION_SET_MODEL_METHOD,
+        BridgeMethod::Compact => protocol::SESSION_COMPACT_METHOD,
+    }
+}
+
+/// Wire string for a thinking level (serde `lowercase` discriminant).
+///
+/// Mirrors the private function in `agent_session/extension.rs`; kept here so
+/// `session_state_to_wire` does not depend on that module's internals.
+fn thinking_level_wire(level: pi_ai::ModelThinkingLevel) -> String {
+    serde_json::to_value(level)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "medium".to_owned())
+}
+
+/// Convert a product [`SessionState`] into the wire [`SessionStateWire`].
+fn session_state_to_wire(state: &SessionState) -> SessionStateWire {
+    SessionStateWire {
+        session_name: state.session_name.clone(),
+        thinking_level: thinking_level_wire(state.thinking_level),
+        active_tools: state.active_tools.clone(),
+        all_tools: state
+            .all_tools
+            .iter()
+            .map(|tool| SessionToolWire {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+                source: None,
+            })
+            .collect(),
+        commands: state
+            .commands
+            .iter()
+            .map(|command| SessionCommandInfoWire {
+                name: command.name.clone(),
+                description: command.description.clone(),
+                source: match command.source {
+                    super::resources::slash::SlashCommandSource::Extension => {
+                        "extension".to_owned()
+                    }
+                    super::resources::slash::SlashCommandSource::Prompt => "prompt".to_owned(),
+                    super::resources::slash::SlashCommandSource::Skill => "skill".to_owned(),
+                },
+            })
+            .collect(),
+        model: state
+            .model
+            .as_ref()
+            .and_then(|m| serde_json::to_value(m).ok()),
+        scoped_models: state
+            .scoped_models
+            .iter()
+            .map(|scoped| SessionScopedModelWire {
+                model: serde_json::to_value(&scoped.model).unwrap_or(Value::Null),
+                thinking_level: scoped.thinking_level.map(thinking_level_wire),
+            })
+            .collect(),
+        is_idle: state.is_idle,
+        has_pending_messages: state.has_pending_messages,
+        context_usage: state.context_usage.map(|usage| {
+            serde_json::json!({
+                "tokens": usage.tokens,
+                "contextWindow": usage.context_window,
+                "percent": usage.percent,
+            })
+        }),
+        system_prompt: state.system_prompt.clone(),
     }
 }
 
@@ -1312,6 +1553,25 @@ impl HostExtensionRunner {
             .unwrap_or_default()
     }
 
+    /// Product command catalog: extension-registered commands with
+    /// host-reported provenance converted to `SourceInfo`. This is the
+    /// adapter-owned `pi_ext::adapters::Registry` conversion — callers never
+    /// see wire registry metadata. Resource-discovered provenance overlays
+    /// this in `ExtensionRuntimeSet::command_catalog`.
+    #[must_use]
+    pub fn command_catalog(&self) -> Vec<CommandCatalogEntry> {
+        self.registry()
+            .commands()
+            .iter()
+            .map(|command| CommandCatalogEntry {
+                name: command.name.clone(),
+                description: command.description.clone().unwrap_or_default(),
+                source: command.source.clone(),
+                source_info: command.source_info.clone().map(SourceInfo::from),
+            })
+            .collect()
+    }
+
     /// Ordered, undeduplicated host shortcut registrations.
     ///
     /// Product code applies last-wins filtering after combining extension and native shortcuts.
@@ -1680,158 +1940,205 @@ impl HostExtensionRunner {
     ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns an [`ExtensionHostError`] if the host has already exited.
     pub async fn respond_set_model(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         success: bool,
-    ) -> Result<(), HostClientError> {
-        self.inner.client.respond_set_model(id, success).await
+    ) -> Result<(), ExtensionHostError> {
+        self.inner
+            .client
+            .respond_set_model(id.0, success)
+            .await
+            .map_err(ExtensionHostError::from)
     }
 
     /// Answer a correlated `session.compact` request.
     ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns an [`ExtensionHostError`] if the host has already exited.
     pub async fn respond_compact(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         outcome: Result<Value, String>,
-    ) -> Result<(), HostClientError> {
-        self.inner.client.respond_compact(id, outcome).await
+    ) -> Result<(), ExtensionHostError> {
+        self.inner
+            .client
+            .respond_compact(id.0, outcome)
+            .await
+            .map_err(ExtensionHostError::from)
     }
 
     /// Answer a correlated `session.newSession` request.
     ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns an [`ExtensionHostError`] if the host has already exited.
     pub async fn respond_new_session(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         cancelled: bool,
         token: Option<&str>,
-    ) -> Result<(), HostClientError> {
+    ) -> Result<(), ExtensionHostError> {
         self.inner
             .client
-            .respond_new_session(id, cancelled, token)
+            .respond_new_session(id.0, cancelled, token)
             .await
+            .map_err(ExtensionHostError::from)
     }
 
     /// Answer a correlated `session.fork` request.
     ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns an [`ExtensionHostError`] if the host has already exited.
     pub async fn respond_fork(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         cancelled: bool,
         selected_text: Option<&str>,
         token: Option<&str>,
-    ) -> Result<(), HostClientError> {
+    ) -> Result<(), ExtensionHostError> {
         self.inner
             .client
-            .respond_fork(id, cancelled, selected_text, token)
+            .respond_fork(id.0, cancelled, selected_text, token)
             .await
+            .map_err(ExtensionHostError::from)
     }
 
     /// Answer a correlated `session.navigateTree` request.
     ///
+    /// Converts the product [`NavigateTreeResult`] into the wire
+    /// [`protocol::SessionNavigateTreeResponse`] at the seam.
+    ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns an [`ExtensionHostError`] if the host has already exited.
     pub async fn respond_navigate_tree(
         &self,
-        id: FrameId,
-        outcome: Result<protocol::SessionNavigateTreeResponse, String>,
-    ) -> Result<(), HostClientError> {
-        self.inner.client.respond_navigate_tree(id, outcome).await
+        id: BridgeRequestId,
+        outcome: Result<NavigateTreeResult, String>,
+    ) -> Result<(), ExtensionHostError> {
+        let wire_outcome = outcome.map(|result| protocol::SessionNavigateTreeResponse {
+            cancelled: result.cancelled,
+            editor_text: result.editor_text,
+            aborted: if result.aborted { Some(true) } else { None },
+            summary_entry: result
+                .summary_entry
+                .and_then(|entry| serde_json::to_value(&entry).ok()),
+        });
+        self.inner
+            .client
+            .respond_navigate_tree(id.0, wire_outcome)
+            .await
+            .map_err(ExtensionHostError::from)
     }
 
     /// Answer a correlated `session.switchSession` request.
     ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns an [`ExtensionHostError`] if the host has already exited.
     pub async fn respond_switch_session(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         cancelled: bool,
         token: Option<&str>,
-    ) -> Result<(), HostClientError> {
+    ) -> Result<(), ExtensionHostError> {
         self.inner
             .client
-            .respond_switch_session(id, cancelled, token)
+            .respond_switch_session(id.0, cancelled, token)
             .await
+            .map_err(ExtensionHostError::from)
     }
 
     /// Answer a correlated `session.reload` request.
     ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns an [`ExtensionHostError`] if the host has already exited.
     pub async fn respond_reload(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         outcome: Result<Option<&str>, String>,
-    ) -> Result<(), HostClientError> {
-        self.inner.client.respond_reload(id, outcome).await
+    ) -> Result<(), ExtensionHostError> {
+        self.inner
+            .client
+            .respond_reload(id.0, outcome)
+            .await
+            .map_err(ExtensionHostError::from)
     }
 
     /// Answer a correlated `session.setupEntries` request from the host.
     ///
+    /// Wraps the product `Vec<Value>` into the wire
+    /// [`protocol::SessionSetupEntriesResponse`] at the seam.
+    ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns an [`ExtensionHostError`] if the host has already exited.
     pub async fn respond_setup_entries(
         &self,
-        id: FrameId,
-        outcome: Result<protocol::SessionSetupEntriesResponse, String>,
-    ) -> Result<(), HostClientError> {
-        self.inner.client.respond_setup_entries(id, outcome).await
+        id: BridgeRequestId,
+        outcome: Result<Vec<Value>, String>,
+    ) -> Result<(), ExtensionHostError> {
+        let wire_outcome = outcome.map(|entries| protocol::SessionSetupEntriesResponse { entries });
+        self.inner
+            .client
+            .respond_setup_entries(id.0, wire_outcome)
+            .await
+            .map_err(ExtensionHostError::from)
     }
 
     /// Reject a ready-gated operation while another operation owns the facade slot.
     ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns an [`ExtensionHostError`] if the host has already exited.
     pub async fn respond_replacement_busy(
         &self,
-        id: FrameId,
-        method: &str,
-    ) -> Result<(), HostClientError> {
-        self.inner.client.respond_replacement_busy(id, method).await
+        id: BridgeRequestId,
+        method: BridgeMethod,
+    ) -> Result<(), ExtensionHostError> {
+        self.inner
+            .client
+            .respond_replacement_busy(id.0, bridge_method_to_wire(method))
+            .await
+            .map_err(ExtensionHostError::from)
     }
 
     /// Answer an unclaimed correlated session request without synthesizing cancellation.
     ///
     /// # Errors
     ///
-    /// Returns a transport error if the host has already exited.
+    /// Returns an [`ExtensionHostError`] if the host has already exited.
     pub async fn respond_session_error(
         &self,
-        id: FrameId,
-        method: &str,
+        id: BridgeRequestId,
+        method: BridgeMethod,
         message: &str,
-    ) -> Result<(), HostClientError> {
+    ) -> Result<(), ExtensionHostError> {
         self.inner
             .client
-            .respond_session_error(id, method, message)
+            .respond_session_error(id.0, bridge_method_to_wire(method), message)
             .await
+            .map_err(ExtensionHostError::from)
     }
+
     /// Push the mirrored session state to the host (`session.update` event).
     ///
-    /// The host serves the synchronous `ExtensionActions` / context getters
-    /// from the latest push. Host failures are isolated as a single
-    /// non-retryable `extension_error`; the session survives.
-    pub async fn push_session_state(&self, state: &SessionStateWire) {
+    /// Converts the product [`SessionState`] into the wire
+    /// [`SessionStateWire`] at the seam. The host serves the synchronous
+    /// `ExtensionActions` / context getters from the latest push. Host
+    /// failures are isolated as a single non-retryable `extension_error`;
+    /// the session survives.
+    pub async fn push_session_state(&self, state: &SessionState) {
         if !self.inner.active() {
             return;
         }
-        let payload = match serde_json::to_value(state) {
+        let wire = session_state_to_wire(state);
+        let payload = match serde_json::to_value(&wire) {
             Ok(payload) => payload,
             Err(error) => {
                 self.inner.publish_error(
@@ -2122,55 +2429,78 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                         Some(HostSessionRequest::SetModel { id, request }) => {
                             forward_session_bridge(
                                 &inner,
-                                SessionBridgeEvent::SetModel { id, request },
+                                SessionBridgeEvent::SetModel {
+                                    id: BridgeRequestId(id),
+                                    request: request.into(),
+                                },
                             )
                             .await;
                         }
                         Some(HostSessionRequest::Compact { id, request }) => {
                             forward_session_bridge(
                                 &inner,
-                                SessionBridgeEvent::Compact { id, request },
+                                SessionBridgeEvent::Compact {
+                                    id: BridgeRequestId(id),
+                                    request: request.into(),
+                                },
                             )
                             .await;
                         }
                         Some(HostSessionRequest::NewSession { id, request }) => {
                             forward_session_bridge(
                                 &inner,
-                                SessionBridgeEvent::NewSession { id, request },
+                                SessionBridgeEvent::NewSession {
+                                    id: BridgeRequestId(id),
+                                    request: request.into(),
+                                },
                             )
                             .await;
                         }
                         Some(HostSessionRequest::Fork { id, request }) => {
                             forward_session_bridge(
                                 &inner,
-                                SessionBridgeEvent::Fork { id, request },
+                                SessionBridgeEvent::Fork {
+                                    id: BridgeRequestId(id),
+                                    request: request.into(),
+                                },
                             )
                             .await;
                         }
                         Some(HostSessionRequest::NavigateTree { id, request }) => {
                             forward_session_bridge(
                                 &inner,
-                                SessionBridgeEvent::NavigateTree { id, request },
+                                SessionBridgeEvent::NavigateTree {
+                                    id: BridgeRequestId(id),
+                                    request: request.into(),
+                                },
                             )
                             .await;
                         }
                         Some(HostSessionRequest::SwitchSession { id, request }) => {
                             forward_session_bridge(
                                 &inner,
-                                SessionBridgeEvent::SwitchSession { id, request },
+                                SessionBridgeEvent::SwitchSession {
+                                    id: BridgeRequestId(id),
+                                    request: request.into(),
+                                },
                             )
                             .await;
                         }
                         Some(HostSessionRequest::Reload { id }) => {
-                            forward_session_bridge(&inner, SessionBridgeEvent::Reload { id })
-                                .await;
+                            forward_session_bridge(
+                                &inner,
+                                SessionBridgeEvent::Reload {
+                                    id: BridgeRequestId(id),
+                                },
+                            )
+                            .await;
                         }
                         Some(HostSessionRequest::SetupEntries { id, request }) => {
                             forward_session_bridge(
                                 &inner,
                                 SessionBridgeEvent::SetupEntries {
-                                    id,
-                                    request,
+                                    id: BridgeRequestId(id),
+                                    request: request.into(),
                                     origin: inner.endpoint_id(),
                                 },
                             )
@@ -2266,9 +2596,10 @@ fn spawn_event_pump(inner: Arc<Inner>) {
 fn deliver_session_control(inner: &Arc<Inner>, event: HostSessionControlEvent) {
     let origin = inner.endpoint_id();
     let event = match event {
-        HostSessionControlEvent::Command(envelope) => {
-            SessionBridgeEvent::Command { envelope, origin }
-        }
+        HostSessionControlEvent::Command(envelope) => SessionBridgeEvent::Command {
+            envelope: envelope.into(),
+            origin,
+        },
         HostSessionControlEvent::ReplacementReady { token } => {
             SessionBridgeEvent::ReplacementReady { token, origin }
         }
@@ -2371,23 +2702,23 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
         Some(SessionBridgeEvent::SetupEntries { id, .. }) => {
             let _ = inner
                 .client
-                .respond_setup_entries(id, Err("no active session".to_owned()))
+                .respond_setup_entries(id.0, Err("no active session".to_owned()))
                 .await;
         }
         Some(SessionBridgeEvent::SetModel { id, .. }) => {
-            let _ = inner.client.respond_set_model(id, false).await;
+            let _ = inner.client.respond_set_model(id.0, false).await;
         }
         Some(SessionBridgeEvent::Compact { id, .. }) => {
             let _ = inner
                 .client
-                .respond_compact(id, Err("no active session".to_owned()))
+                .respond_compact(id.0, Err("no active session".to_owned()))
                 .await;
         }
         Some(SessionBridgeEvent::NewSession { id, .. }) => {
             let _ = inner
                 .client
                 .respond_session_error(
-                    id,
+                    id.0,
                     protocol::SESSION_NEW_SESSION_METHOD,
                     "no active session",
                 )
@@ -2396,20 +2727,20 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
         Some(SessionBridgeEvent::Fork { id, .. }) => {
             let _ = inner
                 .client
-                .respond_session_error(id, protocol::SESSION_FORK_METHOD, "no active session")
+                .respond_session_error(id.0, protocol::SESSION_FORK_METHOD, "no active session")
                 .await;
         }
         Some(SessionBridgeEvent::NavigateTree { id, .. }) => {
             let _ = inner
                 .client
-                .respond_navigate_tree(id, Err("no active session".to_owned()))
+                .respond_navigate_tree(id.0, Err("no active session".to_owned()))
                 .await;
         }
         Some(SessionBridgeEvent::SwitchSession { id, .. }) => {
             let _ = inner
                 .client
                 .respond_session_error(
-                    id,
+                    id.0,
                     protocol::SESSION_SWITCH_SESSION_METHOD,
                     "no active session",
                 )
@@ -2418,7 +2749,7 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
         Some(SessionBridgeEvent::Reload { id }) => {
             let _ = inner
                 .client
-                .respond_reload(id, Err("no active session".to_owned()))
+                .respond_reload(id.0, Err("no active session".to_owned()))
                 .await;
         }
     }

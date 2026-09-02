@@ -29,6 +29,7 @@
 //! Public listeners are invoked without holding any lock.
 
 pub mod bash;
+pub mod bridge_types;
 pub mod compaction;
 pub mod events;
 pub mod extension;
@@ -42,6 +43,11 @@ pub mod subscribe;
 pub mod tools;
 pub mod tree;
 
+pub use bridge_types::{
+    BridgeMethod, BridgeRequestId, CommandCatalogEntry, CompactRequest, ExtensionHostError,
+    ForkRequest, NavigateTreeRequest, NewSessionRequest, SessionCommand, SessionCommandEnvelope,
+    SessionState, SetModelRequest, SetupEntriesRequest, SwitchSessionRequest,
+};
 pub use events::{
     AgentSessionEvent, AgentSessionEventListener, CompactionReason, ModelSelectSource,
     SessionBeforeForkPosition, SessionBeforeSwitchReason, SessionShutdownReason, SessionStartEvent,

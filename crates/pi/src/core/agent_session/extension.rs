@@ -22,6 +22,10 @@
 //! `emit` self-gates on handler presence, so the gate would only suppress
 //! correct emissions.
 
+use super::bridge_types::{
+    BridgeMethod, BridgeRequestId, ExtensionHostError, ForkRequest, NavigateTreeRequest,
+    NewSessionRequest, SessionCommand, SessionState, SetupEntriesRequest, SwitchSessionRequest,
+};
 use crate::core::agent_session_runtime::{
     AgentSessionRuntime, AgentSessionRuntimeError, ForkPosition, NewSessionOptions,
     PrepareReplacementOutcome, PreparedReplacement, SwitchSessionOptions,
@@ -33,20 +37,15 @@ use crate::core::extension_runtime_set::{
 };
 use crate::core::messages::CustomMessageContent;
 use crate::core::resources::{
-    ResourceLoader, SlashCommandInfo, SlashCommandSource, SourceInfo, SourceOrigin, SourceScope,
-    SyntheticSourceInfoOptions, create_synthetic_source_info,
+    ResourceLoader, SlashCommandInfo, SlashCommandSource, SyntheticSourceInfoOptions,
+    create_synthetic_source_info,
 };
 use pi_ai::{ImageContent, Model, ModelThinkingLevel};
-use pi_ext::protocol::{
-    self, SessionCommand, SessionCommandInfoWire, SessionForkPosition, SessionNavigateTreeResponse,
-    SessionScopedModelWire, SessionSetupEntriesRequest, SessionStateWire, SessionToolWire,
-};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
 use super::prompt::{CustomMessageInput, DeliverAs};
 use super::tools::RefreshToolRegistryOptions;
-use super::tree::NavigateTreeOptions;
 
 use super::AgentSession;
 use super::events::{
@@ -59,7 +58,7 @@ const RELOAD_INVALIDATED: &str = "extension runtime was invalidated during reloa
 #[derive(Clone, Copy)]
 enum ReloadOrigin {
     Direct,
-    Bridge { id: protocol::FrameId },
+    Bridge { id: BridgeRequestId },
 }
 
 enum ReloadPreAcceptError {
@@ -67,7 +66,7 @@ enum ReloadPreAcceptError {
     Unreloadable,
     Prepare(crate::core::extension_host::HostStartError),
     InstallConflict,
-    Response(pi_ext::client::HostClientError),
+    Response(ExtensionHostError),
 }
 
 enum ReloadPostAcceptError {
@@ -658,7 +657,7 @@ impl AgentSession {
         let Some(binding) = host.session_binding_for(&session) else {
             return;
         };
-        let state = self.session_state_wire().await;
+        let state = self.session_state().await;
         let _ = host.push_session_state_for_binding(binding, &state).await;
     }
 
@@ -682,32 +681,11 @@ impl AgentSession {
         let mut extension_names = std::collections::HashSet::new();
 
         if let Some(host) = self.host_extension_runner() {
-            for command in host.registry().commands() {
-                extension_names.insert(command.name.clone());
-                let discovered_source = command
-                    .source
-                    .as_deref()
-                    .and_then(|source| host.command_source_info(source));
-                let host_source = command.source_info.clone().map(|info| SourceInfo {
-                    path: info.path,
-                    source: info.source,
-                    scope: match info.scope {
-                        pi_ext::adapters::CommandSourceScope::User => SourceScope::User,
-                        pi_ext::adapters::CommandSourceScope::Project => SourceScope::Project,
-                        pi_ext::adapters::CommandSourceScope::Temporary => SourceScope::Temporary,
-                    },
-                    origin: match info.origin {
-                        pi_ext::adapters::CommandSourceOrigin::Package => SourceOrigin::Package,
-                        pi_ext::adapters::CommandSourceOrigin::TopLevel => SourceOrigin::TopLevel,
-                    },
-                    base_dir: info.base_dir,
-                });
-                let source_info = discovered_source.or(host_source).unwrap_or_else(|| {
+            for entry in host.command_catalog() {
+                extension_names.insert(entry.name.clone());
+                let source_info = entry.source_info.unwrap_or_else(|| {
                     create_synthetic_source_info(
-                        command
-                            .source
-                            .clone()
-                            .unwrap_or_else(|| "<extension>".to_owned()),
+                        entry.source.unwrap_or_else(|| "<extension>".to_owned()),
                         SyntheticSourceInfoOptions {
                             source: "extension".to_owned(),
                             scope: None,
@@ -717,8 +695,8 @@ impl AgentSession {
                     )
                 });
                 commands.push(SlashCommandInfo {
-                    name: command.name.clone(),
-                    description: command.description.clone(),
+                    name: entry.name,
+                    description: Some(entry.description),
                     source: SlashCommandSource::Extension,
                     source_info,
                 });
@@ -873,7 +851,7 @@ impl AgentSession {
         });
         // Awaited: lifecycle handlers must observe the new session state.
         if host.is_session_target_current(binding) {
-            let state = self.session_state_wire().await;
+            let state = self.session_state().await;
             let _ = host.activate_session_state(binding, &state).await;
         }
         tokio::spawn(async move {
@@ -885,7 +863,7 @@ impl AgentSession {
                 let Some(session) = session.upgrade() else {
                     break;
                 };
-                let state = session.session_state_wire().await;
+                let state = session.session_state().await;
                 let _ = host.push_session_state_for_binding(binding, &state).await;
             }
             unsubscribe();
@@ -894,52 +872,20 @@ impl AgentSession {
 
     /// Build the `session.update` mirror behind the host's synchronous
     /// session getters.
-    pub(crate) async fn session_state_wire(&self) -> SessionStateWire {
-        let model = self.model();
-        let context_usage = self.get_context_usage().await.map(|usage| {
-            json!({
-                "tokens": usage.tokens,
-                "contextWindow": usage.context_window,
-                "percent": usage.percent,
-            })
-        });
+    ///
+    /// Returns the product [`SessionState`]; the host adapter serializes it
+    /// to the wire shape at the seam.
+    pub(crate) async fn session_state(&self) -> SessionState {
+        let context_usage = self.get_context_usage().await;
         let prompt = self.hooks.system_prompt_snapshot();
-        SessionStateWire {
+        SessionState {
             session_name: self.session_name().await,
-            thinking_level: thinking_level_wire(self.thinking_level()),
+            thinking_level: self.thinking_level(),
             active_tools: self.active_tool_names(),
-            all_tools: self
-                .get_all_tools()
-                .into_iter()
-                .map(|tool| SessionToolWire {
-                    name: tool.name,
-                    description: tool.description,
-                    parameters: tool.parameters,
-                    source: None,
-                })
-                .collect(),
-            commands: self
-                .slash_commands()
-                .into_iter()
-                .map(|command| SessionCommandInfoWire {
-                    name: command.name,
-                    description: command.description,
-                    source: match command.source {
-                        SlashCommandSource::Extension => "extension".to_owned(),
-                        SlashCommandSource::Prompt => "prompt".to_owned(),
-                        SlashCommandSource::Skill => "skill".to_owned(),
-                    },
-                })
-                .collect(),
-            model: serde_json::to_value(&model).ok(),
-            scoped_models: self
-                .scoped_models()
-                .into_iter()
-                .map(|scoped| SessionScopedModelWire {
-                    model: serde_json::to_value(&scoped.model).unwrap_or(Value::Null),
-                    thinking_level: scoped.thinking_level.map(thinking_level_wire),
-                })
-                .collect(),
+            all_tools: self.get_all_tools(),
+            commands: self.slash_commands(),
+            model: Some(self.model()),
+            scoped_models: self.scoped_models(),
             is_idle: self.is_idle(),
             has_pending_messages: self.pending_message_count() > 0,
             context_usage,
@@ -1049,11 +995,11 @@ impl AgentSession {
     async fn handle_bridge_new_session(
         self: &Arc<Self>,
         host: Arc<ExtensionRuntimeSet>,
-        id: protocol::FrameId,
-        request: protocol::SessionNewSessionRequest,
+        id: BridgeRequestId,
+        request: NewSessionRequest,
     ) {
         if host.is_pending_busy() {
-            self.respond_bridge_busy(&host, id, protocol::SESSION_NEW_SESSION_METHOD)
+            self.respond_bridge_busy(&host, id, BridgeMethod::NewSession)
                 .await;
             return;
         }
@@ -1061,7 +1007,7 @@ impl AgentSession {
             self.respond_bridge_error(
                 &host,
                 id,
-                protocol::SESSION_NEW_SESSION_METHOD,
+                BridgeMethod::NewSession,
                 "session runtime is unavailable",
             )
             .await;
@@ -1088,7 +1034,7 @@ impl AgentSession {
                     Ok(installed) => installed,
                     Err(prepared) => {
                         runtime.abort_prepared_replacement(prepared).await;
-                        self.respond_bridge_busy(&host, id, protocol::SESSION_NEW_SESSION_METHOD)
+                        self.respond_bridge_busy(&host, id, BridgeMethod::NewSession)
                             .await;
                         return;
                     }
@@ -1103,13 +1049,8 @@ impl AgentSession {
             }
             Err(error) => {
                 drop(guard);
-                self.respond_bridge_runtime_error(
-                    &host,
-                    id,
-                    protocol::SESSION_NEW_SESSION_METHOD,
-                    error,
-                )
-                .await;
+                self.respond_bridge_runtime_error(&host, id, BridgeMethod::NewSession, error)
+                    .await;
             }
         }
     }
@@ -1117,11 +1058,11 @@ impl AgentSession {
     async fn handle_bridge_fork(
         self: &Arc<Self>,
         host: Arc<ExtensionRuntimeSet>,
-        id: protocol::FrameId,
-        request: protocol::SessionForkRequest,
+        id: BridgeRequestId,
+        request: ForkRequest,
     ) {
         if host.is_pending_busy() {
-            self.respond_bridge_busy(&host, id, protocol::SESSION_FORK_METHOD)
+            self.respond_bridge_busy(&host, id, BridgeMethod::Fork)
                 .await;
             return;
         }
@@ -1129,16 +1070,13 @@ impl AgentSession {
             self.respond_bridge_error(
                 &host,
                 id,
-                protocol::SESSION_FORK_METHOD,
+                BridgeMethod::Fork,
                 "session runtime is unavailable",
             )
             .await;
             return;
         };
-        let position = match request.position.unwrap_or(SessionForkPosition::Before) {
-            SessionForkPosition::Before => ForkPosition::Before,
-            SessionForkPosition::At => ForkPosition::At,
-        };
+        let position = request.position.unwrap_or(ForkPosition::Before);
         let replacement_lock = runtime.replacement_lock();
         let guard = replacement_lock.lock().await;
         let prepared = runtime.prepare_fork(&request.entry_id, position).await;
@@ -1156,7 +1094,7 @@ impl AgentSession {
                     Ok(installed) => installed,
                     Err(prepared) => {
                         runtime.abort_prepared_replacement(prepared).await;
-                        self.respond_bridge_busy(&host, id, protocol::SESSION_FORK_METHOD)
+                        self.respond_bridge_busy(&host, id, BridgeMethod::Fork)
                             .await;
                         return;
                     }
@@ -1174,7 +1112,7 @@ impl AgentSession {
             }
             Err(error) => {
                 drop(guard);
-                self.respond_bridge_runtime_error(&host, id, protocol::SESSION_FORK_METHOD, error)
+                self.respond_bridge_runtime_error(&host, id, BridgeMethod::Fork, error)
                     .await;
             }
         }
@@ -1183,11 +1121,11 @@ impl AgentSession {
     async fn handle_bridge_switch_session(
         self: &Arc<Self>,
         host: Arc<ExtensionRuntimeSet>,
-        id: protocol::FrameId,
-        request: protocol::SessionSwitchSessionRequest,
+        id: BridgeRequestId,
+        request: SwitchSessionRequest,
     ) {
         if host.is_pending_busy() {
-            self.respond_bridge_busy(&host, id, protocol::SESSION_SWITCH_SESSION_METHOD)
+            self.respond_bridge_busy(&host, id, BridgeMethod::SwitchSession)
                 .await;
             return;
         }
@@ -1195,7 +1133,7 @@ impl AgentSession {
             self.respond_bridge_error(
                 &host,
                 id,
-                protocol::SESSION_SWITCH_SESSION_METHOD,
+                BridgeMethod::SwitchSession,
                 "session runtime is unavailable",
             )
             .await;
@@ -1220,12 +1158,8 @@ impl AgentSession {
                     Ok(installed) => installed,
                     Err(prepared) => {
                         runtime.abort_prepared_replacement(prepared).await;
-                        self.respond_bridge_busy(
-                            &host,
-                            id,
-                            protocol::SESSION_SWITCH_SESSION_METHOD,
-                        )
-                        .await;
+                        self.respond_bridge_busy(&host, id, BridgeMethod::SwitchSession)
+                            .await;
                         return;
                     }
                 };
@@ -1239,13 +1173,8 @@ impl AgentSession {
             }
             Err(error) => {
                 drop(guard);
-                self.respond_bridge_runtime_error(
-                    &host,
-                    id,
-                    protocol::SESSION_SWITCH_SESSION_METHOD,
-                    error,
-                )
-                .await;
+                self.respond_bridge_runtime_error(&host, id, BridgeMethod::SwitchSession, error)
+                    .await;
             }
         }
     }
@@ -1253,8 +1182,8 @@ impl AgentSession {
     async fn handle_bridge_navigate_tree(
         self: &Arc<Self>,
         host: Arc<ExtensionRuntimeSet>,
-        id: protocol::FrameId,
-        request: protocol::SessionNavigateTreeRequest,
+        id: BridgeRequestId,
+        request: NavigateTreeRequest,
     ) {
         if self.is_disposed() {
             let _ = host
@@ -1269,19 +1198,14 @@ impl AgentSession {
         // navigate_tree_inner observes and surfaces as an aborted result rather
         // than persisting a stale summary.
 
-        let options = NavigateTreeOptions {
-            summarize: request.summarize.unwrap_or(false),
-            custom_instructions: request.custom_instructions,
-            replace_instructions: request.replace_instructions.unwrap_or(false),
-            label: request.label,
-        };
+        let NavigateTreeRequest { target_id, options } = request;
         let outcome = if options.summarize {
             match self
                 .resolve_summarization_inputs("branch summarization")
                 .await
             {
                 Ok((auth, summarizer)) => {
-                    self.navigate_tree(&request.target_id, options, auth, Some(&summarizer))
+                    self.navigate_tree(&target_id, options, auth, Some(&summarizer))
                         .await
                 }
                 Err(error) => {
@@ -1291,37 +1215,14 @@ impl AgentSession {
             }
         } else {
             self.navigate_tree(
-                &request.target_id,
+                &target_id,
                 options,
                 super::tree::SummarizationAuth::default(),
                 None,
             )
             .await
         };
-        let outcome = match outcome {
-            Ok(result) => {
-                let summary_entry = match result.summary_entry.map(serde_json::to_value).transpose()
-                {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        let _ = host
-                            .respond_navigate_tree(
-                                id,
-                                Err(format!("encode navigateTree summary: {error}")),
-                            )
-                            .await;
-                        return;
-                    }
-                };
-                Ok(SessionNavigateTreeResponse {
-                    cancelled: result.cancelled,
-                    editor_text: result.editor_text,
-                    aborted: result.aborted.then_some(true),
-                    summary_entry,
-                })
-            }
-            Err(error) => Err(error.to_string()),
-        };
+        let outcome = outcome.map_err(|error| error.to_string());
         if let Err(error) = host.respond_navigate_tree(id, outcome).await {
             self.report_extension_error(format!("navigateTree response: {error}"));
         }
@@ -1330,28 +1231,23 @@ impl AgentSession {
     async fn handle_bridge_reload(
         self: &Arc<Self>,
         host: Arc<ExtensionRuntimeSet>,
-        id: protocol::FrameId,
+        id: BridgeRequestId,
     ) {
         if host.is_pending_busy() {
-            self.respond_bridge_busy(&host, id, protocol::SESSION_RELOAD_METHOD)
+            self.respond_bridge_busy(&host, id, BridgeMethod::Reload)
                 .await;
             return;
         }
         if let Err(error) = self.reload_settings().await {
-            self.respond_bridge_error(
-                &host,
-                id,
-                protocol::SESSION_RELOAD_METHOD,
-                &error.to_string(),
-            )
-            .await;
+            self.respond_bridge_error(&host, id, BridgeMethod::Reload, &error.to_string())
+                .await;
             return;
         }
         let Some(model_runtime) = self.model_runtime() else {
             self.respond_bridge_error(
                 &host,
                 id,
-                protocol::SESSION_RELOAD_METHOD,
+                BridgeMethod::Reload,
                 "model runtime is unavailable",
             )
             .await;
@@ -1374,26 +1270,21 @@ impl AgentSession {
             Err(ReloadTransactionError::Pre(
                 ReloadPreAcceptError::Busy | ReloadPreAcceptError::InstallConflict,
             )) => {
-                self.respond_bridge_busy(&host, id, protocol::SESSION_RELOAD_METHOD)
+                self.respond_bridge_busy(&host, id, BridgeMethod::Reload)
                     .await;
             }
             Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Unreloadable)) => {
                 self.respond_bridge_error(
                     &host,
                     id,
-                    protocol::SESSION_RELOAD_METHOD,
+                    BridgeMethod::Reload,
                     "extension runtime is not reloadable",
                 )
                 .await;
             }
             Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Prepare(error))) => {
-                self.respond_bridge_error(
-                    &host,
-                    id,
-                    protocol::SESSION_RELOAD_METHOD,
-                    &error.to_string(),
-                )
-                .await;
+                self.respond_bridge_error(&host, id, BridgeMethod::Reload, &error.to_string())
+                    .await;
             }
             Err(ReloadTransactionError::Pre(ReloadPreAcceptError::Response(error))) => {
                 self.report_extension_error(format!("reload response: {error}"));
@@ -1404,7 +1295,7 @@ impl AgentSession {
                 );
             }
             Err(ReloadTransactionError::Post(ReloadPostAcceptError::StateLost)) => {
-                self.report_extension_error("reload: replacement ready state was lost");
+                self.report_extension_error("reload: replacement state was lost");
             }
             Err(ReloadTransactionError::Post(ReloadPostAcceptError::Invalidated)) => {
                 self.report_extension_error(
@@ -1429,8 +1320,8 @@ impl AgentSession {
     async fn handle_bridge_setup_entries(
         self: &Arc<Self>,
         host: Arc<ExtensionRuntimeSet>,
-        id: protocol::FrameId,
-        request: SessionSetupEntriesRequest,
+        id: BridgeRequestId,
+        request: SetupEntriesRequest,
     ) {
         let Some(target) = host.validate_setup_token(&request.replacement_token) else {
             let _ = host
@@ -1447,9 +1338,7 @@ impl AgentSession {
                 .map(|entry| serde_json::to_value(*entry))
                 .collect::<Result<Vec<Value>, _>>()
         };
-        let outcome = entries
-            .map(|entries| protocol::SessionSetupEntriesResponse { entries })
-            .map_err(|error| format!("serialize session entries: {error}"));
+        let outcome = entries.map_err(|error| format!("serialize session entries: {error}"));
         let _ = host.respond_setup_entries(id, outcome).await;
     }
 
@@ -1521,8 +1410,8 @@ impl AgentSession {
     async fn respond_bridge_runtime_error(
         &self,
         host: &ExtensionRuntimeSet,
-        id: protocol::FrameId,
-        method: &str,
+        id: BridgeRequestId,
+        method: BridgeMethod,
         error: AgentSessionRuntimeError,
     ) {
         if matches!(error, AgentSessionRuntimeError::ReplacementBusy) {
@@ -1536,23 +1425,23 @@ impl AgentSession {
     async fn respond_bridge_busy(
         &self,
         host: &ExtensionRuntimeSet,
-        id: protocol::FrameId,
-        method: &str,
+        id: BridgeRequestId,
+        method: BridgeMethod,
     ) {
         if let Err(error) = host.respond_replacement_busy(id, method).await {
-            self.report_extension_error(format!("{method} busy response: {error}"));
+            self.report_extension_error(format!("{method:?} busy response: {error}"));
         }
     }
 
     async fn respond_bridge_error(
         &self,
         host: &ExtensionRuntimeSet,
-        id: protocol::FrameId,
-        method: &str,
+        id: BridgeRequestId,
+        method: BridgeMethod,
         message: &str,
     ) {
         if let Err(error) = host.respond_session_error(id, method, message).await {
-            self.report_extension_error(format!("{method} error response: {error}"));
+            self.report_extension_error(format!("{method:?} error response: {error}"));
         }
     }
 
@@ -1736,7 +1625,7 @@ async fn dispatch_session_bridge_route(
             if !host.is_session_target_current(binding) {
                 return;
             }
-            let state = target.session_state_wire().await;
+            let state = target.session_state().await;
             let _ = host.push_session_state_for_binding(binding, &state).await;
         }
         SessionBridgeRoute::Candidate(target) => {
@@ -1785,16 +1674,12 @@ async fn answer_unclaimed_bridge_event(host: &Arc<ExtensionRuntimeSet>, event: S
         }
         SessionBridgeEvent::NewSession { id, .. } => {
             let _ = host
-                .respond_session_error(
-                    id,
-                    protocol::SESSION_NEW_SESSION_METHOD,
-                    "no active session",
-                )
+                .respond_session_error(id, BridgeMethod::NewSession, "no active session")
                 .await;
         }
         SessionBridgeEvent::Fork { id, .. } => {
             let _ = host
-                .respond_session_error(id, protocol::SESSION_FORK_METHOD, "no active session")
+                .respond_session_error(id, BridgeMethod::Fork, "no active session")
                 .await;
         }
         SessionBridgeEvent::NavigateTree { id, .. } => {
@@ -1804,11 +1689,7 @@ async fn answer_unclaimed_bridge_event(host: &Arc<ExtensionRuntimeSet>, event: S
         }
         SessionBridgeEvent::SwitchSession { id, .. } => {
             let _ = host
-                .respond_session_error(
-                    id,
-                    protocol::SESSION_SWITCH_SESSION_METHOD,
-                    "no active session",
-                )
+                .respond_session_error(id, BridgeMethod::SwitchSession, "no active session")
                 .await;
         }
         SessionBridgeEvent::Reload { id } => {
@@ -1822,14 +1703,6 @@ async fn answer_unclaimed_bridge_event(host: &Arc<ExtensionRuntimeSet>, event: S
                 .await;
         }
     }
-}
-
-/// Wire string for a thinking level (serde `lowercase` discriminant).
-fn thinking_level_wire(level: ModelThinkingLevel) -> String {
-    serde_json::to_value(level)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "medium".to_owned())
 }
 
 /// Parse a wire thinking-level discriminant.
@@ -1910,6 +1783,8 @@ fn user_message_parts(content: &Value) -> (String, Vec<ImageContent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Wire-frame emitters (Frame, FrameKind, method constants) emulate the
+    // host. They are the only pi_ext symbols permitted in this test module.
     use crate::core::agent_session::extension_runner::ExtensionRunner;
     use crate::core::agent_session::{AgentSession, AgentSessionConfig};
     use futures::future::BoxFuture;
@@ -1918,6 +1793,8 @@ mod tests {
         AssistantMessageEvent, Context, Model, ModelCost, ModelInput, Provider, ProviderError,
         StreamOptions,
     };
+    use pi_ext::protocol;
+    use serde_json::json;
     use std::collections::HashMap;
     use std::error::Error;
     use std::io;
@@ -2642,7 +2519,9 @@ mod tests {
             .reload_host_transaction(
                 Arc::clone(&runtime_set),
                 model_runtime,
-                ReloadOrigin::Bridge { id: 99 },
+                ReloadOrigin::Bridge {
+                    id: BridgeRequestId(99),
+                },
             )
             .await;
         assert!(matches!(
@@ -3271,9 +3150,9 @@ mod tests {
 
     #[tokio::test]
     async fn answer_unclaimed_bridge_event_answers_correlated_requests() -> TestResult {
+        use crate::core::agent_session::bridge_types::{CompactRequest, SetModelRequest};
         use crate::core::extension_host::SessionBridgeEvent;
         use crate::core::extension_runtime_set::{EndpointKind, ExtensionRuntimeSet};
-        use pi_ext::protocol::{SessionCompactRequest, SessionSetModelRequest};
 
         let (runner, _host) =
             crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
@@ -3290,8 +3169,8 @@ mod tests {
         answer_unclaimed_bridge_event(
             &set,
             SessionBridgeEvent::SetModel {
-                id: 1,
-                request: SessionSetModelRequest {
+                id: BridgeRequestId(1),
+                request: SetModelRequest {
                     model: json!({"provider": "p", "id": "m"}),
                 },
             },
@@ -3301,15 +3180,21 @@ mod tests {
         answer_unclaimed_bridge_event(
             &set,
             SessionBridgeEvent::Compact {
-                id: 2,
-                request: SessionCompactRequest {
+                id: BridgeRequestId(2),
+                request: CompactRequest {
                     custom_instructions: None,
                 },
             },
         )
         .await;
 
-        answer_unclaimed_bridge_event(&set, SessionBridgeEvent::Reload { id: 3 }).await;
+        answer_unclaimed_bridge_event(
+            &set,
+            SessionBridgeEvent::Reload {
+                id: BridgeRequestId(3),
+            },
+        )
+        .await;
 
         set.shutdown_once().await;
         Ok(())
@@ -3608,7 +3493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_state_wire_produces_scoped_models() -> TestResult {
+    async fn session_state_produces_scoped_models() -> TestResult {
         use crate::core::agent_session::ScopedModel;
         use pi_ai::ModelThinkingLevel;
 
@@ -3639,22 +3524,22 @@ mod tests {
             },
         ];
         let session = Arc::new(AgentSession::new(config)?);
-        let state = session.session_state_wire().await;
+        let state = session.session_state().await;
 
         assert_eq!(state.scoped_models.len(), 2);
         assert_eq!(
             state.scoped_models[0].thinking_level,
-            Some("high".to_owned())
+            Some(ModelThinkingLevel::High)
         );
         assert!(state.scoped_models[1].thinking_level.is_none());
-        assert_eq!(state.scoped_models[0].model["id"], "m");
-        assert_eq!(state.scoped_models[1].model["provider"], "other-provider");
+        assert_eq!(state.scoped_models[0].model.id, "m");
+        assert_eq!(state.scoped_models[1].model.provider, "other-provider");
         Ok(())
     }
 
     fn session_name_command(name: &str, replacement_token: Option<&str>) -> SessionBridgeEvent {
         SessionBridgeEvent::Command {
-            envelope: protocol::SessionCommandEnvelope {
+            envelope: crate::core::agent_session::bridge_types::SessionCommandEnvelope {
                 replacement_token: replacement_token.map(str::to_owned),
                 command: SessionCommand::SetSessionName {
                     name: name.to_owned(),
@@ -3664,13 +3549,31 @@ mod tests {
         }
     }
 
+    /// Minimal [`SessionState`] for tests that only exercise the publish/activate
+    /// gating logic (content is irrelevant — the facade just serializes it).
+    fn test_session_state() -> SessionState {
+        SessionState {
+            session_name: None,
+            thinking_level: pi_ai::ModelThinkingLevel::Off,
+            active_tools: Vec::new(),
+            all_tools: Vec::new(),
+            commands: Vec::new(),
+            model: Some(test_model()),
+            scoped_models: Vec::new(),
+            is_idle: true,
+            has_pending_messages: false,
+            context_usage: None,
+            system_prompt: String::new(),
+        }
+    }
+
     #[tokio::test]
     async fn session_bridge_rebind_invalidates_committed_authority() -> TestResult {
         let first = make_session()?;
         let second = make_session()?;
         let set = ExtensionRuntimeSet::bind(Vec::new());
         let first_binding = set.bind_session_target(Arc::downgrade(&first)).await;
-        let state = SessionStateWire::default();
+        let state = test_session_state();
         assert!(
             !set.push_session_state_for_binding(first_binding, &state)
                 .await,
@@ -3775,8 +3678,8 @@ mod tests {
         assert!(Arc::ptr_eq(&target, &candidate));
         assert!(matches!(
             set.route_session_bridge(&SessionBridgeEvent::SetupEntries {
-                id: 1,
-                request: SessionSetupEntriesRequest {
+                id: BridgeRequestId(1),
+                request: SetupEntriesRequest {
                     replacement_token: token.clone(),
                 },
                 origin: None,
@@ -3845,7 +3748,7 @@ mod tests {
         let active = make_session()?;
         let candidate = make_session()?;
         let binding = set.bind_session_target(Arc::downgrade(&active)).await;
-        let state = active.session_state_wire().await;
+        let state = active.session_state().await;
         assert!(set.activate_session_state(binding, &state).await);
         fake_host
             .wait_for_frame(protocol::SESSION_UPDATE_METHOD)
@@ -3886,7 +3789,7 @@ mod tests {
             "a candidate command must not publish the candidate mirror"
         );
         assert_eq!(
-            candidate.session_state_wire().await.session_name.as_deref(),
+            candidate.session_state().await.session_name.as_deref(),
             Some("candidate-name")
         );
 
@@ -3956,7 +3859,7 @@ mod tests {
             ["replacement control unexpectedly reached session bridge dispatch"]
         );
         assert_eq!(
-            session.session_state_wire().await.session_name.as_deref(),
+            session.session_state().await.session_name.as_deref(),
             Some("still-running")
         );
         set.shutdown_once().await;
@@ -4017,11 +3920,162 @@ mod tests {
             ["non-replacement event unexpectedly routed as a bridge operation"]
         );
         assert_eq!(
-            session.session_state_wire().await.session_name.as_deref(),
+            session.session_state().await.session_name.as_deref(),
             Some("still-running")
         );
         set.shutdown_once().await;
         session.dispose().await;
+        Ok(())
+    }
+
+    /// ARC13 guard: the production region of this file (everything before
+    /// `#[cfg(test)]`) must contain zero `pi_ext` symbols. Wire-frame
+    /// emitters in the test module are the sole permitted exception.
+    #[test]
+    fn extension_production_has_no_pi_ext_symbols() {
+        let source = include_str!("extension.rs");
+        // A missing marker scans the whole file — the test module's wire
+        // emitters then fail the assertion, so strictness is preserved.
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            !production.contains("pi_ext"),
+            "ARC13 violation: agent_session/extension.rs production code \
+             references `pi_ext` — wire vocabulary must stay behind the \
+             extension_host adapter seam"
+        );
+    }
+
+    /// ARC13: a stale `session.setupEntries` token fails closed with an
+    /// explicit error response — never a hang and never a partial snapshot.
+    #[tokio::test]
+    async fn stale_setup_entries_token_fails_closed() -> TestResult {
+        let (_session, _runtime, set, host) =
+            build_reload_session_with_provider(provider_snapshot_with_auth(
+                "reload-provider",
+                "https://old.example/v1",
+                "reload-model",
+                4096,
+            ))
+            .await?;
+        // Emit a real inbound wire request whose token no pending
+        // replacement owns (a real pending with a different token is
+        // prepared below). route_session_bridge tags SetupEntries with the
+        // request token and rejects a mismatch at routing (Candidate arm),
+        // so dispatch never reaches the handler: the stale token fails
+        // closed with an error frame. The handler-side validate_setup_token
+        // is defense-in-depth behind this route check.
+        let (replacement, _replacement_host) =
+            crate::core::extension_runtime_set::tests::make_runner(json!({
+                "providers": [provider_snapshot_with_auth(
+                    "reload-provider",
+                    "https://new.example/v1",
+                    "reload-model",
+                    4096
+                )],
+                "handlers": [],
+                "terminalInput": false
+            }))
+            .await?;
+        let (replacement_gen, pending) =
+            crate::core::extension_runtime_set::generation_from_endpoints(
+                2,
+                vec![(
+                    crate::core::extension_runtime_set::EndpointKind::TsCompat,
+                    "<replacement>".to_owned(),
+                    replacement,
+                )],
+            );
+        set.inject_prepared_replacement_for_reload(replacement_gen, pending);
+
+        host.emit(pi_ext::protocol::Frame {
+            id: 9,
+            kind: pi_ext::protocol::FrameKind::Req,
+            method: "session.setupEntries".to_owned(),
+            payload: json!({"replacementToken": "not-the-real-token"}),
+        })
+        .await;
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(frame) = host.correlated_frame("session.setupEntries", 9) {
+                    return frame;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "setupEntries response never arrived")?;
+        // The route layer rejects a token no pending replacement owns, and
+        // the request fails closed: an error frame, never a partial
+        // snapshot. The handler's own stale-token guard is defense in depth
+        // behind the same seam.
+        assert_eq!(frame.kind, pi_ext::protocol::FrameKind::Error);
+        assert_eq!(frame.payload["code"], "extension_error");
+        assert!(
+            frame.payload.get("entries").is_none(),
+            "a stale token must never receive session entries"
+        );
+        Ok(())
+    }
+
+    /// ARC13: extension-registered commands surface in `slash_commands()`
+    /// through the product catalog with resolved provenance.
+    #[tokio::test]
+    async fn slash_commands_includes_host_catalog_entries() -> TestResult {
+        let (runner, _host) = crate::core::extension_runtime_set::tests::make_runner(json!({
+            "providers": [provider_snapshot_with_auth(
+                "reload-provider",
+                "https://old.example/v1",
+                "reload-model",
+                4096
+            )],
+            "commands": [{
+                "name": "extHello",
+                "description": "says hello",
+                "source": "/ext/main.ts",
+                "sourceInfo": {
+                    "path": "/ext/main.ts",
+                    "source": "package",
+                    "origin": "package",
+                    "scope": "project"
+                }
+            }],
+            "handlers": [],
+            "terminalInput": false
+        }))
+        .await?;
+        let set = ExtensionRuntimeSet::bind(vec![(
+            crate::core::extension_runtime_set::EndpointKind::TsCompat,
+            runner,
+        )]);
+        let runtime = Arc::new(crate::core::model_runtime::ModelRuntime::create_in_memory().await?);
+        assert!(
+            set.register_providers_on(&runtime)
+                .into_iter()
+                .all(|(_path, result)| result.is_ok()),
+            "fixture provider registration failed"
+        );
+        let available = runtime.get_available_snapshot();
+        let model = available[0].clone();
+        let mut config = AgentSessionConfig::test_config(Arc::new(StubProvider), model)?;
+        config.extension_runner = Some(set.clone());
+        config.host_extension_runner = Some(set.clone());
+        config.model_runtime = Some(runtime);
+        let session = AgentSession::new(config)?;
+        session
+            .bind_extensions(ExtensionBindings {
+                mode: Some(ExtensionMode::Rpc),
+                ..Default::default()
+            })
+            .await?;
+
+        let commands = session.slash_commands();
+        let entry = commands
+            .iter()
+            .find(|command| command.name == "extHello")
+            .ok_or("extension command missing from slash_commands()")?;
+        assert_eq!(entry.description.as_deref(), Some("says hello"));
+        let info = entry.source_info.clone();
+        assert_eq!(info.path, "/ext/main.ts");
         Ok(())
     }
 }

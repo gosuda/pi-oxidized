@@ -15,9 +15,8 @@ use pi_ext::adapters::{ExtensionProvider, Registry, RendererKind, ShortcutRegist
 use pi_ext::client::{DialogEnd, HostClient, HostClientError, HostUiRequest, HostUiResponse};
 use pi_ext::host::{self, HostSource, HostSpec};
 use pi_ext::protocol::{
-    self, ExtensionErrorEvent, FlagValueWire, FrameId, ProviderEvent, SessionSetupEntriesResponse,
-    SessionStateWire, ShortcutExecuteResponse, ThemeUpdate, ToolUpdate, UiEventRequest,
-    UiEventResponse, UiStateWire,
+    self, ExtensionErrorEvent, FlagValueWire, ProviderEvent, ShortcutExecuteResponse, ThemeUpdate,
+    ToolUpdate, UiEventRequest, UiEventResponse, UiStateWire,
 };
 use pi_ext::sanitize::SanitizedSlot;
 use serde_json::{Map, Value};
@@ -28,6 +27,10 @@ use super::agent_session::events::{AgentSessionEvent, SessionShutdownReason};
 use super::agent_session::extension_runner::{
     BeforeAgentStartResult, CancelResult, ExtensionRunner, ExtensionRunnerError,
     InputTransformResult,
+};
+use super::agent_session::tree::NavigateTreeResult;
+use super::agent_session::{
+    BridgeMethod, BridgeRequestId, CommandCatalogEntry, ExtensionHostError, SessionState,
 };
 use super::agent_session_runtime::{CreateAgentSessionRuntimeResult, spawn_runtime_safe};
 use super::agent_session_services::ExtensionFlagType;
@@ -364,16 +367,16 @@ struct EndpointRelayContext {
 #[derive(Clone, Copy)]
 struct CorrelationRoute {
     endpoint: EndpointId,
-    local: FrameId,
+    local: BridgeRequestId,
 }
 
 struct PublishedRuntimeState {
     generation: Arc<Generation>,
     slots: HashMap<String, BTreeMap<EndpointId, SanitizedSlot>>,
-    routes: HashMap<FrameId, CorrelationRoute>,
+    routes: HashMap<BridgeRequestId, CorrelationRoute>,
     retired: BTreeSet<EndpointId>,
     provider_runtime: Option<ModelRuntime>,
-    next_route_id: FrameId,
+    next_route_id: BridgeRequestId,
     stale: bool,
     shutdown_done: bool,
 }
@@ -386,7 +389,7 @@ impl PublishedRuntimeState {
             routes: HashMap::new(),
             retired: BTreeSet::new(),
             provider_runtime: None,
-            next_route_id: 1,
+            next_route_id: BridgeRequestId(1),
             stale: false,
             shutdown_done: false,
         }
@@ -542,14 +545,18 @@ impl PublishedRuntimeState {
         !self.stale && !self.shutdown_done && self.generation.has_one_active_compat_endpoint()
     }
 
-    fn allocate_route(&mut self, endpoint: EndpointId, local: FrameId) -> Option<FrameId> {
+    fn allocate_route(
+        &mut self,
+        endpoint: EndpointId,
+        local: BridgeRequestId,
+    ) -> Option<BridgeRequestId> {
         if !self.accepts_relay(endpoint) {
             return None;
         }
         loop {
             let id = self.next_route_id;
-            self.next_route_id = self.next_route_id.wrapping_add(1);
-            if id == 0 || self.routes.contains_key(&id) {
+            self.next_route_id = BridgeRequestId(id.0.wrapping_add(1));
+            if id.0 == 0 || self.routes.contains_key(&id) {
                 continue;
             }
             self.routes.insert(id, CorrelationRoute { endpoint, local });
@@ -557,11 +564,14 @@ impl PublishedRuntimeState {
         }
     }
 
-    fn release_route(&mut self, id: FrameId) {
+    fn release_route(&mut self, id: BridgeRequestId) {
         self.routes.remove(&id);
     }
 
-    fn claim_route(&mut self, id: FrameId) -> Option<(GenerationLease, Endpoint, FrameId)> {
+    fn claim_route(
+        &mut self,
+        id: BridgeRequestId,
+    ) -> Option<(GenerationLease, Endpoint, BridgeRequestId)> {
         let route = *self.routes.get(&id)?;
         let endpoint = self.generation.endpoint(route.endpoint)?.clone();
         self.routes.remove(&id);
@@ -926,6 +936,38 @@ impl ExtensionRuntimeSet {
             .cloned()
     }
 
+    /// Product command catalog for the session's slash-command view. The
+    /// facade enriches already-product entries with resource-discovered
+    /// provenance (discovered wins over host-reported, preserving the
+    /// pre-ARC13 precedence) and applies first-wins dedup on names. The wire
+    /// registry conversion lives on `HostExtensionRunner`.
+    #[must_use]
+    pub fn command_catalog(&self) -> Vec<CommandCatalogEntry> {
+        let source_infos = self
+            .command_source_infos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let lease = self.lease();
+        let mut seen = std::collections::HashSet::new();
+        let mut entries = Vec::new();
+        for endpoint in lease.live_endpoints() {
+            for mut entry in endpoint.runner.command_catalog() {
+                let discovered = entry
+                    .source
+                    .as_deref()
+                    .and_then(|source| source_infos.get(source).cloned());
+                if let Some(discovered) = discovered {
+                    entry.source_info = Some(discovered);
+                }
+                if seen.insert(entry.name.clone()) {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries
+    }
+
     /// Bind pre-built single-endpoint runners (focused fake-host tests).
     #[cfg(test)]
     pub(crate) fn bind(endpoints: Vec<(EndpointKind, Arc<HostExtensionRunner>)>) -> Arc<Self> {
@@ -957,9 +999,9 @@ impl ExtensionRuntimeSet {
 
     fn claim_route_and_bind_owner(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         bind_token: Option<&str>,
-    ) -> Option<(GenerationLease, Endpoint, FrameId)> {
+    ) -> Option<(GenerationLease, Endpoint, BridgeRequestId)> {
         // Keep route claim and owner binding atomic against endpoint retirement.
         let mut state = self.state();
         let claimed = state.claim_route(id)?;
@@ -1746,10 +1788,12 @@ impl ExtensionRuntimeSet {
     ///
     /// Returns an error when the response route is stale or missing, or its host rejects it.
     pub async fn respond_ui(&self, response: HostUiResponse) -> Result<(), HostClientError> {
-        let Some((_lease, endpoint, local)) = self.state().claim_route(response.id()) else {
+        let Some((_lease, endpoint, local)) =
+            self.state().claim_route(BridgeRequestId(response.id()))
+        else {
             return Err(HostClientError::NotRunning);
         };
-        endpoint.runner.respond_ui(response.with_id(local)).await
+        endpoint.runner.respond_ui(response.with_id(local.0)).await
     }
 
     /// Whether this facade has at least one active endpoint.
@@ -1931,11 +1975,11 @@ impl ExtensionRuntimeSet {
     /// Returns an error when the response route is stale or missing, or its host rejects it.
     pub async fn respond_set_model(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         success: bool,
-    ) -> Result<(), HostClientError> {
+    ) -> Result<(), ExtensionHostError> {
         let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
-            return Err(HostClientError::NotRunning);
+            return Err(ExtensionHostError::NotRunning);
         };
         endpoint.runner.respond_set_model(local, success).await
     }
@@ -1947,11 +1991,11 @@ impl ExtensionRuntimeSet {
     /// Returns an error when the response route is stale or missing, or its host rejects it.
     pub async fn respond_compact(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         outcome: Result<Value, String>,
-    ) -> Result<(), HostClientError> {
+    ) -> Result<(), ExtensionHostError> {
         let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
-            return Err(HostClientError::NotRunning);
+            return Err(ExtensionHostError::NotRunning);
         };
         endpoint.runner.respond_compact(local, outcome).await
     }
@@ -1963,14 +2007,14 @@ impl ExtensionRuntimeSet {
     /// Returns an error when the response route is stale or its host rejects it.
     pub async fn respond_new_session(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         cancelled: bool,
         token: Option<&str>,
-    ) -> Result<(), HostClientError> {
+    ) -> Result<(), ExtensionHostError> {
         let bind_token = (!cancelled).then_some(token).flatten();
         let Some((_lease, endpoint, local)) = self.claim_route_and_bind_owner(id, bind_token)
         else {
-            return Err(HostClientError::NotRunning);
+            return Err(ExtensionHostError::NotRunning);
         };
         endpoint
             .runner
@@ -1985,15 +2029,15 @@ impl ExtensionRuntimeSet {
     /// Returns an error when the response route is stale or its host rejects it.
     pub async fn respond_fork(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         cancelled: bool,
         selected_text: Option<&str>,
         token: Option<&str>,
-    ) -> Result<(), HostClientError> {
+    ) -> Result<(), ExtensionHostError> {
         let bind_token = (!cancelled).then_some(token).flatten();
         let Some((_lease, endpoint, local)) = self.claim_route_and_bind_owner(id, bind_token)
         else {
-            return Err(HostClientError::NotRunning);
+            return Err(ExtensionHostError::NotRunning);
         };
         endpoint
             .runner
@@ -2008,11 +2052,11 @@ impl ExtensionRuntimeSet {
     /// Returns an error when the response route is stale or its host rejects it.
     pub async fn respond_navigate_tree(
         &self,
-        id: FrameId,
-        outcome: Result<protocol::SessionNavigateTreeResponse, String>,
-    ) -> Result<(), HostClientError> {
+        id: BridgeRequestId,
+        outcome: Result<NavigateTreeResult, String>,
+    ) -> Result<(), ExtensionHostError> {
         let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
-            return Err(HostClientError::NotRunning);
+            return Err(ExtensionHostError::NotRunning);
         };
         endpoint.runner.respond_navigate_tree(local, outcome).await
     }
@@ -2024,14 +2068,14 @@ impl ExtensionRuntimeSet {
     /// Returns an error when the response route is stale or its host rejects it.
     pub async fn respond_switch_session(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         cancelled: bool,
         token: Option<&str>,
-    ) -> Result<(), HostClientError> {
+    ) -> Result<(), ExtensionHostError> {
         let bind_token = (!cancelled).then_some(token).flatten();
         let Some((_lease, endpoint, local)) = self.claim_route_and_bind_owner(id, bind_token)
         else {
-            return Err(HostClientError::NotRunning);
+            return Err(ExtensionHostError::NotRunning);
         };
         endpoint
             .runner
@@ -2046,13 +2090,13 @@ impl ExtensionRuntimeSet {
     /// Returns an error when the response route is stale or its host rejects it.
     pub async fn respond_reload(
         &self,
-        id: FrameId,
+        id: BridgeRequestId,
         outcome: Result<Option<&str>, String>,
-    ) -> Result<(), HostClientError> {
+    ) -> Result<(), ExtensionHostError> {
         let bind_token = outcome.as_ref().ok().and_then(|token| *token);
         let Some((_lease, endpoint, local)) = self.claim_route_and_bind_owner(id, bind_token)
         else {
-            return Err(HostClientError::NotRunning);
+            return Err(ExtensionHostError::NotRunning);
         };
         endpoint.runner.respond_reload(local, outcome).await
     }
@@ -2064,11 +2108,11 @@ impl ExtensionRuntimeSet {
     /// Returns an error when the response route is stale or missing, or its host rejects it.
     pub async fn respond_setup_entries(
         &self,
-        id: FrameId,
-        outcome: Result<SessionSetupEntriesResponse, String>,
-    ) -> Result<(), HostClientError> {
+        id: BridgeRequestId,
+        outcome: Result<Vec<Value>, String>,
+    ) -> Result<(), ExtensionHostError> {
         let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
-            return Err(HostClientError::NotRunning);
+            return Err(ExtensionHostError::NotRunning);
         };
         endpoint.runner.respond_setup_entries(local, outcome).await
     }
@@ -2100,11 +2144,11 @@ impl ExtensionRuntimeSet {
     /// Returns an error when the response route is stale or its host rejects it.
     pub async fn respond_replacement_busy(
         &self,
-        id: FrameId,
-        method: &str,
-    ) -> Result<(), HostClientError> {
+        id: BridgeRequestId,
+        method: BridgeMethod,
+    ) -> Result<(), ExtensionHostError> {
         let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
-            return Err(HostClientError::NotRunning);
+            return Err(ExtensionHostError::NotRunning);
         };
         endpoint
             .runner
@@ -2119,12 +2163,12 @@ impl ExtensionRuntimeSet {
     /// Returns an error when the response route is stale or its host rejects it.
     pub async fn respond_session_error(
         &self,
-        id: FrameId,
-        method: &str,
+        id: BridgeRequestId,
+        method: BridgeMethod,
         message: &str,
-    ) -> Result<(), HostClientError> {
+    ) -> Result<(), ExtensionHostError> {
         let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
-            return Err(HostClientError::NotRunning);
+            return Err(ExtensionHostError::NotRunning);
         };
         endpoint
             .runner
@@ -2136,7 +2180,7 @@ impl ExtensionRuntimeSet {
     pub(crate) async fn activate_session_state(
         &self,
         binding: SessionTargetBinding,
-        state: &SessionStateWire,
+        state: &SessionState,
     ) -> bool {
         let _publish = self.session_publish_lock.lock().await;
         if !self
@@ -2160,7 +2204,7 @@ impl ExtensionRuntimeSet {
     pub(crate) async fn push_session_state_for_binding(
         &self,
         binding: SessionTargetBinding,
-        state: &SessionStateWire,
+        state: &SessionState,
     ) -> bool {
         let _publish = self.session_publish_lock.lock().await;
         if !self
@@ -2176,7 +2220,7 @@ impl ExtensionRuntimeSet {
         true
     }
 
-    async fn broadcast_session_state(&self, state: &SessionStateWire) {
+    async fn broadcast_session_state(&self, state: &SessionState) {
         let lease = self.lease();
         let mut sends = FuturesUnordered::new();
         for endpoint in lease.live_endpoints() {
@@ -3271,7 +3315,7 @@ fn spawn_ui_relays(
                     state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .allocate_route(endpoint, local_id)
+                        .allocate_route(endpoint, BridgeRequestId(local_id))
                 };
                 let Some(routed_id) = routed_id else {
                     // Endpoint no longer accepts relays: self-answer Closed.
@@ -3280,7 +3324,7 @@ fn spawn_ui_relays(
                 };
                 match request_channels
                     .ui_requests_tx
-                    .try_send(request.with_id(routed_id))
+                    .try_send(request.with_id(routed_id.0))
                 {
                     Ok(()) => {}
                     // A bounded facade queue is Full, not failed delivery: self-answer Full.
@@ -3735,16 +3779,12 @@ async fn answer_unclaimed_session(runner: &HostExtensionRunner, event: SessionBr
         }
         SessionBridgeEvent::NewSession { id, .. } => {
             let _ = runner
-                .respond_session_error(
-                    id,
-                    protocol::SESSION_NEW_SESSION_METHOD,
-                    "no active session",
-                )
+                .respond_session_error(id, BridgeMethod::NewSession, "no active session")
                 .await;
         }
         SessionBridgeEvent::Fork { id, .. } => {
             let _ = runner
-                .respond_session_error(id, protocol::SESSION_FORK_METHOD, "no active session")
+                .respond_session_error(id, BridgeMethod::Fork, "no active session")
                 .await;
         }
         SessionBridgeEvent::NavigateTree { id, .. } => {
@@ -3754,11 +3794,7 @@ async fn answer_unclaimed_session(runner: &HostExtensionRunner, event: SessionBr
         }
         SessionBridgeEvent::SwitchSession { id, .. } => {
             let _ = runner
-                .respond_session_error(
-                    id,
-                    protocol::SESSION_SWITCH_SESSION_METHOD,
-                    "no active session",
-                )
+                .respond_session_error(id, BridgeMethod::SwitchSession, "no active session")
                 .await;
         }
         SessionBridgeEvent::Reload { id } => {
@@ -3894,8 +3930,9 @@ pub(crate) mod tests {
     use std::io::{BufRead, Write};
     use std::sync::atomic::AtomicUsize;
 
+    use crate::core::agent_session::{SessionCommand, SessionCommandEnvelope};
     use pi_ext::client::DialogOutcome;
-    use pi_ext::protocol::{Frame, FrameKind, HelloAck, SessionCommand, SessionCommandEnvelope};
+    use pi_ext::protocol::{Frame, FrameId, FrameKind, HelloAck};
     use pi_ext::sanitize::{SanitizedRun, SanitizedSlot};
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -4027,7 +4064,7 @@ pub(crate) mod tests {
         let owner = set.state().generation.endpoints[0].id;
         let route = set
             .state()
-            .allocate_route(owner, 80)
+            .allocate_route(owner, BridgeRequestId(80))
             .ok_or("owner route allocation failed")?;
         set.respond_reload(route, Ok(Some(&token))).await?;
         host.wait_for_response(protocol::SESSION_RELOAD_METHOD, 80)
@@ -4119,7 +4156,7 @@ pub(crate) mod tests {
         let owner = set.state().generation.endpoints[0].id;
         let route = set
             .state()
-            .allocate_route(owner, 81)
+            .allocate_route(owner, BridgeRequestId(81))
             .ok_or("owner route allocation failed")?;
         set.respond_reload(route, Ok(Some(&token))).await?;
         host.wait_for_response(protocol::SESSION_RELOAD_METHOD, 81)
@@ -5738,6 +5775,73 @@ pub(crate) mod tests {
         first_host.wait_for_request("tool.renderHtml").await?;
         assert_eq!(second_host.request_count("command.execute"), 0);
         assert_eq!(second_host.request_count("tool.renderHtml"), 0);
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    /// ARC13: the facade command catalog dedups first-wins across endpoints
+    /// and overlays resource-discovered provenance over host-reported
+    /// provenance (discovered wins).
+    #[tokio::test]
+    async fn command_catalog_dedups_first_wins_and_overlays_discovered_source() -> TestResult {
+        use crate::core::agent_session::CommandCatalogEntry;
+        use crate::core::resources::source_info::{SourceInfo, SourceOrigin, SourceScope};
+
+        let (first, _first_host) = make_runner(json!({
+            "commands": [{
+                "name": "sharedCmd",
+                "description": "first description",
+                "source": "/ext/first.ts",
+                "sourceInfo": {
+                    "path": "/ext/first.ts",
+                    "source": "package",
+                    "origin": "package",
+                    "scope": "project"
+                }
+            }],
+            "handlers": [],
+        }))
+        .await?;
+        let (second, _second_host) = make_runner(json!({
+            "commands": [{
+                "name": "sharedCmd",
+                "description": "second description"
+            }],
+            "handlers": [],
+        }))
+        .await?;
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, first),
+            (EndpointKind::Native, second),
+        ]);
+        set.set_command_source_infos([(
+            "/ext/first.ts".to_owned(),
+            SourceInfo {
+                path: "/discovered/first.ts".to_owned(),
+                source: "local".to_owned(),
+                scope: SourceScope::User,
+                origin: SourceOrigin::TopLevel,
+                base_dir: None,
+            },
+        )]);
+
+        let catalog = set.command_catalog();
+        assert_eq!(
+            catalog,
+            vec![CommandCatalogEntry {
+                name: "sharedCmd".to_owned(),
+                description: "first description".to_owned(),
+                source: Some("/ext/first.ts".to_owned()),
+                source_info: Some(SourceInfo {
+                    path: "/discovered/first.ts".to_owned(),
+                    source: "local".to_owned(),
+                    scope: SourceScope::User,
+                    origin: SourceOrigin::TopLevel,
+                    base_dir: None,
+                }),
+            }],
+            "first endpoint wins on duplicates; discovered provenance overlays host-reported"
+        );
         set.shutdown_once().await;
         Ok(())
     }
@@ -7488,7 +7592,7 @@ pub(crate) mod tests {
             .map_err(|_| "initial pending install was rejected")?;
         let route = set
             .state()
-            .allocate_route(owner, 77)
+            .allocate_route(owner, BridgeRequestId(77))
             .ok_or("owner route allocation failed")?;
         set.respond_reload(route, Ok(Some(&token))).await?;
         owner_host
@@ -7537,7 +7641,7 @@ pub(crate) mod tests {
             .map_err(|_| "initial pending install was rejected")?;
         let route = set
             .state()
-            .allocate_route(owner, 78)
+            .allocate_route(owner, BridgeRequestId(78))
             .ok_or("owner route allocation failed")?;
         set.respond_reload(route, Ok(Some(&token))).await?;
         host.wait_for_response(protocol::SESSION_RELOAD_METHOD, 78)
@@ -7585,7 +7689,7 @@ pub(crate) mod tests {
             .map_err(|_| "initial pending install was rejected")?;
         let route = set
             .state()
-            .allocate_route(owner, 79)
+            .allocate_route(owner, BridgeRequestId(79))
             .ok_or("owner route allocation failed")?;
         set.respond_reload(route, Ok(Some(&token))).await?;
         owner_host
@@ -7622,9 +7726,9 @@ pub(crate) mod tests {
         ));
         assert!(matches!(
             set.route_session_bridge(&SessionBridgeEvent::Command {
-                envelope: protocol::SessionCommandEnvelope {
+                envelope: SessionCommandEnvelope {
                     replacement_token: Some(token.clone()),
-                    command: protocol::SessionCommand::SetSessionName {
+                    command: SessionCommand::SetSessionName {
                         name: "candidate".to_owned(),
                     },
                 },
@@ -7722,7 +7826,7 @@ pub(crate) mod tests {
         set.install(pending);
         let route = set
             .state()
-            .allocate_route(dead_id, 77)
+            .allocate_route(dead_id, BridgeRequestId(77))
             .ok_or("route allocation failed")?;
         assert!(
             set.registry()

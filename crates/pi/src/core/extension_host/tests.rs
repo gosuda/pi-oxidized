@@ -39,6 +39,7 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+use super::super::agent_session::bridge_types::{BridgeRequestId, SessionCommand};
 use super::super::agent_session::events::{
     AgentSessionEvent, SessionShutdownReason as ShutdownReason,
 };
@@ -2348,7 +2349,6 @@ async fn push_theme_update_sends_event_and_records_generation() -> R {
 #[tokio::test]
 async fn session_command_and_set_model_route_through_claimed_bridge() -> R {
     use crate::core::extension_host::SessionBridgeEvent;
-    use pi_ext::protocol::SessionCommand;
 
     let (runner, host) = make_runner(json!({})).await?;
     let mut bridge = runner
@@ -2391,7 +2391,7 @@ async fn session_command_and_set_model_route_through_claimed_bridge() -> R {
     let SessionBridgeEvent::SetModel { id, request } = event else {
         return Err(format!("expected SetModel, got {event:?}").into());
     };
-    assert_eq!(id, 41);
+    assert_eq!(id, BridgeRequestId(41));
     assert_eq!(request.model["id"], "gpt-x");
 
     runner.respond_set_model(id, true).await?;
@@ -2507,7 +2507,7 @@ async fn scoped_command_precedes_replacement_ready_on_claimed_bridge() -> R {
     assert!(matches!(
         command,
         SessionBridgeEvent::Command {
-            envelope: pi_ext::protocol::SessionCommandEnvelope {
+            envelope: super::super::agent_session::bridge_types::SessionCommandEnvelope {
                 replacement_token: Some(token),
                 ..
             },
@@ -2614,7 +2614,9 @@ async fn unexpected_direct_session_control_reports_and_continues() -> R {
 
     finish_direct_session_control_delivery(
         &runner.inner,
-        Some(SessionBridgeEvent::Reload { id: 41 }),
+        Some(SessionBridgeEvent::Reload {
+            id: BridgeRequestId(41),
+        }),
     );
     let protocol_error = next_error(&mut errors, Duration::from_secs(2)).await?;
     assert_eq!(protocol_error.code, "extension_protocol");
@@ -2671,17 +2673,18 @@ async fn ui_control_event_forwards_typed_to_ui_subscribers() -> R {
 
 #[tokio::test]
 async fn push_session_and_ui_state_send_mirror_events() -> R {
-    use pi_ext::protocol::{SessionStateWire, UiStateWire};
+    use crate::core::agent_session::SessionState;
+    use pi_ext::protocol::UiStateWire;
 
     let (runner, host) = make_runner(json!({})).await?;
 
-    let state = SessionStateWire {
+    let state = SessionState {
         session_name: Some("s".to_owned()),
-        thinking_level: "medium".to_owned(),
+        thinking_level: pi_ai::ModelThinkingLevel::Medium,
         active_tools: vec!["read".to_owned()],
         is_idle: true,
         system_prompt: "p".to_owned(),
-        ..SessionStateWire::default()
+        ..SessionState::default()
     };
     runner.push_session_state(&state).await;
     host.wait_for_request("session.update").await?;
@@ -2699,7 +2702,7 @@ async fn push_session_and_ui_state_send_mirror_events() -> R {
     assert_eq!(frame.kind, FrameKind::Event);
     assert_eq!(frame.payload["sessionName"], "s");
     assert_eq!(frame.payload["isIdle"], true);
-    assert_eq!(frame.payload["activeTools"][0], "read");
+    assert_eq!(frame.payload["thinkingLevel"], "medium");
 
     runner
         .push_ui_state(&UiStateWire {
@@ -3182,6 +3185,80 @@ async fn notify_event_forwards_typed_to_ui_subscribers() -> R {
         };
         assert_eq!(level, expected, "notify {wire_type} must forward its level");
     }
+    runner.shutdown_once().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn command_catalog_converts_wire_registry_to_product_entries() -> R {
+    use crate::core::agent_session::CommandCatalogEntry;
+
+    let (runner, host) = make_runner(json!({
+        "commands": [{
+            "name": "catalogCmd",
+            "description": "does a thing",
+            "sourceInfo": {
+                "path": "/ext/main.ts",
+                "source": "package",
+                "origin": "package",
+                "scope": "project"
+            }
+        }],
+        "handlers": [],
+    }))
+    .await?;
+
+    let catalog = runner.command_catalog();
+    assert_eq!(
+        catalog,
+        vec![CommandCatalogEntry {
+            name: "catalogCmd".to_owned(),
+            description: "does a thing".to_owned(),
+            source: None,
+            source_info: Some(crate::core::resources::source_info::SourceInfo {
+                path: "/ext/main.ts".to_owned(),
+                source: "package".to_owned(),
+                origin: crate::core::resources::source_info::SourceOrigin::Package,
+                scope: crate::core::resources::source_info::SourceScope::Project,
+                base_dir: None,
+            }),
+        }],
+        "the wire registry entry must convert: name, description, and host-reported SourceInfo"
+    );
+
+    runner.shutdown_once().await;
+    drop(host);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_request_converts_position_and_entry_id() -> R {
+    let (runner, host) = make_runner(json!({ "handlers": [] })).await?;
+    let mut bridge = runner
+        .take_session_bridge()
+        .ok_or("session bridge receiver missing")?;
+
+    host.emit(Frame {
+        id: 51,
+        kind: FrameKind::Req,
+        method: pi_ext::protocol::SESSION_FORK_METHOD.to_owned(),
+        payload: json!({"entryId": "e7", "position": "before"}),
+    })
+    .await;
+
+    let event = tokio::time::timeout(Duration::from_millis(500), bridge.recv())
+        .await?
+        .ok_or("session bridge channel closed")?;
+    let crate::core::extension_host::SessionBridgeEvent::Fork { id, request } = event else {
+        return Err(format!("expected Fork, got {event:?}").into());
+    };
+    assert_eq!(id, BridgeRequestId(51));
+    assert_eq!(request.entry_id, "e7");
+    assert!(matches!(
+        request.position,
+        Some(crate::core::agent_session_runtime::ForkPosition::Before)
+    ));
+
     runner.shutdown_once().await;
     Ok(())
 }
