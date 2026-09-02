@@ -522,56 +522,10 @@ jobs:
             | tee "$EVIDENCE/runtime-loader-resolution.txt"
           assert_musl_resolution "$EVIDENCE/runtime-loader-resolution.txt" unpacked-runtime
 
-          # Archive-integrity gate: every release.json manifest member must be
-          # present in the unpacked archive with a matching sha256, and the
-          # archive member set must equal the manifest set exactly.
-          python3 - "$root" "$EVIDENCE/archive-members.txt" <<'PY'
-          import hashlib
-          import json
-          import pathlib
-          import sys
-
-          root = pathlib.Path(sys.argv[1])
-          members_path = pathlib.Path(sys.argv[2])
-          manifest = json.loads((root / "release.json").read_text(encoding="utf-8"))
-          # release.json cannot contain its own digest: excluded from the
-          # set equality, but must be present as an archive member.
-          expected = {
-              str(p.relative_to(root))
-              for p in root.rglob("*")
-              if p.is_file() and p.name != "release.json"
-          }
-          listed = {
-              line.strip().lstrip("./").split("/", 1)[1]
-              for line in members_path.read_text(encoding="utf-8").splitlines()
-              if line.strip() and "/" in line.strip().lstrip("./")
-          }
-          listed.discard("release.json")
-          if "release.json" not in {
-              line.strip().lstrip("./").split("/", 1)[-1]
-              for line in members_path.read_text(encoding="utf-8").splitlines()
-          }:
-              raise SystemExit("release.json missing from archive members")
-          manifest_files = {entry["path"] for entry in manifest["files"]}
-          if expected != manifest_files:
-              raise SystemExit(
-                  f"unpacked file set != manifest: only-on-disk={sorted(expected - manifest_files)} "
-                  f"only-in-manifest={sorted(manifest_files - expected)}"
-              )
-          if listed != manifest_files:
-              raise SystemExit(
-                  f"archive member set != manifest: only-in-archive={sorted(listed - manifest_files)} "
-                  f"only-in-manifest={sorted(manifest_files - listed)}"
-              )
-          for entry in manifest["files"]:
-              data = (root / entry["path"]).read_bytes()
-              digest = hashlib.sha256(data).hexdigest()
-              if digest != entry["sha256"]:
-                  raise SystemExit(f"{entry['path']}: sha256 mismatch manifest vs unpacked bytes")
-              if len(data) != entry["size"]:
-                  raise SystemExit(f"{entry['path']}: size mismatch manifest vs unpacked bytes")
-          print(f"archive-integrity: {len(manifest_files)} members verified against release.json")
-          PY
+          # Archive-integrity gate: the single verifier proof owner
+          # (scripts/release/verify.ts) replaces the former Python heredoc.
+          # Manifest set equality (both directions) + per-file sha256/size.
+          bun run scripts/release/verify.ts "$root"
           printf 'PASS\n' > "$EVIDENCE/native-verdict.txt"
 
       - name: Musl packaging/protocol lane (transcript_musl_smoke)
@@ -607,6 +561,26 @@ jobs:
       - name: Verify Determinism
         shell: bash
         run: diff -u dist/pass1/*.sha256 dist/pass2/*.sha256
+      - name: Verify archive integrity (both passes)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for pass in pass1 pass2; do
+            shopt -s nullglob
+            archives=(dist/$pass/*.tar.gz dist/$pass/*.zip)
+            test "${#archives[@]}" -eq 1
+            archive="${archives[0]}"
+            unpack="target/verification/arc21/$pass"
+            rm -rf -- "$unpack"
+            mkdir -p -- "$unpack"
+            case "$archive" in
+              *.tar.gz) tar -xzf "$archive" -C "$unpack" ;;
+              *.zip)    /c/Windows/System32/tar.exe -xf "$archive" -C "$unpack" 2>/dev/null || unzip -o "$archive" -d "$unpack" ;;
+            esac
+            root="$(find "$unpack" -mindepth 1 -maxdepth 1 -type d)"
+            test -n "$root"
+            bun run scripts/release/verify.ts "$root"
+          done
 
       # REL-T4: the five non-musl legs execute the Tier N interaction witness
       # (portable-pty: posix_openpt on the unix rows, ConPTY on windows);

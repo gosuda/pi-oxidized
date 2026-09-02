@@ -48,6 +48,7 @@ import { pathExists } from "./release/runner.ts";
 import { provisionBunRuntime } from "./release/runtime.ts";
 import { assembleRelease } from "./release/stage.ts";
 import { archiveName, type TargetPlan } from "./release/targets.ts";
+import { verifyUnpackedArchive } from "./release/verify.ts";
 
 const CARGO_BUILD_TIMEOUT_MS = 30 * 60_000;
 const ARCHIVE_TOOL_TIMEOUT_MS = 2 * 60_000;
@@ -324,10 +325,20 @@ async function main(): Promise<void> {
 		await mkdir(smokeRoot, { recursive: true });
 		try {
 			await unpackArchive(archivePath, args.plan, smokeRoot, runner);
+			const archiveDir = join(smokeRoot, args.plan.archiveDir);
+			const integrity = await verifyUnpackedArchive(archiveDir);
+			if (!integrity.ok) {
+				throw new Error(
+					`archive-integrity verification failed:\n${integrity.errors.map((e) => `  ${e}`).join("\n")}`,
+				);
+			}
+			process.stdout.write(
+				`  archive-integrity: ${integrity.fileCount} members verified against release.json\n`,
+			);
 			await smokeUnpacked({
 				fs,
 				runner,
-				archiveDir: join(smokeRoot, args.plan.archiveDir),
+				archiveDir,
 				plan: args.plan,
 				dryRun: args.dryRun,
 			});

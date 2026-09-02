@@ -123,7 +123,7 @@
 	"authority": [
 		{
 			"path": "scripts/release/host.ts",
-			"sha256": "abc5a9cc9319c2bc01e4536e0dcafec77df3513311269051d72a9ca7252dc5ee"
+			"sha256": "aa41b92301f4dda7bc9853046125e687f3293330c9f85a0c96de666740a55108"
 		},
 		{
 			"path": "scripts/release/targets.ts",

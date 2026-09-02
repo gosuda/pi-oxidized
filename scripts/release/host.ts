@@ -20,12 +20,13 @@ import { dirname, join, resolve } from "node:path";
 import type { CommandRunner, RunResult } from "./runner.ts";
 import { SpawnRunner } from "./runner.ts";
 import type { TargetPlan } from "./targets.ts";
+import { COMPATIBILITY_VERSION, PROTOCOL_VERSION } from "../../packages/pi-tui-protocol/src/types.ts";
 
-/** Wire protocol version negotiated in `hello` (mirrors pi-tui-protocol). */
-export const HOST_PROTOCOL_VERSION = 1;
+/** Wire protocol version negotiated in `hello` (imported from pi-tui-protocol). */
+export const HOST_PROTOCOL_VERSION = PROTOCOL_VERSION;
 
-/** Compatibility target version (mirrors host COMPATIBILITY_VERSION). */
-export const HOST_COMPATIBILITY_VERSION = "0.80.10";
+/** Compatibility target version (imported from pi-tui-protocol). */
+export const HOST_COMPATIBILITY_VERSION = COMPATIBILITY_VERSION;
 
 /** Maximum bytes of one JSONL frame line. Mirrors the protocol constant. */
 const FRAME_MAX_BYTES = 8 * 1024 * 1024;
