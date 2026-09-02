@@ -6,10 +6,10 @@ use ratatui::layout::Rect;
 use crate::component::{Component, EventResult, UiEvent};
 use crate::frame::{RawRegion, push_raw_region};
 use crate::image::{
-    CellDimensions, ITerm2EncodeOptions, ImageDimensions, KittyEncodeOptions, allocate_image_id,
+    ITerm2EncodeOptions, ImageDimensions, KittyEncodeOptions, allocate_image_id,
     calculate_image_cell_size, encode_iterm2, encode_kitty, get_image_dimensions, image_fallback,
 };
-use crate::terminal::caps::{ImageProtocol, TerminalCapabilities};
+use crate::terminal::caps::{CellDimensions, ImageProtocol, TerminalCapabilities};
 
 use super::util::paint_lines;
 
@@ -86,10 +86,7 @@ impl ImageComponent {
                 height_px: 600,
             });
         let image_id = options.image_id;
-        let cell = CellDimensions {
-            width_px: caps.cell.width,
-            height_px: caps.cell.height,
-        };
+        let cell = caps.cell;
         Self {
             base64_data,
             mime_type,
@@ -115,8 +112,8 @@ impl ImageComponent {
             .min(self.options.max_width_cells.unwrap_or(60))
             .max(1);
         let default_max_height = {
-            let cell_w = u32::from(self.cell.width_px.max(1));
-            let cell_h = u32::from(self.cell.height_px.max(1));
+            let cell_w = u32::from(self.cell.width.max(1));
+            let cell_h = u32::from(self.cell.height.max(1));
             // ceil(max_width * cell_w / cell_h) without float casts.
             let numer = u32::from(max_width).saturating_mul(cell_w);
             let h = numer.div_ceil(cell_h);

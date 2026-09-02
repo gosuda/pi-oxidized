@@ -15,6 +15,7 @@
 //! It also asserts the benchmark produces non-zero results (wall time and
 //! allocation) for both scenarios, proving the workload actually executes.
 
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::Value;
@@ -23,6 +24,28 @@ use serde_json::Value;
 fn bench_binary() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     format!("{manifest_dir}/../../target/release/pi_tui_render_churn_bench")
+}
+
+/// True when the benchmark binary has been built (requires
+/// `cargo build -p pi-tui --release --features bench`). Tests skip
+/// gracefully when this is false so a default `cargo test` run without
+/// the `bench` feature does not fail.
+fn bench_binary_exists() -> bool {
+    Path::new(&bench_binary()).exists()
+}
+
+/// Skip the calling test when the benchmark binary is absent, printing a
+/// clear message to stderr.
+macro_rules! require_bench_binary {
+    () => {
+        if !bench_binary_exists() {
+            eprintln!(
+                "skipped: benchmark binary not found — build with \
+                 `cargo build -p pi-tui --release --features bench`"
+            );
+            return;
+        }
+    };
 }
 
 /// Run the benchmark binary and parse the `__BENCH_JSON__` output.
@@ -62,6 +85,7 @@ fn json_f64(v: &Value) -> Option<f64> {
 #[test]
 #[expect(clippy::expect_used, reason = "test-only assertions")]
 fn benchmark_parameters_match_upstream() {
+    require_bench_binary!();
     let json = run_bench();
 
     // Viewport: 100×30 (matches COLUMNS=100, ROWS=30 in render-churn-bench.ts)
@@ -98,6 +122,7 @@ fn benchmark_parameters_match_upstream() {
 
 #[test]
 fn benchmark_produces_nonzero_results_for_both_scenarios() {
+    require_bench_binary!();
     let json = run_bench();
 
     for scenario in ["static", "editor"] {
@@ -133,6 +158,7 @@ fn benchmark_produces_nonzero_results_for_both_scenarios() {
 #[test]
 #[expect(clippy::expect_used, reason = "test-only assertions")]
 fn editor_scenario_allocates_more_than_static() {
+    require_bench_binary!();
     let json = run_bench();
 
     let static_alloc = json["scenarios"]["static"]["allocatedBytes"]
@@ -172,6 +198,7 @@ fn run_probe() -> Value {
 #[test]
 #[expect(clippy::expect_used, reason = "test-only assertions")]
 fn floor_probe_reports_sane_constants() {
+    require_bench_binary!();
     let probe = run_probe();
     let measured = &probe["measured"];
     let derived = &probe["derived"];

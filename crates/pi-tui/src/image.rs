@@ -6,32 +6,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Detected image protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ImageProtocol {
-    /// Kitty graphics protocol (`APC _G ... ST`).
-    Kitty,
-    /// iTerm2 inline images (`OSC 1337 File=`).
-    ITerm2,
-}
-
-/// Terminal cell size in pixels (default 9×18).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CellDimensions {
-    /// Cell width in pixels.
-    pub width_px: u16,
-    /// Cell height in pixels.
-    pub height_px: u16,
-}
-
-impl Default for CellDimensions {
-    fn default() -> Self {
-        Self {
-            width_px: 9,
-            height_px: 18,
-        }
-    }
-}
+use crate::terminal::caps::CellDimensions;
 
 /// Image pixel dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,8 +204,8 @@ pub fn calculate_image_cell_size(
     let max_height = max_height_cells.map(|height| height.max(1));
     let image_width = u128::from(image_dimensions.width_px.max(1));
     let image_height = u128::from(image_dimensions.height_px.max(1));
-    let cell_width = u128::from(cell_dimensions.width_px.max(1));
-    let cell_height = u128::from(cell_dimensions.height_px.max(1));
+    let cell_width = u128::from(cell_dimensions.width.max(1));
+    let cell_height = u128::from(cell_dimensions.height.max(1));
 
     let width_scale = (u128::from(max_width) * cell_width, image_width);
     let scale = if let Some(height) = max_height {
@@ -592,8 +567,8 @@ mod tests {
             2,
             None,
             CellDimensions {
-                width_px: 10,
-                height_px: 10,
+                width: 10,
+                height: 10,
             },
         );
         assert_eq!(
@@ -612,8 +587,8 @@ mod tests {
             10,
             Some(5),
             CellDimensions {
-                width_px: 10,
-                height_px: 10,
+                width: 10,
+                height: 10,
             },
         );
         assert_eq!(
