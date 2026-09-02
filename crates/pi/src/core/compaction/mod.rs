@@ -195,7 +195,8 @@ pub enum CompactionError {
     Provider(#[from] ProviderError),
 }
 
-/// Outcome of a [`CompactionHooks::before_compact`] call.
+/// Outcome of a pre-compaction hook consultation: cancellation or a
+/// hook-produced replacement result.
 #[derive(Clone, Debug, Default)]
 pub struct BeforeCompactResult {
     /// When true, compaction is cancelled by the extension.
