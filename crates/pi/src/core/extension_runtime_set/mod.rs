@@ -77,7 +77,10 @@ use session_routing::SessionRouter;
 pub(crate) use session_routing::{SessionBridgeRoute, SessionTargetBinding};
 
 /// One aggregate deadline shared by every terminal-input endpoint request.
-pub const TERMINAL_INPUT_DEADLINE: Duration = Duration::from_millis(4);
+/// One terminal-input budget across every Rust home; must equal the
+/// TypeScript host's `EXTENSION_INPUT_TIMEOUT_MS` (pinned by
+/// `terminal_input_deadline_matches_typescript_host` below).
+pub const TERMINAL_INPUT_DEADLINE: Duration = pi_ext::server::NATIVE_TERMINAL_INPUT_BUDGET;
 
 /// Runtime used by one endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1399,9 +1402,11 @@ impl ExtensionRuntimeSet {
         let Some(generation) = self.state().begin_shutdown(&self.channels) else {
             return;
         };
-        generation.drain_leases().await;
-        generation.stop_generation().await;
-        generation.abort_bridges();
+        // One reap order everywhere: drain leases, invalidate runners so
+        // relays stop sourcing, abort bridges, then stop the generation —
+        // the same sequence cutover and commit_reload use, so a frame
+        // already inside a relay cannot publish after slots are disposed.
+        generation::GenerationMachine::retire_reap(&generation).await;
     }
 }
 
@@ -2338,6 +2343,18 @@ fn spawn_fatal_error_relay(
 pub(crate) mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn terminal_input_deadline_matches_typescript_host() {
+        // Drift gate: the shared Rust deadline must equal the TypeScript
+        // host's EXTENSION_INPUT_TIMEOUT_MS, which xc-deadlines.ts pins
+        // to 4. A bump on either side breaks one of the two gates.
+        assert_eq!(
+            super::TERMINAL_INPUT_DEADLINE,
+            std::time::Duration::from_millis(4)
+        );
+    }
+
     use std::error::Error;
     use std::io::{BufRead, Write};
     use std::sync::atomic::AtomicUsize;

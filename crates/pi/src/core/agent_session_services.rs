@@ -23,7 +23,7 @@ use super::model_runtime::{
 };
 use super::resources::{
     DefaultResourceLoader, DefaultResourceLoaderOptions, ExtensionPathInfo,
-    ResourceDiscoveryPolicy, ResourceLoader, SourceInfo,
+    ResourceDiscoveryPolicy, SourceInfo,
 };
 use super::settings::{SettingsManager, SettingsManagerCreateOptions};
 use super::trust::{ProjectTrustStore, ResolveProjectTrustedOptions, resolve_project_trusted};

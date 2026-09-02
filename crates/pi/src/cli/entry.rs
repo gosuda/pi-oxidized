@@ -59,7 +59,7 @@ use crate::core::model_resolver::{
 };
 use crate::core::model_runtime::ModelRuntime;
 use crate::core::package_manager::{PackageManager, PackageManagerOptions, Scope};
-use crate::core::resources::{ResourceDiscoveryPolicy, ResourceLoader};
+use crate::core::resources::ResourceDiscoveryPolicy;
 use crate::core::sessions::SessionManager;
 use crate::core::settings::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::system_prompt::{BuildSystemPromptOptions, build_system_prompt};

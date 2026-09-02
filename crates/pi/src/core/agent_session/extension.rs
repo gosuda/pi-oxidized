@@ -37,8 +37,7 @@ use crate::core::extension_runtime_set::{
 };
 use crate::core::messages::CustomMessageContent;
 use crate::core::resources::{
-    ResourceLoader, SlashCommandInfo, SlashCommandSource, SyntheticSourceInfoOptions,
-    create_synthetic_source_info,
+    SlashCommandInfo, SlashCommandSource, SyntheticSourceInfoOptions, create_synthetic_source_info,
 };
 use pi_ai::{ImageContent, Model, ModelThinkingLevel};
 use serde_json::Value;
@@ -312,7 +311,7 @@ impl AgentSession {
             .map_err(ExtensionBindError::ResourceDiscover)?;
         if let Some(loader) = &self.resource_loader {
             let mut loader = loader.lock().await;
-            loader.extend_resources(paths);
+            loader.extend_resources(&paths);
             self.apply_resource_snapshot(&loader);
         }
         if reason == SessionStartReason::Startup.as_str() {

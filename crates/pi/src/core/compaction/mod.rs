@@ -204,35 +204,6 @@ pub struct BeforeCompactResult {
     pub compaction: Option<CompactionResult>,
 }
 
-/// Extension hook seam for compaction (default no-op; no pi-ext dependency).
-pub trait CompactionHooks: Send + Sync {
-    /// Called after preparation, before summarization.
-    fn before_compact(
-        &self,
-        _preparation: &CompactionPreparation,
-        _custom_instructions: Option<&str>,
-        _cancel: &CancellationToken,
-    ) -> Pin<Box<dyn Future<Output = Result<BeforeCompactResult, CompactionError>> + Send + '_>>
-    {
-        Box::pin(async { Ok(BeforeCompactResult::default()) })
-    }
-
-    /// Called after a compaction result is produced (including hook replacement).
-    fn after_compact(
-        &self,
-        _result: &CompactionResult,
-        _from_hook: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<(), CompactionError>> + Send + '_>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
-/// No-op default hooks.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoopCompactionHooks;
-
-impl CompactionHooks for NoopCompactionHooks {}
-
 /// Injected summarizer stream: `(model, context, options) -> stream of events`.
 pub type SummarizeStreamFn = Arc<
     dyn Fn(
@@ -1357,8 +1328,6 @@ pub struct CompactOptions<'a> {
     pub retry: Option<SummarizationRetryPolicy>,
     /// Lifecycle callbacks for transient summarization retries.
     pub retry_callbacks: Option<SummarizationRetryCallbacks>,
-    /// Extension hooks (default no-op).
-    pub hooks: Option<&'a dyn CompactionHooks>,
 }
 
 /// Generate summaries for compaction using prepared data.
@@ -1372,23 +1341,6 @@ pub async fn compact(
     options: CompactOptions<'_>,
 ) -> Result<CompactionResult, CompactionError> {
     ensure_not_cancelled(options.signal.as_ref())?;
-
-    let hooks = options.hooks.unwrap_or(&NoopCompactionHooks);
-    let before = hooks
-        .before_compact(
-            preparation,
-            options.custom_instructions,
-            options.signal.as_ref().unwrap_or(&CancellationToken::new()),
-        )
-        .await?;
-    if before.cancel {
-        return Err(CompactionError::Cancelled);
-    }
-    if let Some(mut replaced) = before.compaction {
-        replaced.from_hook = Some(true);
-        hooks.after_compact(&replaced, true).await?;
-        return Ok(replaced);
-    }
 
     ensure_not_cancelled(options.signal.as_ref())?;
 
@@ -1419,7 +1371,6 @@ pub async fn compact(
         usage,
     };
 
-    hooks.after_compact(&result, false).await?;
     Ok(result)
 }
 
@@ -1962,7 +1913,6 @@ mod tests {
                     env: None,
                     retry: None,
                     retry_callbacks: None,
-                    hooks: None,
                 },
             )
             .await,
@@ -2052,7 +2002,6 @@ mod tests {
                     env: None,
                     retry: None,
                     retry_callbacks: None,
-                    hooks: None,
                 },
             )
             .await,
@@ -2104,7 +2053,6 @@ mod tests {
                     env: None,
                     retry: None,
                     retry_callbacks: None,
-                    hooks: None,
                 },
             )
             .await,
@@ -2127,7 +2075,6 @@ mod tests {
                     env: None,
                     retry: None,
                     retry_callbacks: None,
-                    hooks: None,
                 },
             )
             .await,
@@ -2179,7 +2126,6 @@ mod tests {
                 env: None,
                 retry: None,
                 retry_callbacks: None,
-                hooks: None,
             },
         ));
 
@@ -2194,81 +2140,6 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(1), run.as_mut()).await?;
         assert!(matches!(result, Err(CompactionError::Cancelled)));
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn compact_hook_replacement_from_hook() {
-        struct ReplaceHooks;
-        impl CompactionHooks for ReplaceHooks {
-            fn before_compact(
-                &self,
-                prep: &CompactionPreparation,
-                _custom: Option<&str>,
-                _cancel: &CancellationToken,
-            ) -> Pin<
-                Box<dyn Future<Output = Result<BeforeCompactResult, CompactionError>> + Send + '_>,
-            > {
-                let result = CompactionResult {
-                    summary: "hook summary".into(),
-                    first_kept_entry_id: prep.first_kept_entry_id.clone(),
-                    tokens_before: prep.tokens_before,
-                    estimated_tokens_after: None,
-                    details: None,
-                    from_hook: None,
-                    usage: None,
-                };
-                Box::pin(async move {
-                    Ok(BeforeCompactResult {
-                        cancel: false,
-                        compaction: Some(result),
-                    })
-                })
-            }
-        }
-
-        let model = test_model(2048, 128_000);
-        let prep = CompactionPreparation {
-            first_kept_entry_id: "k".into(),
-            messages_to_summarize: vec![user_msg("x")],
-            turn_prefix_messages: vec![],
-            is_split_turn: false,
-            tokens_before: 42,
-            previous_summary: None,
-            file_ops: FileOperations::default(),
-            settings: DEFAULT_COMPACTION_SETTINGS,
-        };
-        let hooks = ReplaceHooks;
-        let result = result_ok(
-            compact(
-                &prep,
-                CompactOptions {
-                    model: &model,
-                    api_key: None,
-                    headers: None,
-                    custom_instructions: None,
-                    signal: None,
-                    thinking_level: None,
-                    stream_fn: mock_stream_fn("should not run", StopReason::Stop),
-                    env: None,
-                    retry: None,
-                    retry_callbacks: None,
-                    hooks: Some(&hooks),
-                },
-            )
-            .await,
-        );
-        assert_eq!(result.summary, "hook summary");
-        assert_eq!(result.from_hook, Some(true));
-    }
-
-    #[test]
-    fn prompt_constants_exact() {
-        assert!(SUMMARIZATION_PROMPT.contains("## Goal"));
-        assert!(UPDATE_SUMMARIZATION_PROMPT.contains("PRESERVE all existing information"));
-        assert!(TURN_PREFIX_SUMMARIZATION_PROMPT.contains("## Original Request"));
-        assert_eq!(DEFAULT_COMPACTION_SETTINGS.reserve_tokens, 16_384);
-        assert_eq!(DEFAULT_COMPACTION_SETTINGS.keep_recent_tokens, 20_000);
-        assert!(std::hint::black_box(DEFAULT_COMPACTION_SETTINGS).enabled);
     }
 
     #[tokio::test]

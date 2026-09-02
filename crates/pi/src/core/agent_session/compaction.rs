@@ -593,7 +593,6 @@ impl AgentSession {
                 env: inputs.env.clone(),
                 retry: Some(retry),
                 retry_callbacks: Some(retry_callbacks),
-                hooks: None,
             },
         )
         .await;

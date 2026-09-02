@@ -51,7 +51,6 @@ pub use themes::{
 };
 
 use std::collections::HashMap;
-use std::future::Future;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -238,32 +237,6 @@ pub enum ResourceLoaderError {
     Join(String),
 }
 
-/// Resource loading surface matching TypeScript `ResourceLoader`.
-pub trait ResourceLoader {
-    /// Extension paths (Phase 3: no execution).
-    fn get_extensions(&self) -> &LoadExtensionsResult;
-    /// Skills + diagnostics.
-    fn get_skills(&self) -> (&[Skill], &[ResourceDiagnostic]);
-    /// Prompts + diagnostics.
-    fn get_prompts(&self) -> (&[PromptTemplate], &[ResourceDiagnostic]);
-    /// Themes + diagnostics.
-    fn get_themes(&self) -> (&[LoadedTheme], &[ResourceDiagnostic]);
-    /// Context files.
-    fn get_agents_files(&self) -> &[AgentsFile];
-    /// Resolved system prompt text, if any.
-    fn get_system_prompt(&self) -> Option<&str>;
-    /// Resolved append-system-prompt texts.
-    fn get_append_system_prompt(&self) -> &[String];
-    /// Extend skill/prompt/theme paths after load.
-    fn extend_resources(&mut self, paths: ResourceExtensionPaths);
-    /// Reload packages and all resource snapshots.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ResourceLoaderError`] when package resolve fails or the
-    /// blocking resolve task panics.
-    fn reload(&mut self) -> impl Future<Output = Result<(), ResourceLoaderError>>;
-}
 /// Immutable resource snapshot replaced on reload.
 #[derive(Clone, Debug, Default)]
 struct ResourceSnapshot {
@@ -893,36 +866,51 @@ impl DefaultResourceLoader {
     }
 }
 
-impl ResourceLoader for DefaultResourceLoader {
-    fn get_extensions(&self) -> &LoadExtensionsResult {
+impl DefaultResourceLoader {
+    /// Extension paths (Phase 3: no execution).
+    #[must_use]
+    pub fn get_extensions(&self) -> &LoadExtensionsResult {
         &self.snapshot.extensions
     }
 
-    fn get_skills(&self) -> (&[Skill], &[ResourceDiagnostic]) {
+    /// Skills plus their diagnostics.
+    #[must_use]
+    pub fn get_skills(&self) -> (&[Skill], &[ResourceDiagnostic]) {
         (&self.snapshot.skills, &self.snapshot.skill_diagnostics)
     }
 
-    fn get_prompts(&self) -> (&[PromptTemplate], &[ResourceDiagnostic]) {
+    /// Prompts plus their diagnostics.
+    #[must_use]
+    pub fn get_prompts(&self) -> (&[PromptTemplate], &[ResourceDiagnostic]) {
         (&self.snapshot.prompts, &self.snapshot.prompt_diagnostics)
     }
 
-    fn get_themes(&self) -> (&[LoadedTheme], &[ResourceDiagnostic]) {
+    /// Themes plus their diagnostics.
+    #[must_use]
+    pub fn get_themes(&self) -> (&[LoadedTheme], &[ResourceDiagnostic]) {
         (&self.snapshot.themes, &self.snapshot.theme_diagnostics)
     }
 
-    fn get_agents_files(&self) -> &[AgentsFile] {
+    /// Context files.
+    #[must_use]
+    pub fn get_agents_files(&self) -> &[AgentsFile] {
         &self.snapshot.agents_files
     }
 
-    fn get_system_prompt(&self) -> Option<&str> {
+    /// Resolved system prompt text, if any.
+    #[must_use]
+    pub fn get_system_prompt(&self) -> Option<&str> {
         self.snapshot.system_prompt.as_deref()
     }
 
-    fn get_append_system_prompt(&self) -> &[String] {
+    /// Resolved append-system-prompt texts.
+    #[must_use]
+    pub fn get_append_system_prompt(&self) -> &[String] {
         &self.snapshot.append_system_prompt
     }
 
-    fn extend_resources(&mut self, paths: ResourceExtensionPaths) {
+    /// Extend skill/prompt/theme paths after load.
+    pub fn extend_resources(&mut self, paths: &ResourceExtensionPaths) {
         let skill_paths = self.normalize_extension_paths(&paths.skill_paths);
         let prompt_paths = self.normalize_extension_paths(&paths.prompt_paths);
         let theme_paths = self.normalize_extension_paths(&paths.theme_paths);
@@ -954,7 +942,13 @@ impl ResourceLoader for DefaultResourceLoader {
     // Resource reload refreshes paths and snapshots only. Settings live with
     // their single owner (services, then the session); that owner refreshes
     // them before or after resource reloads.
-    async fn reload(&mut self) -> Result<(), ResourceLoaderError> {
+    /// Reload packages and all resource snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceLoaderError`] when package resolve fails or the
+    /// blocking resolve task panics.
+    pub async fn reload(&mut self) -> Result<(), ResourceLoaderError> {
         let _ = self.loaded;
         let discovery = self.resolve_reload_discovery().await?;
         self.extension_skill_source_infos.clear();
@@ -1297,7 +1291,7 @@ mod tests {
             ..Default::default()
         });
         loader.reload().await?;
-        loader.extend_resources(ResourceExtensionPaths {
+        loader.extend_resources(&ResourceExtensionPaths {
             skill_paths: vec![
                 ExtensionResourcePath::discovered("base-skill".to_owned(), &extension_path),
                 ExtensionResourcePath::discovered("extra-skill".to_owned(), &extension_path),
@@ -1322,7 +1316,7 @@ mod tests {
                 .iter()
                 .any(|skill| skill.name == "extra")
         );
-        loader.extend_resources(ResourceExtensionPaths::default());
+        loader.extend_resources(&ResourceExtensionPaths::default());
         assert_empty_replacement_and_base_preservation(&loader);
 
         let _ = fs::remove_dir_all(fixture.root);
