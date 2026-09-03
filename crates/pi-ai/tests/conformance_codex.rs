@@ -707,14 +707,32 @@ impl LocalWsServer {
         let capture = Arc::new(Mutex::new(None));
         let (shutdown, mut shutdown_rx) = oneshot::channel::<()>();
         let capture_task = Arc::clone(&capture);
+        #[allow(clippy::ignored_unit_patterns)]
         let task = tokio::spawn(async move {
             tokio::select! {
-                accept = listener.accept() => {
-                    if let Ok((stream, _)) = accept {
-                        let _result = serve_ws(stream, frames, capture_task).await;
+                _ = &mut shutdown_rx => {},
+                _ = async {
+                    for _ in 0..16 {
+                        let Ok((stream, _)) = listener.accept().await else {
+                            break;
+                        };
+                        // accept_hdr_async calls the callback with the
+                        // request headers. If the request is not a WS
+                        // upgrade (e.g. a localhost sweep `GET /`), the
+                        // callback returns an error response and we
+                        // continue accepting so the real handshake still
+                        // connects.
+                        let headers = Arc::new(std::sync::Mutex::new(HeaderMap::new()));
+                        let headers_cb = Arc::clone(&headers);
+                        let callback = WsGateCallback {
+                            headers: headers_cb,
+                        };
+                        if let Ok(socket) = accept_hdr_async(stream, callback).await {
+                            let _result = serve_ws_framed(socket, frames.clone(), capture_task.clone(), headers).await;
+                            break;
+                        }
                     }
-                }
-                _ = &mut shutdown_rx => {}
+                } => {},
             }
         });
         Ok(Self {
@@ -752,17 +770,12 @@ impl Drop for LocalWsServer {
     }
 }
 
-async fn serve_ws(
-    stream: TcpStream,
+async fn serve_ws_framed(
+    mut socket: tokio_tungstenite::WebSocketStream<TcpStream>,
     frames: Vec<Value>,
     capture: Arc<Mutex<Option<WsCapture>>>,
+    headers: Arc<std::sync::Mutex<HeaderMap>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let headers = Arc::new(std::sync::Mutex::new(HeaderMap::new()));
-    let headers_cb = Arc::clone(&headers);
-    let callback = CaptureRequestHeaders {
-        headers: headers_cb,
-    };
-    let mut socket = accept_hdr_async(stream, callback).await?;
     let body = match socket.next().await {
         Some(Ok(WsMessage::Text(text))) => serde_json::from_str::<Value>(&text)?,
         Some(Ok(other)) => {
@@ -790,16 +803,31 @@ async fn serve_ws(
     Ok(())
 }
 
-struct CaptureRequestHeaders {
+/// WebSocket handshake callback that captures request headers and rejects
+/// non-WebSocket requests (e.g. localhost sweep `GET /`) with a 404.
+struct WsGateCallback {
     headers: Arc<std::sync::Mutex<HeaderMap>>,
 }
 
-impl WsCallback for CaptureRequestHeaders {
+impl WsCallback for WsGateCallback {
     fn on_request(
         self,
         request: &WsRequest,
         response: WsResponse,
     ) -> Result<WsResponse, WsErrorResponse> {
+        // Reject requests that are not WebSocket upgrades.
+        let is_ws = request.headers().iter().any(|(name, value)| {
+            name.as_str().eq_ignore_ascii_case("upgrade")
+                && value
+                    .to_str()
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case("websocket")
+        });
+        if !is_ws {
+            let mut error = WsErrorResponse::new(Some("Not Found".to_owned()));
+            *error.status_mut() = axum::http::StatusCode::NOT_FOUND;
+            return Err(error);
+        }
         if let Ok(mut guard) = self.headers.lock() {
             for (name, value) in request.headers() {
                 if let (Ok(header_name), Ok(header_value)) = (
@@ -812,4 +840,56 @@ impl WsCallback for CaptureRequestHeaders {
         }
         Ok(response)
     }
+}
+
+/// A localhost sweep (`GET /` at every new listener) must not consume
+/// the WS server's single accept slot: after probing the server, the
+/// real WS handshake still connects and receives its frames.
+#[tokio::test]
+async fn sweep_get_does_not_consume_ws_server()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let server =
+        LocalWsServer::start(vec![json!({"type":"response","response":{"done":true}})]).await?;
+    let address = server.address;
+
+    // Send a sweeper-style GET / to the WS server.
+    {
+        let mut sweep = TcpStream::connect(address).await?;
+        sweep
+            .write_all(b"GET / HTTP/1.1\r\nHost: sweep\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut buf = [0_u8; 1024];
+        let _ = sweep.read(&mut buf).await;
+        // The server should have replied with a 404 (or error response).
+    }
+
+    // Now the real WS handshake must still succeed.
+    let ws_url = format!("ws://{address}/");
+    let (mut ws, _) =
+        tokio_tungstenite::client_async(&ws_url, TcpStream::connect(address).await?).await?;
+    ws.send(WsMessage::Text(r#"{"type":"request"}"#.into()))
+        .await?;
+    let mut got_done = false;
+    while let Some(msg) = ws.next().await {
+        if let Ok(WsMessage::Text(text)) = &msg {
+            let v: Value = serde_json::from_str(text)?;
+            if v.get("response")
+                .and_then(|r| r.get("done"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                got_done = true;
+            }
+        }
+        if matches!(&msg, Ok(WsMessage::Close(_))) {
+            break;
+        }
+    }
+    assert!(
+        got_done,
+        "real WS handshake must receive frames after sweep"
+    );
+    Ok(())
 }

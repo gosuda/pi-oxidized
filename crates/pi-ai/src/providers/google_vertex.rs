@@ -1009,7 +1009,7 @@ fn unix_millis() -> i64 {
 mod tests {
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -1118,20 +1118,79 @@ mod tests {
         .to_string()
     }
 
-    fn spawn_json_token_server(body: &str) -> Result<String, String> {
+    /// Render one HTTP/1.1 stub reply with an exact `Content-Length`.
+    fn http_response(status: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+    /// Drain one HTTP request from a test stub connection before replying.
+    fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut raw = Vec::new();
+        let mut buf = [0_u8; 4096];
+        for _ in 0..16 {
+            match stream.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = pos + 4;
+            let headers = String::from_utf8_lossy(&raw[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while raw.len() < header_end + content_length {
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+        }
+        raw
+    }
+    fn spawn_json_token_server(
+        expected_method: &str,
+        expected_path: &str,
+        body: &str,
+    ) -> Result<String, String> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
         let address = listener.local_addr().map_err(|error| error.to_string())?;
         let body = body.to_owned();
+        let expected_prefix = format!("{expected_method} {expected_path}");
+        let host = address.to_string();
         thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut request = [0_u8; 16_384];
-                let _ = stream.read(&mut request);
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let req = read_http_request(&mut stream);
+                let text = String::from_utf8_lossy(&req);
+                let lowered = text.to_ascii_lowercase();
+                let after = text.get(expected_prefix.len()..expected_prefix.len() + 1);
+                if !text.starts_with(&expected_prefix)
+                    || !matches!(after, Some(" " | "?"))
+                    || !lowered.contains(&format!("host: {host}"))
+                {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
+                return;
             }
         });
         Ok(format!("http://{address}"))
@@ -1140,9 +1199,22 @@ mod tests {
     fn spawn_hanging_token_server() -> Result<String, String> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
         let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let host = address.to_string();
         thread::spawn(move || {
-            if let Ok((_stream, _)) = listener.accept() {
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let req = read_http_request(&mut stream);
+                let text = String::from_utf8_lossy(&req);
+                let lowered = text.to_ascii_lowercase();
+                if !text.starts_with("POST /token ") || !lowered.contains(&format!("host: {host}"))
+                {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
                 thread::sleep(StdDuration::from_secs(30));
+                return;
             }
         });
         Ok(format!("http://{address}"))
@@ -1449,7 +1521,7 @@ mod tests {
             "token_type": "Bearer",
         })
         .to_string();
-        let base = spawn_json_token_server(&token_body)?;
+        let base = spawn_json_token_server("POST", "/token", &token_body)?;
         let token_uri = format!("{base}/token");
         let credentials = write_temp_credentials(
             &json!({
@@ -1487,7 +1559,11 @@ mod tests {
             "token_type": "Bearer",
         })
         .to_string();
-        let endpoint = spawn_json_token_server(&token_body)?;
+        let endpoint = spawn_json_token_server(
+            "GET",
+            "/computeMetadata/v1/instance/service-accounts/default/token",
+            &token_body,
+        )?;
         let provider = DefaultVertexTokenProvider::with_metadata_endpoint(endpoint);
         let token = provider
             .token(token_request(None))
@@ -1594,6 +1670,59 @@ mod tests {
                 .message()
                 .contains("unsupported Google application credentials type")
         );
+        Ok(())
+    }
+
+    /// Send one sweeper-style `GET /` at a stub, draining its 404 reply.
+    fn sweep_probe_stub(url: &str) -> Result<(), String> {
+        let addr = url
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split('/').next())
+            .ok_or_else(|| "bad stub url".to_owned())?;
+        let mut stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: sweep\r\nConnection: close\r\n\r\n")
+            .map_err(|e| e.to_string())?;
+        let mut buf = [0_u8; 1024];
+        let _ = stream.read(&mut buf);
+        Ok(())
+    }
+
+    /// A localhost sweep (`GET /` at every new listener) must not consume
+    /// the scripted stub reply: after probing the token stub, the real
+    /// `authorized_user` refresh still succeeds and returns its token.
+    #[tokio::test]
+    async fn sweep_get_does_not_consume_stub_scripts() -> Result<(), String> {
+        let token_body = json!({
+            "access_token": "sweep-access-token",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        })
+        .to_string();
+        let base = spawn_json_token_server("POST", "/token", &token_body)?;
+        let token_uri = format!("{base}/token");
+        sweep_probe_stub(&base)?;
+        let credentials = write_temp_credentials(
+            &json!({
+                "type": "authorized_user",
+                "client_id": "test-client-id.apps.googleusercontent.com",
+                "client_secret": "test-client-secret",
+                "refresh_token": "test-refresh-token",
+                "token_uri": token_uri,
+            })
+            .to_string(),
+        )?;
+        let path = credentials
+            .path()
+            .to_str()
+            .ok_or_else(|| "temp credentials path is not utf-8".to_owned())?
+            .to_owned();
+        let provider = DefaultVertexTokenProvider::new();
+        let token = provider
+            .token(token_request(Some(path)))
+            .await
+            .map_err(|error| error.message().to_owned())?;
+        assert_eq!(token, "sweep-access-token");
         Ok(())
     }
 }

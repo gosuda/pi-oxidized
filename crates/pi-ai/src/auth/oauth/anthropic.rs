@@ -642,7 +642,7 @@ fn from_hex(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -911,6 +911,46 @@ mod tests {
         body: String,
     }
 
+    /// Render one HTTP/1.1 stub reply with an exact `Content-Length`.
+    fn http_response(status: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+    /// Drain one HTTP request from a test stub connection before replying.
+    fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut raw = Vec::new();
+        let mut buf = [0_u8; 4096];
+        for _ in 0..16 {
+            match stream.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = pos + 4;
+            let headers = String::from_utf8_lossy(&raw[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while raw.len() < header_end + content_length {
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+        }
+        raw
+    }
     fn spawn_json_token_server(
         expected_grant: &'static str,
         response_body: String,
@@ -918,37 +958,46 @@ mod tests {
     ) -> Result<String, String> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| err(e.to_string()))?;
         let address = listener.local_addr().map_err(|e| err(e.to_string()))?;
+        let host = address.to_string();
         thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let req = read_http_request(&mut stream);
+                let request = String::from_utf8_lossy(&req).into_owned();
+                let lowered = request.to_ascii_lowercase();
+                if !request.starts_with("POST /v1/oauth/token ")
+                    || !lowered.contains(&format!("host: {host}"))
+                {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                let (headers, body) = request
+                    .split_once("\r\n\r\n")
+                    .map(|(h, b)| (h.to_owned(), b.to_owned()))
+                    .unwrap_or((request, String::new()));
+                if let Ok(mut guard) = capture.lock() {
+                    *guard = Some(CapturedRequest {
+                        headers: headers.clone(),
+                        body: body.clone(),
+                    });
+                }
+                let headers_l = headers.to_ascii_lowercase();
+                if !headers_l.contains("content-type: application/json")
+                    || !headers_l.contains("accept: application/json")
+                    || !body.contains(&format!("\"grant_type\":\"{expected_grant}\""))
+                {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
                 return;
-            };
-            let mut buf = vec![0_u8; 16 * 1024];
-            let Ok(n) = stream.read(&mut buf) else {
-                return;
-            };
-            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
-            let (headers, body) = request
-                .split_once("\r\n\r\n")
-                .map(|(h, b)| (h.to_owned(), b.to_owned()))
-                .unwrap_or((request, String::new()));
-            if let Ok(mut guard) = capture.lock() {
-                *guard = Some(CapturedRequest {
-                    headers: headers.clone(),
-                    body: body.clone(),
-                });
             }
-            let headers_l = headers.to_ascii_lowercase();
-            if !headers_l.contains("content-type: application/json")
-                || !headers_l.contains("accept: application/json")
-                || !body.contains(&format!("\"grant_type\":\"{expected_grant}\""))
-            {
-                return;
-            }
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
         });
         Ok(format!("http://{address}/v1/oauth/token"))
     }
@@ -958,21 +1007,26 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
         let address = listener.local_addr().map_err(|error| error.to_string())?;
         let (request_seen, request_started) = tokio::sync::oneshot::channel();
+        let host = address.to_string();
         thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut request = [0_u8; 4096];
-            let Ok(size) = stream.read(&mut request) else {
-                return;
-            };
-            let request = String::from_utf8_lossy(&request[..size]);
-            if !request.starts_with("POST /token ") {
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let req = read_http_request(&mut stream);
+                let request = String::from_utf8_lossy(&req);
+                let lowered = request.to_ascii_lowercase();
+                if !request.starts_with("POST /token ")
+                    || !lowered.contains(&format!("host: {host}"))
+                {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                let _ = request_seen.send(());
+                let mut remaining = [0_u8; 1024];
+                while stream.read(&mut remaining).is_ok_and(|size| size > 0) {}
                 return;
             }
-            let _ = request_seen.send(());
-            let mut remaining = [0_u8; 1024];
-            while stream.read(&mut remaining).is_ok_and(|size| size > 0) {}
         });
         Ok((format!("http://{address}/token"), request_started))
     }
@@ -1370,11 +1424,24 @@ mod tests {
         // Hang the token endpoint so cancellation is observed mid-request.
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| err(e.to_string()))?;
         let address = listener.local_addr().map_err(|e| err(e.to_string()))?;
+        let host = address.to_string();
         thread::spawn(move || {
-            let Ok(_stream) = listener.accept() else {
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let req = read_http_request(&mut stream);
+                let request = String::from_utf8_lossy(&req);
+                let lowered = request.to_ascii_lowercase();
+                if !request.starts_with("POST /v1/oauth/token ")
+                    || !lowered.contains(&format!("host: {host}"))
+                {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                thread::sleep(Duration::from_secs(30));
                 return;
-            };
-            thread::sleep(Duration::from_secs(30));
+            }
         });
         let token_url = format!("http://{address}/v1/oauth/token");
         let oauth = AnthropicOAuth::with_http(AuthHttpClient::from_client(reqwest::Client::new()))
@@ -1477,6 +1544,53 @@ mod tests {
                 .body
                 .contains(&format!("\"client_id\":\"{CLIENT_ID}\""))
         );
+        Ok(())
+    }
+
+    /// Send one sweeper-style `GET /` at a stub, draining its 404 reply.
+    fn sweep_probe_stub(url: &str) -> Result<(), String> {
+        let addr = url
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split('/').next())
+            .ok_or_else(|| err("bad stub url"))?;
+        let mut stream = TcpStream::connect(addr).map_err(|e| err(e.to_string()))?;
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: sweep\r\nConnection: close\r\n\r\n")
+            .map_err(|e| err(e.to_string()))?;
+        let mut buf = [0_u8; 1024];
+        let _ = stream.read(&mut buf);
+        Ok(())
+    }
+
+    /// A localhost sweep (`GET /` at every new listener) must not consume
+    /// the scripted stub reply: after probing the token stub, the real
+    /// refresh still succeeds and returns new tokens.
+    #[tokio::test]
+    async fn sweep_get_does_not_consume_stub_scripts() -> TestResult {
+        let capture = Arc::new(Mutex::new(None));
+        let token_url = spawn_json_token_server(
+            "refresh_token",
+            r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#
+                .to_owned(),
+            capture.clone(),
+        )?;
+        sweep_probe_stub(&token_url)?;
+        let oauth = AnthropicOAuth::with_http(AuthHttpClient::from_client(reqwest::Client::new()))
+            .with_token_url(token_url);
+        let cred = oauth
+            .refresh(
+                &OAuthCredential {
+                    refresh: "r".into(),
+                    access: "a".into(),
+                    expires: 0,
+                    extra: BTreeMap::new(),
+                },
+                None,
+            )
+            .await
+            .map_err(|e| err(e.to_string()))?;
+        assert_eq!(cred.access, "new-access");
+        assert_eq!(cred.refresh, "new-refresh");
         Ok(())
     }
 }

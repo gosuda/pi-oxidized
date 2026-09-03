@@ -870,8 +870,20 @@ fn normalize_diagnostic_dynamics(value: &mut Value) {
 fn normalize_loopback_url(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("http://127.0.0.1:")
-        .or_else(|| url.strip_prefix("http://localhost:"))?;
+        .or_else(|| url.strip_prefix("http://localhost:"))
+        .or_else(|| url.strip_prefix("http://127.0.0.1"))
+        .or_else(|| url.strip_prefix("http://localhost"))?;
     let path = rest.find('/').map_or("", |idx| &rest[idx..]);
+    // The harness roots servers under a random /<16-hex> path secret (like
+    // the ephemeral port): strip it so fixtures compare harness-agnostic URLs.
+    let path = path.strip_prefix('/').map_or(path, |bare| {
+        let (head, tail) = bare.split_at(bare.find('/').unwrap_or(bare.len()));
+        if head.len() == 16 && head.bytes().all(|b| b.is_ascii_hexdigit()) {
+            tail
+        } else {
+            path
+        }
+    });
     Some(format!("http://127.0.0.1{path}"))
 }
 

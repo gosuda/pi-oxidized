@@ -140,9 +140,29 @@ pub enum HttpHarnessError {
 #[derive(Debug)]
 struct ServerState {
     authority: String,
+    /// Unguessable path prefix isolating this server's traffic from
+    /// localhost sweep probes (`GET /`): only requests under
+    /// `/{secret}/…` are recorded or served a queued response.
+    secret: String,
     inner: Mutex<ServerInner>,
     captured: Notify,
     closing: watch::Sender<bool>,
+}
+
+/// Mint a per-server path secret from process-unique entropy.
+///
+/// No new dependencies: the default hasher over pid, wall time, and a
+/// counter is unguessable enough that a blind sweeper cannot hit it.
+fn mint_secret() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = DefaultHasher::new();
+    std::process::id().hash(&mut hasher);
+    std::time::SystemTime::now().hash(&mut hasher);
+    COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 #[derive(Debug)]
@@ -180,9 +200,11 @@ impl LocalHttpServer {
         let responses = responses.into_iter().collect::<VecDeque<_>>();
         validate_redirects(&responses, &authority)?;
 
+        let secret = mint_secret();
         let (closing, _) = watch::channel(false);
         let state = Arc::new(ServerState {
             authority,
+            secret,
             inner: Mutex::new(ServerInner {
                 next_sequence: 0,
                 responses,
@@ -192,7 +214,9 @@ impl LocalHttpServer {
             closing,
         });
         let app = Router::new()
-            .fallback(any(handle_request))
+            .route(&format!("/{}", state.secret), any(handle_request))
+            .route(&format!("/{}/{{*rest}}", state.secret), any(handle_request))
+            .fallback(any(unmatched_request))
             .with_state(Arc::clone(&state));
         let (shutdown, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -216,11 +240,12 @@ impl LocalHttpServer {
         self.address
     }
 
-    /// Returns an HTTP base URL without a trailing slash.
+    /// Returns an HTTP base URL without a trailing slash, rooted at this
+    /// server's unguessable path secret: only requests under the secret are
+    /// recorded or served queued responses.
     pub fn base_url(&self) -> String {
-        format!("http://{}", self.address)
+        format!("http://{}/{}", self.address, self.state.secret)
     }
-
     /// Removes and returns all completed captures in deterministic arrival order.
     pub async fn take_requests(&self) -> Vec<CapturedRequest> {
         let mut inner = self.state.inner.lock().await;
@@ -282,9 +307,15 @@ impl Drop for LocalHttpServer {
     }
 }
 
+/// Fallback for requests outside the server's path secret: 404 without
+/// recording or consuming queued responses.
+async fn unmatched_request() -> Response<Body> {
+    plain_response(StatusCode::NOT_FOUND, String::new())
+}
+
 async fn handle_request(State(state): State<Arc<ServerState>>, request: Request) -> Response<Body> {
     let method = request.method().clone();
-    let path = request.uri().path().to_owned();
+    let raw_path = request.uri().path().to_owned();
     let query = request.uri().query().map(str::to_owned);
     let headers = request.headers().clone();
     let host_is_local = headers
@@ -292,11 +323,29 @@ async fn handle_request(State(state): State<Arc<ServerState>>, request: Request)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|host| host == state.authority);
 
+    // Reject alien traffic before bumping the sequence counter or recording
+    // a capture. A sweep must not shift sequence numbers or consume queued
+    // responses. Two layers: a foreign Host is rejected outright, and only
+    // requests under this server's unguessable path secret are served —
+    // the real sweeper sends a matching local Host, so the secret is what
+    // actually isolates it. The secret is stripped before capture so path
+    // assertions keep seeing the application path.
+    if !host_is_local {
+        return plain_response(StatusCode::NOT_FOUND, String::new());
+    }
+    let prefix = format!("/{}/", state.secret);
+    let path = if raw_path == format!("/{}", state.secret) {
+        String::from("/")
+    } else if let Some(rest) = raw_path.strip_prefix(&prefix) {
+        format!("/{rest}")
+    } else {
+        return plain_response(StatusCode::NOT_FOUND, String::new());
+    };
     let (sequence, response_spec) = {
         let mut inner = state.inner.lock().await;
         let sequence = inner.next_sequence;
         inner.next_sequence = inner.next_sequence.saturating_add(1);
-        let response = host_is_local.then(|| inner.responses.pop_front()).flatten();
+        let response = inner.responses.pop_front();
         (sequence, response)
     };
 
@@ -328,16 +377,7 @@ async fn handle_request(State(state): State<Arc<ServerState>>, request: Request)
             format!("failed to capture request body: {error}"),
         );
     }
-    if !host_is_local {
-        return plain_response(
-            StatusCode::MISDIRECTED_REQUEST,
-            format!(
-                "provider test request Host must be {}; received {:?}",
-                state.authority,
-                parts.headers.get(HOST)
-            ),
-        );
-    }
+    let _ = parts;
     match response_spec {
         Some(spec) => response_from_spec(spec, state.closing.subscribe()),
         None => plain_response(
@@ -521,5 +561,59 @@ mod tests {
             error,
             Some(HttpHarnessError::ExternalRedirect { .. })
         ));
+    }
+
+    /// A localhost sweep (`GET /` with a foreign Host) must not be
+    /// recorded or consume a queued response: after probing the server,
+    /// the real request still gets its queued response with sequence 0.
+    #[tokio::test]
+    async fn sweep_get_is_not_recorded_and_does_not_consume_queued_response()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let spec = ResponseSpec::bytes(StatusCode::OK, b"real".to_vec());
+        let server = LocalHttpServer::start([spec]).await?;
+        let base = server.base_url();
+
+        // Send a sweeper-style GET / with a foreign Host.
+        let sweep_response = Client::new()
+            .get(&base)
+            .header(HOST, "sweep")
+            .send()
+            .await?;
+        assert_eq!(sweep_response.status(), StatusCode::NOT_FOUND);
+
+        // The real request must still get the queued response.
+        let response = Client::new().get(&base).send().await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await?.as_ref(), b"real");
+
+        let requests = server.shutdown().await?;
+        assert_eq!(requests.len(), 1, "sweep probe must not be recorded");
+        assert_eq!(requests[0].sequence, 0, "real request must have sequence 0");
+        Ok(())
+    }
+
+    /// The actual localhost sweeper sends `GET /` with a matching local
+    /// Host, which the Host gate cannot distinguish: the path secret must.
+    #[tokio::test]
+    async fn sweep_root_get_with_local_host_is_not_recorded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let spec = ResponseSpec::bytes(StatusCode::OK, b"real".to_vec());
+        let server = LocalHttpServer::start([spec]).await?;
+        let base = server.base_url();
+
+        // Sweeper shape: bare authority root, natural Host header.
+        let root = format!("http://{}", server.address());
+        let sweep_response = Client::new().get(&root).send().await?;
+        assert_eq!(sweep_response.status(), StatusCode::NOT_FOUND);
+
+        // The real request under the secret still gets its queued response.
+        let response = Client::new().get(&base).send().await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await?.as_ref(), b"real");
+
+        let requests = server.shutdown().await?;
+        assert_eq!(requests.len(), 1, "sweep probe must not be recorded");
+        assert_eq!(requests[0].sequence, 0, "real request must have sequence 0");
+        Ok(())
     }
 }

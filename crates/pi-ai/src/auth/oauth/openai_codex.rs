@@ -1852,14 +1852,24 @@ mod tests {
     async fn cancel_signal_aborts_refresh() -> TestResult {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| err(e.to_string()))?;
         let address = listener.local_addr().map_err(|e| err(e.to_string()))?;
+        let host = address.to_string();
         thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let req = read_http_request(&mut stream);
+                let text = String::from_utf8_lossy(&req);
+                let lowered = text.to_ascii_lowercase();
+                if !text.starts_with("POST /token ") || !lowered.contains(&format!("host: {host}"))
+                {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                thread::sleep(Duration::from_secs(5));
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
                 return;
-            };
-            let mut buf = [0_u8; 4096];
-            let _ = stream.read(&mut buf);
-            thread::sleep(Duration::from_secs(5));
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+            }
         });
         let token_url = format!("http://{address}/token");
         let oauth =

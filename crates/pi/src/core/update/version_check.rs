@@ -419,17 +419,38 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0_u8; 4096];
+                let mut total = 0;
+                while total < request.len() {
+                    match stream.read(&mut request[total..]) {
+                        Ok(n) if n > 0 => {
+                            total += n;
+                            if request[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                let text = String::from_utf8_lossy(&request[..total]);
+                if !text.starts_with("GET /latest ") {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                }
+                thread::sleep(delay);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
                 return;
-            };
-            let mut request = [0_u8; 2048];
-            let _ = stream.read(&mut request);
-            thread::sleep(delay);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
+            }
         });
         Ok(format!("http://{address}/latest"))
     }
@@ -507,5 +528,43 @@ mod tests {
         )
         .await;
         assert!(result.is_none());
+    }
+
+    /// A localhost sweep (`GET /` at every new listener) must not consume
+    /// the scripted stub reply: after probing the endpoint, the real
+    /// version check still succeeds and returns the newer version.
+    #[tokio::test]
+    async fn sweep_get_does_not_consume_stub_scripts() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let endpoint = fake_endpoint(r#"{"version":"2.0.0"}"#, Duration::ZERO)?;
+        let addr = endpoint
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split('/').next())
+            .ok_or("bad endpoint url")?;
+
+        // Send a sweeper-style GET / to the stub.
+        {
+            let mut sweep = TcpStream::connect(addr)?;
+            sweep.write_all(b"GET / HTTP/1.1\r\nHost: sweep\r\nConnection: close\r\n\r\n")?;
+            let mut buf = [0_u8; 1024];
+            let _ = sweep.read(&mut buf);
+        }
+
+        // The real version check must still succeed.
+        let client = Client::new();
+        let release = check_for_new_pi_version_from(
+            &client,
+            &endpoint,
+            "1.0.0",
+            Duration::from_secs(1),
+            ReleaseChannel::Stable,
+            false,
+        )
+        .await;
+        assert!(release.is_some(), "real request must succeed after sweep");
+        assert_eq!(release.unwrap_or_default().version, "2.0.0");
+        Ok(())
     }
 }

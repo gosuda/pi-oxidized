@@ -276,7 +276,7 @@ impl DataSseDecoder {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
 
     use futures::future::BoxFuture;
@@ -301,6 +301,47 @@ mod tests {
             compat: None,
             extra: BTreeMap::new(),
         }
+    }
+
+    /// Render one HTTP/1.1 stub reply with an exact `Content-Length`.
+    fn http_response(status: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+    /// Drain one HTTP request from a test stub connection before replying.
+    fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut raw = Vec::new();
+        let mut buf = [0_u8; 4096];
+        for _ in 0..16 {
+            match stream.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = pos + 4;
+            let headers = String::from_utf8_lossy(&raw[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while raw.len() < header_end + content_length {
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+        }
+        raw
     }
 
     #[test]
@@ -360,12 +401,21 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let server = std::thread::spawn(move || -> std::io::Result<()> {
-            let (mut socket, _) = listener.accept()?;
-            let mut request = [0_u8; 1024];
-            let _read = socket.read(&mut request)?;
-            socket.write_all(
-                b"HTTP/1.1 204 No Content\r\nX-Test: yes\r\nContent-Length: 0\r\n\r\n",
-            )?;
+            for _ in 0..16 {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return Ok(());
+                };
+                let req = read_http_request(&mut socket);
+                let text = String::from_utf8_lossy(&req);
+                if !text.starts_with("GET /callback-test ") {
+                    let _ = socket.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                socket.write_all(
+                    b"HTTP/1.1 204 No Content\r\nX-Test: yes\r\nContent-Length: 0\r\n\r\n",
+                )?;
+                return Ok(());
+            }
             Ok(())
         });
         let callback: OnResponseFn = Arc::new(|response, _model| {
@@ -373,7 +423,9 @@ mod tests {
             Box::pin(async move { Err(ProviderError::new(format!("rejected {status}"))) })
                 as BoxFuture<'_, Result<(), ProviderError>>
         });
-        let request = client.get(format!("http://{address}/")).build()?;
+        let request = client
+            .get(format!("http://{address}/callback-test"))
+            .build()?;
         let result = transport
             .execute(request, &model(), None, Some(&callback))
             .await;
@@ -395,12 +447,21 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let server = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
-            let (mut socket, _) = listener.accept()?;
-            let mut request = vec![0_u8; 4096];
-            let read = socket.read(&mut request)?;
-            request.truncate(read);
-            socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
-            Ok(request)
+            for _ in 0..16 {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return Ok(Vec::new());
+                };
+                let req = read_http_request(&mut socket);
+                let text = String::from_utf8_lossy(&req);
+                if !text.starts_with("POST /error ") {
+                    let _ = socket.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                let request_bytes = req.clone();
+                socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
+                return Ok(request_bytes);
+            }
+            Ok(Vec::new())
         });
 
         let response = transport
@@ -424,21 +485,33 @@ mod tests {
         let server = std::thread::spawn({
             let payload = payload.clone();
             move || -> std::io::Result<()> {
-                let (mut socket, _) = listener.accept()?;
-                let mut request = [0_u8; 1024];
-                let _read = socket.read(&mut request)?;
-                let header = format!(
-                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n",
-                    payload.len()
-                );
-                socket.write_all(header.as_bytes())?;
-                socket.write_all(&payload)?;
+                for _ in 0..16 {
+                    let Ok((mut socket, _)) = listener.accept() else {
+                        return Ok(());
+                    };
+                    let req = read_http_request(&mut socket);
+                    let text = String::from_utf8_lossy(&req);
+                    if !text.starts_with("GET /body-64k ") {
+                        let _ = socket.write_all(http_response("404 Not Found", "").as_slice());
+                        continue;
+                    }
+                    let header = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    socket.write_all(header.as_bytes())?;
+                    socket.write_all(&payload)?;
+                    return Ok(());
+                }
                 Ok(())
             }
         });
 
         let client = Client::new();
-        let response = client.get(format!("http://{address}/")).send().await?;
+        let response = client
+            .get(format!("http://{address}/body-64k"))
+            .send()
+            .await?;
         let body = HttpTransport::read_error_body(response, None).await?;
         assert_eq!(body.len(), MAX_ERROR_BODY_BYTES);
         assert!(body.bytes().all(|byte| byte == b'a'));
@@ -453,23 +526,32 @@ mod tests {
         let address = listener.local_addr()?;
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || -> std::io::Result<()> {
-            let (mut socket, _) = listener.accept()?;
-            let mut request = [0_u8; 1024];
-            let _read = socket.read(&mut request)?;
-            socket.write_all(
-                b"HTTP/1.1 500 Internal Server Error\r\nTransfer-Encoding: chunked\r\n\r\n",
-            )?;
-            socket.write_all(b"5\r\nhello\r\n")?;
-            socket.flush()?;
-            let _ = started_tx.send(());
-            // Keep the response open until the client disconnects.
-            let mut sink = [0_u8; 64];
-            let _ = socket.read(&mut sink);
+            for _ in 0..16 {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return Ok(());
+                };
+                let req = read_http_request(&mut socket);
+                let text = String::from_utf8_lossy(&req);
+                if !text.starts_with("GET /hang ") {
+                    let _ = socket.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                socket.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )?;
+                socket.write_all(b"5\r\nhello\r\n")?;
+                socket.flush()?;
+                let _ = started_tx.send(());
+                // Keep the response open until the client disconnects.
+                let mut sink = [0_u8; 64];
+                let _ = socket.read(&mut sink);
+                return Ok(());
+            }
             Ok(())
         });
 
         let client = Client::new();
-        let response = client.get(format!("http://{address}/")).send().await?;
+        let response = client.get(format!("http://{address}/hang")).send().await?;
         started_rx.recv_timeout(std::time::Duration::from_secs(2))?;
         let token = CancellationToken::new();
         let cancel = token.clone();
@@ -483,6 +565,61 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), read).await??;
         assert!(matches!(result, Err(TransportError::Cancelled)));
         server.join().map_err(|_| "server thread failed")??;
+        Ok(())
+    }
+
+    /// Send one sweeper-style `GET /` at a stub, draining its 404 reply.
+    fn sweep_probe_stub(address: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut stream = TcpStream::connect(address)?;
+        stream.write_all(b"GET / HTTP/1.1\r\nHost: sweep\r\nConnection: close\r\n\r\n")?;
+        let mut buf = [0_u8; 1024];
+        let _ = stream.read(&mut buf);
+        Ok(())
+    }
+
+    /// A localhost sweep (`GET /` at every new listener) must not consume
+    /// the scripted stub reply: after probing the stub, the real POST
+    /// still gets its 204 response with the configured header.
+    #[tokio::test]
+    async fn sweep_get_does_not_consume_stub_scripts() -> Result<(), Box<dyn std::error::Error>> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-client",
+            reqwest::header::HeaderValue::from_static("configured"),
+        );
+        let client = Client::builder().default_headers(headers).build()?;
+        let transport = HttpTransport::new(client);
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+            for _ in 0..16 {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return Ok(Vec::new());
+                };
+                let req = read_http_request(&mut socket);
+                let text = String::from_utf8_lossy(&req);
+                if !text.starts_with("POST /error ") {
+                    let _ = socket.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                let request_bytes = req.clone();
+                socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
+                return Ok(request_bytes);
+            }
+            Ok(Vec::new())
+        });
+        sweep_probe_stub(&address.to_string())?;
+        let response = transport
+            .post(format!("http://{address}/error"))
+            .body("{}")
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        let request = server.join().map_err(|_| "server thread failed")??;
+        let request = String::from_utf8_lossy(&request);
+        assert!(request.starts_with("POST /error "));
+        assert!(request.contains("x-client: configured"));
         Ok(())
     }
 }

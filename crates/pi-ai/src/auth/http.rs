@@ -352,8 +352,9 @@ fn parse_json_object(raw: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
+    use std::time::Duration;
 
     use super::*;
 
@@ -370,25 +371,77 @@ mod tests {
         }
     }
 
+    /// Render one HTTP/1.1 stub reply with an exact `Content-Length`.
+    fn http_response(status: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+    /// Drain one HTTP request from a test stub connection before replying.
+    /// Reads the full head, then drains the body by declared Content-Length
+    /// so `close()` never races with an RST from unread queued bytes.
+    fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut raw = Vec::new();
+        let mut buf = [0_u8; 4096];
+        for _ in 0..16 {
+            match stream.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = pos + 4;
+            let headers = String::from_utf8_lossy(&raw[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while raw.len() < header_end + content_length {
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+        }
+        raw
+    }
     fn spawn_raw_server(
+        expected_method: &str,
+        expected_path: &str,
         handler: impl FnOnce(std::net::TcpStream) + Send + 'static,
     ) -> Result<String, String> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| err(e.to_string()))?;
         let address = listener.local_addr().map_err(|e| err(e.to_string()))?;
+        let expected_start = format!("{expected_method} {expected_path} ");
         thread::spawn(move || {
-            let Ok((stream, _)) = listener.accept() else {
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let req = read_http_request(&mut stream);
+                let text = String::from_utf8_lossy(&req);
+                if !text.starts_with(&expected_start) {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                handler(stream);
                 return;
-            };
-            handler(stream);
+            }
         });
-        Ok(format!("http://{address}/"))
+        Ok(format!("http://{address}{expected_path}"))
     }
 
     #[tokio::test]
     async fn post_json_success_returns_body() -> TestResult {
-        let url = spawn_raw_server(|mut stream| {
-            let mut buf = [0_u8; 4096];
-            let _ = stream.read(&mut buf);
+        let url = spawn_raw_server("POST", "/", |mut stream| {
             let body = br#"{"access_token":"tok"}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
@@ -415,9 +468,7 @@ mod tests {
         let long = "x".repeat(MAX_ERROR_BODY_CHARS + 50);
         let url = {
             let payload = long.clone();
-            spawn_raw_server(move |mut stream| {
-                let mut buf = [0_u8; 4096];
-                let _ = stream.read(&mut buf);
+            spawn_raw_server("POST", "/", move |mut stream| {
                 let response = format!(
                     "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{payload}",
                     payload.len()
@@ -450,9 +501,7 @@ mod tests {
         let payload = vec![b'a'; MAX_ERROR_BODY_BYTES + 128];
         let url = {
             let payload = payload.clone();
-            spawn_raw_server(move |mut stream| {
-                let mut buf = [0_u8; 4096];
-                let _ = stream.read(&mut buf);
+            spawn_raw_server("GET", "/body-64k", move |mut stream| {
                 let header = format!(
                     "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     payload.len()
@@ -481,20 +530,28 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| err(e.to_string()))?;
         let address = listener.local_addr().map_err(|e| err(e.to_string()))?;
         thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let req = read_http_request(&mut stream);
+                let text = String::from_utf8_lossy(&req);
+                if !text.starts_with("GET /hang ") {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                let header =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(header);
+                // Never finish the body; wait for the client to drop.
+                thread::sleep(Duration::from_secs(5));
                 return;
-            };
-            let mut buf = [0_u8; 4096];
-            let _ = stream.read(&mut buf);
-            let header = b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n";
-            let _ = stream.write_all(header);
-            // Never finish the body; wait for the client to drop.
-            thread::sleep(Duration::from_secs(5));
+            }
         });
 
         let client = Client::new();
         let response = client
-            .get(format!("http://{address}/"))
+            .get(format!("http://{address}/hang"))
             .send()
             .await
             .map_err(|e| err(e.to_string()))?;
@@ -521,6 +578,47 @@ mod tests {
             .ok_or_else(|| err("prefix"))?;
         let prefix_chars = prefix.chars().count();
         assert_eq!(prefix_chars, MAX_ERROR_BODY_CHARS);
+        Ok(())
+    }
+
+    /// Send one sweeper-style `GET /` at a stub, draining its 404 reply.
+    fn sweep_probe_stub(url: &str) -> Result<(), String> {
+        let addr = url
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split('/').next())
+            .ok_or_else(|| err("bad stub url"))?;
+        let mut stream = TcpStream::connect(addr).map_err(|e| err(e.to_string()))?;
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: sweep\r\nConnection: close\r\n\r\n")
+            .map_err(|e| err(e.to_string()))?;
+        let mut buf = [0_u8; 1024];
+        let _ = stream.read(&mut buf);
+        Ok(())
+    }
+
+    /// A localhost sweep (`GET /` at every new listener) must not consume
+    /// the scripted stub reply: after probing the stub, the real POST still
+    /// succeeds and returns its body.
+    #[tokio::test]
+    async fn sweep_get_does_not_consume_stub_scripts() -> TestResult {
+        let url = spawn_raw_server("POST", "/", |mut stream| {
+            let body = br#"{"access_token":"tok"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body)
+            );
+            let _ = stream.write_all(response.as_bytes());
+        })?;
+        sweep_probe_stub(&url)?;
+        let client = AuthHttpClient::new().map_err(|e| err(e.to_string()))?;
+        let mut fields: BTreeMap<String, String> = BTreeMap::new();
+        fields.insert("grant_type".into(), "refresh_token".into());
+        let body = client
+            .post_json(&url, &fields, None, None)
+            .await
+            .map_err(|e| err(e.to_string()))?;
+        assert!(body.contains("access_token"));
         Ok(())
     }
 }

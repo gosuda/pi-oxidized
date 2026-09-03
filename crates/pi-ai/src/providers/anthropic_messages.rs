@@ -1158,7 +1158,7 @@ enum AdapterError {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
 
     use super::*;
     use crate::types::{
@@ -1188,6 +1188,47 @@ mod tests {
             compat: None,
             extra: BTreeMap::new(),
         }
+    }
+
+    /// Render one HTTP/1.1 stub reply with an exact `Content-Length`.
+    fn http_response(status: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+    /// Drain one HTTP request from a test stub connection before replying.
+    fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut raw = Vec::new();
+        let mut buf = [0_u8; 4096];
+        for _ in 0..16 {
+            match stream.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = pos + 4;
+            let headers = String::from_utf8_lossy(&raw[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while raw.len() < header_end + content_length {
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+        }
+        raw
     }
 
     #[test]
@@ -1428,11 +1469,24 @@ mod tests {
             "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
+        let host = address.to_string();
         let server = std::thread::spawn(move || -> std::io::Result<()> {
-            let (mut socket, _) = listener.accept()?;
-            let mut request = [0_u8; 8_192];
-            let _read = socket.read(&mut request)?;
-            socket.write_all(response.as_bytes())?;
+            for _ in 0..16 {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return Ok(());
+                };
+                let req = read_http_request(&mut socket);
+                let text = String::from_utf8_lossy(&req);
+                let lowered = text.to_ascii_lowercase();
+                if !text.starts_with("POST /v1/messages ")
+                    || !lowered.contains(&format!("host: {host}"))
+                {
+                    let _ = socket.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                socket.write_all(response.as_bytes())?;
+                return Ok(());
+            }
             Ok(())
         });
 
@@ -1475,17 +1529,30 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
+        let host = address.to_string();
         let server = std::thread::spawn(move || -> std::io::Result<()> {
-            let (mut socket, _) = listener.accept()?;
-            let mut request = [0_u8; 8_192];
-            let _read = socket.read(&mut request)?;
-            // Headers only; leave the body hanging so cancellation wins during body read.
-            socket.write_all(
-                b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n",
-            )?;
-            // Keep the connection open until the client times out/cancels.
-            let mut sink = [0_u8; 1];
-            let _ = socket.read(&mut sink);
+            for _ in 0..16 {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return Ok(());
+                };
+                let req = read_http_request(&mut socket);
+                let text = String::from_utf8_lossy(&req);
+                let lowered = text.to_ascii_lowercase();
+                if !text.starts_with("POST /v1/messages ")
+                    || !lowered.contains(&format!("host: {host}"))
+                {
+                    let _ = socket.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                // Headers only; leave the body hanging so cancellation wins during body read.
+                socket.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )?;
+                // Keep the connection open until the client times out/cancels.
+                let mut sink = [0_u8; 1];
+                let _ = socket.read(&mut sink);
+                return Ok(());
+            }
             Ok(())
         });
 
@@ -1530,5 +1597,72 @@ mod tests {
         let usage = Usage::default();
         assert_eq!(usage.total_tokens, 0);
         assert_eq!(usage.cache_write1h, None);
+    }
+
+    /// Send one sweeper-style `GET /` at a stub, draining its 404 reply.
+    fn sweep_probe_stub(address: &str) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        let mut stream = TcpStream::connect(address)?;
+        stream.write_all(b"GET / HTTP/1.1\r\nHost: sweep\r\nConnection: close\r\n\r\n")?;
+        let mut buf = [0_u8; 1024];
+        let _ = stream.read(&mut buf);
+        Ok(())
+    }
+
+    /// A localhost sweep (`GET /` at every new listener) must not consume
+    /// the scripted stub reply: after probing the stub, the real POST
+    /// still gets its 400 response with the truncated body.
+    #[tokio::test]
+    async fn sweep_get_does_not_consume_stub_scripts() -> Result<(), Box<dyn std::error::Error>> {
+        let body = format!("{{\"error\":\"{}\"}}", "x".repeat(4_200));
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let host = address.to_string();
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            for _ in 0..16 {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return Ok(());
+                };
+                let req = read_http_request(&mut socket);
+                let text = String::from_utf8_lossy(&req);
+                let lowered = text.to_ascii_lowercase();
+                if !text.starts_with("POST /v1/messages ")
+                    || !lowered.contains(&format!("host: {host}"))
+                {
+                    let _ = socket.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                socket.write_all(response.as_bytes())?;
+                return Ok(());
+            }
+            Ok(())
+        });
+        sweep_probe_stub(&address.to_string())?;
+        let mut model = model();
+        model.base_url = format!("http://{address}");
+        let client = Client::new();
+        let provider = AnthropicMessages::new(client);
+        let events = provider
+            .stream(
+                &model,
+                Context::default(),
+                StreamOptions {
+                    api_key: Some("test-key".to_owned()),
+                    ..StreamOptions::default()
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.join().map_err(|_| "server thread failed")??;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.first(),
+            Some(Ok(AssistantMessageEvent::Start { .. }))
+        ));
+        Ok(())
     }
 }
