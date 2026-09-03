@@ -2069,6 +2069,63 @@ mod tests {
         assert!(image_value("image/svg+xml", "aGk=").is_err());
         Ok(())
     }
+    #[test]
+    fn budget_thinking_path_defaults_budgets_and_omits_govcloud_display() -> Result<(), String> {
+        fn reasoning_options(reasoning: &str) -> StreamOptions {
+            let mut options = StreamOptions::default();
+            options.insert_extra(
+                StreamOptionKey::REASONING,
+                Value::String(reasoning.to_owned()),
+            );
+            options
+        }
+        fn request_fields(model: &Model, options: &StreamOptions) -> Result<Value, String> {
+            build_additional_model_request_fields(model, options)
+                .map_err(|error| format!("fields failed: {error}"))?
+                .ok_or_else(|| "expected thinking fields".to_owned())
+        }
+
+        // Non-adaptive Claude: budget path with defaults plus interleaved beta.
+        let model = test_model("anthropic.claude-3-7-sonnet", "Claude 3.7 Sonnet");
+        let fields = request_fields(&model, &reasoning_options("medium"))?;
+        assert_eq!(fields.pointer("/thinking/type"), Some(&json!("enabled")));
+        assert_eq!(
+            fields.pointer("/thinking/budget_tokens"),
+            Some(&json!(8192))
+        );
+        assert_eq!(
+            fields.pointer("/thinking/display"),
+            Some(&json!("summarized"))
+        );
+        assert_eq!(
+            fields.pointer("/anthropic_beta"),
+            Some(&json!(["interleaved-thinking-2025-05-14"]))
+        );
+        // GovCloud drops display; an explicit region triggers it too.
+        let mut gov = reasoning_options("medium");
+        gov.insert_extra(
+            StreamOptionKey::REGION,
+            Value::String("us-gov-west-1".to_owned()),
+        );
+        let fields = request_fields(&model, &gov)?;
+        assert_eq!(fields.pointer("/thinking/display"), None);
+        // Custom budgets override the level default.
+        let mut custom = reasoning_options("medium");
+        custom.insert_extra(StreamOptionKey::THINKING_BUDGETS, json!({"medium": 4000}));
+        let fields = request_fields(&model, &custom)?;
+        assert_eq!(
+            fields.pointer("/thinking/budget_tokens"),
+            Some(&json!(4000))
+        );
+        // Unknown display values fail fast instead of reaching the wire.
+        let mut bad = reasoning_options("medium");
+        bad.insert_extra(
+            StreamOptionKey::THINKING_DISPLAY,
+            Value::String("detailed".to_owned()),
+        );
+        assert!(build_additional_model_request_fields(&model, &bad).is_err());
+        Ok(())
+    }
 
     #[test]
     fn request_normalizes_tool_ids_and_coalesces_tool_results() -> Result<(), String> {
