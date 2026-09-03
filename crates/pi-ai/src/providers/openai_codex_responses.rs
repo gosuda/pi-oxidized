@@ -1238,14 +1238,7 @@ fn map_reasoning_effort(model: &Model, effort: &str) -> String {
         // reference `??` fallback resolves to the literal effort, and a
         // null `off` resolves to the literal "none".
         Some(Some(mapped)) => mapped.clone(),
-        _ => {
-            if effort == "none" {
-                "none"
-            } else {
-                effort
-            }
-            .to_owned()
-        }
+        _ => if effort == "none" { "none" } else { effort }.to_owned(),
     }
 }
 
@@ -1916,10 +1909,7 @@ mod tests {
             ModelThinkingLevel::High,
             Some("very-high".to_owned()),
         )]));
-        assert_eq!(
-            map_reasoning_effort(&model, "high"),
-            "very-high".to_owned()
-        );
+        assert_eq!(map_reasoning_effort(&model, "high"), "very-high".to_owned());
     }
     #[test]
     fn extracts_chatgpt_account_id_from_base64url_jwt() -> Result<(), CodexFailure> {
