@@ -3561,6 +3561,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loop_disposes_on_exit() {
+        // The host moves into the loop, so observe disposal through the
+        // shared flag instead of the moved value.
+        let host = FakeRpcHost::new(FakeConfig::default());
+        let disposed = Arc::clone(&host.disposed);
+        let sink = Arc::new(BufferSink::new()) as Arc<dyn RpcSink>;
+        let input: &[u8] = b"";
+        let _ = run_rpc_loop(host, sink, input).await;
+        assert!(disposed.load(Ordering::SeqCst));
+    }
+    #[tokio::test]
     async fn loop_disposes_host() {
         let host = Arc::new(FakeRpcHost::new(FakeConfig::default()));
         let disposed = {
