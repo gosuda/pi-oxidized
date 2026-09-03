@@ -1890,7 +1890,7 @@ async function main(): Promise<number> {
 		}
 		return 0;
 	}
-	if (command === "self-check") {
+	if (command === undefined || command === "self-check") {
 		const referenceDir = resolve(argValue(args, "--reference") ?? CANONICAL_REFERENCE_DIR);
 		const tmpDir = join(REPO_ROOT, "target", "dependency-exposure-selfcheck");
 		const outcomes = await selfCheck(referenceDir, tmpDir);
