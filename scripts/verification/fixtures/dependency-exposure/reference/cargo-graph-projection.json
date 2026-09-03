@@ -6106,6 +6106,13 @@
 		},
 		{
 			"from": "pi-ext",
+			"to": "sha2",
+			"kinds": [
+				"dev"
+			]
+		},
+		{
+			"from": "pi-ext",
 			"to": "tempfile",
 			"kinds": [
 				"dev"

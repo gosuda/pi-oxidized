@@ -1,11 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-08-30T17:22:36.517Z",
-	"captureHead": "3cbd977d9703a1ba45c9efbc3d045f750f881502",
-	"relevantTreeStatus": "M bun.lock\n M packages/extension-host/bun.lock\n M packages/extension-host/package.json\n M packages/extension-host/src/virtual-modules.ts",
+	"capturedAt": "2026-09-03T04:33:12.570Z",
+	"captureHead": "ad0a4c4e36372756f3bea33dc3cb6728eff6d35b",
 	"metafile": {
 		"projectionPath": "metafile-projection.json",
-		"sha256": "c575bcdd970d62e26199cd79db57c573565b817b59a3531aa6885e197e973eca",
+		"sha256": "38ab7a13d8cdb0cd2451b3b6f3bf1f6ec3976bb7145400df365d1b6df0ee9359",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -18,14 +17,14 @@
 			"--target",
 			"bun-linux-x64-baseline",
 			"--outfile",
-			"/home/alpha/harness/pi-oxidized/scripts/verification/fixtures/dependency-exposure/reference/.capture-staging/pi-extension-host/pi-extension-host",
-			"--metafile=/home/alpha/harness/pi-oxidized/scripts/verification/fixtures/dependency-exposure/reference/.capture-staging/metafile.json"
+			"/tmp/dep-ref-fresh/.capture-staging/pi-extension-host/pi-extension-host",
+			"--metafile=/tmp/dep-ref-fresh/.capture-staging/metafile.json"
 		],
-		"metafileSha256": "0e0f88b5d3dc21ce80169330201e75c21df5fb04503a16d9507b9272ca28c4fd"
+		"metafileSha256": "b029dd9c11404e6f4263d264d931463061f3b04b621f4da8c61f2169f4cf89ab"
 	},
 	"cargo": {
 		"projectionPath": "cargo-graph-projection.json",
-		"sha256": "b645afe253cc16752cbd1a66bb7a1c155f05a011a34718d8ef094f9f1c2c71e9",
+		"sha256": "30f5a713aa781e04f622419a62a7525e31a8b2961587cc39d31c08b6fbdd7b35",
 		"argv": [
 			"metadata",
 			"--format-version",
@@ -38,7 +37,7 @@
 	"npmSurfaces": [
 		{
 			"path": "package.json",
-			"sha256": "ded367f430a6f148758d26ed48881ae2861421f4c34243fea75abbcfac9d3999",
+			"sha256": "512f8485f9f0ab498567a0026cb7c0c9eb93de6e6ca2f9ebfa6e5a71c75301c9",
 			"packageName": "pi-oxidized",
 			"depFields": {
 				"dependencies": [
@@ -93,7 +92,7 @@
 	"cargoFiles": [
 		{
 			"path": "Cargo.lock",
-			"sha256": "9eef233da7aa9b08ab4ea6faf52b6daf6d43b34f9cff765734558bd27ffdc2d6"
+			"sha256": "f9beb5f4f3552ddb85486a4c9831e0a4175fcb84c9b0198324a76f962eaf3078"
 		},
 		{
 			"path": "Cargo.toml",
@@ -109,11 +108,11 @@
 		},
 		{
 			"path": "crates/pi-ext/Cargo.toml",
-			"sha256": "ba0b28bffb456d4fa631c1f41df594c1afc3082b1833f335cf4013002a93e271"
+			"sha256": "4515986c59c57c6db45e5fe19e1758ed1dc129c2231a03c64b655ef8f380f890"
 		},
 		{
 			"path": "crates/pi-tui/Cargo.toml",
-			"sha256": "ad6833b5ac280718eda81dbd94625a0d9c0d0a5368d0ed01f9eb242517ddbed3"
+			"sha256": "473536fa876fcfb6d726e3a31fd11b22c878b43f619d3d199e8c9157ac02170c"
 		},
 		{
 			"path": "crates/pi/Cargo.toml",
