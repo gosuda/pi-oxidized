@@ -287,7 +287,6 @@ fn convert_assistant_part(
             }
             Some(Value::Object(part))
         }
-        AssistantContent::Text(_) | AssistantContent::Thinking(_) => None,
     }
 }
 
@@ -1006,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_signed_parts_survive_history_replay() {
+    fn empty_signed_parts_survive_history_replay() -> Result<(), String> {
         use crate::types::{AssistantContent, TextContent, ThinkingContent};
 
         let mut text = TextContent::new(String::new());
@@ -1023,7 +1022,7 @@ mod tests {
         let mut thinking = ThinkingContent::new(String::new());
         thinking.thinking_signature = Some("QUJDRA==".to_owned());
         let kept = convert_assistant_part(AssistantContent::Thinking(thinking), true, false);
-        let part = kept.expect("empty signed thinking must survive replay");
+        let part = kept.ok_or_else(|| "empty signed thinking was dropped".to_owned())?;
         assert_eq!(part.get("thought"), Some(&Value::Bool(true)));
         assert_eq!(
             part.get("thoughtSignature").and_then(Value::as_str),
@@ -1040,6 +1039,7 @@ mod tests {
             convert_assistant_part(AssistantContent::Text(cross_model), false, false),
             None
         );
+        Ok(())
     }
     #[test]
     fn thinking_marker_and_signature_retention_match_google_protocol() {
