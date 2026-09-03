@@ -219,15 +219,20 @@ fn convert_assistant_part(
     include_ids: bool,
 ) -> Option<Value> {
     match block {
-        AssistantContent::Text(text) if !text.text.is_empty() => {
+        AssistantContent::Text(text) => {
+            let signature =
+                resolve_thought_signature(same_provider_and_model, text.text_signature.as_deref());
+            // Gemini attaches signatures to empty-text parts and requires them
+            // echoed back; dropping the part breaks the reasoning chain.
+            if text.text.is_empty() && signature.is_none() {
+                return None;
+            }
             let mut part = Map::new();
             part.insert(
                 "text".to_owned(),
                 Value::String(sanitize_surrogates(&text.text).into_owned()),
             );
-            if let Some(signature) =
-                resolve_thought_signature(same_provider_and_model, text.text_signature.as_deref())
-            {
+            if let Some(signature) = signature {
                 part.insert(
                     "thoughtSignature".to_owned(),
                     Value::String(signature.to_owned()),
@@ -235,7 +240,14 @@ fn convert_assistant_part(
             }
             Some(Value::Object(part))
         }
-        AssistantContent::Thinking(thinking) if !thinking.thinking.trim().is_empty() => {
+        AssistantContent::Thinking(thinking) => {
+            let signature = resolve_thought_signature(
+                same_provider_and_model,
+                thinking.thinking_signature.as_deref(),
+            );
+            if thinking.thinking.trim().is_empty() && signature.is_none() {
+                return None;
+            }
             let mut part = Map::new();
             if same_provider_and_model {
                 part.insert("thought".to_owned(), Value::Bool(true));
@@ -244,10 +256,7 @@ fn convert_assistant_part(
                 "text".to_owned(),
                 Value::String(sanitize_surrogates(&thinking.thinking).into_owned()),
             );
-            if let Some(signature) = resolve_thought_signature(
-                same_provider_and_model,
-                thinking.thinking_signature.as_deref(),
-            ) {
+            if let Some(signature) = signature {
                 part.insert(
                     "thoughtSignature".to_owned(),
                     Value::String(signature.to_owned()),
@@ -996,6 +1005,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn empty_signed_parts_survive_history_replay() {
+        use crate::types::{AssistantContent, TextContent, ThinkingContent};
+
+        let mut text = TextContent::new(String::new());
+        text.text_signature = Some("QUJDRA==".to_owned());
+        let kept = convert_assistant_part(AssistantContent::Text(text), true, false);
+        assert_eq!(
+            kept.and_then(|part| part
+                .get("thoughtSignature")
+                .and_then(Value::as_str)
+                .map(str::to_owned)),
+            Some("QUJDRA==".to_owned())
+        );
+
+        let mut thinking = ThinkingContent::new(String::new());
+        thinking.thinking_signature = Some("QUJDRA==".to_owned());
+        let kept = convert_assistant_part(AssistantContent::Thinking(thinking), true, false);
+        let part = kept.expect("empty signed thinking must survive replay");
+        assert_eq!(part.get("thought"), Some(&Value::Bool(true)));
+        assert_eq!(
+            part.get("thoughtSignature").and_then(Value::as_str),
+            Some("QUJDRA==")
+        );
+
+        let unsigned = TextContent::new(String::new());
+        assert_eq!(
+            convert_assistant_part(AssistantContent::Text(unsigned), true, false),
+            None
+        );
+        let cross_model = TextContent::new(String::new());
+        assert_eq!(
+            convert_assistant_part(AssistantContent::Text(cross_model), false, false),
+            None
+        );
+    }
     #[test]
     fn thinking_marker_and_signature_retention_match_google_protocol() {
         assert!(is_thinking_part(&json!({"thought": true})));
