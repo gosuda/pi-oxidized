@@ -1241,6 +1241,7 @@ fn parse_chunk_usage(raw: &Value, model: &Model) -> Usage {
         .get("cached_tokens")
         .and_then(Value::as_u64)
         .or_else(|| raw.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+        .or_else(|| raw.get("cached_tokens").and_then(Value::as_u64))
         .unwrap_or(0);
     let cache_write = u64_field(details, "cache_write_tokens");
     let input = prompt_tokens
@@ -1748,6 +1749,29 @@ mod tests {
             (5, 4, 3, 2, 14)
         );
         assert_eq!(usage.reasoning, Some(1));
+    }
+    #[test]
+    fn usage_cache_read_falls_back_across_provider_placements() {
+        // DeepSeek reports hits beside the details object.
+        let usage = parse_chunk_usage(
+            &json!({"prompt_tokens":100,"completion_tokens":10,"prompt_cache_hit_tokens":40}),
+            &model("deepseek"),
+        );
+        assert_eq!((usage.input, usage.cache_read), (60, 40));
+
+        // Kimi documents top-level cached_tokens on the final usage chunk.
+        let usage = parse_chunk_usage(
+            &json!({"prompt_tokens":100,"completion_tokens":10,"cached_tokens":25}),
+            &model("kimi-coding"),
+        );
+        assert_eq!((usage.input, usage.cache_read), (75, 25));
+
+        // Nested details win over every fallback placement.
+        let usage = parse_chunk_usage(
+            &json!({"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":7},"prompt_cache_hit_tokens":40,"cached_tokens":25}),
+            &model("openai"),
+        );
+        assert_eq!((usage.input, usage.cache_read), (93, 7));
     }
 
     #[test]
