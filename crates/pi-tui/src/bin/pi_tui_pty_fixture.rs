@@ -308,13 +308,20 @@ async fn run_fixture(
         );
     }
 
+    // Enable raw mode before emitting probe queries: the DSR auto-responder
+    // in the harness reader pump writes `\x1b[1;1R` back for each `\x1b[6n`
+    // it sees. If the slave PTY still has ECHO+ECHOCTL enabled when that
+    // reply arrives, it is echoed as `^[[1;1R` (caret notation), creating a
+    // nondeterministic extra 7 bytes in the output batch that races with
+    // `enable_raw_mode()`. Disabling echo first eliminates the race.
+    crossterm::terminal::enable_raw_mode()?;
+
     // Stage-1 probes must leave the synchronized-output wrapper.
     let probe_bytes = probe_query_batch(true);
     guard.writer_mut().write_all(&probe_bytes)?;
     guard.writer_mut().flush()?;
 
     // Read probe replies from the real PTY stdin before EventStream ownership.
-    crossterm::terminal::enable_raw_mode()?;
     let mut probe = ProbeSession::new();
     let probe_deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < probe_deadline && !probe.is_complete() {
