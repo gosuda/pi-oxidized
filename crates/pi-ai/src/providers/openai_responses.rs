@@ -315,6 +315,11 @@ fn build_payload(
     {
         payload["prompt_cache_retention"] = Value::String("24h".into());
     }
+    if cache_retention == CacheRetention::None
+        && compat_bool(model, "supportsExplicitPromptCacheMode", false)
+    {
+        payload["prompt_cache_options"] = json!({"mode": "explicit"});
+    }
     if let Some(max_tokens) = options.max_tokens {
         payload["max_output_tokens"] = Value::from(max_tokens.max(MIN_OUTPUT_TOKENS));
     }
@@ -614,6 +619,36 @@ mod tests {
         assert_eq!(payload["prompt_cache_retention"], "24h");
         assert_eq!(payload["reasoning"]["effort"], "high");
         assert_eq!(payload["service_tier"], "flex");
+    }
+    #[test]
+    fn explicit_cache_mode_is_opt_in_per_model() {
+        let context = Context::default();
+        let mut explicit = model();
+        explicit.compat = Some(json!({"supportsExplicitPromptCacheMode": true}));
+        // Retention none + opt-in model: explicit mode disables implicit caching.
+        let payload = build_payload(
+            &explicit,
+            &context,
+            &StreamOptions::default(),
+            CacheRetention::None,
+        );
+        assert_eq!(payload["prompt_cache_options"], json!({"mode": "explicit"}));
+        // Long retention on the same model: no explicit marker.
+        let payload = build_payload(
+            &explicit,
+            &context,
+            &StreamOptions::default(),
+            CacheRetention::Long,
+        );
+        assert_eq!(payload.get("prompt_cache_options"), None);
+        // Retention none without the flag: no marker either.
+        let payload = build_payload(
+            &model(),
+            &context,
+            &StreamOptions::default(),
+            CacheRetention::None,
+        );
+        assert_eq!(payload.get("prompt_cache_options"), None);
     }
     #[test]
     fn reasoning_defaults_and_provider_overrides_are_exact() {

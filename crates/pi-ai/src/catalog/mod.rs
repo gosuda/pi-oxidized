@@ -281,6 +281,24 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn explicit_cache_mode_models_carry_their_opt_in_flag() -> TestResult {
+        let catalog = builtin_models()?;
+        for id in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+            let model = required(catalog.get("openai").and_then(|models| models.get(id)), id)?;
+            assert_eq!(model.api, "openai-responses", "{id} api");
+            assert_eq!(
+                model
+                    .compat
+                    .as_ref()
+                    .and_then(|compat| compat.get("supportsExplicitPromptCacheMode"))
+                    .and_then(Value::as_bool),
+                Some(true),
+                "{id} explicit cache flag",
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn representative_builtin_fields_match_checked_in_payload() -> TestResult {
