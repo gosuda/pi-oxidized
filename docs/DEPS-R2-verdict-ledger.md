@@ -33,11 +33,13 @@ entry is an audit failure at DEPS-D1.
 
 | head | date | subject | class | checks |
 |---|---|---|---|---|
-| eb91d6b1d4fa | 2026-08-29 | npm:typebox | S | E1:fail E2:fail E3:pass E4:pass |
-| eb91d6b1d4fa | 2026-08-29 | npm:@types/bun | E | E1:pass E2:pass E3:pass E4:pass |
-| eb91d6b1d4fa | 2026-08-29 | tool:bun-runtime | S | E1:pass E2:fail E3:fail E4:fail |
+| 2c944d965b96 | 2026-09-03 | npm:typebox | S | E1:fail E2:fail E3:pass E4:pass |
+| 2c944d965b96 | 2026-09-03 | npm:@types/bun | E | E1:pass E2:pass E3:pass E4:pass |
+| 2c944d965b96 | 2026-09-03 | tool:bun-runtime | S | E1:pass E2:fail E3:fail E4:fail |
 
 ## Records
+
+- **2c944d965b96 / reference re-anchor (2026-09-03) — sanity rows re-decided, not new verdicts.** The checked-in reference (last captured at `eb91d6b1d4fa`) trailed the current tree: the metafile projection pinned `openrouter.json` at sha `a9a1e3cf…` but the file on disk hashes `f370fd84…`. The fail-closed self-check emitted E2-undecidable for `npm:@types/bun` (stale metafile input), which the verdict algebra forces to Class S — this was a stale-reference artifact, not a real classification. Mechanical regeneration captured 2,490 metafile inputs at `2c944d965b96`; all three classes stayed unchanged. SBOM baseline `verify:sbom` green (no drift).
 
 - **eb91d6b1d4fa / DOC-F final-tree re-ground (2026-08-29) — sanity rows
   re-decided, not new verdicts.** The final parity and performance work added a

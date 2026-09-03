@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-09-03T10:07:55.192Z",
-	"captureHead": "af28efd28e00df25a5acd13bfc380259783fa0d5",
+	"capturedAt": "2026-09-03T16:32:44.380Z",
+	"captureHead": "2c944d965b96e4b1772af0153d7a732eeeb5b990",
 	"metafile": {
 		"projectionPath": "metafile-projection.json",
-		"sha256": "339215fb72bd8765b3dbe7764bdd22d1e658924c749468b3e611e0cb984b6fa7",
+		"sha256": "dcd40e01b7a53cf365012bb8dc4cf470b3ee087b1ca18f7fd957e7b4d45fc27d",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -17,10 +17,10 @@
 			"--target",
 			"bun-linux-x64-baseline",
 			"--outfile",
-			"/tmp/e2-recapture/.capture-staging/pi-extension-host/pi-extension-host",
-			"--metafile=/tmp/e2-recapture/.capture-staging/metafile.json"
+			"/tmp/exposure-recapture/.capture-staging/pi-extension-host/pi-extension-host",
+			"--metafile=/tmp/exposure-recapture/.capture-staging/metafile.json"
 		],
-		"metafileSha256": "619224669bb9935634bc997f3e6c6b25f4d78c93713cf7c045561a1f315396ae"
+		"metafileSha256": "aa3c713dc1b8e6b7e154e4e874926f3249594a320265cd50a0d5585c3b49c36b"
 	},
 	"cargo": {
 		"projectionPath": "cargo-graph-projection.json",

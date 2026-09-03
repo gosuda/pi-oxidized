@@ -135,6 +135,14 @@ jobs:
         if: matrix.musl != 'true'
         run: npm ci --ignore-scripts --prefix .references/pi-2.0
 
+      - name: Dependency exposure predicate self-check
+        if: matrix.musl != 'true'
+        run: bun run verify:dependency-exposure self-check
+
+      - name: SBOM baseline verification
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: bun run verify:sbom
+
       - name: Prepare interactive script test prerequisites
         if: runner.os != 'Windows' && matrix.musl != 'true'
         shell: bash
