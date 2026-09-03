@@ -1,6 +1,6 @@
 //! Print (single-shot) mode: send prompts, render output, exit.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/modes/print-mode.ts` into
+//! Ports `.references/pi-2.0/packages/coding-agent/src/modes/print-mode.ts` into
 //! three independent pieces so the runtime binding is deferred:
 //!
 //! - [`input`] assembles the initial prompt from piped stdin, `@file`

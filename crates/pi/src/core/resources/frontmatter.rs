@@ -1,6 +1,6 @@
 //! Markdown YAML frontmatter extraction and parsing.
 //!
-//! Port of `.references/pi/packages/coding-agent/src/utils/frontmatter.ts`.
+//! Port of `.references/pi-2.0/packages/coding-agent/src/utils/frontmatter.ts`.
 //! Uses `serde-saphyr` for real YAML parsing of the frontmatter block.
 
 use std::collections::BTreeMap;

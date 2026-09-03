@@ -1,6 +1,6 @@
 //! System prompt construction for the coding agent.
 //!
-//! Port of `.references/pi/packages/coding-agent/src/core/system-prompt.ts`.
+//! Port of `.references/pi-2.0/packages/coding-agent/src/core/system-prompt.ts`.
 //! Pure assembly of identity, tools, guidelines, docs paths, append text,
 //! project context XML, skills XML, and cwd — no date/time injection.
 

@@ -1,6 +1,6 @@
 //! Text renderer: drain an [`AgentSessionEvent`] stream to stdout/stderr text.
 //!
-//! Mirrors the text-mode branch of `.references/pi/packages/coding-agent/src/
+//! Mirrors the text-mode branch of `.references/pi-2.0/packages/coding-agent/src/
 //! modes/print-mode.ts`: the session runs to completion, then the final
 //! assistant message's text blocks are written to stdout (one line each). An
 //! `error` or `aborted` stop reason writes the failure text to stderr and

@@ -1,6 +1,6 @@
 //! Skill loading, validation, and prompt formatting.
 //!
-//! Port of `.references/pi/packages/coding-agent/src/core/skills.ts`.
+//! Port of `.references/pi-2.0/packages/coding-agent/src/core/skills.ts`.
 
 use std::collections::HashSet;
 use std::fs;

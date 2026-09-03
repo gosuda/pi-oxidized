@@ -1,6 +1,6 @@
 //! Terminal text primitives: width, wrap, truncate, slice, and ANSI-aware surgery.
 //!
-//! Ports the observable semantics of `.references/pi/packages/tui/src/utils.ts`
+//! Ports the observable semantics of `.references/pi-2.0/packages/tui/src/utils.ts`
 //! (plus `compositeLineAt` / `CURSOR_MARKER` helpers from `tui.ts`).
 
 mod ansi;

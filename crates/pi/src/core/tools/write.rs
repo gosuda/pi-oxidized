@@ -1,6 +1,6 @@
 //! Write tool: create or overwrite a file under the mutation queue.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/write.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/write.ts`.
 //! Success text reports a JS-style UTF-16 code-unit length as "bytes".
 
 use std::path::{Path, PathBuf};

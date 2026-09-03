@@ -1,5 +1,5 @@
 //! Terminal LaTeX math rendering: a Rust-native port of the upstream
-//! `.references/pi/packages/tui/src/latex.ts` layout engine (T4,
+//! `.references/pi-2.0/packages/tui/src/latex.ts` layout engine (T4,
 //! `docs/PAR-MATH-latex-strategy.md`).
 //!
 //! Entry-exact command tables (same names, same mappings, same entry counts,

@@ -1,7 +1,7 @@
 //! Selector view-models (model / session / tree / settings / config / auth / scoped).
 //!
 //! Ports the `*SelectorComponent` family from
-//! `.references/pi/packages/coding-agent/src/modes/interactive/components/`.
+//! `.references/pi-2.0/packages/coding-agent/src/modes/interactive/components/`.
 //! Each builder produces a pi-tui `SelectList` or `SettingsList` configured
 //! against the thread-local current theme (set by [`super::view::compose`] via
 //! [`super::theme::with_theme`]). Selectors *replace* the editor inline (not

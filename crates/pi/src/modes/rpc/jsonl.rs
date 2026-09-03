@@ -1,6 +1,6 @@
 //! Strict LF-only JSONL framing for RPC stdin/stdout.
 //!
-//! Port of `.references/pi/packages/coding-agent/src/modes/rpc/jsonl.ts`.
+//! Port of `.references/pi-2.0/packages/coding-agent/src/modes/rpc/jsonl.ts`.
 //!
 //! Framing rules:
 //! - records are split on `\n` only (not `\r\n` as a unit, not U+2028/U+2029)

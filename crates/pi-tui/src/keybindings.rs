@@ -1,6 +1,6 @@
 //! Keybinding definitions, defaults, and conflict detection.
 //!
-//! Ports `.references/pi/packages/tui/src/keybindings.ts` including the exact
+//! Ports `.references/pi-2.0/packages/tui/src/keybindings.ts` including the exact
 //! 31 `TUI_KEYBINDINGS` defaults (lines 54–134) and `KeybindingsManager`
 //! user-claim conflict detection.
 

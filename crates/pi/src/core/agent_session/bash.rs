@@ -1,6 +1,6 @@
 //! Product bash execution impls.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/agent-session.ts`
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/agent-session.ts`
 //! `executeBash`, `recordBashResult`, `abortBash`, `isBashRunning`,
 //! `hasPendingBashMessages`, and `_flushPendingBashMessages`.
 //!

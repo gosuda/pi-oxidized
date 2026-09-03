@@ -1,6 +1,6 @@
 //! Status indicator view-model (working / retry / compaction / branch).
 //!
-//! Ports `.references/pi/packages/coding-agent/src/modes/interactive/components/status-indicator.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/modes/interactive/components/status-indicator.ts`.
 //! Wraps pi-tui's `Loader` braille spinner with a kind + message.
 
 use pi_tui::component::Component;

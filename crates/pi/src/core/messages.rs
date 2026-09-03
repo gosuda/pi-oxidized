@@ -1,6 +1,6 @@
 //! Custom product message types and LLM conversion for the coding agent.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/messages.ts`. Typed
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/messages.ts`. Typed
 //! product roles sit on top of [`pi_agent::CustomAgentMessage`]; unknown custom
 //! roles are skipped by [`convert_to_llm`] the same way the TypeScript exhaustive
 //! `default` branch drops them.

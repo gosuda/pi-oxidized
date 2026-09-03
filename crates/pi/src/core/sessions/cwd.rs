@@ -1,6 +1,6 @@
 //! Missing stored-cwd detection and error helpers.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/session-cwd.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/session-cwd.ts`.
 
 use std::path::Path;
 

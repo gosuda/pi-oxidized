@@ -1,6 +1,6 @@
 //! Image MIME sniffing and the inline-image pipeline facade.
 //!
-//! Ports the *surface* of `.references/pi/packages/coding-agent/src/utils/`
+//! Ports the *surface* of `.references/pi-2.0/packages/coding-agent/src/utils/`
 //! `{mime.ts, image-process.ts, image-convert.ts}`. The decoder, EXIF
 //! orientation, resize, and encode ladder live in
 //! [`crate::core::tools::read`] (the read-tool pipeline, which is the single

@@ -1,6 +1,6 @@
 //! Context token estimation used by simple-stream max-token clamping.
 //!
-//! Port of `.references/pi/packages/ai/src/utils/estimate.ts`.
+//! Port of `.references/pi-2.0/packages/ai/src/utils/estimate.ts`.
 
 use serde_json::Value;
 

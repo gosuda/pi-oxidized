@@ -1,6 +1,6 @@
 //! Bash tool: execute a shell command with streamed, tail-truncated output.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/bash.ts` plus the
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/bash.ts` plus the
 //! local process-tree kill path from `utils/shell.ts`. stdout and stderr are
 //! merged by arrival order into an [`OutputAccumulator`] with spill prefix
 //! `pi-bash`. Partial tool updates are throttled to 100 ms.

@@ -2,7 +2,7 @@
 //!
 //! Verifies that the Rust render-churn benchmark binary
 //! (`pi_tui_render_churn_bench`) uses parameters matching the upstream
-//! TypeScript benchmark (`.references/pi/packages/tui/test/render-churn-bench.ts`).
+//! TypeScript benchmark (`.references/pi-2.0/packages/tui/test/render-churn-bench.ts`).
 //!
 //! The test reads the `__BENCH_JSON__` output from the benchmark binary and
 //! asserts every parameter matches the upstream constants:

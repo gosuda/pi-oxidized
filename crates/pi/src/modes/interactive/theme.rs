@@ -1,7 +1,7 @@
 //! Product theme: resolved colors, built-in defaults, JSON loading, and
 //! conversion to pi-tui component themes.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/modes/interactive/theme/`
+//! Ports `.references/pi-2.0/packages/coding-agent/src/modes/interactive/theme/`
 //! (`theme.ts`, `dark.json`, `light.json`). The reference uses a global
 //! singleton `theme`; pi-tui component themes take `fn(&str) -> String` hooks
 //! that cannot capture state, so this module mirrors the singleton with a

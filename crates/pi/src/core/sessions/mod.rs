@@ -1,6 +1,6 @@
 //! Append-only JSONL v3 session store.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/session-manager.ts` and
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/session-manager.ts` and
 //! `session-cwd.ts`. Disk create is deferred until the first assistant message
 //! (`create_new` / `wx`); historical lines are rewritten only on migration load,
 //! empty-file init, or [`SessionManager::create_branched_session`].

@@ -2,7 +2,7 @@
 //! npm/git/local install/remove/update, and atomic `packages[]` settings edits.
 //!
 //! Ports the install/remove/update/list side of
-//! `.references/pi/packages/coding-agent/src/core/package-manager.ts`. The
+//! `.references/pi-2.0/packages/coding-agent/src/core/package-manager.ts`. The
 //! resolve-side resource collection lives in
 //! [`crate::core::resources::discovery`]; [`PackageManager::resolve`]
 //! delegates to [`PackagePathResolver`] so the two surfaces never disagree on

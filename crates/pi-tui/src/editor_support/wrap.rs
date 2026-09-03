@@ -1,7 +1,7 @@
 //! Logical/visual wrap maps for the multiline editor.
 //!
 //! Ports `wordWrapLine` and `buildVisualLineMap` from
-//! `.references/pi/packages/tui/src/components/editor.ts`.
+//! `.references/pi-2.0/packages/tui/src/components/editor.ts`.
 
 use unicode_segmentation::UnicodeSegmentation;
 

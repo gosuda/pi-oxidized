@@ -1,6 +1,6 @@
 //! Cross-platform "open URL in browser" launcher.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/utils/open-browser.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/utils/open-browser.ts`.
 //!
 //! This intentionally never invokes a shell. On Windows, `cmd /c start` is
 //! avoided because `cmd.exe` re-parses metacharacters (`&`, `|`, `^`, ...)

@@ -1,6 +1,6 @@
 //! Render-churn benchmark matching the upstream TUI churn workload.
 //!
-//! Mirrors `.references/pi/packages/tui/test/render-churn-bench.ts`:
+//! Mirrors `.references/pi-2.0/packages/tui/test/render-churn-bench.ts`:
 //! - 100×30 viewport
 //! - 150-line transcript/dock tree: VStack [ ScrollView(transcript), dock
 //!   VStack [status, editor, footer] ]

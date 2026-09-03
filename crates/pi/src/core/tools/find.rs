@@ -1,6 +1,6 @@
 //! Find files by glob pattern using `globset` + `ignore::WalkBuilder`.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/find.ts` without
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/find.ts` without
 //! spawning `fd`. Hidden entries are included, hierarchical `.gitignore` is
 //! honored (with nested-repo boundary semantics), directories keep a trailing
 //! `/`, paths are POSIX-relative and sorted deterministically.

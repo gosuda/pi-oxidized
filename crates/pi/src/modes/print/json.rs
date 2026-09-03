@@ -1,7 +1,7 @@
 //! JSON renderer: emit a session header followed by a lossless JSONL event
 //! stream.
 //!
-//! Mirrors the json-mode branch of `.references/pi/packages/coding-agent/src/
+//! Mirrors the json-mode branch of `.references/pi-2.0/packages/coding-agent/src/
 //! modes/print-mode.ts`: the session header (if any) is written first, then
 //! every [`AgentSessionEvent`] is serialized with [`serialize_json_line`] (raw
 //! U+2028/U+2029, LF-terminated). Writes go through a [`PrintSink`] so the

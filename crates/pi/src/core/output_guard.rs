@@ -1,6 +1,6 @@
 //! Process-global raw stdout coordinator for print/RPC modes.
 //!
-//! Port of `.references/pi/packages/coding-agent/src/core/output-guard.ts`.
+//! Port of `.references/pi-2.0/packages/coding-agent/src/core/output-guard.ts`.
 //!
 //! # Ownership model
 //!

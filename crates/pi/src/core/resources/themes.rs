@@ -1,7 +1,7 @@
 //! Theme path collection (raw JSON load only; Theme type stays Phase 4).
 //!
 //! Port of theme path loading from
-//! `.references/pi/packages/coding-agent/src/core/resource-loader.ts`.
+//! `.references/pi-2.0/packages/coding-agent/src/core/resource-loader.ts`.
 
 use std::collections::HashMap;
 use std::fs;

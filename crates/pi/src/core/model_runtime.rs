@@ -1669,7 +1669,7 @@ fn parse_models_json(
 }
 
 fn strip_json_comments(input: &str) -> String {
-    // Ports stripJsonComments from .references/pi/utils/json.ts exactly:
+    // Ports stripJsonComments from .references/pi-2.0/packages/coding-agent/src/utils/json.ts exactly:
     //  - remove // line comments (preserving the newline)
     //  - remove trailing commas before } or ]
     //  - leave string literals untouched

@@ -1,6 +1,6 @@
 //! Shared truncation utilities for tool outputs.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/truncate.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/truncate.ts`.
 //! Truncation is based on two independent limits — whichever is hit first
 //! wins: a line limit (default [`DEFAULT_MAX_LINES`]) and a byte limit
 //! (default [`DEFAULT_MAX_BYTES`]). Never returns partial lines, except the

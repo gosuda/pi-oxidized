@@ -1,6 +1,6 @@
 //! Unicode-aware word navigation with paste-marker atomic segments.
 //!
-//! Ports `.references/pi/packages/tui/src/word-navigation.ts`. Word bounds use
+//! Ports `.references/pi-2.0/packages/tui/src/word-navigation.ts`. Word bounds use
 //! `unicode_segmentation::UnicodeSegmentation::split_word_bound_indices`, which
 //! is the Rust equivalent of `Intl.Segmenter({ granularity: "word" })` for the
 //! editor's observable step behaviour (including CJK per-character words and

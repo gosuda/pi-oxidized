@@ -1,7 +1,7 @@
 //! Multiline editor component with wrap, history, kill/yank, undo, paste markers,
 //! autocomplete, and grapheme-safe navigation.
 //!
-//! Ports `.references/pi/packages/tui/src/components/editor.ts`.
+//! Ports `.references/pi-2.0/packages/tui/src/components/editor.ts`.
 
 mod paste;
 mod state;

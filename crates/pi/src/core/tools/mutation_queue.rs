@@ -1,6 +1,6 @@
 //! Per-realpath serialization for file mutations (edit / write).
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/file-mutation-queue.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/file-mutation-queue.ts`.
 //! Operations targeting the same canonical path run FIFO; operations on
 //! distinct paths run concurrently. The queue key is
 //! `realpath(resolve(path))`, falling back to the lexically resolved path

@@ -1,6 +1,6 @@
 //! pi user-agent string.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/utils/pi-user-agent.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/utils/pi-user-agent.ts`.
 //!
 //! TypeScript emits `pi/{version} ({platform}; {bun|node}/{ver}; {arch})`
 //! because pi historically shipped as a Node/Bun application. The native Rust

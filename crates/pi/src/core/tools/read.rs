@@ -1,6 +1,6 @@
 //! Read tool: text files and supported images.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/read.ts` plus the
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/read.ts` plus the
 //! image pipeline from `utils/{mime,image-process,image-resize-core}.ts`.
 
 use std::fmt::Write as _;

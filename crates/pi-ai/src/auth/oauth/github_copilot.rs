@@ -1,6 +1,6 @@
 //! GitHub Copilot device-flow OAuth.
 //!
-//! Port of `.references/pi/packages/ai/src/auth/oauth/github-copilot.ts`.
+//! Port of `.references/pi-2.0/packages/ai/src/auth/oauth/github-copilot.ts`.
 //! Login is device-code only (no loopback). The stored `refresh` value is the
 //! GitHub user access token; `refresh` re-exchanges it for a Copilot API token
 //! via `GET /copilot_internal/v2/token` (not an RFC `refresh_token` grant).
@@ -53,7 +53,7 @@ pub const EXTRA_AVAILABLE_MODEL_IDS: &str = "availableModelIds";
 /// Built-in GitHub Copilot model ids used for post-login policy enablement.
 ///
 /// Mirrors `GITHUB_COPILOT_MODELS` keys from
-/// `.references/pi/packages/ai/src/providers/github-copilot.models.ts`.
+/// `.references/pi-2.0/packages/ai/src/providers/github-copilot.models.ts`.
 pub const GITHUB_COPILOT_MODEL_IDS: &[&str] = &[
     "claude-fable-5",
     "claude-haiku-4.5",

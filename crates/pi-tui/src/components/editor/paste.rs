@@ -1,6 +1,6 @@
 //! Large-paste markers and paste normalization.
 //!
-//! Ports paste handling from `.references/pi/packages/tui/src/components/editor.ts`.
+//! Ports paste handling from `.references/pi-2.0/packages/tui/src/components/editor.ts`.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;

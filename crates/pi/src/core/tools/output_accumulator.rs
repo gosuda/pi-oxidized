@@ -1,6 +1,6 @@
 //! Streaming output accumulator with bounded memory and full-output spill.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/output-accumulator.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/output-accumulator.ts`.
 //! Chunks arrive as raw bytes, are decoded through a streaming UTF-8 decoder
 //! (partial multi-byte sequences are held across chunk boundaries), and only a
 //! rolling decoded tail is kept for display snapshots. Once the raw byte,
@@ -27,7 +27,7 @@ pub const DEFAULT_TEMP_FILE_PREFIX: &str = "pi-output";
 
 /// Sanitize decoded tool output for storage and display.
 ///
-/// Ports `sanitizeBinaryOutput` from `.references/pi/utils/shell.ts`:
+/// Ports `sanitizeBinaryOutput` from `.references/pi-2.0/packages/coding-agent/src/utils/shell.ts`:
 /// - keeps tab, newline, and carriage return
 /// - drops other C0 control characters (0x00-0x1F)
 /// - drops Unicode format characters U+FFF9..U+FFFB

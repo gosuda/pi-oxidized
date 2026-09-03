@@ -1,6 +1,6 @@
 //! Terminal image protocol encoders and header dimension parsers.
 //!
-//! Ports `.references/pi/packages/tui/src/terminal-image.ts` for Kitty and
+//! Ports `.references/pi-2.0/packages/tui/src/terminal-image.ts` for Kitty and
 //! iTerm2 inline graphics. No stdin picker, no terminal writes — callers emit
 //! the returned bytes through frame annotations.
 

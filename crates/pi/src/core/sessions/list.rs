@@ -1,7 +1,7 @@
 //! Session listing, info extraction, and most-recent lookup.
 //!
 //! Ports `buildSessionInfo`, `findMostRecentSession`, `list`/`listAll` helpers
-//! from `.references/pi/packages/coding-agent/src/core/session-manager.ts`.
+//! from `.references/pi-2.0/packages/coding-agent/src/core/session-manager.ts`.
 
 use std::cmp::Reverse;
 use std::fs::{self, File};

@@ -1,6 +1,6 @@
 //! Footer status-bar view-model.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/modes/interactive/components/footer.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/modes/interactive/components/footer.ts`.
 //! Pure data → pi-tui `Text` lines (cwd + stats + model). No session reads.
 
 use pi_tui::component::Component;

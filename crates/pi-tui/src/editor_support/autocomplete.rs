@@ -1,6 +1,6 @@
 //! Autocomplete provider trait, items, and combined slash/@/path provider.
 //!
-//! Ports `.references/pi/packages/tui/src/autocomplete.ts`. File listing is
+//! Ports `.references/pi-2.0/packages/tui/src/autocomplete.ts`. File listing is
 //! abstracted behind [`FileLister`] so product code can inject an `fd`-backed
 //! implementation without coupling `pi-tui` to process spawning.
 

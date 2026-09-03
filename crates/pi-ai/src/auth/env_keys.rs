@@ -1,6 +1,6 @@
 //! Environment and ambient API-key detection.
 //!
-//! Ports `.references/pi/packages/ai/src/env-api-keys.ts` and the
+//! Ports `.references/pi-2.0/packages/ai/src/env-api-keys.ts` and the
 //! `envApiKeyAuth` / `lazyOAuth` helpers from `auth/helpers.ts`.
 //!
 //! Ambient Vertex/Bedrock detection returns the [`AMBIENT_AUTH_MARKER`]

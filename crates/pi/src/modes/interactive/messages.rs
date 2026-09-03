@@ -1,6 +1,6 @@
 //! Chat message view-models and component builders.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/modes/interactive/components/`
+//! Ports `.references/pi-2.0/packages/coding-agent/src/modes/interactive/components/`
 //! `assistant-message.ts`, `user-message.ts`, `tool-execution.ts`,
 //! `bash-execution.ts`, `custom-message.ts`, `compaction-summary-message.ts`,
 //! `branch-summary-message.ts`, and `skill-invocation-message.ts` into pure

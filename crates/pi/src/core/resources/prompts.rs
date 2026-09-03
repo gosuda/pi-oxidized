@@ -1,6 +1,6 @@
 //! Prompt template loading and argument substitution.
 //!
-//! Port of `.references/pi/packages/coding-agent/src/core/prompt-templates.ts`.
+//! Port of `.references/pi-2.0/packages/coding-agent/src/core/prompt-templates.ts`.
 
 use std::fs;
 use std::path::{Path, PathBuf};

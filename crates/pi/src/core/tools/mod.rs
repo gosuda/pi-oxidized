@@ -1,6 +1,6 @@
 //! Shared infrastructure and seven concrete coding tools.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/`: the ordered
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/`: the ordered
 //! built-in registry, read/bash/edit/write/grep/find/ls implementations,
 //! truncation, rolling-output spill, per-realpath mutation serialization, and
 //! path resolution.

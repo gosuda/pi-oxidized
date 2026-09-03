@@ -1,6 +1,6 @@
 //! `OpenAI` `Codex` (`ChatGPT` OAuth) login, refresh, and to-auth.
 //!
-//! Ports `.references/pi/packages/ai/src/auth/oauth/openai-codex.ts`:
+//! Ports `.references/pi-2.0/packages/ai/src/auth/oauth/openai-codex.ts`:
 //! browser `PKCE` + fixed loopback callback, device-code login, form-encoded
 //! token exchange/refresh, JWT `accountId` extraction (no skew on expiry),
 //! and soft-fail when port `1455` is already bound.

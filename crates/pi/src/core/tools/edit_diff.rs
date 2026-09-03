@@ -1,6 +1,6 @@
 //! Pure edit matching and diff helpers for the edit tool.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/edit-diff.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/edit-diff.ts`.
 //! Matching runs against the original LF-normalized file; multi-edits apply in
 //! reverse offset order. Fuzzy matches preserve untouched original line bytes.
 

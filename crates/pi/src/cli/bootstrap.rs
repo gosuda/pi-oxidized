@@ -1,6 +1,6 @@
 //! CLI bootstrap: argv → resolved mode + runtime handle, or short-circuit exit.
 //!
-//! Ports the ordered pipeline of `.references/pi/packages/coding-agent/src/
+//! Ports the ordered pipeline of `.references/pi-2.0/packages/coding-agent/src/
 //! main.ts` into a testable orchestrator. Everything that touches the process
 //! (env vars, TTY status, stdin, stdout/stderr) flows through an injected
 //! [`BootstrapIo`] trait; everything that builds the agent-session runtime
@@ -787,7 +787,7 @@ struct ListModelsRow {
 
 /// Format a token count using the upstream-friendly `K` / `M` style.
 ///
-/// Mirrors `.references/pi/packages/coding-agent/src/cli/list-models.ts`
+/// Mirrors `.references/pi-2.0/packages/coding-agent/src/cli/list-models.ts`
 /// `formatTokenCount`: integer buckets use a bare count; sub-integer are kept
 /// at one decimal; values under 1k render as the raw number.
 fn format_token_count(count: u64) -> String {

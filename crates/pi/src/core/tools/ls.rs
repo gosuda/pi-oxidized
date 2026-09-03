@@ -1,6 +1,6 @@
 //! List directory contents (dotfiles included).
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/ls.ts` with a
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/ls.ts` with a
 //! pure native filesystem walk (no subprocess). Output is sorted
 //! case-insensitively, directories receive a trailing `/`, and entry count
 //! plus 50 KiB head truncation match the TypeScript notices.

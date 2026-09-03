@@ -1,6 +1,6 @@
 //! `OpenRouter` OAuth PKCE flow.
 //!
-//! Ports `.references/pi/packages/ai/src/auth/oauth/openrouter.ts`: PKCE
+//! Ports `.references/pi-2.0/packages/ai/src/auth/oauth/openrouter.ts`: PKCE
 //! browser flow with an ephemeral callback server on a random UUID path,
 //! manual-code race, JSON token exchange returning a permanent API key,
 //! and no-op refresh.

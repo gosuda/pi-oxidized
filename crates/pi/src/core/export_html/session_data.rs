@@ -13,7 +13,7 @@ use super::super::sessions::entries::{SessionEntry, SessionHeader};
 /// Pre-rendered HTML for a single custom tool call + result.
 ///
 /// Serialized with camelCase keys matching `RenderedToolHtml` in
-/// `.references/pi/packages/coding-agent/src/core/export-html/index.ts`.
+/// `.references/pi-2.0/packages/coding-agent/src/core/export-html/index.ts`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenderedToolHtml {

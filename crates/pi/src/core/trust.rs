@@ -1,6 +1,6 @@
 //! Project trust store and trust resolution.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/trust-manager.ts` and
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/trust-manager.ts` and
 //! `project-trust.ts`. The store is a sorted-key `trust.json` map under the
 //! agent directory; resolution walks ancestors, skips `null`, and applies the
 //! fixed decision order used by coding-agent.

@@ -2,7 +2,7 @@
 //!
 //! Ports `SizeValue`, `OverlayAnchor`, `OverlayMargin`, `OverlayOptions` layout
 //! fields, and `resolveOverlayLayout` from
-//! `.references/pi/packages/tui/src/tui.ts`.
+//! `.references/pi-2.0/packages/tui/src/tui.ts`.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 

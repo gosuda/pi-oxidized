@@ -1,6 +1,6 @@
 //! Key identifier grammar and matching against crossterm [`KeyEvent`]s.
 //!
-//! Ports the observable `KeyId` contract from `.references/pi/packages/tui/src/keys.ts`
+//! Ports the observable `KeyId` contract from `.references/pi-2.0/packages/tui/src/keys.ts`
 //! onto structured terminal events rather than raw escape bytes.
 //!
 //! # modifyOtherKeys omission

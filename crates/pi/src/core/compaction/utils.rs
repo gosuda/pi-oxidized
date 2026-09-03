@@ -1,6 +1,6 @@
 //! Shared utilities for compaction and branch summarization.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/compaction/utils.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/compaction/utils.ts`.
 
 use std::collections::BTreeSet;
 

@@ -1,6 +1,6 @@
 //! Session statistics + context usage impls.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/agent-session.ts`
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/agent-session.ts`
 //! `getSessionStats`, `getContextUsage`, and the
 //! `ContextUsage` / `SessionStats` types.
 //!

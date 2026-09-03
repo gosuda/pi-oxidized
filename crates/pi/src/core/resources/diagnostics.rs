@@ -1,6 +1,6 @@
 //! Resource load diagnostics and name-collision reports.
 //!
-//! Port of `.references/pi/packages/coding-agent/src/core/diagnostics.ts`.
+//! Port of `.references/pi-2.0/packages/coding-agent/src/core/diagnostics.ts`.
 
 /// Resource kind that participated in a name collision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

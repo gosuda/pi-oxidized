@@ -2,7 +2,7 @@
 //!
 //! Pure functions for compaction logic. Session I/O lives in
 //! [`crate::core::sessions`]. Ports
-//! `.references/pi/packages/coding-agent/src/core/compaction/compaction.ts`.
+//! `.references/pi-2.0/packages/coding-agent/src/core/compaction/compaction.ts`.
 
 mod branch;
 mod utils;

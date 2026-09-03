@@ -1,7 +1,7 @@
 //! Standalone resource-config TUI for `pi config`.
 //!
 //! Ports the observable surface of
-//! `.references/pi/packages/coding-agent/src/cli/config-selector.ts` using the
+//! `.references/pi-2.0/packages/coding-agent/src/cli/config-selector.ts` using the
 //! shared pi-tui `SettingsList` + terminal guard loop (same machinery as the
 //! interactive runtime, without a full agent session).
 

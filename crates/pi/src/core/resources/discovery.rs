@@ -1,7 +1,7 @@
 //! Package path resolution and resource discovery (resolve-side only).
 //!
 //! Port of the resolve/discovery surface from
-//! `.references/pi/packages/coding-agent/src/core/package-manager.ts`.
+//! `.references/pi-2.0/packages/coding-agent/src/core/package-manager.ts`.
 //! Network install/update is intentionally out of scope for Phase 3.
 
 use std::collections::{HashMap, HashSet};

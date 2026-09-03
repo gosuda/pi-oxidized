@@ -1,6 +1,6 @@
 //! Model set / cycle / scope / thinking-clamp impls.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/agent-session.ts`
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/agent-session.ts`
 //! `setModel`, `cycleModel`, `setThinkingLevel`, `cycleThinkingLevel`,
 //! `getAvailableThinkingLevels`, `supportsThinking`, plus the private helpers
 //! `_cycleScopedModel`, `_cycleAvailableModel`, `_getThinkingLevelForModelSwitch`,

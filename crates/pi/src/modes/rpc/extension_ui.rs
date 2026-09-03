@@ -1,7 +1,7 @@
 //! Extension UI proxy for RPC mode.
 //!
 //! Ports the interactive-dialog correlation layer from
-//! `.references/pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts`
+//! `.references/pi-2.0/packages/coding-agent/src/modes/rpc/rpc-mode.ts`
 //! (`createDialogPromise`, `createExtensionUIContext`).
 //!
 //! In RPC mode the agent runs headless and all extension UI interactions are

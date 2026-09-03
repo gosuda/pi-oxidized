@@ -13,7 +13,7 @@
 //! in [`InputState`]; the runtime owns one instance for the lifetime of the
 //! session and resets it whenever focus moves to or from a selector.
 //!
-//! Field and constant names mirror `.references/pi/packages/coding-agent/
+//! Field and constant names mirror `.references/pi-2.0/packages/coding-agent/
 //! src/modes/interactive/interactive-mode.ts` (key handler block) and
 //! `core/keybindings.ts` defaults.
 

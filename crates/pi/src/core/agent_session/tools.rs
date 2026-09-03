@@ -1,6 +1,6 @@
 //! Tool registry / activation impls.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/agent-session.ts`
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/agent-session.ts`
 //! `getActiveToolNames`, `getAllTools`, `getToolDefinition`,
 //! `setActiveToolsByName`, `_refreshToolRegistry`, and the tool-registry half
 //! of `_buildRuntime`.

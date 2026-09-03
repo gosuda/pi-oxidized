@@ -1,7 +1,7 @@
 //! Session JSONL entry types, load/parse helpers, and v1→v2→v3 migrations.
 //!
 //! Ports the entry catalog and in-file migrations from
-//! `.references/pi/packages/coding-agent/src/core/session-manager.ts`.
+//! `.references/pi-2.0/packages/coding-agent/src/core/session-manager.ts`.
 //! Unknown entry variants keep their raw JSON so rewrites and forks never drop
 //! future fields; typed variants preserve unrecognized sibling keys via
 //! `#[serde(flatten)]`.

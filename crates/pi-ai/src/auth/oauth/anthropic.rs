@@ -1,6 +1,6 @@
 //! Anthropic OAuth flow (Claude Pro/Max).
 //!
-//! Port of `.references/pi/packages/ai/src/auth/oauth/anthropic.ts`.
+//! Port of `.references/pi-2.0/packages/ai/src/auth/oauth/anthropic.ts`.
 //!
 //! Quirks preserved from the reference:
 //! - PKCE verifier is reused as the OAuth `state`

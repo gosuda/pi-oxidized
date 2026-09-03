@@ -1,6 +1,6 @@
 //! App-level keybinding defaults and `keybindings.json` loading.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/keybindings.ts`
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/keybindings.ts`
 //! `KEYBINDINGS` (app.* ids + defaults) on top of the pi-tui
 //! [`KeybindingsManager`](pi_tui::keybindings::KeybindingsManager). Legacy
 //! name renames live in [`super::migrations`]; this module only loads the

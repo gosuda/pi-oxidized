@@ -1,6 +1,6 @@
 //! `pi install`/`remove`/`update`/`list`/`config` subcommand router.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/package-manager-cli.ts` into
+//! Ports `.references/pi-2.0/packages/coding-agent/src/package-manager-cli.ts` into
 //! a thin parser + dispatcher. The parser is pure and infallible; the
 //! dispatcher maps parsed options onto exit codes and verbatim status/error
 //! strings, driving all side effects through an injected [`PackageHandler`]

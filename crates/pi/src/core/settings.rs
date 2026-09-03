@@ -1,7 +1,7 @@
 //! Global and project settings: wire types, migrations, trust-gated merge, and
 //! atomic persistence.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/settings-manager.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/settings-manager.ts`.
 //!
 //! Settings documents are carried as raw [`Map<String, Value>`] inside
 //! [`SettingsManager`] so unknown keys, wrong-typed values, and explicit

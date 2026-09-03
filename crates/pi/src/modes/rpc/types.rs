@@ -1,6 +1,6 @@
 //! RPC protocol wire types for headless operation.
 //!
-//! Port of `.references/pi/packages/coding-agent/src/modes/rpc/rpc-types.ts`.
+//! Port of `.references/pi-2.0/packages/coding-agent/src/modes/rpc/rpc-types.ts`.
 //!
 //! Commands arrive as JSON lines on stdin. Responses, extension UI requests, and
 //! agent events leave as JSON lines on stdout. Unknown command discriminants are
@@ -24,7 +24,7 @@ use crate::core::sessions::SessionEntry;
 
 /// Bash execution result returned by the `bash` RPC command.
 ///
-/// Matches `.references/pi/packages/coding-agent/src/core/bash-executor.ts`
+/// Matches `.references/pi-2.0/packages/coding-agent/src/core/bash-executor.ts`
 /// `BashResult`. Defined here until the product bash-executor surface lands.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

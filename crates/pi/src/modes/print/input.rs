@@ -1,6 +1,6 @@
 //! Non-interactive prompt assembly: stdin/argv merge and `@file` expansion.
 //!
-//! Ports the input half of `.references/pi/packages/coding-agent/src/modes/
+//! Ports the input half of `.references/pi-2.0/packages/coding-agent/src/modes/
 //! print-mode.ts` together with `cli/file-processor.ts`, `cli/initial-message.ts`,
 //! and the piped-stdin reader in `main.ts`. File argument expansion reuses the
 //! shared image pipeline in [`crate::core::tools::read`]

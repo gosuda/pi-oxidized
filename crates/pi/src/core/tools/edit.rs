@@ -1,6 +1,6 @@
 //! Edit tool: exact multi-replacement file edits under the mutation queue.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/edit.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/edit.ts`.
 //! Argument preparation folds legacy top-level `oldText`/`newText` and
 //! stringified `edits` JSON. Execution serializes per-file mutations, preserves
 //! BOM/CRLF, and applies original-coordinate non-overlapping replacements.

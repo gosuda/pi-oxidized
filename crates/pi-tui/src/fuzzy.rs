@@ -1,6 +1,6 @@
 //! Fuzzy matching utilities (lower score = better match).
 //!
-//! Ports `.references/pi/packages/tui/src/fuzzy.ts`.
+//! Ports `.references/pi-2.0/packages/tui/src/fuzzy.ts`.
 
 /// Result of a single fuzzy match attempt.
 #[derive(Debug, Clone, Copy, PartialEq)]

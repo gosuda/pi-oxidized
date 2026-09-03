@@ -1,9 +1,9 @@
 //! Path expansion, cwd resolution, and macOS path-variant fallback for tool
 //! file arguments.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/path-utils.ts`
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/path-utils.ts`
 //! together with the `normalizePath` / `resolvePath` helpers from
-//! `.references/pi/packages/coding-agent/src/utils/paths.ts`. Inputs are
+//! `.references/pi-2.0/packages/coding-agent/src/utils/paths.ts`. Inputs are
 //! normalized with Unicode-space folding and an optional `@` strip, `~` and
 //! `file://` expansion, then resolved against a cwd. When the resolved path
 //! does not exist, the read resolvers try the macOS variants in order:

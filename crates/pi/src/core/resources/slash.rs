@@ -1,6 +1,6 @@
 //! Built-in slash commands and slash-command metadata.
 //!
-//! Port of `.references/pi/packages/coding-agent/src/core/slash-commands.ts`.
+//! Port of `.references/pi-2.0/packages/coding-agent/src/core/slash-commands.ts`.
 
 use crate::core::config::APP_NAME;
 use crate::core::resources::source_info::SourceInfo;

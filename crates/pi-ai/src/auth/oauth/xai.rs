@@ -1,6 +1,6 @@
 //! xAI OAuth device-code flow.
 //!
-//! Ports `.references/pi/packages/ai/src/auth/oauth/xai.ts`: fixed client id,
+//! Ports `.references/pi-2.0/packages/ai/src/auth/oauth/xai.ts`: fixed client id,
 //! scopes, device/token endpoints, required `referrer=pi`, polling with
 //! `wait_before_first_poll`, default 3600s lifetime, 5-minute refresh skew,
 //! and refresh-token reuse when the server omits rotation.

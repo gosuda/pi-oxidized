@@ -2,7 +2,7 @@
 //!
 //! Ports `buildSessionPath`, `buildContextEntries`, `buildSessionContext`, and
 //! `sessionEntryToContextMessages` from
-//! `.references/pi/packages/coding-agent/src/core/session-manager.ts`.
+//! `.references/pi-2.0/packages/coding-agent/src/core/session-manager.ts`.
 
 use std::collections::HashMap;
 

@@ -1,6 +1,6 @@
 //! Source provenance for discovered product resources.
 //!
-//! Port of `.references/pi/packages/coding-agent/src/core/source-info.ts`.
+//! Port of `.references/pi-2.0/packages/coding-agent/src/core/source-info.ts`.
 
 use super::discovery::PathMetadata;
 

@@ -1,6 +1,6 @@
 //! Provider-auth resolution with stored-credential ownership.
 //!
-//! Ports `.references/pi/packages/ai/src/auth/resolve.ts`:
+//! Ports `.references/pi-2.0/packages/ai/src/auth/resolve.ts`:
 //! - request overrides win when an API-key handler exists
 //! - a stored credential owns the provider (no ambient/env fallback)
 //! - OAuth uses a zero-lock fast path when unexpired, otherwise

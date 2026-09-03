@@ -1,6 +1,6 @@
 //! Model resolution, scoping, and CLI/model-pattern matching.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/model-resolver.ts`.
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/model-resolver.ts`.
 //! Initial-model priority and session restore live in
 //! [`crate::core::agent_session_services`] and are re-exported here so entry
 //! and callers share one implementation.

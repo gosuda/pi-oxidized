@@ -1,6 +1,6 @@
 //! Kimi Code (subscription) OAuth device-code flow.
 //!
-//! Ports `.references/pi/packages/ai/src/auth/oauth/kimi-coding.ts`: fixed
+//! Ports `.references/pi-2.0/packages/ai/src/auth/oauth/kimi-coding.ts`: fixed
 //! client id, device/token endpoints under a configurable host, polling with
 //! `wait_before_first_poll`, 15-minute device-code lifetime, retry-on-5xx
 //! refresh with exponential backoff, and `Bearer` auth header derivation.

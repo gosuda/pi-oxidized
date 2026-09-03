@@ -1,6 +1,6 @@
 //! RPC server: JSONL stdin → command dispatch → JSONL stdout.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts`
+//! Ports `.references/pi-2.0/packages/coding-agent/src/modes/rpc/rpc-mode.ts`
 //! (`runRpcMode`, `handleCommand`, `handleInputLine`, `shutdown`).
 //!
 //! # Dispatch contract

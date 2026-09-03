@@ -1,6 +1,6 @@
 //! Cross-platform clipboard text and image I/O.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/utils/{clipboard.ts,
+//! Ports `.references/pi-2.0/packages/coding-agent/src/utils/{clipboard.ts,
 //! clipboard-native.ts, clipboard-image.ts}`.
 //!
 //! The TypeScript reference uses the `@mariozechner/clipboard` native addon

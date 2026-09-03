@@ -1,6 +1,6 @@
 //! Search file contents with native regex / literal matching.
 //!
-//! Ports `.references/pi/packages/coding-agent/src/core/tools/grep.ts` without
+//! Ports `.references/pi-2.0/packages/coding-agent/src/core/tools/grep.ts` without
 //! spawning `rg`. Directory searches use `ignore::WalkBuilder` (hidden +
 //! hierarchical gitignore). Output lines are 1-indexed, match/context/unread
 //! formats match TypeScript, lines are truncated to 500 chars, and match count

@@ -1,7 +1,7 @@
 //! Branch summarization for tree navigation.
 //!
 //! Ports
-//! `.references/pi/packages/coding-agent/src/core/compaction/branch-summarization.ts`.
+//! `.references/pi-2.0/packages/coding-agent/src/core/compaction/branch-summarization.ts`.
 
 use std::collections::BTreeMap;
 
