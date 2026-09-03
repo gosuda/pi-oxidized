@@ -526,6 +526,54 @@ mod tests {
         }
     }
 
+    fn assert_cost(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1e-12,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn calculate_cost_applies_highest_tier_and_1h_write_pricing() {
+        use crate::types::Usage;
+
+        // 3400 counted input tokens clear the above-100 tier: rates 2/4/1/2.5.
+        let model = model();
+        let mut usage = Usage {
+            input: 1000,
+            output: 500,
+            cache_read: 2000,
+            cache_write: 400,
+            cache_write1h: Some(100),
+            ..Usage::default()
+        };
+        let cost = calculate_cost(&model, &mut usage);
+        assert_cost(cost.input, 0.002);
+        assert_cost(cost.output, 0.002);
+        assert_cost(cost.cache_read, 0.002);
+        assert_cost(cost.cache_write, 0.001_15);
+        assert_cost(cost.total, 0.007_15);
+
+        // Exactly at the threshold the tier does not apply (strict above).
+        let mut boundary = Usage {
+            input: 100,
+            ..Usage::default()
+        };
+        let cost = calculate_cost(&model, &mut boundary);
+        assert_cost(cost.input, 0.000_1);
+        assert_cost(cost.total, 0.000_1);
+
+        // 1h writes beyond total writes clamp to total: intentional hardening,
+        // the reference would price a negative short-write leg instead.
+        let mut over = Usage {
+            input: 1000,
+            cache_write: 400,
+            cache_write1h: Some(500),
+            ..Usage::default()
+        };
+        let cost = calculate_cost(&model, &mut over);
+        assert_cost(cost.cache_write, 0.001_6);
+    }
     #[test]
     fn streaming_json_returns_only_objects_and_repairs_partial_values() {
         assert_eq!(parse_streaming_json(""), Map::new());
