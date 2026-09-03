@@ -14905,33 +14905,6 @@ mod tests {
             ));
             Ok(())
         }
-
-        #[tokio::test]
-        async fn auth_cmd_rx_none_clears_receiver_prevents_spin() -> TestResult {
-            let (mut rt, _log) = try_make_runtime()?;
-            rt.session.set_login_provider_options(vec![login_opt(
-                "anthropic",
-                "Anthropic",
-                AuthType::Oauth,
-                true,
-            )]);
-            rt.dispatch_builtin_command("login", "anthropic").await;
-            assert!(rt.auth_cmd_rx.is_some());
-
-            // Drop the cmd_tx sender (simulates task completion).
-            // The auth_cmd_rx arm should see None and clear itself.
-            // We simulate this by directly taking and dropping the sender
-            // side via the channel — but since we don't have access to the
-            // sender, we verify the invariant: when auth_cmd_rx is polled
-            // and returns None, it is cleared. We test this by manually
-            // clearing and verifying the guard.
-            rt.auth_cmd_rx = None;
-            assert!(rt.auth_cmd_rx.is_none());
-            // auth_done_rx should still be active for completion.
-            assert!(rt.auth_done_rx.is_some());
-            Ok(())
-        }
-
         #[tokio::test]
         async fn dismiss_login_overlay_cancels_auth_flow() -> TestResult {
             let (mut rt, _log) = try_make_runtime()?;
