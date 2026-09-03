@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use pi_ai::auth::AuthType;
 use pi_ai::{AssistantMessage, ModelThinkingLevel};
 use pi_ext::sanitize::SanitizedSlot;
 use pi_tui::component::EventResult;
@@ -454,6 +455,26 @@ pub struct AuthSelectorEntry {
     pub description: Option<String>,
 }
 
+/// One login option for a provider + auth-type combination.
+///
+/// Ports the `AuthSelectorProvider` shape from the reference
+/// `getLoginProviderOptions`: each entry pairs a provider id/name with the
+/// auth mechanism it supports, plus whether interactive login is available
+/// (ambient-only API-key providers have `has_login = false`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginProviderOption {
+    /// Provider id.
+    pub id: String,
+    /// Display name (falls back to the id).
+    pub name: String,
+    /// Auth mechanism.
+    pub auth_type: AuthType,
+    /// Whether interactive login is available (`false` for ambient-only keys).
+    pub has_login: bool,
+    /// OAuth login-label override (e.g. "Sign in with Kimi Code").
+    pub login_label: Option<String>,
+}
+
 /// One stored credential offered by the `/logout` selector.
 ///
 /// Ports the `AuthSelectorProvider` shape upstream builds in
@@ -800,6 +821,8 @@ pub enum SelectorKind {
     Trust,
     /// Auth/login selector.
     Auth,
+    /// Auth-type selector (oauth / api-key labels).
+    AuthType,
     /// Settings menu.
     Settings,
     /// Config selector.

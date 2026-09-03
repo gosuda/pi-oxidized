@@ -147,6 +147,7 @@ pub fn selector_empty_copy(kind: SelectorKind) -> SelectorEmptyCopy {
             empty: "  No providers available",
             no_match: "  No matching providers",
         },
+        SelectorKind::AuthType => both("  No login methods available"),
         SelectorKind::Logout => SelectorEmptyCopy {
             empty: "  No providers logged in. Use /login first.",
             no_match: "  No matching providers",
@@ -507,6 +508,7 @@ mod tests {
         SelectorKind::Fork,
         SelectorKind::Trust,
         SelectorKind::Theme,
+        SelectorKind::AuthType,
         SelectorKind::Auth,
         SelectorKind::Logout,
         SelectorKind::Settings,
@@ -566,6 +568,13 @@ mod tests {
                 },
                 HelperBoundary::Select,
             ),
+            SelectorKind::AuthType => (
+                SelectorEmptyCopy {
+                    empty: "  No login methods available",
+                    no_match: "  No login methods available",
+                },
+                HelperBoundary::Select,
+            ),
             SelectorKind::Logout => (
                 SelectorEmptyCopy {
                     empty: "  No providers logged in. Use /login first.",
@@ -605,8 +614,8 @@ mod tests {
     #[test]
     fn selector_kind_mapping_is_exhaustive_at_helper_boundary() {
         assert_eq!(
+            14,
             ALL_KINDS.len(),
-            13,
             "update ALL_KINDS when SelectorKind grows"
         );
         for &kind in ALL_KINDS {
