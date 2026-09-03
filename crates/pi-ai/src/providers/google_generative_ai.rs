@@ -282,22 +282,17 @@ fn thinking_config(model: &Model, options: &StreamOptions) -> Result<Option<Valu
     if effort == Effort::Off {
         return Ok(Some(disabled_thinking_config(model)));
     }
-    let effective = if effort == Effort::Off {
-        Effort::High
-    } else {
-        effort
-    };
     let mut config = Map::new();
     config.insert("includeThoughts".to_owned(), Value::Bool(true));
     if is_gemini3_pro(model) || is_gemini3_flash(model) || is_gemma4(model) {
         config.insert(
             "thinkingLevel".to_owned(),
-            Value::String(thinking_level(effective, model).as_str().to_owned()),
+            Value::String(thinking_level(effort, model).as_str().to_owned()),
         );
     } else {
         config.insert(
             "thinkingBudget".to_owned(),
-            Value::from(thinking_budget(model, effective, options)),
+            Value::from(thinking_budget(model, effort, options)),
         );
     }
     Ok(Some(Value::Object(config)))
@@ -594,6 +589,28 @@ mod tests {
         assert_eq!(
             thinking_config(&model("gemini-2.5-flash-lite"), &enabled)?,
             Some(json!({"includeThoughts": true, "thinkingBudget": 8192}))
+        );
+        Ok(())
+    }
+    #[test]
+    fn explicit_thinking_level_wins_over_budget() -> Result<(), GoogleFailure> {
+        let mut options = StreamOptions::default();
+        options.insert_extra(
+            StreamOptionKey::THINKING,
+            json!({"enabled": true, "level": "high", "budgetTokens": 500}),
+        );
+        assert_eq!(
+            thinking_config(&model("gemini-3.1-pro-preview"), &options)?,
+            Some(json!({"includeThoughts": true, "thinkingLevel": "HIGH"}))
+        );
+        let mut options = StreamOptions::default();
+        options.insert_extra(
+            StreamOptionKey::THINKING,
+            json!({"enabled": true, "budgetTokens": 500}),
+        );
+        assert_eq!(
+            thinking_config(&model("gemini-2.5-pro"), &options)?,
+            Some(json!({"includeThoughts": true, "thinkingBudget": 500}))
         );
         Ok(())
     }
