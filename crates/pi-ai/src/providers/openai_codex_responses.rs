@@ -1155,9 +1155,8 @@ fn apply_codex_optional_request_fields(
             )),
         );
     }
-    if let Some(reasoning_effort) = extra_string(options, StreamOptionKey::REASONING_EFFORT)
-        && let Some(mapped) = map_reasoning_effort(model, &reasoning_effort)
-    {
+    if let Some(reasoning_effort) = extra_string(options, StreamOptionKey::REASONING_EFFORT) {
+        let mapped = map_reasoning_effort(model, &reasoning_effort);
         body.insert(
             "reasoning".into(),
             json!({
@@ -1219,7 +1218,7 @@ fn split_deferred_tools(
     (immediate, deferred)
 }
 
-fn map_reasoning_effort(model: &Model, effort: &str) -> Option<String> {
+fn map_reasoning_effort(model: &Model, effort: &str) -> String {
     let level = match effort {
         "none" => ModelThinkingLevel::Off,
         "minimal" => ModelThinkingLevel::Minimal,
@@ -1228,15 +1227,25 @@ fn map_reasoning_effort(model: &Model, effort: &str) -> Option<String> {
         "high" => ModelThinkingLevel::High,
         "xhigh" => ModelThinkingLevel::Xhigh,
         "max" => ModelThinkingLevel::Max,
-        other => return Some(other.to_owned()),
+        other => return other.to_owned(),
     };
     match model
         .thinking_level_map
         .as_ref()
         .and_then(|mapping| mapping.get(&level))
     {
-        Some(mapped) => mapped.clone(),
-        None => Some(if effort == "none" { "none" } else { effort }.to_owned()),
+        // An explicit null mapping behaves like a missing entry: the
+        // reference `??` fallback resolves to the literal effort, and a
+        // null `off` resolves to the literal "none".
+        Some(Some(mapped)) => mapped.clone(),
+        _ => {
+            if effort == "none" {
+                "none"
+            } else {
+                effort
+            }
+            .to_owned()
+        }
     }
 }
 
@@ -1878,6 +1887,40 @@ mod tests {
         format!("aaa.{encoded}.bbb")
     }
 
+    #[test]
+    fn null_level_mappings_fall_back_to_literal_effort() {
+        use crate::types::{ModelCost, ModelInput};
+
+        let mut model = Model {
+            id: "gpt-5.5".into(),
+            name: "GPT-5.5".into(),
+            api: API.into(),
+            provider: "openai-codex".into(),
+            base_url: DEFAULT_CODEX_BASE_URL.into(),
+            reasoning: true,
+            thinking_level_map: Some(BTreeMap::from([(ModelThinkingLevel::Off, None)])),
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            context_window: 128_000,
+            max_tokens: 16_384,
+            headers: None,
+            compat: None,
+            extra: BTreeMap::new(),
+        };
+        // A null `off` resolves to the literal "none", matching `??`.
+        assert_eq!(map_reasoning_effort(&model, "none"), "none".to_owned());
+        // A null level resolves to the literal effort, not a dropped field.
+        assert_eq!(map_reasoning_effort(&model, "high"), "high".to_owned());
+        // Present mappings still win over the literal.
+        model.thinking_level_map = Some(BTreeMap::from([(
+            ModelThinkingLevel::High,
+            Some("very-high".to_owned()),
+        )]));
+        assert_eq!(
+            map_reasoning_effort(&model, "high"),
+            "very-high".to_owned()
+        );
+    }
     #[test]
     fn extracts_chatgpt_account_id_from_base64url_jwt() -> Result<(), CodexFailure> {
         assert_eq!(
