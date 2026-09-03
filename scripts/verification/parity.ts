@@ -53,7 +53,7 @@ export const PINNED_AGENT_LOOP_CONFIG_SITES: readonly AgentLoopConfigPin[] = [
 	{ path: "crates/pi-agent/src/config.rs", start: 373, end: 409 },
 	{ path: "crates/pi-agent/src/run.rs", start: 944, end: 971 },
 	{ path: "crates/pi-agent/src/schedule.rs", start: 902, end: 929 },
-	{ path: "crates/pi/src/core/agent_session/mod.rs", start: 473, end: 501 },
+	{ path: "crates/pi/src/core/agent_session/mod.rs", start: 472, end: 500 },
 	{ path: "crates/pi-agent/src/bin/pi_agent_stream_frame_bench.rs", start: 267, end: 295 },
 ];
 

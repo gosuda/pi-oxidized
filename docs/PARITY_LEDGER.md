@@ -79,7 +79,7 @@ Finalized by PAR-CLOSE (#39). Each entry names the deleted surface, the ruling, 
 
 The workspace contains exactly `pi`, `pi-agent`, `pi-ai`, `pi-ext`, and `pi-tui`. Its complete internal edge set is `pi-agent -> pi-ai`, `pi-ext -> pi-ai`, `pi-ext -> pi-agent`, `pi-ext -> pi-tui`, and `pi -> pi-ai`, `pi -> pi-agent`, `pi -> pi-ext`, `pi -> pi-tui`. `pi-ai` and `pi-tui` have no workspace dependencies. `pi-agent` must not import `pi_ext` or `pi_tui`; `pi-ext` must not import `pi`.
 
-The shared arbitration oracle is exactly six `AgentLoopConfig` literal sites: `crates/pi-agent/src/agent.rs:65-93`, `crates/pi-agent/src/config.rs:373-409`, `crates/pi-agent/src/run.rs:944-971`, `crates/pi-agent/src/schedule.rs:902-929`, `crates/pi/src/core/agent_session/mod.rs:473-501`, and `crates/pi-agent/src/bin/pi_agent_stream_frame_bench.rs:267-295`.
+The shared arbitration oracle is exactly six `AgentLoopConfig` literal sites: `crates/pi-agent/src/agent.rs:65-93`, `crates/pi-agent/src/config.rs:373-409`, `crates/pi-agent/src/run.rs:944-971`, `crates/pi-agent/src/schedule.rs:902-929`, `crates/pi/src/core/agent_session/mod.rs:472-500`, and `crates/pi-agent/src/bin/pi_agent_stream_frame_bench.rs:267-295`.
 
 ## Graduated parity-ticket DAG
 
