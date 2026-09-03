@@ -743,16 +743,26 @@ fn run_keyboard_wizard(
     // Down selects "Don't share" → analytics must persist false.
     run.write_input(KEY_DOWN)?;
     run.write_input(KEY_ENTER)?;
-    let frame = run.settle_frame(ready_predicate)?;
-    if !frame
+    // The ready predicate matches boot-era bytes (the header renders
+    // beneath the wizard), so the accumulated fallback returns a
+    // pre-dismissal frame. The dismissal reanchor repaints every row;
+    // poll the reconstructed screen until a composer-ready marker is
+    // actually visible — that repaint is the event the corpus pins.
+    let mut frame = run.settle_frame(ready_predicate)?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !frame
         .snapshot
         .lines
         .iter()
         .any(|line| line.contains("type a message") || line.contains("No messages"))
     {
-        return Err(CorpusError::Assert(
-            "keyboard-wizard: composer not ready after wizard completion".to_owned(),
-        ));
+        if Instant::now() > deadline {
+            return Err(CorpusError::Assert(
+                "keyboard-wizard: composer not ready after wizard completion".to_owned(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        frame = run.settle_frame(|_| true)?;
     }
 
     quit_cleanly(&mut run)?;

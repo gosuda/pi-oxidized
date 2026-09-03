@@ -80,9 +80,10 @@ pub enum ReanchorCause {
     ScrollbackInvalidate,
     /// Suspend/resume redraw.
     Resume,
-    /// An overlay opened over rows that still hold unrelated content, so a
-    /// cell diff against them would fragment the overlay's first paint.
-    OverlayOpen,
+    /// An overlay opened over — or dismissed from — rows that hold
+    /// unrelated content, so a cell diff against them would fragment the
+    /// overlay's paint or leave dismissed remnants on screen.
+    OverlayCover,
 }
 
 /// Settled content moved into terminal scrollback via `insert_before`.
@@ -411,7 +412,13 @@ impl<W: Write> Tui<W> {
         let (mut prior_table, frame_table, mut changes_table) = row_claims.into_tables();
         let paint_timed = paint_timer_on();
         let paint_t0 = paint_timed.then(Instant::now);
-        self.emit_frame_diff(&prior_table, &frame_table, &changes_table, frame_area)?;
+        self.emit_frame_diff(
+            &prior_table,
+            &frame_table,
+            &changes_table,
+            frame_area,
+            full_rows,
+        )?;
         self.prior_claims = frame_table;
         // Design F: the consumed prior table returns to the pool; its rows
         // keep the capacity this frame's recording will reuse next frame.
@@ -540,6 +547,7 @@ impl<W: Write> Tui<W> {
         frame: &[Vec<RowClaim>],
         changes: &[Option<(u16, u16)>],
         area: Rect,
+        force_full_rows: bool,
     ) -> io::Result<()> {
         let width = usize::from(area.width);
         let rows = usize::from(area.height);
@@ -570,10 +578,27 @@ impl<W: Write> Tui<W> {
                 blank_vanished_spans(prior_row, frame_row, row_y, width, current);
                 let outer = row_walk_span(prior_row, frame_row, width);
                 let change = changes.get(y_abs).copied().flatten();
-                let (from, to) = narrowed_walk_span(prior_row, frame_row, change, outer);
+                // Reanchor/full-row mode: the emitted-state snapshot may be
+                // stale for covered rows, so neither claim narrowing nor
+                // cell-level skip suppression may drop content — walk the
+                // whole row and force every cell out.
+                let (from, to) = if force_full_rows {
+                    (0, width)
+                } else {
+                    narrowed_walk_span(prior_row, frame_row, change, outer)
+                };
                 let prev = &mut self.grid.content[start..end];
                 let next = &current.content[start..end];
-                push_row_diff(prev, next, row_y, area.x, from, to, &mut updates);
+                push_row_diff(
+                    prev,
+                    next,
+                    row_y,
+                    area.x,
+                    from,
+                    to,
+                    force_full_rows,
+                    &mut updates,
+                );
                 #[cfg(debug_assertions)]
                 if (from, to) != outer {
                     // Narrowed window: the producer feed claims everything
@@ -991,6 +1016,53 @@ fn blank_vanished_spans(
     }
 }
 
+/// Skip belief for one buffer cell: an explicit opt-out, or the legacy flag
+/// with no explicit option set.
+#[allow(deprecated)]
+fn is_skip_cell(cell: &Cell) -> bool {
+    matches!(cell.diff_option, CellDiffOption::Skip)
+        || (cell.skip && matches!(cell.diff_option, CellDiffOption::None))
+}
+
+/// Fused sync: copy the buffer cell into the snapshot when they differ.
+fn sync_snapshot_cell(prev: &mut [Cell], next: &[Cell], j: usize) {
+    if prev[j] != next[j] {
+        prev[j] = next[j].clone();
+    }
+}
+
+/// Drain a pending wide-grapheme trailing run: emit the first cell whose
+/// symbol changed on screen (or every visited cell on a forced pass) and
+/// sync the rest into the snapshot. Returns the re-armed run when emission
+/// stopped mid-run, otherwise `None` with the resume column.
+#[allow(clippy::too_many_arguments)]
+fn drain_trailing_run(
+    prev: &mut [Cell],
+    next: &[Cell],
+    x0: u16,
+    y: u16,
+    len: usize,
+    mut next_index: usize,
+    mut end: usize,
+    emit_trailing: bool,
+    out: &mut Vec<(u16, u16, Cell)>,
+) -> (Option<(usize, usize, bool)>, usize) {
+    while next_index < end {
+        let j = next_index;
+        let cell_width = next[j].cell_width().max(1) as usize;
+        next_index += cell_width;
+        end = end.max(next_index).min(len);
+        if !is_skip_cell(&next[j]) && (emit_trailing || prev[j].symbol() != next[j].symbol()) {
+            let x = x0.saturating_add(u16::try_from(j).unwrap_or(u16::MAX));
+            out.push((x, y, next[j].clone()));
+            sync_snapshot_cell(prev, next, j);
+            return (Some((next_index, end, emit_trailing)), next_index);
+        }
+        sync_snapshot_cell(prev, next, j);
+    }
+    (None, end)
+}
+
 /// Row-scoped port of ratatui's `BufferDiff` iterator (`ratatui-core` 0.1.2).
 ///
 /// Emits the same `(x, y, cell)` update stream the whole-grid diff produces
@@ -1017,6 +1089,7 @@ fn push_row_diff(
     x0: u16,
     from: usize,
     to: usize,
+    force: bool,
     out: &mut Vec<(u16, u16, Cell)>,
 ) {
     /// Modifiers visually apparent on a blank (space) cell.
@@ -1026,42 +1099,18 @@ fn push_row_diff(
         .union(Modifier::RAPID_BLINK)
         .union(Modifier::CROSSED_OUT);
 
-    #[allow(deprecated)]
-    let is_skip = |cell: &Cell| {
-        matches!(cell.diff_option, CellDiffOption::Skip)
-            || (cell.skip && matches!(cell.diff_option, CellDiffOption::None))
-    };
-
-    // Fused sync: copy the buffer cell into the snapshot when they differ.
-    let sync = |j: usize, prev: &mut [Cell], next: &[Cell]| {
-        if prev[j] != next[j] {
-            prev[j] = next[j].clone();
-        }
-    };
-
     let len = prev.len().min(next.len());
     let to = to.min(len);
     let mut pos = from.min(to);
     // Pending trailing cells after a wide character: `(next index, end, force)`.
     let mut trailing: Option<(usize, usize, bool)> = None;
     while pos < to || trailing.is_some() {
-        if let Some((mut next_index, mut end, force)) = trailing.take() {
-            while next_index < end {
-                let j = next_index;
-                let cell_width = next[j].cell_width().max(1) as usize;
-                next_index += cell_width;
-                end = end.max(next_index).min(len);
-                if !is_skip(&next[j]) && (force || prev[j].symbol() != next[j].symbol()) {
-                    let x = x0.saturating_add(u16::try_from(j).unwrap_or(u16::MAX));
-                    out.push((x, y, next[j].clone()));
-                    sync(j, prev, next);
-                    trailing = Some((next_index, end, force));
-                    break;
-                }
-                sync(j, prev, next);
-            }
+        if let Some((next_index, end, trailing_force)) = trailing.take() {
+            let (rearmed, resume) =
+                drain_trailing_run(prev, next, x0, y, len, next_index, end, trailing_force, out);
+            trailing = rearmed;
             if trailing.is_none() {
-                pos = end.max(pos);
+                pos = resume.max(pos);
             }
             continue;
         }
@@ -1073,17 +1122,28 @@ fn push_row_diff(
         let current = &next[i];
         let x = x0.saturating_add(u16::try_from(i).unwrap_or(u16::MAX));
         match current.diff_option {
-            CellDiffOption::Skip => {
-                sync(i, prev, next);
+            CellDiffOption::Skip if !force => {
+                sync_snapshot_cell(prev, next, i);
             }
-            _ if is_skip(current) => {
-                sync(i, prev, next);
+            CellDiffOption::Skip => {
+                // Forced (reanchor) emission: the skip flag reflects a
+                // same-screen belief that may be stale for covered rows.
+                let cell_width = current.cell_width().max(1) as usize;
+                out.push((x, y, current.clone()));
+                sync_snapshot_cell(prev, next, i);
+                pos += cell_width.saturating_sub(1);
+                for j in (i + 1)..pos.min(len) {
+                    sync_snapshot_cell(prev, next, j);
+                }
+            }
+            _ if is_skip_cell(current) && !force => {
+                sync_snapshot_cell(prev, next, i);
             }
             CellDiffOption::ForcedWidth(width) => {
-                let emit = *current != prev[i];
+                let emit = force || *current != prev[i];
                 pos = pos.saturating_add(width.get().saturating_sub(1) as usize);
                 for j in i..pos.min(len) {
-                    sync(j, prev, next);
+                    sync_snapshot_cell(prev, next, j);
                 }
                 if emit {
                     out.push((x, y, current.clone()));
@@ -1091,12 +1151,15 @@ fn push_row_diff(
             }
             CellDiffOption::None | CellDiffOption::AlwaysUpdate => {
                 let cell_width = current.cell_width() as usize;
-                if matches!(current.diff_option, CellDiffOption::None) && *current == prev[i] {
+                if !force
+                    && matches!(current.diff_option, CellDiffOption::None)
+                    && *current == prev[i]
+                {
                     // Head is equal (just compared) — sync only the wide
                     // grapheme's continuation columns; the old bulk row copy
                     // paid a full-cell move for every equal cell.
                     for j in (i + 1)..(i + cell_width).min(len) {
-                        sync(j, prev, next);
+                        sync_snapshot_cell(prev, next, j);
                     }
                     pos += cell_width.saturating_sub(1);
                     continue;
@@ -1114,13 +1177,13 @@ fn push_row_diff(
                 } else if cell_width > 1 {
                     pos += cell_width.saturating_sub(1);
                     for j in (i + 1)..(i + cell_width).min(len) {
-                        sync(j, prev, next);
+                        sync_snapshot_cell(prev, next, j);
                     }
                 } else if prev_width > cell_width && prev_visible {
                     trailing = Some((i + 1, i + prev_width, true));
                 }
                 out.push((x, y, current.clone()));
-                sync(i, prev, next);
+                sync_snapshot_cell(prev, next, i);
             }
         }
     }
@@ -1316,7 +1379,7 @@ mod tests {
         let reference = next.clone();
         let mut updates = Vec::new();
         let mut snapshot = prev.clone();
-        push_row_diff(&mut snapshot, &next, 4, 10, 0, 8, &mut updates);
+        push_row_diff(&mut snapshot, &next, 4, 10, 0, 8, false, &mut updates);
 
         // (a) emission: the changed symbol (x=11), the narrow replacement
         // (x=15), and its force-refreshed trailing cell (x=16).
@@ -1331,12 +1394,64 @@ mod tests {
         // boundary-crossing graphemes).
         let mut updates2 = Vec::new();
         let mut snapshot2 = prev.clone();
-        push_row_diff(&mut snapshot2, &next, 4, 10, 2, 6, &mut updates2);
+        push_row_diff(&mut snapshot2, &next, 4, 10, 2, 6, false, &mut updates2);
         let xs2: Vec<u16> = updates2.iter().map(|(x, _, _)| *x).collect();
         assert_eq!(xs2, vec![15, 16]);
         for j in 2..7 {
             assert_eq!(snapshot2[j], reference[j], "window column {j} synced");
         }
+    }
+
+    /// Forced (reanchor) row emission must emit every cell even when the
+    /// emitted snapshot claims the row is already on screen: the gauntlet
+    /// wizard dismissal once emitted `typ`, skipped the two cells a stale
+    /// snapshot believed present, then `a message`.
+    #[test]
+    fn forced_row_diff_emits_every_cell_despite_stale_snapshot() {
+        fn mk(sym: &str) -> Cell {
+            let mut cell = Cell::default();
+            cell.set_symbol(sym);
+            cell
+        }
+        let text = "type a message";
+        let width = text.chars().count();
+        let mut next = vec![mk(" "); width];
+        for (j, c) in text.chars().enumerate() {
+            next[j].set_symbol(&c.to_string());
+        }
+        // Stale belief one: the snapshot claims the row is already on
+        // screen, and every third cell carries an explicit skip flag.
+        let mut believed = next.clone();
+        for cell in believed.iter_mut().step_by(3) {
+            cell.set_diff_option(CellDiffOption::Skip);
+        }
+        // Unforced control: an equal snapshot suppresses everything.
+        let mut quiet = Vec::new();
+        let mut quiet_prev = next.clone();
+        push_row_diff(&mut quiet_prev, &next, 1, 0, 0, width, false, &mut quiet);
+        assert!(
+            quiet.is_empty(),
+            "equal snapshot must suppress unforced emission"
+        );
+
+        // Forced (reanchor): every column emitted exactly once, in order.
+        let mut updates = Vec::new();
+        let mut snapshot = believed.clone();
+        push_row_diff(&mut snapshot, &next, 1, 0, 0, width, true, &mut updates);
+        let xs: Vec<u16> = updates.iter().map(|(x, _, _)| *x).collect();
+        let expected: Vec<u16> = (0..u16::try_from(width).unwrap_or(u16::MAX)).collect();
+        assert_eq!(xs, expected);
+        let rendered: String = updates.iter().map(|(_, _, c)| c.symbol()).collect();
+        assert_eq!(rendered, text);
+        assert_eq!(snapshot, next);
+
+        // Stale belief two: the snapshot holds unrelated overlay content.
+        let mut stale = vec![mk("#"); width];
+        let mut updates2 = Vec::new();
+        push_row_diff(&mut stale, &next, 1, 0, 0, width, true, &mut updates2);
+        let xs2: Vec<u16> = updates2.iter().map(|(x, _, _)| *x).collect();
+        assert_eq!(xs2, expected);
+        assert_eq!(stale, next);
     }
 
     /// `row_walk_span` unions prior and frame claim spans; foreign claims or

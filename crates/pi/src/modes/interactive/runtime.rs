@@ -1283,8 +1283,8 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     /// inheriting a prior phase's time.
     spinner_kind: Option<StatusKind>,
     /// Cause for re-anchoring the next paint (full rows, no cell diff);
-    /// set when an extension overlay opens over unrelated content so its
-    /// first frame cannot be fragmented by the diff.
+    /// set when an overlay covers or uncovers unrelated content so neither
+    /// its first frame nor the restored chrome is fragmented by the diff.
     pending_reanchor: Option<ReanchorCause>,
     pending_settle: Option<Vec<SettledBlock>>,
     shutdown: Arc<Notify>,
@@ -3029,6 +3029,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.view.extension_overlay_slot = None;
         self.view.focus = FocusArea::Editor;
         self.input_state.reset_taps();
+        // The claim-set diff skips rows whose component claims are
+        // unchanged — the chrome a dismissed overlay covered claims the
+        // same rows it did before the overlay opened — so without a
+        // re-anchor the overlay's last paint stays on screen forever.
+        self.pending_reanchor = Some(ReanchorCause::OverlayCover);
         ActionOutcome::Repaint
     }
 
@@ -4327,7 +4332,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     // An open OR a reshape covers rows whose previous content
                     // is unrelated; re-anchor so the first frame is not
                     // fragmented by the cell diff (codex PRRT …VM-tM).
-                    self.pending_reanchor = Some(ReanchorCause::OverlayOpen);
+                    self.pending_reanchor = Some(ReanchorCause::OverlayCover);
                 }
             }
             SlotPlacement::Header
@@ -9871,7 +9876,7 @@ mod tests {
         rt.project_extension_slot(overlay(3, None));
         assert_eq!(
             rt.pending_reanchor,
-            Some(ReanchorCause::OverlayOpen),
+            Some(ReanchorCause::OverlayCover),
             "overlay open must queue a reanchor"
         );
         rt.pending_reanchor = None;
@@ -9887,7 +9892,7 @@ mod tests {
         rt.project_extension_slot(overlay(5, None));
         assert_eq!(
             rt.pending_reanchor,
-            Some(ReanchorCause::OverlayOpen),
+            Some(ReanchorCause::OverlayCover),
             "reshaped overlay must reanchor"
         );
     }
@@ -9898,7 +9903,7 @@ mod tests {
     #[test]
     fn commit_reanchor_clears_stale_pending_reanchor() -> TestResult {
         let (mut rt, _log) = make_runtime();
-        rt.pending_reanchor = Some(ReanchorCause::OverlayOpen);
+        rt.pending_reanchor = Some(ReanchorCause::OverlayCover);
         rt.commit_reanchor()
             .map_err(|e| format!("commit_reanchor failed: {e}"))?;
         assert_eq!(
