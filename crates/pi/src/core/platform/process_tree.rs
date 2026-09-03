@@ -1,11 +1,15 @@
-//! Process-tree termination shared by every native spawn site.
+//! Process-tree termination shared by the two `pi` spawn sites.
 //!
-//! One owner for the platform kill path so the three spawn sites (bash tool,
-//! package manager, config-value command runner) cannot drift apart: Unix
-//! kills the detached process group (`process_group(0)` at spawn, mirroring
-//! Node `detached`), Windows resolves `taskkill.exe` under `%SystemRoot%`
-//! `\System32` per upstream `7af2d27dc` (#6596) instead of a bare `PATH`
-//! search, falling back to `PATH` only when `SystemRoot` is unset.
+//! One owner for the platform kill path so the bash tool and the package
+//! manager cannot drift apart: Unix kills the detached process group
+//! (`process_group(0)` at spawn, mirroring Node `detached`), Windows resolves
+//! `taskkill.exe` under `%SystemRoot%\System32` per upstream `7af2d27dc`
+//! (#6596) instead of a bare `PATH` search, falling back to `PATH` only when
+//! `SystemRoot` is unset. `pi-ai`'s config-value runner keeps a parallel local
+//! copy because `pi-ai` takes no workspace dependencies and cannot import
+//! this module; its Unix branch reports kill failure as `Err` where this
+//! module falls back to pid-kill, so this module is the canonical behavior
+//! for `pi` and the `pi-ai` copy is the documented exception.
 
 #[cfg(any(windows, test))]
 use std::path::PathBuf;
@@ -53,17 +57,14 @@ pub fn kill_process_tree(pid: u32) {
 /// bare `PATH` search only when `SystemRoot` is unset.
 #[cfg(windows)]
 fn taskkill_path() -> PathBuf {
-    std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .map(|root| root.join("System32").join("taskkill.exe"))
-        .unwrap_or_else(|| PathBuf::from("taskkill.exe"))
+    taskkill_path_for(std::env::var_os("SystemRoot").as_deref())
 }
 
 /// Unit-testable view of the Windows resolution: the joined path for a given
 /// `SystemRoot` value, or the `PATH` fallback name when unset.
-#[cfg(test)]
+#[cfg(any(windows, test))]
 #[must_use]
-pub fn taskkill_path_for(system_root: Option<&str>) -> PathBuf {
+pub fn taskkill_path_for(system_root: Option<&std::ffi::OsStr>) -> PathBuf {
     system_root.map_or_else(
         || PathBuf::from("taskkill.exe"),
         |root| PathBuf::from(root).join("System32").join("taskkill.exe"),
@@ -73,11 +74,10 @@ pub fn taskkill_path_for(system_root: Option<&str>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn taskkill_prefers_system_root_over_path() {
         assert_eq!(
-            taskkill_path_for(Some("C:\\Windows")),
+            taskkill_path_for(Some(std::ffi::OsStr::new("C:\\Windows"))),
             PathBuf::from("C:\\Windows/System32/taskkill.exe")
         );
     }
