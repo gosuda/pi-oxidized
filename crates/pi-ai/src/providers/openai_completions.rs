@@ -1751,6 +1751,59 @@ mod tests {
         assert_eq!(usage.reasoning, Some(1));
     }
     #[test]
+    fn thinking_formats_emit_provider_reasoning_controls() {
+        fn effort_options(effort: Option<&str>) -> StreamOptions {
+            let mut options = StreamOptions::default();
+            if let Some(effort) = effort {
+                options.insert_extra(
+                    StreamOptionKey::REASONING_EFFORT,
+                    Value::String(effort.to_owned()),
+                );
+            }
+            options
+        }
+
+        // Qwen declares its format through catalog compat with effort mapping off.
+        let mut qwen = model("qwen-token-plan");
+        qwen.reasoning = true;
+        qwen.base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1".into();
+        qwen.compat = Some(json!({"thinkingFormat":"qwen","supportsReasoningEffort":false}));
+        let compat = Compat::resolve(&qwen);
+        let mut payload = json!({});
+        apply_thinking(&qwen, &effort_options(Some("high")), &compat, &mut payload);
+        assert_eq!(payload.get("enable_thinking"), Some(&Value::Bool(true)));
+        assert_eq!(payload.get("reasoning_effort"), None);
+        let mut payload = json!({});
+        apply_thinking(&qwen, &effort_options(None), &compat, &mut payload);
+        assert_eq!(payload.get("enable_thinking"), Some(&Value::Bool(false)));
+
+        // Default OpenAI shape: raw effort, then the off-map value without effort.
+        let mut openai = model("openai");
+        openai.reasoning = true;
+        openai.thinking_level_map = Some(BTreeMap::from([(
+            ModelThinkingLevel::Off,
+            Some("none".to_owned()),
+        )]));
+        let compat = Compat::resolve(&openai);
+        let mut payload = json!({});
+        apply_thinking(
+            &openai,
+            &effort_options(Some("high")),
+            &compat,
+            &mut payload,
+        );
+        assert_eq!(
+            payload.get("reasoning_effort"),
+            Some(&Value::String("high".to_owned()))
+        );
+        let mut payload = json!({});
+        apply_thinking(&openai, &effort_options(None), &compat, &mut payload);
+        assert_eq!(
+            payload.get("reasoning_effort"),
+            Some(&Value::String("none".to_owned()))
+        );
+    }
+    #[test]
     fn usage_cache_read_falls_back_across_provider_placements() {
         // DeepSeek reports hits beside the details object.
         let usage = parse_chunk_usage(
