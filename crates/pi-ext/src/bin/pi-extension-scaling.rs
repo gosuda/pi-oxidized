@@ -291,6 +291,7 @@ impl RawPeer {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 #[expect(
     clippy::struct_field_names,
     reason = "renaming would change serde camelCase output keys"
@@ -909,6 +910,41 @@ mod tests {
         );
         assert_ne!(corpus.digest(), different_framing.digest());
         assert_eq!(CORPUS_IDENTITY, "extension-scaling-terminal-input-v1");
+    }
+
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test fails on Err via the asserts below"
+    )]
+    fn protocol_provenance_serializes_camel_case() {
+        let provenance = ProtocolProvenance {
+            compiled_protocol_version: PROTOCOL_VERSION,
+            compiled_compatibility_version: COMPATIBILITY_VERSION,
+            observed_protocol_version: PROTOCOL_VERSION,
+            observed_compatibility_version: COMPATIBILITY_VERSION.to_owned(),
+        };
+        let json = serde_json::to_value(&provenance).expect("provenance serializes");
+        assert_eq!(
+            json.get("compiledProtocolVersion")
+                .and_then(serde_json::Value::as_u64),
+            Some(u64::from(PROTOCOL_VERSION))
+        );
+        assert_eq!(
+            json.get("compiledCompatibilityVersion")
+                .and_then(|v| v.as_str()),
+            Some(COMPATIBILITY_VERSION)
+        );
+        assert_eq!(
+            json.get("observedProtocolVersion")
+                .and_then(serde_json::Value::as_u64),
+            Some(u64::from(PROTOCOL_VERSION))
+        );
+        assert_eq!(
+            json.get("observedCompatibilityVersion")
+                .and_then(|v| v.as_str()),
+            Some(COMPATIBILITY_VERSION)
+        );
     }
 
     #[test]
