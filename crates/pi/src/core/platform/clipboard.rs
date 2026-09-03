@@ -191,29 +191,14 @@ pub fn osc52_encode(text: &str) -> Option<String> {
     Some(format!("\x1b]52;c;{encoded}\x07"))
 }
 
-/// Copy `text` to the clipboard using the host platform and environment.
-///
-/// An OSC 52 fallback sequence is written to stdout when no shell tool
-/// applies (or fails), and additionally after a successful tool copy in a
-/// remote session, mirroring the reference `copyToClipboard` order.
-///
-/// # Errors
-///
-/// Returns [`ClipboardError::Failed`] when every available clipboard path fails.
-pub fn copy_to_clipboard(text: &str) -> Result<(), ClipboardError> {
-    copy_to_clipboard_with(text, ClipboardPlatform::host(), &HostEnv, &mut |sequence| {
-        let _ = std::io::stdout().write_all(sequence.as_bytes());
-    })
-}
-
 /// Copy `text` with an explicit platform/env and OSC 52 sink.
 ///
 /// Tries the selected shell tool (and its fallback) first: emitting OSC 52
 /// before a tool copy can make terminals write the native clipboard twice,
 /// and large payloads can desynchronize rendering. The sink receives the
-/// encoded sequence when the OSC 52 path triggers — on the host this writes
-/// to stdout; tests inject a capturing closure so the decision logic is
-/// exercised without side effects.
+/// encoded sequence when the OSC 52 path triggers — callers pass the
+/// terminal's stdout handle; tests inject a capturing closure so the
+/// decision logic is exercised without side effects.
 ///
 /// # Errors
 ///

@@ -3835,7 +3835,21 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     async fn copy_last_assistant(&mut self) -> ActionOutcome {
         match self.session.last_assistant_text().await {
             Ok(Some(text)) if !text.is_empty() => {
-                if crate::core::platform::clipboard::copy_to_clipboard(&text).is_ok() {
+                if crate::core::platform::clipboard::copy_to_clipboard_with(
+                    &text,
+                    crate::core::platform::clipboard::ClipboardPlatform::host(),
+                    &crate::core::platform::clipboard::HostEnv,
+                    &mut |sequence| {
+                        // OSC 52 must travel through the runtime's sole stdout
+                        // handle: a second `io::stdout()` LineWriter would hold
+                        // sub-kilobyte payloads until the next newline, and the
+                        // flush below is what delivers them.
+                        let _ = self.tui.outer_mut().write_all(sequence.as_bytes());
+                        let _ = self.tui.outer_mut().flush();
+                    },
+                )
+                .is_ok()
+                {
                     self.set_status(SessionStatus {
                         kind: StatusKind::Working,
                         frame: 0,
