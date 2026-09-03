@@ -2048,6 +2048,27 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn image_mime_types_map_to_bedrock_formats() -> Result<(), String> {
+        for (mime, format) in [
+            ("image/jpeg", "jpeg"),
+            ("image/jpg", "jpeg"),
+            ("image/png", "png"),
+            ("image/gif", "gif"),
+            ("image/webp", "webp"),
+        ] {
+            let value =
+                image_value(mime, "aGk=").map_err(|error| format!("{mime} rejected: {error}"))?;
+            assert_eq!(
+                value.pointer("/image/format"),
+                Some(&Value::String(format.to_owned())),
+                "mime {mime}"
+            );
+        }
+        assert!(image_value("image/bmp", "aGk=").is_err());
+        assert!(image_value("image/svg+xml", "aGk=").is_err());
+        Ok(())
+    }
 
     #[test]
     fn request_normalizes_tool_ids_and_coalesces_tool_results() -> Result<(), String> {
