@@ -32,11 +32,11 @@
 		"verify:snippets": "bun run scripts/verification/snippet-harness.ts",
 		"verify:extension-scaling": "bun run scripts/bench-extension-scaling.ts",
 		"gen:compat-docs": "bun run scripts/verification/generate-compat-docs.ts",
-		"verify:compat-docs": "bun run scripts/verification/generate-compat-docs.ts",
+		"verify:compat-docs": "bun run scripts/verification/generate-compat-docs.ts --check",
 		"gen:witness": "bun run scripts/verification/gen-witness.ts",
 		"verify:witness": "bun run scripts/verification/gen-witness.ts --check",
 		"gen:fixtures": "bun run scripts/generate-session-fixtures.ts && bun run scripts/generate-tool-schemas.ts",
-		"check:fixtures": "bun run scripts/generate-session-fixtures.ts --check && bun run scripts/generate-tool-schemas.ts --check",
+		"check:fixtures": "bun run scripts/generate-session-fixtures.ts --check && bun run scripts/generate-tool-schemas.ts --check && bun run scripts/generate-builtin-models.ts --check",
 		"gen:execution-map": "bun run scripts/verification/fetch-map-source.ts | bun run scripts/verification/publish-map.ts"
 	},
 	"devDependencies": {

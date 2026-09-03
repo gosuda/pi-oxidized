@@ -10,7 +10,7 @@
  * Usage: bun run scripts/generate-builtin-models.ts
  */
 
-import { access, mkdir, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -347,6 +347,15 @@ async function main(): Promise<void> {
 	const sorted = buildSortedCatalog(catalog);
 	const encoded = encodeCatalog(sorted);
 	validateEncodedCatalog(encoded, sorted);
+	if (process.argv.includes("--check")) {
+		const onDisk = await readFile(OUTPUT_PATH, "utf8").catch(() => null);
+		if (onDisk !== encoded) {
+			process.stderr.write(`stale builtin-models catalog: ${OUTPUT_PATH}\n`);
+			process.exit(1);
+		}
+		process.stdout.write(`BUILTIN_MODELS_FRESH ${OUTPUT_PATH}\n`);
+		return;
+	}
 	await writeAtomically(OUTPUT_PATH, encoded);
 	process.stdout.write(`${summarize(sorted)}\n`);
 }

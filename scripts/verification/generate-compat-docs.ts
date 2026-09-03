@@ -500,10 +500,24 @@ function scanDirForRegisteredPins(
 // ---------------------------------------------------------------------------
 
 function main(): void {
+	const check = process.argv.includes("--check");
 	const pins = collectPins();
 	const doc = generateDoc(pins);
 	const outputPath = resolve(REPO_ROOT, PATHS.output);
-	writeFileSync(outputPath, doc, "utf8");
+	if (check) {
+		let onDisk: string | null = null;
+		try {
+			onDisk = readFileSync(outputPath, "utf8");
+		} catch {
+			onDisk = null;
+		}
+		if (onDisk !== doc) {
+			process.stderr.write(`[generate-compat-docs] stale committed doc: ${outputPath}\n`);
+			process.exit(1);
+		}
+	} else {
+		writeFileSync(outputPath, doc, "utf8");
+	}
 
 	// Check 1: every semver in the generated doc must be a registered pin
 	const genDrift = findUnregisteredSemverInGeneratedDoc(pins, doc);
