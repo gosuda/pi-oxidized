@@ -235,13 +235,13 @@ describe("execution map ledger (MAP-1)", () => {
 
 	test("mutation: telemetry pin drift fails the documented-site check", () => {
 		const mutated = MAP_TEXT.replace(
-			"crates/pi-agent/src/agent.rs:62-88",
-			"crates/pi-agent/src/agent.rs:62-89",
+			"crates/pi-agent/src/agent.rs:65-93",
+			"crates/pi-agent/src/agent.rs:65-94",
 		);
 		const violations = run(mutated);
 		expect(
 			violations.some((entry) =>
-				entry.includes("[telemetry] documented site crates/pi-agent/src/agent.rs:62-89 matches no pinned"),
+				entry.includes("[telemetry] documented site crates/pi-agent/src/agent.rs:65-94 matches no pinned"),
 			),
 		).toBe(true);
 	});

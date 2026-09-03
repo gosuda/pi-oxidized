@@ -356,7 +356,7 @@ describe("parity witness suite", () => {
 		expect(hasViolation(violations, "AgentLoopConfig literal at crates/pi-agent/src/agent.rs:40 matches no pinned site")).toBe(
 			true,
 		);
-		expect(hasViolation(violations, "missing pinned AgentLoopConfig literal site crates/pi-agent/src/agent.rs:62-88")).toBe(
+		expect(hasViolation(violations, "missing pinned AgentLoopConfig literal site crates/pi-agent/src/agent.rs:65-93")).toBe(
 			true,
 		);
 	});

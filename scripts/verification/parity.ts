@@ -49,12 +49,12 @@ export interface AgentLoopConfigPin {
 
 /** The shared arbitration oracle: every full AgentLoopConfig construction site. */
 export const PINNED_AGENT_LOOP_CONFIG_SITES: readonly AgentLoopConfigPin[] = [
-	{ path: "crates/pi-agent/src/agent.rs", start: 62, end: 88 },
-	{ path: "crates/pi-agent/src/config.rs", start: 360, end: 389 },
-	{ path: "crates/pi-agent/src/run.rs", start: 915, end: 942 },
-	{ path: "crates/pi-agent/src/schedule.rs", start: 902, end: 928 },
-	{ path: "crates/pi/src/core/agent_session/mod.rs", start: 496, end: 523 },
-	{ path: "crates/pi-agent/src/bin/pi_agent_stream_frame_bench.rs", start: 267, end: 294 },
+	{ path: "crates/pi-agent/src/agent.rs", start: 65, end: 93 },
+	{ path: "crates/pi-agent/src/config.rs", start: 373, end: 409 },
+	{ path: "crates/pi-agent/src/run.rs", start: 944, end: 971 },
+	{ path: "crates/pi-agent/src/schedule.rs", start: 902, end: 929 },
+	{ path: "crates/pi/src/core/agent_session/mod.rs", start: 473, end: 501 },
+	{ path: "crates/pi-agent/src/bin/pi_agent_stream_frame_bench.rs", start: 267, end: 295 },
 ];
 
 // ============================================================================
