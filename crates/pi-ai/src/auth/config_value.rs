@@ -292,7 +292,13 @@ fn terminate_process_group_and_reap(
     }
     #[cfg(windows)]
     {
-        let status = Command::new("taskkill")
+        // Upstream 7af2d27dc (#6596): resolve taskkill.exe under %SystemRoot%\System32
+        // instead of PATH so a hijacked PATH entry cannot redirect the kill.
+        let taskkill = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .map(|root| root.join("System32").join("taskkill.exe"))
+            .unwrap_or_else(|| std::path::PathBuf::from("taskkill.exe"));
+        let status = Command::new(taskkill)
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())

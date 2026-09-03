@@ -34,6 +34,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::core::config::{CONFIG_DIR_NAME, PathInputOptions, resolve_path, resolve_path_with};
+use crate::core::platform::process_tree::kill_process_tree;
 use crate::core::resources::discovery::{
     PackagePathResolver, PackageResolveError, ParsedSource, ResolvedPaths, parse_package_source,
     temporary_dir_hash,
@@ -432,29 +433,7 @@ fn read_pipe<R: Read>(mut pipe: Option<R>) -> String {
     buf
 }
 
-/// Kill a process and its descendants (process group on Unix, `taskkill /T` on Windows).
-fn kill_process_tree(pid: u32) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{Signal, kill, killpg};
-        use nix::unistd::Pid;
-        if let Ok(raw) = i32::try_from(pid) {
-            let group = Pid::from_raw(raw);
-            if killpg(group, Signal::SIGKILL).is_err() {
-                let _ = kill(group, Signal::SIGKILL);
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
-}
+// Kill routing lives in [`crate::core::platform::process_tree::kill_process_tree`].
 
 /// Options for constructing a [`PackageManager`].
 #[derive(Clone, Debug)]

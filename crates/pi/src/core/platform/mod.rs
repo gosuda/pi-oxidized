@@ -16,6 +16,7 @@
 //! - [`first_run`]: first-run setup gating and persistence.
 //! - [`release_packaging`]: release cargo/archive plan, runner, path safety,
 //!   and reproducibility.
+//! - [`process_tree`]: process-tree termination shared by every spawn site.
 
 pub mod clipboard;
 pub mod command;
@@ -24,4 +25,5 @@ pub mod external_editor;
 pub mod first_run;
 pub mod image;
 pub mod open_browser;
+pub mod process_tree;
 pub mod release_packaging;
