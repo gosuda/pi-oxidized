@@ -24,10 +24,10 @@ use pi_ai::auth::config_value::{
 use pi_ai::auth::context::{DefaultAuthContext, overlay_env_auth_context};
 use pi_ai::auth::resolve::resolve_provider_auth_with_signal;
 use pi_ai::auth::{
-    AMBIENT_AUTH_MARKER, AuthCheck, AuthContext, AuthResolutionOverrides, AuthResult, AuthType,
-    Credential, CredentialInfo, CredentialStore, FileCredentialStore, InMemoryCredentialStore,
-    ModelAuth, ModelsError, ModelsErrorCode, OAuthAuth, ProviderEnv, RuntimeCredentials,
-    default_provider_auth, find_env_keys, get_env_api_key,
+    AMBIENT_AUTH_MARKER, AuthCheck, AuthContext, AuthInteraction, AuthResolutionOverrides,
+    AuthResult, AuthType, Credential, CredentialInfo, CredentialStore, FileCredentialStore,
+    InMemoryCredentialStore, ModelAuth, ModelsError, ModelsErrorCode, OAuthAuth, ProviderEnv,
+    RuntimeCredentials, default_provider_auth, find_env_keys, get_env_api_key,
 };
 use pi_ai::catalog::{BuiltinModels, ModelsStoreEntry, builtin_models};
 use pi_ai::models_store::{
@@ -282,6 +282,20 @@ pub enum ModelRuntimeError {
     /// Provider HTTP client construction failure.
     #[error("Failed to configure provider HTTP client: {0}")]
     HttpClient(String),
+    /// Credential write/delete committed, but availability refresh could not
+    /// be synchronized. Mirrors upstream `CredentialSynchronizationError`;
+    /// the interactive layer formats the user-facing wording from this.
+    #[error(
+        "Credential {operation} committed for {provider_id}, but local synchronization failed: {detail}"
+    )]
+    CredentialSynchronization {
+        /// Provider the credential operation targeted.
+        provider_id: String,
+        /// Credential operation that committed (`login` or `logout`).
+        operation: &'static str,
+        /// Timeout or refresh error detail.
+        detail: String,
+    },
 }
 
 /// Result of [`ModelRuntime::refresh`].
@@ -651,28 +665,151 @@ impl ModelRuntime {
             .map_err(|error| ModelsError::new(ModelsErrorCode::Auth, error.to_string()).into())
     }
 
+    /// Interactive login for `provider_id` using the given auth mechanism.
+    ///
+    /// Resolves the provider's [`ProviderAuth`] from the runtime's existing
+    /// registry, dispatches to the OAuth or API-key login method per
+    /// `auth_type`, persists the resulting credential via the credential store
+    /// (same write path as [`Self::logout`]), and refreshes availability so the
+    /// provider becomes active.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelRuntimeError::Models`] when the provider does not support
+    /// the requested auth type, the login flow fails, or credential persistence
+    /// fails. Returns [`ModelRuntimeError::CredentialSynchronization`] when
+    /// the credential persists but availability refresh cannot be
+    /// synchronized within the timeout.
+    pub async fn login(
+        &self,
+        provider_id: &str,
+        auth_type: AuthType,
+        interaction: Arc<dyn AuthInteraction>,
+    ) -> Result<(), ModelRuntimeError> {
+        let provider_auth = default_provider_auth(
+            provider_id,
+            self.inner.oauth_handlers.get(provider_id).cloned(),
+        );
+        let credential = match auth_type {
+            AuthType::Oauth => {
+                let oauth = provider_auth.oauth.ok_or_else(|| {
+                    ModelsError::new(
+                        ModelsErrorCode::Auth,
+                        format!("Provider {provider_id} does not support OAuth login"),
+                    )
+                })?;
+                let oauth_credential = oauth
+                    .login(&*interaction)
+                    .await
+                    .map_err(|error| ModelsError::new(ModelsErrorCode::Oauth, error.to_string()))?;
+                Credential::Oauth(oauth_credential)
+            }
+            AuthType::ApiKey => {
+                let api_key = provider_auth.api_key.ok_or_else(|| {
+                    ModelsError::new(
+                        ModelsErrorCode::Auth,
+                        format!("Provider {provider_id} does not support API key login"),
+                    )
+                })?;
+                let login_future = api_key.login(&*interaction).ok_or_else(|| {
+                    ModelsError::new(
+                        ModelsErrorCode::Auth,
+                        format!(
+                            "Provider {provider_id} does not support interactive API key login"
+                        ),
+                    )
+                })?;
+                let api_key_credential = login_future
+                    .await
+                    .map_err(|error| ModelsError::new(ModelsErrorCode::Auth, error.to_string()))?;
+                Credential::ApiKey(api_key_credential)
+            }
+        };
+        self.inner
+            .credentials
+            .modify(
+                provider_id,
+                Box::new(move |_| Box::pin(async move { Ok(Some(credential)) })),
+            )
+            .await
+            .map_err(|error| ModelsError::new(ModelsErrorCode::Auth, error.to_string()))?;
+        self.synchronize_after_credential_change(provider_id, "login")
+            .await
+    }
+
+    /// Refresh availability after a committed credential write/delete.
+    ///
+    /// Mirrors upstream `synchronizeCredentialState`: the post-commit refresh
+    /// is bounded by a 15-second timeout, and any timeout, abort, or refresh
+    /// error becomes a typed synchronization failure so the interactive layer
+    /// can format its own wording.
+    async fn synchronize_after_credential_change(
+        &self,
+        provider_id: &str,
+        operation: &'static str,
+    ) -> Result<(), ModelRuntimeError> {
+        let refresh_result = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.refresh(ModelsRefreshOptions {
+                allow_network: Some(self.inner.allow_model_network),
+            }),
+        )
+        .await;
+        match refresh_result {
+            Ok(Ok(result)) if !result.aborted && result.errors.is_empty() => Ok(()),
+            Ok(Ok(result)) => {
+                let detail = if result.aborted {
+                    "refresh aborted".to_owned()
+                } else {
+                    result
+                        .errors
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                Err(ModelRuntimeError::CredentialSynchronization {
+                    provider_id: provider_id.to_owned(),
+                    operation,
+                    detail,
+                })
+            }
+            Ok(Err(error)) => Err(ModelRuntimeError::CredentialSynchronization {
+                provider_id: provider_id.to_owned(),
+                operation,
+                detail: error.to_string(),
+            }),
+            Err(_) => Err(ModelRuntimeError::CredentialSynchronization {
+                provider_id: provider_id.to_owned(),
+                operation,
+                detail: "timed out after 15s".to_owned(),
+            }),
+        }
+    }
+
     /// Remove the stored credential for `provider_id` (logout).
     ///
     /// Mirrors upstream `Models.logout`: deletes the credential from the store
     /// and refreshes availability so the removed provider drops out of the
-    /// active catalog.
+    /// active catalog. The post-delete refresh is bounded by a 15-second
+    /// timeout; when the credential is removed but the refresh times out or
+    /// reports errors, a [`ModelRuntimeError::CredentialSynchronization`] is
+    /// returned so the caller can retry or surface the inconsistency.
     ///
     /// # Errors
     ///
     /// Returns [`ModelRuntimeError::Models`] when the credential store delete
-    /// fails.
+    /// fails, or [`ModelRuntimeError::CredentialSynchronization`] when the
+    /// delete succeeds but availability refresh cannot be synchronized
+    /// within the timeout.
     pub async fn logout(&self, provider_id: &str) -> Result<(), ModelRuntimeError> {
         self.inner
             .credentials
             .delete(provider_id)
             .await
             .map_err(|error| ModelsError::new(ModelsErrorCode::Auth, error.to_string()))?;
-        let _ = self
-            .refresh(ModelsRefreshOptions {
-                allow_network: Some(self.inner.allow_model_network),
-            })
-            .await;
-        Ok(())
+        self.synchronize_after_credential_change(provider_id, "logout")
+            .await
     }
 
     /// Registered extension provider configuration for `provider_id`.
