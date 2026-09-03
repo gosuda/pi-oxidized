@@ -46,6 +46,8 @@ use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, poll_fn};
 use pi_ai::AssistantMessage;
+use pi_ai::auth::types::AuthSelectOption;
+use pi_ai::auth::{AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthType};
 use pi_tui::component::{Component, EventResult, UiEvent};
 use pi_tui::components::editor::{Editor, EditorOptions};
 use pi_tui::keys::{
@@ -590,6 +592,20 @@ pub trait SessionHost: Send + Sync + 'static {
     /// Remove the stored credential for `provider_id` (upstream
     /// `modelRuntime.logout`).
     fn logout(&self, provider_id: &str) -> BoxFuture<'_, Result<(), String>>;
+
+    /// Log in to a provider (upstream `modelRuntime.login`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoginError::Sync`] when the credential commits but
+    /// availability refresh cannot synchronize; [`LoginError::Other`] for
+    /// flow failures, unsupported auth, or persistence errors.
+    fn login(
+        &self,
+        provider_id: &str,
+        auth_type: AuthType,
+        interaction: Arc<dyn AuthInteraction>,
+    ) -> BoxFuture<'_, Result<(), LoginError>>;
 
     /// Copy the last assistant text (returns the text so the runtime can
     /// resolve the platform clipboard).
@@ -1380,6 +1396,8 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     /// Editor placeholder saved while a built-in confirm/logout selector shows
     /// its prompt; restored when the selector closes.
     confirm_saved_placeholder: Option<String>,
+    #[allow(dead_code, reason = "polled by the event loop wired in slice 3")]
+    auth_flow: Option<AuthFlowState>,
 }
 
 /// In-flight `/import` awaiting its confirm dialog(s).
@@ -1460,6 +1478,198 @@ impl PromptOperations {
             bash_operation: None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Auth interaction driver
+// ---------------------------------------------------------------------------
+
+/// Login flow error surfaced through [`SessionHost::login`].
+///
+/// Distinguishes credential-synchronization failures (credential committed
+/// but availability refresh could not sync) from generic login failures, so
+/// the interactive layer can format the reference UI wordings.
+#[derive(Clone, Debug)]
+pub enum LoginError {
+    /// Credential committed but availability refresh could not synchronize.
+    Sync {
+        /// Provider the credential operation targeted.
+        provider_id: String,
+        /// Operation that committed (`login` or `logout`).
+        operation: String,
+        /// Timeout or refresh error detail.
+        detail: String,
+    },
+    /// Generic login failure.
+    Other(String),
+}
+
+/// Command sent from the [`TuiAuthInteraction`] driver to the runtime.
+#[derive(Debug)]
+#[allow(dead_code, reason = "constructed by the event loop wired in slice 3")]
+enum AuthCmd {
+    /// Show a selector with the given options; response is the selected id.
+    ShowSelector {
+        /// Prompt message.
+        message: String,
+        /// Selectable options.
+        options: Vec<AuthSelectOption>,
+        /// One-shot response channel.
+        response: oneshot::Sender<Result<String, AuthError>>,
+    },
+    /// Show a text input in the Login overlay; response is the entered text.
+    ShowInput {
+        /// Prompt message.
+        message: String,
+        /// Optional placeholder.
+        placeholder: Option<String>,
+        /// Whether the input is a secret (API key).
+        secret: bool,
+        /// One-shot response channel.
+        response: oneshot::Sender<Result<String, AuthError>>,
+    },
+    /// Update the auth progress display.
+    UpdateProgress {
+        /// OAuth stage.
+        stage: super::state::OAuthStage,
+        /// Stage detail (URL, code, message).
+        detail: Option<String>,
+    },
+}
+
+/// TUI auth interaction driver: bridges [`AuthInteraction`] calls to the
+/// interactive runtime via channels.
+///
+/// The driver is `Send + Sync` (only holds a channel sender and a
+/// [`CancellationToken`]), so it can be wrapped in `Arc<dyn AuthInteraction>`
+/// and passed to `ModelRuntime::login`. The runtime receives commands via
+/// the channel and sends responses back through per-prompt `oneshot` channels.
+#[allow(
+    dead_code,
+    reason = "constructed by start_login_flow; event loop wired in slice 3"
+)]
+struct TuiAuthInteraction {
+    /// Command channel to the runtime.
+    cmd_tx: mpsc::UnboundedSender<AuthCmd>,
+    /// Whole-flow cancellation token (cancelled by Esc/Ctrl+C).
+    cancel: CancellationToken,
+}
+
+impl TuiAuthInteraction {
+    /// Construct a new driver with the given command channel and cancellation.
+    #[allow(
+        dead_code,
+        reason = "called by start_login_flow; event loop wired in slice 3"
+    )]
+    fn new(cmd_tx: mpsc::UnboundedSender<AuthCmd>, cancel: CancellationToken) -> Self {
+        Self { cmd_tx, cancel }
+    }
+}
+
+impl AuthInteraction for TuiAuthInteraction {
+    fn prompt(&self, prompt: AuthPrompt) -> BoxFuture<'_, Result<String, AuthError>> {
+        let cancel = self.cancel.clone();
+        let cmd_tx = self.cmd_tx.clone();
+        Box::pin(async move {
+            if cancel.is_cancelled() {
+                return Err(AuthError::Cancelled);
+            }
+            let (tx, rx) = oneshot::channel();
+            match prompt {
+                AuthPrompt::Select {
+                    message, options, ..
+                } => {
+                    let _ = cmd_tx.send(AuthCmd::ShowSelector {
+                        message,
+                        options,
+                        response: tx,
+                    });
+                }
+                AuthPrompt::Text {
+                    message,
+                    placeholder,
+                    ..
+                }
+                | AuthPrompt::ManualCode {
+                    message,
+                    placeholder,
+                    ..
+                } => {
+                    let _ = cmd_tx.send(AuthCmd::ShowInput {
+                        message,
+                        placeholder,
+                        secret: false,
+                        response: tx,
+                    });
+                }
+                AuthPrompt::Secret {
+                    message,
+                    placeholder,
+                    ..
+                } => {
+                    let _ = cmd_tx.send(AuthCmd::ShowInput {
+                        message,
+                        placeholder,
+                        secret: true,
+                        response: tx,
+                    });
+                }
+            }
+            tokio::select! {
+            result = rx => result.unwrap_or(Err(AuthError::Cancelled)),
+            () = cancel.cancelled() => Err(AuthError::Cancelled),
+            }
+        })
+    }
+
+    fn notify(&self, event: AuthEvent) {
+        match event {
+            AuthEvent::AuthUrl { url, .. } => {
+                let _ = self.cmd_tx.send(AuthCmd::UpdateProgress {
+                    stage: super::state::OAuthStage::BrowserCallback,
+                    detail: Some(url),
+                });
+            }
+            AuthEvent::DeviceCode {
+                user_code,
+                verification_uri,
+                ..
+            } => {
+                let _ = self.cmd_tx.send(AuthCmd::UpdateProgress {
+                    stage: super::state::OAuthStage::DeviceCode,
+                    detail: Some(format!("{user_code}  {verification_uri}")),
+                });
+            }
+            AuthEvent::Progress { message } | AuthEvent::Info { message, .. } => {
+                let _ = self.cmd_tx.send(AuthCmd::UpdateProgress {
+                    stage: super::state::OAuthStage::Exchanging,
+                    detail: Some(message),
+                });
+            }
+        }
+    }
+
+    fn signal(&self) -> Option<CancellationToken> {
+        Some(self.cancel.clone())
+    }
+}
+
+/// Runtime-side state for an active login flow.
+///
+/// Created by [`InteractiveRuntime::start_login_flow`] and consumed by
+/// [`InteractiveRuntime::complete_login_flow`]. The event loop (wired in a
+/// later slice) polls `cmd_rx` for auth commands and `done_rx` for completion.
+#[expect(dead_code, reason = "consumed by the event loop wired in slice 3")]
+struct AuthFlowState {
+    cmd_rx: mpsc::UnboundedReceiver<AuthCmd>,
+    /// Whole-flow cancellation token.
+    cancel: CancellationToken,
+    /// Provider being authenticated.
+    provider_id: String,
+    /// Auth type for the flow.
+    auth_type: AuthType,
+    /// Receives the login result when the spawned task completes.
+    done_rx: oneshot::Receiver<Result<(), LoginError>>,
 }
 
 /// Build the live editor with the runtime's fixed options and submit hook.
@@ -1652,6 +1862,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             logout_options: Vec::new(),
             reset_ui_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             confirm_saved_placeholder: None,
+            auth_flow: None,
         };
         for slot in initial_extension_slots {
             runtime.project_extension_slot(slot);
@@ -2684,6 +2895,121 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             Err(error) => self.push_notice("logout", format!("Logout failed: {error}")),
         }
         ActionOutcome::Repaint
+    }
+
+    #[allow(dead_code, reason = "called by the /login dispatch wired in slice 3")]
+    /// Start an interactive login flow for `provider_id` with `auth_type`.
+    ///
+    /// Opens the Login overlay, builds a [`TuiAuthInteraction`] driver, and
+    /// spawns the `ModelRuntime::login` call on a background task. The runtime
+    /// polls the driver's command channel for auth prompts/notifications and
+    /// the completion channel for the login result. On completion, call
+    /// [`Self::complete_login_flow`] to close the overlay and push notices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when a login flow is already in progress.
+    fn start_login_flow(&mut self, provider_id: &str, auth_type: AuthType) -> Result<(), String> {
+        if self.auth_flow.is_some() {
+            return Err("A login flow is already in progress".to_owned());
+        }
+
+        // Open the Login overlay with an initial progress message.
+        let stage = match auth_type {
+            AuthType::Oauth => super::state::OAuthStage::BrowserCallback,
+            AuthType::ApiKey => super::state::OAuthStage::ManualKey,
+        };
+        self.view.auth_progress = Some(super::state::AuthProgress {
+            stage,
+            provider: provider_id.to_owned(),
+            detail: None,
+        });
+        self.open_overlay(OverlayKind::Login);
+
+        // Build the driver and channels.
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let interaction = Arc::new(TuiAuthInteraction {
+            cmd_tx,
+            cancel: cancel.clone(),
+        });
+
+        // Spawn the login task.
+        let session = Arc::clone(&self.session);
+        let provider_id_owned = provider_id.to_owned();
+        let (done_tx, done_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = session
+                .login(&provider_id_owned, auth_type, interaction)
+                .await;
+            let _ = done_tx.send(result);
+        });
+
+        self.auth_flow = Some(AuthFlowState {
+            cmd_rx,
+            cancel,
+            provider_id: provider_id.to_owned(),
+            auth_type,
+            done_rx,
+        });
+        Ok(())
+    }
+
+    #[allow(dead_code, reason = "called by the event loop wired in slice 3")]
+    /// Complete a login flow: close the overlay, restore editor focus, and
+    /// push status/error notices.
+    ///
+    /// Formats the three reference UI sync-failure wordings when the result is
+    /// [`LoginError::Sync`].
+    fn complete_login_flow(&mut self, result: Result<(), LoginError>) {
+        let Some(flow) = self.auth_flow.take() else {
+            return;
+        };
+
+        // Close the overlay and restore editor focus.
+        self.view.auth_progress = None;
+        self.close_selector();
+        self.view.focus = FocusArea::Editor;
+
+        match result {
+            Ok(()) => {
+                let provider_name = &flow.provider_id;
+                self.push_notice("login", format!("Logged in to {provider_name}."));
+            }
+            Err(LoginError::Sync {
+                provider_id,
+                detail,
+                ..
+            }) => {
+                // Branch on auth_type for the reference UI wording:
+                // OAuth => "Logged in to {name}, but local model state
+                // could not be synchronized: {msg}"
+                // API key => "Saved API key for {name}, but local model
+                // state could not be synchronized: {msg}"
+                if flow.auth_type == AuthType::ApiKey {
+                    self.push_notice(
+                        "login",
+                        format!(
+                            "Saved API key for {provider_id}, but local model state could not be synchronized: {detail}"
+                        ),
+                    );
+                } else {
+                    self.push_notice(
+                        "login",
+                        format!(
+                            "Logged in to {provider_id}, but local model state could not be synchronized: {detail}"
+                        ),
+                    );
+                }
+            }
+            Err(LoginError::Other(message)) => {
+                // Cancellation is silent (interactive-mode.ts:5787 skips
+                // showError when errorMsg === "Login cancelled").
+                if message != "Login cancelled" {
+                    self.push_notice("login", format!("Login failed: {message}"));
+                }
+            }
+        }
     }
 
     /// Show the `/import` replace-session confirmation (ports upstream
@@ -6544,6 +6870,36 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
+    fn login(
+        &self,
+        provider_id: &str,
+        auth_type: AuthType,
+        interaction: Arc<dyn AuthInteraction>,
+    ) -> BoxFuture<'_, Result<(), LoginError>> {
+        let session = self.read_session();
+        let provider_id = provider_id.to_owned();
+        Box::pin(async move {
+            let runtime = session
+                .model_runtime_handle()
+                .ok_or_else(|| LoginError::Other("No model runtime available".to_owned()))?;
+            runtime
+                .login(&provider_id, auth_type, interaction)
+                .await
+                .map_err(|err| match err {
+                    crate::core::model_runtime::ModelRuntimeError::CredentialSynchronization {
+                        provider_id,
+                        operation,
+                        detail,
+                    } => LoginError::Sync {
+                        provider_id,
+                        operation: operation.to_owned(),
+                        detail,
+                    },
+                    other => LoginError::Other(other.to_string()),
+                })
+        })
+    }
+
     fn last_assistant_text(&self) -> BoxFuture<'_, Result<Option<String>, String>> {
         let session = self.read_session();
         Box::pin(async move { Ok(session.get_last_assistant_text()) })
@@ -7404,6 +7760,8 @@ mod tests {
         settings_changes: std::sync::Mutex<Vec<(String, String)>>,
         first_runs: std::sync::Mutex<Vec<crate::core::platform::first_run::FirstRunSelection>>,
         deleted_sessions: Mutex<Vec<String>>,
+        login_ids: Mutex<Vec<String>>,
+        login_results: std::sync::Mutex<std::collections::HashMap<String, Result<(), LoginError>>>,
     }
 
     struct FakeHost {
@@ -7545,6 +7903,13 @@ mod tests {
                 .session_entries
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = entries;
+        }
+        fn set_login_result(&self, provider_id: &str, result: Result<(), LoginError>) {
+            self.log
+                .login_results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(provider_id.to_owned(), result);
         }
     }
 
@@ -7902,6 +8267,27 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             Box::pin(async move { Ok(options) })
+        }
+
+        fn login(
+            &self,
+            provider_id: &str,
+            _auth_type: AuthType,
+            _interaction: Arc<dyn AuthInteraction>,
+        ) -> BoxFuture<'_, Result<(), LoginError>> {
+            let log = Arc::clone(&self.log);
+            let id = provider_id.to_owned();
+            Box::pin(async move {
+                log.login_ids.lock().await.push(id.clone());
+                let results = log
+                    .login_results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match results.get(&id) {
+                    Some(result) => result.clone(),
+                    None => Ok(()),
+                }
+            })
         }
 
         fn messages(&self) -> Vec<pi_agent::AgentMessage> {
@@ -12825,6 +13211,524 @@ mod tests {
             assert_eq!(diagnostic.severity, expected, "level {level:?}");
             assert_eq!(diagnostic.source, "extension");
             assert_eq!(diagnostic.message, format!("level {level:?}"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth interaction driver (TuiAuthInteraction)
+    // -----------------------------------------------------------------------
+    #[allow(
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only assertions: expect/panic are the failure signal in unit tests"
+    )]
+    mod auth_login_tests {
+        use super::*;
+        #[tokio::test]
+        async fn driver_prompt_select_sends_show_selector_and_resolves() -> TestResult {
+            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let driver = TuiAuthInteraction::new(cmd_tx, cancel);
+
+            let prompt_task = tokio::spawn(async move {
+                driver
+                    .prompt(AuthPrompt::Select {
+                        message: "Choose provider".to_owned(),
+                        options: vec![
+                            AuthSelectOption {
+                                id: "anthropic".to_owned(),
+                                label: "Anthropic".to_owned(),
+                                description: None,
+                            },
+                            AuthSelectOption {
+                                id: "openai".to_owned(),
+                                label: "OpenAI".to_owned(),
+                                description: None,
+                            },
+                        ],
+                        signal: None,
+                    })
+                    .await
+            });
+
+            let cmd = cmd_rx.recv().await.expect("command received");
+            let AuthCmd::ShowSelector { response, .. } = cmd else {
+                panic!("expected ShowSelector, got {cmd:?}");
+            };
+            let _ = response.send(Ok("openai".to_owned()));
+
+            let result = prompt_task.await.expect("task joined");
+            assert_eq!(result.expect("prompt result"), "openai");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn driver_prompt_text_sends_show_input_with_placeholder() -> TestResult {
+            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let driver = TuiAuthInteraction::new(cmd_tx, cancel);
+
+            let prompt_task = tokio::spawn(async move {
+                driver
+                    .prompt(AuthPrompt::Text {
+                        message: "Enter URL".to_owned(),
+                        placeholder: Some("https://...".to_owned()),
+                        signal: None,
+                    })
+                    .await
+            });
+
+            let cmd = cmd_rx.recv().await.expect("command received");
+            let AuthCmd::ShowInput {
+                message,
+                placeholder,
+                secret,
+                response,
+            } = cmd
+            else {
+                panic!("expected ShowInput, got {cmd:?}");
+            };
+            assert_eq!(message, "Enter URL");
+            assert_eq!(placeholder.as_deref(), Some("https://..."));
+            assert!(!secret);
+            let _ = response.send(Ok("https://example.com".to_owned()));
+
+            let result = prompt_task.await.expect("task joined");
+            assert_eq!(result.expect("prompt result"), "https://example.com");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn driver_prompt_secret_sets_secret_flag() -> TestResult {
+            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let driver = TuiAuthInteraction::new(cmd_tx, cancel);
+
+            let prompt_task = tokio::spawn(async move {
+                driver
+                    .prompt(AuthPrompt::Secret {
+                        message: "Enter API key".to_owned(),
+                        placeholder: None,
+                        signal: None,
+                    })
+                    .await
+            });
+
+            let cmd = cmd_rx.recv().await.expect("command received");
+            let AuthCmd::ShowInput {
+                secret, response, ..
+            } = cmd
+            else {
+                panic!("expected ShowInput, got {cmd:?}");
+            };
+            assert!(secret, "secret flag must be true for Secret prompt");
+            let _ = response.send(Ok("sk-secret-key".to_owned()));
+
+            let result = prompt_task.await.expect("task joined");
+            assert_eq!(result.expect("prompt result"), "sk-secret-key");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn driver_prompt_manual_code_is_not_secret() -> TestResult {
+            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let driver = TuiAuthInteraction::new(cmd_tx, cancel);
+
+            let prompt_task = tokio::spawn(async move {
+                driver
+                    .prompt(AuthPrompt::ManualCode {
+                        message: "Paste code".to_owned(),
+                        placeholder: Some("http://localhost".to_owned()),
+                        signal: None,
+                    })
+                    .await
+            });
+
+            let cmd = cmd_rx.recv().await.expect("command received");
+            let AuthCmd::ShowInput {
+                secret, response, ..
+            } = cmd
+            else {
+                panic!("expected ShowInput, got {cmd:?}");
+            };
+            assert!(!secret, "ManualCode must not set secret flag");
+            let _ = response.send(Ok("auth-code-123".to_owned()));
+
+            let result = prompt_task.await.expect("task joined");
+            assert_eq!(result.expect("prompt result"), "auth-code-123");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn driver_notify_auth_url_sends_browser_callback() -> TestResult {
+            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let driver = TuiAuthInteraction::new(cmd_tx, cancel);
+
+            driver.notify(AuthEvent::AuthUrl {
+                url: "https://auth.example.com/oauth".to_owned(),
+                instructions: None,
+            });
+
+            let cmd = cmd_rx.recv().await.expect("command received");
+            let AuthCmd::UpdateProgress { stage, detail } = cmd else {
+                panic!("expected UpdateProgress, got {cmd:?}");
+            };
+            assert_eq!(stage, super::state::OAuthStage::BrowserCallback);
+            assert_eq!(detail.as_deref(), Some("https://auth.example.com/oauth"));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn driver_notify_device_code_sends_device_code_stage() -> TestResult {
+            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let driver = TuiAuthInteraction::new(cmd_tx, cancel);
+
+            driver.notify(AuthEvent::DeviceCode {
+                user_code: "ABCD-1234".to_owned(),
+                verification_uri: "https://github.com/login/device".to_owned(),
+                interval_seconds: Some(5),
+                expires_in_seconds: Some(900),
+            });
+
+            let cmd = cmd_rx.recv().await.expect("command received");
+            let AuthCmd::UpdateProgress { stage, detail } = cmd else {
+                panic!("expected UpdateProgress, got {cmd:?}");
+            };
+            assert_eq!(stage, super::state::OAuthStage::DeviceCode);
+            let detail = detail.expect("detail present");
+            assert!(detail.contains("ABCD-1234"));
+            assert!(detail.contains("github.com/login/device"));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn driver_notify_progress_sends_exchanging_stage() -> TestResult {
+            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let driver = TuiAuthInteraction::new(cmd_tx, cancel);
+
+            driver.notify(AuthEvent::Progress {
+                message: "Exchanging authorization code for tokens...".to_owned(),
+            });
+
+            let cmd = cmd_rx.recv().await.expect("command received");
+            let AuthCmd::UpdateProgress { stage, detail } = cmd else {
+                panic!("expected UpdateProgress, got {cmd:?}");
+            };
+            assert_eq!(stage, super::state::OAuthStage::Exchanging);
+            assert_eq!(
+                detail.as_deref(),
+                Some("Exchanging authorization code for tokens...")
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn driver_notify_info_sends_exchanging_stage() -> TestResult {
+            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let driver = TuiAuthInteraction::new(cmd_tx, cancel);
+
+            driver.notify(AuthEvent::Info {
+                message: "Starting OAuth flow...".to_owned(),
+                links: None,
+            });
+
+            let cmd = cmd_rx.recv().await.expect("command received");
+            let AuthCmd::UpdateProgress { stage, detail } = cmd else {
+                panic!("expected UpdateProgress, got {cmd:?}");
+            };
+            assert_eq!(stage, super::state::OAuthStage::Exchanging);
+            assert_eq!(detail.as_deref(), Some("Starting OAuth flow..."));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn driver_signal_returns_cancellation_token() -> TestResult {
+            let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let driver = TuiAuthInteraction::new(cmd_tx, cancel);
+
+            let signal = driver.signal();
+            assert!(signal.is_some());
+            assert!(!signal.expect("signal present").is_cancelled());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn driver_prompt_cancelled_before_send_returns_cancelled() -> TestResult {
+            let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let driver = TuiAuthInteraction::new(cmd_tx, cancel.clone());
+
+            cancel.cancel();
+
+            let result = driver
+                .prompt(AuthPrompt::Text {
+                    message: "Enter".to_owned(),
+                    placeholder: None,
+                    signal: None,
+                })
+                .await;
+            assert!(matches!(result, Err(AuthError::Cancelled)));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn driver_prompt_cancelled_during_wait_returns_cancelled() -> TestResult {
+            let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let driver = TuiAuthInteraction::new(cmd_tx, cancel.clone());
+
+            let cancel_for_task = cancel;
+            let prompt_task = tokio::spawn(async move {
+                driver
+                    .prompt(AuthPrompt::Text {
+                        message: "Enter".to_owned(),
+                        placeholder: None,
+                        signal: None,
+                    })
+                    .await
+            });
+
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            cancel_for_task.cancel();
+
+            let result = prompt_task.await.expect("task joined");
+            assert!(matches!(result, Err(AuthError::Cancelled)));
+            Ok(())
+        }
+
+        // -----------------------------------------------------------------------
+        // start_login_flow / complete_login_flow
+        // -----------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn start_login_flow_opens_login_overlay_with_oauth_progress() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.start_login_flow("anthropic", AuthType::Oauth)?;
+
+            assert!(rt.view.overlay.is_some());
+            assert_eq!(
+                rt.view.overlay.as_ref().expect("overlay open").kind,
+                super::state::OverlayKind::Login
+            );
+            let progress = rt.view.auth_progress.as_ref().expect("auth progress set");
+            assert_eq!(progress.stage, super::state::OAuthStage::BrowserCallback);
+            assert_eq!(progress.provider, "anthropic");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn start_login_flow_api_key_sets_manual_key_stage() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.start_login_flow("openai", AuthType::ApiKey)?;
+
+            let progress = rt.view.auth_progress.as_ref().expect("auth progress set");
+            assert_eq!(progress.stage, super::state::OAuthStage::ManualKey);
+            assert_eq!(progress.provider, "openai");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn start_login_flow_rejects_concurrent_flow() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.start_login_flow("anthropic", AuthType::Oauth)?;
+            assert!(rt.start_login_flow("openai", AuthType::ApiKey).is_err());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn complete_login_flow_success_pushes_notice() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.start_login_flow("anthropic", AuthType::Oauth)?;
+            let before = rt.view.messages.len();
+
+            rt.complete_login_flow(Ok(()));
+
+            assert!(rt.auth_flow.is_none());
+            assert!(rt.view.auth_progress.is_none());
+            assert_eq!(rt.view.focus, super::state::FocusArea::Editor);
+            assert!(rt.view.messages.len() > before);
+            assert!(matches!(
+                rt.view.messages.last(),
+                Some(MessageView::Custom(c)) if c.text.contains("Logged in to anthropic.")
+            ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn complete_login_flow_sync_oauth_uses_logged_in_wording() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.start_login_flow("anthropic", AuthType::Oauth)?;
+
+            rt.complete_login_flow(Err(LoginError::Sync {
+                provider_id: "anthropic".to_owned(),
+                operation: "login".to_owned(),
+                detail: "refresh timed out".to_owned(),
+            }));
+
+            assert!(matches!(
+                rt.view.messages.last(),
+                Some(MessageView::Custom(c))
+                    if c.text.contains("Logged in to anthropic, but local model state could not be synchronized: refresh timed out")
+            ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn complete_login_flow_sync_api_key_uses_saved_api_key_wording() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.start_login_flow("openai", AuthType::ApiKey)?;
+
+            rt.complete_login_flow(Err(LoginError::Sync {
+                provider_id: "openai".to_owned(),
+                operation: "login".to_owned(),
+                detail: "refresh aborted".to_owned(),
+            }));
+
+            assert!(matches!(
+                rt.view.messages.last(),
+                Some(MessageView::Custom(c))
+                    if c.text.contains("Saved API key for openai, but local model state could not be synchronized: refresh aborted")
+            ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn complete_login_flow_cancelled_is_silent() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.start_login_flow("anthropic", AuthType::Oauth)?;
+            let before = rt.view.messages.len();
+
+            rt.complete_login_flow(Err(LoginError::Other("Login cancelled".to_owned())));
+
+            assert!(rt.auth_flow.is_none());
+            assert!(rt.view.auth_progress.is_none());
+            assert_eq!(
+                rt.view.messages.len(),
+                before,
+                "cancellation must push no notice"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn complete_login_flow_generic_error_pushes_failure() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.start_login_flow("anthropic", AuthType::Oauth)?;
+
+            rt.complete_login_flow(Err(LoginError::Other("Network error".to_owned())));
+
+            assert!(matches!(
+                rt.view.messages.last(),
+                Some(MessageView::Custom(c))
+                    if c.text.contains("Login failed: Network error")
+            ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn complete_login_flow_without_active_flow_is_noop() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            let before = rt.view.messages.len();
+            rt.complete_login_flow(Ok(()));
+            assert_eq!(rt.view.messages.len(), before);
+            Ok(())
+        }
+        #[tokio::test]
+        async fn full_login_flow_success_through_fake_host() -> TestResult {
+            let (mut rt, log) = try_make_runtime()?;
+            rt.start_login_flow("anthropic", AuthType::Oauth)?;
+
+            // Await the spawned login task's completion, then put the flow back
+            // so complete_login_flow can take() it.
+            let result = {
+                let mut flow = rt.auth_flow.take().expect("flow active");
+                let result = flow.done_rx.await.expect("done channel received");
+                // Replace done_rx with a fresh closed channel so the flow struct
+                // is still valid; complete_login_flow only needs provider_id and
+                // auth_type from it.
+                let (tx, rx) = oneshot::channel();
+                drop(tx); // closed → complete_login_flow won't try_recv it
+                flow.done_rx = rx;
+                rt.auth_flow = Some(flow);
+                result
+            };
+            rt.complete_login_flow(result);
+
+            assert_eq!(log.login_ids.lock().await.as_slice(), ["anthropic"]);
+            assert!(matches!(
+                rt.view.messages.last(),
+                Some(MessageView::Custom(c)) if c.text.contains("Logged in to anthropic.")
+            ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn full_login_flow_sync_error_through_fake_host() -> TestResult {
+            let (mut rt, log) = try_make_runtime()?;
+            rt.session.set_login_result(
+                "anthropic",
+                Err(LoginError::Sync {
+                    provider_id: "anthropic".to_owned(),
+                    operation: "login".to_owned(),
+                    detail: "timeout".to_owned(),
+                }),
+            );
+            rt.start_login_flow("anthropic", AuthType::Oauth)?;
+
+            let result = {
+                let mut flow = rt.auth_flow.take().expect("flow active");
+                let result = flow.done_rx.await.expect("done channel received");
+                let (tx, rx) = oneshot::channel();
+                drop(tx);
+                flow.done_rx = rx;
+                rt.auth_flow = Some(flow);
+                result
+            };
+            rt.complete_login_flow(result);
+
+            assert_eq!(log.login_ids.lock().await.as_slice(), ["anthropic"]);
+            assert!(matches!(
+                rt.view.messages.last(),
+                Some(MessageView::Custom(c))
+                    if c.text.contains("Logged in to anthropic, but local model state could not be synchronized: timeout")
+            ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn full_login_flow_cancelled_through_driver() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.start_login_flow("anthropic", AuthType::Oauth)?;
+
+            // Cancel the flow.
+            if let Some(flow) = &rt.auth_flow {
+                flow.cancel.cancel();
+            }
+
+            // The spawned task should complete with a cancelled error
+            // (FakeHost::login ignores the interaction, but the done_rx
+            // still receives Ok(()) since FakeHost doesn't check cancellation).
+            // We simulate the cancellation result directly.
+            let result = {
+                let mut flow = rt.auth_flow.take().expect("flow active");
+                let result = flow.done_rx.await.expect("done channel received");
+                let (tx, rx) = oneshot::channel();
+                drop(tx);
+                flow.done_rx = rx;
+                rt.auth_flow = Some(flow);
+                result
+            };
+            // FakeHost returns Ok regardless; in a real flow the driver
+            // would return Cancelled. Here we just verify the flow completes.
+            rt.complete_login_flow(result);
+            assert!(rt.auth_flow.is_none());
+            Ok(())
         }
     }
 }

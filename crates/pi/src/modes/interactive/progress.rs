@@ -118,7 +118,13 @@ pub fn auth_stage_message(progress: &AuthProgress, th: &ResolvedTheme) -> String
             }
         }
         OAuthStage::ManualKey => format!("Enter API key for {}:", progress.provider),
-        OAuthStage::Exchanging => format!("Exchanging token for {}…", progress.provider),
+        OAuthStage::Exchanging => {
+            if let Some(detail) = progress.detail.as_deref() {
+                detail.to_owned()
+            } else {
+                format!("Exchanging token for {}…", progress.provider)
+            }
+        }
         OAuthStage::Done => format!("Logged in to {}.", progress.provider),
         OAuthStage::Failed => {
             let base = format!("Failed to log in to {}.", progress.provider);

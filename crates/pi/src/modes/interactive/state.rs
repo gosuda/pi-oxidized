@@ -91,6 +91,8 @@ pub struct ViewState {
     /// braille animation; `Some` with a single frame renders a static
     /// indicator (TUI-T11 reduced-motion mechanism per TUI-G1 decision).
     pub indicator_frames: Option<Vec<String>>,
+    /// Active auth/login progress (drives the Login overlay content).
+    pub auth_progress: Option<AuthProgress>,
 }
 
 /// Header view-model data.
@@ -591,6 +593,7 @@ impl ViewState {
             working_visible: true,
             hyperlinks: false,
             indicator_frames: None,
+            auth_progress: None,
         }
     }
 
