@@ -1853,6 +1853,31 @@ mod tests {
         assert_eq!(payload["store"], false);
         assert_eq!(payload["tool_choice"], "required");
     }
+    #[test]
+    fn stream_options_follow_usage_in_streaming_support() {
+        let options = StreamOptions::default();
+        // Present by default (reference treats unset as supported).
+        let supported = model("openai");
+        let payload = build_payload(
+            &supported,
+            &Context::default(),
+            &options,
+            &Compat::resolve(&supported),
+            CacheRetention::None,
+        );
+        assert_eq!(payload["stream_options"], json!({"include_usage":true}));
+        // Absent once catalog compat opts out.
+        let mut unsupported = model("openai");
+        unsupported.compat = Some(json!({"supportsUsageInStreaming":false}));
+        let payload = build_payload(
+            &unsupported,
+            &Context::default(),
+            &options,
+            &Compat::resolve(&unsupported),
+            CacheRetention::None,
+        );
+        assert_eq!(payload.get("stream_options"), None);
+    }
 
     #[test]
     fn openrouter_omits_reasoning_when_off_level_is_null() {
