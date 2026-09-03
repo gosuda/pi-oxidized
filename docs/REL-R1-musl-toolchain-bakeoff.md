@@ -432,10 +432,6 @@ names. Primary-source verification performed 2026-08-27:
 | crates.io API | cargo-zigbuild 0.23.0 checksum | matches pin `68c7df45...`; not yanked |
 | GitHub runner-images README | `ubuntu-24.04-arm` | available (arm64) |
 
-All four aarch64 direct-download artifacts were downloaded and sha256-verified
-on the x86_64 host. Build and smoke execution is pending REL-T3 CI on
-`ubuntu-24.04-arm`.
-
 ### musl.cc probe (Candidate C rejection evidence)
 
 ```

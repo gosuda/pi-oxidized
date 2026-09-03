@@ -58,9 +58,6 @@ outputs.
 
 ## Doc-evidence run
 
-The checker emits one run manifest only after every row passes. A failed run
-removes any prior manifest before evaluation.
-
 | Field | Value |
 |---|---|
 | Schema | `pi.docs.evidence.run.v1` |
@@ -70,13 +67,6 @@ removes any prior manifest before evaluation.
 | Canonical ledger hash | `1c1d5479cecca4568888b3929b7e0648ea653493f595f4890c8d8aa125e11ac3` |
 | Ledger file SHA-256 | `b05b3948e6cec7294d8027abf33ebe567eed05482095754032dd32af0b0a459e` |
 | Run manifest | `target/verification/docs-evidence/run-manifest.json` |
-
-The manifest sorts its 77 entries by row ID. Each entry binds the row's
-`present` status to the fresh sidecar content hash. A passed compatibility
-matrix embeds the validated manifest as `docsEvidence` in
-`target/verification/compat-matrix/result.json`. The existing release workflow
-retains that file in its `compatibility-performance-x86_64-unknown-linux-gnu`
-artifact.
 
 ## Prerequisite closure evidence
 
@@ -112,6 +102,5 @@ The audit file SHA-256 is
 
 ## Boundary
 
-The DOC-F change contains no `examplesSource`, no `examples/` tree, and no edit
-under `scripts/release/` or `.github/workflows/`. Release code remains owned by
-REL-DOCS and REL-CLOSE.
+The DOC-F change contains no `examplesSource`, no `examples/` tree. Release
+code remains owned by REL-DOCS and REL-CLOSE.

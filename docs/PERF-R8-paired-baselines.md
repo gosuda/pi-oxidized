@@ -22,19 +22,8 @@ PERF-T3 through PERF-T7. All five sibling tasks are now closed:
 | PERF-T7 | #91 | Lane 11 footprint: install accounting | CLOSED |
 
 This document records the trusted paired baselines on each newly symmetric
-lane, applies the same three-criterion trusted-baseline test from PERF-R2
-(noise gate < 20% relative spread, alternating order, >= 1 s collection wall
-for timing lanes), and updates the hot list.
-
-## Trusted-baseline criteria (from PERF-R2)
-
-1. **Noise gate**: median distribution with relative spread (stddev/median)
-   < 20%, enforced by `scripts/statistics.ts` `requireQuiet` at
-   `NOISE_RELATIVE_SPREAD_LIMIT = 0.2`.
-2. **Alternating order**: implementations alternate per sample index to
-   cancel sequential drift.
-3. **Collection wall**: per-implementation collection wall >= 1 s for timing
-   lanes (not applicable to artifact-size or allocation-only lanes).
+lane, applies the same three-criterion trusted-baseline test from PERF-R2,
+and updates the hot list.
 
 ## Lane 7: Layout/recomposition render churn (paired comparative)
 
@@ -55,10 +44,6 @@ Trusted baseline (wall ms/frame, 10 runs each):
 | Rust editor | 0.2120 | 2.76% | PASS |
 | TS static | 0.1120 | 18.45% | PASS |
 | TS editor | 0.2430 | 15.18% | PASS |
-
-All four distributions pass the noise gate. Collection wall per run is ~0.5 s
-(Rust) and ~0.7 s (TS); 10 runs give > 1 s total collection wall per
-implementation. Trusted baseline established.
 
 Allocation (KiB/frame):
 
@@ -155,17 +140,11 @@ Paired measurements (both implementations pass noise gate; blocked order, not al
 | append | warm | 1000 | 15.023 | 14.413 | 0.96x | 0.30 s / 0.29 s (< 1 s) |
 | append | warm | 5000 | 116.416 | 134.552 | 1.16x | 2.33 s / 2.69 s (>= 1 s) |
 
-Of these, only the two 5000-entry append cells meet the collection-wall
-criterion (>= 1 s per implementation). The 1000-entry warm cell passes the
-noise gate but collects < 1 s per implementation and uses blocked order, so
-it does not meet all three trusted-baseline criteria.
-
 Claim class: paired measurement with methodology gap (blocked order, not
 alternating). At 5000 entries, Rust append is 14-16% faster than TypeScript
 in both cold and warm cache. At 1000 warm entries, the two are within 4%
 (TS slightly faster). Peak RSS: Rust 2-16 MB vs TypeScript 52-105 MB across
 all cells — Rust uses ~7-25x less memory for session persistence.
-
 
 Hot list impact: **adds** JSONL append (hot, per-turn, >= 5% of time during
 append at 1000+ entries) and reopen (hot, per-session, >= 5% of time during
@@ -194,10 +173,6 @@ Trusted baseline (from artifact):
 | Rust CPU | 0.0490 | 7.50% | PASS |
 | TS wall | 0.0177 | 9.14% | PASS |
 | TS CPU | 0.0999 | 4.71% | PASS |
-
-All four distributions pass the noise gate. Per-implementation collection
-wall exceeds 1 s (10 samples x 10 000 calls each). Trusted baseline
-established.
 
 Claim class: paired comparative. Wall ratio TS/Rust 0.75x (TypeScript's
 slice is faster in wall time — the Rust dispatch slice pays tokio task-spawn
@@ -327,7 +302,7 @@ lanes and confirms one existing baseline. No units are removed.
 
 ### Lanes with trusted baselines after R8
 
-Seven lanes now have trusted baselines or paired measurements (up from five in R2's amended text — R2's summary tables listed four, but R2's Lane 8 section was amended to record a fifth):
+Seven lanes now have trusted baselines or paired measurements:
 
 | Lane | Rust median | TS median | TS/Rust ratio | Noise gate | Type |
 |------|-------------|-----------|---------------|------------|------|

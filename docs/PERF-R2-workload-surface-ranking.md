@@ -50,8 +50,6 @@ Trusted baseline (from artifact):
 | Rust warm | 40.93 | 3.86% | pass | ~2.5 s |
 | TS warm | 535.01 | 8.84% | pass | ~32.1 s |
 
-All four distributions pass the noise gate. The Rust cold collection is borderline at ~0.8 s; the paired TypeScript cold collection exceeds 1 s, and the warm collections for both implementations exceed 1 s. The lane has a trusted baseline.
-
 Ranked time share: one-time startup cost. Negligible in long sessions; dominant in short `--version`-class invocations. Ranked 8/11 by session time share (startup is a fixed cost, not a sustained loop).
 
 Hot/cold unit split:
@@ -63,8 +61,6 @@ Hot/cold unit split:
 | CLI argument parsing | Hot | Executes on every invocation regardless of cache |
 | Version lookup | Hot | In-memory constant-time path |
 | One output write + clean exit | Hot | Executes on every invocation |
-
-Cold units dominate: Rust cold is approximately warm (40.07 vs 40.93), TS cold is approximately warm (540.42 vs 535.01), confirming runtime loading is the dominant cost and cache-drop has minimal marginal effect.
 
 Claim class: paired comparative. Speedup TS/Rust: cold 13.49x, warm 13.07x.
 
@@ -89,8 +85,6 @@ Trusted baseline (from artifact):
 | Rust warm | 248.36 | 2.53% | pass | ~8.7 s |
 | TS warm | 600.24 | 6.43% | pass | ~21.0 s |
 
-All pass. Trusted baseline established.
-
 Ranked time share: one-time per session. For a 30-minute coding session, ~0.4 s (Rust) is <0.02% of wall time. For a 5-second short session, it is ~5%. Ranked 7/11 by session time share.
 
 Hot/cold unit split:
@@ -102,8 +96,6 @@ Hot/cold unit split:
 | Model/provider construction | Hot | Every invocation (offline stub) |
 | TUI construction + layout | Hot | Every invocation; scales with component tree |
 | First terminal paint (synchronized output) | Hot | Every invocation; I/O-bound |
-
-Cold-warm delta: Rust +4.75 ms (243.61 to 248.36), TS +47.59 ms (552.65 to 600.24). The TS warm path is 10x more affected by warmup, suggesting JIT/initialization work that the Rust binary does not have. Hot units: TUI construction, layout, first paint. Cold units: process creation, runtime loading.
 
 Claim class: paired comparative. Speedup TS/Rust: cold 2.27x, warm 2.42x.
 
@@ -126,7 +118,7 @@ Trusted baseline (from artifact):
 | Rust | 1.133 | 5.13% | pass | ~11.8 s (23 x 512 ms minimum) |
 | TS | 2.441 | 3.59% | pass | ~11.8 s |
 
-All pass. Trusted baseline established. Threshold validity confirmed: zero starvation samples in either implementation (`thresholdValid: true`).
+Threshold validity confirmed: zero starvation samples in either implementation (`thresholdValid: true`).
 
 Ranked time share: sustained dominant workload during active model interaction. During a streaming turn, this is approximately 60 to 80% of wall time. Ranked 1/11 by session time share.
 
@@ -141,7 +133,7 @@ Hot/cold unit split:
 | Session JSONL append (persistence) | Hot | Per-frame; input-scaling |
 | Process startup | Cold | One-time per sample |
 
-All per-frame units are hot (>=5% of time, input-scaling). The 512 ms injected delay (256 x 2 ms) is wall time but not CPU, so CPU/frame is the clean implementation metric.
+The 512 ms injected delay (256 x 2 ms) is wall time but not CPU, so CPU/frame is the clean implementation metric.
 
 Claim class: paired comparative. Speedup TS/Rust: 2.16x.
 
@@ -168,7 +160,7 @@ Hot/cold unit split:
 | Input dispatch to state mutation | Hot | Per-keystroke |
 | Terminal diff/encode/write (paint) | Hot | Per-keystroke |
 
-All units are hot. No cold units (process is already warm; this is a steady-state interactive measurement).
+No cold units (process is already warm; this is a steady-state interactive measurement).
 
 Claim class: single-implementation regression floor. The p99 threshold is 5 ms (current p99: 2.59 ms, passes the regression floor). No comparative claim is supportable because no TypeScript peer exists. The noise-gate failure means the current distribution cannot feed a verdict; remediation requires pinning CPU governor, isolating the process, widening sample counts, or enlarging the input.
 
@@ -195,7 +187,7 @@ Trusted baseline: none. All seven measured timed distributions fail the noise ga
 | active20 frame | 0.018 | 34.4% | FAIL |
 | fast terminalInput | 0.024 | 46.5% | FAIL |
 
-The artifact is rejected as noise (the `requireQuiet` gating set covers five distributions; the active20 keypress and frame distributions are reported in the artifact but not gated by the script). Sub-millisecond medians with high jitter are inherent to the current sample size and input granularity. Collection wall per scenario is < 1 s.
+The artifact is rejected as noise (the `requireQuiet` gating set covers five distributions; the active20 keypress and frame distributions are reported in the artifact but not gated by the script). Sub-millisecond medians with high jitter are inherent to the current sample size and input granularity.
 
 Ranked time share: per-input-event overhead. During active interaction with extensions, this is per-keystroke overhead. Ranked 5/11 by session time share (amortized over the extension fan-out).
 
@@ -210,7 +202,7 @@ Hot/cold unit split:
 | Widget callback + UI-slot traffic | Hot | Per-frame when active |
 | Timeout/locality correctness | Cold | One-time correctness assertion (slow path) |
 
-Claim class: single-implementation regression floor (TypeScript `ExtensionHost` only). No Rust peer executes the same frames. The Rust `serve_io` scaling suite (lane 6) covers the production server path but does not produce timed distributions. Remediation for the noise gate: enlarge the input (heavier per-request work), widen sample counts, or pin CPU governor.
+Claim class: single-implementation regression floor (TypeScript `ExtensionHost` only). No Rust peer executes the same frames. The Rust `serve_io` scaling suite (lane 6) covers the production server path but does not produce timed distributions.
 
 ### Lane 6: Rust `serve_io` scaling (D8-blocked)
 
@@ -252,7 +244,7 @@ Hot/cold unit split:
 | NullTerminal write (discard) | Hot | Per-frame (counts bytes only) |
 | V8 heap profiler sampling | Cold | One-time setup per scenario |
 
-All per-frame units are hot. The static scenario measures pure recomposition churn; the editor scenario adds one text mutation per frame.
+The static scenario measures pure recomposition churn; the editor scenario adds one text mutation per frame.
 
 Claim class: D8-blocked. Upstream-only; no symmetric Rust benchmark. PERF-T3 (#89) will build the Rust peer with the same tree, viewport, warmups, frame count, and scenarios. Until then, this lane is an explicit non-claim.
 
@@ -279,8 +271,6 @@ Trusted baseline (from `target/bench/tool-dispatch.json`, 2026-08-27, Xeon Gold 
 | Rust CPU | 0.05 | 5.52% | pass |
 | TypeScript CPU | 0.102231 | 4.05% | pass |
 
-All four distributions pass the noise gate; per-implementation collection wall exceeds 1 s (10 samples × 10 000 calls each); order alternates per sample.
-
 Claim class: paired comparative. Wall ratio TS/Rust 0.77x (TypeScript's slice is faster in wall time); CPU ratio TS/Rust 2.04x (Rust uses half the CPU per call). Recorded as lane data — the Rust dispatch slice pays tokio task-spawn scheduling for the production parallel batch path, while upstream executes the batch on promises. Both implementations reject the shared invalid payload (`count: 999`) during argument validation with `update=0` and an error result per call; upstream additionally coerces mistyped primitives (TypeBox `Value.Convert`) where Rust rejects them — a recorded validation divergence, kept out of the timed payload.
 
 ### Lane 9: Session persistence/reopen (D8-blocked)
@@ -306,7 +296,7 @@ Hot/cold unit split:
 | Session/tree state reconstruction | Hot | Per-session; input-scaling |
 | Page-cache warm/cold | Cold | Cache-dependent; requires explicit warm/cold lanes |
 
-All persistence units are hot (>=5% of time during append/reopen). The cold-cache lane (page-cache miss on reopen) is a cold unit that requires explicit instrumentation.
+The cold-cache lane (page-cache miss on reopen) is a cold unit that requires explicit instrumentation.
 
 Claim class: D8-blocked. Composite evidence exists; no isolated timed boundary. PERF-T4 (#86) will add isolated session append and reopen timing lanes. Until then, this lane is an explicit non-claim.
 
@@ -378,8 +368,6 @@ Claim class: paired comparative, carefully named. The comparison supports "Rust 
 
 ## Lanes with trusted baselines
 
-Four lanes (1, 2, 3, 11) have trusted baselines. Three are paired comparative timing lanes; one is an artifact-size comparison.
-
 | Lane | Rust median | TS median | TS/Rust ratio | Noise gate | Alternating | >=1 s wall |
 |---|---|---|---|---|---|---|
 | Startup `--version` (cold) | 40.07 ms | 540.42 ms | 13.49x | pass | yes | yes (TS) |
@@ -410,8 +398,6 @@ Four lanes (1, 2, 3, 11) have trusted baselines. Three are paired comparative ti
 | `pi-ext` | 3, 5, 6 | 3 | 5 | 6 |
 | `pi-ai` | 2, 3, 8, 9, 10 | 2, 3 | none | 8, 9, 10 |
 | `pi-agent` | 3, 8 | 3 | none | 8 |
-
-All five crates have at least one paired comparative lane with a trusted baseline (lane 3 crosses all five crates). `pi-agent` has no standalone lane; its tool-dispatch path is measured through lane 8 (`pi` entry, `pi-agent` dispatch).
 
 ## Evidence provenance
 

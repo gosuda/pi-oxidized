@@ -324,11 +324,7 @@ the conhost-reap condition). The repo's shipped testkit already pins the
 conhost-specific pieces (`ConhostVtDec2026Fallback` profile, alt-buffer-aware
 snapshots) that make the assertions deterministic, and the windows-2025
 transcript leg already exercises the same portable-pty ConPTY driver against
-the fixture. The word *provisional* is load-bearing: this GO is derived from
-the exact vendored portable-pty 0.9.0 source, `microsoft/terminal@main`, and
-Microsoft Learn — it is not an executed windows-latest transcript. REL-T7
-converts it to a final GO by running the harness on windows-latest and
-requiring exit 0 with the artifacts of §2.
+the fixture. REL-T7 converts this to a final GO by running the harness on windows-latest and requiring exit 0 with the artifacts of §2.
 
 ### 5.2 Conditions attached to the GO (all implementable in REL-T7 wiring)
 

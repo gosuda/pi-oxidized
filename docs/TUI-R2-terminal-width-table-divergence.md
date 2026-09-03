@@ -12,8 +12,6 @@ External evidence resolved: 2026-08-26 (terminal versions from each project's re
 
 The width contract in `crates/pi-tui/src/text/width.rs` stays **terminal-agnostic**: it is the single width oracle for rails, table borders, truncation, and cursor accounting, and it is not branched per terminal. Of the six parity-gate terminals (kitty, iTerm2, WezTerm, Terminal.app, Windows Terminal, alacritty), only kitty matches the contract on all four axes; iTerm2, WezTerm, alacritty, and Windows Terminal diverge on the emoji axis (ledger D-1..D-6), and Terminal.app is provisional on every axis pending the darwin spot-check. Every divergence becomes a **documented parity-gated terminal list entry plus a TUI-P5 limitations-table row** — never a per-terminal special case, and never a runtime escape-sequence patch: pi must not emit `OSC 1337 ; UnicodeVersion=N` (or any other per-terminal mode escape) to coerce a host width table.
 
-This record is the only deliverable of TUI-R2: a survey, a probe corpus, a verdict matrix, and routing. No `.rs`, protocol, verification-script, or ledger file changes.
-
 ## 2. The width.rs contract under survey
 
 Contract owner: `grapheme_width` / `visible_width` / `normalize_terminal_output` in `crates/pi-tui/src/text/width.rs`, pinned to `unicode-width = "=0.2.2"` (`crates/pi-tui/Cargo.toml:25`). The module doc (width.rs:1-5) declares parity with the reference TypeScript helpers `graphemeWidth` / `visibleWidth` (`.references/pi-2.0/packages/tui/src/utils.ts:174-235`, `:240-295` at `853a80d26c90a14c1886f0ebb8ffaae133ca2185`) and `normalizeTerminalOutput` (utils.ts:379-384) — those TS helpers are the parity target this survey measures against, via the Rust contract's identical rules.
@@ -65,7 +63,6 @@ Derivations: P3/P4/P5/P6 follow `east_asian_width` per code point; P7/P8 are zer
 - Width tables are generated from Unicode 17 data by `gen/wcwidth.py` (kitty has shipped Unicode 17 tables since 0.44; changelog). Ambiguous defaults narrow → axis A matches.
 - `wcswidth.c` implements the emoji-presentation upgrade: VS16 sequences (P9) resolve to 2 columns, ZWJ clusters (P10) are measured as one emoji cell (2), and regional indicators are wide — RI pair (P11) 2 and singleton RI (P12) 2.
 - Thai/Lao: U+0E33/U+0EB3 carry the generated table's default width of 1 column each, so the P13 clusters total 1 + 1 = 2 columns — axis D matches.
-- **All four axes MATCH.**
 
 ### 4.2 iTerm2 — 3.6.11 (stable, 2026-06-02)
 
@@ -74,14 +71,12 @@ Derivations: P3/P4/P5/P6 follow `east_asian_width` per code point; P7/P8 are zer
 - VS16: `ScreenChar.m` upgrades a base + U+FE0F pair to a double-width cell → P9 = 2. RI pair renders as the flag glyph at 2 columns (P11 = 2).
 - **No ZWJ merge**: each constituent of a family sequence is measured separately at 2 columns → P10 = **8 columns** vs contract 2 → axis C diverges (D-1). Singleton RI (P12) is measured by the table as 1 in ambiguous-off configs and stays protocol-pending; the axis verdict is already D from P10.
 - Thai/Lao AM cluster allocates 1 + 1 → axis D matches.
-- **Axes A/B/D MATCH; axis C DIVERGES (D-1).**
 
 ### 4.3 WezTerm — rolling release (no version number exists to pin)
 
 - Documentation (`unicode_version` config): default is **Unicode 9**, chosen for cross-terminal consistency; **emoji/text presentation selectors (VS15/VS16) influence width only when `unicode_version >= 14`**.
 - At the default config, P9 (❤️) measures **1 column** vs contract 2 → axis C diverges at default config (D-2). With `unicode_version = 14+` it measures 2 — a config axis, so the spot-check captures both settings (§6.2).
 - Ambiguous widening is an opt-in option, default off → axis A matches. ZWJ family, RI pair, wide, and Thai/Lao AM all match (WezTerm clusters emoji sequences).
-- **Axes A/B/D MATCH; axis C DIVERGES at default config (D-2).**
 
 ### 4.4 Terminal.app — closed source
 
@@ -92,14 +87,12 @@ Derivations: P3/P4/P5/P6 follow `east_asian_width` per code point; P7/P8 are zer
 - `CodepointWidthDetector` (measurement mode defaults to **Graphemes**): cluster-level measurement, `_ambiguousWidth = 1` → axis A matches.
 - Explicit width lookup gives U+FE0F width 2 → P9 = 2; the ZWJ family cluster measures 2 (P10); RI pair 2 (P11). The width table's only per-codepoint override is U+FE0F, and regional indicators carry their UAX#11 Neutral width of 1, so a singleton RI (P12) measures **1 column** vs contract 2 → axis C diverges (D-6); the §6 capture graduates this cell.
 - Wide/fullwidth = 2; Thai/Lao AM cluster allocates 2 columns → axes B/D match.
-- **Axes A/B/D MATCH; axis C DIVERGES (D-6).**
 
 ### 4.6 alacritty — v0.17.0 (stable, 2026-04-06)
 
 - Width is per-code-point `UnicodeWidthChar::width` from the `unicode-width` release resolved in `Cargo.lock`; there is no grapheme-cluster summation.
 - Ambiguous = 1 and wide/fullwidth = 2 come from the same East-Asian data family as this crate's contract → axes A/B match. Thai (U+0E33) and Lao (U+0EB3) are East-Asian Neutral = 1 per code point, so a P13 cluster allocates 1 + 1 = 2 → axis D matches.
 - **Axis C diverges on three sub-probes**: P10 family = 4 × 2 = **8 columns** (D-3); P9 VS16 = base 1 + FE0F 0 = **1 column** (D-4); P12 singleton RI = **1 column** (D-5). The RI pair (P11) does sum to 2 and matches.
-- **Axes A/B/D MATCH; axis C DIVERGES (D-3, D-4, D-5).**
 
 ## 5. Verdict matrix and divergence ledger
 
@@ -118,8 +111,6 @@ M = match (observed columns equal contract columns), D = diverge, P = provisiona
 
 ### 5.2 Divergence ledger D-1..D-6
 
-Every row routes to exactly the parity-gated terminal list plus a TUI-P5 limitations-table entry. None routes to a width.rs change, a per-terminal branch, a new `CapabilityProfile` variant, or an emitted escape.
-
 | ID | Divergence (observed vs contract) | Terminals | Probe | Disposition |
 | --- | --- | --- | --- | --- |
 | D-1 | ZWJ family = 8 cols vs 2 (no ZWJ merge) | iTerm2 3.6.11 | P10 | Parity-gated terminal list + TUI-P5 entry |
@@ -128,7 +119,6 @@ Every row routes to exactly the parity-gated terminal list plus a TUI-P5 limitat
 | D-4 | VS16 emoji = 1 col vs 2 (FE0F width 0 per-codepoint) | alacritty v0.17.0 | P9 | Parity-gated terminal list + TUI-P5 entry |
 | D-5 | Singleton RI = 1 col vs 2 | alacritty v0.17.0 | P12 | Parity-gated terminal list + TUI-P5 entry |
 | D-6 | Singleton RI = 1 col vs 2 (no RI override; only U+FE0F is forced wide) | Windows Terminal v1.24.11911.0 | P12 | Parity-gated terminal list + TUI-P5 entry |
-**OSC 1337 prohibition (explicit).** WezTerm and iTerm2 accept a `UnicodeVersion` escape (`OSC 1337`). Emitting it to realign a host width table would be a per-terminal code special case mutating user configuration out of band. pi and pi-tui must never emit it; divergences are documented, not patched.
 
 **Terminal.app P rows are not ledger entries.** A P cell is unresolved, not divergent; it graduates to M or D only through §6 captures.
 
@@ -154,8 +144,5 @@ The limitations-table owner receives D-1..D-6 as rows: terminal, version, probe,
 
 ### 7.3 Frozen five-row Tier N topology
 
-The runner topology stays frozen at the five `RowId` rows — `gnu-x64`, `gnu-arm64`, `darwin-x64`, `darwin-arm64`, `windows-x64` (`docs/tui-transcript-schema-v1.md` §6). Divergence handling adds documentation and limitations rows only: never a runner row, never a `CapabilityProfile` variant (`crates/pi-tui/src/testkit/transcript.rs:127-142`), never a width.rs branch.
+The runner topology stays frozen at the five `RowId` rows — `gnu-x64`, `gnu-arm64`, `darwin-x64`, `darwin-arm64`, `windows-x64` (`docs/tui-transcript-schema-v1.md` §6).
 
-## 8. Scope
-
-TUI-R2 changes no source. `width.rs` is the surveyed contract, not an edit target; the testkit, protocol, verification scripts, gate ledgers, and issue state are untouched. This record — contract, corpus, matrix, ledger, protocol, and routing — is the deliverable, and every verdict it asserts is confirmed or graduated only through the §6 protocol.

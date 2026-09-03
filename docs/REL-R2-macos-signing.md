@@ -67,7 +67,6 @@ those facts outside this repository.
 ### Required credential set
 Confirm or provision every item below before enabling the signed channel.
 
-
 | Credential | Purpose | Who confirms or provisions | Notes |
 |---|---|---|---|
 | Apple Developer Program membership | Prerequisite for every Developer ID / notarization credential | Apple Developer account owner | Confirm active membership; enroll only if absent. |
@@ -174,11 +173,6 @@ NO-GO until an account owner confirms the Apple credential inventory and a
 repository administrator confirms or provisions the required Actions secrets.
 The required tools are already present on the `macos-15-intel` and `macos-15`
 runners at the dated image snapshot.
-
-This verdict is **non-gating by design**: the unsigned seven-target release definition is
-unaffected and remains the current ship contract. The darwin legs already build and package
-correctly unsigned; signing/notarization is a credential-gated follow-on, as the issue
-states.
 
 ## 7. Open items for the REL implementer (out of scope here)
 

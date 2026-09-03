@@ -286,8 +286,8 @@ lane, already established and verified:
   commit law (§7). The target versions are deliberately not picked here —
   picking them now would execute from remembered values; §4.4 defers to the
   live registry at activation.
-- **Not scheduled today.** Both lines at latest stable (§4.3); no Bin X slot;
-  the unit activates on trigger, not on cadence.
+- **Not scheduled today.** No Bin X slot; the unit activates on trigger, not
+  on cadence.
 - **Out of scope:** the bump itself; backend re-platforming (termina et al.);
   crossterm feature-set changes (`event-stream`, `bracketed-paste`) — they move
   only with a pairing-motivated need and stay inside the atomic commit.

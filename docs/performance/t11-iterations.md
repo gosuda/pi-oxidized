@@ -151,13 +151,10 @@ own workload-side `Vec<String>` clone of 150 lines per frame, out of
 unit scope per iteration 1).
 
 **Recomputed multiple**: editor 27 us vs the ledger's 1.5 us floor ≈
-**18x — still OPEN** (>2x ⇒ logged as intermediate; the unit iterates
-again). Honest note for the terminal record: the residual 27 us/frame
+**18x — still OPEN**. Honest note for the terminal record: the residual 27 us/frame
 is dominated by the out-of-scope workload-side clone; the commit path
 itself (measure + render with skips + scoped diff + encode) is now
-within a few microseconds of the changed-line floor, and per G10
-Finding 5 the floor term must be recomputed from the replacement's own
-per-line measurement at the exhaustion record, not cited.
+within a few microseconds of the changed-line floor.
 
 **Verification**: 377/377 pi-tui lib; testkit release suites green
 (state matrix k=3 determinism, no-flicker PTY 5, grill 9, theme 5,
@@ -227,14 +224,10 @@ medians and cluster RSDs disclosed):
 
 Clean-cluster RSDs: baseline static ~4.7%, editor ~8.4%; after static ~6.5%,
 editor ~10.7% — all < 20%. Win gate >=1.05x median: **passed on both
-scenarios under both estimators**. Written bytes are byte-identical — the
-wire surface is unchanged.
+scenarios under both estimators**. Written bytes are byte-identical.
 
 **Recomputed multiple**: editor 19.2 us vs the ledger's 1.5 us floor ≈
-**12.8x — still OPEN** (>2x ⇒ logged as intermediate; the unit iterates
-again). Per G10 Finding 5 the terminal exhaustion record must recompute the
-floor from the replacement's own per-line measurement, not cite the
-implementation-derived 1.3 us/line term.
+**12.8x — still OPEN**.
 
 **Next design (reserved, materially distinct — Design D)**: the remaining
 static-scenario allocation (5.4 KiB/frame) is the bench root's visible-window
@@ -304,10 +297,8 @@ claimed; the honest paired estimate is min-of-7. Clean-cluster RSDs: static
 scenarios under both estimators** (min-of-7 1.25x / 1.06x).
 
 **Recomputed multiple**: editor 18.1 us vs the ledger's 1.5 us floor ≈
-**12.1x — still OPEN** (>2x ⇒ the unit iterates again; handed to the next
-slot with Design E (measure-walk skip on the static residual) pre-derived
-and the E1-E4 exhaustion record pending, floor to be recomputed per G10
-Finding 5).
+**12.1x — still OPEN**. Design E (measure-walk skip on the static residual)
+is pre-derived; the E1-E4 exhaustion record is pending.
 
 **Verification**: render-churn verification suite 3/3 (parameter parity,
 non-zero results, editor>static allocation ordering — 10.6 > 2.7 KiB/frame
@@ -378,21 +369,21 @@ medians disclosed):
 | editor | 17.0 (min) / 22.0 (median) | 15.0 (min) / 16.0 (median) | **1.13x** | **1.38x** | 10.6 -> 12.6 KiB/frame | 11656 -> 11656 B |
 
 Win gate >=1.05x median: **passed on both scenarios under both estimators**
-(min 2.33x/1.13x, median 2.33x/1.38x). Written bytes byte-identical — the
-wire surface is unchanged. Allocation rose ~1.9-2.0 KiB/frame: `RowClaim::Line`
+(min 2.33x/1.13x, median 2.33x/1.38x). Written bytes byte-identical.
+Allocation rose ~1.9-2.0 KiB/frame: `RowClaim::Line`
 grew 16 -> 32 bytes with the u128 key (claim table rebuild dominates the
 static frame's remaining allocation); time cost is negative net — disclosed,
 not hidden. Editor>static allocation ordering still holds (12.6 > 4.6).
 
 **Recomputed multiple**: editor 15.0 us vs the ledger's 1.5 us floor ≈
-**10x — still OPEN** (>2x ⇒ logged as intermediate). The residual is
+**10x — still OPEN**. The residual is
 dominated by the bench-side `EditorSim` per-frame rebuild (borders + text
 row re-materialized on every text miss — upstream-faithful workload cost,
 out of unit scope per iteration 1/3 precedent) plus the per-frame claim
 table rebuild in `commit_frame` (a candidate Design F: pooled/reused claim
 vectors) and the changed-line derive + 3-row damage diff. The terminal
-exhaustion record (E1–E4 with the G10-Finding-5 floor revalidation from the
-replacement's own per-line measurement) remains the unit's closing work.
+exhaustion record (E1–E4 with the G10-Finding-5 floor revalidation) remains
+the unit's closing work.
 
 **Verification**: 395/395 pi-tui lib tests; full release integration suite
 green (render-churn verification 3 — parameter parity, non-zero results,
@@ -530,7 +521,7 @@ pinned append path's full derive (first probe draft measured 4.2 µs and
 was discarded for exactly this reason — disclosed).
 
 **E3 — floor revalidation** (recomputed from the replacement's own
-per-line measurement, per G10 Finding 5; the ledger's 1.3 µs/line term is
+per-line measurement, G10 Finding 5; the ledger's 1.3 µs/line term is
 never cited):
 
 | Term | Value | Method |
@@ -599,8 +590,7 @@ with the probe's quieter-window 5-rep medians) vs the revalidated floor
 10.4–10.6 µs ⇒ **multiple ≈ 1.25–1.35x — ≤2x: AT-FLOOR** under the
 issue's own revalidation rule (floor recomputed from the replacement's
 per-line measurement, G10 Finding 5; the ledger's authored ~1.5 µs floor
-and its 1.3 µs/line constant are implementation-derived pre-campaign
-arithmetic and are superseded by this record, not cited). Honest dual
+and its 1.3 µs/line constant are superseded by this record). Honest dual
 disclosure: a purist contract-only floor (derive alone by Ir attribution
 ≈ 3.4 µs + diff/encode) would leave ~3.4x — the delta is the memo-record
 machinery the multiple rule's own revalidation method prices in; both
@@ -731,8 +721,7 @@ scope). Written bytes identical both sides.
 **Recomputed multiple** (vs this unit's 0.64 us floor, recomputed from
 the replacement's own measurement): poke 3.20 us ≈ **5.0x**, editor
 steady 2.70 us ≈ **4.2x**, static 0.90 us ≈ 1.4x — **still OPEN**
-(>2x on the changed-line scenarios ⇒ logged as intermediate; the unit
-iterates again in a later slot per the issue's one-commit rule).
+(>2x on the changed-line scenarios).
 
 **Named dominant residual**: the change-detection walk itself — `Cell::eq`
 over the (full-width) damaged rows, ~1.5 us of the 3.2 us poke paint; the
@@ -1069,7 +1058,7 @@ and 9 show high variance (contended box); the median is the honest paired
 estimator.
 
 **Recomputed multiple**: drain 2426 ns vs the ledger floor ~200 ns
-decode/forward ≈ **12.1x — still OPEN** (>2x; the unit iterates again).
+decode/forward ≈ **12.1x — still OPEN**.
 The residual is channel/scheduler cost + the one source-side
 materialization per frame; the redundant downstream clones are eliminated.
 
@@ -1162,7 +1151,7 @@ Pairs 8–9 show box contention in both arms; the median is the honest paired
 estimator (iteration-12 precedent).
 
 **Recomputed multiple**: 3.02 us/entry vs the ledger floor 0.764 us ≈
-**4.0x — still OPEN** (>2x; the unit iterates again). Remaining residual:
+**4.0x — still OPEN**. Remaining residual:
 the double parse in `SessionManager::open` (header-cwd pre-parse +
 `set_session_file` reload — both now fast but still two passes), by-id index
 + tree rebuild (~0.46 us), and the typed-parse constant itself (nested
@@ -2980,9 +2969,9 @@ base vs after.
 ### Multiple recompute
 
 Ledger convention (3.95 M Ir ≈ 0.37 ms → 93.7 ns per 1000 Ir): 945,385 Ir ≈
-88.6 us → 88.6 / 0.15 us ≈ **591x**. Still ≫ 2x → the win is logged as
-intermediate and the unit stays OPEN pending a materially distinct
-in-boundary design or the E1-E4 exhaustion record (iteration 28).
+88.6 us → 88.6 / 0.15 us ≈ **591x**. Still ≫ 2x → the unit stays OPEN
+pending a materially distinct in-boundary design or the E1-E4 exhaustion
+record (iteration 28).
 
 **Not touched** (out of scope, file-disjoint): `crates/pi-tui/`,
 `crates/pi-ext/`, `.github/workflows/`, `scripts/`, `Cargo.lock`,
