@@ -1024,6 +1024,40 @@ fn convert_tools(tools: &[Tool], compat: &Compat) -> Vec<Value> {
         .collect()
 }
 
+fn apply_chat_template_object(
+    model: &Model,
+    effort: Option<&str>,
+    input_key: &str,
+    output_key: &str,
+    payload: &mut Value,
+) {
+    if let Some(source) = model
+        .compat
+        .as_ref()
+        .and_then(|value| value.get(input_key))
+        .and_then(Value::as_object)
+    {
+        let mut resolved = Map::new();
+        for (name, value) in source {
+            if let Some(value) = resolve_chat_template_value(model, effort, value) {
+                resolved.insert(name.clone(), value);
+            }
+        }
+        if !resolved.is_empty() {
+            payload[output_key] = Value::Object(resolved);
+        }
+    }
+}
+fn apply_openai_reasoning_effort(model: &Model, effort: Option<&str>, payload: &mut Value) {
+    let value = match effort {
+        Some(requested) => Some(map_thinking_level(model, requested)),
+        None => off_thinking_value(model),
+    };
+    if let Some(value) = value {
+        payload["reasoning_effort"] = Value::String(value);
+    }
+}
+
 fn apply_thinking(model: &Model, options: &StreamOptions, compat: &Compat, payload: &mut Value) {
     if !model.reasoning {
         return;
@@ -1051,21 +1085,24 @@ fn apply_thinking(model: &Model, options: &StreamOptions, compat: &Compat, paylo
                 json!({"enable_thinking":effort.is_some(),"preserve_thinking":true});
         }
         "chat-template" => {
-            if let Some(kwargs) = model
-                .compat
-                .as_ref()
-                .and_then(|value| value.get("chatTemplateKwargs"))
-                .and_then(Value::as_object)
-            {
-                let mut resolved = Map::new();
-                for (name, value) in kwargs {
-                    if let Some(value) = resolve_chat_template_value(model, effort, value) {
-                        resolved.insert(name.clone(), value);
-                    }
-                }
-                if !resolved.is_empty() {
-                    payload["chat_template_kwargs"] = Value::Object(resolved);
-                }
+            apply_chat_template_object(
+                model,
+                effort,
+                "chatTemplateKwargs",
+                "chat_template_kwargs",
+                payload,
+            );
+        }
+        "baseten" => {
+            apply_chat_template_object(
+                model,
+                effort,
+                "chatTemplateArgs",
+                "chat_template_args",
+                payload,
+            );
+            if compat.thinking.supports_reasoning_effort {
+                apply_openai_reasoning_effort(model, effort, payload);
             }
         }
         "deepseek" => {
@@ -1112,10 +1149,8 @@ fn apply_thinking(model: &Model, options: &StreamOptions, compat: &Compat, paylo
             }
         }
         _ => {
-            if compat.thinking.supports_reasoning_effort
-                && let Some(value) = mapped.or_else(|| off_thinking_value(model))
-            {
-                payload["reasoning_effort"] = Value::String(value);
+            if compat.thinking.supports_reasoning_effort {
+                apply_openai_reasoning_effort(model, effort, payload);
             }
         }
     }
@@ -1801,6 +1836,61 @@ mod tests {
         assert_eq!(
             payload.get("reasoning_effort"),
             Some(&Value::String("none".to_owned()))
+        );
+    }
+    #[test]
+    fn baseten_format_emits_chat_template_args() {
+        fn baseten_model(supports_effort: bool) -> Model {
+            let mut model = model("baseten");
+            model.reasoning = true;
+            model.base_url = "https://inference.baseten.co/v1".into();
+            model.compat = Some(json!({
+                "thinkingFormat": "baseten",
+                "supportsReasoningEffort": supports_effort,
+                "chatTemplateArgs": {"enable_thinking": {"$var": "thinking.enabled"}},
+            }));
+            model
+        }
+        fn effort_options(effort: Option<&str>) -> StreamOptions {
+            let mut options = StreamOptions::default();
+            if let Some(effort) = effort {
+                options.insert_extra(
+                    StreamOptionKey::REASONING_EFFORT,
+                    Value::String(effort.to_owned()),
+                );
+            }
+            options
+        }
+
+        // Effort support off (Kimi-K2.5 shape): only the template flag is sent.
+        let model = baseten_model(false);
+        let compat = Compat::resolve(&model);
+        let mut payload = json!({});
+        apply_thinking(&model, &effort_options(Some("high")), &compat, &mut payload);
+        assert_eq!(
+            payload.pointer("/chat_template_args/enable_thinking"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(payload.get("reasoning_effort"), None);
+        let mut payload = json!({});
+        apply_thinking(&model, &effort_options(None), &compat, &mut payload);
+        assert_eq!(
+            payload.pointer("/chat_template_args/enable_thinking"),
+            Some(&Value::Bool(false))
+        );
+
+        // Effort support on (GLM-5.2 shape): the mapped effort rides along.
+        let model = baseten_model(true);
+        let compat = Compat::resolve(&model);
+        let mut payload = json!({});
+        apply_thinking(&model, &effort_options(Some("high")), &compat, &mut payload);
+        assert_eq!(
+            payload.pointer("/chat_template_args/enable_thinking"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            payload.get("reasoning_effort"),
+            Some(&Value::String("high".to_owned()))
         );
     }
     #[test]
