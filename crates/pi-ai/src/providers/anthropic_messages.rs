@@ -1277,6 +1277,40 @@ mod tests {
         );
         assert_eq!(payload["messages"][2]["content"][0]["tool_use_id"], tool_id);
     }
+    #[test]
+    fn temperature_yields_to_thinking_and_thinking_requests_default() {
+        let context = Context::default();
+
+        // No thinking: temperature passes through.
+        let options = StreamOptions {
+            temperature: Some(0.7),
+            ..StreamOptions::default()
+        };
+        let payload = build_payload(&model(), &context, &options);
+        assert_eq!(payload["temperature"], 0.7);
+
+        // Enabled thinking omits temperature and defaults budget and display.
+        let mut thinking = StreamOptions {
+            temperature: Some(0.7),
+            ..StreamOptions::default()
+        };
+        thinking.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(true));
+        let payload = build_payload(&model(), &context, &thinking);
+        assert!(payload.get("temperature").is_none());
+        assert_eq!(payload["thinking"]["type"], "enabled");
+        assert_eq!(payload["thinking"]["budget_tokens"], 1024);
+        assert_eq!(payload["thinking"]["display"], "summarized");
+
+        // Forced adaptive thinking carries the effort as output config.
+        let mut adaptive = model();
+        adaptive.compat = Some(json!({"forceAdaptiveThinking": true}));
+        let mut options = StreamOptions::default();
+        options.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(true));
+        options.insert_extra(StreamOptionKey::EFFORT, Value::String("high".to_owned()));
+        let payload = build_payload(&adaptive, &context, &options);
+        assert_eq!(payload["thinking"]["type"], "adaptive");
+        assert_eq!(payload["output_config"]["effort"], "high");
+    }
 
     #[test]
     fn thinking_disable_respects_off_null_sentinel() {
