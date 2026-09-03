@@ -498,6 +498,7 @@ pub async fn create_agent_session_services_with_trust(
         .model_runtime
         .refresh(super::model_runtime::ModelsRefreshOptions {
             allow_network: Some(false),
+            ..Default::default()
         })
         .await;
 

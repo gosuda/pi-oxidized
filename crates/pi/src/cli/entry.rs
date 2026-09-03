@@ -1148,6 +1148,7 @@ impl PackageHandler for RealPackageHandler {
                     runtime
                         .refresh(crate::core::model_runtime::ModelsRefreshOptions {
                             allow_network: Some(true),
+                            ..Default::default()
                         })
                         .await
                         .map(|_| ())

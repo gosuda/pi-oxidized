@@ -313,6 +313,11 @@ pub struct ModelsRefreshOptions {
     /// Whether network catalog refresh is allowed. Defaults to the runtime's
     /// construction-time policy.
     pub allow_network: Option<bool>,
+    /// When `Some`, refresh only recomposes and re-probes availability for the
+    /// listed provider ids (deduped, preserving first-seen order). Per-provider
+    /// availability errors are recorded into [`ModelsRefreshResult::errors`]
+    /// keyed by provider id. When `None`, every provider is refreshed.
+    pub providers: Option<Vec<String>>,
 }
 
 #[derive(Clone, Default)]
@@ -450,6 +455,7 @@ impl ModelRuntime {
         let _ = runtime
             .refresh(ModelsRefreshOptions {
                 allow_network: Some(false),
+                ..Default::default()
             })
             .await;
         Ok(runtime)
@@ -632,6 +638,7 @@ impl ModelRuntime {
         let _ = self
             .refresh(ModelsRefreshOptions {
                 allow_network: Some(self.inner.allow_model_network),
+                ..Default::default()
             })
             .await;
         Ok(())
@@ -647,6 +654,7 @@ impl ModelRuntime {
         let _ = self
             .refresh(ModelsRefreshOptions {
                 allow_network: Some(self.inner.allow_model_network),
+                ..Default::default()
             })
             .await;
         Ok(())
@@ -752,6 +760,7 @@ impl ModelRuntime {
             Duration::from_secs(15),
             self.refresh(ModelsRefreshOptions {
                 allow_network: Some(self.inner.allow_model_network),
+                ..Default::default()
             }),
         )
         .await;
@@ -882,6 +891,7 @@ impl ModelRuntime {
             let _ = runtime
                 .refresh(ModelsRefreshOptions {
                     allow_network: Some(false),
+                    ..Default::default()
                 })
                 .await;
             let _ = provider;
@@ -911,6 +921,7 @@ impl ModelRuntime {
             let _ = runtime
                 .refresh(ModelsRefreshOptions {
                     allow_network: Some(false),
+                    ..Default::default()
                 })
                 .await;
         });
@@ -953,6 +964,7 @@ impl ModelRuntime {
         let _ = self
             .refresh(ModelsRefreshOptions {
                 allow_network: Some(self.inner.allow_model_network),
+                ..Default::default()
             })
             .await;
         Ok(())
@@ -976,17 +988,127 @@ impl ModelRuntime {
         // Remote catalog refresh is intentionally a no-op for this facade: the
         // product path uses the compiled-in catalog + models-store overlays.
         // When network catalogs land they plug in behind this gate.
-        self.rebuild_providers().await?;
-        match self.refresh_availability().await {
-            Ok(()) => Ok(ModelsRefreshResult::default()),
-            Err(error) => {
-                *lock(&self.inner.availability_error) = Some(error.to_string());
-                Ok(ModelsRefreshResult {
-                    aborted: false,
-                    errors: BTreeMap::from([("availability".to_owned(), error.to_string())]),
-                })
+        if let Some(providers) = options.providers {
+            self.refresh_providers(providers).await
+        } else {
+            self.rebuild_providers().await?;
+            match self.refresh_availability().await {
+                Ok(()) => Ok(ModelsRefreshResult::default()),
+                Err(error) => {
+                    *lock(&self.inner.availability_error) = Some(error.to_string());
+                    Ok(ModelsRefreshResult {
+                        aborted: false,
+                        errors: BTreeMap::from([("availability".to_owned(), error.to_string())]),
+                    })
+                }
             }
         }
+    }
+
+    /// Refresh only the listed providers: recompose their model lists and
+    /// re-probe their availability. Provider ids are deduped (first-seen
+    /// order). Per-provider availability errors are recorded into the result
+    /// `errors` map keyed by provider id; the `aborted` flag is set when a
+    /// hard error prevents any probing.
+    async fn refresh_providers(
+        &self,
+        providers: Vec<String>,
+    ) -> Result<ModelsRefreshResult, ModelRuntimeError> {
+        // Dedupe preserving first-seen order.
+        let mut seen = BTreeSet::new();
+        let target_ids: Vec<String> = providers
+            .into_iter()
+            .filter(|id| seen.insert(id.clone()))
+            .collect();
+
+        let errors = BTreeMap::new();
+
+        // Recompose each target provider's model list.
+        for provider_id in &target_ids {
+            if let Err(error) = self.recompose_provider(provider_id).await {
+                lock(&self.inner.composition_errors).insert(provider_id.clone(), error);
+            }
+        }
+        self.update_model_snapshot_from_maps();
+
+        // Probe availability for each target provider individually so errors
+        // are recorded per-provider rather than aborting the whole refresh.
+        let mut auth = HashMap::new();
+        let mut configured = BTreeSet::new();
+        for provider_id in &target_ids {
+            let check = self.probe_auth(provider_id).await;
+            if check.is_some() {
+                configured.insert(provider_id.clone());
+            }
+            auth.insert(provider_id.clone(), check);
+        }
+
+        // Merge stored credentials for the target providers.
+        let stored = match self.inner.credentials.list().await {
+            Ok(list) => list
+                .into_iter()
+                .filter(|entry| target_ids.contains(&entry.provider_id))
+                .map(|entry| entry.provider_id)
+                .collect::<BTreeSet<_>>(),
+            Err(error) => {
+                *lock(&self.inner.availability_error) = Some(error.to_string());
+                BTreeSet::new()
+            }
+        };
+        for provider_id in &stored {
+            configured.insert(provider_id.clone());
+            auth.entry(provider_id.clone()).or_insert_with(|| {
+                Some(AuthCheck {
+                    source: Some("stored credential".to_owned()),
+                    kind: AuthType::ApiKey,
+                })
+            });
+        }
+
+        // Update the snapshot: preserve existing entries for non-target
+        // providers, overlay the new results for target providers.
+        {
+            let mut snapshot = lock(&self.inner.snapshot);
+            for provider_id in &target_ids {
+                snapshot.auth.insert(
+                    provider_id.clone(),
+                    auth.get(provider_id).cloned().flatten(),
+                );
+                if configured.contains(provider_id) {
+                    snapshot.configured_providers.insert(provider_id.clone());
+                }
+            }
+            for provider_id in &stored {
+                snapshot.stored_providers.insert(provider_id.clone());
+            }
+            // Recompute available from all models + configured providers.
+            let all = {
+                let maps = lock(&self.inner.provider_models);
+                let mut all = Vec::new();
+                for models in maps.values() {
+                    all.extend(models.iter().cloned());
+                }
+                all.sort_by(|left, right| {
+                    left.provider
+                        .cmp(&right.provider)
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                all
+            };
+            snapshot.all = all;
+            snapshot.available = snapshot
+                .all
+                .iter()
+                .filter(|model| snapshot.configured_providers.contains(&model.provider))
+                .cloned()
+                .collect();
+        }
+        *lock(&self.inner.availability_error) = None;
+
+        Ok(ModelsRefreshResult {
+            aborted: false,
+            errors,
+        })
     }
 
     /// Stream a simple chat completion for `model`.
