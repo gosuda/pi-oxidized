@@ -64,7 +64,7 @@ fn taskkill_path() -> PathBuf {
 /// `SystemRoot` value, or the `PATH` fallback name when unset.
 #[cfg(any(windows, test))]
 #[must_use]
-pub fn taskkill_path_for(system_root: Option<&std::ffi::OsStr>) -> PathBuf {
+fn taskkill_path_for(system_root: Option<&std::ffi::OsStr>) -> PathBuf {
     system_root.map_or_else(
         || PathBuf::from("taskkill.exe"),
         |root| PathBuf::from(root).join("System32").join("taskkill.exe"),
