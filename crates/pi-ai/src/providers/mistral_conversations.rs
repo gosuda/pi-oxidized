@@ -1144,6 +1144,97 @@ mod tests {
         assert!((output.usage.cost.cache_read - 0.000_04).abs() < f64::EPSILON);
         assert!((output.usage.cost.total - 0.000_24).abs() < f64::EPSILON);
     }
+    #[test]
+    fn reasoning_modes_and_cache_key_follow_model_and_options() {
+        fn reasoning_options(level: &str) -> StreamOptions {
+            let mut options = StreamOptions::default();
+            options.insert_extra(StreamOptionKey::REASONING, Value::String(level.to_owned()));
+            options
+        }
+
+        // Named reasoning-effort models map the level, defaulting to high.
+        let payload = build_payload(
+            &model("mistral-small-2603", true),
+            &Context::default(),
+            &reasoning_options("high"),
+        );
+        assert_eq!(payload["reasoning_effort"], "high");
+        assert_eq!(payload.get("prompt_mode"), None);
+        // Every other reasoning model gets prompt-mode reasoning instead.
+        let payload = build_payload(
+            &model("mistral-large-latest", true),
+            &Context::default(),
+            &reasoning_options("high"),
+        );
+        assert_eq!(payload["prompt_mode"], "reasoning");
+        assert_eq!(payload.get("reasoning_effort"), None);
+        // Off and none levels send neither control.
+        let payload = build_payload(
+            &model("mistral-small-2603", true),
+            &Context::default(),
+            &reasoning_options("off"),
+        );
+        assert_eq!(payload.get("reasoning_effort"), None);
+        assert_eq!(payload.get("prompt_mode"), None);
+        // Explicit overrides win over level routing.
+        let mut options = StreamOptions::default();
+        options.insert_extra(
+            StreamOptionKey::PROMPT_MODE,
+            Value::String("custom".to_owned()),
+        );
+        let payload = build_payload(
+            &model("mistral-small-2603", true),
+            &Context::default(),
+            &options,
+        );
+        assert_eq!(payload["prompt_mode"], "custom");
+        let mut options = StreamOptions::default();
+        options.insert_extra(
+            StreamOptionKey::REASONING_EFFORT,
+            Value::String("low".to_owned()),
+        );
+        let payload = build_payload(
+            &model("mistral-large-latest", true),
+            &Context::default(),
+            &options,
+        );
+        assert_eq!(payload["reasoning_effort"], "low");
+
+        // Cache key needs a retention and a nonempty session id.
+        let mut cached = StreamOptions {
+            cache_retention: Some(CacheRetention::Long),
+            session_id: Some("session".into()),
+            ..StreamOptions::default()
+        };
+        let payload = build_payload(
+            &model("mistral-large-latest", true),
+            &Context::default(),
+            &cached,
+        );
+        assert_eq!(payload["prompt_cache_key"], "session");
+        cached.session_id = Some(String::new());
+        let payload = build_payload(
+            &model("mistral-large-latest", true),
+            &Context::default(),
+            &cached,
+        );
+        assert_eq!(payload.get("prompt_cache_key"), None);
+    }
+
+    #[test]
+    fn usage_clamps_cache_to_prompt_and_reads_legacy_paths() {
+        let model = model("x", false);
+        // Over-reported cache clamps so plain input never goes negative.
+        let mut output = AssistantMessage::new("mistral-conversations", "mistral", "x", 1);
+        apply_usage(
+            &mut output,
+            &model,
+            &json!({"prompt_tokens": 50, "completion_tokens": 5, "num_cached_tokens": 90}),
+        );
+        assert_eq!(output.usage.input, 0);
+        assert_eq!(output.usage.cache_read, 50);
+        assert_eq!(output.usage.total_tokens, 55);
+    }
 
     #[tokio::test]
     async fn later_tool_deltas_without_ids_reuse_the_stream_index() {
