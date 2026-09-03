@@ -1253,6 +1253,40 @@ mod tests {
         assert!(bearer.get(API_KEY_HEADER).is_none());
         Ok(())
     }
+    #[test]
+    fn adc_dispatch_rejects_unknown_and_missing_types_without_leakage() {
+        let scopes = ["https://www.googleapis.com/auth/cloud-platform"];
+        // Unknown types fail closed with the type named and nothing else.
+        let error = build_credentials_from_json(json!({"type": "mystery"}), &scopes, None).err();
+        assert_eq!(
+            error.as_ref().map(ProviderError::message),
+            Some("unsupported Google application credentials type `mystery`")
+        );
+        // Missing and blank types fail with the stable shape error.
+        for payload in [json!({}), json!({"type": "  "})] {
+            let error = build_credentials_from_json(payload, &scopes, None).err();
+            assert!(
+                error
+                    .as_ref()
+                    .is_some_and(|error| error.message().contains("missing a non-empty")),
+                "typeless ADC JSON must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn vertex_explicit_thinking_level_wins_over_budget() -> Result<(), GoogleFailure> {
+        let mut options = StreamOptions::default();
+        options.insert_extra(
+            StreamOptionKey::THINKING,
+            json!({"enabled": true, "level": "low", "budgetTokens": 500}),
+        );
+        assert_eq!(
+            thinking_config(&model(), &options)?,
+            Some(json!({"includeThoughts": true, "thinkingLevel": "LOW"}))
+        );
+        Ok(())
+    }
 
     #[test]
     fn vertex_thinking_does_not_apply_gemma4_exception() -> Result<(), GoogleFailure> {
