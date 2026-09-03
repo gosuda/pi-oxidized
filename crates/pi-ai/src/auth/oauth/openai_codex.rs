@@ -977,7 +977,7 @@ pub fn openai_codex_oauth() -> Result<OpenAiCodexOAuth, AuthError> {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -1122,43 +1122,100 @@ mod tests {
         }
     }
 
+    /// Render one HTTP/1.1 stub reply with an exact `Content-Length`.
+    fn http_response(status: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+    /// Drain one HTTP request from a test stub connection before replying.
+    /// The stub answers from the request line, so it must read the whole
+    /// head first; a single `read` can return a partial segment. The body
+    /// is drained by declared length: closing with unread bytes queued
+    /// makes Linux send RST instead of FIN, which can race the client.
+    fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut raw = Vec::new();
+        let mut buf = [0_u8; 4096];
+        for _ in 0..16 {
+            match stream.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = pos + 4;
+            let headers = String::from_utf8_lossy(&raw[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while raw.len() < header_end + content_length {
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+        }
+        raw
+    }
     fn spawn_device_user_code_server() -> Result<String, String> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| err(e.to_string()))?;
         let address = listener.local_addr().map_err(|e| err(e.to_string()))?;
         thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
+            // Same sweep guard as the token stub: only a real device-code
+            // request draws the single scripted reply.
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let req = read_http_request(&mut stream);
+                if !String::from_utf8_lossy(&req).starts_with("POST /usercode ") {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                let body = json!({
+                    "device_auth_id": "dev-1",
+                    "user_code": "ABCD-1234",
+                    "interval": 0,
+                })
+                .to_string();
+                let _ = stream.write_all(http_response("200 OK", &body).as_slice());
                 return;
-            };
-            let mut buf = [0_u8; 8192];
-            let _ = stream.read(&mut buf);
-            let body = json!({
-                "device_auth_id": "dev-1",
-                "user_code": "ABCD-1234",
-                "interval": 0,
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
+            }
         });
         Ok(format!("http://{address}/usercode"))
     }
 
-    fn spawn_device_token_server() -> Result<String, String> {
+    fn spawn_device_token_server() -> Result<(String, Arc<AtomicUsize>), String> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| err(e.to_string()))?;
         let address = listener.local_addr().map_err(|e| err(e.to_string()))?;
         let hits = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
         thread::spawn(move || {
-            for _ in 0..2 {
+            // Answer pending once, then success, for real device polls only.
+            // Alien traffic (localhost sweeps send `GET /`) gets a 404
+            // without consuming the script, so a sweep cannot starve the
+            // flow and fail the suite with a refused connection.
+            for _ in 0..64 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
-                let mut buf = [0_u8; 8192];
-                let _ = stream.read(&mut buf);
-                let first = hits.fetch_add(1, Ordering::SeqCst) == 0;
-                let (status, body) = if first {
+                let req = read_http_request(&mut stream);
+                let text = String::from_utf8_lossy(&req);
+                if !text.starts_with("POST /device-token ") {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                let attempt = served.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if attempt == 0 {
                     (
                         "403 Forbidden",
                         json!({"error":"deviceauth_authorization_pending"}).to_string(),
@@ -1173,14 +1230,13 @@ mod tests {
                         .to_string(),
                     )
                 };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(http_response(status, &body).as_slice());
+                if attempt > 0 {
+                    return;
+                }
             }
         });
-        Ok(format!("http://{address}/device-token"))
+        Ok((format!("http://{address}/device-token"), hits))
     }
 
     fn spawn_hanging_token_server(
@@ -1190,20 +1246,22 @@ mod tests {
         let address = listener.local_addr().map_err(|error| error.to_string())?;
         let (request_seen, request_started) = tokio::sync::oneshot::channel();
         thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut request = [0_u8; 4096];
-            let Ok(size) = stream.read(&mut request) else {
-                return;
-            };
-            let request = String::from_utf8_lossy(&request[..size]);
-            if !request.starts_with(&format!("POST {path} ")) {
+            // Sweep guard: a `GET /` must not consume the single accept and
+            // starve the real device poll of its hang point.
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let req = read_http_request(&mut stream);
+                if !String::from_utf8_lossy(&req).starts_with(&format!("POST {path} ")) {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
+                }
+                let _ = request_seen.send(());
+                let mut remaining = [0_u8; 1024];
+                while stream.read(&mut remaining).is_ok_and(|size| size > 0) {}
                 return;
             }
-            let _ = request_seen.send(());
-            let mut remaining = [0_u8; 1024];
-            while stream.read(&mut remaining).is_ok_and(|size| size > 0) {}
         });
         Ok((format!("http://{address}{path}"), request_started))
     }
@@ -1233,71 +1291,41 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| err(e.to_string()))?;
         let address = listener.local_addr().map_err(|e| err(e.to_string()))?;
         thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut raw = Vec::new();
-            let mut buf = [0_u8; 4096];
-            loop {
-                let Ok(n) = stream.read(&mut buf) else {
+            // Sweep guard: answer only the expected grant POST; anything
+            // else gets a 404 so a sweep cannot consume the single accept.
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
-                if n == 0 {
-                    break;
+                let raw = read_http_request(&mut stream);
+                let request = String::from_utf8_lossy(&raw).into_owned();
+                let first = request.lines().next().unwrap_or("").to_owned();
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
+                let lowered = request.to_ascii_lowercase();
+                let is_grant_post = first.starts_with("POST /token ")
+                    && lowered.contains("content-type: application/x-www-form-urlencoded")
+                    && (body.contains(&format!("grant_type={expected_grant}"))
+                        || body.contains(&format!(
+                            "grant_type={}",
+                            expected_grant.replace('_', "%5F")
+                        )));
+                if !is_grant_post {
+                    let _ = stream.write_all(http_response("404 Not Found", "").as_slice());
+                    continue;
                 }
-                raw.extend_from_slice(&buf[..n]);
-                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let header_end = pos + 4;
-                    let headers = String::from_utf8_lossy(&raw[..header_end]).to_ascii_lowercase();
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| line.strip_prefix("content-length:"))
-                        .and_then(|v| v.trim().parse::<usize>().ok())
-                        .unwrap_or(0);
-                    while raw.len() < header_end + content_length {
-                        let Ok(n) = stream.read(&mut buf) else {
-                            return;
-                        };
-                        if n == 0 {
-                            break;
-                        }
-                        raw.extend_from_slice(&buf[..n]);
-                    }
-                    break;
+                {
+                    let mut guard = capture.blocking_lock();
+                    *guard = Some(body);
                 }
-                if raw.len() > 64 * 1024 {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&raw).into_owned();
-            let body = request.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
-            {
-                let mut guard = capture.blocking_lock();
-                *guard = Some(body.clone());
-            }
-            let lowered = request.to_ascii_lowercase();
-            if !lowered.contains("content-type: application/x-www-form-urlencoded") {
+                let response_body = json!({
+                    "access_token": access,
+                    "refresh_token": refresh,
+                    "expires_in": expires_in,
+                })
+                .to_string();
+                let _ = stream.write_all(http_response("200 OK", &response_body).as_slice());
                 return;
             }
-            if !(body.contains(&format!("grant_type={expected_grant}"))
-                || body.contains(&format!(
-                    "grant_type={}",
-                    expected_grant.replace('_', "%5F")
-                )))
-            {
-                return;
-            }
-            let response_body = json!({
-                "access_token": access,
-                "refresh_token": refresh,
-                "expires_in": expires_in,
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
         });
         Ok(format!("http://{address}/token"))
     }
@@ -1861,7 +1889,7 @@ mod tests {
     #[tokio::test]
     async fn device_login_polls_and_exchanges() -> TestResult {
         let usercode = spawn_device_user_code_server()?;
-        let device_token = spawn_device_token_server()?;
+        let (device_token, token_hits) = spawn_device_token_server()?;
         let access = make_jwt("acct-device");
         let capture = Arc::new(AsyncMutex::new(None));
         let token_url = spawn_form_token_server(
@@ -1901,6 +1929,72 @@ mod tests {
             "redirect_uri={}",
             DEVICE_REDIRECT_URI.replace(':', "%3A").replace('/', "%2F")
         )));
+        assert_eq!(
+            token_hits.load(Ordering::SeqCst),
+            2,
+            "device flow must poll exactly twice (pending then success)"
+        );
+        Ok(())
+    }
+
+    /// Send one sweeper-style `GET /` at a stub, draining its 404 reply.
+    fn sweep_probe_stub(url: &str) -> Result<(), String> {
+        let addr = url
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split('/').next())
+            .ok_or_else(|| err("bad stub url"))?;
+        let mut stream = TcpStream::connect(addr).map_err(|e| err(e.to_string()))?;
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: sweep\r\nConnection: close\r\n\r\n")
+            .map_err(|e| err(e.to_string()))?;
+        let mut buf = [0_u8; 1024];
+        let _ = stream.read(&mut buf);
+        Ok(())
+    }
+
+    /// A localhost sweep (`GET /` at every new listener) must not consume
+    /// scripted stub replies: after probing all three stubs, the device
+    /// flow still polls exactly twice and exchanges.
+    #[tokio::test]
+    async fn sweep_get_does_not_consume_stub_scripts() -> TestResult {
+        let usercode = spawn_device_user_code_server()?;
+        let (device_token, token_hits) = spawn_device_token_server()?;
+        let access = make_jwt("acct-device");
+        let capture = Arc::new(AsyncMutex::new(None));
+        let token_url = spawn_form_token_server(
+            "authorization_code",
+            &access,
+            "refresh-dev",
+            45,
+            Arc::clone(&capture),
+        )?;
+        sweep_probe_stub(&usercode)?;
+        sweep_probe_stub(&device_token)?;
+        sweep_probe_stub(&token_url)?;
+        let oauth =
+            OpenAiCodexOAuth::with_http(AuthHttpClient::new().map_err(|e| err(e.to_string()))?)
+                .with_endpoints(OpenAiCodexEndpoints {
+                    token_url,
+                    device_user_code_url: usercode,
+                    device_token_url: device_token,
+                    device_redirect_uri: DEVICE_REDIRECT_URI.into(),
+                    ..OpenAiCodexEndpoints::default()
+                });
+        let interaction =
+            ScriptedInteraction::new(vec![Ok(OPENAI_CODEX_DEVICE_CODE_LOGIN_METHOD.into())]);
+        let cred = oauth
+            .login(&interaction)
+            .await
+            .map_err(|e| err(e.to_string()))?;
+        assert_eq!(
+            cred.extra.get(ACCOUNT_ID_EXTRA_KEY),
+            Some(&Value::String("acct-device".into()))
+        );
+        assert_eq!(
+            token_hits.load(Ordering::SeqCst),
+            2,
+            "sweeper traffic must not consume the pending/success script"
+        );
         Ok(())
     }
 
