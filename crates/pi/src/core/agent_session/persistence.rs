@@ -15,12 +15,12 @@ use std::io;
 use std::sync::Arc;
 
 use pi_agent::{AgentEvent, AgentMessage};
-use pi_ai::{AssistantMessage, Message, StopReason, UserContent, UserMessageContent};
+use pi_ai::{Message, StopReason, UserContent, UserMessageContent};
 
+use super::AgentSession;
 use super::events::AgentSessionEvent;
-use super::{AgentSession, AgentSessionInner};
 use crate::core::messages::{CustomMessage, CustomMessageContent};
-use crate::core::sessions::{SessionEntry, SessionError, SessionManager};
+use crate::core::sessions::{SessionError, SessionManager};
 
 impl AgentSession {
     /// Handle one agent event for mirror queues + persistence side effects.
@@ -255,12 +255,6 @@ pub(super) fn user_message_text(message: &AgentMessage) -> String {
         },
         _ => String::new(),
     }
-}
-
-// Re-export for typecheck of SessionEntry in callers.
-#[allow(dead_code)]
-fn _keep(entry: SessionEntry, assistant: AssistantMessage, inner: &AgentSessionInner) {
-    let _ = (entry, assistant, inner);
 }
 
 use serde_json::Value;

@@ -937,7 +937,7 @@ impl<'a> MarkdownRenderer<'a> {
             Event::Start(Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell)
             | Event::End(
                 TagEnd::Table | TagEnd::TableHead | TagEnd::TableRow | TagEnd::TableCell,
-            ) => self.consume_table(event),
+            ) => self.consume_table(&event),
             Event::Text(_)
             | Event::Code(_)
             | Event::SoftBreak
@@ -1608,15 +1608,14 @@ impl<'a> MarkdownRenderer<'a> {
         logical
     }
 
-    fn consume_table(&mut self, event: Event<'_>) {
+    fn consume_table(&mut self, event: &Event<'_>) {
         match event {
-            Event::Start(Tag::Table(alignments)) => {
+            Event::Start(Tag::Table(_)) => {
                 self.pending_paragraph_end = None;
                 if !self.lists.is_empty() && !self.inline.is_empty() {
                     self.flush_inline_to_segment();
                 }
                 self.table = Some(TableBuilder {
-                    alignments: alignments.len(),
                     headers: Vec::new(),
                     rows: Vec::new(),
                     current_row: Vec::new(),
@@ -1859,8 +1858,6 @@ fn emit_wrapped(
 
 #[derive(Clone)]
 struct TableBuilder {
-    #[allow(dead_code)]
-    alignments: usize,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
     current_row: Vec<String>,

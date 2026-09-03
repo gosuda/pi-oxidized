@@ -827,7 +827,6 @@ mod tests {
     use super::*;
     use crate::core::agent_session::{
         AgentSessionConfig, AgentSessionEvent, ExtensionRunner, ExtensionRunnerError,
-        NullExtensionRunner,
     };
     use futures::future::BoxFuture;
     use futures::stream::{self, BoxStream, StreamExt};
@@ -2032,13 +2031,5 @@ mod tests {
             "exactly one settle per run: {observed:?}"
         );
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn _ensure_null_runner_send_sync(_: NullExtensionRunner) {}
-
-    #[allow(dead_code)]
-    fn _ensure_ok_event_ok(e: AssistantMessageEvent) {
-        let _ = ok_event(e);
     }
 }

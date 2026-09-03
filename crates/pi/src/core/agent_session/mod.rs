@@ -63,7 +63,6 @@ pub use extension_runner::{
 };
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use futures::future::BoxFuture;
 use pi_agent::{Agent, AgentLoopConfig, AgentMessage, AgentOptions, AgentTool, QueueMode};
@@ -1272,12 +1271,6 @@ impl Drop for AgentSession {
     fn drop(&mut self) {
         self.extension_registry_cancel.cancel();
     }
-}
-
-// Silence unused Duration until retry sleep lands.
-#[allow(dead_code)]
-fn _duration_keep() -> Duration {
-    Duration::from_millis(0)
 }
 
 #[cfg(test)]

@@ -377,8 +377,6 @@ impl AgentSessionRuntime {
         Arc::clone(&self.replacement_lock)
     }
 
-    /// Lifecycle gate used by replacement teardown to exclude concurrent navigation.
-    #[allow(dead_code)]
     pub(crate) fn lifecycle_gate(&self) -> &AsyncRwLock<()> {
         &self.lifecycle_gate
     }

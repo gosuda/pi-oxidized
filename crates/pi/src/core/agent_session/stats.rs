@@ -18,7 +18,7 @@
 //! Lock order: only `AgentSessionInner` (briefly, to read mirrors). The
 //! session manager async mutex is acquired for entry enumeration.
 
-use pi_ai::{AssistantContent, Message, Model, StopReason};
+use pi_ai::{AssistantContent, Message, StopReason};
 
 use crate::core::compaction::{calculate_context_tokens, estimate_context_tokens};
 use crate::core::sessions::{SessionEntry, get_latest_compaction_entry};
@@ -291,13 +291,6 @@ fn post_compaction_usage_tokens(entry: &SessionEntry) -> Option<u64> {
         return None;
     }
     Some(tokens)
-}
-
-/// Helper retained for sibling modules / future slices that need to read the
-/// active model's context window without downcasting the runtime.
-#[allow(dead_code)]
-fn model_context_window(model: &Model) -> u64 {
-    model.context_window
 }
 
 #[cfg(test)]
