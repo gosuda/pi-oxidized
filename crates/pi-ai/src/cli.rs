@@ -1,6 +1,6 @@
 //! Crate-local OAuth CLI binary.
 //!
-//! Ports `.references/pi-2.0/packages/ai/src/cli.ts` at 8fa7eeb: commands
+//! Ports `.references/pi-2.0/packages/ai/src/cli.ts` at 853a80d: commands
 //! `help|--help|-h`, `list`, `login [provider]`; readline 1-indexed
 //! selection; URL/device-code/progress console output in upstream ordering;
 //! credentials to `auth.json` in cwd via the A7 auth store; `exit(1)` text
