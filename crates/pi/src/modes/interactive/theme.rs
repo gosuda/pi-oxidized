@@ -2574,6 +2574,41 @@ mod tests {
         ),
     ];
 
+    /// Semantic foreground slots rendered on the terminal default background
+    /// (white for light themes, black for dark themes). These text roles must
+    /// meet WCAG AA (>= 4.5) even when no named `ThemeBg` slot is set, because
+    /// the terminal default is the actual render surface for body markdown,
+    /// syntax highlighting, and status lines.
+    const NATIVE_DEFAULT_BG_PAIRS: [(ThemeColor, &str); 3] = [
+        (ThemeColor::Error, "Error/default"),
+        (ThemeColor::MdLinkUrl, "MdLinkUrl/default"),
+        (ThemeColor::SyntaxComment, "SyntaxComment/default"),
+    ];
+
+    /// Terminal default background RGB for each built-in theme family.
+    fn terminal_default_bg(name: &str) -> Rgb {
+        if name == "dark" || name.ends_with("-dark") {
+            Rgb(0, 0, 0)
+        } else {
+            Rgb(255, 255, 255)
+        }
+    }
+
+    /// Convert a 256-color palette index back to its rendered RGB triple.
+    fn palette256_to_rgb(index: u8) -> Rgb {
+        if index >= 232 {
+            let v = 8 + 10 * (index - 232);
+            Rgb(v, v, v)
+        } else {
+            let i = usize::from(index - 16);
+            Rgb(
+                CUBE_VALUES[i / 36],
+                CUBE_VALUES[(i % 36) / 6],
+                CUBE_VALUES[i % 6],
+            )
+        }
+    }
+
     /// Six named CIEDE2000 phase separations, rounded to two decimals.
     #[derive(Clone, Copy, Debug)]
     struct NativeDeltaEOracle {
@@ -2959,6 +2994,46 @@ mod tests {
                 assert!(
                     (rounded - expected).abs() < f64::EPSILON,
                     "asset={asset} pair={pair} measured={rounded:.2} requirement={expected:.2}"
+                );
+            }
+        }
+        // The default dark/light themes are not in NATIVE_DELTA_E_ORACLES
+        // (which covers BUILT_IN_THEME_NAMES[2..]), so the loop above never
+        // measures them. Assert their text-on-terminal-default pairs here,
+        // in both truecolor and forced-256.
+        for &asset in &["dark", "light"] {
+            let theme = built_in_theme(asset);
+            assert!(theme.is_some(), "{asset} intern missing");
+            let Some(theme) = theme else {
+                continue;
+            };
+
+            // Existing named-bg pairs must also pass for the default themes.
+            for &(fg, bg, pair) in &NATIVE_CONTRAST_PAIRS {
+                let measured = contrast_ratio(theme.fg_rgb(fg), theme.bg_rgb(bg));
+                assert!(
+                    measured >= 4.5,
+                    "asset={asset} pair={pair} measured={measured} requirement>=4.5"
+                );
+            }
+
+            // Text roles on the terminal default background (no named ThemeBg),
+            // measured in truecolor (interned) and forced-256 (downsampled).
+            let default_bg = terminal_default_bg(asset);
+            for &(fg, pair) in &NATIVE_DEFAULT_BG_PAIRS {
+                let truecolor_rgb = theme.fg_rgb(fg);
+                let measured_tc = contrast_ratio(truecolor_rgb, default_bg);
+                assert!(
+                    measured_tc >= 4.5,
+                    "asset={asset} pair={pair} truecolor measured={measured_tc} requirement>=4.5"
+                );
+
+                let index = rgb_to_256(truecolor_rgb);
+                let palette_rgb = palette256_to_rgb(index);
+                let measured_256 = contrast_ratio(palette_rgb, default_bg);
+                assert!(
+                    measured_256 >= 4.5,
+                    "asset={asset} pair={pair} forced-256 measured={measured_256} requirement>=4.5"
                 );
             }
         }
