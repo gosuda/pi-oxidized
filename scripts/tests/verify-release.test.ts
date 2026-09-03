@@ -229,7 +229,9 @@ test("verifier collects null manifest entries instead of crashing", () => {
 	const dir = makeArchiveRoot({}, [null as unknown as Entry]);
 	return verifyUnpackedArchive(dir).then((result) => {
 		expect(result.ok).toBe(false);
-		expect(result.errors?.some((e) => e.includes("files[0] is not an object"))).toBe(true);
+		if (!result.ok) {
+			expect(result.errors.some((e: string) => e.includes("files[0] is not an object"))).toBe(true);
+		}
 	});
 });
 
@@ -239,7 +241,9 @@ test("verifier collects invalid entry field types", () => {
 	]);
 	return verifyUnpackedArchive(dir).then((result) => {
 		expect(result.ok).toBe(false);
-		expect(result.errors?.some((e) => e.includes("invalid field types"))).toBe(true);
+		if (!result.ok) {
+			expect(result.errors.some((e: string) => e.includes("invalid field types"))).toBe(true);
+		}
 	});
 });
 
@@ -248,6 +252,8 @@ test("verifier collects a null manifest instead of crashing", () => {
 	writeFileSync(join(dir, "release.json"), "null");
 	return verifyUnpackedArchive(dir).then((result) => {
 		expect(result.ok).toBe(false);
-		expect(result.errors?.some((e) => e.includes("manifest is not an object"))).toBe(true);
+		if (!result.ok) {
+			expect(result.errors.some((e: string) => e.includes("manifest is not an object"))).toBe(true);
+		}
 	});
 });
