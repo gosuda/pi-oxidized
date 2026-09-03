@@ -270,6 +270,7 @@ fn resolve_deployment_name(model: &Model, options: &StreamOptions) -> String {
     {
         if let Some((model_id, deployment)) = entry.split_once('=')
             && model_id.trim() == model.id
+            && !deployment.trim().is_empty()
         {
             return deployment.trim().to_owned();
         }
@@ -555,5 +556,60 @@ mod tests {
             [DataSseEvent::Data(_), DataSseEvent::Done]
         ));
         Ok(())
+    }
+    #[test]
+    fn deployment_precedence_skips_empty_mappings() {
+        fn mapped_options(mapping: &str) -> StreamOptions {
+            StreamOptions {
+                env: Some(BTreeMap::from([(
+                    "AZURE_OPENAI_DEPLOYMENT_NAME_MAP".into(),
+                    mapping.into(),
+                )])),
+                ..StreamOptions::default()
+            }
+        }
+        let model = model("https://x.openai.azure.com");
+        // Explicit option wins over every mapping.
+        let mut options = mapped_options("gpt-5=mapped");
+        options.insert_extra(
+            StreamOptionKey::AZURE_DEPLOYMENT_NAME,
+            Value::String("explicit".into()),
+        );
+        assert_eq!(resolve_deployment_name(&model, &options), "explicit");
+        // Empty mapped names fall through to the model id, like the reference.
+        let options = mapped_options("gpt-5=,other=x");
+        assert_eq!(resolve_deployment_name(&model, &options), "gpt-5");
+        // A later entry still matches after an empty one is skipped.
+        let options = mapped_options("gpt-5=,gpt-5=production");
+        assert_eq!(resolve_deployment_name(&model, &options), "production");
+    }
+
+    #[test]
+    fn max_tokens_clamp_and_reasoning_defaults_are_exact() {
+        let mut reasoning = model("https://x.openai.azure.com");
+        reasoning.reasoning = true;
+        let deployment = "gpt-5".to_owned();
+        // Sub-minimum requests clamp to 16; effort maps with auto summary.
+        let mut options = StreamOptions {
+            max_tokens: Some(4),
+            ..StreamOptions::default()
+        };
+        options.insert_extra(
+            StreamOptionKey::REASONING_EFFORT,
+            Value::String("high".into()),
+        );
+        let payload = build_payload(&reasoning, &Context::default(), &options, &deployment);
+        assert_eq!(payload["max_output_tokens"], 16);
+        assert_eq!(payload["reasoning"]["effort"], "high");
+        assert_eq!(payload["reasoning"]["summary"], "auto");
+        assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
+        // No effort and no summary pin the off-map value when off is unset.
+        let payload = build_payload(
+            &reasoning,
+            &Context::default(),
+            &StreamOptions::default(),
+            &deployment,
+        );
+        assert_eq!(payload["reasoning"]["effort"], "none");
     }
 }
