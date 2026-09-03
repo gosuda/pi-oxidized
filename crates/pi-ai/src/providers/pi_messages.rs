@@ -1062,6 +1062,47 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn cache_retention_prefers_explicit_then_legacy_env() {
+        use crate::types::CacheRetention;
+        use std::collections::BTreeMap;
+
+        // Explicit retention wins even over the legacy env opt-in.
+        let options = StreamOptions {
+            cache_retention: Some(CacheRetention::Short),
+            env: Some(BTreeMap::from([(
+                "PI_CACHE_RETENTION".into(),
+                "long".into(),
+            )])),
+            ..StreamOptions::default()
+        };
+        assert_eq!(
+            resolve_cache_retention(&options),
+            Some(CacheRetention::Short)
+        );
+        // The legacy env value maps only the exact "long" opt-in.
+        let options = StreamOptions {
+            env: Some(BTreeMap::from([(
+                "PI_CACHE_RETENTION".into(),
+                "long".into(),
+            )])),
+            ..StreamOptions::default()
+        };
+        assert_eq!(
+            resolve_cache_retention(&options),
+            Some(CacheRetention::Long)
+        );
+        let options = StreamOptions {
+            env: Some(BTreeMap::from([(
+                "PI_CACHE_RETENTION".into(),
+                "short".into(),
+            )])),
+            ..StreamOptions::default()
+        };
+        assert_eq!(resolve_cache_retention(&options), None);
+        // Unset means backend defaults apply: no key is sent.
+        assert_eq!(resolve_cache_retention(&StreamOptions::default()), None);
+    }
 
     #[test]
     fn request_payload_passes_native_context_and_options_through() {
