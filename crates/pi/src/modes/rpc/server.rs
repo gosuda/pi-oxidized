@@ -2963,9 +2963,8 @@ mod tests {
 
     #[tokio::test]
     async fn clone_with_leaf() {
-        let (r, host) = dispatch(r#"{"type":"clone","id":"cl2"}"#, FakeConfig::default()).await;
-        let _ = r;
-        let _ = host;
+        let (r, _) = dispatch(r#"{"type":"clone","id":"cl2"}"#, FakeConfig::default()).await;
+        assert_eq!(r["data"]["cancelled"], false);
     }
 
     #[tokio::test]
@@ -3559,16 +3558,6 @@ mod tests {
                 .count(),
             2
         );
-    }
-
-    #[tokio::test]
-    async fn loop_disposes_on_exit() {
-        let host = FakeRpcHost::new(FakeConfig::default());
-        let sink = Arc::new(BufferSink::new()) as Arc<dyn RpcSink>;
-        let input: &[u8] = b"";
-        let _ = run_rpc_loop(host, sink, input).await;
-        // host was moved; we can't check disposed flag after move.
-        // Instead, verify via a shared flag.
     }
 
     #[tokio::test]

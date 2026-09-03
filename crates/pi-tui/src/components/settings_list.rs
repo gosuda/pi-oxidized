@@ -665,21 +665,6 @@ mod tests {
     }
 
     #[test]
-    fn widths_matrix() {
-        let mut list = SettingsList::new(
-            sample_items(),
-            5,
-            SettingsListTheme::default(),
-            |_, _| {},
-            || {},
-            &SettingsListOptions::default(),
-        );
-        for w in [24_u16, 60, 80, 120] {
-            let _ = render_snapshot(&mut list, w);
-        }
-    }
-
-    #[test]
     fn truncation_marks_long_values_without_ascii_ellipsis() {
         use crate::text::{TRUNCATION_MARKER, visible_width};
 

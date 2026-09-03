@@ -334,23 +334,4 @@ mod tests {
         assert!(!ann.raw_regions().is_empty());
         assert!(ann.raw_regions()[0].kitty_id.is_some());
     }
-
-    #[test]
-    fn widths_matrix_fallback() {
-        let caps = TerminalCapabilities::default();
-        let mut img = ImageComponent::new(
-            "",
-            "image/png",
-            ImageTheme::default(),
-            ImageOptions::default(),
-            Some(ImageDimensions {
-                width_px: 10,
-                height_px: 10,
-            }),
-            caps,
-        );
-        for w in [24_u16, 60, 80, 120] {
-            let _ = render_snapshot(&mut img, w);
-        }
-    }
 }

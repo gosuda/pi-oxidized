@@ -374,7 +374,6 @@ pub fn create_ls_tool(cwd: impl Into<PathBuf>) -> Arc<dyn AgentTool> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     use serde_json::json;
     use tempfile::tempdir;
@@ -535,11 +534,5 @@ mod tests {
         };
         assert_eq!(err.message(), "Operation aborted");
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn unique_tmp_names_avoid_collision() {
-        // Ensure PermissionsExt stays imported under unix-only symlink test.
-        let _ = fs::Permissions::from_mode(0o644);
     }
 }

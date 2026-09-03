@@ -961,40 +961,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn path_prefix_lists_files() {
-        let lister = FakeLister::new();
-        lister.insert(
-            "/tmp",
-            vec![
-                FileEntry {
-                    path: "src".into(),
-                    is_directory: true,
-                },
-                FileEntry {
-                    path: "readme.md".into(),
-                    is_directory: false,
-                },
-            ],
-        );
-        let provider = CombinedAutocompleteProvider::new(vec![], "/tmp", lister);
-        let lines = vec!["./".to_owned()];
-        // force Tab on empty-looking path after ./
-        let result = provider
-            .get_suggestions(
-                &lines,
-                0,
-                2,
-                SuggestionOptions {
-                    force: true,
-                    request_token: 1,
-                },
-            )
-            .await;
-        // May be empty if search_dir resolution differs; at least exercise path.
-        let _ = result;
-    }
-
     #[test]
     fn apply_slash_completion_adds_space() {
         let lister = FakeLister::new();
