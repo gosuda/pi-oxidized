@@ -264,6 +264,23 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn every_catalog_provider_has_a_native_registration() -> TestResult {
+        use crate::providers::KnownProvider;
+
+        let catalog = builtin_models()?;
+        let mut missing = Vec::new();
+        for provider_id in catalog.keys() {
+            if KnownProvider::from_id(provider_id).is_none() {
+                missing.push(provider_id.clone());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "catalog providers without native registration: {missing:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn representative_builtin_fields_match_checked_in_payload() -> TestResult {

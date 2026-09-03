@@ -85,6 +85,8 @@ pub enum KnownProvider {
     Anthropic,
     /// Azure `OpenAI` Responses.
     AzureOpenAiResponses,
+    /// Baseten.
+    Baseten,
     /// Cerebras.
     Cerebras,
     /// Cloudflare AI Gateway.
@@ -129,6 +131,12 @@ pub enum KnownProvider {
     OpencodeGo,
     /// `OpenRouter`.
     Openrouter,
+    /// Qwen Token Plan.
+    QwenTokenPlan,
+    /// Qwen Token Plan CN.
+    QwenTokenPlanCn,
+    /// Qwen Token Plan Individual.
+    QwenTokenPlanIndividual,
     /// Radius.
     Radius,
     /// Together AI.
@@ -153,11 +161,12 @@ pub enum KnownProvider {
 
 impl KnownProvider {
     /// Every built-in provider in stable catalog order.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 40] = [
         Self::AmazonBedrock,
         Self::AntLing,
         Self::Anthropic,
         Self::AzureOpenAiResponses,
+        Self::Baseten,
         Self::Cerebras,
         Self::CloudflareAiGateway,
         Self::CloudflareWorkersAi,
@@ -180,6 +189,9 @@ impl KnownProvider {
         Self::Opencode,
         Self::OpencodeGo,
         Self::Openrouter,
+        Self::QwenTokenPlan,
+        Self::QwenTokenPlanCn,
+        Self::QwenTokenPlanIndividual,
         Self::Radius,
         Self::Together,
         Self::VercelAiGateway,
@@ -200,6 +212,7 @@ impl KnownProvider {
             Self::AntLing => "ant-ling",
             Self::Anthropic => "anthropic",
             Self::AzureOpenAiResponses => "azure-openai-responses",
+            Self::Baseten => "baseten",
             Self::Cerebras => "cerebras",
             Self::CloudflareAiGateway => "cloudflare-ai-gateway",
             Self::CloudflareWorkersAi => "cloudflare-workers-ai",
@@ -222,6 +235,9 @@ impl KnownProvider {
             Self::Opencode => "opencode",
             Self::OpencodeGo => "opencode-go",
             Self::Openrouter => "openrouter",
+            Self::QwenTokenPlan => "qwen-token-plan",
+            Self::QwenTokenPlanCn => "qwen-token-plan-cn",
+            Self::QwenTokenPlanIndividual => "qwen-token-plan-individual",
             Self::Radius => "radius",
             Self::Together => "together",
             Self::VercelAiGateway => "vercel-ai-gateway",
@@ -280,7 +296,7 @@ const COMPLETIONS_RESPONSES: &[KnownApi] =
     &[KnownApi::OpenAiCompletions, KnownApi::OpenAiResponses];
 
 /// Every built-in chat provider in catalog order with its allowed native APIs.
-pub const BUILTIN_PROVIDERS: [BuiltinProviderSpec; 36] = [
+pub const BUILTIN_PROVIDERS: [BuiltinProviderSpec; 40] = [
     BuiltinProviderSpec {
         id: KnownProvider::AmazonBedrock,
         apis: BEDROCK,
@@ -296,6 +312,10 @@ pub const BUILTIN_PROVIDERS: [BuiltinProviderSpec; 36] = [
     BuiltinProviderSpec {
         id: KnownProvider::AzureOpenAiResponses,
         apis: AZURE_RESPONSES,
+    },
+    BuiltinProviderSpec {
+        id: KnownProvider::Baseten,
+        apis: COMPLETIONS,
     },
     BuiltinProviderSpec {
         id: KnownProvider::Cerebras,
@@ -383,6 +403,18 @@ pub const BUILTIN_PROVIDERS: [BuiltinProviderSpec; 36] = [
     },
     BuiltinProviderSpec {
         id: KnownProvider::Openrouter,
+        apis: COMPLETIONS,
+    },
+    BuiltinProviderSpec {
+        id: KnownProvider::QwenTokenPlan,
+        apis: COMPLETIONS,
+    },
+    BuiltinProviderSpec {
+        id: KnownProvider::QwenTokenPlanCn,
+        apis: COMPLETIONS,
+    },
+    BuiltinProviderSpec {
+        id: KnownProvider::QwenTokenPlanIndividual,
         apis: COMPLETIONS,
     },
     BuiltinProviderSpec {
@@ -654,6 +686,7 @@ mod tests {
                 "ant-ling",
                 "anthropic",
                 "azure-openai-responses",
+                "baseten",
                 "cerebras",
                 "cloudflare-ai-gateway",
                 "cloudflare-workers-ai",
@@ -676,6 +709,9 @@ mod tests {
                 "opencode",
                 "opencode-go",
                 "openrouter",
+                "qwen-token-plan",
+                "qwen-token-plan-cn",
+                "qwen-token-plan-individual",
                 "radius",
                 "together",
                 "vercel-ai-gateway",
@@ -688,7 +724,7 @@ mod tests {
                 "zai-coding-cn",
             ]
         );
-        assert_eq!(ids.into_iter().collect::<BTreeSet<_>>().len(), 36);
+        assert_eq!(ids.into_iter().collect::<BTreeSet<_>>().len(), 40);
         assert_eq!(BUILTIN_PROVIDERS.map(|spec| spec.id), KnownProvider::ALL);
         assert_eq!(
             BUILTIN_PROVIDERS.map(|spec| spec.apis),
@@ -697,6 +733,7 @@ mod tests {
                 COMPLETIONS,
                 ANTHROPIC,
                 AZURE_RESPONSES,
+                COMPLETIONS,
                 COMPLETIONS,
                 ANTHROPIC_COMPLETIONS_RESPONSES,
                 COMPLETIONS,
@@ -718,6 +755,9 @@ mod tests {
                 CODEX_RESPONSES,
                 ANTHROPIC_GENERATIVE_COMPLETIONS_RESPONSES,
                 ANTHROPIC_COMPLETIONS,
+                COMPLETIONS,
+                COMPLETIONS,
+                COMPLETIONS,
                 COMPLETIONS,
                 PI_MESSAGES,
                 COMPLETIONS,
