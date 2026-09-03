@@ -1567,6 +1567,50 @@ mod tests {
     }
 
     #[test]
+    fn service_tier_pricing_multiplies_every_cost_leg() {
+        fn costed(input: f64, output: f64, read: f64, write: f64) -> Usage {
+            Usage {
+                cost: UsageCost {
+                    input,
+                    output,
+                    cache_read: read,
+                    cache_write: write,
+                    total: input + output + read + write,
+                },
+                ..Usage::default()
+            }
+        }
+
+        fn assert_micros(actual: f64, expected: f64) {
+            assert!(
+                (actual - expected).abs() <= 1e-12,
+                "expected {expected}, got {actual}"
+            );
+        }
+
+        let gpt5 = model();
+        let mut flex = costed(1.0, 2.0, 0.5, 0.25);
+        apply_service_tier_pricing(&gpt5, &mut flex, Some("flex"));
+        assert_micros(flex.cost.total, 3.75 * 0.5);
+        let mut priority = costed(1.0, 2.0, 0.5, 0.25);
+        apply_service_tier_pricing(&gpt5, &mut priority, Some("priority"));
+        assert_micros(priority.cost.total, 3.75 * 2.0);
+        assert_micros(priority.cost.input, 2.0);
+
+        // gpt-5.5 bills priority at 2.5x; anything else leaves cost alone.
+        let mut special = model();
+        special.id = "gpt-5.5".to_owned();
+        let mut priority = costed(1.0, 2.0, 0.5, 0.25);
+        apply_service_tier_pricing(&special, &mut priority, Some("priority"));
+        assert_micros(priority.cost.total, 3.75 * 2.5);
+        let mut plain = costed(1.0, 2.0, 0.5, 0.25);
+        apply_service_tier_pricing(&gpt5, &mut plain, None);
+        assert_micros(plain.cost.total, 3.75);
+        let mut unknown = costed(1.0, 2.0, 0.5, 0.25);
+        apply_service_tier_pricing(&gpt5, &mut unknown, Some("standard"));
+        assert_micros(unknown.cost.total, 3.75);
+    }
+    #[test]
     fn foreign_pipe_ids_are_safe_and_response_tools_are_flat() {
         let source = AssistantMessage::new("openai-responses", "github-copilot", "gpt-5", 1);
         let allowed = ["openai".to_owned()].into_iter().collect();
