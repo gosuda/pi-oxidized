@@ -615,6 +615,56 @@ mod tests {
         assert_eq!(payload["reasoning"]["effort"], "high");
         assert_eq!(payload["service_tier"], "flex");
     }
+    #[test]
+    fn reasoning_defaults_and_provider_overrides_are_exact() {
+        let context = Context::default();
+        // No retention: no cache key and no retention marker at all.
+        let payload = build_payload(
+            &model(),
+            &context,
+            &StreamOptions::default(),
+            CacheRetention::None,
+        );
+        assert_eq!(payload.get("prompt_cache_key"), None);
+        assert_eq!(payload.get("prompt_cache_retention"), None);
+        // Effort without summary: auto summary plus encrypted include.
+        let mut options = StreamOptions::default();
+        options.insert_extra(
+            StreamOptionKey::REASONING_EFFORT,
+            Value::String("medium".into()),
+        );
+        let payload = build_payload(&model(), &context, &options, CacheRetention::None);
+        assert_eq!(payload["reasoning"]["effort"], "medium");
+        assert_eq!(payload["reasoning"]["summary"], "auto");
+        assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
+        // No effort: plain providers pin the off-map none.
+        let payload = build_payload(
+            &model(),
+            &context,
+            &StreamOptions::default(),
+            CacheRetention::None,
+        );
+        assert_eq!(payload["reasoning"]["effort"], "none");
+        // Copilot skips the implicit off; xAI always requests encrypted reasoning.
+        let mut copilot = model();
+        copilot.provider = "github-copilot".into();
+        let payload = build_payload(
+            &copilot,
+            &context,
+            &StreamOptions::default(),
+            CacheRetention::None,
+        );
+        assert_eq!(payload.get("reasoning"), None);
+        let mut xai = model();
+        xai.provider = "xai".into();
+        let payload = build_payload(
+            &xai,
+            &context,
+            &StreamOptions::default(),
+            CacheRetention::None,
+        );
+        assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
+    }
 
     #[test]
     fn session_headers_obey_affinity_and_options_override_auth() {
