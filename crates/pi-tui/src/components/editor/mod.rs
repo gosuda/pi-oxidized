@@ -2053,7 +2053,7 @@ fn paint_grapheme(
     grapheme: &str,
     style: Style,
 ) -> u16 {
-    let width = u16::try_from(visible_width(grapheme).max(1)).unwrap_or(u16::MAX);
+    let width = u16::try_from(visible_width(grapheme)).unwrap_or(u16::MAX);
     if position.x.saturating_add(width) > right {
         return right;
     }
@@ -2826,5 +2826,43 @@ mod tests {
             assert_eq!(bottom.symbol(), "─");
         }
         assert_eq!(editor.get_expanded_text(), payload);
+    }
+
+    #[test]
+    fn p08_zwsp_does_not_shift_caret_position() {
+        // P08: a standalone ZWSP (U+200B) is zero-width and must not advance
+        // the caret column.  The caret should remain at the same screen
+        // position as if the ZWSP were absent.
+        let mut editor = Editor::with_defaults();
+        editor.set_text("ab\u{200B}cd");
+        editor.state.cursor_line = 0;
+        // Place cursor right after "ab" (before ZWSP).
+        editor.set_cursor_col(2);
+        editor.handle_event(&UiEvent::FocusGained);
+
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buffer = Buffer::empty(area);
+        editor.render(area, &mut buffer);
+
+        // ZWSP is zero-width: 'a' at col 0, 'b' at col 1, 'c' at col 2, 'd' at col 3.
+        assert_eq!(
+            buffer.cell((0, 1)).map(ratatui::buffer::Cell::symbol),
+            Some("a")
+        );
+        assert_eq!(
+            buffer.cell((1, 1)).map(ratatui::buffer::Cell::symbol),
+            Some("b")
+        );
+        // ZWSP occupies no cell — 'c' appears at column 2, not 3.
+        assert_eq!(
+            buffer.cell((2, 1)).map(ratatui::buffer::Cell::symbol),
+            Some("c")
+        );
+        assert_eq!(
+            buffer.cell((3, 1)).map(ratatui::buffer::Cell::symbol),
+            Some("d")
+        );
+        // Caret screen position should be at column 2 (after "ab", ZWSP is invisible).
+        assert_eq!(editor.last_cursor_screen, Some((2, 1)));
     }
 }

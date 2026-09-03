@@ -334,6 +334,130 @@ fn partial_fence_streaming() {
     assert_eq!(stripped, "```ts\nconst x = 1;");
 }
 
+// ---------------------------------------------------------------------------
+// grapheme_width parity tests — port of utils.ts graphemeWidth semantics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spacing_mark_standalone_occupies_one_cell() {
+    // U+093E DEVANAGARI VOWEL SIGN AA (Mc) — terminalSpacingMark → code-point count
+    assert_eq!(grapheme_width("\u{093E}"), 1);
+    // U+0903 DEVANAGARI SIGN VISARGA (Mc)
+    assert_eq!(grapheme_width("\u{0903}"), 1);
+    // U+093B DEVANAGARI VOWEL SIGN OE (Mc)
+    assert_eq!(grapheme_width("\u{093B}"), 1);
+}
+
+#[test]
+fn multiple_spacing_marks_standalone_count_codepoints() {
+    // Two Mc chars → code-point count = 2
+    assert_eq!(grapheme_width("\u{093E}\u{093E}"), 2);
+    // Three Mc chars → 3
+    assert_eq!(grapheme_width("\u{093E}\u{0903}\u{093E}"), 3);
+}
+
+#[test]
+fn spacing_mark_attached_to_base_adds_one() {
+    // U+0915 DEVANAGARI LETTER KA (width 1) + U+093E (Mc, spacing mark) → 2
+    assert_eq!(grapheme_width("का"), 2);
+    // Base + two spacing marks → 1 + 1 + 1 = 3
+    assert_eq!(grapheme_width("\u{0915}\u{093E}\u{093E}"), 3);
+}
+
+#[test]
+fn excluded_spacing_mark_is_zero_width() {
+    // U+1734 HANUNOO SIGN PAMUDPOD is Mc but excluded from terminalSpacingMark.
+    // As a Mark it matches zeroWidthRegex → 0.
+    assert_eq!(grapheme_width("\u{1734}"), 0);
+    // U+302E HANGUL SINGLE DOT TONE MARK, excluded Mc → 0
+    assert_eq!(grapheme_width("\u{302E}"), 0);
+    // U+302F HANGUL DOUBLE DOT TONE MARK, excluded Mc → 0
+    assert_eq!(grapheme_width("\u{302F}"), 0);
+}
+
+#[test]
+fn legacy_exception_spacing_marks_standalone() {
+    // U+065F ARABIC WAVY HAMZA BELOW — not Mc (it's Mn), but added as exception
+    assert_eq!(grapheme_width("\u{065F}"), 1);
+    // U+0F7F TIBETAN SIGN RNAM BCAD — not Mc (Mn), exception
+    assert_eq!(grapheme_width("\u{0F7F}"), 1);
+    // U+102B MYANMAR SIGN TALL AA — not Mc (Mn in some versions), exception
+    assert_eq!(grapheme_width("\u{102B}"), 1);
+}
+
+#[test]
+fn indic_consonant_after_mark_counts_visible() {
+    // U+0915 (KA, width 1) + U+093C (nukta, Mn) + U+0916 (KHA, consonant)
+    // followsMark → width += eastAsianWidth(KHA) = 1 → total 2
+    assert_eq!(grapheme_width("\u{0915}\u{093C}\u{0916}"), 2);
+    // Base + Mn + Mn + consonant → still followsMark through chain
+    assert_eq!(grapheme_width("\u{0915}\u{093C}\u{093C}\u{0916}"), 2);
+}
+
+#[test]
+fn zero_width_graphemes_are_zero() {
+    // ZWSP (DICP)
+    assert_eq!(grapheme_width("\u{200B}"), 0);
+    // ZWNJ (DICP)
+    assert_eq!(grapheme_width("\u{200C}"), 0);
+    // ZWJ (DICP)
+    assert_eq!(grapheme_width("\u{200D}"), 0);
+    // VS16 (DICP)
+    assert_eq!(grapheme_width("\u{FE0F}"), 0);
+    // Combining grave (Mn, Mark)
+    assert_eq!(grapheme_width("\u{0300}"), 0);
+    // BEL (Control)
+    assert_eq!(grapheme_width("\u{0007}"), 0);
+}
+
+#[test]
+fn combining_mark_attached_to_base_no_extra_width() {
+    // 'a' (width 1) + combining grave (Mn, zero-width) → 1
+    assert_eq!(grapheme_width("a\u{0300}"), 1);
+    // 'a' + combining grave + combining acute → still 1
+    assert_eq!(grapheme_width("a\u{0300}\u{0301}"), 1);
+}
+
+#[test]
+fn regional_indicator_singleton_is_two() {
+    assert_eq!(grapheme_width("\u{1F1FA}"), 2);
+    assert_eq!(grapheme_width("\u{1F1E6}"), 2);
+}
+
+#[test]
+fn fullwidth_and_halfwidth_in_cluster() {
+    // Fullwidth A U+FF21 → eastAsianWidth = 2
+    assert_eq!(grapheme_width("\u{FF21}"), 2);
+    // Halfwidth katakana U+FF61 → in 0xFF00-0xFFEF range → eastAsianWidth = 1
+    assert_eq!(grapheme_width("\u{FF61}"), 1);
+}
+
+#[test]
+fn thai_lao_am_vowel_in_cluster() {
+    // U+0E33 THAI CHARACTER SARA AM → eastAsianWidth = 1, plus 0x0E33 rule → +1 = 2
+    // Wait: in grapheme_width, 0E33 is Lo (not Mc, not zero-width).
+    // base = 0E33, width = eastAsianWidth(0E33) = 1.
+    // No trailing chars. Total = 1.
+    // The +1 for 0E33 only applies in the trailing-char loop, not for the base.
+    assert_eq!(grapheme_width("\u{0E33}"), 1);
+    assert_eq!(grapheme_width("\u{0EB3}"), 1);
+}
+
+#[test]
+fn visible_width_spacing_mark_string() {
+    // "क" (1) + "ा" (1, spacing mark standalone) → visible_width = 2
+    // But Intl.Segmenter groups का as one grapheme → grapheme_width("का") = 2
+    // For visible_width, the graphemes are segmented by unicode-segmentation.
+    // "का" is one grapheme → visible_width = 2
+    assert_eq!(visible_width("का"), 2);
+    // Standalone spacing mark
+    assert_eq!(visible_width("\u{093E}"), 1);
+    // ZWSP is zero-width
+    assert_eq!(visible_width("\u{200B}"), 0);
+    // "abc" + ZWSP + "def" → 6 (ZWSP is zero-width)
+    assert_eq!(visible_width("abc\u{200B}def"), 6);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 

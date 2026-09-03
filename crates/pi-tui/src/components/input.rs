@@ -526,7 +526,7 @@ impl Component for Input {
         let mut byte_i = 0usize;
         let max_w = usize::from(area.width);
         for g in UnicodeSegmentation::graphemes(visible, true) {
-            let gw = visible_width(g).max(1);
+            let gw = visible_width(g);
             if col + gw > max_w {
                 break;
             }

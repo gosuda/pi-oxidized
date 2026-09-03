@@ -177,8 +177,7 @@ pub fn write_link(
         for grapheme in
             unicode_segmentation::UnicodeSegmentation::graphemes(span.content.as_ref(), true)
         {
-            let w =
-                u16::try_from(unicode_width::UnicodeWidthStr::width(grapheme)).unwrap_or(u16::MAX);
+            let w = u16::try_from(crate::text::grapheme_width(grapheme)).unwrap_or(u16::MAX);
             if w == 0 {
                 continue;
             }
@@ -403,6 +402,87 @@ mod tests {
         assert_eq!(
             format_link_open("https://a", None).as_deref(),
             Some("\u{1b}]8;;https://a\u{1b}\\")
+        );
+    }
+
+    #[test]
+    fn write_link_vs16_zwj_ri_agree_with_layout() {
+        // VS16 (U+FE0F) is zero-width via grapheme_width — it does not
+        // consume an extra cell.  unicode-segmentation groups "B\u{FE0F}"
+        // as one grapheme, so the cell symbol is "B\u{FE0F}" but it
+        // occupies only one column.
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        let span = Span::raw("AB\u{FE0F}CD");
+        let result = write_link(&mut buf, area, &[span], "https://e.com", None);
+        // visible_width("AB\u{FE0F}CD") = 4 (VS16 is zero-width)
+        assert_eq!(result.cells_written, 4);
+        assert_eq!(
+            buf.cell((0, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("A")
+        );
+        assert_eq!(
+            buf.cell((1, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("B\u{FE0F}")
+        );
+        assert_eq!(
+            buf.cell((2, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("C")
+        );
+        assert_eq!(
+            buf.cell((3, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("D")
+        );
+    }
+
+    #[test]
+    fn write_link_ri_pair_agrees_with_layout() {
+        // Regional indicator pair 🇺🇸 is ONE grapheme cluster, width 2
+        // (grapheme_width returns 2 via the RI base-char rule).
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        let span = Span::raw("\u{1F1FA}\u{1F1F8}");
+        let result = write_link(&mut buf, area, &[span], "https://e.com", None);
+        assert_eq!(result.cells_written, 2);
+        assert_eq!(
+            buf.cell((0, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("\u{1F1FA}\u{1F1F8}")
+        );
+        assert_eq!(
+            buf.cell((1, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn write_link_ri_singleton_two_cells() {
+        // A single regional indicator is width 2.
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        let span = Span::raw("\u{1F1FA}");
+        let result = write_link(&mut buf, area, &[span], "https://e.com", None);
+        assert_eq!(result.cells_written, 2);
+        assert_eq!(
+            buf.cell((0, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("\u{1F1FA}")
+        );
+        assert_eq!(
+            buf.cell((1, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn write_link_spacing_mark_agrees_with_layout() {
+        // "का" (U+0915 + U+093E) is one grapheme, width 2 (base + spacing mark).
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        let span = Span::raw("का");
+        let result = write_link(&mut buf, area, &[span], "https://e.com", None);
+        assert_eq!(result.cells_written, 2);
+        assert_eq!(
+            buf.cell((0, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("का")
         );
     }
 }

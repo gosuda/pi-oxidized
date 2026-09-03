@@ -81,7 +81,7 @@ pub fn write_overlay_cells(buf: &mut Buffer, area: Rect, text: &str) {
 
     let mut col = 0u16;
     for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(text, true) {
-        let w = u16::try_from(unicode_width::UnicodeWidthStr::width(grapheme)).unwrap_or(u16::MAX);
+        let w = u16::try_from(crate::text::grapheme_width(grapheme)).unwrap_or(u16::MAX);
         if w == 0 {
             continue;
         }
@@ -215,5 +215,88 @@ mod tests {
         );
         let c2 = buf.cell((2, 0)).map(|c| c.symbol().to_owned());
         assert_eq!(c2.as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn buffer_vs16_does_not_consume_cell() {
+        // VS16 (U+FE0F) is zero-width via grapheme_width — it does not
+        // consume an extra cell.  unicode-segmentation groups "B\u{FE0F}"
+        // as one grapheme, so the cell symbol is "B\u{FE0F}" but it
+        // occupies only one column.
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        write_overlay_cells(&mut buf, area, "AB\u{FE0F}CD");
+        assert_eq!(
+            buf.cell((0, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("A")
+        );
+        assert_eq!(
+            buf.cell((1, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("B\u{FE0F}")
+        );
+        assert_eq!(
+            buf.cell((2, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("C")
+        );
+        assert_eq!(
+            buf.cell((3, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("D")
+        );
+    }
+
+    #[test]
+    fn buffer_ri_pair_one_grapheme_two_cells() {
+        // Regional indicator pair 🇺🇸 is ONE grapheme cluster, width 2.
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        write_overlay_cells(&mut buf, area, "\u{1F1FA}\u{1F1F8}");
+        assert_eq!(
+            buf.cell((0, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("\u{1F1FA}\u{1F1F8}")
+        );
+        assert_eq!(
+            buf.cell((1, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn buffer_ri_singleton_two_cells() {
+        // A single regional indicator is width 2.
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        write_overlay_cells(&mut buf, area, "\u{1F1FA}X");
+        assert_eq!(
+            buf.cell((0, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("\u{1F1FA}")
+        );
+        assert_eq!(
+            buf.cell((1, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("")
+        );
+        assert_eq!(
+            buf.cell((2, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("X")
+        );
+    }
+
+    #[test]
+    fn buffer_spacing_mark_agrees_with_layout() {
+        // "का" (U+0915 + U+093E) is one grapheme, width 2 (base + spacing mark).
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        write_overlay_cells(&mut buf, area, "काX");
+        assert_eq!(
+            buf.cell((0, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("का")
+        );
+        assert_eq!(
+            buf.cell((1, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("")
+        );
+        assert_eq!(
+            buf.cell((2, 0)).map(ratatui::buffer::Cell::symbol),
+            Some("X")
+        );
     }
 }
