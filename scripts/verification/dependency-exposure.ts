@@ -1661,6 +1661,12 @@ export async function captureReference(
 	const inputsRecord = asRecord(inputsRaw, "metafile inputs");
 	const inputs: Record<string, string> = {};
 	for (const path of Object.keys(inputsRecord)) {
+		// The provider-data manifest embeds its own generation timestamp
+		// (generatedAt), so its digest changes on every data hydration and
+		// can never reproduce a capture. Pinning it tests recency, not
+		// integrity. The manifest's source files are pinned individually
+		// below, so skipping it loses no coverage.
+		if (path.endsWith("packages/ai/src/providers/data/.manifest.json")) continue;
 		inputs[path] = sha256FileAt(resolve(hostDir, path));
 	}
 	const metafileProjection: MetafileProjection = {
