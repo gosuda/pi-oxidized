@@ -21,8 +21,7 @@ use crate::editor_support::{
 use crate::frame::set_cursor;
 use crate::keybindings::get_keybindings;
 use crate::keys::{
-    KeyId, MODIFY_OTHER_KEYS_OMISSION, backslash_enter_inserts_newline, key_matches,
-    should_submit_on_backslash_enter,
+    KeyId, backslash_enter_inserts_newline, key_matches, should_submit_on_backslash_enter,
 };
 use crate::text::{is_whitespace_char, truncate_with_marker, visible_width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -46,9 +45,6 @@ pub use self::paste::{
     normalize_text as normalize_editor_text,
 };
 pub use self::state::{EditorState as BufferState, compute_vertical_move_column as sticky_column};
-
-/// Documented legacy-input omission (re-export for key-matrix tests).
-pub const LEGACY_MODIFY_OTHER_KEYS_OMISSION: &str = MODIFY_OTHER_KEYS_OMISSION;
 
 /// Theme hooks for the editor border and optional select-list styling.
 #[derive(Clone, Copy)]
@@ -2262,12 +2258,6 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         key_press(KeyCode::Char(c), KeyModifiers::CONTROL)
-    }
-
-    #[test]
-    fn legacy_omission_documented() {
-        assert!(LEGACY_MODIFY_OTHER_KEYS_OMISSION.contains("modifyOtherKeys"));
-        assert!(LEGACY_MODIFY_OTHER_KEYS_OMISSION.contains("backslash-Enter"));
     }
 
     #[test]

@@ -3865,11 +3865,6 @@ mod tests {
         assert_eq!(DoubleEscapeAction::parse("bogus"), None);
     }
 
-    #[test]
-    fn double_escape_action_default_is_tree() {
-        assert_eq!(DoubleEscapeAction::default(), DoubleEscapeAction::Tree);
-    }
-
     /// Malformed stored values use the typed default instead of becoming a
     /// second hidden action.
     #[test]

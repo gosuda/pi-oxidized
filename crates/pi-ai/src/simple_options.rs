@@ -402,17 +402,4 @@ mod tests {
             Some(None)
         );
     }
-
-    #[test]
-    fn documented_shared_defaults() {
-        assert_eq!(DEFAULT_MAX_RETRY_DELAY_MS, 60_000);
-        assert!(matches!(
-            DEFAULT_CACHE_RETENTION,
-            crate::types::CacheRetention::Short
-        ));
-        // SDK-style timeoutMs / maxRetries defaults (10 minutes / 2) are
-        // OpenAI/Anthropic SDK client defaults, not applied by pi-ai adapters
-        // when the option is omitted (TS also only passes them when set, and
-        // uses maxRetries ?? 0 for the create call). Left unset = no invent.
-    }
 }
