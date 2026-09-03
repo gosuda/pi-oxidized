@@ -193,18 +193,27 @@ pub fn osc52_encode(text: &str) -> Option<String> {
 
 /// Copy `text` to the clipboard using the host platform and environment.
 ///
+/// An OSC 52 fallback sequence is written to stdout when no shell tool
+/// applies (or fails), and additionally after a successful tool copy in a
+/// remote session, mirroring the reference `copyToClipboard` order.
+///
 /// # Errors
 ///
 /// Returns [`ClipboardError::Failed`] when every available clipboard path fails.
 pub fn copy_to_clipboard(text: &str) -> Result<(), ClipboardError> {
-    copy_to_clipboard_with(text, ClipboardPlatform::host(), &HostEnv)
+    copy_to_clipboard_with(text, ClipboardPlatform::host(), &HostEnv, &mut |sequence| {
+        let _ = std::io::stdout().write_all(sequence.as_bytes());
+    })
 }
 
-/// Copy `text` with an explicit platform/env.
+/// Copy `text` with an explicit platform/env and OSC 52 sink.
 ///
-/// Tries the selected shell tool (and its fallback), then OSC 52. On the host
-/// this writes the OSC sequence to stdout; tests inject platforms whose tools
-/// are absent so the decision logic is exercised without side effects.
+/// Tries the selected shell tool (and its fallback) first: emitting OSC 52
+/// before a tool copy can make terminals write the native clipboard twice,
+/// and large payloads can desynchronize rendering. The sink receives the
+/// encoded sequence when the OSC 52 path triggers — on the host this writes
+/// to stdout; tests inject a capturing closure so the decision logic is
+/// exercised without side effects.
 ///
 /// # Errors
 ///
@@ -214,6 +223,7 @@ pub fn copy_to_clipboard_with(
     text: &str,
     platform: ClipboardPlatform,
     env: &dyn ClipboardEnv,
+    emit_osc52: &mut dyn FnMut(&str),
 ) -> Result<(), ClipboardError> {
     let mut copied = false;
 
@@ -223,7 +233,10 @@ pub fn copy_to_clipboard_with(
         copied = true;
     }
 
-    if !copied && osc52_encode(text).is_some() {
+    if (is_remote_session(env) || !copied)
+        && let Some(sequence) = osc52_encode(text)
+    {
+        emit_osc52(&sequence);
         copied = true;
     }
 
@@ -707,6 +720,46 @@ mod tests {
     fn osc52_rejects_oversized_payload() {
         let big = "a".repeat(MAX_OSC52_ENCODED_LENGTH * 3 / 4 + 1);
         assert!(osc52_encode(&big).is_none());
+    }
+
+    #[test]
+    fn osc52_fallback_emits_sequence_when_no_tool_applies() -> TestResult {
+        let env = MapEnv::default();
+        let mut emitted = Vec::new();
+        let result = copy_to_clipboard_with("hi", ClipboardPlatform::Unix, &env, &mut |seq| {
+            emitted.push(seq.to_owned());
+        });
+        assert!(result.is_ok());
+        assert_eq!(
+            emitted,
+            vec![required(osc52_encode("hi"), "OSC 52 sequence")?]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn osc52_emits_in_remote_session() {
+        let env = MapEnv::default().set("SSH_CONNECTION", "1.2.3.4");
+        let mut emitted = Vec::new();
+        let result = copy_to_clipboard_with("hi", ClipboardPlatform::Unix, &env, &mut |seq| {
+            emitted.push(seq.to_owned());
+        });
+        assert!(result.is_ok());
+        assert_eq!(emitted.len(), 1);
+    }
+
+    #[test]
+    fn oversize_without_tool_errors_without_emit() {
+        let env = MapEnv::default();
+        let mut emitted = 0;
+        let result = copy_to_clipboard_with(
+            &"a".repeat(MAX_OSC52_ENCODED_LENGTH * 3 / 4 + 1),
+            ClipboardPlatform::Unix,
+            &env,
+            &mut |_| emitted += 1,
+        );
+        assert!(matches!(result, Err(ClipboardError::Failed)));
+        assert_eq!(emitted, 0);
     }
 
     #[test]
