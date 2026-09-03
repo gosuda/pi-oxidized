@@ -663,6 +663,21 @@ mod tests {
         assert_eq!(list.filtered.len(), 1);
         assert_eq!(list.filtered[0].id, "model");
     }
+    #[test]
+    fn widths_matrix() {
+        // Fails iff measure/paint heights diverge (see render_snapshot contract).
+        let mut list = SettingsList::new(
+            sample_items(),
+            5,
+            SettingsListTheme::default(),
+            |_, _| {},
+            || {},
+            &SettingsListOptions::default(),
+        );
+        for w in [24_u16, 60, 80, 120] {
+            let _ = render_snapshot(&mut list, w);
+        }
+    }
 
     #[test]
     fn truncation_marks_long_values_without_ascii_ellipsis() {
