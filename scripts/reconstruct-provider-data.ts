@@ -198,6 +198,7 @@ function rebuildProviderManifest(
 	bodies: ReadonlyMap<string, string>,
 	previous: Uint8Array | null,
 	initialGeneratedAt?: string,
+	pinnedGeneratedAt?: string,
 ): Uint8Array | null {
 	let generatedAt = initialGeneratedAt;
 	if (previous !== null) {
@@ -217,7 +218,9 @@ function rebuildProviderManifest(
 		if (typeof previousGeneratedAt !== "string") {
 			throw new Error("provider manifest has an invalid generation timestamp");
 		}
-		generatedAt = previousGeneratedAt;
+		// Repository defaults heal a wall-clock-stamped manifest back to the
+		// pinned timestamp; custom fixture paths preserve theirs (line-699 test).
+		generatedAt = pinnedGeneratedAt ?? previousGeneratedAt;
 		const previousSchemaVersion = record["schemaVersion"];
 		if (previousSchemaVersion !== MANIFEST_SCHEMA_VERSION) {
 			throw new Error(
@@ -989,6 +992,7 @@ export async function reconstructProviderData(
 			expectedBodies,
 			previousManifest,
 			initialManifestGeneratedAt,
+			usesRepositoryDefaultPaths(proofCtx) ? PINNED_PROVIDER_DATA_GENERATED_AT : undefined,
 		);
 		const stagingDir = uniqueSibling(dataDir, "staging");
 		let backupDir: string | null = null;
