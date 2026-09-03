@@ -972,7 +972,13 @@ fn kill_process_tree(pid: u32) {
 
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
+        // Upstream 7af2d27dc (#6596): resolve taskkill.exe under %SystemRoot%\System32
+        // instead of PATH so a hijacked PATH entry cannot redirect the kill.
+        let system_root = std::env::var_os("SystemRoot").map(PathBuf::from);
+        let taskkill = system_root
+            .map(|root| root.join("System32").join("taskkill.exe"))
+            .unwrap_or_else(|| PathBuf::from("taskkill.exe"));
+        let _ = std::process::Command::new(taskkill)
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
