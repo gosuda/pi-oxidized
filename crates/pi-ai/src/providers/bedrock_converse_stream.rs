@@ -675,7 +675,8 @@ fn convert_thinking_block(
     thinking: &crate::types::ThinkingContent,
     model: &Model,
 ) -> Option<Value> {
-    let text = non_blank_text(&thinking.thinking)?;
+    // Encrypted reasoning is opaque: replay the stored payload without
+    // requiring display text, mirroring the reference redacted-first order.
     if thinking.redacted == Some(true) {
         let data = thinking
             .thinking_signature
@@ -685,6 +686,7 @@ fn convert_thinking_block(
             "reasoningContent": { "redactedContent": data }
         }));
     }
+    let text = non_blank_text(&thinking.thinking)?;
     if is_anthropic_claude(model) {
         if let Some(signature) = thinking
             .thinking_signature
@@ -2022,6 +2024,27 @@ mod tests {
         assert_eq!(
             payload.pointer("/messages/0/content/0/reasoningContent/reasoningText/signature"),
             None
+        );
+        Ok(())
+    }
+    #[test]
+    fn redacted_reasoning_replays_without_display_text() -> Result<(), String> {
+        let model = test_model("us.anthropic.claude-sonnet-4-6-v1:0", "Claude Sonnet 4.6");
+        let mut prior = assistant_message(&model);
+        let mut thinking = ThinkingContent::new(String::new());
+        thinking.redacted = Some(true);
+        thinking.thinking_signature = Some("opaque-signature".to_owned());
+        prior.content.push(AssistantContent::Thinking(thinking));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::Assistant(prior)],
+            tools: None,
+        };
+        let payload = build_request_payload(&model, &context, &StreamOptions::default())
+            .map_err(|error| format!("request conversion failed: {error}"))?;
+        assert_eq!(
+            payload.pointer("/messages/0/content/0/reasoningContent/redactedContent"),
+            Some(&Value::String("opaque-signature".to_owned()))
         );
         Ok(())
     }
