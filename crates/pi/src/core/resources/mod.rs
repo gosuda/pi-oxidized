@@ -5,7 +5,7 @@
 //! - `skills.ts` → [`skills`]
 //! - `prompt-templates.ts` → [`prompts`]
 //! - theme path collection from `resource-loader.ts` → [`themes`]
-//! - `resource-loader.ts` → [`ResourceLoader`] / [`DefaultResourceLoader`]
+//! - `resource-loader.ts` → [`DefaultResourceLoader`]
 
 pub mod diagnostics;
 pub mod discovery;
@@ -100,7 +100,7 @@ pub struct AgentsFile {
     pub content: String,
 }
 
-/// Paths registered via [`ResourceLoader::extend_resources`].
+/// Paths registered via [`DefaultResourceLoader::extend_resources`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ResourceExtensionPaths {
     /// Extra skill paths with metadata.
@@ -295,7 +295,7 @@ pub struct DefaultResourceLoader {
 }
 
 impl DefaultResourceLoader {
-    /// Create a loader (does not load until [`ResourceLoader::reload`]).
+    /// Create a loader (does not load until [`DefaultResourceLoader::reload`]).
     #[must_use]
     pub fn new(options: DefaultResourceLoaderOptions) -> Self {
         let cwd = resolve_path_with(

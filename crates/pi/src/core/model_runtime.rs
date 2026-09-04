@@ -313,9 +313,8 @@ pub struct ModelsRefreshOptions {
     /// Whether network catalog refresh is allowed. Defaults to the runtime's
     /// construction-time policy.
     pub allow_network: Option<bool>,
-    /// When `Some`, refresh only recomposes and re-probes availability for the
     /// listed provider ids (deduped, preserving first-seen order). Per-provider
-    /// availability errors are recorded into [`ModelsRefreshResult::errors`]
+    /// recomposition errors are recorded into [`ModelsRefreshResult::errors`]
     /// keyed by provider id. When `None`, every provider is refreshed.
     pub providers: Option<Vec<String>>,
 }
@@ -1007,7 +1006,7 @@ impl ModelRuntime {
 
     /// Refresh only the listed providers: recompose their model lists and
     /// re-probe their availability. Provider ids are deduped (first-seen
-    /// order). Per-provider availability errors are recorded into the result
+    /// order). Per-provider recomposition errors are recorded into the result
     /// `errors` map keyed by provider id; the `aborted` flag is set when a
     /// hard error prevents any probing.
     async fn refresh_providers(
@@ -1021,11 +1020,12 @@ impl ModelRuntime {
             .filter(|id| seen.insert(id.clone()))
             .collect();
 
-        let errors = BTreeMap::new();
+        let mut errors = BTreeMap::new();
 
         // Recompose each target provider's model list.
         for provider_id in &target_ids {
             if let Err(error) = self.recompose_provider(provider_id).await {
+                errors.insert(provider_id.clone(), error.clone());
                 lock(&self.inner.composition_errors).insert(provider_id.clone(), error);
             }
         }
@@ -3893,6 +3893,66 @@ mod tests {
                 .extra_value(StreamOptionKey::THINKING_BUDGET_TOKENS)
                 .is_none(),
             "non-reasoning model must not emit thinking budget"
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn refresh_providers_returns_composition_errors() -> Result<(), ModelRuntimeError> {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "broken".to_owned(),
+            ProviderConfigInput {
+                models: Some(vec![ProviderModelDefinition {
+                    id: "m".into(),
+                    name: None,
+                    api: None,
+                    base_url: None,
+                    reasoning: false,
+                    thinking_level_map: None,
+                    input: None,
+                    cost: None,
+                    context_window: None,
+                    max_tokens: None,
+                    headers: None,
+                    compat: None,
+                }]),
+                ..ProviderConfigInput::default()
+            },
+        );
+
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
+            models_store: Some(Arc::new(InMemoryModelsStore::new())),
+            models_config: Some(ModelsJsonConfig::from_providers(providers)),
+            allow_model_network: Some(false),
+            ..CreateModelRuntimeOptions::default()
+        })
+        .await?;
+
+        let result = runtime
+            .refresh(ModelsRefreshOptions {
+                providers: Some(vec!["anthropic".to_owned(), "broken".to_owned()]),
+                ..ModelsRefreshOptions::default()
+            })
+            .await?;
+
+        assert!(
+            result
+                .errors
+                .get("broken")
+                .is_some_and(|message| message.contains("no \"api\" specified")),
+            "expected broken provider composition error in {:?}",
+            result.errors
+        );
+        assert!(
+            !result.errors.contains_key("anthropic"),
+            "successful provider must not appear in errors: {:?}",
+            result.errors
+        );
+        assert!(!result.aborted, "refresh must not abort");
+        assert!(
+            !runtime.get_models(Some("anthropic")).is_empty(),
+            "anthropic models must still be composed"
         );
         Ok(())
     }

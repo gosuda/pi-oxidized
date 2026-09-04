@@ -10,7 +10,7 @@
 //!
 //! Matched boundary with the TypeScript worker in
 //! `scripts/bench-tool-dispatch.ts` (which drives upstream `runAgentLoop`
-//! from `.references/pi`): the timed slice starts when the event sink
+//! from `.references/pi-2.0`): the timed slice starts when the event sink
 //! receives `tool_execution_start` and ends when the sink has appended the
 //! tool-result message to a real `SessionManager` JSONL file. Loop/stream
 //! overhead sits outside the slice on both implementations.

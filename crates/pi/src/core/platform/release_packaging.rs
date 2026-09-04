@@ -10,7 +10,9 @@
 //! Supported targets (baseline x64 hosts avoid Bun's AVX2 floor; arm64 hosts
 //! use the standard target):
 //! - `x86_64-unknown-linux-gnu`
+//! - `x86_64-unknown-linux-musl`
 //! - `aarch64-unknown-linux-gnu`
+//! - `aarch64-unknown-linux-musl`
 //! - `x86_64-apple-darwin`
 //! - `aarch64-apple-darwin`
 //! - `x86_64-pc-windows-msvc`
@@ -25,9 +27,13 @@ use super::command::{CommandRunner, CommandSpec};
 pub enum ReleaseTarget {
     /// Linux `x86_64` (GNU).
     LinuxX64,
+    /// Linux `x86_64` (musl).
+    LinuxMuslX64,
 
     /// Linux aarch64 (GNU).
     LinuxArm64,
+    /// Linux aarch64 (musl).
+    LinuxMuslArm64,
     /// macOS `x86_64`.
     MacosX64,
     /// macOS aarch64.
@@ -42,7 +48,9 @@ impl ReleaseTarget {
     pub const fn all() -> &'static [ReleaseTarget] {
         &[
             Self::LinuxX64,
+            Self::LinuxMuslX64,
             Self::LinuxArm64,
+            Self::LinuxMuslArm64,
             Self::MacosX64,
             Self::MacosArm64,
             Self::WindowsX64,
@@ -54,7 +62,9 @@ impl ReleaseTarget {
     pub const fn triple(self) -> &'static str {
         match self {
             Self::LinuxX64 => "x86_64-unknown-linux-gnu",
+            Self::LinuxMuslX64 => "x86_64-unknown-linux-musl",
             Self::LinuxArm64 => "aarch64-unknown-linux-gnu",
+            Self::LinuxMuslArm64 => "aarch64-unknown-linux-musl",
             Self::MacosX64 => "x86_64-apple-darwin",
             Self::MacosArm64 => "aarch64-apple-darwin",
             Self::WindowsX64 => "x86_64-pc-windows-msvc",
@@ -67,13 +77,21 @@ impl ReleaseTarget {
         matches!(self, Self::WindowsX64)
     }
 
+    /// Whether the archive carries both compiled and runtime host forms.
+    #[must_use]
+    pub const fn ships_dual_host(self) -> bool {
+        matches!(self, Self::LinuxMuslX64 | Self::LinuxMuslArm64)
+    }
+
     /// Host-asset branch name. x64 targets build the baseline-x64 host (to
     /// avoid Bun's AVX2 floor); arm64 targets build the standard host.
     #[must_use]
     pub const fn host_branch(self) -> &'static str {
         match self {
-            Self::LinuxX64 | Self::MacosX64 | Self::WindowsX64 => "baseline-x64",
-            Self::LinuxArm64 | Self::MacosArm64 => "arm64",
+            Self::LinuxX64 | Self::LinuxMuslX64 | Self::MacosX64 | Self::WindowsX64 => {
+                "baseline-x64"
+            }
+            Self::LinuxArm64 | Self::LinuxMuslArm64 | Self::MacosArm64 => "arm64",
         }
     }
 
@@ -88,7 +106,9 @@ impl ReleaseTarget {
     pub const fn bun_target(self) -> &'static str {
         match self {
             Self::LinuxX64 => "bun-linux-x64-baseline",
+            Self::LinuxMuslX64 => "bun-linux-x64-musl-baseline",
             Self::LinuxArm64 => "bun-linux-arm64",
+            Self::LinuxMuslArm64 => "bun-linux-arm64-musl",
             Self::MacosX64 => "bun-darwin-x64-baseline",
             Self::MacosArm64 => "bun-darwin-arm64",
             Self::WindowsX64 => "bun-windows-x64-baseline",
@@ -100,7 +120,9 @@ impl ReleaseTarget {
     pub const fn archive_dir(self) -> &'static str {
         match self {
             Self::LinuxX64 => "pi-linux-x64-base",
+            Self::LinuxMuslX64 => "pi-linux-x64-musl-base",
             Self::LinuxArm64 => "pi-linux-arm64",
+            Self::LinuxMuslArm64 => "pi-linux-arm64-musl",
             Self::MacosX64 => "pi-darwin-x64-base",
             Self::MacosArm64 => "pi-darwin-arm64",
             Self::WindowsX64 => "pi-windows-x64-base",
@@ -130,6 +152,11 @@ impl HostVariant {
     #[must_use]
     pub fn assets_for(self, target: ReleaseTarget) -> Vec<ReleaseAsset> {
         match self {
+            Self::Compiled if target.ships_dual_host() => vec![
+                ReleaseAsset::host_compiled_for(target),
+                ReleaseAsset::host_runtime_for(target),
+                ReleaseAsset::host_script(),
+            ],
             Self::Compiled => vec![ReleaseAsset::host_compiled_for(target)],
             Self::RuntimeFallback => {
                 vec![
@@ -287,6 +314,12 @@ pub fn plan_release(
     host_variant: HostVariant,
     source_date_epoch: Option<&str>,
 ) -> Result<ReleasePlan, String> {
+    if target.ships_dual_host() && host_variant == HostVariant::RuntimeFallback {
+        return Err(format!(
+            "musl release for {} requires a compiled sidecar",
+            target.triple()
+        ));
+    }
     let fixed_mtime = resolved_fixed_mtime(source_date_epoch)?;
     let triple = target.triple();
     let cargo_build = CommandSpec::new(
@@ -464,8 +497,8 @@ mod tests {
         let mut dedup = triples.clone();
         dedup.sort_unstable();
         dedup.dedup();
-        assert_eq!(triples.len(), 5);
-        assert_eq!(dedup.len(), 5, "duplicate triples: {triples:?}");
+        assert_eq!(triples.len(), 7);
+        assert_eq!(dedup.len(), 7, "duplicate triples: {triples:?}");
     }
 
     #[test]
@@ -479,9 +512,23 @@ mod tests {
                 "bun",
             ),
             (
+                ReleaseTarget::LinuxMuslX64,
+                "bun-linux-x64-musl-baseline",
+                "pi-linux-x64-musl-base",
+                "pi-extension-host",
+                "bun",
+            ),
+            (
                 ReleaseTarget::LinuxArm64,
                 "bun-linux-arm64",
                 "pi-linux-arm64",
+                "pi-extension-host",
+                "bun",
+            ),
+            (
+                ReleaseTarget::LinuxMuslArm64,
+                "bun-linux-arm64-musl",
+                "pi-linux-arm64-musl",
                 "pi-extension-host",
                 "bun",
             ),
@@ -518,20 +565,36 @@ mod tests {
                     .iter()
                     .any(|asset| asset.relative_path == host_name)
             );
-            let fallback = plan_release(target, "1.0.0", HostVariant::RuntimeFallback, None)
-                .map_err(io::Error::other)?;
-            assert!(
-                fallback
-                    .assets
-                    .iter()
-                    .any(|asset| asset.relative_path == runtime_name)
-            );
-            assert!(
-                fallback
-                    .assets
-                    .iter()
-                    .any(|asset| asset.relative_path == "pi-extension-host.js")
-            );
+            if target.ships_dual_host() {
+                assert!(
+                    compiled
+                        .assets
+                        .iter()
+                        .any(|asset| { asset.relative_path == runtime_name })
+                );
+                assert!(
+                    compiled
+                        .assets
+                        .iter()
+                        .any(|asset| { asset.relative_path == "pi-extension-host.js" })
+                );
+                assert!(plan_release(target, "1.0.0", HostVariant::RuntimeFallback, None).is_err());
+            } else {
+                let fallback = plan_release(target, "1.0.0", HostVariant::RuntimeFallback, None)
+                    .map_err(io::Error::other)?;
+                assert!(
+                    fallback
+                        .assets
+                        .iter()
+                        .any(|asset| { asset.relative_path == runtime_name })
+                );
+                assert!(
+                    fallback
+                        .assets
+                        .iter()
+                        .any(|asset| { asset.relative_path == "pi-extension-host.js" })
+                );
+            }
         }
         Ok(())
     }

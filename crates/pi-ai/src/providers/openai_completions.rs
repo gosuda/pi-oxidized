@@ -1058,6 +1058,19 @@ fn apply_openai_reasoning_effort(model: &Model, effort: Option<&str>, payload: &
     }
 }
 
+fn apply_mapped_reasoning_effort(compat: &Compat, mapped: Option<&str>, payload: &mut Value) {
+    if compat.thinking.supports_reasoning_effort
+        && let Some(mapped) = mapped
+    {
+        payload["reasoning_effort"] = Value::String(mapped.to_owned());
+    }
+}
+
+fn apply_qwen_thinking(enabled: bool, compat: &Compat, mapped: Option<&str>, payload: &mut Value) {
+    payload["enable_thinking"] = Value::Bool(enabled);
+    apply_mapped_reasoning_effort(compat, mapped, payload);
+}
+
 fn apply_thinking(model: &Model, options: &StreamOptions, compat: &Compat, payload: &mut Value) {
     if !model.reasoning {
         return;
@@ -1073,13 +1086,9 @@ fn apply_thinking(model: &Model, options: &StreamOptions, compat: &Compat, paylo
             } else {
                 json!({"type":"disabled"})
             };
-            if compat.thinking.supports_reasoning_effort
-                && let Some(mapped) = mapped
-            {
-                payload["reasoning_effort"] = Value::String(mapped);
-            }
+            apply_mapped_reasoning_effort(compat, mapped.as_deref(), payload);
         }
-        "qwen" => payload["enable_thinking"] = Value::Bool(effort.is_some()),
+        "qwen" => apply_qwen_thinking(effort.is_some(), compat, mapped.as_deref(), payload),
         "qwen-chat-template" => {
             payload["chat_template_kwargs"] =
                 json!({"enable_thinking":effort.is_some(),"preserve_thinking":true});
@@ -1118,11 +1127,7 @@ fn apply_thinking(model: &Model, options: &StreamOptions, compat: &Compat, paylo
             } else if off_supported {
                 payload["thinking"] = json!({"type":"disabled"});
             }
-            if compat.thinking.supports_reasoning_effort
-                && let Some(mapped) = mapped
-            {
-                payload["reasoning_effort"] = Value::String(mapped);
-            }
+            apply_mapped_reasoning_effort(compat, mapped.as_deref(), payload);
         }
         "openrouter" => {
             let value = mapped.or_else(|| off_thinking_value(model));
@@ -1137,11 +1142,7 @@ fn apply_thinking(model: &Model, options: &StreamOptions, compat: &Compat, paylo
         }
         "together" => {
             payload["reasoning"] = json!({"enabled":effort.is_some()});
-            if compat.thinking.supports_reasoning_effort
-                && let Some(mapped) = mapped
-            {
-                payload["reasoning_effort"] = Value::String(mapped);
-            }
+            apply_mapped_reasoning_effort(compat, mapped.as_deref(), payload);
         }
         "string-thinking" => {
             if let Some(value) = mapped.or_else(|| off_thinking_value(model)) {
@@ -1837,6 +1838,52 @@ mod tests {
             payload.get("reasoning_effort"),
             Some(&Value::String("none".to_owned()))
         );
+    }
+    #[test]
+    fn qwen_thinking_format_emits_mapped_reasoning_effort_when_supported() {
+        fn effort_options(effort: Option<&str>) -> StreamOptions {
+            let mut options = StreamOptions::default();
+            if let Some(effort) = effort {
+                options.insert_extra(
+                    StreamOptionKey::REASONING_EFFORT,
+                    Value::String(effort.to_owned()),
+                );
+            }
+            options
+        }
+
+        let mut qwen = model("qwen-token-plan");
+        qwen.reasoning = true;
+        qwen.base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1".into();
+        qwen.thinking_level_map = Some(BTreeMap::from([(
+            ModelThinkingLevel::High,
+            Some("low".to_owned()),
+        )]));
+
+        // Supports reasoning effort: the mapped value is emitted.
+        qwen.compat = Some(json!({"thinkingFormat":"qwen","supportsReasoningEffort":true}));
+        let compat = Compat::resolve(&qwen);
+        let mut payload = json!({});
+        apply_thinking(&qwen, &effort_options(Some("high")), &compat, &mut payload);
+        assert_eq!(payload.get("enable_thinking"), Some(&Value::Bool(true)));
+        assert_eq!(
+            payload.get("reasoning_effort"),
+            Some(&Value::String("low".to_owned()))
+        );
+
+        // Supports reasoning effort but no effort requested: no reasoning_effort.
+        let mut payload = json!({});
+        apply_thinking(&qwen, &effort_options(None), &compat, &mut payload);
+        assert_eq!(payload.get("enable_thinking"), Some(&Value::Bool(false)));
+        assert_eq!(payload.get("reasoning_effort"), None);
+
+        // Reasoning effort not supported: enable_thinking still set, reasoning_effort omitted.
+        qwen.compat = Some(json!({"thinkingFormat":"qwen","supportsReasoningEffort":false}));
+        let compat = Compat::resolve(&qwen);
+        let mut payload = json!({});
+        apply_thinking(&qwen, &effort_options(Some("high")), &compat, &mut payload);
+        assert_eq!(payload.get("enable_thinking"), Some(&Value::Bool(true)));
+        assert_eq!(payload.get("reasoning_effort"), None);
     }
     #[test]
     fn baseten_format_emits_chat_template_args() {

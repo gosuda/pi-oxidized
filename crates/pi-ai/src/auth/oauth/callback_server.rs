@@ -6,8 +6,8 @@
 //! future they own via [`race_callback_and_manual`].
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use axum::Router;
 use axum::extract::{Query, State};
@@ -105,7 +105,7 @@ pub struct OAuthCallbackServer {
     wait: Mutex<Option<oneshot::Receiver<Option<OAuthCallbackCode>>>>,
     settle: SettleSlot,
     shutdown: CancellationToken,
-    join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    join: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     soft_failed: bool,
 }
 
@@ -225,7 +225,7 @@ impl OAuthCallbackServer {
             wait: Mutex::new(Some(rx)),
             settle,
             shutdown,
-            join: Mutex::new(Some(join)),
+            join: StdMutex::new(Some(join)),
             soft_failed: false,
         })
     }
@@ -248,7 +248,7 @@ impl OAuthCallbackServer {
             wait: Mutex::new(Some(rx)),
             settle,
             shutdown: CancellationToken::new(),
-            join: Mutex::new(None),
+            join: StdMutex::new(None),
             soft_failed: true,
         }
     }
@@ -301,8 +301,27 @@ impl OAuthCallbackServer {
     pub async fn close(self) {
         self.settle.settle(None).await;
         self.shutdown.cancel();
-        if let Some(handle) = self.join.lock().await.take() {
+        let handle = self
+            .join
+            .lock()
+            .map_or_else(|e| e.into_inner().take(), |mut guard| guard.take());
+        if let Some(handle) = handle {
             let _ = handle.await;
+        }
+    }
+}
+impl Drop for OAuthCallbackServer {
+    fn drop(&mut self) {
+        // Signal graceful shutdown; then, if the listener task has not already
+        // been awaited by [`close`], abort it so the task and its TcpListener
+        // are released instead of being detached.
+        self.shutdown.cancel();
+        let handle = self
+            .join
+            .lock()
+            .map_or_else(|e| e.into_inner().take(), |mut guard| guard.take());
+        if let Some(handle) = handle {
+            handle.abort();
         }
     }
 }
@@ -579,6 +598,45 @@ mod tests {
             .ok_or_else(|| err("code"))?;
         assert_eq!(winner.code, "manual");
         server.close().await;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn drop_releases_listener_and_allows_rebind() -> TestResult {
+        let server = OAuthCallbackServer::start(OAuthCallbackConfig {
+            port: 0,
+            path: "/callback".into(),
+            expected_state: "s".into(),
+            success_message: "ok".into(),
+            host: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        })
+        .await
+        .map_err(|e| err(e.to_string()))?;
+
+        let bound = SocketAddr::new(server.host(), server.port());
+        assert_ne!(server.port(), 0);
+
+        // Dropping the server must stop the listener and free the bound address.
+        drop(server);
+
+        let mut last_err = None;
+        let mut rebound = None;
+        for _ in 0..40 {
+            match tokio::net::TcpListener::bind(bound).await {
+                Ok(listener) => {
+                    rebound = Some(listener);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        let _listener = rebound.ok_or_else(|| {
+            err(format!(
+                "address {bound} still in use after drop: {last_err:?}"
+            ))
+        })?;
         Ok(())
     }
 }
