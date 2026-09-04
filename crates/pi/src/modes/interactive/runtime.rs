@@ -95,7 +95,7 @@ use super::state::{
     WidgetSlot,
 };
 use super::theme::{ResolvedTheme, ThemeColor};
-use super::view::{ComposedSection, compose};
+use super::view::{ComposedSection, compose, overlay_rect};
 
 /// Maximum time the runtime will wait for one [`Tui::commit`] before declaring
 /// a draw deadlock (cursor-query trap, runaway probe, etc.).
@@ -112,6 +112,12 @@ pub const BACKGROUND_COALESCE_WINDOW: Duration = Duration::from_millis(16);
 /// Spinner tick cadence; matches `DEFAULT_INTERVAL_MS` (`loader.rs`), the
 /// interval the braille `Loader` frames were designed for.
 const SPINNER_TICK: Duration = Duration::from_millis(80);
+
+/// Bound on the runtime-owned post-login provider catalog refresh. The
+/// refresh runs as a background task (never inside the event loop), and a
+/// refresh exceeding this bound resolves to the timeout warning while cached
+/// models stay in use (ports reference `completeProviderAuthentication`).
+const LOGIN_REFRESH_BOUND: Duration = Duration::from_secs(15);
 
 /// Bound on the runtime's incoming event channel. Matches the agent crate's
 /// extension-queue capacity so a lagging consumer surfaces backpressure early.
@@ -854,6 +860,7 @@ struct InteractiveRoot {
     editor: Editor,
     post_editor: Vec<ComposedSection>,
     overlay: Option<Box<dyn Component>>,
+    overlay_spec: Option<pi_tui::layout::OverlaySpec>,
     selector: Option<Box<dyn Component>>,
     dialog_title: Option<Box<dyn Component>>,
     focus: FocusArea,
@@ -877,6 +884,7 @@ impl InteractiveRoot {
             editor,
             post_editor: sections,
             overlay: composed.overlay,
+            overlay_spec: composed.overlay_spec,
             selector,
             dialog_title: None,
             focus: view.focus,
@@ -926,6 +934,7 @@ impl InteractiveRoot {
             editor,
             post_editor: sections,
             overlay,
+            overlay_spec: composed.overlay_spec,
             selector,
             dialog_title,
             focus: view.focus,
@@ -1179,7 +1188,11 @@ impl Component for InteractiveRoot {
             y = y.saturating_add(height);
         }
         if let Some(overlay) = self.overlay.as_mut() {
-            overlay.render(area, buf);
+            let measured = overlay.measure(area.width).min(area.height);
+            let rect = overlay_rect(self.overlay_spec.as_ref(), measured, area);
+            if rect.height > 0 {
+                overlay.render(rect, buf);
+            }
         }
     }
 
@@ -1451,6 +1464,13 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     auth_search_preset: Option<String>,
     /// Cached login provider options for the current `/login` flow.
     login_provider_options: Vec<super::state::LoginProviderOption>,
+    /// Outcome channel for the runtime-owned post-login provider catalog
+    /// refresh; drained by the event loop so the bounded refresh never runs
+    /// inside input/paint handling.
+    auth_refresh_rx: Option<mpsc::UnboundedReceiver<AuthRefreshOutcome>>,
+    /// Abort handle for the in-flight owned refresh, keeping the spawned task
+    /// cancellable (aborted on supersession and at teardown).
+    auth_refresh_abort: Option<tokio::task::AbortHandle>,
 }
 
 /// In-flight `/import` awaiting its confirm dialog(s).
@@ -1716,6 +1736,80 @@ struct AuthFlowState {
     previous_model: pi_ai::Model,
 }
 
+/// Outcome of the runtime-owned post-login provider catalog refresh.
+///
+/// Delivered on `auth_refresh_rx` after [`LOGIN_REFRESH_BOUND`] so the
+/// warning semantics survive without awaiting the refresh inside the event
+/// loop.
+struct AuthRefreshOutcome {
+    /// Provider the refresh was scoped to.
+    provider_id: String,
+    /// Display name of the provider (for warning wording).
+    provider_name: String,
+    /// Refresh result, or `None` when the 15-second bound elapsed first.
+    result: Option<Result<crate::core::model_runtime::ModelsRefreshResult, String>>,
+}
+
+impl AuthRefreshOutcome {
+    /// User-visible warning per the reference wordings; `None` when the
+    /// refresh succeeded without a provider-scoped error.
+    fn warning(&self) -> Option<String> {
+        match &self.result {
+            Some(Ok(refresh)) if !refresh.errors.contains_key(&self.provider_id) => None,
+            Some(Ok(_)) => Some(format!(
+                "{} model catalog could not be refreshed; using cached models.",
+                self.provider_name
+            )),
+            Some(Err(err)) => Some(format!(
+                "{} model catalog could not be refreshed; using cached models. ({err})",
+                self.provider_name
+            )),
+            None => Some(format!(
+                "{} model catalog refresh timed out; using cached models.",
+                self.provider_name
+            )),
+        }
+    }
+}
+
+/// Separator for encoded auth provider selector values. The auth-type tag
+/// leads and cannot contain the separator, so the provider id after the
+/// first separator is taken verbatim — the identity stays unambiguous for
+/// any provider id.
+const AUTH_PROVIDER_VALUE_SEP: char = '\u{0}';
+
+/// Canonical tag for an [`AuthType`] inside encoded selector values.
+fn auth_type_tag(auth_type: AuthType) -> &'static str {
+    match auth_type {
+        AuthType::Oauth => "oauth",
+        AuthType::ApiKey => "api_key",
+    }
+}
+
+/// Encode the auth provider selector identity (auth type + provider id) into
+/// a `SelectItem` value, so the OAuth and API-key rows of one provider never
+/// collide on the bare provider id.
+fn encode_auth_provider_value(provider_id: &str, auth_type: AuthType) -> String {
+    format!(
+        "{}{}{provider_id}",
+        auth_type_tag(auth_type),
+        AUTH_PROVIDER_VALUE_SEP
+    )
+}
+
+/// Decode an encoded auth provider selector value into `(provider_id,
+/// auth_type)`. `None` for values that are not encoded identities (confirm
+/// paths fail closed on those).
+fn decode_auth_provider_value(value: &str) -> Option<(&str, AuthType)> {
+    let (tag, provider_id) = value.split_once(AUTH_PROVIDER_VALUE_SEP)?;
+    let auth_type = match tag {
+        "oauth" => AuthType::Oauth,
+        "api_key" => AuthType::ApiKey,
+        _ => return None,
+    };
+    Some((provider_id, auth_type))
+}
+
 /// Build the live editor with the runtime's fixed options and submit hook.
 fn build_initial_editor(
     options: &InteractiveRuntimeOptions,
@@ -1914,6 +2008,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             auth_type_filter: None,
             auth_search_preset: None,
             login_provider_options: Vec::new(),
+            auth_refresh_rx: None,
+            auth_refresh_abort: None,
         };
         for slot in initial_extension_slots {
             runtime.project_extension_slot(slot);
@@ -2264,6 +2360,25 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                         self.fail_io(&err);
                     }
                 }
+                refresh_outcome = poll_fn(|cx: &mut std::task::Context<'_>| {
+                    if let Some(rx) = self.auth_refresh_rx.as_mut() {
+                        rx.poll_recv(cx)
+                    } else {
+                        Poll::Pending
+                    }
+                }), if self.auth_refresh_rx.is_some() => {
+                    match refresh_outcome {
+                        Some(outcome) => self.handle_auth_refresh_outcome(outcome).await,
+                        None => {
+                            // Owned refresh task gone (aborted or finished):
+                            // stop polling the drained channel.
+                            self.auth_refresh_rx = None;
+                        }
+                    }
+                    if let Err(err) = self.paint_frame() {
+                        self.fail_io(&err);
+                    }
+                }
             }
 
             self.end_loop_turn().await;
@@ -2361,6 +2476,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         // A prompt owns AgentSession turn cleanup until it settles. Abort and
         // drain before returning so dropping the runtime cannot detach a turn.
         self.quiesce_prompt_operations().await;
+
+        // Tear down any in-flight owned catalog refresh so the runtime does
+        // not leave a pending task holding a stale session after exit.
+        self.abort_provider_refresh();
 
         // Final paint so the last view-state mutation is visible.
         if matches!(
@@ -2472,7 +2591,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             session_mutated = true;
         }
         while let Ok(error) = self.session_selector_error_rx.try_recv() {
-            self.last_error = Some(error);
+            self.last_error = Some(error.clone());
+            self.push_notice("session", error);
             session_mutated = true;
         }
         while let Ok(confirm) = self.session_confirm_rx.try_recv() {
@@ -2749,8 +2869,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.handle_select_confirmed(selector, value).await
             }
             ViewAction::SelectCancelled => {
-                // If an auth-flow prompt selector was showing, cancel it.
-                if self.auth_prompt_response.is_some() {
+                if self.pending_extension_dialog.is_some() {
+                    self.cancel_extension_dialog(DialogEnd::Cancelled).await;
+                    ActionOutcome::Repaint
+                } else if self.auth_prompt_response.is_some() {
                     self.cancel_auth_flow();
                     ActionOutcome::Repaint
                 } else {
@@ -3167,8 +3289,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
     }
 
-    /// Post-login completion: default-model selection, provider-scoped refresh,
-    /// and status message (mirrors reference `completeProviderAuthentication`).
+    /// Post-login completion: default-model selection, status message, and an
+    /// owned bounded provider-scoped refresh (mirrors reference
+    /// `completeProviderAuthentication` as of #7027).
     ///
     /// - Action label: `"Logged in to {name}"` (OAuth) / `"Saved API key for
     ///   {name}"` (API key).
@@ -3176,8 +3299,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     ///   default-model selection from the default map → availability check →
     ///   `set_model` (persist). Selection errors are recorded but do not block
     ///   the status message.
-    /// - Refresh only the logged-in provider with a 15-second timeout. Timeout
-    ///   and error warnings are appended to the status message per reference.
+    /// - The login UI (status message, footer) finishes here, before the
+    ///   refresh: the provider-scoped refresh runs as a runtime-owned
+    ///   background task bounded by [`LOGIN_REFRESH_BOUND`], never awaited
+    ///   inside the event loop. Its outcome is delivered on `auth_refresh_rx`
+    ///   and handled by [`Self::handle_auth_refresh_outcome`], which keeps the
+    ///   timeout/error warning semantics.
     /// - Status message includes the credential path.
     async fn complete_provider_authentication(
         &mut self,
@@ -3191,39 +3318,6 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         } else {
             format!("Logged in to {provider_name}")
         };
-
-        // Provider-scoped refresh with 15-second timeout (mirrors reference
-        // refresh(options.providers) with a 15s timeout).
-        let refresh_result = tokio::time::timeout(
-            Duration::from_secs(15),
-            self.session
-                .refresh_models(crate::core::model_runtime::ModelsRefreshOptions {
-                    allow_network: None,
-                    providers: Some(vec![provider_id.to_owned()]),
-                }),
-        )
-        .await;
-
-        let mut refresh_warning = String::new();
-        match refresh_result {
-            Ok(Ok(refresh)) => {
-                if refresh.errors.contains_key(provider_id) {
-                    refresh_warning = format!(
-                        " {provider_name} model catalog could not be refreshed; using cached models."
-                    );
-                }
-            }
-            Ok(Err(err)) => {
-                refresh_warning = format!(
-                    " {provider_name} model catalog could not be refreshed; using cached models. ({err})"
-                );
-            }
-            Err(_) => {
-                refresh_warning = format!(
-                    " {provider_name} model catalog refresh timed out; using cached models."
-                );
-            }
-        }
 
         // Default-model selection when the previous model was the unknown
         // sentinel (provider == "unknown"). Mirrors reference:
@@ -3268,13 +3362,65 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             message.push('\n');
             message.push_str(err);
         }
-        if !refresh_warning.is_empty() {
-            message.push_str(&refresh_warning);
-        }
 
         self.push_notice("login", message);
 
-        // Update footer to reflect any model change.
+        // Update footer to reflect any model change, then hand the bounded
+        // provider refresh to its owned background task.
+        self.refresh_footer().await;
+        self.spawn_provider_refresh(provider_id, provider_name);
+    }
+
+    /// Abort any in-flight owned provider refresh and drop its outcome
+    /// channel (supersession and teardown path).
+    fn abort_provider_refresh(&mut self) {
+        if let Some(handle) = self.auth_refresh_abort.take() {
+            handle.abort();
+        }
+        self.auth_refresh_rx = None;
+    }
+
+    /// Spawn the provider-scoped catalog refresh as a runtime-owned
+    /// background task bounded by [`LOGIN_REFRESH_BOUND`].
+    ///
+    /// The event loop never awaits the refresh: input and paint stay
+    /// responsive for the full bound, and the outcome (including the timeout
+    /// resolution) arrives on `auth_refresh_rx`.
+    fn spawn_provider_refresh(&mut self, provider_id: &str, provider_name: &str) {
+        self.abort_provider_refresh();
+        let session = Arc::clone(&self.session);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let refresh_provider_id = provider_id.to_owned();
+        let outcome_provider_id = provider_id.to_owned();
+        let outcome_provider_name = provider_name.to_owned();
+        let task = tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                LOGIN_REFRESH_BOUND,
+                session.refresh_models(crate::core::model_runtime::ModelsRefreshOptions {
+                    allow_network: None,
+                    providers: Some(vec![refresh_provider_id]),
+                }),
+            )
+            .await
+            .ok();
+            let _ = tx.send(AuthRefreshOutcome {
+                provider_id: outcome_provider_id,
+                provider_name: outcome_provider_name,
+                result,
+            });
+        });
+        self.auth_refresh_rx = Some(rx);
+        self.auth_refresh_abort = Some(task.abort_handle());
+    }
+
+    /// Event-loop handler for a settled owned provider refresh: retain the
+    /// user-visible warning semantics as a follow-up notice and refresh the
+    /// footer for availability changes.
+    async fn handle_auth_refresh_outcome(&mut self, outcome: AuthRefreshOutcome) {
+        self.auth_refresh_abort = None;
+        if let Some(warning) = outcome.warning() {
+            self.push_notice("login", warning);
+        }
         self.refresh_footer().await;
     }
 
@@ -4157,7 +4303,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             }
             super::state::SelectorKind::AuthType => {
                 // Auth-type selector confirm: show provider selector filtered
-                // by the selected auth type.
+                // by the selected auth type. Close first — closing an
+                // auth-kind selector resets its selection state at the close
+                // boundary — then re-establish the filter as the explicit
+                // handoff to the freshly opened provider selector.
                 let auth_type = match value.as_str() {
                     "oauth" => AuthType::Oauth,
                     "api_key" => AuthType::ApiKey,
@@ -4166,9 +4315,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                         return ActionOutcome::Repaint;
                     }
                 };
+                self.close_selector();
                 self.auth_type_filter = Some(auth_type);
                 self.auth_search_preset = None;
-                self.close_selector();
                 self.open_selector(super::state::SelectorKind::Auth).await;
                 ActionOutcome::Repaint
             }
@@ -4184,24 +4333,24 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     }
                     return ActionOutcome::Repaint;
                 }
-                // Otherwise, this is the /login provider selector: look up
-                // the provider option and start its login flow.
-                let auth_type = self.auth_type_filter.unwrap_or(AuthType::Oauth);
-                let option = self
-                    .login_provider_options
-                    .iter()
-                    .find(|opt| opt.id == value && opt.auth_type == auth_type)
-                    .or_else(|| {
+                // Otherwise, this is the /login provider selector: the value
+                // encodes the selected row's provider id AND auth type, so a
+                // dual-mechanism provider resolves to the row actually
+                // selected instead of whichever entry matches first.
+                let decoded = decode_auth_provider_value(&value);
+                let option = decoded
+                    .and_then(|(provider_id, auth_type)| {
                         self.login_provider_options
                             .iter()
-                            .find(|opt| opt.id == value)
+                            .find(|opt| opt.id == provider_id && opt.auth_type == auth_type)
                     })
                     .cloned();
                 self.close_selector();
                 if let Some(opt) = option {
                     self.start_provider_login(&opt.id, opt.auth_type, opt.has_login, &opt.name);
                 } else {
-                    self.push_notice("login", format!("Unknown provider: {value}"));
+                    let shown = decoded.map_or(value.as_str(), |(provider_id, _)| provider_id);
+                    self.push_notice("login", format!("Unknown provider: {shown}"));
                 }
                 ActionOutcome::Repaint
             }
@@ -4262,6 +4411,17 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     fn close_selector(&mut self) {
+        // Real selector-close boundary: an auth-kind selector reset its own
+        // selection state here, so a cancelled or superseded `/login` cannot
+        // leak a stale type filter / search preset into a later one. Other
+        // selector kinds are unaffected.
+        if matches!(
+            self.active_selector_kind,
+            Some(super::state::SelectorKind::Auth | super::state::SelectorKind::AuthType)
+        ) {
+            self.auth_type_filter = None;
+            self.auth_search_preset = None;
+        }
         if let Some(placeholder) = self.session_delete_hint_restore.take() {
             self.view.editor.placeholder = placeholder;
         }
@@ -4269,11 +4429,27 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.view.editor.placeholder = placeholder;
         }
         self.logout_options.clear();
-        self.view.overlay = None;
-        self.view.extension_overlay_slot = None;
+        if self
+            .view
+            .extension_overlay_slot
+            .as_ref()
+            .is_none_or(|slot| !self.extension_slots.contains_key(&slot.key))
+        {
+            self.view.overlay = None;
+            self.view.extension_overlay_slot = None;
+        }
         self.active_selector = None;
         self.active_selector_kind = None;
-        self.view.focus = FocusArea::Editor;
+        self.view.focus = if self
+            .view
+            .extension_overlay_slot
+            .as_ref()
+            .is_some_and(|slot| slot.focusable && self.extension_slots.contains_key(&slot.key))
+        {
+            FocusArea::Overlay
+        } else {
+            FocusArea::Editor
+        };
         self.input_state.reset_taps();
     }
 
@@ -4407,8 +4583,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 let items = options
                     .into_iter()
                     .map(|opt| {
-                        SelectItem::new(opt.id.clone(), opt.name.clone())
-                            .with_description(opt.login_label.clone().unwrap_or_default())
+                        SelectItem::new(
+                            encode_auth_provider_value(&opt.id, opt.auth_type),
+                            opt.name.clone(),
+                        )
+                        .with_description(opt.login_label.clone().unwrap_or_default())
                     })
                     .collect();
                 let mut list = super::selectors::apply_select_list_copy(
@@ -4685,6 +4864,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.view.focus = FocusArea::Editor;
             }
         }
+        self.view.extension_dialog = true;
         self.pending_extension_dialog = Some(PendingExtensionDialog {
             request,
             saved_editor_text,
@@ -4717,14 +4897,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let Some(dialog) = self.pending_extension_dialog.take() else {
             return;
         };
-        // Clone keeps the dialog struct intact for editor restoration; the
-        // payload is a handful of strings on a user-driven cancel path.
+        self.view.extension_dialog = false;
         let response = dialog.request.clone().end(end);
         self.deliver_extension_dialog(Some(dialog), response).await;
     }
 
     async fn finish_extension_dialog(&mut self, response: HostUiResponse) {
         let dialog = self.pending_extension_dialog.take();
+        self.view.extension_dialog = false;
         self.deliver_extension_dialog(dialog, response).await;
     }
 
@@ -8470,6 +8650,9 @@ mod tests {
         refresh_models_result: std::sync::Mutex<
             Option<Result<crate::core::model_runtime::ModelsRefreshResult, String>>,
         >,
+        /// Test seam: held by a test to stall `refresh_models` for the
+        /// "login completes before refresh" regression.
+        refresh_models_gate: Arc<tokio::sync::Mutex<()>>,
         current_model: std::sync::Mutex<Option<pi_ai::Model>>,
     }
 
@@ -9051,6 +9234,9 @@ mod tests {
         {
             let log = Arc::clone(&self.log);
             Box::pin(async move {
+                // Test seam: hold the gate so a test can stall the refresh
+                // and observe login completion without blocking on it.
+                let _gate = log.refresh_models_gate.lock().await;
                 let result = log
                     .refresh_models_result
                     .lock()
@@ -11230,6 +11416,61 @@ mod tests {
             .collect::<String>();
         assert!(visible.contains("Verification confirm prompt"));
         assert!(visible.contains("Choose Yes"));
+    }
+
+    #[tokio::test]
+    async fn stacked_select_keeps_extension_overlay_visible() {
+        let (mut rt, _log) = make_runtime();
+        rt.project_extension_slot(pi_ext::sanitize::sanitize_slot(&pi_ext::protocol::UiSlot {
+            key: "overlay.stack".to_owned(),
+            generation: 1,
+            placement: SlotPlacement::Overlay,
+            height: 1,
+            runs: vec![vec![pi_ext::protocol::StyledRun {
+                text: "Verification overlay-stack state=pending".to_owned(),
+                style: pi_ext::protocol::Style::default(),
+            }]],
+            focusable: true,
+            cursor: None,
+            overlay_options: Some(pi_ext::protocol::OverlaySpec::default()),
+        }));
+        rt.begin_extension_dialog(HostUiRequest::Select {
+            id: 91,
+            request: pi_ext::protocol::SelectRequest {
+                title: "Verification stacked select".to_owned(),
+                options: vec!["one".to_owned(), "two".to_owned()],
+                options_meta: pi_ext::protocol::DialogOptions::default(),
+            },
+        })
+        .await;
+        assert_eq!(rt.view.focus, FocusArea::Selector);
+        assert!(rt.view.extension_overlay_slot.is_some());
+
+        let editor = std::mem::replace(&mut rt.editor, Editor::with_defaults());
+        let selector = rt.active_selector.take();
+        let mut root = rt.build_root(editor, selector);
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        root.render(area, &mut buffer);
+        let visible = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(
+            visible.contains("Verification overlay-stack state=pending"),
+            "stacked overlay must stay painted: {visible}"
+        );
+        assert!(
+            visible.contains("Verification stacked select"),
+            "stacked select title must stay painted: {visible}"
+        );
+
+        rt.cancel_extension_dialog(DialogEnd::TimedOut).await;
+        assert!(
+            rt.view.extension_overlay_slot.is_some(),
+            "timeout must leave the host overlay mounted"
+        );
     }
 
     /// The wire collapses every non-`Answered` outcome to identical default
@@ -14824,12 +15065,10 @@ mod tests {
                 Some(super::super::state::SelectorKind::Auth)
             );
 
-            // Confirm "anthropic" → start_login_flow.
+            // Confirm the encoded provider identity → start_login_flow.
+            let value = encode_auth_provider_value("anthropic", AuthType::Oauth);
             let _ = rt
-                .handle_select_confirmed(
-                    super::super::state::SelectorKind::Auth,
-                    "anthropic".to_owned(),
-                )
+                .handle_select_confirmed(super::super::state::SelectorKind::Auth, value)
                 .await;
             assert!(rt.auth_flow.is_some());
             assert_eq!(
@@ -15050,21 +15289,30 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn refresh_timeout_appends_warning() -> TestResult {
+        async fn refresh_error_warning_delivered_after_background_refresh() -> TestResult {
             let (mut rt, log) = try_make_runtime()?;
-            // Configure refresh_models to hang so the 15s timeout fires.
-            // With start_paused = true, tokio fast-forwards simulated time.
-            *log.refresh_models_result
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None; // Default Ok, but we need a timeout...
-            // Actually, FakeHost::refresh_models returns immediately, so we
-            // can't easily test timeout with it. Instead, test the error path.
             *log.refresh_models_result
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(Err("network error".to_owned()));
             rt.start_login_flow("anthropic", "Anthropic", AuthType::Oauth)?;
             rt.complete_login_flow(Ok(())).await;
+
+            // Complete the login UI before the refresh outcome arrives.
+            assert!(matches!(
+                rt.view.messages.last(),
+                Some(MessageView::Custom(c)) if c.text.contains("Logged in to Anthropic.")
+            ));
+
+            // Drain the owned background outcome and handle it like the loop.
+            let outcome = rt
+                .auth_refresh_rx
+                .as_mut()
+                .expect("refresh task spawned")
+                .recv()
+                .await
+                .expect("refresh outcome");
+            rt.handle_auth_refresh_outcome(outcome).await;
 
             assert!(matches!(
                 rt.view.messages.last(),
@@ -15075,7 +15323,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn refresh_success_with_provider_error_appends_warning() -> TestResult {
+        async fn refresh_provider_error_warning_delivered_after_background_refresh() -> TestResult {
             let (mut rt, log) = try_make_runtime()?;
             *log.refresh_models_result
                 .lock()
@@ -15089,6 +15337,15 @@ mod tests {
                 }));
             rt.start_login_flow("anthropic", "Anthropic", AuthType::Oauth)?;
             rt.complete_login_flow(Ok(())).await;
+
+            let outcome = rt
+                .auth_refresh_rx
+                .as_mut()
+                .expect("refresh task spawned")
+                .recv()
+                .await
+                .expect("refresh outcome");
+            rt.handle_auth_refresh_outcome(outcome).await;
 
             assert!(matches!(
                 rt.view.messages.last(),
@@ -15124,6 +15381,261 @@ mod tests {
                     if c.text.contains("Could not select default model")
                     && c.text.contains("model not available")
             ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn auth_provider_selector_value_round_trips() -> TestResult {
+            let oauth = encode_auth_provider_value("anthropic", AuthType::Oauth);
+            let api_key = encode_auth_provider_value("anthropic", AuthType::ApiKey);
+
+            assert_ne!(oauth, api_key, "dual-auth provider rows must not collide");
+
+            let (id, auth_type) = decode_auth_provider_value(&oauth).expect("oauth decodes");
+            assert_eq!(id, "anthropic");
+            assert_eq!(auth_type, AuthType::Oauth);
+
+            let (id, auth_type) = decode_auth_provider_value(&api_key).expect("api_key decodes");
+            assert_eq!(id, "anthropic");
+            assert_eq!(auth_type, AuthType::ApiKey);
+
+            // Provider ids containing the separator are still decoded verbatim.
+            let tricky = encode_auth_provider_value("foo\u{0}bar", AuthType::ApiKey);
+            let (id, auth_type) = decode_auth_provider_value(&tricky).expect("tricky id decodes");
+            assert_eq!(id, "foo\u{0}bar");
+            assert_eq!(auth_type, AuthType::ApiKey);
+
+            assert!(decode_auth_provider_value("unencoded").is_none());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn auth_provider_selector_api_key_starts_api_key_flow() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.session.set_login_provider_options(vec![
+                login_opt("acme", "Acme", AuthType::Oauth, true),
+                login_opt("acme", "Acme", AuthType::ApiKey, true),
+            ]);
+            rt.dispatch_builtin_command("login", "nonexistent").await;
+            assert_eq!(rt.active_selector_kind, Some(SelectorKind::Auth));
+
+            let api_key_value = encode_auth_provider_value("acme", AuthType::ApiKey);
+            let _ = rt
+                .handle_select_confirmed(SelectorKind::Auth, api_key_value)
+                .await;
+            assert!(rt.auth_flow.is_some());
+            let flow = rt.auth_flow.as_ref().expect("auth flow active");
+            assert_eq!(flow.provider_id, "acme");
+            assert_eq!(flow.auth_type, AuthType::ApiKey);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn auth_provider_selector_oauth_starts_oauth_flow() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.session.set_login_provider_options(vec![
+                login_opt("acme", "Acme", AuthType::Oauth, true),
+                login_opt("acme", "Acme", AuthType::ApiKey, true),
+            ]);
+            rt.dispatch_builtin_command("login", "nonexistent").await;
+
+            let oauth_value = encode_auth_provider_value("acme", AuthType::Oauth);
+            let _ = rt
+                .handle_select_confirmed(SelectorKind::Auth, oauth_value)
+                .await;
+            let flow = rt.auth_flow.as_ref().expect("auth flow active");
+            assert_eq!(flow.auth_type, AuthType::Oauth);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn auth_provider_selector_unencoded_value_fails_closed() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.session.set_login_provider_options(vec![
+                login_opt("acme", "Acme", AuthType::Oauth, true),
+                login_opt("acme", "Acme", AuthType::ApiKey, true),
+            ]);
+            rt.dispatch_builtin_command("login", "nonexistent").await;
+            assert_eq!(rt.active_selector_kind, Some(SelectorKind::Auth));
+
+            // A bare provider id (the pre-fix collision value) no longer
+            // matches any row; we fail closed with an unknown-provider notice.
+            let _ = rt
+                .handle_select_confirmed(SelectorKind::Auth, "acme".to_owned())
+                .await;
+            assert!(rt.auth_flow.is_none());
+            assert!(matches!(
+                rt.view.messages.last(),
+                Some(MessageView::Custom(c)) if c.text.contains("Unknown provider: acme")
+            ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn auth_provider_selector_cancel_resets_auth_state() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.session.set_login_provider_options(vec![
+                login_opt("acme", "Acme", AuthType::Oauth, true),
+                login_opt("acme", "Acme", AuthType::ApiKey, true),
+            ]);
+            // /login → auth-type selector → choose api_key → provider selector.
+            rt.dispatch_builtin_command("login", "").await;
+            assert_eq!(rt.active_selector_kind, Some(SelectorKind::AuthType));
+            let _ = rt
+                .handle_select_confirmed(SelectorKind::AuthType, "api_key".to_owned())
+                .await;
+            assert_eq!(rt.active_selector_kind, Some(SelectorKind::Auth));
+            assert_eq!(rt.auth_type_filter, Some(AuthType::ApiKey));
+
+            // Cancel the provider selector.
+            let _ = rt.dispatch_action(ViewAction::SelectCancelled).await;
+            assert!(rt.active_selector_kind.is_none());
+            assert!(rt.auth_type_filter.is_none());
+            assert!(rt.auth_search_preset.is_none());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn auth_type_selector_cancel_resets_auth_state() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.session.set_login_provider_options(vec![
+                login_opt("anthropic", "Anthropic", AuthType::Oauth, true),
+                login_opt("openai", "OpenAI", AuthType::ApiKey, true),
+            ]);
+            rt.dispatch_builtin_command("login", "").await;
+            assert_eq!(rt.active_selector_kind, Some(SelectorKind::AuthType));
+
+            // Cancel the auth-type selector itself.
+            let _ = rt.dispatch_action(ViewAction::SelectCancelled).await;
+            assert!(rt.active_selector_kind.is_none());
+            assert!(rt.auth_type_filter.is_none());
+            assert!(rt.auth_search_preset.is_none());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn provider_search_preset_cancel_resets_auth_state() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            rt.session.set_login_provider_options(vec![login_opt(
+                "anthropic",
+                "Anthropic",
+                AuthType::Oauth,
+                true,
+            )]);
+            rt.dispatch_builtin_command("login", "nonexistent").await;
+            assert_eq!(rt.active_selector_kind, Some(SelectorKind::Auth));
+            assert_eq!(rt.auth_search_preset.as_deref(), Some("nonexistent"));
+
+            let _ = rt.dispatch_action(ViewAction::SelectCancelled).await;
+            assert!(rt.active_selector_kind.is_none());
+            assert!(rt.auth_type_filter.is_none());
+            assert!(rt.auth_search_preset.is_none());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn cancelling_non_auth_selector_does_not_clear_auth_state() -> TestResult {
+            let (mut rt, _log) = try_make_runtime()?;
+            // Seed an auth-kind selector state.
+            rt.auth_type_filter = Some(AuthType::ApiKey);
+            rt.auth_search_preset = Some("preset".to_owned());
+
+            // Open and cancel a non-auth selector.
+            let _ = rt.open_selector(SelectorKind::Model).await;
+            assert_eq!(rt.active_selector_kind, Some(SelectorKind::Model));
+            let _ = rt.dispatch_action(ViewAction::SelectCancelled).await;
+
+            // Auth state should survive the unrelated selector close.
+            assert_eq!(rt.auth_type_filter, Some(AuthType::ApiKey));
+            assert_eq!(rt.auth_search_preset.as_deref(), Some("preset"));
+            Ok(())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn login_completion_returns_before_owned_refresh_times_out() -> TestResult {
+            let (mut rt, log) = try_make_runtime()?;
+            // Hold the refresh gate to stall the background refresh.
+            let _gate = log.refresh_models_gate.lock().await;
+
+            rt.start_login_flow("anthropic", "Anthropic", AuthType::Oauth)?;
+            rt.complete_login_flow(Ok(())).await;
+
+            // Login UI finished before the bounded refresh timed out: the
+            // status message is visible and no timeout warning has been pushed.
+            assert!(matches!(
+                rt.view.messages.last(),
+                Some(MessageView::Custom(c))
+                    if c.text.contains("Logged in to Anthropic.")
+                        && !c.text.contains("timed out")
+            ));
+            assert!(rt.auth_refresh_rx.is_some());
+            assert!(rt.auth_refresh_abort.is_some());
+
+            // Advance the paused clock through the 15-second bound and drain
+            // the owned outcome, as the event loop would.
+            let outcome = rt
+                .auth_refresh_rx
+                .as_mut()
+                .expect("refresh task spawned")
+                .recv()
+                .await
+                .expect("refresh outcome");
+            assert!(outcome.result.is_none(), "timeout should yield no result");
+            rt.handle_auth_refresh_outcome(outcome).await;
+
+            assert!(matches!(
+                rt.view.messages.last(),
+                Some(MessageView::Custom(c))
+                    if c.text.contains("model catalog refresh timed out; using cached models")
+            ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn owned_refresh_is_cancellable() -> TestResult {
+            let (mut rt, log) = try_make_runtime()?;
+            // Hold the refresh gate so the background task parks.
+            let _gate = log.refresh_models_gate.lock().await;
+
+            rt.start_login_flow("anthropic", "Anthropic", AuthType::Oauth)?;
+            rt.complete_login_flow(Ok(())).await;
+
+            let abort = rt.auth_refresh_abort.take().expect("refresh task spawned");
+            abort.abort();
+
+            // The channel closes because the sender (aborted task) is gone;
+            // no warning is delivered.
+            let maybe = rt
+                .auth_refresh_rx
+                .as_mut()
+                .expect("refresh receiver active")
+                .recv()
+                .await;
+            assert!(maybe.is_none(), "aborted task should not send an outcome");
+            assert!(!rt.view.messages.iter().any(|m| match m {
+                MessageView::Custom(c) => c.text.contains("timed out"),
+                _ => false,
+            }));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn owned_refresh_supersession_aborts_previous() -> TestResult {
+            let (mut rt, log) = try_make_runtime()?;
+            let _gate = log.refresh_models_gate.lock().await;
+
+            rt.start_login_flow("anthropic", "Anthropic", AuthType::Oauth)?;
+            rt.complete_login_flow(Ok(())).await;
+            let Some(first_handle) = rt.auth_refresh_abort.clone() else {
+                return Err("first refresh abort handle missing".into());
+            };
+
+            // A second login supersedes the first refresh.
+            rt.start_login_flow("openai", "OpenAI", AuthType::ApiKey)?;
+            rt.complete_login_flow(Ok(())).await;
+            assert!(rt.auth_refresh_abort.is_some());
+            tokio::task::yield_now().await;
+            assert!(first_handle.is_finished());
             Ok(())
         }
     }

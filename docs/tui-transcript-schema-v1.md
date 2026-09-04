@@ -37,7 +37,7 @@ All enumerations serialize with kebab-case values (`serde(rename_all = "kebab-ca
 - **`ClaimClass`** (7 variants): `execution`, `protocol`, `pty`, `render`, `synchronized-output`, `no-clear`, `snapshot`.
 - **`CapabilityProfile`** (7 variants): `xterm256-color-truecolor`, `xterm256-color`, `dumb`, `terminal-app`, `iterm2`, `windows-terminal-vt`, `conhost-vt-dec2026-fallback`.
 - **`EventKind`** (7 variants): `spawn`, `input`, `output`, `snapshot`, `resize`, `resize-storm`, `exit`.
-- **`NormalizationKind`** (7 variants in `NORMALIZATION_TABLE_V1`): `path-home`, `path-cwd`, `time-iso8601`, `time-relative`, `id-session`, `snapshot-trailing-space-trim`, `resize-collapse`.
+- **`NormalizationKind`** (8 variants in `NORMALIZATION_TABLE_V1`): `path-home`, `path-cwd`, `time-iso8601`, `time-relative`, `id-session`, `snapshot-trailing-space-trim`, `resize-collapse`, `output-settle-collapse`.
 
 ## 3. Canonical envelope and timing quarantine
 
@@ -52,7 +52,7 @@ The non-canonical `TimingEnvelope` (`TimingEnvelope` in `transcript.rs`) contain
 - `settleWindowsMs`: Durations of successful quiescence settle windows (`Vec<u64>`).
 - `abortCeiling`: Present only on timeout: `AbortCeiling { ceilingMs, observedMs }`.
 - `rawLogB64`: Complete unnormalized raw I/O byte stream in base64.
-- `outputAudits`: Reconstruction proofs (`OutputAudit`) for every canonical output event.
+- `outputAudits`: Reconstruction proofs (`OutputAudit`) for every canonical output event and, under settled-frame canon, every snapshot event.
 
 ### Cross-contamination rejection
 `validate_value` (`reject_cross_contamination` in `crates/pi-tui/src/testkit/validate.rs`) strictly rejects field leakage:
@@ -81,6 +81,8 @@ The non-canonical `TimingEnvelope` (`TimingEnvelope` in `transcript.rs`) contain
 
 `RecordingSession::read_settled_frame` (`crates/pi-tui/src/testkit/session.rs`) orchestrates settle reading and invokes `output_and_snapshot` atomically.
 
+Settled-frame canon (`TranscriptSpec.output_canon = OutputCanon::SettledFrame`) records one Snapshot per settle boundary and no Output event. `TranscriptRecorder::output` and `snapshot` return `TranscriptError::SettledFrameOnly`. `RecordingSession::read_settled_frame_where` is one logical checkpoint ⇒ one Snapshot, regardless of how many quiet windows elapse. QEMU sessions only expose `read_output`, which fails closed with `SettledFrameOnly` on first use.
+
 ## 5. Normalization pipeline and output audits
 
 ### Replacement hierarchy and token normalization
@@ -93,6 +95,7 @@ The non-canonical `TimingEnvelope` (`TimingEnvelope` in `transcript.rs`) contain
    - `TimeRelative`: Durations matching `\d+(ms|[smh]) ago` -> `<AGO>`.
 4. `SnapshotTrailingSpaceTrim`: Right-trims trailing whitespace from snapshot lines (`TranscriptRecorder::snapshot`).
 5. `ResizeCollapse`: Collapses intermediate resize storm entries to the final observed size (`TranscriptRecorder::resize_storm`).
+6. `OutputSettleCollapse`: Applied only by settled-frame recorders (never detected from raw bytes). Pins every `DEFAULT_LOADER_FRAMES[1..]` glyph to `⠋` and every ` <digits>s ·` run to ` <ELAPSED> ·`.
 
 ### Output audit re-derivation
 For every `CanonicalEvent::Output`, `timing.output_audits` must supply exactly one `OutputAudit` (`validate_output_audits` in `validate.rs`):
@@ -102,6 +105,8 @@ For every `CanonicalEvent::Output`, `timing.output_audits` must supply exactly o
 - `applied`: List of `NormalizationEntry` records.
 
 The validator decodes `rawBytesB64` and `context`, runs `normalize_raw_bytes`, and asserts that the resulting bytes and `applied` set match `CanonicalEvent::Output` exactly (`ValidatorError::OutputAuditMismatch`). Un-enumerated volatile tokens in `rawLogB64` fail validation (`ValidatorError::UnenumeratedVolatile` in `validate.rs`).
+
+Under settled-frame canon (artifacts that enumerate `OutputSettleCollapse`), every Snapshot needs an audit. The validator re-derives the frame via `snapshot_from_raw(concat(prior audits), {cols,rows})` then `settled_frame_lines`, and requires `rawLogB64` to equal the concatenation of all audits in event order (`ValidatorError::RawLogAuditMismatch`).
 
 ## 6. Runner matrix, driver pairings, and QEMU contingency
 

@@ -52,6 +52,37 @@ pub struct ComposedView {
     pub overlay_spec: Option<pi_tui::layout::OverlaySpec>,
 }
 
+/// Resolve the rectangle an overlay paints into.
+///
+/// Host-owned extension overlays carry a layout spec and must not fill the
+/// viewport — a stacked select lives in the editor region underneath.
+/// Native overlays (shortcut help, changelog, login) have no spec and keep
+/// the full-width measured band at the origin.
+pub(super) fn overlay_rect(
+    spec: Option<&pi_tui::layout::OverlaySpec>,
+    measured: u16,
+    area: Rect,
+) -> Rect {
+    let width = area.width.max(1);
+    let height = area.height.max(1);
+    spec.map_or_else(
+        || Rect::new(area.x, area.y, width, measured.min(height)),
+        |spec| {
+            let layout = pi_tui::layout::resolve_overlay_layout(spec, measured, width, height);
+            let overlay_height = layout
+                .max_height
+                .map_or(measured, |max_height| measured.min(max_height))
+                .min(height.saturating_sub(layout.row));
+            Rect::new(
+                area.x.saturating_add(layout.col),
+                area.y.saturating_add(layout.row),
+                layout.width,
+                overlay_height,
+            )
+        },
+    )
+}
+
 /// Compose the full view-model into ordered sections for `state`.
 ///
 /// The caller renders via [`render_view`] or walks sections directly. The
@@ -359,23 +390,9 @@ pub fn render_view_with_height(state: &ViewState, width: u16, height: u16) -> Bu
         }
     }
     if let Some(mut overlay) = composed.overlay {
-        let measured = overlay.measure(width.max(1)).min(height);
-        let rect = composed.overlay_spec.as_ref().map_or_else(
-            || Rect::new(0, 0, width.max(1), measured),
-            |spec| {
-                let layout = pi_tui::layout::resolve_overlay_layout(
-                    spec,
-                    measured,
-                    width.max(1),
-                    height.max(1),
-                );
-                let overlay_height = layout
-                    .max_height
-                    .map_or(measured, |max_height| measured.min(max_height))
-                    .min(height.saturating_sub(layout.row));
-                Rect::new(layout.col, layout.row, layout.width, overlay_height)
-            },
-        );
+        let area = Rect::new(0, 0, width.max(1), height);
+        let measured = overlay.measure(area.width).min(area.height);
+        let rect = overlay_rect(composed.overlay_spec.as_ref(), measured, area);
         if rect.height > 0 {
             overlay.render(rect, &mut buf);
         }

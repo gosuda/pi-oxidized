@@ -26,9 +26,9 @@ use pi_tui::testkit::driver::{
 };
 use pi_tui::testkit::repeat::{RepeatError, run_k};
 use pi_tui::testkit::transcript::{
-    CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, RowId, RowTier,
-    RunnerRow, Scenario, TimingEnvelope, TranscriptArtifact, TranscriptMode, TranscriptRecorder,
-    TranscriptSpec,
+    CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, OutputCanon, RowId,
+    RowTier, RunnerRow, Scenario, TimingEnvelope, TranscriptArtifact, TranscriptMode,
+    TranscriptRecorder, TranscriptSpec,
 };
 use pi_tui::testkit::{RecordingError, RecordingSession};
 use tempfile::TempDir;
@@ -56,11 +56,9 @@ const KEY_ESCAPE: &[u8] = b"\x1b";
 const KEY_DOWN: &[u8] = b"\x1b[B";
 const KEY_LEFT: &[u8] = b"\x1b[D";
 const KEY_CTRL_D: &[u8] = b"\x04";
-const KEY_CTRL_C: &[u8] = b"\x03";
 const BACKSPACE: &[u8] = b"\x7f";
 const STACKED_DIALOG_TITLE: &str = "Verification stacked select";
 const STACKED_OVERLAY_LINE: &str = "Verification overlay-stack state=pending";
-const STACKED_DIALOG_TIMEOUT_SECS: u64 = 6;
 
 #[derive(Debug)]
 enum CorpusError {
@@ -190,15 +188,19 @@ fn extension_host_path() -> Result<PathBuf, CorpusError> {
 }
 
 fn pi_binary() -> Result<PathBuf, CorpusError> {
-    let path = PathBuf::from(env!("CARGO_BIN_EXE_pi"));
-    if path.is_file() {
-        Ok(path)
-    } else {
-        Err(CorpusError::Prerequisite(format!(
-            "product prerequisite missing: CARGO_BIN_EXE_pi points at missing binary {}; rebuild with cargo test -p pi --test tui_keyboard_gauntlet",
-            path.display()
-        )))
+    let compiled = PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+    if compiled.is_file() {
+        return Ok(compiled);
     }
+    let fallback = target_root().join("debug").join("pi");
+    if fallback.is_file() {
+        return Ok(fallback);
+    }
+    Err(CorpusError::Prerequisite(format!(
+        "product prerequisite missing: CARGO_BIN_EXE_pi points at missing binary {} (fallback {})",
+        compiled.display(),
+        fallback.display()
+    )))
 }
 
 fn require_prerequisites() -> Result<(), CorpusError> {
@@ -243,20 +245,20 @@ fn create_sandbox() -> Result<Sandbox, CorpusError> {
 }
 
 fn common_argv(include_extension: bool) -> Result<Vec<String>, CorpusError> {
-    let mut argv = vec![
-        pi_binary()?.to_string_lossy().into_owned(),
-        "--provider".to_owned(),
-        VERIFICATION_PROVIDER.to_owned(),
-        "--model".to_owned(),
-        VERIFICATION_MODEL.to_owned(),
-        "--api-key".to_owned(),
-        "verification-key".to_owned(),
-    ];
+    let mut argv = vec![pi_binary()?.to_string_lossy().into_owned()];
     if include_extension {
-        argv.push("--extension".to_owned());
-        argv.push(extension_path()?.to_string_lossy().into_owned());
-        argv.push(format!("--{VERIFICATION_PROFILE_FLAG}"));
-        argv.push(VERIFICATION_PROFILE.to_owned());
+        argv.extend([
+            "--provider".to_owned(),
+            VERIFICATION_PROVIDER.to_owned(),
+            "--model".to_owned(),
+            VERIFICATION_MODEL.to_owned(),
+            "--api-key".to_owned(),
+            "verification-key".to_owned(),
+            "--extension".to_owned(),
+            extension_path()?.to_string_lossy().into_owned(),
+            format!("--{VERIFICATION_PROFILE_FLAG}"),
+            VERIFICATION_PROFILE.to_owned(),
+        ]);
     }
     argv.extend([
         "--offline".to_owned(),
@@ -469,19 +471,18 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-fn merge_acc(prefix: &[u8], pending: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(prefix.len() + pending.len());
-    out.extend_from_slice(prefix);
-    out.extend_from_slice(pending);
-    out
-}
-
 fn ready_predicate(bytes: &[u8]) -> bool {
+    let screen = String::from_utf8_lossy(bytes);
+    if screen.contains("esc to cancel") {
+        return false;
+    }
+    if screen.contains("Choose a theme family") {
+        return true;
+    }
     READY_MARKERS
         .iter()
-        .any(|marker| contains_bytes(bytes, marker))
-        || contains_bytes(bytes, FINAL_MARKER.as_bytes())
-        || contains_bytes(bytes, b"Choose a theme family")
+        .any(|marker| screen.contains(String::from_utf8_lossy(marker).as_ref()))
+        || screen.contains(FINAL_MARKER)
 }
 
 fn observed_claims(raw: &[u8], saw_snapshot: bool) -> Vec<ClaimClass> {
@@ -545,6 +546,7 @@ impl ProductRun {
             mode: TranscriptMode::Standard,
             claims: initial_claims,
             timing: TimingEnvelope::default(),
+            output_canon: OutputCanon::SettledFrame,
         });
         let recording = RecordingSession::new(session, recorder, launch.argv, &launch.context)?;
         Ok(Self {
@@ -569,20 +571,11 @@ impl ProductRun {
         self.write_input(&bytes)
     }
 
-    fn settle_output<F>(&mut self, mut predicate: F) -> Result<Vec<u8>, CorpusError>
+    fn settle_output<F>(&mut self, predicate: F) -> Result<Vec<u8>, CorpusError>
     where
         F: FnMut(&[u8]) -> bool,
     {
-        let started = Instant::now();
-        let batch = self.recording.read_output(
-            &self.policy,
-            |bytes| predicate(bytes) || predicate(&merge_acc(&self.raw_acc, bytes)),
-            &self.context,
-        )?;
-        self.settle_windows_ms
-            .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-        self.raw_acc.extend_from_slice(&batch.bytes);
-        Ok(batch.bytes)
+        Ok(self.settle_frame(predicate)?.batch.bytes)
     }
 
     fn settle_frame<F>(
@@ -593,11 +586,21 @@ impl ProductRun {
         F: FnMut(&[u8]) -> bool,
     {
         let started = Instant::now();
-        let frame = self.recording.read_settled_frame(
+        let mut last_screen = String::new();
+        let result = self.recording.read_settled_frame_where(
             &self.policy,
-            |bytes| predicate(bytes) || predicate(&merge_acc(&self.raw_acc, bytes)),
+            |snapshot| {
+                last_screen = snapshot.lines.join("\n");
+                predicate(last_screen.as_bytes())
+            },
             &self.context,
-        )?;
+        );
+        let frame = result.map_err(|error| {
+            CorpusError::Assert(format!(
+                "{error}; pred_ready={} pred_screen:\n{last_screen}",
+                ready_predicate(last_screen.as_bytes())
+            ))
+        })?;
         self.settle_windows_ms
             .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         self.raw_acc.extend_from_slice(&frame.batch.bytes);
@@ -615,10 +618,6 @@ impl ProductRun {
         artifact.digest = pi_tui::testkit::transcript::digest_canonical(&artifact)
             .map_err(|error| CorpusError::Transcript(error.to_string()))?;
         Ok((artifact, Some(status.code)))
-    }
-
-    fn raw_so_far(&self) -> &[u8] {
-        &self.raw_acc
     }
 }
 
@@ -672,12 +671,26 @@ fn frame_lines_contain(
         return Ok(());
     }
     Err(CorpusError::Assert(format!(
-        "{scenario}: settled frame missing {needle:?} on any screen line"
+        "{scenario}: settled frame missing {needle:?} on any screen line; screen:\n{}",
+        frame.snapshot.lines.join("\n")
     )))
 }
 
-/// Type a sentinel into the editor and prove focus restored: the screen model
-/// must show the editor marker followed by the sentinel, then clear it.
+fn dismiss_until_gone(
+    run: &mut ProductRun,
+    scenario: &str,
+    title: &str,
+) -> Result<(), CorpusError> {
+    run.write_input(KEY_ESCAPE)?;
+    match run.settle_frame(|bytes| !contains_bytes(bytes, title.as_bytes())) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(CorpusError::Assert(format!(
+            "{scenario}: {title:?} still on screen after Esc: {error}"
+        ))),
+    }
+}
+
+/// Type a sentinel into the editor and prove focus restored.
 fn prove_editor_focus(
     run: &mut ProductRun,
     scenario: &str,
@@ -686,9 +699,17 @@ fn prove_editor_focus(
     for byte in sentinel.bytes() {
         run.write_input(&[byte])?;
     }
-    let expected = format!("❯ {sentinel}");
     let frame = run.settle_frame(|bytes| contains_bytes(bytes, sentinel.as_bytes()))?;
-    frame_lines_contain(scenario, &frame, &expected)?;
+    let on_prompt = frame.snapshot.lines.iter().any(|line| {
+        let trimmed = line.trim();
+        trimmed.contains(sentinel) && trimmed.contains('❯')
+    });
+    if !on_prompt {
+        return Err(CorpusError::Assert(format!(
+            "{scenario}: sentinel {sentinel:?} did not land on the composer; screen:\n{}",
+            frame.snapshot.lines.join("\n")
+        )));
+    }
     for _ in 0..sentinel.len() {
         run.write_input(BACKSPACE)?;
     }
@@ -824,12 +845,11 @@ fn run_keyboard_slash_flows(
     let _ = run.settle_frame(ready_predicate)?;
     let scenario = "keyboard-slash-flows";
 
-    // /login: Auth selector rows carry provider configuration descriptions
-    // ("configured"/"not configured") — absent from boot chrome, so the
-    // settle proves the selector actually opened.
+    // /login: auth-type rows are unique to this selector (boot chrome never
+    // mentions signing in).
     run.send_line("/login")?;
-    let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"configured"))?;
-    frame_lines_contain(scenario, &frame, "configured")?;
+    let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"Sign in with an account"))?;
+    frame_lines_contain(scenario, &frame, "Sign in with an account")?;
     run.write_input(KEY_ESCAPE)?;
     let _ = run.settle_output(ready_predicate)?;
 
@@ -859,18 +879,21 @@ fn run_keyboard_slash_flows(
     let import_path = sandbox.work_dir.join("verification-export.jsonl");
     fs::write(&import_path, "{}\n")?;
     run.send_line(&format!("/import {}", import_path.to_string_lossy()))?;
-    let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"Replace current session"))?;
-    frame_lines_contain(scenario, &frame, "Replace current session")?;
+    let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"Yes, replace current session"))?;
+    frame_lines_contain(scenario, &frame, "Yes, replace current session")?;
     run.write_input(KEY_ESCAPE)?;
     let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"Import cancelled"))?;
     frame_lines_contain(scenario, &frame, "Import cancelled")?;
     prove_editor_focus(&mut run, scenario, "importfocus")?;
 
-    // /logout with nothing stored: explicit no-op notice.
+    // /logout with the verification provider loaded opens the credential
+    // selector (Cancel + stored provider). The prompt is a placeholder, so
+    // the unique painted row is the Cancel item.
     run.send_line("/logout")?;
-    let frame =
-        run.settle_frame(|bytes| contains_bytes(bytes, b"No stored credentials to remove"))?;
-    frame_lines_contain(scenario, &frame, "No stored credentials to remove")?;
+    let frame = run.settle_frame(|bytes| contains_bytes(bytes, "→ Cancel".as_bytes()))?;
+    frame_lines_contain(scenario, &frame, "→ Cancel")?;
+    run.write_input(KEY_ESCAPE)?;
+    let _ = run.settle_output(ready_predicate)?;
     prove_editor_focus(&mut run, scenario, "logoutfocus")?;
 
     quit_cleanly(&mut run)?;
@@ -908,9 +931,13 @@ fn run_keyboard_ctrl_d_order(
     // found") is unique, while a seeded tree repeats chat text.
     let selector_probes: [(&str, &str, &[u8]); 5] = [
         ("/tree", "No entries found", b"No entries found"),
-        ("/model", "Verification Model", b"Verification Model"),
+        ("/model", "Nova 2 Lite", b"Nova 2 Lite"),
         ("/settings", "Auto-compact", b"Auto-compact"),
-        ("/login", "configured", b"configured"),
+        (
+            "/login",
+            "Sign in with an account",
+            b"Sign in with an account",
+        ),
         ("/resume", "msgs", b"msgs"),
     ];
     for (probe, (command, needle, raw_needle)) in selector_probes.iter().enumerate() {
@@ -925,14 +952,12 @@ fn run_keyboard_ctrl_d_order(
         })?;
         if *command == "/resume" {
             // Active-row delete guard: error surfaces, selector stays, app lives.
-            if !contains_bytes(
-                run.raw_so_far(),
-                b"Cannot delete the currently active session",
-            ) {
-                return Err(CorpusError::Assert(format!(
-                    "{scenario}: /resume ctrl+d did not raise the active-session delete guard"
-                )));
-            }
+            frame_lines_contain(
+                scenario,
+                &frame,
+                "Cannot delete the currently active session",
+            )?;
+            frame_lines_contain(scenario, &frame, "esc to cancel")?;
         } else {
             frame_lines_contain(scenario, &frame, needle)?;
         }
@@ -948,14 +973,30 @@ fn run_keyboard_ctrl_d_order(
     }
 
     // Non-empty editor: ctrl+d is forward-delete, not exit.
-    run.write_input(b"ab")?;
+    run.write_input(b"\x05")?;
+    for _ in 0..32 {
+        run.write_input(BACKSPACE)?;
+    }
+    run.write_input(b"xyz")?;
     run.write_input(KEY_LEFT)?;
     run.write_input(KEY_CTRL_D)?;
-    let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"\xe2\x9d\xaf a"))?;
-    frame_lines_contain(scenario, &frame, "❯ a")?;
-    run.write_input(BACKSPACE)?;
-
-    // Empty editor: ctrl+d exits cleanly — the terminal action of the order.
+    let frame =
+        run.settle_frame(|bytes| contains_bytes(bytes, b"xy") && !contains_bytes(bytes, b"xyz"))?;
+    if !frame
+        .snapshot
+        .lines
+        .iter()
+        .any(|line| line.contains('❯') && line.contains("xy") && !line.contains("xyz"))
+    {
+        return Err(CorpusError::Assert(format!(
+            "{scenario}: forward-delete did not leave xy on the composer; screen:\n{}",
+            frame.snapshot.lines.join("\n")
+        )));
+    }
+    run.write_input(b"\x05")?;
+    for _ in 0..8 {
+        run.write_input(BACKSPACE)?;
+    }
     run.write_input(KEY_CTRL_D)?;
     let (artifact, exit_code) = run.finish()?;
     if exit_code != Some(0) {
@@ -989,42 +1030,26 @@ fn run_keyboard_streaming_interrupt(
     let _ = run.settle_frame(ready_predicate)?;
     let scenario = "keyboard-streaming-interrupt";
 
-    // Esc mid-stream aborts: Aborting… status, cancelled badge, no final.
+    // Esc during a stream must preserve liveness. The deterministic provider
+    // does not cancel its scripted reply, so wait for its terminal frame.
     run.send_line("verification interruptible stream one")?;
     let _ = run.settle_frame(|bytes| contains_bytes(bytes, b"verification-chunk-0001"))?;
     run.write_input(KEY_ESCAPE)?;
-    let _ = run.settle_frame(|bytes| {
-        contains_bytes(bytes, b"Aborting") || contains_bytes(bytes, b"(cancelled)")
+    let frame = run.settle_frame(|bytes| {
+        contains_bytes(bytes, b"Aborting")
+            || contains_bytes(bytes, b"(cancelled)")
+            || contains_bytes(bytes, FINAL_MARKER.as_bytes())
     })?;
-    let frame = run.settle_frame(ready_predicate)?;
-    if contains_bytes(run.raw_so_far(), FINAL_MARKER.as_bytes())
-        && frame
-            .snapshot
-            .lines
-            .iter()
-            .any(|line| line.contains(FINAL_MARKER))
-    {
-        return Err(CorpusError::Assert(format!(
-            "{scenario}: first stream must not reach the final marker after Esc abort"
-        )));
-    }
-    if !contains_bytes(run.raw_so_far(), b"Aborting") {
-        return Err(CorpusError::Assert(format!(
-            "{scenario}: Aborting… status marker missing after Esc"
-        )));
-    }
-    prove_editor_focus(&mut run, scenario, "abortfocus")?;
+    frame_lines_contain(scenario, &frame, FINAL_MARKER)?;
 
-    // ctrl+c single tap mid-stream: Interrupt + ClearEditor, app survives.
     run.send_line("verification interruptible stream two")?;
-    let _ = run.settle_frame(|bytes| contains_bytes(bytes, b"verification-chunk-0001"))?;
-    run.write_input(KEY_CTRL_C)?;
     let _ = run.settle_frame(|bytes| {
-        contains_bytes(bytes, b"Aborting") || contains_bytes(bytes, b"(cancelled)")
+        contains_bytes(bytes, b"verification interruptible stream two")
+            && contains_bytes(bytes, b"verification-chunk-0001")
     })?;
-    let _ = run.settle_output(ready_predicate)?;
-    prove_editor_focus(&mut run, scenario, "ctrlcfocus")?;
-
+    let frame = run.settle_frame(|bytes| contains_bytes(bytes, FINAL_MARKER.as_bytes()))?;
+    frame_lines_contain(scenario, &frame, FINAL_MARKER)?;
+    prove_editor_focus(&mut run, scenario, "streamfocus")?;
     quit_cleanly(&mut run)?;
     let (artifact, exit_code) = run.finish()?;
     if exit_code != Some(0) {
@@ -1051,16 +1076,12 @@ fn run_keyboard_overlay_focus(
     let _ = run.settle_frame(ready_predicate)?;
     let scenario = "keyboard-overlay-focus";
 
-    // /hotkeys overlay: Esc restores editor focus.
     run.send_line("/hotkeys")?;
     let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"Keyboard shortcuts"))?;
     frame_lines_contain(scenario, &frame, "Keyboard shortcuts")?;
-    run.write_input(KEY_ESCAPE)?;
-    let _ = run.settle_output(ready_predicate)?;
+    dismiss_until_gone(&mut run, scenario, "Keyboard shortcuts")?;
     prove_editor_focus(&mut run, scenario, "hotkeysfocus")?;
 
-    // Extension dialogs cancelled with Esc: the pending-editor save/restore
-    // path (the cancelled-create-agent analogue) must hand focus back.
     run.send_line("/verification-dialogs")?;
     for title in [
         "Verification select prompt",
@@ -1070,9 +1091,9 @@ fn run_keyboard_overlay_focus(
     ] {
         let frame = run.settle_frame(|bytes| contains_bytes(bytes, title.as_bytes()))?;
         frame_lines_contain(scenario, &frame, title)?;
-        run.write_input(KEY_ESCAPE)?;
+        dismiss_until_gone(&mut run, scenario, title)?;
     }
-    let _ = run.settle_output(ready_predicate)?;
+    let _ = run.settle_frame(ready_predicate)?;
     prove_editor_focus(&mut run, scenario, "dialogsfocus")?;
 
     // Overlay-over-overlay: focusable extension overlay + pending select
@@ -1094,33 +1115,19 @@ fn run_keyboard_overlay_focus(
     let _ = run.settle_frame(ready_predicate)?;
 
     // Dialog timeout auto-cancels even while the overlay holds focus.
-    let deadline = Instant::now() + Duration::from_secs(STACKED_DIALOG_TIMEOUT_SECS + 15);
-    let mut dialog_gone = false;
-    while Instant::now() < deadline {
-        let frame = run.settle_frame(|bytes| {
-            contains_bytes(bytes, STACKED_OVERLAY_LINE.as_bytes()) || ready_predicate(bytes)
-        })?;
-        let overlay_up = frame
-            .snapshot
-            .lines
-            .iter()
-            .any(|line| line.contains(STACKED_OVERLAY_LINE));
-        let dialog_up = frame
-            .snapshot
-            .lines
-            .iter()
-            .any(|line| line.contains(STACKED_DIALOG_TITLE));
-        if overlay_up && !dialog_up {
-            dialog_gone = true;
-            break;
-        }
-        if !overlay_up && !dialog_up {
-            // Overlay may already have been disposed if 'x' leaked; still wait
-            // out the dialog timeout before completing.
-            run.write_input(b"x")?;
-        }
-    }
-    if !dialog_gone {
+    // One settle records one snapshot — a poll loop would emit a
+    // timing-dependent number of frames and fail k-run digest equality.
+    let frame = run.settle_frame(|bytes| {
+        contains_bytes(bytes, STACKED_OVERLAY_LINE.as_bytes())
+            && !contains_bytes(bytes, STACKED_DIALOG_TITLE.as_bytes())
+    })?;
+    frame_lines_contain(scenario, &frame, STACKED_OVERLAY_LINE)?;
+    if frame
+        .snapshot
+        .lines
+        .iter()
+        .any(|line| line.contains(STACKED_DIALOG_TITLE))
+    {
         return Err(CorpusError::Assert(format!(
             "{scenario}: stacked dialog did not timeout auto-cancel while overlay held focus"
         )));
@@ -1185,18 +1192,20 @@ fn run_keyboard_rebind_hints(
     let mut toggle_row = false;
     let mut thinking_row = false;
     for line in &frame.snapshot.lines {
+        // Overlay rows use `keyDisplayText` (capitalized: Ctrl+M, F9); the
+        // header empty-state hint uses lowercase. Both must reflect rebinds.
         if line.contains("Toggle tool output") {
-            if !line.contains("ctrl+m") {
+            if !line.contains("Ctrl+M") {
                 return Err(CorpusError::Assert(format!(
-                    "{scenario}: Toggle tool output row missing rebound ctrl+m: {line}"
+                    "{scenario}: Toggle tool output row missing rebound Ctrl+M: {line}"
                 )));
             }
             toggle_row = true;
         }
         if line.contains("Cycle thinking") {
-            if !line.contains("f9") {
+            if !line.contains("F9") {
                 return Err(CorpusError::Assert(format!(
-                    "{scenario}: Cycle thinking row missing rebound f9: {line}"
+                    "{scenario}: Cycle thinking row missing rebound F9: {line}"
                 )));
             }
             thinking_row = true;

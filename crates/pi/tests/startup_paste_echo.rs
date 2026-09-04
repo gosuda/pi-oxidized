@@ -134,7 +134,7 @@ fn paste_after_first_frame_paints_label_as_synchronized_text() {
         let frame = match session.read_settled_frame(&paint_policy, |_| true) {
             Ok(frame) => frame,
             // No bytes within the ceiling: keep polling until the deadline.
-            Err(DriverError::SettleCeiling) => continue,
+            Err(DriverError::SettleCeiling(_)) => continue,
             Err(error) => panic!("paste echo read failed: {error}"),
         };
         let screen = frame.snapshot.lines.join("\n");

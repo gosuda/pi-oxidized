@@ -2,17 +2,17 @@
 
 #![cfg(windows)]
 
-use std::io::Write;
-
 use portable_pty::win::conpty::ConPtySystem;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, PtySystem};
 
 use super::transcript::DriverKind;
 use crate::testkit::driver::{
     DriverError, DriverSession, ExitStatus, Geometry, LaunchSpec, OutputBatch, RenderSession,
-    SettlePolicy, SettledFrame, TerminalDriver,
+    SettlePolicy, SettledFrame, TerminalDriver, TerminalSnapshot,
 };
-use crate::testkit::session::{SessionIo, apply_env, snapshot_from_raw};
+use crate::testkit::session::{
+    SessionIo, apply_env, snapshot_from_raw, viewport_snapshot_from_raw,
+};
 
 /// Windows ConPTY driver using `portable-pty` 0.9.0 `ConPtySystem`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -65,16 +65,11 @@ impl TerminalDriver for ConPtyDriver {
         let shared = crate::testkit::session::SharedWriter::new(raw_writer);
         let dsr_writer = shared.clone_handle();
 
-        // Write probe reply through the shared writer.
-        let probe = spec.profile.probe_reply();
-        if !probe.is_empty() {
-            let mut w = shared.clone_handle();
-            w.write_all(probe)?;
-            w.flush()?;
-        }
-
-        let pump =
-            crate::testkit::session::ReaderPump::from_reader_with_dsr_responder(reader, dsr_writer);
+        let pump = crate::testkit::session::ReaderPump::from_reader_with_probe_responder(
+            reader,
+            dsr_writer,
+            spec.profile,
+        );
         Ok(ConPtySession {
             master: pair.master,
             child: Some(child),
@@ -170,6 +165,22 @@ impl RenderSession for ConPtySession {
     {
         let batch = self.read_output(policy, predicate)?;
         let snapshot = snapshot_from_raw(self.io.ledger.raw_log(), self.geometry);
+        Ok(SettledFrame { batch, snapshot })
+    }
+
+    fn read_settled_frame_where<F>(
+        &mut self,
+        policy: &SettlePolicy,
+        mut predicate: F,
+    ) -> Result<SettledFrame, DriverError>
+    where
+        F: FnMut(&TerminalSnapshot) -> bool,
+    {
+        let geometry = self.geometry;
+        let batch = self.io.read_output_where(policy, |ledger| {
+            predicate(&viewport_snapshot_from_raw(ledger.raw_log(), geometry))
+        })?;
+        let snapshot = viewport_snapshot_from_raw(self.io.ledger.raw_log(), self.geometry);
         Ok(SettledFrame { batch, snapshot })
     }
 }

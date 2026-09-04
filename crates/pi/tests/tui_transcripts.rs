@@ -23,13 +23,14 @@ use std::time::{Duration, Instant};
 
 use pi_tui::terminal::audit_bytes;
 use pi_tui::testkit::driver::{
-    Geometry as DriverGeometry, LaunchSpec, SettlePolicy, TerminalDriver,
+    Geometry as DriverGeometry, LaunchSpec, SettlePolicy, SettledFrame, TerminalDriver,
+    TerminalSnapshot,
 };
 use pi_tui::testkit::repeat::{RepeatError, run_k};
 use pi_tui::testkit::transcript::{
-    CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, RowId, RowTier,
-    RunnerRow, Scenario, TimingEnvelope, TranscriptArtifact, TranscriptMode, TranscriptRecorder,
-    TranscriptSpec,
+    CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, OutputCanon, RowId,
+    RowTier, RunnerRow, Scenario, TimingEnvelope, TranscriptArtifact, TranscriptMode,
+    TranscriptRecorder, TranscriptSpec,
 };
 use pi_tui::testkit::{RecordingError, RecordingSession};
 use tempfile::TempDir;
@@ -47,11 +48,7 @@ const VERIFICATION_PROVIDER: &str = "verification";
 const VERIFICATION_MODEL: &str = "model";
 const VERIFICATION_PROFILE_FLAG: &str = "verification-profile";
 const VERIFICATION_PROFILE: &str = "tui-transcript-profile";
-const READY_MARKERS: &[&[u8]] = &[
-    b"type a message",
-    b"type a message to begin",
-    b"No messages",
-];
+const READY_MARKERS_STR: &[&str] = &["type a message", "type a message to begin", "No messages"];
 const KEY_ENTER: &[u8] = b"\r";
 const KEY_ESCAPE: &[u8] = b"\x1b";
 
@@ -485,19 +482,16 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-fn merge_acc(prefix: &[u8], pending: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(prefix.len() + pending.len());
-    out.extend_from_slice(prefix);
-    out.extend_from_slice(pending);
-    out
-}
-
-fn ready_predicate(bytes: &[u8]) -> bool {
-    READY_MARKERS
+/// Ready markers: cell-diff paints split header text with cursor moves, so
+/// raw bytes never carry a contiguous marker — checks run against the
+/// reconstructed viewport.
+fn ready_snapshot_predicate(snap: &TerminalSnapshot) -> bool {
+    let lines = snap.lines.join("\n");
+    READY_MARKERS_STR
         .iter()
-        .any(|marker| contains_bytes(bytes, marker))
-        || contains_bytes(bytes, FINAL_MARKER.as_bytes())
-        || contains_bytes(bytes, b"Choose a theme family")
+        .any(|marker| lines.contains(marker))
+        || lines.contains(FINAL_MARKER)
+        || lines.contains("Choose a theme family")
 }
 
 fn observed_claims(raw: &[u8], saw_snapshot: bool) -> Vec<ClaimClass> {
@@ -562,6 +556,7 @@ impl ProductRun {
             mode: TranscriptMode::Standard,
             claims: initial_claims,
             timing: TimingEnvelope::default(),
+            output_canon: OutputCanon::SettledFrame,
         });
         let recording = RecordingSession::new(session, recorder, launch.argv, &launch.context)?;
         Ok(Self {
@@ -586,35 +581,14 @@ impl ProductRun {
         self.write_input(&bytes)
     }
 
-    fn settle_output<F>(&mut self, mut predicate: F) -> Result<Vec<u8>, CorpusError>
+    fn settle_frame_where<F>(&mut self, predicate: F) -> Result<SettledFrame, CorpusError>
     where
-        F: FnMut(&[u8]) -> bool,
+        F: FnMut(&TerminalSnapshot) -> bool,
     {
         let started = Instant::now();
-        let batch = self.recording.read_output(
-            &self.policy,
-            |bytes| predicate(bytes) || predicate(&merge_acc(&self.raw_acc, bytes)),
-            &self.context,
-        )?;
-        self.settle_windows_ms
-            .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-        self.raw_acc.extend_from_slice(&batch.bytes);
-        Ok(batch.bytes)
-    }
-
-    fn settle_frame<F>(
-        &mut self,
-        mut predicate: F,
-    ) -> Result<pi_tui::testkit::driver::SettledFrame, CorpusError>
-    where
-        F: FnMut(&[u8]) -> bool,
-    {
-        let started = Instant::now();
-        let frame = self.recording.read_settled_frame(
-            &self.policy,
-            |bytes| predicate(bytes) || predicate(&merge_acc(&self.raw_acc, bytes)),
-            &self.context,
-        )?;
+        let frame =
+            self.recording
+                .read_settled_frame_where(&self.policy, predicate, &self.context)?;
         self.settle_windows_ms
             .push(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         self.raw_acc.extend_from_slice(&frame.batch.bytes);
@@ -696,7 +670,7 @@ fn run_cold_start(
         row.clone(),
         vec![ClaimClass::Execution],
     )?;
-    let frame = run.settle_frame(ready_predicate)?;
+    let frame = run.settle_frame_where(ready_snapshot_predicate)?;
     if !frame
         .snapshot
         .lines
@@ -726,8 +700,11 @@ fn run_wizard(
         row.clone(),
         vec![ClaimClass::Execution],
     )?;
-    let frame = run.settle_frame(|bytes| {
-        contains_bytes(bytes, b"Choose a theme family") || ready_predicate(bytes)
+    let frame = run.settle_frame_where(|snap| {
+        snap.lines
+            .iter()
+            .any(|line| line.contains("Choose a theme family"))
+            || ready_snapshot_predicate(snap)
     })?;
     if !contains_bytes(run.raw_so_far(), b"Choose a theme family")
         && !frame
@@ -743,10 +720,10 @@ fn run_wizard(
     // Advance family → mode → analytics with Enter selections for deterministic completion.
     for _ in 0..3 {
         run.write_input(KEY_ENTER)?;
-        let _ = run.settle_output(|bytes| {
-            contains_bytes(bytes, b"Choose a theme mode")
-                || contains_bytes(bytes, b"anonymous usage")
-                || ready_predicate(bytes)
+        let _ = run.settle_frame_where(|snap| {
+            snap.lines.iter().any(|line| {
+                line.contains("Choose a theme mode") || line.contains("anonymous usage")
+            }) || ready_snapshot_predicate(snap)
         })?;
     }
     quit_cleanly(&mut run)?;
@@ -769,7 +746,7 @@ fn run_trust_selector(
         row.clone(),
         vec![ClaimClass::Execution],
     )?;
-    let _ = run.settle_frame(ready_predicate)?;
+    let _ = run.settle_frame_where(ready_snapshot_predicate)?;
 
     // Boot trust events: `--approve` overrides trust for the project that has
     // trust-requiring `.pi/settings.json`. Production interactive TrustUi is absent.
@@ -781,7 +758,11 @@ fn run_trust_selector(
     let _ = LIMITATION_ABSENT_PRODUCTION_TRUST_UI;
 
     run.send_line("/trust")?;
-    let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"Default project trust"))?;
+    let frame = run.settle_frame_where(|snap| {
+        snap.lines
+            .iter()
+            .any(|line| line.contains("Default project trust"))
+    })?;
     if !frame
         .snapshot
         .lines
@@ -794,7 +775,7 @@ fn run_trust_selector(
         ));
     }
     run.write_input(KEY_ESCAPE)?;
-    let _ = run.settle_output(ready_predicate)?;
+    let _ = run.settle_frame_where(ready_snapshot_predicate)?;
     quit_cleanly(&mut run)?;
     let artifact = run.finish()?;
     write_artifact(row_label, "trust-selector", iteration, &artifact)?;
@@ -814,9 +795,10 @@ fn run_streaming(
         row.clone(),
         vec![ClaimClass::Execution],
     )?;
-    let _ = run.settle_frame(ready_predicate)?;
+    let _ = run.settle_frame_where(ready_snapshot_predicate)?;
     run.send_line("verification deterministic stream")?;
-    let frame = run.settle_frame(|bytes| contains_bytes(bytes, FINAL_MARKER.as_bytes()))?;
+    let frame =
+        run.settle_frame_where(|snap| snap.lines.iter().any(|line| line.contains(FINAL_MARKER)))?;
     if !contains_bytes(run.raw_so_far(), FINAL_MARKER.as_bytes())
         && !frame
             .snapshot
@@ -852,35 +834,54 @@ fn run_selectors(
         row.clone(),
         vec![ClaimClass::Execution],
     )?;
-    let _ = run.settle_frame(ready_predicate)?;
+    let _ = run.settle_frame_where(ready_snapshot_predicate)?;
     // Deterministic seeded turn so /resume has a session entry.
     run.send_line("verification seeded turn")?;
-    let _ = run.settle_frame(|bytes| contains_bytes(bytes, FINAL_MARKER.as_bytes()))?;
+    let _ =
+        run.settle_frame_where(|snap| snap.lines.iter().any(|line| line.contains(FINAL_MARKER)))?;
 
     run.send_line("/model")?;
-    let _ = run.settle_frame(|bytes| {
-        contains_bytes(bytes, VERIFICATION_MODEL.as_bytes())
-            || contains_bytes(bytes, VERIFICATION_PROVIDER.as_bytes())
-            || contains_bytes(bytes, b"model")
+    let _ = run.settle_frame_where(|snap| {
+        snap.lines.iter().any(|line| {
+            line.contains(VERIFICATION_MODEL)
+                || line.contains(VERIFICATION_PROVIDER)
+                || line.contains("model")
+        })
     })?;
     run.write_input(KEY_ESCAPE)?;
-    let _ = run.settle_output(ready_predicate)?;
+    let _ = run.settle_frame_where(ready_snapshot_predicate)?;
 
     run.send_line("/settings")?;
-    let _ = run.settle_frame(|bytes| {
-        contains_bytes(bytes, b"Theme") || contains_bytes(bytes, b"Auto-compact")
+    let _ = run.settle_frame_where(|snap| {
+        snap.lines
+            .iter()
+            .any(|line| line.contains("Theme") || line.contains("Auto-compact"))
     })?;
     run.write_input(KEY_ESCAPE)?;
-    let _ = run.settle_output(ready_predicate)?;
+    let _ = run.settle_frame_where(ready_snapshot_predicate)?;
 
     run.send_line("/resume")?;
-    let _ = run.settle_frame(|bytes| {
-        contains_bytes(bytes, b"verification seeded")
-            || contains_bytes(bytes, FINAL_MARKER.as_bytes())
-            || contains_bytes(bytes, b"session")
+    // Snapshot-only: `settle_frame` ORs `raw_acc`, so the seeded FINAL_MARKER
+    // can match before /resume paints. Empty picker text is a hard reject —
+    // a seeded active session must produce an entry.
+    let _ = run.settle_frame_where(|snap| {
+        let visible: Vec<_> = snap
+            .lines
+            .iter()
+            .rev()
+            .take(usize::from(snap.geometry.rows))
+            .collect();
+        let empty = visible
+            .iter()
+            .any(|line| line.contains("No sessions found"));
+        let picker_open = visible.iter().any(|line| line.contains("esc to cancel"));
+        let seeded_row = visible
+            .iter()
+            .any(|line| line.contains("verification seeded"));
+        matches!((empty, picker_open, seeded_row), (false, true, true))
     })?;
     run.write_input(KEY_ESCAPE)?;
-    let _ = run.settle_output(ready_predicate)?;
+    let _ = run.settle_frame_where(ready_snapshot_predicate)?;
 
     quit_cleanly(&mut run)?;
     let artifact = run.finish()?;
@@ -901,21 +902,27 @@ fn run_overlays(
         row.clone(),
         vec![ClaimClass::Execution],
     )?;
-    let _ = run.settle_frame(ready_predicate)?;
+    let _ = run.settle_frame_where(ready_snapshot_predicate)?;
 
     run.send_line("/hotkeys")?;
-    let _ = run.settle_frame(|bytes| contains_bytes(bytes, b"Keyboard shortcuts"))?;
-    run.write_input(KEY_ESCAPE)?;
-    let _ = run.settle_output(ready_predicate)?;
-
-    run.send_line("/changelog")?;
-    let _ = run.settle_frame(|bytes| {
-        contains_bytes(bytes, b"No changelog entries found")
-            || contains_bytes(bytes, b"# ")
-            || contains_bytes(bytes, b"changelog")
+    let _ = run.settle_frame_where(|snap| {
+        snap.lines
+            .iter()
+            .any(|line| line.contains("Keyboard shortcuts"))
     })?;
     run.write_input(KEY_ESCAPE)?;
-    let _ = run.settle_output(ready_predicate)?;
+    let _ = run.settle_frame_where(ready_snapshot_predicate)?;
+
+    run.send_line("/changelog")?;
+    let _ = run.settle_frame_where(|snap| {
+        snap.lines.iter().any(|line| {
+            line.contains("No changelog entries found")
+                || line.contains("# ")
+                || line.contains("changelog")
+        })
+    })?;
+    run.write_input(KEY_ESCAPE)?;
+    let _ = run.settle_frame_where(ready_snapshot_predicate)?;
 
     quit_cleanly(&mut run)?;
     let artifact = run.finish()?;
@@ -936,13 +943,20 @@ fn run_product_resize_ladder(
         row.clone(),
         vec![ClaimClass::Execution],
     )?;
-    let _ = run.settle_frame(ready_predicate)?;
+    let _ = run.settle_frame_where(ready_snapshot_predicate)?;
 
     let mut last_snapshot = None;
     for (cols, rows) in RESIZE_LADDER {
         run.resize(cols, rows)?;
         let marker = format!("{cols}x{rows}");
-        let frame = run.settle_frame(ready_predicate)?;
+        // Ready markers wrap off-viewport at short heights and the <20-col
+        // floor blanks the render entirely (final step is 1x1), so the ladder
+        // settles on quiescence: a repaint at the new size and then quiet.
+        let frame = run.settle_frame_where(|snap| {
+            ready_snapshot_predicate(snap)
+                || snap.lines.iter().any(|line| !line.trim().is_empty())
+                || snap.lines.iter().all(|line| line.trim().is_empty())
+        })?;
         if frame.snapshot.geometry.cols != cols || frame.snapshot.geometry.rows != rows {
             return Err(CorpusError::Assert(format!(
                 "product-resize-ladder: expected geometry {marker}, got {}x{}",
@@ -979,9 +993,9 @@ fn run_product_resize_storm(
         row.clone(),
         vec![ClaimClass::Execution],
     )?;
-    let _ = run.settle_frame(ready_predicate)?;
+    let _ = run.settle_frame_where(ready_snapshot_predicate)?;
     run.resize_storm(&RESIZE_STORM)?;
-    let frame = run.settle_frame(ready_predicate)?;
+    let frame = run.settle_frame_where(ready_snapshot_predicate)?;
     // Survival observation: process still rendering after the storm.
     if frame
         .snapshot

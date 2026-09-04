@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use avt::Vt;
 
+use super::profile::CapabilityProfile;
 use crate::testkit::driver::{
     DriverError, DriverSession, ExitStatus, Geometry, OutputBatch, RenderSession, SettlePolicy,
     SettledFrame, TerminalSnapshot,
@@ -219,6 +220,39 @@ impl<S: RenderSession> RecordingSession<S> {
     {
         let session = self.session.as_mut().ok_or(DriverError::Closed)?;
         let frame = session.read_settled_frame(policy, predicate)?;
+        self.record_frame(frame, context)
+    }
+
+    /// Settles when the quiet window holds and the snapshot rebuilt from the
+    /// full raw log satisfies `predicate`.
+    ///
+    /// One logical checkpoint yields exactly one Snapshot boundary regardless
+    /// of how many quiet windows elapse.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordingError::Driver`] on settle failure or invalid snapshot
+    /// coordinates, and [`RecordingError::Transcript`] if the event cannot
+    /// be recorded.
+    pub fn read_settled_frame_where<F>(
+        &mut self,
+        policy: &SettlePolicy,
+        predicate: F,
+        context: &NormalizationContext,
+    ) -> Result<SettledFrame, RecordingError>
+    where
+        F: FnMut(&TerminalSnapshot) -> bool,
+    {
+        let session = self.session.as_mut().ok_or(DriverError::Closed)?;
+        let frame = session.read_settled_frame_where(policy, predicate)?;
+        self.record_frame(frame, context)
+    }
+
+    fn record_frame(
+        &mut self,
+        frame: SettledFrame,
+        context: &NormalizationContext,
+    ) -> Result<SettledFrame, RecordingError> {
         Geometry::new(frame.snapshot.geometry.cols, frame.snapshot.geometry.rows)?;
         let cursor_col = u16::try_from(frame.snapshot.cursor_col).map_err(|_| {
             DriverError::InvalidSpec("snapshot cursor column exceeds u16".to_owned())
@@ -281,6 +315,20 @@ pub(crate) struct ReaderPump {
     rx: Receiver<ReaderEvent>,
     joins: Vec<JoinHandle<()>>,
 }
+struct ProbeResponder {
+    writer: Box<dyn Write + Send>,
+    profile: CapabilityProfile,
+}
+
+impl ProbeResponder {
+    fn respond(&mut self, query: &[u8]) {
+        let Some(reply) = self.profile.probe_response(query) else {
+            return;
+        };
+        let _ = self.writer.write_all(reply);
+        let _ = self.writer.flush();
+    }
+}
 
 impl ReaderPump {
     /// Builds a pump from a single readable end.
@@ -291,30 +339,42 @@ impl ReaderPump {
         Self::from_reader_inner(reader, None)
     }
 
-    /// Builds a pump that auto-responds to DSR cursor-position queries (`\x1b[6n`)
-    /// by writing `\x1b[1;1R` back to the child via `responder`.
-    ///
-    /// Extension hosts and TUI probes emit `\x1b[6n` during boot. Without a reply
-    /// the child blocks indefinitely, causing the harness settle to hit its
-    /// ceiling. The responder writer must write to the child's stdin (PTY master).
-    pub(crate) fn from_reader_with_dsr_responder<R, W>(reader: R, responder: W) -> Self
+    /// Builds a pump that answers terminal capability queries as they appear.
+    pub(crate) fn from_reader_with_probe_responder<R, W>(
+        reader: R,
+        responder: W,
+        profile: CapabilityProfile,
+    ) -> Self
     where
         R: Read + Send + 'static,
         W: Write + Send + 'static,
     {
-        Self::from_reader_inner(reader, Some(Box::new(responder)))
+        Self::from_reader_inner(
+            reader,
+            Some(ProbeResponder {
+                writer: Box::new(responder),
+                profile,
+            }),
+        )
     }
 
-    fn from_reader_inner<R>(reader: R, mut responder: Option<Box<dyn Write + Send>>) -> Self
+    fn from_reader_inner<R>(reader: R, mut responder: Option<ProbeResponder>) -> Self
     where
         R: Read + Send + 'static,
     {
+        const QUERIES: [&[u8]; 6] = [
+            b"\x1b[?u",
+            b"\x1b[c",
+            b"\x1b[16t",
+            b"\x1b]11;?\x07",
+            b"\x1b]11;?\x1b\\",
+            b"\x1b[6n",
+        ];
+        const MAX_QUERY_LEN: usize = 8;
         let (tx, rx) = mpsc::channel();
         let join = thread::spawn(move || {
             let mut reader = reader;
             let mut buf = [0u8; 8192];
-            // Residual tail from the previous chunk for cross-chunk DSR detection.
-            // `\x1b[6n` is 4 bytes; keeping 3 residual bytes covers any split.
             let mut residual: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
@@ -322,26 +382,23 @@ impl ReaderPump {
                     Ok(n) => {
                         let chunk = &buf[..n];
 
-                        // Auto-respond to any DSR cursor-position queries.
-                        if let Some(w) = &mut responder {
+                        if let Some(probe) = &mut responder {
                             let scan: Vec<u8> =
                                 residual.iter().chain(chunk.iter()).copied().collect();
-                            let needle = b"\x1b[6n";
-                            let mut idx = 0;
-                            while let Some(pos) =
-                                scan[idx..].windows(needle.len()).position(|w| w == needle)
-                            {
-                                let abs = idx + pos;
-                                // Only respond to matches that start at or after
-                                // the residual boundary so we don't double-respond.
-                                if abs >= residual.len().saturating_sub(needle.len() - 1) {
-                                    let _ = w.write_all(b"\x1b[1;1R");
-                                    let _ = w.flush();
+                            for query in QUERIES {
+                                let mut idx = 0;
+                                while let Some(pos) = scan[idx..]
+                                    .windows(query.len())
+                                    .position(|window| window == query)
+                                {
+                                    let abs = idx + pos;
+                                    if abs >= residual.len().saturating_sub(query.len() - 1) {
+                                        probe.respond(query);
+                                    }
+                                    idx = abs + query.len();
                                 }
-                                idx = abs + needle.len();
                             }
-                            // Update residual to the tail of this chunk.
-                            let take = chunk.len().min(needle.len() - 1);
+                            let take = chunk.len().min(MAX_QUERY_LEN - 1);
                             residual.clear();
                             residual.extend_from_slice(&chunk[chunk.len() - take..]);
                         }
@@ -457,6 +514,17 @@ impl SessionIo {
     where
         F: FnMut(&[u8]) -> bool,
     {
+        self.read_output_where(policy, |ledger| predicate(ledger.pending()))
+    }
+
+    pub(crate) fn read_output_where<F>(
+        &mut self,
+        policy: &SettlePolicy,
+        mut predicate: F,
+    ) -> Result<OutputBatch, DriverError>
+    where
+        F: FnMut(&OutputLedger) -> bool,
+    {
         if self.closed {
             return Err(DriverError::Closed);
         }
@@ -490,7 +558,7 @@ impl Drop for SessionIo {
     }
 }
 
-/// Quiescence-bounded read: predicate then quiet window, else ceiling error.
+/// Quiescence-bounded read: quiet window, then predicate against the settled ledger.
 pub(crate) fn settle_read<F>(
     rx: &Receiver<ReaderEvent>,
     ledger: &mut OutputLedger,
@@ -498,30 +566,41 @@ pub(crate) fn settle_read<F>(
     predicate: &mut F,
 ) -> Result<(), DriverError>
 where
-    F: FnMut(&[u8]) -> bool,
+    F: FnMut(&OutputLedger) -> bool,
 {
     let started = Instant::now();
     let mut last_data = Instant::now();
-    let mut matched = predicate(ledger.pending());
 
     loop {
-        let elapsed = started.elapsed();
-        if elapsed >= policy.ceiling {
-            return Err(DriverError::SettleCeiling);
-        }
-
-        if matched && last_data.elapsed() >= policy.quiet {
+        let since_data = last_data.elapsed();
+        let matched = predicate(ledger);
+        if since_data >= policy.quiet && matched {
             return Ok(());
         }
+        if started.elapsed() >= policy.ceiling {
+            let pending = String::from_utf8_lossy(ledger.pending());
+            return Err(DriverError::SettleCeiling(format!(
+                "last_data_ms={} raw_len={} pending_len={} predicate={matched} pending={pending:?}",
+                last_data.elapsed().as_millis(),
+                ledger.raw_log().len(),
+                ledger.pending().len()
+            )));
+        }
 
-        let wait = remaining_wait(policy, started, matched, last_data);
+        let until_ceiling = policy
+            .ceiling
+            .checked_sub(started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let until_quiet = policy
+            .quiet
+            .checked_sub(since_data)
+            .filter(|remaining| !remaining.is_zero())
+            .unwrap_or(policy.quiet.max(Duration::from_millis(1)));
+        let wait = until_ceiling.min(until_quiet);
         match rx.recv_timeout(wait) {
             Ok(Ok(chunk)) => {
                 ledger.push(&chunk);
                 last_data = Instant::now();
-                if !matched {
-                    matched = predicate(ledger.pending());
-                }
             }
             Ok(Err(err)) => {
                 return Err(DriverError::Io(std::io::Error::new(
@@ -529,17 +608,9 @@ where
                     format!("reader failed before settle: {err}"),
                 )));
             }
-            Err(RecvTimeoutError::Timeout) => {
-                if matched && last_data.elapsed() >= policy.quiet {
-                    return Ok(());
-                }
-                if started.elapsed() >= policy.ceiling {
-                    return Err(DriverError::SettleCeiling);
-                }
-            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                // Clean EOF only. Accept only if the predicate already matched.
-                if matched {
+                if predicate(ledger) {
                     return Ok(());
                 }
                 return Err(DriverError::PrematureExit);
@@ -548,28 +619,23 @@ where
     }
 }
 
-fn remaining_wait(
-    policy: &SettlePolicy,
-    started: Instant,
-    matched: bool,
-    last_data: Instant,
-) -> Duration {
-    let until_ceiling = policy
-        .ceiling
-        .checked_sub(started.elapsed())
-        .unwrap_or(Duration::ZERO);
-    if !matched {
-        return until_ceiling;
-    }
-    let until_quiet = policy
-        .quiet
-        .checked_sub(last_data.elapsed())
-        .unwrap_or(Duration::ZERO);
-    until_ceiling.min(until_quiet)
+/// Rebuilds a scrollback-inclusive AVT snapshot from the full raw log.
+///
+/// Bytes-predicate settles match raw frame text that cell-diff repaints may
+/// leave partly outside the live viewport, so assertions may need scrollback.
+pub(crate) fn snapshot_from_raw(raw: &[u8], geometry: Geometry) -> TerminalSnapshot {
+    build_snapshot(raw, geometry, false)
 }
 
-/// Rebuilds an AVT snapshot from the full raw log at `geometry`.
-pub(crate) fn snapshot_from_raw(raw: &[u8], geometry: Geometry) -> TerminalSnapshot {
+/// Rebuilds a viewport-only AVT snapshot (the live screen a user sees).
+///
+/// Snapshot-predicate settles must not see stale overlay/editor paints that
+/// dismissal and clears scrolled out of the viewport.
+pub(crate) fn viewport_snapshot_from_raw(raw: &[u8], geometry: Geometry) -> TerminalSnapshot {
+    build_snapshot(raw, geometry, true)
+}
+
+fn build_snapshot(raw: &[u8], geometry: Geometry, viewport_only: bool) -> TerminalSnapshot {
     let cols = usize::from(geometry.cols.max(1));
     let rows = usize::from(geometry.rows.max(1));
     let mut vt = Vt::builder()
@@ -579,10 +645,17 @@ pub(crate) fn snapshot_from_raw(raw: &[u8], geometry: Geometry) -> TerminalSnaps
     let lossy = String::from_utf8_lossy(raw);
     let _ = vt.feed_str(&lossy);
     let cursor = vt.cursor();
-    let mut lines: Vec<String> = vt
-        .lines()
+    let view: Vec<String> = vt
+        .view()
         .map(|line| line.text().trim_end().to_owned())
         .collect();
+    let mut lines = if viewport_only {
+        view
+    } else {
+        vt.lines()
+            .map(|line| line.text().trim_end().to_owned())
+            .collect()
+    };
     if lines.iter().all(|line| line.trim().is_empty()) {
         lines = vt
             .text()
@@ -630,8 +703,8 @@ mod tests {
     use super::*;
     use crate::testkit::CapabilityProfile;
     use crate::testkit::transcript::{
-        CanonicalEvent, EventKind, RowId, RowTier, RunnerRow, Scenario, TimingEnvelope,
-        TranscriptMode,
+        CanonicalEvent, EventKind, OutputCanon, RowId, RowTier, RunnerRow, Scenario,
+        TimingEnvelope, TranscriptMode,
     };
 
     #[derive(Default)]
@@ -661,10 +734,10 @@ mod tests {
             F: FnMut(&[u8]) -> bool,
         {
             if self.fail_read {
-                return Err(DriverError::SettleCeiling);
+                return Err(DriverError::SettleCeiling("fake fail_read".to_owned()));
             }
             if !predicate(&self.output) {
-                return Err(DriverError::SettleCeiling);
+                return Err(DriverError::SettleCeiling("fake predicate miss".to_owned()));
             }
             Ok(OutputBatch {
                 bytes: self.output.clone(),
@@ -686,6 +759,8 @@ mod tests {
         lines: Vec<String>,
         cursor_col: usize,
         cursor_row: usize,
+        chunks: Vec<Vec<u8>>,
+        raw_log: Vec<u8>,
     }
 
     impl Default for FakeRender {
@@ -697,6 +772,8 @@ mod tests {
                 lines: Vec::new(),
                 cursor_col: 1,
                 cursor_row: 2,
+                chunks: Vec::new(),
+                raw_log: Vec::new(),
             }
         }
     }
@@ -758,6 +835,30 @@ mod tests {
                 },
             })
         }
+
+        fn read_settled_frame_where<F>(
+            &mut self,
+            _policy: &SettlePolicy,
+            mut predicate: F,
+        ) -> Result<SettledFrame, DriverError>
+        where
+            F: FnMut(&TerminalSnapshot) -> bool,
+        {
+            let mut drained = Vec::new();
+            while !self.chunks.is_empty() {
+                let chunk = self.chunks.remove(0);
+                drained.extend_from_slice(&chunk);
+                self.raw_log.extend_from_slice(&chunk);
+                let snapshot = snapshot_from_raw(&self.raw_log, self.geometry);
+                if predicate(&snapshot) {
+                    return Ok(SettledFrame {
+                        batch: OutputBatch { bytes: drained },
+                        snapshot,
+                    });
+                }
+            }
+            Err(DriverError::SettleCeiling("fake drained".to_owned()))
+        }
     }
 
     fn transcript_spec(driver: DriverKind, claims: Vec<ClaimClass>) -> TranscriptSpec {
@@ -774,6 +875,7 @@ mod tests {
             mode: TranscriptMode::Standard,
             claims,
             timing: TimingEnvelope::default(),
+            output_canon: OutputCanon::Bytes,
         }
     }
 
@@ -1102,6 +1204,81 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn settle_read_accepts_preloaded_channel_when_log_len_matches() -> Result<(), DriverError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(vec![b'a']))
+            .map_err(|error| DriverError::Io(std::io::Error::other(error.to_string())))?;
+        tx.send(Ok(vec![b'b']))
+            .map_err(|error| DriverError::Io(std::io::Error::other(error.to_string())))?;
+        tx.send(Ok(vec![b'c']))
+            .map_err(|error| DriverError::Io(std::io::Error::other(error.to_string())))?;
+        drop(tx);
+        let mut ledger = OutputLedger::default();
+        let policy = SettlePolicy::new(Duration::from_millis(1), Duration::from_secs(1))?;
+        settle_read(&rx, &mut ledger, &policy, &mut |ledger: &OutputLedger| {
+            ledger.raw_log().len() == 3
+        })?;
+        assert_eq!(ledger.pending(), b"abc");
+        Ok(())
+    }
+
+    #[test]
+    fn settle_read_premature_exit_when_predicate_never_holds() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = tx.send(Ok(vec![b'a']));
+        drop(tx);
+        let mut ledger = OutputLedger::default();
+        let policy =
+            SettlePolicy::new(Duration::from_millis(1), Duration::from_secs(1)).expect("policy");
+        let error = settle_read(&rx, &mut ledger, &policy, &mut |_: &OutputLedger| false)
+            .expect_err("predicate never true");
+        assert!(matches!(error, DriverError::PrematureExit));
+    }
+
+    #[test]
+    fn settled_frame_where_records_one_snapshot_for_concatenated_chunks()
+    -> Result<(), RecordingError> {
+        let context = NormalizationContext::default();
+        let mut spec = transcript_spec(
+            DriverKind::PosixPty,
+            vec![ClaimClass::Execution, ClaimClass::Render],
+        );
+        spec.output_canon = OutputCanon::SettledFrame;
+        let mut session = RecordingSession::new(
+            FakeRender {
+                chunks: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+                ..FakeRender::default()
+            },
+            TranscriptRecorder::new(spec),
+            vec!["pi".to_owned()],
+            &context,
+        )?;
+        let frame = session.read_settled_frame_where(
+            &SettlePolicy::default(),
+            |snap| snap.lines.first().is_some_and(|line| line == "abc"),
+            &context,
+        )?;
+        assert_eq!(frame.batch.bytes, b"abc");
+        session.close()?;
+        let artifact = session.finish()?;
+        assert_eq!(
+            kinds(&artifact),
+            vec![EventKind::Spawn, EventKind::Snapshot, EventKind::Exit]
+        );
+        match &artifact.canonical.events[1] {
+            CanonicalEvent::Snapshot { seq, lines, .. } => {
+                assert_eq!(*seq, 1);
+                assert_eq!(lines.first().map(String::as_str), Some("abc"));
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+        assert_eq!(artifact.timing.output_audits.len(), 1);
+        assert_eq!(artifact.timing.output_audits[0].event_seq, 1);
+        assert_eq!(artifact.timing.output_audits[0].raw_bytes_b64, "YWJj");
+        Ok(())
+    }
+
     /// DSR auto-responder writes `\x1b[1;1R` for each `\x1b[6n` in the stream.
     #[test]
     fn dsr_responder_replies_to_cursor_query() {
@@ -1116,7 +1293,11 @@ mod tests {
         let sink = Arc::clone(&received);
         let responder = DsrSink(sink);
 
-        let pump = ReaderPump::from_reader_with_dsr_responder(reader, responder);
+        let pump = ReaderPump::from_reader_with_probe_responder(
+            reader,
+            responder,
+            CapabilityProfile::Xterm256Color,
+        );
 
         // Drain all chunks from the channel.
         let mut collected = Vec::new();
@@ -1135,6 +1316,30 @@ mod tests {
             &replies[..],
             b"\x1b[1;1R\x1b[1;1R",
             "expected two DSR replies"
+        );
+    }
+
+    #[test]
+    fn probe_responder_waits_for_first_cursor_query() {
+        use std::io::Cursor;
+        use std::sync::{Arc, Mutex};
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let input = b"\x1b[?u\x1b[c\x1b[16t\x1b]11;?\x1b\\\x1b[6n";
+        let pump = ReaderPump::from_reader_with_probe_responder(
+            Cursor::new(input.to_vec()),
+            DsrSink(Arc::clone(&received)),
+            CapabilityProfile::Xterm256Color,
+        );
+
+        while pump.rx.recv_timeout(Duration::from_secs(1)).is_ok() {}
+
+        let replies = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            &replies[..],
+            b"\x1b[?0u\x1b[?1;2c\x1b[6;10;20t\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R"
         );
     }
 
@@ -1172,7 +1377,11 @@ mod tests {
         let sink = Arc::clone(&received);
         let responder = DsrSink(sink);
 
-        let pump = ReaderPump::from_reader_with_dsr_responder(reader, responder);
+        let pump = ReaderPump::from_reader_with_probe_responder(
+            reader,
+            responder,
+            CapabilityProfile::Xterm256Color,
+        );
 
         let mut collected = Vec::new();
         while let Ok(Ok(chunk)) = pump.rx.recv_timeout(Duration::from_secs(1)) {

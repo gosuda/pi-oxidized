@@ -71,16 +71,20 @@ impl CapabilityProfile {
         env
     }
 
-    /// Pinned probe-reply bytes written immediately after PTY spawn.
+    /// Returns this profile's response to one terminal capability query.
     #[must_use]
-    pub fn probe_reply(self) -> &'static [u8] {
-        match self {
-            // Deny synchronized-output / DEC 2026 style probes; keep DA/cursor replies.
-            Self::ConhostVtDec2026Fallback => {
-                b"\x1b[?0u\x1b[?1;0c\x1b[6;10;20t\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R"
-            }
-            Self::Dumb => b"",
-            _ => b"\x1b[?0u\x1b[?1;2c\x1b[6;10;20t\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R",
+    pub fn probe_response(self, query: &[u8]) -> Option<&'static [u8]> {
+        if self == Self::Dumb {
+            return None;
+        }
+        match query {
+            b"\x1b[?u" => Some(b"\x1b[?0u"),
+            b"\x1b[c" if self == Self::ConhostVtDec2026Fallback => Some(b"\x1b[?1;0c"),
+            b"\x1b[c" => Some(b"\x1b[?1;2c"),
+            b"\x1b[16t" => Some(b"\x1b[6;10;20t"),
+            b"\x1b]11;?\x07" | b"\x1b]11;?\x1b\\" => Some(b"\x1b]11;rgb:0000/0000/0000\x07"),
+            b"\x1b[6n" => Some(b"\x1b[1;1R"),
+            _ => None,
         }
     }
 

@@ -194,8 +194,9 @@ fn first_divergent_seq(left: &TranscriptArtifact, right: &TranscriptArtifact) ->
 #[cfg(test)]
 mod tests {
     use super::super::transcript::{
-        CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, RowId, RowTier,
-        RunnerRow, Scenario, TimingEnvelope, TranscriptMode, TranscriptRecorder, TranscriptSpec,
+        CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, OutputCanon,
+        RowId, RowTier, RunnerRow, Scenario, TimingEnvelope, TranscriptMode, TranscriptRecorder,
+        TranscriptSpec,
     };
     use super::*;
 
@@ -213,6 +214,7 @@ mod tests {
             mode: TranscriptMode::Standard,
             claims: vec![ClaimClass::Execution],
             timing: TimingEnvelope::default(),
+            output_canon: OutputCanon::Bytes,
         });
         recorder
             .spawn(vec!["pi".to_owned()], &NormalizationContext::default())
@@ -279,6 +281,7 @@ mod tests {
                 mode: TranscriptMode::Standard,
                 claims: vec![ClaimClass::Execution],
                 timing: TimingEnvelope::default(),
+                output_canon: OutputCanon::Bytes,
             });
             recorder
                 .spawn(vec!["pi".to_owned()], &NormalizationContext::default())

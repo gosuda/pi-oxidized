@@ -204,8 +204,8 @@ pub enum DriverError {
     #[error("pty error: {0}")]
     Pty(String),
     /// Settle ceiling elapsed before the content predicate stayed quiet.
-    #[error("settle ceiling elapsed before quiescence")]
-    SettleCeiling,
+    #[error("settle ceiling elapsed before quiescence: {0}")]
+    SettleCeiling(String),
     /// Child ended before the content predicate matched.
     #[error("child ended before settle predicate matched")]
     PrematureExit,
@@ -301,4 +301,20 @@ pub trait RenderSession: DriverSession {
     ) -> Result<SettledFrame, DriverError>
     where
         F: FnMut(&[u8]) -> bool;
+
+    /// Settles when the quiet window holds and the snapshot rebuilt from the
+    /// full raw log satisfies `predicate`.
+    ///
+    /// The returned batch is every byte since the previous boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError`] on settle failure or closed session.
+    fn read_settled_frame_where<F>(
+        &mut self,
+        policy: &SettlePolicy,
+        predicate: F,
+    ) -> Result<SettledFrame, DriverError>
+    where
+        F: FnMut(&TerminalSnapshot) -> bool;
 }

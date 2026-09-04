@@ -33,6 +33,7 @@ const LEDGER: &[(&str, &[(&str, &str, &str)])] = &[
             ("protocol", "DialogOptions", "dialog request builder"),
             ("protocol", "EditorRequest", "dialog request builder"),
             ("protocol", "InputRequest", "dialog request builder"),
+            ("protocol", "SelectRequest", "dialog request builder (test)"),
             // layout value adapters — structurally identical to StyledRun/Style
             ("protocol", "Hyperlink", "layout value adapter"),
             ("protocol", "OverlaySpec", "layout value adapter"),

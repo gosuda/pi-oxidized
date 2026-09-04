@@ -94,6 +94,8 @@ pub struct ViewState {
     pub indicator_frames: Option<Vec<String>>,
     /// Active auth/login progress (drives the Login overlay content).
     pub auth_progress: Option<AuthProgress>,
+    /// True while an extension HostUi Input/Editor/Select/Confirm dialog is open.
+    pub extension_dialog: bool,
 }
 
 /// Header view-model data.
@@ -615,6 +617,7 @@ impl ViewState {
             hyperlinks: false,
             indicator_frames: None,
             auth_progress: None,
+            extension_dialog: false,
         }
     }
 

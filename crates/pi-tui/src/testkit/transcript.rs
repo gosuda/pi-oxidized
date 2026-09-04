@@ -18,6 +18,7 @@ pub const NORMALIZATION_TABLE_V1: &[NormalizationKind] = &[
     NormalizationKind::IdSession,
     NormalizationKind::SnapshotTrailingSpaceTrim,
     NormalizationKind::ResizeCollapse,
+    NormalizationKind::OutputSettleCollapse,
 ];
 
 /// A scenario represented by a transcript.
@@ -214,6 +215,13 @@ pub enum NormalizationKind {
     SnapshotTrailingSpaceTrim,
     /// Retains only the terminal size observable after a resize storm.
     ResizeCollapse,
+    /// Retains only the frame observable after settle.
+    ///
+    /// Scoped pins: any [`crate::components::DEFAULT_LOADER_FRAMES`] glyph after
+    /// the first becomes `⠋`, and ` <digits>s ·` becomes ` <ELAPSED> ·`. This
+    /// kind is applied only by settled-frame recorders and is never detected
+    /// from raw bytes by [`detected_volatile_kinds`].
+    OutputSettleCollapse,
 }
 
 /// Runner identity, excluded from canonical encoding.
@@ -404,7 +412,7 @@ pub struct NormalizationAuditContext {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct OutputAudit {
-    /// Canonical output sequence this raw evidence reconstructs.
+    /// Output or settled-frame Snapshot sequence this raw evidence reconstructs.
     pub event_seq: u32,
     /// Unnormalized observed bytes encoded as standard base64.
     pub raw_bytes_b64: String,
@@ -428,8 +436,22 @@ pub struct TimingEnvelope {
     pub abort_ceiling: Option<AbortCeiling>,
     /// Concatenated raw PTY/stdio log encoded as standard base64.
     pub raw_log_b64: String,
-    /// Raw-to-canonical reconstruction evidence for every output event.
+    /// Raw-to-canonical reconstruction evidence for every output event
+    /// and, under settled-frame canon, every snapshot event.
     pub output_audits: Vec<OutputAudit>,
+}
+
+/// Canonical form of each settle boundary.
+///
+/// This is a recorder construction choice, not an artifact field. Settled-frame
+/// artifacts signal the mode by enumerating [`NormalizationKind::OutputSettleCollapse`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OutputCanon {
+    /// Schema-v1 Output+Snapshot pairs from raw settle bytes.
+    #[default]
+    Bytes,
+    /// One Snapshot per settle boundary; raw evidence lives in audits.
+    SettledFrame,
 }
 
 /// A complete schema-v1 transcript artifact.
@@ -483,6 +505,9 @@ pub enum TranscriptError {
     /// More than `u32::MAX` events were appended to one recorder.
     #[error("event sequence overflowed u32")]
     SequenceOverflow,
+    /// Settled-frame canon records only `output_and_snapshot` boundaries.
+    #[error("settled-frame canon records only output_and_snapshot boundaries")]
+    SettledFrameOnly,
 }
 
 /// Produces compact deterministic JSON for exactly the digested fields.
@@ -738,6 +763,8 @@ pub struct TranscriptRecorder {
     applied: BTreeSet<NormalizationEntry>,
     raw_log: Vec<u8>,
     output_audits: Vec<OutputAudit>,
+    output_canon: OutputCanon,
+    context: NormalizationContext,
 }
 
 /// Named construction inputs for [`TranscriptRecorder`].
@@ -759,6 +786,9 @@ pub struct TranscriptSpec {
     pub claims: Vec<ClaimClass>,
     /// Initial non-canonical timing envelope.
     pub timing: TimingEnvelope,
+    /// Canonical form of each settle boundary. `Bytes` keeps schema-v1
+    /// Output+Snapshot pairs.
+    pub output_canon: OutputCanon,
 }
 
 impl TranscriptRecorder {
@@ -774,6 +804,7 @@ impl TranscriptRecorder {
             mode,
             claims,
             timing,
+            output_canon,
         } = spec;
         let (mode, claims) = constrain_driver(driver_kind, mode, claims);
         Self {
@@ -797,6 +828,8 @@ impl TranscriptRecorder {
             applied: BTreeSet::new(),
             raw_log: Vec::new(),
             output_audits: Vec::new(),
+            output_canon,
+            context: NormalizationContext::default(),
         }
     }
 
@@ -810,6 +843,7 @@ impl TranscriptRecorder {
         argv: Vec<String>,
         context: &NormalizationContext,
     ) -> Result<(), TranscriptError> {
+        self.context = context.clone();
         let mut normalized_argv = Vec::with_capacity(argv.len());
         for arg in argv {
             let (value, applied) = normalize_text(&arg, context);
@@ -824,16 +858,19 @@ impl TranscriptRecorder {
         Ok(())
     }
 
-    /// Records one input boundary with exact base64 payload bytes.
+    /// Records one input boundary. Home and cwd path tokens are replaced
+    /// with the same pinned markers used for spawn argv and snapshots.
     ///
     /// # Errors
     ///
     /// Returns [`TranscriptError::SequenceOverflow`] when the event sequence is exhausted.
     pub fn input(&mut self, bytes: &[u8]) -> Result<(), TranscriptError> {
+        let normalized = normalize_raw_bytes(bytes, &self.context);
+        self.applied.extend(normalized.applied);
         let seq = self.take_seq()?;
         self.artifact.canonical.events.push(CanonicalEvent::Input {
             seq,
-            bytes_b64: BASE64.encode(bytes),
+            bytes_b64: BASE64.encode(normalized.bytes),
         });
         Ok(())
     }
@@ -848,6 +885,9 @@ impl TranscriptRecorder {
         chunks: &[&[u8]],
         context: &NormalizationContext,
     ) -> Result<(), TranscriptError> {
+        if self.output_canon == OutputCanon::SettledFrame {
+            return Err(TranscriptError::SettledFrameOnly);
+        }
         let raw_len = chunks.iter().map(|chunk| chunk.len()).sum();
         let mut raw = Vec::with_capacity(raw_len);
         for chunk in chunks {
@@ -891,24 +931,14 @@ impl TranscriptRecorder {
         lines: Vec<String>,
         context: &NormalizationContext,
     ) -> Result<bool, TranscriptError> {
+        if self.output_canon == OutputCanon::SettledFrame {
+            return Err(TranscriptError::SettledFrameOnly);
+        }
         if self.artifact.driver.kind == DriverKind::QemuUserSmoke {
             return Ok(false);
         }
-        let mut trimmed = false;
-        let mut normalized_lines = Vec::with_capacity(lines.len());
-        for line in lines {
-            let (mut value, applied) = normalize_text(&line, context);
-            self.applied.extend(applied);
-            let len = value.len();
-            value.truncate(value.trim_end_matches(' ').len());
-            trimmed |= len != value.len();
-            normalized_lines.push(value);
-        }
-        if trimmed {
-            self.applied.insert(NormalizationEntry {
-                kind: NormalizationKind::SnapshotTrailingSpaceTrim,
-            });
-        }
+        let (normalized_lines, applied) = normalize_snapshot_lines(lines, context);
+        self.applied.extend(applied);
         let seq = self.take_seq()?;
         self.artifact
             .canonical
@@ -925,14 +955,17 @@ impl TranscriptRecorder {
 
     /// Records one settled output boundary and its snapshot as one atomic pair.
     ///
-    /// Both consecutive sequence numbers are reserved before any raw log,
-    /// normalization, audit, or event mutation. QEMU recorders record only the
-    /// output event and return `false`, matching [`Self::snapshot`].
+    /// In [`OutputCanon::Bytes`], consecutive sequence numbers are reserved
+    /// before any raw log, normalization, audit, or event mutation. QEMU
+    /// recorders record only the output event and return `false`, matching
+    /// [`Self::snapshot`]. In [`OutputCanon::SettledFrame`], a single sequence
+    /// is reserved and only a Snapshot is appended.
     ///
     /// # Errors
     ///
-    /// Returns [`TranscriptError::SequenceOverflow`] when either required
-    /// sequence number is unavailable.
+    /// Returns [`TranscriptError::SequenceOverflow`] when a required sequence
+    /// number is unavailable, or [`TranscriptError::SettledFrameOnly`] when a
+    /// QEMU recorder is constructed in settled-frame canon.
     pub fn output_and_snapshot(
         &mut self,
         chunks: &[&[u8]],
@@ -947,6 +980,25 @@ impl TranscriptRecorder {
             return Ok(false);
         }
 
+        match self.output_canon {
+            OutputCanon::Bytes => {
+                self.output_and_snapshot_bytes(chunks, cols, rows, cursor, lines, context)
+            }
+            OutputCanon::SettledFrame => {
+                self.output_and_snapshot_settled(chunks, cols, rows, cursor, lines, context)
+            }
+        }
+    }
+
+    fn output_and_snapshot_bytes(
+        &mut self,
+        chunks: &[&[u8]],
+        cols: u16,
+        rows: u16,
+        cursor: [u16; 2],
+        lines: Vec<String>,
+        context: &NormalizationContext,
+    ) -> Result<bool, TranscriptError> {
         let output_seq = self.next_seq;
         let snapshot_seq = output_seq
             .checked_add(1)
@@ -961,28 +1013,12 @@ impl TranscriptRecorder {
             raw.extend_from_slice(chunk);
         }
         let normalized = normalize_raw_bytes(&raw, context);
-
-        let mut trimmed = false;
-        let mut normalized_lines = Vec::with_capacity(lines.len());
-        let mut snapshot_applied = Vec::new();
-        for line in lines {
-            let (mut value, applied) = normalize_text(&line, context);
-            snapshot_applied.extend(applied);
-            let len = value.len();
-            value.truncate(value.trim_end_matches(' ').len());
-            trimmed |= len != value.len();
-            normalized_lines.push(value);
-        }
+        let (normalized_lines, snapshot_applied) = normalize_snapshot_lines(lines, context);
 
         self.next_seq = advanced;
         self.raw_log.extend_from_slice(&raw);
         self.applied.extend(normalized.applied.iter().copied());
         self.applied.extend(snapshot_applied);
-        if trimmed {
-            self.applied.insert(NormalizationEntry {
-                kind: NormalizationKind::SnapshotTrailingSpaceTrim,
-            });
-        }
         self.output_audits.push(OutputAudit {
             event_seq: output_seq,
             raw_bytes_b64: BASE64.encode(&raw),
@@ -1005,6 +1041,52 @@ impl TranscriptRecorder {
                 rows,
                 cursor,
                 lines: normalized_lines,
+            });
+        Ok(true)
+    }
+
+    fn output_and_snapshot_settled(
+        &mut self,
+        chunks: &[&[u8]],
+        cols: u16,
+        rows: u16,
+        _cursor: [u16; 2],
+        lines: Vec<String>,
+        context: &NormalizationContext,
+    ) -> Result<bool, TranscriptError> {
+        let seq = self.take_seq()?;
+        let raw_len = chunks.iter().map(|chunk| chunk.len()).sum();
+        let mut raw = Vec::with_capacity(raw_len);
+        for chunk in chunks {
+            raw.extend_from_slice(chunk);
+        }
+        let enumerated = normalize_raw_bytes(&raw, context).applied;
+        let (lines, applied) = settled_frame_lines(lines, context);
+        self.raw_log.extend_from_slice(&raw);
+        self.applied.extend(enumerated);
+        self.applied.extend(applied.iter().copied());
+        self.output_audits.push(OutputAudit {
+            event_seq: seq,
+            raw_bytes_b64: BASE64.encode(&raw),
+            context: NormalizationAuditContext {
+                home_b64: context.home.as_ref().map(|value| BASE64.encode(value)),
+                cwd_b64: context.cwd.as_ref().map(|value| BASE64.encode(value)),
+            },
+            applied: applied.into_iter().collect(),
+        });
+        self.artifact
+            .canonical
+            .events
+            .push(CanonicalEvent::Snapshot {
+                seq,
+                cols,
+                rows,
+                // AVT hardware cursor row/column jitters across otherwise
+                // identical settled frames (Kitty hide/show, reverse-video
+                // cell vs terminal cursor). Pin it so k-run digests compare
+                // visible lines only.
+                cursor: [0, 0],
+                lines,
             });
         Ok(true)
     }
@@ -1099,6 +1181,87 @@ impl TranscriptRecorder {
     }
 }
 
+pub(crate) fn normalize_snapshot_lines(
+    lines: Vec<String>,
+    context: &NormalizationContext,
+) -> (Vec<String>, BTreeSet<NormalizationEntry>) {
+    let mut applied = BTreeSet::new();
+    let mut trimmed = false;
+    let mut normalized_lines = Vec::with_capacity(lines.len());
+    for line in lines {
+        let (mut value, line_applied) = normalize_text(&line, context);
+        applied.extend(line_applied);
+        let len = value.len();
+        value.truncate(value.trim_end_matches(' ').len());
+        trimmed |= len != value.len();
+        normalized_lines.push(value);
+    }
+    if trimmed {
+        applied.insert(NormalizationEntry {
+            kind: NormalizationKind::SnapshotTrailingSpaceTrim,
+        });
+    }
+    (normalized_lines, applied)
+}
+
+fn pin_elapsed_token(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != ' ' {
+            out.push(ch);
+            continue;
+        }
+
+        let mut probe = chars.clone();
+        let mut saw_digit = false;
+        while probe.next_if(char::is_ascii_digit).is_some() {
+            saw_digit = true;
+        }
+        if saw_digit
+            && probe.next() == Some('s')
+            && probe.next() == Some(' ')
+            && probe.next() == Some('·')
+        {
+            out.push_str(" <ELAPSED> ·");
+            chars = probe;
+        } else {
+            out.push(' ');
+        }
+    }
+    out
+}
+fn pin_composer_border_leak(line: &str) -> String {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix('❯') {
+        if rest.chars().all(|ch| ch == ' ' || ch == '─') {
+            return "❯".to_owned();
+        }
+    }
+    line.to_owned()
+}
+
+pub(crate) fn settled_frame_lines(
+    lines: Vec<String>,
+    context: &NormalizationContext,
+) -> (Vec<String>, BTreeSet<NormalizationEntry>) {
+    let (mut lines, mut applied) = normalize_snapshot_lines(lines, context);
+    if let Some((first, glyphs)) = crate::components::DEFAULT_LOADER_FRAMES.split_first() {
+        for line in &mut lines {
+            for glyph in glyphs {
+                if line.contains(*glyph) {
+                    *line = line.replace(*glyph, first);
+                }
+            }
+            *line = pin_composer_border_leak(&pin_elapsed_token(line));
+        }
+    }
+    applied.insert(NormalizationEntry {
+        kind: NormalizationKind::OutputSettleCollapse,
+    });
+    (lines, applied)
+}
+
 fn constrain_driver(
     driver: DriverKind,
     mode: TranscriptMode,
@@ -1121,6 +1284,10 @@ mod tests {
     use super::*;
 
     fn recorder(driver: DriverKind) -> TranscriptRecorder {
+        recorder_with_canon(driver, OutputCanon::Bytes)
+    }
+
+    fn recorder_with_canon(driver: DriverKind, output_canon: OutputCanon) -> TranscriptRecorder {
         TranscriptRecorder::new(TranscriptSpec {
             scenario: Scenario::ColdStart,
             row: RunnerRow {
@@ -1134,6 +1301,7 @@ mod tests {
             mode: TranscriptMode::Standard,
             claims: vec![ClaimClass::Execution, ClaimClass::Render],
             timing: TimingEnvelope::default(),
+            output_canon,
         })
     }
 
@@ -1219,6 +1387,7 @@ mod tests {
             vec!["/home/alice/.cargo/bin/pi".to_owned(), "--cwd".to_owned()],
             &context,
         )?;
+        value.input(b"/import /home/alice/project/export.jsonl\r")?;
         value.snapshot(
             80,
             24,
@@ -1232,7 +1401,11 @@ mod tests {
             return Err("missing spawn".into());
         };
         assert_eq!(argv[0], "<HOME>/.cargo/bin/pi");
-        let CanonicalEvent::Snapshot { lines, .. } = &artifact.canonical.events[1] else {
+        let CanonicalEvent::Input { bytes_b64, .. } = &artifact.canonical.events[1] else {
+            return Err("missing input".into());
+        };
+        assert_eq!(bytes_b64, &BASE64.encode(b"/import <CWD>/export.jsonl\r"));
+        let CanonicalEvent::Snapshot { lines, .. } = &artifact.canonical.events[2] else {
             return Err("missing snapshot".into());
         };
         assert_eq!(lines[0], "cwd=<CWD>");
@@ -1314,6 +1487,7 @@ mod tests {
                 ClaimClass::Render,
             ],
             timing: TimingEnvelope::default(),
+            output_canon: OutputCanon::Bytes,
         });
         value.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
         value.exit(Some(0), true)?;
@@ -1577,6 +1751,159 @@ mod tests {
                 .iter()
                 .any(|entry| entry.kind == NormalizationKind::ResizeCollapse)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn settled_frame_collapses_divergent_raw_to_identical_canonical()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let geometry = Geometry { cols: 80, rows: 24 };
+        let raw_blank_then_ready: &[u8] = b"xxxx\rready";
+        let raw_ready: &[u8] = b"ready";
+        let snap_a = super::super::session::snapshot_from_raw(raw_blank_then_ready, geometry);
+        let snap_b = super::super::session::snapshot_from_raw(raw_ready, geometry);
+        assert_eq!(snap_a.lines, snap_b.lines);
+
+        let mut left = recorder_with_canon(DriverKind::PosixPty, OutputCanon::SettledFrame);
+        let mut right = recorder_with_canon(DriverKind::PosixPty, OutputCanon::SettledFrame);
+        for (recorder, raw, snap) in [
+            (&mut left, raw_blank_then_ready, &snap_a),
+            (&mut right, raw_ready, &snap_b),
+        ] {
+            recorder.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
+            recorder.output_and_snapshot(
+                &[raw],
+                geometry.cols,
+                geometry.rows,
+                [
+                    u16::try_from(snap.cursor_col).unwrap_or(0),
+                    u16::try_from(snap.cursor_row).unwrap_or(0),
+                ],
+                snap.lines.clone(),
+                &NormalizationContext::default(),
+            )?;
+            recorder.exit(Some(0), true)?;
+        }
+        let left = left.finish()?;
+        let right = right.finish()?;
+        assert_eq!(encode_canonical(&left)?, encode_canonical(&right)?);
+
+        let mut left_bytes = recorder(DriverKind::PosixPty);
+        let mut right_bytes = recorder(DriverKind::PosixPty);
+        for (recorder, raw, snap) in [
+            (&mut left_bytes, raw_blank_then_ready, &snap_a),
+            (&mut right_bytes, raw_ready, &snap_b),
+        ] {
+            recorder.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
+            recorder.output_and_snapshot(
+                &[raw],
+                geometry.cols,
+                geometry.rows,
+                [
+                    u16::try_from(snap.cursor_col).unwrap_or(0),
+                    u16::try_from(snap.cursor_row).unwrap_or(0),
+                ],
+                snap.lines.clone(),
+                &NormalizationContext::default(),
+            )?;
+            recorder.exit(Some(0), true)?;
+        }
+        assert_ne!(
+            encode_canonical(&left_bytes.finish()?)?,
+            encode_canonical(&right_bytes.finish()?)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn settled_frame_lines_pins_loader_clock_and_marks_collapse() {
+        let context = NormalizationContext::default();
+        let first = crate::components::DEFAULT_LOADER_FRAMES[0];
+        for glyph in crate::components::DEFAULT_LOADER_FRAMES {
+            let (lines, applied) =
+                settled_frame_lines(vec![format!("{glyph} Working… 1s ·")], &context);
+            assert_eq!(lines, vec![format!("{first} Working… <ELAPSED> ·")]);
+            assert!(
+                applied
+                    .iter()
+                    .any(|entry| entry.kind == NormalizationKind::OutputSettleCollapse)
+            );
+        }
+        let (lines, applied) = settled_frame_lines(vec![" 12s ·".to_owned()], &context);
+        assert_eq!(lines, vec![" <ELAPSED> ·".to_owned()]);
+        assert!(
+            applied
+                .iter()
+                .any(|entry| entry.kind == NormalizationKind::OutputSettleCollapse)
+        );
+        let a11y = " ⠋ Working… 4s · esc to cancel".to_owned();
+        let (lines, applied) = normalize_snapshot_lines(vec![a11y.clone()], &context);
+        assert_eq!(lines, vec![a11y]);
+        assert!(
+            !applied
+                .iter()
+                .any(|entry| entry.kind == NormalizationKind::OutputSettleCollapse)
+        );
+        assert!(
+            !detected_volatile_kinds("⠋ Working… 4s ·".as_bytes())
+                .contains(&NormalizationKind::OutputSettleCollapse)
+        );
+    }
+
+    #[test]
+    fn settled_frame_lines_pins_empty_composer_border_leak() {
+        let context = NormalizationContext::default();
+        let (lines, _) = settled_frame_lines(vec!["❯ ─".to_owned(), "❯".to_owned()], &context);
+        assert_eq!(lines, vec!["❯".to_owned(), "❯".to_owned()]);
+        let (kept, _) = settled_frame_lines(vec!["❯ hello".to_owned()], &context);
+        assert_eq!(kept, vec!["❯ hello".to_owned()]);
+    }
+
+    #[test]
+    fn settled_frame_rejects_bare_output_and_snapshot() -> Result<(), TranscriptError> {
+        let mut value = recorder_with_canon(DriverKind::PosixPty, OutputCanon::SettledFrame);
+        value.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
+        let before = value.artifact.canonical.events.len();
+        assert!(matches!(
+            value.output(&[b"ready"], &NormalizationContext::default()),
+            Err(TranscriptError::SettledFrameOnly)
+        ));
+        assert!(matches!(
+            value.snapshot(
+                80,
+                24,
+                [0, 0],
+                vec!["ready".to_owned()],
+                &NormalizationContext::default()
+            ),
+            Err(TranscriptError::SettledFrameOnly)
+        ));
+        assert_eq!(value.artifact.canonical.events.len(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn settled_output_and_snapshot_consumes_one_seq_keyed_to_snapshot()
+    -> Result<(), TranscriptError> {
+        let mut value = recorder_with_canon(DriverKind::PosixPty, OutputCanon::SettledFrame);
+        value.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
+        assert_eq!(value.next_seq, 1);
+        assert!(value.output_and_snapshot(
+            &[b"ready"],
+            80,
+            24,
+            [0, 0],
+            vec!["ready".to_owned()],
+            &NormalizationContext::default(),
+        )?);
+        assert_eq!(value.next_seq, 2);
+        assert_eq!(value.artifact.canonical.events.len(), 2);
+        let CanonicalEvent::Snapshot { seq, .. } = value.artifact.canonical.events[1] else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(seq, 1);
+        assert_eq!(value.output_audits.len(), 1);
+        assert_eq!(value.output_audits[0].event_seq, seq);
         Ok(())
     }
 

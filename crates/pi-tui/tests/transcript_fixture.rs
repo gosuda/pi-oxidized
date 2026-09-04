@@ -24,9 +24,9 @@ use pi_tui::testkit::driver::{
 use pi_tui::testkit::posix::PosixPtyDriver;
 use pi_tui::testkit::repeat::{RepeatError, run_k};
 use pi_tui::testkit::transcript::{
-    CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, RowId, RowTier,
-    RunnerRow, Scenario, TimingEnvelope, TranscriptArtifact, TranscriptMode, TranscriptRecorder,
-    TranscriptSpec,
+    CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, OutputCanon, RowId,
+    RowTier, RunnerRow, Scenario, TimingEnvelope, TranscriptArtifact, TranscriptMode,
+    TranscriptRecorder, TranscriptSpec,
 };
 use pi_tui::testkit::{RecordingError, RecordingSession};
 
@@ -172,6 +172,7 @@ impl FixtureRun {
             mode: TranscriptMode::Standard,
             claims,
             timing: TimingEnvelope::default(),
+            output_canon: OutputCanon::Bytes,
         });
         let recording = RecordingSession::new(session, recorder, argv, &context)?;
         Ok(Self {

@@ -42,8 +42,9 @@ use pi_tui::testkit::driver::{DriverError, LaunchSpec, SettlePolicy, TerminalDri
 use pi_tui::testkit::qemu::QemuUserSmokeDriver;
 use pi_tui::testkit::repeat::{RepeatError, run_k};
 use pi_tui::testkit::transcript::{
-    CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, RowId, RowTier,
-    RunnerRow, Scenario, TimingEnvelope, TranscriptArtifact, TranscriptMode, TranscriptSpec,
+    CapabilityProfile, ClaimClass, DriverKind, Geometry, NormalizationContext, OutputCanon, RowId,
+    RowTier, RunnerRow, Scenario, TimingEnvelope, TranscriptArtifact, TranscriptMode,
+    TranscriptSpec,
 };
 use pi_tui::testkit::validate::validate_artifact;
 use pi_tui::testkit::{RecordingError, RecordingSession};
@@ -254,6 +255,7 @@ impl SmokeRun {
                 mode,
                 claims,
                 timing: TimingEnvelope::default(),
+                output_canon: OutputCanon::Bytes,
             },
             spec.argv,
             &context,

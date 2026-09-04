@@ -3,19 +3,22 @@
 #![cfg(unix)]
 
 use std::fs::OpenOptions;
-use std::io::Write;
 use std::os::fd::AsFd;
 
+use nix::sys::signal::{Signal, killpg};
 use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+use nix::unistd::{Pid, getpid};
 use portable_pty::unix::UnixPtySystem;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, PtySystem};
 
 use super::transcript::DriverKind;
 use crate::testkit::driver::{
     DriverError, DriverSession, ExitStatus, Geometry, LaunchSpec, OutputBatch, RenderSession,
-    SettlePolicy, SettledFrame, TerminalDriver,
+    SettlePolicy, SettledFrame, TerminalDriver, TerminalSnapshot,
 };
-use crate::testkit::session::{SessionIo, apply_env, snapshot_from_raw};
+use crate::testkit::session::{
+    SessionIo, apply_env, snapshot_from_raw, viewport_snapshot_from_raw,
+};
 
 /// POSIX PTY driver using `portable-pty`'s Unix backend.
 #[derive(Debug, Default, Clone, Copy)]
@@ -48,12 +51,12 @@ impl TerminalDriver for PosixPtyDriver {
         cmd.cwd(&spec.cwd);
         apply_env(&mut cmd, spec);
 
+        disable_pty_echo(pair.master.as_ref())?;
         let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|err| DriverError::pty(&err))?;
         drop(pair.slave);
-
         disable_pty_echo(pair.master.as_ref())?;
 
         let raw_writer = pair
@@ -70,19 +73,21 @@ impl TerminalDriver for PosixPtyDriver {
         let shared = crate::testkit::session::SharedWriter::new(raw_writer);
         let dsr_writer = shared.clone_handle();
 
-        // Write probe reply through the shared writer.
-        let probe = spec.profile.probe_reply();
-        if !probe.is_empty() {
-            let mut w = shared.clone_handle();
-            w.write_all(probe)?;
-            w.flush()?;
-        }
-
-        let pump =
-            crate::testkit::session::ReaderPump::from_reader_with_dsr_responder(reader, dsr_writer);
+        let pump = crate::testkit::session::ReaderPump::from_reader_with_probe_responder(
+            reader,
+            dsr_writer,
+            spec.profile,
+        );
+        let pgid = child.process_id().and_then(|id| {
+            i32::try_from(id).ok().and_then(|raw| {
+                let pid = Pid::from_raw(raw);
+                (raw > 1 && pid != getpid()).then_some(pid)
+            })
+        });
         Ok(PosixPtySession {
             master: pair.master,
             child: Some(child),
+            pgid,
             io: SessionIo::new(Box::new(shared), pump),
             geometry: spec.geometry,
         })
@@ -93,6 +98,7 @@ impl TerminalDriver for PosixPtyDriver {
 pub struct PosixPtySession {
     master: Box<dyn MasterPty + Send>,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    pgid: Option<Pid>,
     io: SessionIo,
     geometry: Geometry,
 }
@@ -103,6 +109,15 @@ impl PosixPtySession {
             Err(DriverError::Closed)
         } else {
             Ok(())
+        }
+    }
+
+    fn kill_session(&mut self) {
+        if let Some(pgid) = self.pgid {
+            let _ = killpg(pgid, Signal::SIGKILL);
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
         }
     }
 }
@@ -120,7 +135,22 @@ impl DriverSession for PosixPtySession {
     where
         F: FnMut(&[u8]) -> bool,
     {
-        self.io.read_output(policy, predicate)
+        self.io
+            .read_output(policy, predicate)
+            .map_err(|error| match error {
+                DriverError::SettleCeiling(detail) => {
+                    let child = match self.child.as_mut() {
+                        Some(child) => match child.try_wait() {
+                            Ok(Some(status)) => format!("exited:{status:?}"),
+                            Ok(None) => "running".to_owned(),
+                            Err(err) => format!("try_wait:{err}"),
+                        },
+                        None => "missing".to_owned(),
+                    };
+                    DriverError::SettleCeiling(format!("{detail} child={child}"))
+                }
+                other => other,
+            })
     }
 
     fn close(mut self) -> Result<ExitStatus, DriverError> {
@@ -135,10 +165,23 @@ impl DriverSession for PosixPtySession {
         // already exited) are ignored, matching the Drop-time behavior.
         let _ = self.io.write_all(b"\n\x04");
         self.io.closed = true;
-        // Writer EOF first, then wait for the child, then join the reader.
         self.io.close_writer();
         let mut child = self.child.take().ok_or(DriverError::Closed)?;
-        let wait_result = child.wait().map_err(|err| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let wait_result = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    self.kill_session();
+                    break child.wait();
+                }
+                Err(err) => break Err(err),
+            }
+        }
+        .map_err(|err| {
             DriverError::Io(std::io::Error::new(
                 err.kind(),
                 format!("posix pty child wait failed: {err}"),
@@ -147,6 +190,8 @@ impl DriverSession for PosixPtySession {
         let join_result = self.io.join_readers();
         let status = wait_result?;
         join_result?;
+        // Reap leftover session members (extension host) after pi exits.
+        self.kill_session();
         Ok(status.into())
     }
 }
@@ -186,6 +231,41 @@ impl RenderSession for PosixPtySession {
         let snapshot = snapshot_from_raw(self.io.ledger.raw_log(), self.geometry);
         Ok(SettledFrame { batch, snapshot })
     }
+
+    fn read_settled_frame_where<F>(
+        &mut self,
+        policy: &SettlePolicy,
+        mut predicate: F,
+    ) -> Result<SettledFrame, DriverError>
+    where
+        F: FnMut(&TerminalSnapshot) -> bool,
+    {
+        let geometry = self.geometry;
+        let batch = self
+            .io
+            .read_output_where(policy, |ledger| {
+                predicate(&viewport_snapshot_from_raw(ledger.raw_log(), geometry))
+            })
+            .map_err(|error| match error {
+                DriverError::SettleCeiling(detail) => {
+                    let child = match self.child.as_mut() {
+                        Some(child) => match child.try_wait() {
+                            Ok(Some(status)) => format!("exited:{status:?}"),
+                            Ok(None) => "running".to_owned(),
+                            Err(err) => format!("try_wait:{err}"),
+                        },
+                        None => "missing".to_owned(),
+                    };
+                    let screen = viewport_snapshot_from_raw(self.io.ledger.raw_log(), geometry)
+                        .lines
+                        .join("\n");
+                    DriverError::SettleCeiling(format!("{detail} child={child} screen:\n{screen}"))
+                }
+                other => other,
+            })?;
+        let snapshot = viewport_snapshot_from_raw(self.io.ledger.raw_log(), self.geometry);
+        Ok(SettledFrame { batch, snapshot })
+    }
 }
 
 impl Drop for PosixPtySession {
@@ -193,12 +273,12 @@ impl Drop for PosixPtySession {
         if !self.io.closed {
             self.io.closed = true;
             self.io.close_writer();
-            if let Some(mut child) = self.child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            let _ = self.io.join_readers();
         }
+        self.kill_session();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+        let _ = self.io.join_readers();
     }
 }
 

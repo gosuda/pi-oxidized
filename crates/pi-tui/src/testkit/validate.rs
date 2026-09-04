@@ -6,11 +6,14 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::Value;
 use thiserror::Error;
 
+#[cfg(test)]
+use super::session::snapshot_from_raw;
+use super::session::viewport_snapshot_from_raw;
 use super::transcript::{
-    CanonicalEvent, ClaimClass, DriverKind, EventKind, NORMALIZATION_TABLE_V1,
+    CanonicalEvent, ClaimClass, DriverKind, EventKind, Geometry, NORMALIZATION_TABLE_V1,
     NormalizationAuditContext, NormalizationContext, NormalizationKind, RowId, RowTier, SCHEMA_ID,
     TranscriptArtifact, TranscriptMode, detected_volatile_kinds, digest_canonical,
-    normalize_raw_bytes,
+    normalize_raw_bytes, settled_frame_lines,
 };
 
 const TIMING_LIKE_FIELDS: &[&str] = &[
@@ -93,7 +96,7 @@ pub enum ValidatorError {
     /// Applied normalization is outside the pinned schema-v1 table.
     #[error("normalization entry is outside NORMALIZATION_TABLE_V1: {0:?}")]
     UnknownNormalization(NormalizationKind),
-    /// Every canonical output event needs matching raw-audit evidence.
+    /// Every canonical output event, and every snapshot in settled-frame canon, needs raw-audit evidence.
     #[error("missing output audit for seq {0}")]
     MissingOutputAudit(u32),
     /// Output audits must be unique per canonical output sequence.
@@ -105,6 +108,9 @@ pub enum ValidatorError {
     /// Re-normalizing audit bytes did not reproduce the canonical output.
     #[error("output audit mismatch for seq {0}")]
     OutputAuditMismatch(u32),
+    /// Raw log is not the concatenation of output audits.
+    #[error("raw log is not the concatenation of output audits")]
+    RawLogAuditMismatch,
     /// Geometry must be non-zero in both dimensions.
     #[error("geometry has zero cols or rows: {cols}x{rows}")]
     ZeroGeometry {
@@ -329,25 +335,24 @@ fn validate_driver_row_pairing(artifact: &TranscriptArtifact) -> Result<(), Vali
         return Err(mismatch);
     }
 
-    if artifact.row.tier == RowTier::TierN {
-        match row {
-            RowId::GnuX64 | RowId::GnuArm64 | RowId::DarwinX64 | RowId::DarwinArm64 => {
-                if driver != DriverKind::PosixPty {
-                    return Err(mismatch);
-                }
-            }
-            RowId::WindowsX64 => {
-                if driver != DriverKind::ConPty {
-                    return Err(mismatch);
-                }
+    match row {
+        RowId::GnuX64 | RowId::GnuArm64 | RowId::DarwinX64 | RowId::DarwinArm64 => {
+            if driver != DriverKind::PosixPty && driver != DriverKind::QemuUserSmoke {
+                return Err(mismatch);
             }
         }
+        RowId::WindowsX64 => {}
     }
 
     Ok(())
 }
 
 fn validate_output_audits(artifact: &TranscriptArtifact) -> Result<(), ValidatorError> {
+    let settled = artifact
+        .canonical
+        .normalizations
+        .iter()
+        .any(|entry| entry.kind == NormalizationKind::OutputSettleCollapse);
     let mut by_seq = BTreeMap::new();
     for audit in &artifact.timing.output_audits {
         if by_seq.insert(audit.event_seq, audit).is_some() {
@@ -356,34 +361,76 @@ fn validate_output_audits(artifact: &TranscriptArtifact) -> Result<(), Validator
     }
 
     let mut consumed = BTreeSet::new();
+    let mut raw_prefix = Vec::new();
     for event in &artifact.canonical.events {
-        let CanonicalEvent::Output { seq, bytes_b64 } = event else {
-            continue;
-        };
-        let Some(audit) = by_seq.get(seq) else {
-            return Err(ValidatorError::MissingOutputAudit(*seq));
-        };
-        if !consumed.insert(*seq) {
-            return Err(ValidatorError::DuplicateOutputAudit(*seq));
-        }
+        match event {
+            CanonicalEvent::Output { seq, bytes_b64 } => {
+                let Some(audit) = by_seq.get(seq) else {
+                    return Err(ValidatorError::MissingOutputAudit(*seq));
+                };
+                if !consumed.insert(*seq) {
+                    return Err(ValidatorError::DuplicateOutputAudit(*seq));
+                }
 
-        let raw = BASE64
-            .decode(audit.raw_bytes_b64.as_bytes())
-            .map_err(|error| ValidatorError::Parse(error.to_string()))?;
-        let context = context_from_audit(&audit.context)?;
-        let normalized = normalize_raw_bytes(&raw, &context);
-        if normalized.applied != audit.applied {
-            return Err(ValidatorError::OutputAuditMismatch(*seq));
-        }
-        let recomputed = BASE64.encode(normalized.bytes);
-        if &recomputed != bytes_b64 {
-            return Err(ValidatorError::OutputAuditMismatch(*seq));
+                let raw = BASE64
+                    .decode(audit.raw_bytes_b64.as_bytes())
+                    .map_err(|error| ValidatorError::Parse(error.to_string()))?;
+                let context = context_from_audit(&audit.context)?;
+                let normalized = normalize_raw_bytes(&raw, &context);
+                if normalized.applied != audit.applied {
+                    return Err(ValidatorError::OutputAuditMismatch(*seq));
+                }
+                let recomputed = BASE64.encode(normalized.bytes);
+                if &recomputed != bytes_b64 {
+                    return Err(ValidatorError::OutputAuditMismatch(*seq));
+                }
+                raw_prefix.extend_from_slice(&raw);
+            }
+            CanonicalEvent::Snapshot {
+                seq,
+                cols,
+                rows,
+                cursor: _,
+                lines,
+            } if settled => {
+                let Some(audit) = by_seq.get(seq) else {
+                    return Err(ValidatorError::MissingOutputAudit(*seq));
+                };
+                if !consumed.insert(*seq) {
+                    return Err(ValidatorError::DuplicateOutputAudit(*seq));
+                }
+                let raw = BASE64
+                    .decode(audit.raw_bytes_b64.as_bytes())
+                    .map_err(|error| ValidatorError::Parse(error.to_string()))?;
+                raw_prefix.extend_from_slice(&raw);
+                let snap = viewport_snapshot_from_raw(
+                    &raw_prefix,
+                    Geometry {
+                        cols: *cols,
+                        rows: *rows,
+                    },
+                );
+                let context = context_from_audit(&audit.context)?;
+                let (expected, applied) = settled_frame_lines(snap.lines, &context);
+                if expected != *lines || applied.into_iter().collect::<Vec<_>>() != audit.applied {
+                    return Err(ValidatorError::OutputAuditMismatch(*seq));
+                }
+            }
+            _ => {}
         }
     }
 
     for audit in &artifact.timing.output_audits {
         if !consumed.contains(&audit.event_seq) {
             return Err(ValidatorError::ExtraOutputAudit(audit.event_seq));
+        }
+    }
+    if settled {
+        let raw_log = BASE64
+            .decode(artifact.timing.raw_log_b64.as_bytes())
+            .map_err(|error| ValidatorError::Parse(error.to_string()))?;
+        if raw_log != raw_prefix {
+            return Err(ValidatorError::RawLogAuditMismatch);
         }
     }
     Ok(())
@@ -412,8 +459,8 @@ fn decode_optional_b64(value: Option<&str>) -> Result<Option<Vec<u8>>, Validator
 mod tests {
     use super::super::transcript::{
         CapabilityProfile, DriverDescriptor, Geometry, NormalizationAuditContext,
-        NormalizationContext, NormalizationEntry, OutputAudit, RowId, RunnerRow, Scenario,
-        TimingEnvelope, TranscriptRecorder, TranscriptSpec,
+        NormalizationContext, NormalizationEntry, OutputAudit, OutputCanon, RowId, RunnerRow,
+        Scenario, TimingEnvelope, TranscriptRecorder, TranscriptSpec,
     };
     use super::*;
 
@@ -431,6 +478,7 @@ mod tests {
             mode: TranscriptMode::Standard,
             claims: vec![ClaimClass::Execution, ClaimClass::Render],
             timing: TimingEnvelope::default(),
+            output_canon: OutputCanon::Bytes,
         });
         recorder.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
         recorder.output(&[b"ready"], &NormalizationContext::default())?;
@@ -607,6 +655,7 @@ mod tests {
             mode: TranscriptMode::Standard,
             claims: vec![ClaimClass::Execution],
             timing: TimingEnvelope::default(),
+            output_canon: OutputCanon::Bytes,
         });
         recorder.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
         recorder.snapshot(
@@ -684,6 +733,7 @@ mod tests {
                 ClaimClass::Snapshot,
             ],
             timing: TimingEnvelope::default(),
+            output_canon: OutputCanon::Bytes,
         });
         recorder.spawn(vec!["qemu".to_owned()], &NormalizationContext::default())?;
         assert!(!recorder.snapshot(
@@ -911,6 +961,133 @@ mod tests {
                 driver: DriverKind::ConPty,
             }
         );
+        Ok(())
+    }
+
+    fn valid_settled() -> Result<TranscriptArtifact, Box<dyn std::error::Error>> {
+        let raw = "hello\r\n⠙ Working… 1s · escape to cancel".as_bytes();
+        let geometry = Geometry { cols: 80, rows: 24 };
+        let snap = super::snapshot_from_raw(raw, geometry);
+        let cursor = [
+            u16::try_from(snap.cursor_col).unwrap_or(0),
+            u16::try_from(snap.cursor_row).unwrap_or(0),
+        ];
+        let mut recorder = TranscriptRecorder::new(TranscriptSpec {
+            scenario: Scenario::ColdStart,
+            row: RunnerRow {
+                tier: RowTier::Local,
+                id: RowId::GnuX64,
+                runner_image: None,
+            },
+            geometry,
+            capability_profile: CapabilityProfile::Xterm256Color,
+            driver_kind: DriverKind::PosixPty,
+            mode: TranscriptMode::Standard,
+            claims: vec![
+                ClaimClass::Execution,
+                ClaimClass::Render,
+                ClaimClass::Snapshot,
+            ],
+            timing: TimingEnvelope::default(),
+            output_canon: OutputCanon::SettledFrame,
+        });
+        recorder.spawn(vec!["pi".to_owned()], &NormalizationContext::default())?;
+        recorder.input(b"go")?;
+        recorder.output_and_snapshot(
+            &[raw],
+            geometry.cols,
+            geometry.rows,
+            cursor,
+            snap.lines,
+            &NormalizationContext::default(),
+        )?;
+        recorder.exit(Some(0), true)?;
+        Ok(recorder.finish()?)
+    }
+
+    #[test]
+    fn accepts_valid_settled_artifact() -> Result<(), Box<dyn std::error::Error>> {
+        let artifact = valid_settled()?;
+        validate_artifact(&artifact)?;
+        Ok(())
+    }
+
+    #[test]
+    fn settled_snapshot_line_tamper_mismatches_audit() -> Result<(), Box<dyn std::error::Error>> {
+        let mut artifact = valid_settled()?;
+        let seq = artifact
+            .canonical
+            .events
+            .iter()
+            .find_map(|event| match event {
+                CanonicalEvent::Snapshot { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .ok_or("snapshot")?;
+        for event in &mut artifact.canonical.events {
+            if let CanonicalEvent::Snapshot { lines, .. } = event {
+                let line = lines.first_mut().ok_or("line")?;
+                line.push_str(" tampered");
+            }
+        }
+        artifact.digest = digest_canonical(&artifact)?;
+        let error = validate_artifact(&artifact).err().ok_or("tamper")?;
+        assert_eq!(error, ValidatorError::OutputAuditMismatch(seq));
+        Ok(())
+    }
+
+    #[test]
+    fn settled_audit_raw_tamper_mismatches() -> Result<(), Box<dyn std::error::Error>> {
+        let mut artifact = valid_settled()?;
+        let seq = artifact.timing.output_audits[0].event_seq;
+        artifact.timing.output_audits[0].raw_bytes_b64 = BASE64.encode(b"tampered-raw");
+        artifact.digest = digest_canonical(&artifact)?;
+        let error = validate_artifact(&artifact).err().ok_or("raw")?;
+        assert_eq!(error, ValidatorError::OutputAuditMismatch(seq));
+        Ok(())
+    }
+
+    #[test]
+    fn settled_audit_rekeyed_to_input_is_extra_and_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut artifact = valid_settled()?;
+        let input_seq = artifact
+            .canonical
+            .events
+            .iter()
+            .find_map(|event| match event {
+                CanonicalEvent::Input { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .ok_or("input")?;
+        let snapshot_seq = artifact
+            .canonical
+            .events
+            .iter()
+            .find_map(|event| match event {
+                CanonicalEvent::Snapshot { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .ok_or("snapshot")?;
+        artifact.timing.output_audits[0].event_seq = input_seq;
+        artifact.digest = digest_canonical(&artifact)?;
+        let error = validate_artifact(&artifact).err().ok_or("rekey")?;
+        assert!(
+            error == ValidatorError::MissingOutputAudit(snapshot_seq)
+                || error == ValidatorError::ExtraOutputAudit(input_seq)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn settled_truncated_raw_log_mismatches_concat() -> Result<(), Box<dyn std::error::Error>> {
+        let mut artifact = valid_settled()?;
+        let mut raw = BASE64.decode(artifact.timing.raw_log_b64.as_bytes())?;
+        raw.pop();
+        artifact.timing.raw_log_b64 = BASE64.encode(raw);
+        artifact.digest = digest_canonical(&artifact)?;
+        let error = validate_artifact(&artifact).err().ok_or("concat")?;
+        assert_eq!(error, ValidatorError::RawLogAuditMismatch);
         Ok(())
     }
 }

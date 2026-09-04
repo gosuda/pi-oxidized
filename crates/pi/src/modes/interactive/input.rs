@@ -372,9 +372,13 @@ impl InputMapper {
         state: &mut InputState,
         out: &mut Vec<ViewAction>,
     ) {
-        // 1. Any active overlay dismisses first.
         if view.overlay.is_some() {
             out.push(ViewAction::DismissOverlay);
+            state.reset_taps();
+            return;
+        }
+        if view.extension_dialog {
+            out.push(ViewAction::SelectCancelled);
             state.reset_taps();
             return;
         }
@@ -1011,6 +1015,23 @@ mod tests {
         let view = view_with_overlay(OverlayKind::ShortcutHelp);
         let actions = mapper.map(&plain(KeyCode::Esc), &view, "abc", "abc", &mut state, false);
         assert_eq!(actions, vec![ViewAction::DismissOverlay]);
+    }
+
+    #[test]
+    fn esc_cancels_extension_dialog_before_clearing_editor() {
+        let mapper = mapper();
+        let mut state = InputState::default();
+        let mut view = view_with_editor("draft");
+        view.extension_dialog = true;
+        let actions = mapper.map(
+            &plain(KeyCode::Esc),
+            &view,
+            "draft",
+            "draft",
+            &mut state,
+            false,
+        );
+        assert_eq!(actions, vec![ViewAction::SelectCancelled]);
     }
 
     #[test]
