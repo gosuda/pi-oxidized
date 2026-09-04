@@ -573,8 +573,10 @@ where
 
     loop {
         let since_data = last_data.elapsed();
-        let matched = predicate(ledger);
-        if since_data >= policy.quiet && matched {
+        // Predicate evaluation can rebuild a full-log VT snapshot; skip it
+        // while output is still arriving (quiet window not yet elapsed).
+        let matched = since_data >= policy.quiet && predicate(ledger);
+        if matched {
             return Ok(());
         }
         if started.elapsed() >= policy.ceiling {
@@ -645,24 +647,28 @@ fn build_snapshot(raw: &[u8], geometry: Geometry, viewport_only: bool) -> Termin
     let lossy = String::from_utf8_lossy(raw);
     let _ = vt.feed_str(&lossy);
     let cursor = vt.cursor();
-    let view: Vec<String> = vt
-        .view()
-        .map(|line| line.text().trim_end().to_owned())
-        .collect();
-    let mut lines = if viewport_only {
-        view
-    } else {
-        vt.lines()
+    let lines = if viewport_only {
+        // `view()` is the authoritative viewport. Never fall back to
+        // `vt.text()` here: it walks the whole buffer, so a blank live
+        // viewport would re-import scrolled-out stale paints — exactly
+        // what viewport-only settles must not see.
+        vt.view()
             .map(|line| line.text().trim_end().to_owned())
             .collect()
-    };
-    if lines.iter().all(|line| line.trim().is_empty()) {
-        lines = vt
-            .text()
-            .into_iter()
-            .map(|line| line.trim_end().to_owned())
+    } else {
+        let mut all: Vec<String> = vt
+            .lines()
+            .map(|line| line.text().trim_end().to_owned())
             .collect();
-    }
+        if all.iter().all(|line| line.trim().is_empty()) {
+            all = vt
+                .text()
+                .into_iter()
+                .map(|line| line.trim_end().to_owned())
+                .collect();
+        }
+        all
+    };
     TerminalSnapshot {
         geometry,
         cursor_col: cursor.col,
