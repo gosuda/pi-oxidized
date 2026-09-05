@@ -5431,6 +5431,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     && prev.height == slot.height
                     && prev.overlay_options == slot.overlay_options
             });
+        let replacement_had_focus_token =
+            self.focused_extension_slot.as_deref() == Some(slot.key.as_str());
         self.dispose_extension_slot(&slot.key);
         let non_capturing = slot
             .overlay_options
@@ -5482,6 +5484,15 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             } else {
                 FocusArea::Widget
             };
+        } else if captures_focus && replacement_had_focus_token {
+            // Same-key replacement while a host surface (selector, extension
+            // dialog, or another overlay) owns input: the republished slot
+            // keeps its logical routing-ownership token, but view.focus stays
+            // host-owned. Key routing stays blocked until the host closes
+            // because extension_slot_owns_focus still requires the matching
+            // FocusArea. A slot that did not own the token before replacement
+            // must not acquire it here.
+            self.focused_extension_slot = Some(slot.key.clone());
         }
         self.extension_slots.insert(
             slot.key,
@@ -11573,7 +11584,9 @@ mod tests {
     }
 
     /// A focused extension slot must not steal keys from a host selector:
-    /// Esc closes the host selector instead of vanishing into the slot.
+    /// Esc closes the host selector instead of vanishing into the slot. Once
+    /// the selector is gone, the republished generation-2 overlay must regain
+    /// the extension routing ownership token and the Overlay focus area.
     #[tokio::test]
     async fn host_selector_outranks_focused_extension_slot() -> TestResult {
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -11617,6 +11630,16 @@ mod tests {
         assert!(
             rt.active_selector_kind.is_none(),
             "Esc must close the host selector, not feed the extension slot"
+        );
+        assert_eq!(
+            rt.focused_extension_slot.as_deref(),
+            Some("overlay.grab"),
+            "republished overlay must regain the extension routing ownership token"
+        );
+        assert_eq!(
+            rt.view.focus,
+            FocusArea::Overlay,
+            "focus must return to the republished overlay once the selector closes"
         );
         Ok(())
     }
