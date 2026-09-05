@@ -142,7 +142,11 @@ describe("writeTarGz determinism", () => {
 			{ path: "alpha", data: new Uint8Array([1]), mode: 0o644 },
 		];
 		await writeTarGz(entries, join(work, "order.tar.gz"), { sourceDateEpoch: 0 });
-		const proc = Bun.spawnSync(["tar", "-tzf", join(work, "order.tar.gz")]);
+		const proc = Bun.spawnSync(["tar", "--force-local", "-tzf", join(work, "order.tar.gz")]);
+		if (proc.exitCode !== 0) {
+			const stderr = (proc.stderr?.toString("utf8") ?? "").slice(0, 300);
+			throw new Error(`tar exited ${proc.exitCode}: ${stderr}`);
+		}
 		const out = (proc.stdout?.toString("utf8") ?? "").trim().split("\n");
 		expect(out).toEqual(["alpha", "zeta"]);
 	});

@@ -190,7 +190,7 @@ async function extractArchive(
 		await extractZip(archivePath, outDir);
 		return;
 	}
-	const result = await new SpawnRunner().run("tar", ["-xzf", archivePath, "-C", outDir], {
+	const result = await new SpawnRunner().run("tar", ["--force-local", "-xzf", archivePath, "-C", outDir], {
 		rejectOnError: false,
 		timeoutMs: 60_000,
 	});

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { resolve } from "node:path";
 
 import {
 	ArgvHelpRequested,
@@ -48,23 +49,25 @@ describe("args", () => {
 	});
 
 	test("expands --out to an absolute path", () => {
+		// Expectations go through resolve like the parser does: identical on
+		// POSIX, drive-aware on Windows ("/tmp/x" is drive-relative there).
 		const abs = parseReleaseArgs(
 			["--target", "x86_64-apple-darwin", "--out", "/tmp/release"],
 			"/cwd",
 		);
-		expect(abs.outDir).toBe("/tmp/release");
+		expect(abs.outDir).toBe(resolve("/cwd", "/tmp/release"));
 
 		const relative = parseReleaseArgs(
 			["--target", "x86_64-apple-darwin", "--out", "artifacts"],
 			"/cwd",
 		);
-		expect(relative.outDir).toBe("/cwd/artifacts");
+		expect(relative.outDir).toBe(resolve("/cwd", "artifacts"));
 
 		const defaultArgs = parseReleaseArgs(
 			["--target", "x86_64-apple-darwin"],
 			"/cwd",
 		);
-		expect(defaultArgs.outDir).toBe("/cwd/dist/release");
+		expect(defaultArgs.outDir).toBe(resolve("/cwd", "dist/release"));
 	});
 
 	test("accepts the --out-dir alias", () => {
@@ -72,7 +75,7 @@ describe("args", () => {
 			["--target", "x86_64-apple-darwin", "--out-dir", "/tmp/r2"],
 			"/cwd",
 		);
-		expect(args.outDir).toBe("/tmp/r2");
+		expect(args.outDir).toBe(resolve("/cwd", "/tmp/r2"));
 	});
 
 	test("resolves --runtime-cache to an absolute path and defaults to undefined", () => {
@@ -80,13 +83,13 @@ describe("args", () => {
 			["--target", "x86_64-unknown-linux-gnu", "--runtime-cache", "/var/cache/pi"],
 			"/cwd",
 		);
-		expect(absolute.runtimeCache).toBe("/var/cache/pi");
+		expect(absolute.runtimeCache).toBe(resolve("/cwd", "/var/cache/pi"));
 
 		const relative = parseReleaseArgs(
 			["--target", "x86_64-unknown-linux-gnu", "--runtime-cache", "rel/cache"],
 			"/cwd",
 		);
-		expect(relative.runtimeCache).toBe("/cwd/rel/cache");
+		expect(relative.runtimeCache).toBe(resolve("/cwd", "rel/cache"));
 
 		const omitted = parseReleaseArgs(["--target", "x86_64-unknown-linux-gnu"], "/cwd");
 		expect(omitted.runtimeCache).toBeUndefined();

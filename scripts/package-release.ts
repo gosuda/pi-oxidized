@@ -375,7 +375,9 @@ async function unpackArchive(
 		await extractZip(archivePath, smokeRoot);
 		return;
 	}
-	const result = await runner.run("tar", ["-xzf", archivePath, "-C", smokeRoot], {
+	// --force-local: bsdtar treats `C:\...` as a remote host (`C:`) and dies
+	// with "Cannot connect"; GNU tar accepts the flag harmlessly.
+	const result = await runner.run("tar", ["--force-local", "-xzf", archivePath, "-C", smokeRoot], {
 		rejectOnError: false,
 		timeoutMs: ARCHIVE_TOOL_TIMEOUT_MS,
 	});
