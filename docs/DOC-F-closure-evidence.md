@@ -104,3 +104,25 @@ The audit file SHA-256 is
 
 The DOC-F change contains no `examplesSource`, no `examples/` tree. Release
 code remains owned by REL-DOCS and REL-CLOSE.
+
+## Addendum: final-tree re-verification (2026-09-05)
+
+The 08-29 record above is retained verbatim. After the intervening tree work
+(overlay routing-token repair, model-runtime lock-order repair, testkit
+hardening, transcript exit guards, exposure hydrated-data exclusion), every
+locally-executable DOC-F item was re-run against the final tree:
+
+| Item | Result |
+|---|---|
+| Seven dry-run archive consumers (`release-docs.test.ts`) | 42/42 pass, docs/ tree consumed incl. the new solution note |
+| Compat-docs triple generation | byte-stable (`f0f6044e…`), tree clean |
+| Generated fixtures (`check:fixtures`) | all FRESH after catalog regen 1337→1353 models (pin test follows) |
+| Doc-evidence run | 77/77 present, runId `2026-09-05T11:00:15.970Z`, manifest emitted |
+| Root README crate catalog | 5 rows = workspace members, verified |
+| Exposure ledger | sanity rows re-emitted verbatim at `9d67f0eff96d` with re-anchor record; self-check 33/33 |
+| SBOM baseline | `14ed8987` still describes the tree |
+| Final-tree drift sweep | no new HIGH/MEDIUM: no doc states the old 1337 count, no doc states the old 2491-input projection as current (dated re-anchor records only), solution-note identifiers match production symbols, no new rust/ts fences under docs/ |
+
+Remaining open: the seven CI artifacts (release workflow billing-locked per
+[#138](https://github.com/metaphorics/pi-oxidized/issues/138)) and the musl
+native-run leg (no loader on this host). Both are environmental, not tree state.
