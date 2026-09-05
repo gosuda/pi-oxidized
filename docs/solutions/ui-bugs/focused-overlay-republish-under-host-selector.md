@@ -54,7 +54,7 @@ The replacement path treated the publish as a new focus request. It disposed the
 
 Capture whether the replaced key owns the logical token before disposal. Restore that token only when the replacement has the same key and still captures focus. Do not change the current host-owned `view.focus`.
 
-```rust
+```
 let replacement_had_focus_token =
     self.focused_extension_slot.as_deref() == Some(slot.key.as_str());
 self.dispose_extension_slot(&slot.key);
