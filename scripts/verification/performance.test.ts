@@ -45,6 +45,8 @@ import {
 const SYNC_BEGIN = "\x1b[?2026h";
 const SYNC_END = "\x1b[?2026l";
 const isWindows = process.platform === "win32";
+// spawnPty shells to util-linux setsid/script: absent on macOS and Windows.
+const lacksUtilLinuxPty = process.platform !== "linux";
 const bunExecutable = process.execPath;
 
 const REPOSITORY_ROOT = resolve(import.meta.dirname, "../..");
@@ -154,7 +156,7 @@ process.stdout.write(${JSON.stringify(SYNC_BEGIN)} + "probe complete" + ${JSON.s
 const CLEAN_EXIT_CHILD = "process.exit(0);";
 const FAILURE_EXIT_CHILD = "process.exit(7);";
 
-describe.skipIf(isWindows)("TypeScript extension startup settlement", () => {
+describe.skipIf(lacksUtilLinuxPty)("TypeScript extension startup settlement", () => {
 	test("waits past the first frame for the extensions readiness marker", async () => {
 		const sandbox = temporaryDirectory("perf-extension-startup-");
 		const pty = spawnPty({
@@ -183,7 +185,7 @@ describe.skipIf(isWindows)("TypeScript extension startup settlement", () => {
 	}, 10_000);
 });
 
-describe.skipIf(isWindows)("performance first-frame lifecycle", () => {
+describe.skipIf(lacksUtilLinuxPty)("performance first-frame lifecycle", () => {
 	// Internal deadlines exercised by the ignore-quit test: 5_000ms frame
 	// wait + 10_000ms /quit exit wait (terminateAndRequireCleanExit). The
 	// test timeout is their sum plus 50% headroom so a slow runner fails
@@ -409,7 +411,7 @@ describe("timed CPU sampler purity", () => {
 	}, 15_000);
 });
 
-describe.skipIf(isWindows)("terminal probe emulation", () => {
+describe.skipIf(lacksUtilLinuxPty)("terminal probe emulation", () => {
 	test("answers completion-required probes through a real PTY", async () => {
 		const sandbox = temporaryDirectory("perf-terminal-probes-");
 		const pty = spawnPty({
