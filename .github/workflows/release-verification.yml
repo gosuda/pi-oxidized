@@ -572,8 +572,10 @@ jobs:
             x86_64-unknown-linux-musl) export PI_TUI_MUSL_ROW=musl-x64 ;;
             *) export PI_TUI_MUSL_ROW=musl-arm64 ;;
           esac
-          export PI_TUI_MUSL_ROOT="$root"
-          export PI_TUI_MUSL_ARCHIVE="$archive"
+          # Absolute: cargo runs each test binary with cwd set to its package
+          # dir, so a workspace-relative root would resolve under crates/pi-tui.
+          export PI_TUI_MUSL_ROOT="$PWD/$root"
+          export PI_TUI_MUSL_ARCHIVE="$PWD/$archive"
           printf 'musl-lane row=%s root=%s archive=%s\n' \
             "$PI_TUI_MUSL_ROW" "$PI_TUI_MUSL_ROOT" "$PI_TUI_MUSL_ARCHIVE"
           cargo test -p pi-tui --features testkit --test transcript_musl_smoke
