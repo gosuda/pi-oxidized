@@ -759,6 +759,14 @@ export function observeProcessTreeMemory(
 		}
 
 		if (assembled.kind === "incomplete") {
+			// A zombie descendant is present but has no address space: its
+			// smaps_rollup is empty and status lacks VmHWM. It contributes no
+			// memory, so account it with the vanished instead of failing the
+			// observation on a reaping race.
+			if (assembled.reason === "parse" && fields[0] === "Z") {
+				vanishedDescendants += 1;
+				continue;
+			}
 			incompleteLive += 1;
 			throw new HarnessFailure(
 				label,

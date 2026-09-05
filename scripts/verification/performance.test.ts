@@ -44,7 +44,6 @@ import {
 
 const SYNC_BEGIN = "\x1b[?2026h";
 const SYNC_END = "\x1b[?2026l";
-const isWindows = process.platform === "win32";
 // spawnPty shells to util-linux setsid/script: absent on macOS and Windows.
 const lacksUtilLinuxPty = process.platform !== "linux";
 const bunExecutable = process.execPath;
@@ -578,7 +577,8 @@ describe("process memory assembly policy", () => {
 	});
 });
 
-describe.skipIf(isWindows)("process-tree memory observation", () => {
+// Live /proc observation only exists on Linux (no /proc on macOS/Windows).
+describe.skipIf(process.platform !== "linux")("process-tree memory observation", () => {
 	test("populates complete coverage for a live synthetic root", async () => {
 		const child = Bun.spawn({
 			cmd: [bunExecutable, "-e", "setInterval(() => {}, 1000)"],
@@ -645,6 +645,31 @@ describe("memory-path child enumeration policy", () => {
 			}),
 		).toThrow(HarnessFailure);
 		expect(childEnumCalls).toBe(0);
+	});
+
+	test("zombie descendant with empty maps counts as vanished, not failure", () => {
+		const stat = (pid: number, state: string, startTime: string) =>
+			`${pid} (cmd) ${state} ${Array.from({ length: 18 }, () => "0").concat(startTime).join(" ")}`;
+		const observation = observeProcessTreeMemory(1, "zombie-descendant", {
+			readProcFile: (path) => {
+				if (path === "/proc/1/stat") return { kind: "ok", text: stat(1, "R", "100") };
+				if (path === "/proc/2/stat") return { kind: "ok", text: stat(2, "Z", "101") };
+				if (path.endsWith("smaps_rollup")) {
+					if (path.startsWith("/proc/2/")) return { kind: "ok", text: "" };
+					return { kind: "ok", text: "Rss: 10 kB\nPss: 7 kB\n" };
+				}
+				if (path.endsWith("status")) {
+					if (path.startsWith("/proc/2/")) return { kind: "ok", text: "Name:\tcmd\nState:\tZ (zombie)\n" };
+					return { kind: "ok", text: "VmHWM:\t12 kB\n" };
+				}
+				return { kind: "vanished" };
+			},
+			enumerateChildren: (pid: number) => ({ kind: "ok", children: pid === 1 ? [2] : [] }),
+		});
+		expect(observation.coverageComplete).toBe(true);
+		expect(observation.vanishedDescendants).toBe(1);
+		expect(observation.identitiesWithCompleteMemory).toBe(1);
+		expect(observation.processes.map((process) => process.pid)).toEqual([1]);
 	});
 });
 
