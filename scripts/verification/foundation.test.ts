@@ -275,10 +275,19 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 	try {
 		await waitForFileContent(readyPath, "ready\n", 20_000);
 		cli.writeKeys(`foundation prompt for ${fixture.name}`, PTY_KEYS.enter);
-		const response = await cli.waitFor(new RegExp(DEFAULT_FINAL_MARKER), {
-			deadlineMs: 120_000,
-			source: "application",
-		});
+		// Match the marker with terminal styling removed: the response
+		// renderer can place a style boundary (e.g. streaming-cursor reset
+		// `\x1b[;m`) inside the marker bytes, so a raw match hangs on text
+		// that is visibly on screen (proven: split marker at 2.0s, 150s
+		// deadline, PTY silent after). Echo stays raw: it carries no styling.
+		const response = await cli.waitFor(
+			(snapshot) =>
+				snapshot.applicationText
+					.replaceAll(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+					.replaceAll(/\x1b\]8;;.*?\x07/g, "")
+					.includes(DEFAULT_FINAL_MARKER),
+			{ deadlineMs: 120_000 },
+		);
 		expect(response.echoText).not.toContain(DEFAULT_FINAL_MARKER);
 		cli.writeKeys("/quit", PTY_KEYS.enter);
 		expect(await cli.waitForExit(10_000)).toBe(0);
