@@ -756,13 +756,11 @@ jobs:
           artifacts=(dist/pass1/*.tar.gz dist/pass1/*.zip dist/pass1/*.sha256)
           test "${#artifacts[@]}" -eq 2
           for artifact in "${artifacts[@]}"; do
+            # Explicit -R: gh cannot always infer owner/repo from the
+            # checkout remote here (proven: owner/repo group error on musl).
             gh attestation verify "$artifact" --bundle "$bundle" \
-              --signer-repo "$GITHUB_REPOSITORY"
+              -R "$GITHUB_REPOSITORY" --signer-repo "$GITHUB_REPOSITORY"
           done
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-        with:
           name: pi-${{ matrix.target }}
           path: dist/pass1/*
 
