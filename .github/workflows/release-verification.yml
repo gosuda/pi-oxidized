@@ -70,6 +70,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The exposure bundle hashes 2,442 reference file bytes, and the
+      # reference repo carries no eol pin of its own: a Windows CRLF
+      # checkout breaks every one of those hashes. Our .gitattributes
+      # cannot reach another repo, so disable conversion before checkout.
+      - name: Disable CRLF conversion for the reference checkout
+        shell: bash
+        run: git config --global core.autocrlf false
       - name: Checkout TypeScript reference (pinned)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
