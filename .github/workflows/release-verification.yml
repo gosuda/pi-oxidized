@@ -761,6 +761,10 @@ jobs:
             gh attestation verify "$artifact" --bundle "$bundle" \
               -R "$GITHUB_REPOSITORY" --signer-repo "$GITHUB_REPOSITORY"
           done
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
           name: pi-${{ matrix.target }}
           path: dist/pass1/*
 
