@@ -4,4 +4,4 @@
 # breaks them all the same way (proven twice on CI: hash-chain load failure,
 # then authority + manifest drift on the very next run). No CRLF blobs exist
 # in the index, so no fixture depends on checked-in CRLF bytes.
-* text eol=lf
+* text=auto eol=lf
