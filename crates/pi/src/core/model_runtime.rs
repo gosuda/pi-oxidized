@@ -957,9 +957,21 @@ impl ModelRuntime {
     /// Propagates catalog recompose failures. File parse problems are recorded
     /// in [`Self::get_error`] rather than returned.
     pub async fn reload_config(&self) -> Result<(), ModelRuntimeError> {
+        // Deletions come from the old-vs-new diff, not from a blind clear:
+        // rebuild no longer wipes the shared map (concurrent publishes
+        // would read it gutted), so drop exactly the providers the reload
+        // retired. Providers added concurrently survive either way: they
+        // are in `after` (kept) or commit after the diff (untouched).
+        let before = self.provider_ids();
         let reloaded = ModelsJsonConfig::load(self.inner.models_path.as_deref());
         *lock(&self.inner.config) = reloaded;
         self.rebuild_providers().await?;
+        let after = self.provider_ids();
+        for retired in before.difference(&after) {
+            lock(&self.inner.provider_models).remove(retired);
+            lock(&self.inner.composition_errors).remove(retired);
+        }
+        self.update_model_snapshot_from_maps();
         let _ = self
             .refresh(ModelsRefreshOptions {
                 allow_network: Some(self.inner.allow_model_network),
@@ -1586,9 +1598,14 @@ impl ModelRuntime {
     }
 
     async fn rebuild_providers(&self) -> Result<(), ModelRuntimeError> {
+        // No clear-then-fill: wiping the shared map while recomposing
+        // asynchronously lets any concurrent snapshot publish (register,
+        // availability refresh, sampler) read a gutted map and drop live
+        // providers transiently. Upsert per provider instead; removals are
+        // already applied synchronously by unregister_provider, so the
+        // clear removes nothing the rebuild must delete.
         let provider_ids = self.provider_ids();
         lock(&self.inner.composition_errors).clear();
-        lock(&self.inner.provider_models).clear();
         for provider_id in provider_ids {
             if let Err(error) = self.recompose_provider(&provider_id).await {
                 lock(&self.inner.composition_errors).insert(provider_id, error);
@@ -2368,7 +2385,9 @@ mod tests {
     async fn concurrent_provider_registration_and_refresh_complete()
     -> Result<(), Box<dyn std::error::Error>> {
         let runtime = ModelRuntime::create_in_memory().await?;
+        let registration_done = Arc::new(AtomicBool::new(false));
         let registration_runtime = runtime.clone();
+        let registration_flag = Arc::clone(&registration_done);
         let registration = tokio::spawn(async move {
             for revision in 0..8 {
                 registration_runtime.register_provider(
@@ -2384,6 +2403,7 @@ mod tests {
                 )?;
                 tokio::task::yield_now().await;
             }
+            registration_flag.store(true, Ordering::Relaxed);
             Ok::<(), ModelRuntimeError>(())
         });
         let refresh_runtime = runtime.clone();
@@ -2399,12 +2419,39 @@ mod tests {
             }
             Ok::<(), ModelRuntimeError>(())
         });
+        // During-race witness: once the model is observable it must never
+        // vanish again. A lost-update in the refresh swap shows up here,
+        // inside the interleaving, where post-join assertions cannot see it.
+        // The sampler runs until registration completes (a fixed iteration
+        // budget can burn out before spawned tasks are first polled), with a
+        // hard cap so a wedged peer still trips the outer timeout.
+        let seen_present = Arc::new(AtomicBool::new(false));
+        let lost_after_present = Arc::new(AtomicBool::new(false));
+        let sampler_runtime = runtime.clone();
+        let sampler_seen = Arc::clone(&seen_present);
+        let sampler_lost = Arc::clone(&lost_after_present);
+        let sampler_reg = Arc::clone(&registration_done);
+        let sampler = tokio::spawn(async move {
+            for _ in 0..100_000 {
+                if sampler_runtime.get_model("acme", "acme-1").is_some() {
+                    sampler_seen.store(true, Ordering::Relaxed);
+                } else if sampler_seen.load(Ordering::Relaxed) {
+                    sampler_lost.store(true, Ordering::Relaxed);
+                }
+                if sampler_reg.load(Ordering::Relaxed) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
 
         let registration_abort = registration.abort_handle();
         let refresh_abort = refresh.abort_handle();
+        let sampler_abort = sampler.abort_handle();
         let outcome = tokio::time::timeout(Duration::from_secs(30), async {
             registration.await??;
             refresh.await??;
+            sampler.await?;
             Ok::<(), Box<dyn std::error::Error>>(())
         })
         .await;
@@ -2413,9 +2460,18 @@ mod tests {
             Err(elapsed) => {
                 registration_abort.abort();
                 refresh_abort.abort();
+                sampler_abort.abort();
                 return Err(elapsed.into());
             }
         };
+        assert!(
+            !lost_after_present.load(Ordering::Relaxed),
+            "registered model vanished mid-race during concurrent refresh",
+        );
+        assert!(
+            seen_present.load(Ordering::Relaxed),
+            "sampler never observed the model; absence witness is vacuous",
+        );
         // Atomicity contract: concurrent refreshes must neither wedge nor
         // clobber the registered models out of the snapshot.
         let model = runtime
@@ -2450,6 +2506,37 @@ mod tests {
         .await?;
         let model = required(runtime.get_model("anthropic", "claude-opus-4-8"), "model")?;
         assert_eq!(model.name, "Opus Override");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_config_retires_providers_missing_from_new_config()
+    -> Result<(), ModelRuntimeError> {
+        // Guards the rebuild change: with no blind clear, providers retired
+        // by a config reload must still disappear via the old-vs-new diff.
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "filey".to_owned(),
+            ProviderConfigInput {
+                models: Some(vec![custom_model("filey", "filey-1")]),
+                ..ProviderConfigInput::default()
+            },
+        );
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
+            models_store: Some(Arc::new(InMemoryModelsStore::new())),
+            models_config: Some(ModelsJsonConfig::from_providers(providers)),
+            allow_model_network: Some(false),
+            ..CreateModelRuntimeOptions::default()
+        })
+        .await?;
+        required(
+            runtime.get_model("filey", "filey-1"),
+            "config model before reload",
+        )?;
+        // Reload reads models_path (None here), whose empty config retires filey.
+        runtime.reload_config().await?;
+        assert!(runtime.get_model("filey", "filey-1").is_none());
         Ok(())
     }
 
