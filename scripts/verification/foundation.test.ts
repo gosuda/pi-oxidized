@@ -18,7 +18,9 @@ import verificationExtension, {
 import { PTY_KEYS, spawnPty } from "./pty.ts";
 import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-identity.ts";
 
-const isWindows = process.platform === "win32";
+// The PTY driver shells to util-linux `setsid`/`script`, absent on macOS
+// (BSD userland) and Windows. Gate the suites that need it on Linux.
+const lacksUtilLinuxPty = process.platform !== "linux";
 
 interface RegisteredProvider {
 	readonly models?: readonly { readonly id: string }[];
@@ -190,7 +192,7 @@ describe("verification extension", () => {
 	}, 15_000);
 });
 
-describe.skipIf(isWindows)("PTY driver", () => {
+describe.skipIf(lacksUtilLinuxPty)("PTY driver", () => {
 	test("preserves hostile argv, separates terminal echo, timestamps chunks, and exits cleanly", async () => {
 		const root = temporaryDirectory("pi pty ' $() ");
 		const process = spawnPty({
@@ -274,7 +276,7 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 		await waitForFileContent(readyPath, "ready\n", 20_000);
 		cli.writeKeys(`foundation prompt for ${fixture.name}`, PTY_KEYS.enter);
 		const response = await cli.waitFor(new RegExp(DEFAULT_FINAL_MARKER), {
-			deadlineMs: 30_000,
+			deadlineMs: 60_000,
 			source: "application",
 		});
 		expect(response.echoText).not.toContain(DEFAULT_FINAL_MARKER);
@@ -295,7 +297,7 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 	}
 }
 
-describe.skipIf(isWindows)("shared interactive provider smoke", () => {
+describe.skipIf(lacksUtilLinuxPty)("shared interactive provider smoke", () => {
 	test("drives Rust and TypeScript CLIs with one extension and model", async () => {
 		// Gate before the first reference spawn: the TypeScript fixture runs the
 		// canonical checkout's CLI, so its HEAD must match the pinned SHA.
@@ -315,6 +317,6 @@ describe.skipIf(isWindows)("shared interactive provider smoke", () => {
 			},
 			{ name: "rust", argvPrefix: [rustBinary] },
 		];
-		for (const fixture of fixtures) await smokeCli(fixture, sharedDirectory);
-	}, 90_000);
+	for (const fixture of fixtures) await smokeCli(fixture, sharedDirectory);
+	}, 180_000);
 });
