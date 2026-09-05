@@ -137,9 +137,12 @@ jobs:
       # Bench workers and compat generators import reference dist bundles
       # (gitignored; absent after a bare checkout). Non-musl legs run those
       # suites; musl legs only link reference source into the sidecar build.
+      # Offline variant: ai's full build runs generate-models --strict
+      # against live catalog APIs; the source data is already deterministically
+      # reconstructed above, so skip regeneration and compile from it.
       - name: Build reference packages
         if: matrix.musl != 'true'
-        run: npm run build --prefix .references/pi-2.0
+        run: npm run build:offline --prefix .references/pi-2.0
 
       - name: Dependency exposure predicate self-check
         if: matrix.musl != 'true'
