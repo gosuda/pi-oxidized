@@ -12,12 +12,21 @@ import { InvalidTargetError, RUST_TARGETS } from "../release/targets.ts";
 
 describe("args", () => {
 	test("resolves the minimal happy path with defaults", () => {
-		const args = parseReleaseArgs(["--target", "x86_64-unknown-linux-gnu"]);
-		expect(args.plan.rustTarget).toBe("x86_64-unknown-linux-gnu");
-		expect(args.dryRun).toBe(false);
-		expect(args.noCargo).toBe(false);
-		expect(args.handshake).toBe(true);
-		expect(args.sourceDateEpoch).toBe("0");
+		// The release workflow exports SOURCE_DATE_EPOCH and the parser
+		// forwards process.env by default (explicit undefined re-triggers
+		// the default), so scope a clean env around the default leg.
+		const savedEpoch = process.env.SOURCE_DATE_EPOCH;
+		delete process.env.SOURCE_DATE_EPOCH;
+		try {
+			const args = parseReleaseArgs(["--target", "x86_64-unknown-linux-gnu"]);
+			expect(args.plan.rustTarget).toBe("x86_64-unknown-linux-gnu");
+			expect(args.dryRun).toBe(false);
+			expect(args.noCargo).toBe(false);
+			expect(args.handshake).toBe(true);
+			expect(args.sourceDateEpoch).toBe("0");
+		} finally {
+			if (savedEpoch !== undefined) process.env.SOURCE_DATE_EPOCH = savedEpoch;
+		}
 	});
 
 	test("honors --dry-run and --no-cargo independently", () => {
