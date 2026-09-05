@@ -554,7 +554,7 @@ describe("release CHANGELOG gate", () => {
 
 	test("fails when the Unreleased section is absent", async () => {
 		const fs = memoryFs({
-			"/workspace/CHANGELOG.md": bytes(
+			[join("/workspace", "CHANGELOG.md")]: bytes(
 				"# Changelog\n\n## [0.1.0] - 2026-01-01\n\n- Shipped something.\n",
 			),
 		});
@@ -565,7 +565,7 @@ describe("release CHANGELOG gate", () => {
 
 	test("fails when the Unreleased section carries no entries", async () => {
 		const fs = memoryFs({
-			"/workspace/CHANGELOG.md": bytes(
+			[join("/workspace", "CHANGELOG.md")]: bytes(
 				"# Changelog\n\n## [Unreleased]\n\n### Added\n\n## [0.1.0] - 2026-01-01\n\n- Shipped something.\n",
 			),
 		});
@@ -576,7 +576,7 @@ describe("release CHANGELOG gate", () => {
 
 	test("passes when the Unreleased section carries entries", async () => {
 		const fs = memoryFs({
-			"/workspace/CHANGELOG.md": bytes(
+			[join("/workspace", "CHANGELOG.md")]: bytes(
 				"# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Docs staged into release archives [#111]\n\n## [0.1.0] - 2026-01-01\n\n- Shipped something.\n",
 			),
 		});
