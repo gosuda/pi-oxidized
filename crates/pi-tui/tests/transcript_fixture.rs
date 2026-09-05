@@ -33,6 +33,7 @@ use pi_tui::testkit::{RecordingError, RecordingSession};
 const INITIAL_COLS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
 const K: usize = 3;
+const CURSOR_KEY_COUNT: u32 = 6;
 
 const RESIZE_LADDER: [(u16, u16); 8] = [
     (80, 24),
@@ -260,7 +261,13 @@ impl FixtureRun {
     }
 
     fn finish(mut self) -> Result<TranscriptArtifact, CorpusError> {
-        let _status = self.recording.close()?;
+        let status = self.recording.close()?;
+        if !status.success() {
+            return Err(CorpusError::Assert(format!(
+                "fixture exited unsuccessfully: code={} signal={:?}",
+                status.code, status.signal
+            )));
+        }
         let mut artifact = self.recording.finish()?;
         artifact.timing.wall_ms =
             u64::try_from(self.wall_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -630,6 +637,7 @@ fn run_paste_cursor(
     let _ = run.settle_output(|bytes| {
         contains_bytes(bytes, b"PASTED-BLOCK") || contains_bytes(bytes, b"paste=")
     })?;
+    // Six cursor escape sequences are sent: left, right, up, down, home, end.
     let cursor = b"\x1b[D\x1b[C\x1b[A\x1b[B\x1b[H\x1b[F";
     let before = run.settle_frame(|_| true)?;
     let count_before = before
@@ -643,7 +651,8 @@ fn run_paste_cursor(
         })?;
     run.write_input(cursor)?;
     // Cell-diff repaints emit only the changed digit cells, so no contiguous
-    // fresh marker exists; settle on quiet and prove the counter advanced.
+    // fresh marker exists; settle on quiet and prove all six cursor keys are
+    // decoded: the counter must advance by exactly the six escape sequences sent.
     let after = run.settle_frame(|_| true)?;
     let count_after = after
         .snapshot
@@ -654,9 +663,15 @@ fn run_paste_cursor(
         .ok_or_else(|| {
             CorpusError::Assert("paste-cursor: cursor counter absent post-keys".to_owned())
         })?;
-    if count_after <= count_before {
+    let expected_count = count_before.checked_add(CURSOR_KEY_COUNT).ok_or_else(|| {
+        CorpusError::Assert(format!(
+            "paste-cursor: cursor counter {count_before} + {CURSOR_KEY_COUNT} keys would overflow"
+        ))
+    })?;
+    if count_after != expected_count {
         return Err(CorpusError::Assert(format!(
-            "paste-cursor: cursor keys did not advance the counter ({count_before} -> {count_after})"
+            "paste-cursor: cursor counter expected {expected_count}, observed {count_after} \
+             ({count_before} before {CURSOR_KEY_COUNT} keys)"
         )));
     }
     if !after
@@ -740,4 +755,29 @@ fn transcript_fixture_corpus_stream_settle_resize_storm_paste_cursor() {
         run_paste_cursor(iteration, &label_paste, &row_paste)
     })
     .unwrap_or_else(|error| panic!("{error}"));
+}
+
+#[test]
+fn fixture_run_rejects_unsuccessful_child_exit() {
+    let (_, row) = resolve_row().unwrap_or_else(|error| {
+        panic!("hard-fail harness prerequisites / row config: {error}");
+    });
+    let mut argv = fixture_argv(false).expect("fixture argv");
+    let exit = argv
+        .iter_mut()
+        .find(|arg| arg.as_str() == "--exit=success")
+        .expect("fixture exit argument");
+    *exit = "--exit=abort".to_owned();
+    let mut run = FixtureRun::open(argv, Scenario::FixtureStreamSettle, row, standard_claims())
+        .expect("fixture run");
+    let _ = run
+        .settle_output(|_| true)
+        .expect("final fixture output may settle before exit status is checked");
+    let error = run
+        .finish()
+        .expect_err("unsuccessful fixture exit must reject the transcript");
+    assert!(
+        error.to_string().contains("fixture exited unsuccessfully"),
+        "unexpected error: {error}"
+    );
 }

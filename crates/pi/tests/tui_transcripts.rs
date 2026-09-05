@@ -607,7 +607,13 @@ impl ProductRun {
     }
 
     fn finish(mut self) -> Result<TranscriptArtifact, CorpusError> {
-        let _status = self.recording.close()?;
+        let status = self.recording.close()?;
+        if !status.success() {
+            return Err(CorpusError::Assert(format!(
+                "product exited unsuccessfully: code={} signal={:?}",
+                status.code, status.signal
+            )));
+        }
         let mut artifact = self.recording.finish()?;
         artifact.timing.wall_ms =
             u64::try_from(self.wall_started.elapsed().as_millis()).unwrap_or(u64::MAX);
