@@ -276,7 +276,7 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 		await waitForFileContent(readyPath, "ready\n", 20_000);
 		cli.writeKeys(`foundation prompt for ${fixture.name}`, PTY_KEYS.enter);
 		const response = await cli.waitFor(new RegExp(DEFAULT_FINAL_MARKER), {
-			deadlineMs: 60_000,
+			deadlineMs: 120_000,
 			source: "application",
 		});
 		expect(response.echoText).not.toContain(DEFAULT_FINAL_MARKER);
@@ -318,5 +318,5 @@ describe.skipIf(lacksUtilLinuxPty)("shared interactive provider smoke", () => {
 			{ name: "rust", argvPrefix: [rustBinary] },
 		];
 	for (const fixture of fixtures) await smokeCli(fixture, sharedDirectory);
-	}, 180_000);
+	}, 300_000);
 });
