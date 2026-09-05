@@ -1667,6 +1667,12 @@ export async function captureReference(
 		// integrity. The manifest's source files are pinned individually
 		// below, so skipping it loses no coverage.
 		if (path.endsWith("packages/ai/src/providers/data/.manifest.json")) continue;
+		// The live provider catalogs beside it are hydrated from the vendor
+		// APIs on every data hydration (the whole directory is generated and
+		// gitignored upstream), so their digests drift with each hydration
+		// and can never reproduce a capture either. They carry model-list
+		// data, not staged code, so skipping them loses no exposure signal.
+		if (path.includes("packages/ai/src/providers/data/") && path.endsWith(".json")) continue;
 		inputs[path] = sha256FileAt(resolve(hostDir, path));
 	}
 	const metafileProjection: MetafileProjection = {
