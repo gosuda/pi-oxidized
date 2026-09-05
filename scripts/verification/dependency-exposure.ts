@@ -1604,6 +1604,7 @@ const RELEVANT_PATHSPECS = [
 	"scripts/release",
 	"scripts/package-release.ts",
 	"scripts/build-extension-host.ts",
+	"scripts/verification/dependency-exposure.ts",
 	"packages/extension-host/src",
 	"packages/pi-tui-protocol/src",
 ] as const;

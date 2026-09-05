@@ -2409,13 +2409,22 @@ mod tests {
         })
         .await;
         match outcome {
-            Ok(outcome) => outcome,
+            Ok(inner) => inner?,
             Err(elapsed) => {
                 registration_abort.abort();
                 refresh_abort.abort();
                 return Err(elapsed.into());
             }
-        }
+        };
+        // Atomicity contract: concurrent refreshes must neither wedge nor
+        // clobber the registered models out of the snapshot.
+        let model = runtime
+            .get_model("acme", "acme-1")
+            .ok_or("registered model missing from snapshot after concurrent refresh")?;
+        assert_eq!(model.provider, "acme");
+        runtime.unregister_provider("acme");
+        assert!(runtime.get_model("acme", "acme-1").is_none());
+        Ok(())
     }
 
     #[tokio::test]

@@ -1,5 +1,8 @@
-# Hash-pinned verification bundles must check out byte-identical on every
-# OS. Without this, Windows checkouts convert LF to CRLF and the
-# fail-closed hash chain in dependency-exposure self-check breaks
-# (proven: CRLF bytes reproduce the exact CI error).
-scripts/verification/fixtures/dependency-exposure/reference/*.json text eol=lf
+# Hash-pinned verification fixtures must check out byte-identical on every
+# OS. Without this, Windows checkouts convert LF to CRLF and pinned hashes
+# break: the exposure bundle hash chain (proven: CRLF bytes reproduce the
+# exact CI error) and the content-addressed execution-map generations
+# (generation ID is SHA-256 over complete file bytes; Windows runs
+# `bun test scripts`, which loads the map at module scope).
+scripts/verification/fixtures/** text eol=lf
+docs/PARITY_LEDGER.md text eol=lf
