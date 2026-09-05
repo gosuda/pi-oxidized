@@ -24,7 +24,7 @@
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import type { Dirent } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { CANONICAL_REFERENCE_ROOT, assertCanonicalReference } from "../reference-identity.ts";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -286,7 +286,7 @@ export function enumerateCompatImporters(refRoot: string): {
 			COMPAT_IMPORT_RE.lastIndex = 0;
 			let m: RegExpExecArray | null;
 			while ((m = COMPAT_IMPORT_RE.exec(content)) !== null) {
-				const relPath = file.replace(refRoot + "/", "");
+				const relPath = relative(refRoot, file).replaceAll("\\", "/");
 				const parts = relPath.split("/");
 				const pkgName = parts[0] ?? "";
 				const subdir = parts[1] ?? "";
@@ -296,8 +296,8 @@ export function enumerateCompatImporters(refRoot: string): {
 					subdir,
 					specifier: m[0],
 				});
-			}
 		}
+	}
 	}
 	return { importers, problems };
 }
@@ -507,7 +507,11 @@ function scanConfigValueOwnership(repoRoot: string) {
 	const strayImports: string[] = [];
 
 	for (const file of rustFiles) {
-		const rel = file.replace(repoRoot + "/", "");
+		// Native separators on both sides: every comparison below (join-built
+		// constants, isWithin) already speaks native. String-stripping the
+		// root with a posix "/" never matches on Windows and leaks absolute
+		// paths into every witness verdict.
+		const rel = relative(repoRoot, file);
 		if (file.endsWith("config_value.rs") || file.endsWith(join("config_value", "mod.rs"))) modules.push(rel);
 		const source = readFileSync(file, "utf8");
 		if (source.includes("fn parse_config_value_reference")) parserFiles.push(rel);
