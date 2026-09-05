@@ -1,8 +1,7 @@
-# Hash-pinned verification fixtures must check out byte-identical on every
-# OS. Without this, Windows checkouts convert LF to CRLF and pinned hashes
-# break: the exposure bundle hash chain (proven: CRLF bytes reproduce the
-# exact CI error) and the content-addressed execution-map generations
-# (generation ID is SHA-256 over complete file bytes; Windows runs
-# `bun test scripts`, which loads the map at module scope).
-scripts/verification/fixtures/** text eol=lf
-docs/PARITY_LEDGER.md text eol=lf
+# Every text file checks out LF on every OS. Verification pins hashes over
+# raw file bytes (exposure bundle chain, execution-map generation IDs,
+# release authority modules, Cargo manifests), so a Windows CRLF checkout
+# breaks them all the same way (proven twice on CI: hash-chain load failure,
+# then authority + manifest drift on the very next run). No CRLF blobs exist
+# in the index, so no fixture depends on checked-in CRLF bytes.
+* text eol=lf
