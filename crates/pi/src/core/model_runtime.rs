@@ -2427,10 +2427,12 @@ mod tests {
         // hard cap so a wedged peer still trips the outer timeout.
         let seen_present = Arc::new(AtomicBool::new(false));
         let lost_after_present = Arc::new(AtomicBool::new(false));
+        let sampler_capped = Arc::new(AtomicBool::new(false));
         let sampler_runtime = runtime.clone();
         let sampler_seen = Arc::clone(&seen_present);
         let sampler_lost = Arc::clone(&lost_after_present);
         let sampler_reg = Arc::clone(&registration_done);
+        let sampler_cap = Arc::clone(&sampler_capped);
         let sampler = tokio::spawn(async move {
             for _ in 0..100_000 {
                 if sampler_runtime.get_model("acme", "acme-1").is_some() {
@@ -2442,6 +2444,9 @@ mod tests {
                     break;
                 }
                 tokio::task::yield_now().await;
+            }
+            if !sampler_reg.load(Ordering::Relaxed) {
+                sampler_cap.store(true, Ordering::Relaxed);
             }
         });
 
@@ -2470,10 +2475,9 @@ mod tests {
         );
         assert!(
             seen_present.load(Ordering::Relaxed),
-            "sampler never observed the model; absence witness is vacuous",
+            "sampler never observed the model (capped out: {}); absence witness is vacuous",
+            sampler_capped.load(Ordering::Relaxed),
         );
-        // Atomicity contract: concurrent refreshes must neither wedge nor
-        // clobber the registered models out of the snapshot.
         let model = runtime
             .get_model("acme", "acme-1")
             .ok_or("registered model missing from snapshot after concurrent refresh")?;
