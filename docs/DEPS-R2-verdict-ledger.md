@@ -33,12 +33,14 @@ entry is an audit failure at DEPS-D1.
 
 | head | date | subject | class | checks |
 |---|---|---|---|---|
-| ab1a3524f876 | 2026-09-05 | npm:typebox | S | E1:fail E2:fail E3:pass E4:pass |
-| ab1a3524f876 | 2026-09-05 | npm:@types/bun | E | E1:pass E2:pass E3:pass E4:pass |
-| ab1a3524f876 | 2026-09-05 | tool:bun-runtime | S | E1:pass E2:fail E3:fail E4:fail |
+| a8896826f4b0 | 2026-09-05 | npm:typebox | S | E1:fail E2:fail E3:pass E4:pass |
+| a8896826f4b0 | 2026-09-05 | npm:@types/bun | E | E1:pass E2:pass E3:pass E4:pass |
+| a8896826f4b0 | 2026-09-05 | tool:bun-runtime | S | E1:pass E2:fail E3:fail E4:fail |
 
 ## Records
-- **ab1a3524f876 / witness-accuracy re-capture (2026-09-05) — sanity rows re-decided, not new verdicts.** The `cc0181b` record named a captureHead that cannot reproduce its own bundle: the tmpdir staging change landed in `2be7ca2` while the capture ran with the script dirty, and the capture tool did not count itself as a relevant pathspec so its own assert let it pass. The tool now lists its own path, and mechanical regeneration at `ab1a352` captured 2,451 metafile inputs (zero `providers/data/` paths, no staging residue) with captureHead `ab1a3524f876`; all three classes stayed unchanged. `verify:dependency-exposure` 33/33 green.
+- **a8896826f4b0 / platform-fix re-capture (2026-09-05) — sanity rows re-decided, not new verdicts.** The CI platform batch (repo-wide LF pin, posix surface paths, exec-bit host gate in `stage.ts`) changed an authority module, invalidating the bundle pin by design; every non-musl leg failed the self-check on authority drift. Mechanical regeneration at `a889682` captured 2,451 metafile inputs with captureHead `a8896826f4b0`; all three classes stayed unchanged. `verify:dependency-exposure` 33/33 green.
+
+- **ab1a3524f876 / witness-accuracy re-capture (2026-09-05) — sanity rows re-decided, not new verdicts.** The `cc0181b` record named a captureHead that cannot reproduce its own bundle: the tmpdir staging change landed in `2be7ca2` while the capture ran with the script dirty, and the capture tool did not count itself as a relevant pathspec so its own assert let it pass. The tool now lists its own path, and mechanical regeneration at `ab1a352` captured 2,451 metafile inputs (zero `providers/data/` paths, no staging residue) with captureHead `ab1a3524f876`; all three classes stayed unchanged. `verify:dependency-exposure` 33/33 green. Superseded same-day by the platform-fix re-capture above, whose head carries the CI platform batch.
 
 - **cc0181bc46b4 / staging-hygiene re-capture (2026-09-05) — sanity rows re-decided, not new verdicts.** Council review found the `9d67f0e` bundle pinned the author's absolute checkout path in its argv (in-repo `.capture-staging`) and a use-after-head rows/bundle mismatch. The capture now stages under the OS temp dir, leaving no residue and no checkout path in the bundle; mechanical regeneration captured 2,451 metafile inputs with captureHead `cc0181bc46b4`; all three classes stayed unchanged. `verify:dependency-exposure` 33/33 green. Superseded same-day by the witness-accuracy re-capture above, whose captureHead names the head that actually contains the staging change.
 
