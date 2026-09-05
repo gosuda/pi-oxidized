@@ -71,7 +71,6 @@ jobs:
           persist-credentials: false
 
       - name: Checkout TypeScript reference (pinned)
-        if: matrix.musl != 'true'
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           repository: earendil-works/pi
@@ -80,7 +79,6 @@ jobs:
           persist-credentials: false
 
       - name: Verify reference pin
-        if: matrix.musl != 'true'
         shell: bash
         run: |
           test "$(git -C .references/pi-2.0 rev-parse HEAD)" = "853a80d26c90a14c1886f0ebb8ffaae133ca2185"
@@ -128,12 +126,12 @@ jobs:
         if: matrix.musl != 'true'
         run: bun install --frozen-lockfile
 
+      # Musl legs need the reference too: the musl archive ships a compiled
+      # sidecar (9f4aafa), whose build links the reference workspace.
       - name: Reconstruct reference provider data (offline)
-        if: matrix.musl != 'true'
         run: bun run scripts/reconstruct-provider-data.ts
 
       - name: Install reference dependencies
-        if: matrix.musl != 'true'
         run: npm ci --ignore-scripts --prefix .references/pi-2.0
 
       - name: Dependency exposure predicate self-check
@@ -142,7 +140,11 @@ jobs:
 
       - name: SBOM baseline verification
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: bun run verify:sbom
+        run: |
+          # The SBOM verifier reads the locked graph via cargo metadata
+          # --offline; warm the registry first (no cargo step runs before this).
+          cargo fetch --locked
+          bun run verify:sbom
 
       - name: Prepare interactive script test prerequisites
         if: runner.os != 'Windows' && matrix.musl != 'true'
@@ -163,9 +165,9 @@ jobs:
             bun build ./src/main.ts --compile --minify --compile-autoload-tsconfig --compile-autoload-package-json --target "$host_target" --outfile dist/pi-extension-host
           )
 
-      # Bun's terminal spawn is POSIX-only. The Windows leg runs the portable
-      # script tests; PTY driver, interactive smoke, and performance suites
-      # self-skip via describe.skipIf(isWindows) where prerequisites are absent.
+      # The PTY driver shells to util-linux setsid/script. Non-Linux legs run
+      # the portable script tests; PTY driver and interactive smoke self-skip
+      # via describe.skipIf(lacksUtilLinuxPty) where prerequisites are absent.
       - name: JS checks and scripts tests
         if: matrix.musl != 'true'
         shell: bash
