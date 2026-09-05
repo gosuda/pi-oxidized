@@ -11,6 +11,7 @@ import {
 	distribution,
 	exitCodeForFailure,
 	frameObservation,
+	isSharedCiEnvironment,
 	keySyncTransaction,
 	observeProcessTreeMemory,
 	parseProcStatusPeakRssText,
@@ -347,8 +348,14 @@ describe("exitCodeForFailure mapping", () => {
 		expect(rejection.name).toBe("NoiseRejection");
 		expect(rejection instanceof HarnessFailure).toBe(false);
 	});
-});
 
+	test("detects shared CI runners for the noise advisory", () => {
+		expect(isSharedCiEnvironment({})).toBe(false);
+		expect(isSharedCiEnvironment({ CI: "false" })).toBe(false);
+		expect(isSharedCiEnvironment({ CI: "true" })).toBe(true);
+		expect(isSharedCiEnvironment({ GITHUB_ACTIONS: "true" })).toBe(true);
+	});
+	});
 describe("process memory parsers", () => {
 	test("parseSmapsRollupText requires both fields and multiplies by 1024", () => {
 		const parsed = parseSmapsRollupText("Rss: 10 kB\nPss: 7 kB\n");
