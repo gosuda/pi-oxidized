@@ -1,0 +1,5 @@
+# Hash-pinned verification bundles must check out byte-identical on every
+# OS. Without this, Windows checkouts convert LF to CRLF and the
+# fail-closed hash chain in dependency-exposure self-check breaks
+# (proven: CRLF bytes reproduce the exact CI error).
+scripts/verification/fixtures/dependency-exposure/reference/*.json text eol=lf
