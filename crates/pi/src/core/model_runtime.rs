@@ -2338,6 +2338,60 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_provider_registration_and_refresh_complete()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let registration_runtime = runtime.clone();
+        let registration = tokio::spawn(async move {
+            for revision in 0..8 {
+                registration_runtime.register_provider(
+                    "acme",
+                    &ProviderConfigInput {
+                        name: Some(format!("Acme {revision}")),
+                        base_url: Some("https://acme.test/v1".to_owned()),
+                        api: Some("openai-completions".to_owned()),
+                        api_key: Some("sk-acme".to_owned()),
+                        models: Some(vec![custom_model("acme", "acme-1")]),
+                        ..ProviderConfigInput::default()
+                    },
+                )?;
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), ModelRuntimeError>(())
+        });
+        let refresh_runtime = runtime.clone();
+        let refresh = tokio::spawn(async move {
+            for _ in 0..8 {
+                refresh_runtime
+                    .refresh(ModelsRefreshOptions {
+                        allow_network: Some(false),
+                        ..ModelsRefreshOptions::default()
+                    })
+                    .await?;
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), ModelRuntimeError>(())
+        });
+
+        let registration_abort = registration.abort_handle();
+        let refresh_abort = refresh.abort_handle();
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            registration.await??;
+            refresh.await??;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
+        .await;
+        match outcome {
+            Ok(outcome) => outcome,
+            Err(elapsed) => {
+                registration_abort.abort();
+                refresh_abort.abort();
+                return Err(elapsed.into());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn models_json_override_and_reload() -> Result<(), ModelRuntimeError> {
         let mut providers = BTreeMap::new();
