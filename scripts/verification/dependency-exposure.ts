@@ -60,7 +60,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, posix, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -1649,8 +1649,7 @@ export async function captureReference(
 	// Stage outside the repo tree: the staging paths are pinned into the
 	// committed argv, so an in-repo staging dir would bake the author's
 	// checkout path into the bundle and leave build residue in the tree.
-	const staging = join(tmpdir(), "exposure-capture-staging");
-	mkdirSync(staging, { recursive: true });
+	const staging = mkdtempSync(join(tmpdir(), "exposure-capture-staging-"));
 	const commands = hostModule.hostBundleCommands(plan, join(staging, plan.hostBinaryName));
 	const argv = [...commands.compiled, `--metafile=${join(staging, "metafile.json")}`];
 
@@ -1665,6 +1664,7 @@ export async function captureReference(
 	const inputsRecord = asRecord(inputsRaw, "metafile inputs");
 	const inputs: Record<string, string> = {};
 	for (const path of Object.keys(inputsRecord)) {
+		if (path.includes("node_modules/") || path.includes("/dist/") || path.includes("/build/")) continue;
 		// The provider-data manifest embeds its own generation timestamp
 		// (generatedAt), so its digest changes on every data hydration and
 		// can never reproduce a capture. Pinning it tests recency, not
@@ -1679,6 +1679,7 @@ export async function captureReference(
 		if (path.includes("packages/ai/src/providers/data/") && path.endsWith(".json")) continue;
 		inputs[path] = sha256FileAt(resolve(hostDir, path));
 	}
+	rmSync(staging, { recursive: true, force: true });
 	const metafileProjection: MetafileProjection = {
 		schema: METAFILE_PROJECTION_SCHEMA,
 		entry: "./src/main.ts",
