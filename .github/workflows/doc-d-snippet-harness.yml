@@ -48,7 +48,11 @@ jobs:
           test -f packages/pi-tui-protocol/dist/index.d.ts || (echo "pi-tui-protocol dist missing" && exit 1)
 
       - name: Run snippet harness (both lanes)
-        run: bun run verify:snippets
+        run: |
+          # The harness cargo-checks snippets --offline; warm the registry
+          # first (this workflow has no Rust cache step).
+          cargo fetch --locked
+          bun run verify:snippets
 
       - name: Run snippet harness tests
         run: bun test scripts/verification/snippet-harness.test.ts
