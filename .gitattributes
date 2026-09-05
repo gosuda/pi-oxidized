@@ -5,3 +5,7 @@
 # then authority + manifest drift on the very next run). No CRLF blobs exist
 # in the index, so no fixture depends on checked-in CRLF bytes.
 * text eol=lf
+# Fixtures are byte witnesses: no conversion ever, so a future binary
+# fixture cannot be silently corrupted (blobs under this tree are LF-clean
+# today, so this changes nothing checked in).
+scripts/verification/fixtures/** -text
