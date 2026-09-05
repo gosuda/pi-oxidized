@@ -376,7 +376,11 @@ export function parseNpmSurface(path: string, root: string): NpmSurface {
 	}
 	return {
 		path,
-		relPath: relative(root, path),
+		// Posix separators: the checked-in bundle pins `/` paths, and
+		// downstream uses (surface-set equality, dirname splits) assume
+		// them. Node's relative() yields `\` on Windows (proven: surface
+		// set compared packages\extension-host\... against packages/...).
+		relPath: relative(root, path).replace(/\\/g, "/"),
 		sha256: sha256Text(text),
 		depFields,
 		packageName: typeof nameValue === "string" ? nameValue : undefined,
@@ -1334,11 +1338,11 @@ function readScriptSources(root: string): Record<string, string> {
 	];
 	for (const dir of dirs) {
 		for (const name of readdirSync(dir).filter((n) => n.endsWith(".ts")).sort()) {
-			sources[relative(root, join(dir, name))] = readFileSync(join(dir, name), "utf8");
+			sources[relative(root, join(dir, name)).replace(/\\/g, "/")] = readFileSync(join(dir, name), "utf8");
 		}
 	}
 	for (const file of files) {
-		if (existsSync(file)) sources[relative(root, file)] = readFileSync(file, "utf8");
+		if (existsSync(file)) sources[relative(root, file).replace(/\\/g, "/")] = readFileSync(file, "utf8");
 	}
 	return sources;
 }
