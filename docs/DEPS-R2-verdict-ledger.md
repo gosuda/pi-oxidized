@@ -33,15 +33,14 @@ entry is an audit failure at DEPS-D1.
 
 | head | date | subject | class | checks |
 |---|---|---|---|---|
-| 9d67f0eff96d | 2026-09-05 | npm:typebox | S | E1:fail E2:fail E3:pass E4:pass |
-| 9d67f0eff96d | 2026-09-05 | npm:@types/bun | E | E1:pass E2:pass E3:pass E4:pass |
-| 9d67f0eff96d | 2026-09-05 | tool:bun-runtime | S | E1:pass E2:fail E3:fail E4:fail |
-| 2c944d965b96 | 2026-09-03 | npm:typebox | S | E1:fail E2:fail E3:pass E4:pass |
-| 2c944d965b96 | 2026-09-03 | npm:@types/bun | E | E1:pass E2:pass E3:pass E4:pass |
-| 2c944d965b96 | 2026-09-03 | tool:bun-runtime | S | E1:pass E2:fail E3:fail E4:fail |
+| cc0181bc46b4 | 2026-09-05 | npm:typebox | S | E1:fail E2:fail E3:pass E4:pass |
+| cc0181bc46b4 | 2026-09-05 | npm:@types/bun | E | E1:pass E2:pass E3:pass E4:pass |
+| cc0181bc46b4 | 2026-09-05 | tool:bun-runtime | S | E1:pass E2:fail E3:fail E4:fail |
 
 ## Records
-- **9d67f0eff96d / hydrated-data exclusion re-anchor (2026-09-05) — sanity rows re-decided, not new verdicts.** The checked-in reference (last captured at `2c944d965b96`) pinned live-hydrated catalog JSON under the reference data dir (gitignored upstream, rewritten wholesale by any hydration); `openrouter.json` drifted twice in one session and the fail-closed self-check emitted E2-undecidable for `npm:@types/bun`, forcing Class S — a stale-pin artifact, not a real classification. Durable fix per the G3 open item: the capture now skips the generated data dir (same doctrine as the existing `.manifest.json` carve-out; model-list data carries no exposure signal), then mechanical regeneration captured 2,451 metafile inputs at `9d67f0eff96d`; all three classes stayed unchanged. `verify:dependency-exposure` 33/33 green, SBOM baseline green (no drift).
+- **cc0181bc46b4 / staging-hygiene re-capture (2026-09-05) — sanity rows re-decided, not new verdicts.** Council review found the `9d67f0e` bundle pinned the author's absolute checkout path in its argv (in-repo `.capture-staging`) and a use-after-head rows/bundle mismatch. The capture now stages under the OS temp dir, leaving no residue and no checkout path in the bundle; mechanical regeneration captured 2,451 metafile inputs with captureHead `cc0181bc46b4`; all three classes stayed unchanged. `verify:dependency-exposure` 33/33 green.
+
+- **9d67f0eff96d / hydrated-data exclusion re-anchor (2026-09-05) — sanity rows re-decided, not new verdicts.** The checked-in reference (last captured at `2c944d965b96`) pinned live-hydrated catalog JSON under the reference data dir (gitignored upstream, rewritten wholesale by any hydration); `openrouter.json` drifted twice in one session and the fail-closed self-check emitted E2-undecidable for `npm:@types/bun`, forcing Class S — a stale-pin artifact, not a real classification. Durable fix per the G3 open item: the capture now skips the generated data dir (same doctrine as the existing `.manifest.json` carve-out; model-list data carries no exposure signal), then mechanical regeneration captured 2,451 metafile inputs (bundle captureHead `cd80b8d`; rows re-emitted at `9d67f0eff96d`); all three classes stayed unchanged. `verify:dependency-exposure` 33/33 green, SBOM baseline green (no drift). Superseded same-day by the staging-hygiene re-capture below, which also moved capture staging out of the repo tree.
 
 - **2c944d965b96 / reference re-anchor (2026-09-03) — sanity rows re-decided, not new verdicts.** The checked-in reference (last captured at `eb91d6b1d4fa`) trailed the current tree: the metafile projection pinned `openrouter.json` at sha `a9a1e3cf…` but the file on disk hashes `f370fd84…`. The fail-closed self-check emitted E2-undecidable for `npm:@types/bun` (stale metafile input), which the verdict algebra forces to Class S — this was a stale-reference artifact, not a real classification. Mechanical regeneration captured 2,490 metafile inputs at `2c944d965b96`; all three classes stayed unchanged. SBOM baseline `verify:sbom` green (no drift).
 

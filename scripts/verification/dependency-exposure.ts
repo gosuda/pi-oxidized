@@ -62,6 +62,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, posix, relative, resolve } from "node:path";
+import { tmpdir } from "node:os";
 
 import type { hostBundleCommands } from "../release/host.ts";
 import type { planFor, TARGET_PLANS } from "../release/targets.ts";
@@ -1645,7 +1646,10 @@ export async function captureReference(
 	const triple = localRustTriple();
 	if (triple === undefined) throw new ExposureError("cannot map the local platform to a release triple");
 	const plan = targetsModule.planFor(triple);
-	const staging = join(outDir, ".capture-staging");
+	// Stage outside the repo tree: the staging paths are pinned into the
+	// committed argv, so an in-repo staging dir would bake the author's
+	// checkout path into the bundle and leave build residue in the tree.
+	const staging = join(tmpdir(), "exposure-capture-staging");
 	mkdirSync(staging, { recursive: true });
 	const commands = hostModule.hostBundleCommands(plan, join(staging, plan.hostBinaryName));
 	const argv = [...commands.compiled, `--metafile=${join(staging, "metafile.json")}`];
