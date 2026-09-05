@@ -56,6 +56,7 @@ pub const EXTRA_AVAILABLE_MODEL_IDS: &str = "availableModelIds";
 /// `.references/pi-2.0/packages/ai/src/providers/github-copilot.models.ts`.
 pub const GITHUB_COPILOT_MODEL_IDS: &[&str] = &[
     "claude-fable-5",
+      "claude-fable-5.1",
     "claude-haiku-4.5",
     "claude-opus-4.5",
     "claude-opus-4.6",
@@ -69,6 +70,7 @@ pub const GITHUB_COPILOT_MODEL_IDS: &[&str] = &[
     "gemini-3-flash-preview",
     "gemini-3.1-pro-preview",
     "gemini-3.5-flash",
+      "gemini-3.8-flash",
     "gpt-4.1",
     "gpt-5-mini",
     "gpt-5.2",
@@ -81,6 +83,7 @@ pub const GITHUB_COPILOT_MODEL_IDS: &[&str] = &[
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
+      "gpt-6-astra",
     "kimi-k2.7-code",
     "mai-code-1-flash-picker",
 ];
