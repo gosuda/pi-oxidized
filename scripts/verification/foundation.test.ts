@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, watch } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, watch } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type {
@@ -289,8 +289,32 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 			`marker raw=${snapshot.rawText.includes(DEFAULT_FINAL_MARKER)} ` +
 			`application=${snapshot.applicationText.includes(DEFAULT_FINAL_MARKER)} ` +
 			`echo=${snapshot.echoText.includes(DEFAULT_FINAL_MARKER)}`;
+		// Diagnostics for the next red run: the PTY tail shows the app is
+		// alive, so name the hang from on-disk state (ready handshake,
+		// agent/session residues). Never let diagnostics mask the cause.
+		let diagnostics = "";
+		try {
+			const readyState = existsSync(readyPath)
+				? `ready=${JSON.stringify(readFileSync(readyPath, "utf8").slice(0, 32))}`
+				: "ready=MISSING";
+			let agentList: string;
+			try {
+				agentList = readdirSync(agentDirectory).slice(0, 12).join(",");
+			} catch {
+				agentList = "UNREADABLE";
+			}
+			let sessionList: string;
+			try {
+				sessionList = readdirSync(sessionDirectory).slice(0, 12).join(",");
+			} catch {
+				sessionList = "UNREADABLE";
+			}
+			diagnostics = `\nready ${readyState}\nagent dir [${agentList}]\nsessions dir [${sessionList}]`;
+		} catch {
+			diagnostics = "\ndiagnostics unavailable";
+		}
 		throw new Error(
-			`${fixture.name} smoke failed: ${error instanceof Error ? error.message : String(error)}\n${markerState}\nPTY tail:\n${tail}`,
+			`${fixture.name} smoke failed: ${error instanceof Error ? error.message : String(error)}\n${markerState}${diagnostics}\nPTY tail:\n${tail}`,
 		);
 	} finally {
 		await cli.terminate();
