@@ -1066,7 +1066,9 @@ impl ModelRuntime {
         }
 
         // Update the snapshot: preserve existing entries for non-target
-        // providers, overlay the new results for target providers.
+        // providers, overlay the new results for target providers. No guard
+        // may nest inside another (see configured_api_key): the snapshot
+        // guard releases before the maps guard acquires.
         {
             let mut snapshot = lock(&self.inner.snapshot);
             for provider_id in &target_ids {
@@ -1081,20 +1083,23 @@ impl ModelRuntime {
             for provider_id in &stored {
                 snapshot.stored_providers.insert(provider_id.clone());
             }
-            // Recompute available from all models + configured providers.
-            let all = {
-                let maps = lock(&self.inner.provider_models);
-                let mut all = Vec::new();
-                for models in maps.values() {
-                    all.extend(models.iter().cloned());
-                }
-                all.sort_by(|left, right| {
-                    left.provider
-                        .cmp(&right.provider)
-                        .then_with(|| left.id.cmp(&right.id))
-                });
-                all
-            };
+        }
+        // Recompute available from all models + configured providers.
+        let all = {
+            let maps = lock(&self.inner.provider_models);
+            let mut all = Vec::new();
+            for models in maps.values() {
+                all.extend(models.iter().cloned());
+            }
+            all.sort_by(|left, right| {
+                left.provider
+                    .cmp(&right.provider)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            all
+        };
+        {
+            let mut snapshot = lock(&self.inner.snapshot);
             snapshot.all = all;
             snapshot.available = snapshot
                 .all
@@ -1534,14 +1539,16 @@ impl ModelRuntime {
     }
 
     fn configured_api_key(&self, provider_id: &str) -> Option<String> {
-        lock(&self.inner.extension_providers)
+        // One lock per statement: no guard may overlap the next acquisition.
+        let extension_key = lock(&self.inner.extension_providers)
             .get(provider_id)
+            .and_then(|config| config.api_key.clone());
+        if extension_key.is_some() {
+            return extension_key;
+        }
+        lock(&self.inner.config)
+            .get_provider(provider_id)
             .and_then(|config| config.api_key.clone())
-            .or_else(|| {
-                lock(&self.inner.config)
-                    .get_provider(provider_id)
-                    .and_then(|config| config.api_key.clone())
-            })
     }
 
     fn configured_headers(&self, provider_id: &str) -> Option<BTreeMap<String, String>> {
@@ -1565,14 +1572,16 @@ impl ModelRuntime {
     }
 
     fn configured_auth_header(&self, provider_id: &str) -> bool {
-        lock(&self.inner.extension_providers)
+        // One lock per statement (see configured_api_key).
+        let extension_header = lock(&self.inner.extension_providers)
             .get(provider_id)
+            .and_then(|config| config.auth_header);
+        if let Some(value) = extension_header {
+            return value;
+        }
+        lock(&self.inner.config)
+            .get_provider(provider_id)
             .and_then(|config| config.auth_header)
-            .or_else(|| {
-                lock(&self.inner.config)
-                    .get_provider(provider_id)
-                    .and_then(|config| config.auth_header)
-            })
             .unwrap_or(false)
     }
 
@@ -1615,17 +1624,24 @@ impl ModelRuntime {
         // built-ins + models.json + extension config are composed. The next
         // async refresh re-reads the store.
         let store_entry = None;
+        // One lock per statement: the config and extension guards must not
+        // overlap, or a concurrent reader taking them in the opposite order
+        // deadlocks (config -> extension here vs extension -> config in
+        // auth probing).
+        let models_config = lock(&self.inner.config).get_provider(provider_id).cloned();
+        let extension_config = lock(&self.inner.extension_providers)
+            .get(provider_id)
+            .cloned();
         let models = compose_models_static(
             provider_id,
             &self.inner.builtins,
             store_entry,
-            lock(&self.inner.config).get_provider(provider_id),
-            lock(&self.inner.extension_providers).get(provider_id),
+            models_config.as_ref(),
+            extension_config.as_ref(),
         )?;
         lock(&self.inner.provider_models).insert(provider_id.to_owned(), models);
         Ok(())
     }
-
     async fn compose_models_for_provider(&self, provider_id: &str) -> Result<Vec<Model>, String> {
         let store_entry = self
             .inner
@@ -1633,12 +1649,17 @@ impl ModelRuntime {
             .read(provider_id)
             .await
             .map_err(|error| error.to_string())?;
+        // One lock per statement (see recompose_provider_sync).
+        let models_config = lock(&self.inner.config).get_provider(provider_id).cloned();
+        let extension_config = lock(&self.inner.extension_providers)
+            .get(provider_id)
+            .cloned();
         compose_models_static(
             provider_id,
             &self.inner.builtins,
             store_entry.as_ref(),
-            lock(&self.inner.config).get_provider(provider_id),
-            lock(&self.inner.extension_providers).get(provider_id),
+            models_config.as_ref(),
+            extension_config.as_ref(),
         )
     }
 
@@ -1668,14 +1689,16 @@ impl ModelRuntime {
             is_config_value_configured(&key, Some(&self.inner.auth_env))
                 || (!key.starts_with('$') && !key.starts_with('!'))
         });
-        let has_oauth = lock(&self.inner.extension_providers)
+        // One lock per statement (see configured_api_key).
+        let extension_oauth = lock(&self.inner.extension_providers)
             .get(provider_id)
             .and_then(|config| config.oauth.as_ref())
-            .is_some()
-            || lock(&self.inner.config)
-                .get_provider(provider_id)
-                .and_then(|config| config.oauth.as_ref())
-                .is_some();
+            .is_some();
+        let models_oauth = lock(&self.inner.config)
+            .get_provider(provider_id)
+            .and_then(|config| config.oauth.as_ref())
+            .is_some();
+        let has_oauth = extension_oauth || models_oauth;
         let stored = lock(&self.inner.snapshot)
             .stored_providers
             .contains(provider_id);
@@ -1816,14 +1839,17 @@ impl ModelRuntime {
                 kind: AuthType::ApiKey,
             });
         }
-        let oauth = lock(&self.inner.extension_providers)
+        // One lock per statement (see configured_api_key).
+        let extension_oauth = lock(&self.inner.extension_providers)
             .get(provider_id)
-            .and_then(|config| config.oauth.clone())
-            .or_else(|| {
-                lock(&self.inner.config)
-                    .get_provider(provider_id)
-                    .and_then(|config| config.oauth.clone())
-            });
+            .and_then(|config| config.oauth.clone());
+        let oauth = if extension_oauth.is_some() {
+            extension_oauth
+        } else {
+            lock(&self.inner.config)
+                .get_provider(provider_id)
+                .and_then(|config| config.oauth.clone())
+        };
         if oauth.is_some()
             && lock(&self.inner.snapshot)
                 .stored_providers
