@@ -189,6 +189,9 @@ jobs:
         if: matrix.musl != 'true'
         shell: bash
         run: |
+          # In-suite SBOM tests shell cargo metadata --offline; the SBOM
+          # step's fetch covers only the gnu leg, so warm here for all legs.
+          cargo fetch --locked
           bun run check
           bun test scripts
 
