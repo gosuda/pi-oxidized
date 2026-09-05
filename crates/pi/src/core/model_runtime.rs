@@ -2468,7 +2468,7 @@ mod tests {
                 sampler_abort.abort();
                 return Err(elapsed.into());
             }
-        };
+        }
         assert!(
             !lost_after_present.load(Ordering::Relaxed),
             "registered model vanished mid-race during concurrent refresh",
