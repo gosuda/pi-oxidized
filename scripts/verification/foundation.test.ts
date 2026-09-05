@@ -285,6 +285,10 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 	} catch (error) {
 		const snapshot = cli.snapshot();
 		const tail = snapshot.rawText.slice(-4_000);
+		const lastChunk = snapshot.chunks.at(-1);
+		const chunkState =
+			`chunks=${snapshot.chunks.length} lastChunkElapsedMs=${lastChunk ? Math.round(lastChunk.elapsedMs) : -1} ` +
+			`exited=${snapshot.exited} exitCode=${snapshot.exitCode}`;
 		const markerState =
 			`marker raw=${snapshot.rawText.includes(DEFAULT_FINAL_MARKER)} ` +
 			`application=${snapshot.applicationText.includes(DEFAULT_FINAL_MARKER)} ` +
@@ -314,7 +318,7 @@ async function smokeCli(fixture: CliFixture, sharedDirectory: string): Promise<v
 			diagnostics = "\ndiagnostics unavailable";
 		}
 		throw new Error(
-			`${fixture.name} smoke failed: ${error instanceof Error ? error.message : String(error)}\n${markerState}${diagnostics}\nPTY tail:\n${tail}`,
+			`${fixture.name} smoke failed: ${error instanceof Error ? error.message : String(error)}\n${chunkState}\n${markerState}${diagnostics}\nPTY tail:\n${tail}`,
 		);
 	} finally {
 		await cli.terminate();
