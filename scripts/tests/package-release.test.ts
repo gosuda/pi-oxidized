@@ -16,7 +16,7 @@ import {
 	HOST_COMPATIBILITY_VERSION,
 	HOST_PROTOCOL_VERSION,
 } from "../release/host.ts";
-import { RecordingRunner, realFs, safeJoinPath, SpawnRunner, type Fs, type RunResult } from "../release/runner.ts";
+import { RecordingRunner, realFs, safeJoinPath, SpawnRunner, tarArgs, type Fs, type RunResult } from "../release/runner.ts";
 import { assembleRelease } from "../release/stage.ts";
 import {
 	BUN_RUNTIME_VERSION,
@@ -677,7 +677,7 @@ describe("seven-archive release path", () => {
 		} else {
 			const tar = await new SpawnRunner().run(
 				"tar",
-				["--force-local", "-xzf", archivePath, "-C", extractDir],
+				tarArgs("-xzf", archivePath, "-C", extractDir),
 				{ rejectOnError: false, timeoutMs: 30_000 },
 			);
 			if (tar.exitCode !== 0) {
