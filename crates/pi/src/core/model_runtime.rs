@@ -1066,9 +1066,12 @@ impl ModelRuntime {
         }
 
         // Update the snapshot: preserve existing entries for non-target
-        // providers, overlay the new results for target providers. No guard
-        // may nest inside another (see configured_api_key): the snapshot
-        // guard releases before the maps guard acquires.
+        // providers, overlay the new results for target providers.
+        // The maps read nests inside the snapshot guard; this order is
+        // uniform (no site holds the maps guard while acquiring the
+        // snapshot guard), so unlike the config/extension pair it cannot
+        // deadlock. Keep it atomic: splitting it opens a lost-update
+        // window against concurrent register/unregister snapshot writes.
         {
             let mut snapshot = lock(&self.inner.snapshot);
             for provider_id in &target_ids {
@@ -1083,23 +1086,20 @@ impl ModelRuntime {
             for provider_id in &stored {
                 snapshot.stored_providers.insert(provider_id.clone());
             }
-        }
-        // Recompute available from all models + configured providers.
-        let all = {
-            let maps = lock(&self.inner.provider_models);
-            let mut all = Vec::new();
-            for models in maps.values() {
-                all.extend(models.iter().cloned());
-            }
-            all.sort_by(|left, right| {
-                left.provider
-                    .cmp(&right.provider)
-                    .then_with(|| left.id.cmp(&right.id))
-            });
-            all
-        };
-        {
-            let mut snapshot = lock(&self.inner.snapshot);
+            // Recompute available from all models + configured providers.
+            let all = {
+                let maps = lock(&self.inner.provider_models);
+                let mut all = Vec::new();
+                for models in maps.values() {
+                    all.extend(models.iter().cloned());
+                }
+                all.sort_by(|left, right| {
+                    left.provider
+                        .cmp(&right.provider)
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                all
+            };
             snapshot.all = all;
             snapshot.available = snapshot
                 .all
