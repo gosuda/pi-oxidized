@@ -555,11 +555,30 @@ async fn run_fixture(
     root.plugin = "DONE-MARKER".into();
     commit_with_deadline(&mut tui, Txn::Frame, &mut root, started)?;
 
+    let mut live = None;
     if serve {
         root.status = "serving".into();
         root.plugin = "SERVE-READY".into();
         commit_with_deadline(&mut tui, Txn::Frame, &mut root, started)?;
+        // Baseline the live-input boundary before announcing readiness, so the
+        // published deltas cover exactly the events consumed after the harness
+        // observed INPUT_READY — never the scripted fallback counts above.
+        let paste_baseline = root.paste_count;
+        let cursor_baseline = root.cursor_moves;
+        {
+            let mut out = io::stdout();
+            out.write_all(b"\x1b]999;PI_TUI_INPUT_READY=1\x07")?;
+            out.flush()?;
+        }
         serve_live_events(&mut input, &mut tui, &mut root, started).await?;
+        live = Some((
+            root.paste_count
+                .checked_sub(paste_baseline)
+                .ok_or_else(|| io::Error::other("live paste counter decreased"))?,
+            root.cursor_moves
+                .checked_sub(cursor_baseline)
+                .ok_or_else(|| io::Error::other("live cursor counter decreased"))?,
+        ));
     }
 
     // Publish write accounting on the wire for the harness (outside stage-3).
@@ -567,13 +586,19 @@ async fn run_fixture(
         let log = write_log
             .lock()
             .map_err(|_| io::Error::other("write log poisoned"))?;
-        let summary = format!(
+        let mut summary = format!(
             "\x1b]999;PI_TUI_TXN_COUNT={}\x07\x1b]999;PI_TUI_PASTE={}\x07\x1b]999;PI_TUI_CURSOR={}\x07\x1b]999;PI_TUI_RESIZE={}\x07",
             log.len(),
             root.paste_count,
             root.cursor_moves,
             root.resize_count
         );
+        if let Some((live_paste, live_cursor)) = live {
+            let _ = write!(
+                summary,
+                "\x1b]999;PI_TUI_LIVE_PASTE={live_paste}\x07\x1b]999;PI_TUI_LIVE_CURSOR={live_cursor}\x07"
+            );
+        }
         // Bypass Tui so accounting stays about stage-3 only; still sole post-probe
         // process stdout, just a harness side-channel.
         let mut out = io::stdout();

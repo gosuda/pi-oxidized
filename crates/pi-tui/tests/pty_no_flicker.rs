@@ -395,6 +395,7 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
 
     let mut cmd = CommandBuilder::new(&binary);
     cmd.arg(format!("--exit={exit}"));
+    cmd.arg("--serve");
     if !sync {
         cmd.arg("--no-sync");
         cmd.env("PI_TUI_NO_SYNC", "1");
@@ -506,6 +507,47 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
         raw.len(),
         String::from_utf8_lossy(&raw[..raw.len().min(200)])
     );
+
+    // Input rendezvous: the fixture publishes a complete OSC-999 readiness
+    // record only after its scripted prelude and the live-counter baseline.
+    // Drain raw output through the same reader/VT path; child exit or hard
+    // timeout before readiness is a failure, not a skip.
+    let mut ready = false;
+    while started.elapsed() < HARD_TIMEOUT {
+        while let Ok(chunk) = rx.try_recv() {
+            raw.extend_from_slice(&chunk);
+            feed_vt(&mut vt, &chunk);
+            last_data = Instant::now();
+        }
+        if find_subslice(&raw, b"\x1b]999;PI_TUI_INPUT_READY=1\x07").is_some() {
+            ready = true;
+            break;
+        }
+        if child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        ready,
+        "fixture never published input readiness; raw_len={} head={:?}",
+        raw.len(),
+        String::from_utf8_lossy(&raw[..raw.len().min(200)])
+    );
+
+    // Exactly one paste and six cursor moves, delivered once, after readiness.
+    write_stimulus(
+        &mut writer,
+        child.as_mut(),
+        b"\x1b[200~PASTED-BLOCK-line1\nline2\x1b[201~",
+        "paste",
+    );
+    write_stimulus(
+        &mut writer,
+        child.as_mut(),
+        b"\x1b[D\x1b[C\x1b[A\x1b[B\x1b[H\x1b[F",
+        "cursor",
+    );
     painted = true;
 
     for (cols, rows) in resize_plan {
@@ -522,23 +564,6 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
             .unwrap_or_else(|err| panic!("resize failed: {err}"));
         resize_count = resize_count.saturating_add(1);
         vt.resize(usize::from(cols), usize::from(rows));
-
-        if resize_count == 5 {
-            write_stimulus(
-                &mut writer,
-                child.as_mut(),
-                b"\x1b[200~PASTED-BLOCK-line1\nline2\x1b[201~",
-                "paste",
-            );
-        }
-        if resize_count == 8 {
-            write_stimulus(
-                &mut writer,
-                child.as_mut(),
-                b"\x1b[D\x1b[C\x1b[A\x1b[B\x1b[H\x1b[F",
-                "cursor",
-            );
-        }
 
         let slice_deadline = Instant::now() + Duration::from_millis(100);
         while Instant::now() < slice_deadline {
@@ -595,6 +620,11 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
         }
     }
 
+    // End the ordered input stream: Ctrl+D is the fixture's explicit serve
+    // terminator, sent through the still-owned master writer before waiting
+    // on child completion (writer Drop would only fire after the wait).
+    write_stimulus(&mut writer, child.as_mut(), b"\x04", "ctrl+d");
+
     while started.elapsed() < HARD_TIMEOUT {
         while let Ok(chunk) = rx.try_recv() {
             raw.extend_from_slice(&chunk);
@@ -620,10 +650,6 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
                 thread::sleep(Duration::from_millis(10));
             }
             break;
-        }
-
-        if find_subslice(&raw, b"DONE-MARKER").is_some() && last_data.elapsed() > READ_IDLE {
-            let _ = child.try_wait();
         }
 
         thread::sleep(Duration::from_millis(15));
@@ -657,11 +683,27 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
     });
     let row_erase_immediate_reflow = detect_row_erase_immediate_reflow(&raw, &txns);
 
-    let paste_count = parse_sidechannel_u32(&raw, b"PI_TUI_PASTE=");
-    let cursor_moves = parse_sidechannel_u32(&raw, b"PI_TUI_CURSOR=");
+    let paste_count = parse_sidechannel_u32(&raw, b"PI_TUI_PASTE=").unwrap_or(0);
+    let cursor_moves = parse_sidechannel_u32(&raw, b"PI_TUI_CURSOR=").unwrap_or(0);
     let txn_count = parse_sidechannel_u32(&raw, b"PI_TUI_TXN_COUNT=")
+        .unwrap_or(0)
         .max(u32::try_from(txns.len()).unwrap_or(u32::MAX));
-    let fixture_resize = parse_sidechannel_u32(&raw, b"PI_TUI_RESIZE=");
+    let fixture_resize = parse_sidechannel_u32(&raw, b"PI_TUI_RESIZE=").unwrap_or(0);
+
+    // Live-input provenance: the serve-phase deltas must be present, complete,
+    // and exact — a missing or malformed record is never a successful zero.
+    let live_paste = parse_sidechannel_u32(&raw, b"PI_TUI_LIVE_PASTE=");
+    let live_cursor = parse_sidechannel_u32(&raw, b"PI_TUI_LIVE_CURSOR=");
+    assert_eq!(
+        live_paste,
+        Some(1),
+        "expected exactly one live paste after readiness, got {live_paste:?}"
+    );
+    assert_eq!(
+        live_cursor,
+        Some(6),
+        "expected exactly six live cursor moves after readiness, got {live_cursor:?}"
+    );
 
     let sole_stdout_owner = find_subslice(&raw, &probe_query_batch(true)).is_some()
         && audit.clear_2j == 0
@@ -734,30 +776,25 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
     }
 }
 
-/// Write harness stimulus (paste / cursor keys) to the fixture, tolerating a
-/// fixture that already free-ran to a normal exit: its script takes ~250ms
-/// while the resize plan takes seconds, so post-exit master writes are the
-/// common case. Linux absorbs them; macOS fails them with EIO. A write
-/// failure against a fixture that is still alive is a real defect and panics.
-/// Verdicts never depend on stimulus delivery: the side-channel accounting
-/// and stream audits read the complete script output either way.
+/// Write harness input (paste / cursor keys / serve terminator) to the live
+/// fixture. Delivery is mandatory: readiness was already observed, so a
+/// write/flush failure or an already-exited child is a defect, not a race.
 fn write_stimulus(
     writer: &mut impl Write,
     child: &mut dyn portable_pty::Child,
     bytes: &[u8],
     what: &str,
 ) {
-    if child.try_wait().ok().flatten().is_some() {
-        return;
-    }
-    if let Err(err) = writer.write_all(bytes).and_then(|()| writer.flush()) {
-        // Exit between the check and the write is a won race, not a defect.
-        let finished = child.try_wait().ok().flatten().is_some();
-        assert!(
-            finished,
-            "{what} write failed against a live fixture: {err}"
-        );
-    }
+    assert!(
+        child.try_wait().ok().flatten().is_none(),
+        "{what} write skipped: fixture exited before input delivery"
+    );
+    writer
+        .write_all(bytes)
+        .unwrap_or_else(|err| panic!("{what} write failed: {err}"));
+    writer
+        .flush()
+        .unwrap_or_else(|err| panic!("{what} flush failed: {err}"));
 }
 
 fn disable_pty_echo(master: &dyn portable_pty::MasterPty) {
@@ -880,19 +917,17 @@ fn detect_row_erase_immediate_reflow(raw: &[u8], txns: &[Vec<u8>]) -> bool {
     }
     audit_bytes(raw).clear_2j == 0 && audit_bytes(raw).clear_3j == 0
 }
-fn parse_sidechannel_u32(raw: &[u8], key: &[u8]) -> u32 {
-    let Some(pos) = find_subslice(raw, key) else {
-        return 0;
-    };
+fn parse_sidechannel_u32(raw: &[u8], key: &[u8]) -> Option<u32> {
+    let pos = find_subslice(raw, key)?;
     let start = pos + key.len();
     let mut end = start;
     while end < raw.len() && raw[end].is_ascii_digit() {
         end += 1;
     }
-    std::str::from_utf8(&raw[start..end])
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+    if end == start || raw.get(end) != Some(&b'\x07') {
+        return None;
+    }
+    std::str::from_utf8(&raw[start..end]).ok()?.parse().ok()
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
