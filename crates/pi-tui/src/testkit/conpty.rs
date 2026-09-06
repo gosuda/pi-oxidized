@@ -1,4 +1,4 @@
-//! Windows ConPTY adapter backed by `portable-pty` `ConPtySystem`.
+//! Windows `ConPTY` adapter backed by `portable-pty` `ConPtySystem`.
 
 #![cfg(windows)]
 
@@ -14,7 +14,7 @@ use crate::testkit::session::{
     SessionIo, apply_env, snapshot_from_raw, viewport_snapshot_from_raw,
 };
 
-/// Windows ConPTY driver using `portable-pty` 0.9.0 `ConPtySystem`.
+/// Windows `ConPTY` driver using `portable-pty` 0.9.0 `ConPtySystem`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConPtyDriver;
 
@@ -79,7 +79,7 @@ impl TerminalDriver for ConPtyDriver {
     }
 }
 
-/// Render-capable ConPTY session.
+/// Render-capable `ConPTY` session.
 pub struct ConPtySession {
     master: Box<dyn MasterPty + Send>,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
