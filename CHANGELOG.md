@@ -13,3 +13,4 @@ All notable changes to the pi Rust port are documented in this file.
 ### Fixed
 
 - Large tool results that cross the context threshold now compact before the next assistant request in the same run. Compaction preserves queued steering and stops cleanly when the run is cancelled or terminated.
+- Terminal resizing now keeps the inline viewport aligned with the rendered frame and restores its requested height when the terminal grows.

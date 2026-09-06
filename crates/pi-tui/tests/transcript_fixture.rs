@@ -640,10 +640,12 @@ fn run_paste_cursor(
     // Six cursor escape sequences are sent: left, right, up, down, home, end.
     let cursor = b"\x1b[D\x1b[C\x1b[A\x1b[B\x1b[H\x1b[F";
     let before = run.settle_frame(|_| true)?;
+    // Snapshots include scrollback; the last counter row is the current paint.
     let count_before = before
         .snapshot
         .lines
         .iter()
+        .rev()
         .find_map(|line| line.split("cursor=").nth(1)?.split_whitespace().next())
         .and_then(|value| value.parse::<u32>().ok())
         .ok_or_else(|| {
@@ -658,6 +660,7 @@ fn run_paste_cursor(
         .snapshot
         .lines
         .iter()
+        .rev()
         .find_map(|line| line.split("cursor=").nth(1)?.split_whitespace().next())
         .and_then(|value| value.parse::<u32>().ok())
         .ok_or_else(|| {

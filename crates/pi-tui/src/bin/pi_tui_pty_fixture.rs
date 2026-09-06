@@ -680,13 +680,11 @@ async fn serve_live_events(
 
         // Coalesce a back-to-back resize storm into one note_resize + Reanchor.
         let mut latest = (width, height);
-        let _ = root.handle_event(&UiEvent::Resize { width, height });
         tokio::task::yield_now().await;
         while let Some(next) = input.try_recv() {
             match next {
                 UiEvent::Resize { width, height } => {
                     latest = (width, height);
-                    let _ = root.handle_event(&UiEvent::Resize { width, height });
                 }
                 other => {
                     pending = Some(other);
@@ -694,6 +692,10 @@ async fn serve_live_events(
                 }
             }
         }
+        let _ = root.handle_event(&UiEvent::Resize {
+            width: latest.0,
+            height: latest.1,
+        });
         tui.note_resize(latest.0.max(1), latest.1.max(1));
         commit_with_deadline(tui, Txn::Reanchor(ReanchorCause::Resize), root, started)?;
     }
