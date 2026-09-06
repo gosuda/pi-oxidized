@@ -697,7 +697,11 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
     assert_eq!(
         live_paste,
         Some(1),
-        "expected exactly one live paste after readiness, got {live_paste:?}"
+        "expected exactly one live paste after readiness, got {live_paste:?} \
+         (live_cursor={live_cursor:?}, raw={})",
+        String::from_utf8_lossy(&raw)
+            .escape_default()
+            .collect::<String>()
     );
     assert_eq!(
         live_cursor,

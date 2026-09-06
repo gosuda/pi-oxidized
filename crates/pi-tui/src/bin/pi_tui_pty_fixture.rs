@@ -67,6 +67,10 @@ struct FixtureRoot {
     cursor_moves: u32,
     resize_count: u32,
     generation: u64,
+    /// Windows CI diagnostic: bounded escaped Debug trace of live `UiEvent`s
+    /// received during the serve phase.
+    #[cfg(windows)]
+    live_trace: Vec<String>,
 }
 
 impl FixtureRoot {
@@ -81,7 +85,36 @@ impl FixtureRoot {
             cursor_moves: 0,
             resize_count: 0,
             generation: 0,
+            #[cfg(windows)]
+            live_trace: Vec::new(),
         }
+    }
+
+    /// Records one received live event as an escaped, bounded Debug string.
+    /// `escape_default` guarantees no raw control bytes can enter the OSC
+    /// payload. Overlong entries and an over-capacity trace each get an
+    /// explicit truncation marker.
+    #[cfg(windows)]
+    fn record_live_event(&mut self, event: &UiEvent) {
+        const MAX_ENTRIES: usize = 128;
+        const MAX_CHARS: usize = 512;
+        const ENTRY_TRUNC: &str = "...ENTRY_TRUNCATED";
+        if self.live_trace.len() >= MAX_ENTRIES {
+            if let Some(last) = self.live_trace.last_mut() {
+                *last = "PI_TUI_LIVE_TRACE_TRUNCATED".to_string();
+            }
+            return;
+        }
+        // Escaped output is pure ASCII, so byte cuts stay on char boundaries.
+        let mut escaped: String = format!("{event:?}")
+            .escape_default()
+            .take(MAX_CHARS + 1)
+            .collect();
+        if escaped.len() > MAX_CHARS {
+            escaped.truncate(MAX_CHARS - ENTRY_TRUNC.len());
+            escaped.push_str(ENTRY_TRUNC);
+        }
+        self.live_trace.push(escaped);
     }
 
     fn lines(&self, width: u16) -> Vec<String> {
@@ -606,6 +639,17 @@ async fn run_fixture(
                 summary,
                 "\x1b]999;PI_TUI_LIVE_PASTE={live_paste}\x07\x1b]999;PI_TUI_LIVE_CURSOR={live_cursor}\x07"
             );
+            // Windows CI diagnostic: when no live paste was observed, publish
+            // the bounded escaped trace of every UiEvent received during the
+            // serve phase so the harness log shows exactly what arrived.
+            #[cfg(windows)]
+            if live_paste == 0 {
+                let _ = write!(
+                    summary,
+                    "\x1b]999;PI_TUI_LIVE_TRACE={}\x07",
+                    root.live_trace.join("|")
+                );
+            }
         }
         // Bypass Tui so accounting stays about stage-3 only; still sole post-probe
         // process stdout, just a harness side-channel.
@@ -692,7 +736,11 @@ async fn serve_live_events(
         let event = match pending.take() {
             Some(event) => event,
             None => match input.recv().await {
-                Some(event) => event,
+                Some(event) => {
+                    #[cfg(windows)]
+                    root.record_live_event(&event);
+                    event
+                }
                 None => return Ok(()),
             },
         };
@@ -715,6 +763,8 @@ async fn serve_live_events(
         let mut latest = (width, height);
         tokio::task::yield_now().await;
         while let Some(next) = input.try_recv() {
+            #[cfg(windows)]
+            root.record_live_event(&next);
             match next {
                 UiEvent::Resize { width, height } => {
                     latest = (width, height);
