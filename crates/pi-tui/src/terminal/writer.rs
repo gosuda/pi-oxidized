@@ -178,21 +178,35 @@ impl Coalescer {
 struct ViewportState {
     size: Size,
     cursor: Position,
+    /// Height requested by the app, floored at one row and *not* clamped to
+    /// the terminal. A viewport temporarily clamped by a small terminal keeps
+    /// this so it can regrow when the terminal grows back.
+    requested_height: u16,
+    /// Effective height: `requested_height` clamped into the terminal.
     viewport_height: u16,
     viewport_top: u16,
     live_kitty_ids: HashSet<u32>,
 }
 
 impl ViewportState {
-    fn new(size: Size, cursor: Position, viewport_height: u16) -> Self {
+    fn new(size: Size, cursor: Position, requested_height: u16) -> Self {
+        let requested_height = requested_height.max(1);
+        let viewport_height = Self::effective_height(requested_height, size.height);
         let viewport_top = cursor.y.saturating_sub(viewport_height.saturating_sub(1));
         Self {
             size,
             cursor,
+            requested_height,
             viewport_height,
             viewport_top,
             live_kitty_ids: HashSet::new(),
         }
+    }
+
+    /// Clamp a request into the terminal, keeping at least one row.
+    #[must_use]
+    fn effective_height(requested_height: u16, terminal_height: u16) -> u16 {
+        requested_height.min(terminal_height).max(1)
     }
 
     fn viewport_area(&self) -> Rect {
@@ -262,10 +276,13 @@ impl<W: Write> Tui<W> {
         if std::env::var_os("PI_TUI_AUDIT").is_some() {
             guarded.set_byte_audit(true);
         }
+        // One clamp for both: the ratatui inline viewport and `state` must start
+        // with the same effective height, and `viewport_top` is derived from it.
+        let state = ViewportState::new(size, cursor, viewport_height);
         let terminal = Terminal::with_options(
             guarded,
             TerminalOptions {
-                viewport: Viewport::Inline(viewport_height.min(size.height).max(1)),
+                viewport: Viewport::Inline(state.viewport_height),
             },
         )?;
         outer.flush()?;
@@ -274,7 +291,7 @@ impl<W: Write> Tui<W> {
             composition,
             outer,
             caps,
-            state: ViewportState::new(size, cursor, viewport_height),
+            state,
             coalescer: Coalescer::new(),
             write_count: 0,
             scratch_claims: Vec::new(),
@@ -341,9 +358,10 @@ impl<W: Write> Tui<W> {
     pub fn note_resize(&mut self, width: u16, height: u16) {
         self.state.size = Size::new(width, height);
         self.terminal.backend_mut().set_size(self.state.size);
-        if self.state.viewport_height > height {
-            self.state.viewport_height = height.max(1);
-        }
+        // Recompute from the retained request on grow *and* shrink: a viewport
+        // clamped by a small terminal regrows when the terminal does.
+        self.state.viewport_height =
+            ViewportState::effective_height(self.state.requested_height, height);
     }
 
     /// Commit a transaction against `root`.
@@ -707,21 +725,22 @@ impl<W: Write> Tui<W> {
             x: 0,
             y: self.state.bottom_row(),
         };
-        self.terminal.backend_mut().set_size(self.state.size);
-        self.terminal
-            .backend_mut()
-            .set_cursor_cache(self.state.cursor);
-        // Explicit buffer resize uses the cached cursor and suppresses bulk clears.
-        self.terminal.resize(self.state.viewport_area())?;
-
         let mut payload_prefix = Vec::new();
         for id in &self.state.live_kitty_ids {
             payload_prefix.extend_from_slice(&kitty_delete_id(*id));
         }
         self.state.live_kitty_ids.clear();
-        if !payload_prefix.is_empty() {
-            self.push_composition_bytes(&payload_prefix);
-        }
+        // Park the real cursor on the viewport's first row before rebuilding, so
+        // the height-minus-one inline initialization LFs end on the last terminal
+        // row without scrolling, wherever reflow left the cursor.
+        payload_prefix.extend_from_slice(
+            format!("\x1b[{};1H", self.state.viewport_top.saturating_add(1)).as_bytes(),
+        );
+        self.push_composition_bytes(&payload_prefix);
+        // `Viewport::Inline(h)` is immutable and `Terminal::resize` recomputes the
+        // origin from cursor offsets, so rebuild the terminal: its inline height,
+        // area, and known size must equal `state` before the full-row redraw.
+        self.rebuild_terminal()?;
         // Full-row reanchor: drop claims so every row reaches the wire.
         self.invalidate_damage();
         self.commit_frame(root, true)
@@ -732,7 +751,11 @@ impl<W: Write> Tui<W> {
         height: u16,
         root: &mut dyn Component,
     ) -> io::Result<()> {
-        let height = height.min(self.state.size.height).max(1);
+        // Retain the normalized request before any clamp so a height set while
+        // the terminal is too small takes effect when the terminal regrows.
+        self.state.requested_height = height.max(1);
+        let height =
+            ViewportState::effective_height(self.state.requested_height, self.state.size.height);
         if height == self.state.viewport_height {
             return self.commit_frame(root, false);
         }
@@ -760,9 +783,23 @@ impl<W: Write> Tui<W> {
         }
         self.state.viewport_height = height;
 
+        // Rebuild so terminal geometry equals `state`; the scroll / abandoned-row
+        // bytes above stay in front of the initialization bytes.
+        self.rebuild_terminal()?;
+        // Terminal rebuilt with fresh buffers: emitted snapshot restarts.
+        self.invalidate_damage();
+        self.commit_frame(root, true)
+    }
+
+    /// Rebuild the ratatui terminal so its inline geometry equals `self.state`:
+    /// `Viewport::Inline(viewport_height)` anchored at `(0, viewport_top)`, hence
+    /// `viewport_area() == state.viewport_area()` and the backend's known size is
+    /// `state.size` (the `autoresize` in `commit_frame` stays a no-op). Any bytes
+    /// already staged in the composition are preserved ahead of the initialization
+    /// bytes the constructor may emit.
+    fn rebuild_terminal(&mut self) -> io::Result<()> {
         let pending = self.take_composition_bytes();
-        let composition = Arc::clone(&self.composition);
-        let sink = FrameSink::with_shared(composition);
+        let sink = FrameSink::with_shared(Arc::clone(&self.composition));
         let backend = CrosstermBackend::new(sink);
         let anchor = Position {
             x: 0,
@@ -774,17 +811,15 @@ impl<W: Write> Tui<W> {
         self.terminal = Terminal::with_options(
             guarded,
             TerminalOptions {
-                viewport: Viewport::Inline(height),
+                viewport: Viewport::Inline(self.state.viewport_height),
             },
         )?;
         // Initialization may emit scroll/cursor bytes. Preserve transaction
-        // order: abandoned-row erases precede initialization and redraw.
+        // order: staged bytes precede initialization and the redraw.
         let initialization = self.take_composition_bytes();
         self.push_composition_bytes(&pending);
         self.push_composition_bytes(&initialization);
-        // Terminal rebuilt with fresh buffers: emitted snapshot restarts.
-        self.invalidate_damage();
-        self.commit_frame(root, true)
+        Ok(())
     }
 
     fn push_composition_bytes(&self, bytes: &[u8]) {
@@ -1918,6 +1953,60 @@ mod tests {
             assert_eq!(report.sync_begin, usize::from(sync_output));
             assert_eq!(report.sync_end, usize::from(sync_output));
         }
+        Ok(())
+    }
+
+    /// A viewport clamped by a temporarily small terminal keeps the requested
+    /// height and regrows with the terminal — including a request changed while
+    /// the clamp was in force.
+    #[test]
+    fn clamped_viewport_regrows_to_retained_request() -> io::Result<()> {
+        let caps = TerminalCapabilities {
+            sync_output: true,
+            ..TerminalCapabilities::default()
+        };
+        let outer = Cursor::new(Vec::new());
+        // Requested 6 rows in a 4-row terminal: the effective height clamps.
+        let mut tui = Tui::new(outer, Size::new(20, 4), Position::ORIGIN, 6, caps)?;
+        let mut root = StubRoot {
+            label: "live".into(),
+            invalidated: 0,
+        };
+        tui.commit(Txn::Frame, &mut root)?;
+        assert_eq!(tui.viewport_height(), 4);
+
+        // Regrow: the retained request restores six rows, bottom-anchored.
+        tui.note_resize(20, 24);
+        assert_eq!(tui.viewport_height(), 6);
+        tui.commit(Txn::Reanchor(ReanchorCause::Resize), &mut root)?;
+        let payload = tui.last_payload().to_vec();
+        let first_row = find_subslice(&payload, b"\x1b[19;1H\x1b[2K")
+            .ok_or_else(|| io::Error::other("missing restored first row"))?;
+        let last_row = find_subslice(&payload, b"\x1b[24;1H\x1b[2K")
+            .ok_or_else(|| io::Error::other("missing restored last row"))?;
+        let content = find_subslice(&payload, b"live")
+            .ok_or_else(|| io::Error::other("missing regrown viewport content"))?;
+        assert!(first_row < content && content < last_row);
+
+        // Shrink again, then change the request while clamped: the effective
+        // height cannot move yet, but the new request must survive.
+        tui.note_resize(20, 4);
+        assert_eq!(tui.viewport_height(), 4);
+        tui.commit(Txn::SetViewportHeight(8), &mut root)?;
+        assert_eq!(tui.viewport_height(), 4);
+        tui.note_resize(20, 24);
+        assert_eq!(tui.viewport_height(), 8);
+        tui.commit(Txn::Reanchor(ReanchorCause::Resize), &mut root)?;
+        let payload = tui.last_payload();
+        let report = audit_bytes(payload);
+        assert_eq!(report.clear_2j, 0);
+        assert_eq!(report.clear_3j, 0);
+        assert!(
+            find_subslice(payload, b"\x1b[17;1H\x1b[2K").is_some(),
+            "eight rows bottom-anchor at row 17: {:?}",
+            String::from_utf8_lossy(payload)
+        );
+        assert!(find_subslice(payload, b"live").is_some());
         Ok(())
     }
 

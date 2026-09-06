@@ -825,6 +825,13 @@ fn modifier_from_params(params: &[u32]) -> KeyModifiers {
 /// `Ok(None)` means the readiness window expired without bytes; `Ok(Some)`
 /// carries one read (empty on EOF). Zero timeout keeps the old
 /// non-blocking semantics.
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix arm can return real poll/read I/O errors; callers need one shared io::Result contract across platforms"
+    )
+)]
 fn read_stdin_within(timeout: Duration) -> io::Result<Option<Vec<u8>>> {
     #[cfg(unix)]
     {
