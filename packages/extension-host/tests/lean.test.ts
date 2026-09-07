@@ -63,6 +63,7 @@ function flagContextLog(): Marker[] {
 afterEach(() => {
 	(globalThis as Record<string, unknown>).__leanEchoLog = [];
 	(globalThis as Record<string, unknown>).__leanFlagContextLog = [];
+	(globalThis as Record<string, unknown>).__leanDeferredLog = [];
 	delete (globalThis as Record<string, unknown>).__leanFlow;
 });
 
@@ -285,6 +286,63 @@ describe("lean: extensions.load registry", () => {
 		expect(res["terminalInput"]).toBe(false);
 
 		await link.finish();
+	});
+
+	test("snapshot preserves false/config and omits an absent value", async () => {
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-sampling-"));
+		const entry = join(directory, "sampling.mjs");
+		let link: LeanLink | undefined;
+		try {
+			await writeFile(
+				entry,
+				`export default {
+					tools: [
+						{
+							name: "sampling-disabled",
+							description: "Explicitly disables constrained sampling",
+							parameters: { type: "object" },
+							constrainedSampling: false,
+							execute: async () => ({ content: [] }),
+						},
+						{
+							name: "sampling-configured",
+							description: "Requests strict constrained sampling",
+							parameters: { type: "object" },
+							constrainedSampling: { type: "json_schema", strict: "prefer" },
+							execute: async () => ({ content: [] }),
+						},
+						{
+							name: "sampling-absent",
+							description: "Leaves constrained sampling to the provider",
+							parameters: { type: "object" },
+							execute: async () => ({ content: [] }),
+						},
+					],
+				};`,
+			);
+			link = new LeanLink({ cwd: directory, extensionPaths: [] });
+			await link.hello(1);
+			link.request(2, "extensions.load", { extensionPaths: [entry], cwd: directory });
+			const response = payload(await link.response(2, "extensions.load"));
+			expect(response["extensions"]).toBe(1);
+
+			const tools = response["tools"] as Array<Record<string, unknown>>;
+			expect(tools.map((tool) => tool["name"])).toEqual([
+				"sampling-disabled",
+				"sampling-configured",
+				"sampling-absent",
+			]);
+			const byName = new Map(tools.map((tool) => [tool["name"], tool]));
+			expect(byName.get("sampling-disabled")?.["constrainedSampling"]).toBe(false);
+			expect(byName.get("sampling-configured")?.["constrainedSampling"]).toEqual({
+				type: "json_schema",
+				strict: "prefer",
+			});
+			expect(Object.hasOwn(byName.get("sampling-absent") ?? {}, "constrainedSampling")).toBe(false);
+		} finally {
+			await link?.finish();
+			await rm(directory, { recursive: true, force: true });
+		}
 	});
 
 	test("CLI --extension load failures surface as extensionError events", async () => {
@@ -1304,6 +1362,114 @@ describe("lean: commands, flags, shortcuts, providers", () => {
 		})()).rejects.toThrow("provider stream requires options.signal");
 	});
 });
+// ---------------------------------------------------------------------------
+// provider.fetchDeferred / provider.cancelDeferred over the real JSONL link
+// ---------------------------------------------------------------------------
+
+describe("lean: provider deferred fetch/cancel boundary", () => {
+
+	test("deferred handles are validated and dispatched to the extension with their payload retained", async () => {
+		const deferredEvents: unknown[] = [];
+		Reflect.set(globalThis, "__leanDeferredLog", deferredEvents);
+		const directory = await mkdtemp(join(PACKAGE_DIR, ".test-lean-deferred-"));
+		const entry = join(directory, "deferred-provider.mjs");
+		await writeFile(entry, `function mark(name, value) {
+	const key = "__leanDeferredLog";
+	const log = globalThis[key] ?? [];
+	log.push({ name, value });
+	globalThis[key] = log;
+}
+export default {
+	name: "lean-deferred",
+	providers: [{
+		name: "deferred-provider",
+		fetchDeferred: async function* (model, handle) {
+			mark("fetchDeferred", { model, handle });
+			yield { type: "start", partial: { role: "assistant", content: [] } };
+			yield { type: "done", reason: "stop", message: { role: "assistant", content: [] } };
+		},
+		cancelDeferred: async (model, handle) => {
+			mark("cancelDeferred", { model, handle });
+		},
+	}],
+};
+`);
+		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [entry] });
+		try {
+			await link.hello(1);
+			link.request(2, "extensions.load", { extensionPaths: [entry], cwd: PACKAGE_DIR });
+			await link.response(2, "extensions.load");
+
+			// A string sitting in the optional expiresAt slot must be rejected
+			// as invalid_arguments before the provider callback can run.
+			const malformed = {
+				provider: "deferred-provider",
+				modelId: "m-deferred",
+				api: "openai-completions",
+				id: "op-malformed",
+				expiresAt: "soon",
+			};
+			link.request(3, "provider.fetchDeferred", {
+				providerId: "deferred-provider",
+				model: { id: "m-deferred" },
+				handle: malformed,
+			});
+			const invalidFetch = await link.waitFor(
+				(frame) => frame.id === 3 && (frame.kind === "res" || frame.kind === "error"),
+			);
+			expect(invalidFetch.kind).toBe("error");
+			expect(payload(invalidFetch)["code"]).toBe("invalid_arguments");
+			link.request(4, "provider.cancelDeferred", {
+				providerId: "deferred-provider",
+				model: { id: "m-deferred" },
+				handle: malformed,
+			});
+			const invalidCancel = await link.waitFor(
+				(frame) => frame.id === 4 && (frame.kind === "res" || frame.kind === "error"),
+			);
+			expect(invalidCancel.kind).toBe("error");
+			expect(payload(invalidCancel)["code"]).toBe("invalid_arguments");
+			expect(deferredEvents).toEqual([]);
+
+			// A valid handle carrying nested opaque provider data must reach
+			// both deferred callbacks unchanged after the JSONL round-trip.
+			const handle = {
+				provider: "deferred-provider",
+				modelId: "m-deferred",
+				api: "openai-completions",
+				id: "op-42",
+				expiresAt: 4102444800000,
+				pollAfterMs: 250,
+				data: { nested: [1, "two", { deep: true }] },
+			};
+			const model = { id: "m-deferred" };
+			link.request(5, "provider.fetchDeferred", {
+				providerId: "deferred-provider",
+				model,
+				handle,
+			});
+			await link.response(5, "provider.fetchDeferred");
+			expect(deferredEvents).toEqual([
+				{ name: "fetchDeferred", value: { handle, model } },
+			]);
+
+			link.request(6, "provider.cancelDeferred", {
+				providerId: "deferred-provider",
+				model,
+				handle,
+			});
+			await link.response(6, "provider.cancelDeferred");
+			expect(deferredEvents).toEqual([
+				{ name: "fetchDeferred", value: { handle, model } },
+				{ name: "cancelDeferred", value: { handle, model } },
+			]);
+		} finally {
+			await link.finish();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+});
+
 
 // ---------------------------------------------------------------------------
 // Declared lifecycle hooks
@@ -2257,6 +2423,39 @@ describe("lean: surface validation units", () => {
 
 		for (const [definition, message] of cases) {
 			expect(() => parseLeanExtension(definition)).toThrow(message);
+		}
+	});
+
+	test("parseLeanExtension validates constrained sampling shapes", () => {
+		const tool = { name: "sampling", description: "d", execute: () => ({}) };
+		const validValues: unknown[] = [
+			false,
+			{ type: "json_schema", strict: "prefer" },
+			{ type: "json_schema", strict: "require" },
+			{ type: "grammar", variants: { openai_lark: "start: /.+/s" } },
+			{ type: "grammar", variants: { openai_regex: "[a-z]+" } },
+			{ type: "grammar", variants: { openai_lark: "lark", openai_regex: "regex" } },
+		];
+		for (const constrainedSampling of validValues) {
+			expect(() =>
+				parseLeanExtension({ tools: [{ ...tool, constrainedSampling }] }),
+			).not.toThrow();
+		}
+
+		const invalidValues: Array<[unknown, string]> = [
+			[true, "must be false or an object"],
+			[{}, 'type must be "json_schema" or "grammar"'],
+			[{ type: "json_schema", strict: "optional" }, 'strict must be "prefer" or "require"'],
+			[{ type: "grammar" }, "variants must be an object"],
+			[{ type: "grammar", variants: { openai_xml: "<x/>" } }, 'unknown key "openai_xml"'],
+			[{ type: "grammar", variants: { openai_lark: "   " } }, "must be a non-empty string"],
+			[{ type: "grammar", variants: { openai_lark: 42 } }, "must be a non-empty string"],
+			[{ type: "json_schema", strict: "prefer", extra: true }, 'unknown key "extra"'],
+		];
+		for (const [constrainedSampling, message] of invalidValues) {
+			expect(() =>
+				parseLeanExtension({ tools: [{ ...tool, constrainedSampling }] }),
+			).toThrow(message);
 		}
 	});
 
