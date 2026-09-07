@@ -254,6 +254,10 @@ pub struct Tui<W: Write> {
     /// Pooled composition buffer swapped into the sink on each take.
     comp_scratch: Option<Vec<u8>>,
     hardware_cursor: bool,
+    /// `note_resize` changed the effective viewport geometry but the ratatui
+    /// inline viewport (immutable `Viewport::Inline`) still has the previous
+    /// one; the next commit re-anchors before painting.
+    geometry_stale: bool,
 }
 
 impl<W: Write> Tui<W> {
@@ -303,6 +307,7 @@ impl<W: Write> Tui<W> {
             grid: Buffer::default(),
             prior_claims: Vec::new(),
             hardware_cursor: std::env::var_os("PI_HARDWARE_CURSOR").is_some(),
+            geometry_stale: false,
         })
     }
 
@@ -360,8 +365,17 @@ impl<W: Write> Tui<W> {
         self.terminal.backend_mut().set_size(self.state.size);
         // Recompute from the retained request on grow *and* shrink: a viewport
         // clamped by a small terminal regrows when the terminal does.
-        self.state.viewport_height =
-            ViewportState::effective_height(self.state.requested_height, height);
+        let viewport_height = ViewportState::effective_height(self.state.requested_height, height);
+        let viewport_top = self
+            .state
+            .viewport_top
+            .min(height.saturating_sub(viewport_height));
+        if viewport_height != self.state.viewport_height || viewport_top != self.state.viewport_top
+        {
+            self.state.viewport_height = viewport_height;
+            self.state.viewport_top = viewport_top;
+            self.geometry_stale = true;
+        }
     }
 
     /// Commit a transaction against `root`.
@@ -370,6 +384,14 @@ impl<W: Write> Tui<W> {
     ///
     /// Returns an I/O error when composing or writing the transaction fails.
     pub fn commit(&mut self, txn: Txn, root: &mut dyn Component) -> io::Result<()> {
+        if self.geometry_stale && !matches!(txn, Txn::Reanchor(_)) {
+            // The terminal geometry no longer matches `state`; painting through
+            // the stale inline viewport would place rows off `viewport_area()`.
+            self.commit_reanchor(ReanchorCause::Resize, root)?;
+            if matches!(txn, Txn::Frame) {
+                return Ok(());
+            }
+        }
         match txn {
             Txn::Frame => self.commit_frame(root, false),
             Txn::Settle(blocks) => self.commit_settle(blocks, root),
@@ -814,6 +836,7 @@ impl<W: Write> Tui<W> {
                 viewport: Viewport::Inline(self.state.viewport_height),
             },
         )?;
+        self.geometry_stale = false;
         // Initialization may emit scroll/cursor bytes. Preserve transaction
         // order: staged bytes precede initialization and the redraw.
         let initialization = self.take_composition_bytes();
@@ -2007,6 +2030,64 @@ mod tests {
             String::from_utf8_lossy(payload)
         );
         assert!(find_subslice(payload, b"live").is_some());
+        Ok(())
+    }
+
+    /// A resize that changes the effective geometry must not paint through the
+    /// previous inline viewport: a plain `Frame` (or an equal-height
+    /// `SetViewportHeight`) after `note_resize` re-anchors into the new rows.
+    #[test]
+    fn stale_geometry_reanchors_before_frame_paint() -> io::Result<()> {
+        let caps = TerminalCapabilities {
+            sync_output: true,
+            ..TerminalCapabilities::default()
+        };
+        let outer = Cursor::new(Vec::new());
+        let mut tui = Tui::new(outer, Size::new(20, 24), Position::ORIGIN, 8, caps)?;
+        let mut root = StubRoot {
+            label: "live".into(),
+            invalidated: 0,
+        };
+        tui.commit(Txn::Reanchor(ReanchorCause::Resize), &mut root)?;
+        assert_eq!(tui.state.viewport_top, 16);
+
+        // Shrink to four rows: the request clamps and the old top (16) no
+        // longer fits; the next Frame must land on rows 1..=4.
+        tui.note_resize(20, 4);
+        assert_eq!(tui.viewport_height(), 4);
+        assert_eq!(tui.state.viewport_top, 0);
+        tui.commit(Txn::Frame, &mut root)?;
+        let payload = tui.last_payload().to_vec();
+        let content = find_subslice(&payload, b"live")
+            .ok_or_else(|| io::Error::other("missing content after shrink"))?;
+        let first_row = find_subslice(&payload, b"\x1b[1;1H\x1b[2K")
+            .ok_or_else(|| io::Error::other("missing first row after shrink"))?;
+        assert!(first_row < content);
+        assert!(
+            find_subslice(&payload, b"\x1b[17;1H").is_none(),
+            "stale 24-row geometry leaked into the paint: {:?}",
+            String::from_utf8_lossy(&payload)
+        );
+        assert!(!tui.geometry_stale);
+
+        // Equal effective height through SetViewportHeight after a regrow must
+        // still re-anchor into the eight rows at the bottom.
+        tui.note_resize(20, 24);
+        assert_eq!(tui.viewport_height(), 8);
+        assert!(tui.geometry_stale);
+        let invalidated = root.invalidated;
+        tui.commit(Txn::SetViewportHeight(8), &mut root)?;
+        assert_eq!(tui.state.viewport_top, 16);
+        assert!(!tui.geometry_stale);
+        assert_eq!(
+            root.invalidated,
+            invalidated + 1,
+            "equal-height request over stale geometry must re-anchor"
+        );
+        let payload = tui.last_payload();
+        let report = audit_bytes(payload);
+        assert_eq!(report.clear_2j, 0);
+        assert_eq!(report.clear_3j, 0);
         Ok(())
     }
 

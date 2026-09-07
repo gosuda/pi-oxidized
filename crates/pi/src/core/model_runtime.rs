@@ -968,6 +968,11 @@ impl ModelRuntime {
         self.rebuild_providers().await?;
         let after = self.provider_ids();
         for retired in before.difference(&after) {
+            // A provider re-registered between the `after` capture and this
+            // point is live again; its sync recompose already republished it.
+            if self.is_known_provider(retired) {
+                continue;
+            }
             lock(&self.inner.provider_models).remove(retired);
             lock(&self.inner.composition_errors).remove(retired);
         }
@@ -1631,9 +1636,30 @@ impl ModelRuntime {
 
     async fn recompose_provider(&self, provider_id: &str) -> Result<(), String> {
         let models = self.compose_models_for_provider(provider_id).await?;
+        // The store read above is an await point: a provider unregistered or
+        // retired by a config reload in the meantime must not be resurrected
+        // by this stale composition.
+        if !self.is_known_provider(provider_id) {
+            lock(&self.inner.provider_models).remove(provider_id);
+            lock(&self.inner.composition_errors).remove(provider_id);
+            return Ok(());
+        }
         lock(&self.inner.provider_models).insert(provider_id.to_owned(), models);
         lock(&self.inner.composition_errors).remove(provider_id);
         Ok(())
+    }
+
+    /// Whether `provider_id` is currently sourced from built-ins, models.json,
+    /// or an extension registration. One lock per statement (see
+    /// [`Self::recompose_provider_sync`]).
+    fn is_known_provider(&self, provider_id: &str) -> bool {
+        if self.inner.builtins.contains_key(provider_id) {
+            return true;
+        }
+        if lock(&self.inner.config).get_provider(provider_id).is_some() {
+            return true;
+        }
+        lock(&self.inner.extension_providers).contains_key(provider_id)
     }
 
     fn recompose_provider_sync(&self, provider_id: &str) -> Result<(), String> {
@@ -2460,15 +2486,16 @@ mod tests {
             Ok::<(), Box<dyn std::error::Error>>(())
         })
         .await;
-        match outcome {
-            Ok(inner) => inner?,
-            Err(elapsed) => {
-                registration_abort.abort();
-                refresh_abort.abort();
-                sampler_abort.abort();
-                return Err(elapsed.into());
-            }
+        let result = match outcome {
+            Ok(inner) => inner,
+            Err(elapsed) => Err(elapsed.into()),
+        };
+        if result.is_err() {
+            registration_abort.abort();
+            refresh_abort.abort();
+            sampler_abort.abort();
         }
+        result?;
         assert!(
             !lost_after_present.load(Ordering::Relaxed),
             "registered model vanished mid-race during concurrent refresh",
@@ -2541,6 +2568,62 @@ mod tests {
         // Reload reads models_path (None here), whose empty config retires filey.
         runtime.reload_config().await?;
         assert!(runtime.get_model("filey", "filey-1").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_recompose_cannot_resurrect_unregistered_provider()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A per-provider refresh that composed from the store after the
+        // provider was unregistered (or retired by reload) must not publish
+        // the stale models back into the snapshot.
+        let store = Arc::new(InMemoryModelsStore::new());
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
+            models_store: Some(store.clone()),
+            models_config: Some(ModelsJsonConfig::empty()),
+            allow_model_network: Some(false),
+            ..CreateModelRuntimeOptions::default()
+        })
+        .await?;
+        runtime.register_provider(
+            "acme",
+            &ProviderConfigInput {
+                name: Some("Acme".to_owned()),
+                base_url: Some("https://acme.test/v1".to_owned()),
+                api: Some("openai-completions".to_owned()),
+                api_key: Some("sk-acme".to_owned()),
+                models: Some(vec![custom_model("acme", "acme-1")]),
+                ..ProviderConfigInput::default()
+            },
+        )?;
+        let model = runtime
+            .get_model("acme", "acme-1")
+            .ok_or("registered model missing")?;
+        store
+            .write(
+                "acme",
+                ModelsStoreEntry {
+                    models: vec![model],
+                    checked_at: None,
+                },
+            )
+            .await?;
+
+        runtime.unregister_provider("acme");
+        assert!(runtime.get_model("acme", "acme-1").is_none());
+
+        let result = runtime
+            .refresh(ModelsRefreshOptions {
+                allow_network: Some(false),
+                providers: Some(vec!["acme".to_owned()]),
+            })
+            .await?;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            runtime.get_model("acme", "acme-1").is_none(),
+            "stale store composition resurrected an unregistered provider"
+        );
         Ok(())
     }
 

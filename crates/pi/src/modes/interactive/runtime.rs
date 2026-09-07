@@ -4440,26 +4440,77 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
         self.active_selector = None;
         self.active_selector_kind = None;
-        self.view.focus = if self
+        self.restore_extension_focus_after_host_close();
+        self.input_state.reset_taps();
+    }
+
+    /// Hand focus back after a host surface (selector, extension dialog) closes.
+    ///
+    /// Focus and the routing token move together: a capturing extension
+    /// overlay regains `FocusArea::Overlay` and becomes the routing owner even
+    /// if it was first published while the host owned input; otherwise a
+    /// non-overlay slot that kept its token across the host's lifetime regains
+    /// `FocusArea::Widget`; otherwise the editor. Restoring a focus area without
+    /// its matching token would strand keys on a component with no router.
+    fn restore_extension_focus_after_host_close(&mut self) {
+        let overlay_key = self
             .view
             .extension_overlay_slot
             .as_ref()
-            .is_some_and(|slot| {
-                // Mirror project_extension_slot's effective-focus rule: a
-                // non-capturing overlay renders unfocused, so restoring
-                // Overlay focus would strand keys on an Ignored component.
+            .filter(|slot| {
                 slot.focusable
                     && !slot
                         .overlay_options
                         .as_ref()
                         .is_some_and(|options| options.non_capturing)
-                    && self.extension_slots.contains_key(&slot.key)
-            }) {
-            FocusArea::Overlay
-        } else {
-            FocusArea::Editor
-        };
-        self.input_state.reset_taps();
+                    && self
+                        .extension_slots
+                        .get(&slot.key)
+                        .is_some_and(|projected| projected.focusable)
+            })
+            .map(|slot| slot.key.clone());
+        if let Some(key) = overlay_key {
+            for widget in self
+                .view
+                .widgets_above
+                .iter_mut()
+                .chain(self.view.widgets_below.iter_mut())
+            {
+                widget.focused = false;
+            }
+            self.focused_extension_slot = Some(key);
+            self.view.focus = FocusArea::Overlay;
+            return;
+        }
+
+        let widget_key = self
+            .focused_extension_slot
+            .as_deref()
+            .filter(|key| {
+                self.extension_slots
+                    .get(*key)
+                    .is_some_and(|slot| slot.focusable && slot.placement != SlotPlacement::Overlay)
+            })
+            .map(str::to_owned);
+        if let Some(key) = widget_key {
+            let mut present = false;
+            for widget in self
+                .view
+                .widgets_above
+                .iter_mut()
+                .chain(self.view.widgets_below.iter_mut())
+            {
+                widget.focused = widget.slot.key == key;
+                present |= widget.focused;
+            }
+            if present {
+                self.view.focus = FocusArea::Widget;
+                return;
+            }
+            self.focused_extension_slot = None;
+        }
+
+        self.view.focus = FocusArea::Editor;
     }
 
     /// Coalesce consecutive resize events into a single [`Txn::Reanchor`].
@@ -5586,8 +5637,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     .map(|slot| self.extension_slot_owns_focus(key, slot))
             })
             .unwrap_or(false);
+        // The routing token survives the rebind when its slot is republished:
+        // project_extension_slot treats a same-key replacement whose token is
+        // still set as retaining ownership even while a host surface owns
+        // input, so the host's close can hand focus back to that slot.
+        let retained_token = self
+            .focused_extension_slot
+            .take()
+            .filter(|key| current_slots.iter().any(|slot| slot.key == *key));
         self.extension_slots.clear();
-        self.focused_extension_slot = None;
+        self.focused_extension_slot = retained_token;
         self.view.extension_overlay_slot = None;
         self.view.extension_shortcuts = shortcut_hints(&self.effective_extension_shortcuts);
         self.view.widgets_above.clear();
@@ -8130,12 +8189,13 @@ pub async fn run_interactive_mode(
     //    process's stdout fd — both handles write to the OS stream, but Tui
     //    is the sole writer of paint bytes (guard only wrote mode setup).
     let stdout_writer = stdout();
-    let viewport_height = options.viewport_height.max(1).min(size.1);
+    // Tui clamps the request into the terminal itself and retains the
+    // unclamped value so a short startup terminal can regrow the viewport.
     let tui = Tui::new(
         stdout_writer,
         ratatui::layout::Size::new(size.0, size.1),
         ratatui::layout::Position::ORIGIN,
-        viewport_height,
+        options.viewport_height,
         options.caps.clone(),
     )
     .map_err(|e| format!("tui initialization failed: {e}"))?;
@@ -11703,6 +11763,95 @@ mod tests {
             overlay_options: None,
         }));
         assert_eq!(rt.view.focus, FocusArea::Editor);
+    }
+
+    /// A capturing overlay published for the first time while a host selector
+    /// owns input never acquired the routing token. Closing the selector must
+    /// hand it both the Overlay focus area and the token, or its keys would
+    /// land on a component with no router.
+    #[tokio::test]
+    async fn first_overlay_publish_under_selector_gains_token_on_close() -> TestResult {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let (mut rt, _log) = try_make_runtime()?;
+        rt.open_selector(super::state::SelectorKind::Model).await;
+        assert_eq!(rt.view.focus, FocusArea::Selector);
+        rt.project_extension_slot(pi_ext::sanitize::sanitize_slot(&pi_ext::protocol::UiSlot {
+            key: "overlay.late".to_owned(),
+            generation: 1,
+            placement: SlotPlacement::Overlay,
+            height: 1,
+            runs: vec![vec![pi_ext::protocol::StyledRun {
+                text: "published under selector".to_owned(),
+                style: pi_ext::protocol::Style::default(),
+            }]],
+            focusable: true,
+            cursor: None,
+            overlay_options: None,
+        }));
+        assert_eq!(rt.view.focus, FocusArea::Selector);
+        assert!(
+            rt.focused_extension_slot.is_none(),
+            "a first publication must not take the token from a host surface"
+        );
+        rt.step_ui(key(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("esc through host selector failed: {error}"))?;
+        assert!(rt.active_selector_kind.is_none());
+        assert_eq!(rt.view.focus, FocusArea::Overlay);
+        assert_eq!(rt.focused_extension_slot.as_deref(), Some("overlay.late"));
+        let slot = rt
+            .extension_slots
+            .get("overlay.late")
+            .cloned()
+            .ok_or("overlay slot must stay projected")?;
+        assert!(
+            rt.extension_slot_owns_focus("overlay.late", &slot),
+            "restored overlay focus must be routable"
+        );
+        Ok(())
+    }
+
+    /// A focused non-overlay widget republished while a selector owns input
+    /// keeps its token; the selector's close must restore `Widget` focus (and
+    /// the widget's focused flag), not fall back to the editor.
+    #[tokio::test]
+    async fn selector_close_restores_preserved_widget_focus() -> TestResult {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let (mut rt, _log) = try_make_runtime()?;
+        let widget = |generation| {
+            pi_ext::sanitize::sanitize_slot(&pi_ext::protocol::UiSlot {
+                key: "widget.keep".to_owned(),
+                generation,
+                placement: SlotPlacement::AboveEditor,
+                height: 1,
+                runs: vec![vec![pi_ext::protocol::StyledRun {
+                    text: "focused widget".to_owned(),
+                    style: pi_ext::protocol::Style::default(),
+                }]],
+                focusable: true,
+                cursor: None,
+                overlay_options: None,
+            })
+        };
+        rt.project_extension_slot(widget(1));
+        assert_eq!(rt.view.focus, FocusArea::Widget);
+        rt.open_selector(super::state::SelectorKind::Model).await;
+        rt.project_extension_slot(widget(2));
+        assert_eq!(rt.view.focus, FocusArea::Selector);
+        assert_eq!(rt.focused_extension_slot.as_deref(), Some("widget.keep"));
+        rt.step_ui(key(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .map_err(|error| format!("esc through host selector failed: {error}"))?;
+        assert_eq!(rt.view.focus, FocusArea::Widget);
+        assert_eq!(rt.focused_extension_slot.as_deref(), Some("widget.keep"));
+        assert!(
+            rt.view
+                .widgets_above
+                .iter()
+                .any(|slot| slot.slot.key == "widget.keep" && slot.focused),
+            "republished widget must render focused after the selector closes"
+        );
+        Ok(())
     }
 
     /// The wire collapses every non-`Answered` outcome to identical default

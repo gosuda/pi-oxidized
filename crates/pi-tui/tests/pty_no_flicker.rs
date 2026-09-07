@@ -43,6 +43,14 @@ const HARD_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_IDLE: Duration = Duration::from_millis(300);
 const INITIAL_COLS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
+/// Whether the PTY master hands back the child's bytes verbatim. `ConPTY` is a
+/// renderer: it consumes the child's control sequences and re-synthesizes its
+/// own, so probe/sync/restore byte provenance is only observable on POSIX
+/// masters (see docs/REL-R3-conpty-witness-prototype.md §3.4/§3.6). Decoded
+/// frames and fixture side-channel counters remain the cross-platform evidence.
+const BYTE_TRANSPARENT_MASTER: bool = cfg!(not(windows));
+/// Longest raw-transcript tail included in assertion diagnostics.
+const RAW_DIAG_TAIL: usize = 4096;
 
 #[derive(Clone, Copy)]
 struct Scenario {
@@ -73,6 +81,13 @@ fn pty_no_flicker_sync_ignored_branch_single_write_no_clear() {
 fn pty_cursor_restore_after_success_abort_provider_error_panic_and_sigint() {
     for exit in ["success", "abort", "provider-error", "panic", "sigint"] {
         let report = drive_fixture(exit, true, false);
+        assert!(
+            report.finished_within_timeout,
+            "exit={exit}: fixture must terminate within the hard timeout"
+        );
+        if !BYTE_TRANSPARENT_MASTER {
+            continue;
+        }
         if exit == "panic" {
             assert_eq!(
                 report.emergency_restore_count,
@@ -237,6 +252,56 @@ fn key_matrix_linux_macos_windows_legacy_modifyotherkeys_omission() {
 #[allow(clippy::too_many_lines)]
 fn run_scenario(scenario: Scenario) {
     let report = drive_fixture(scenario.exit, scenario.sync, true);
+
+    assert!(
+        report.resize_count >= 20,
+        "{}: expected >=20 resizes, got {}",
+        scenario.name,
+        report.resize_count
+    );
+    assert!(
+        report.paste_count > 0,
+        "{}: fixture must observe paste (paste_count={})",
+        scenario.name,
+        report.paste_count
+    );
+    assert!(
+        report.cursor_moves > 0,
+        "{}: fixture must observe cursor movement (cursor_moves={})",
+        scenario.name,
+        report.cursor_moves
+    );
+    assert!(
+        report.saw_plugin_frame,
+        "{}: plugin frames must appear",
+        scenario.name
+    );
+    assert!(
+        report.saw_stream_and_tools,
+        "{}: long stream + tool updates required",
+        scenario.name
+    );
+    assert!(
+        report.continuous_content,
+        "{}: content must remain continuous across resizes",
+        scenario.name
+    );
+    assert!(
+        report.finished_within_timeout,
+        "{}: hard draw/run timeout exceeded",
+        scenario.name
+    );
+    let text = report.final_vt_text.join("\n");
+    assert!(
+        text.contains("STATUS") || text.contains("FOOTER") || text.contains("DONE"),
+        "{}: avt final view missing fixture content: {text:?}",
+        scenario.name
+    );
+
+    if !BYTE_TRANSPARENT_MASTER {
+        return;
+    }
+
     let audit = audit_bytes(&report.raw);
 
     assert_eq!(audit.clear_2j, 0, "{}: CSI 2J forbidden", scenario.name);
@@ -299,46 +364,8 @@ fn run_scenario(scenario: Scenario) {
         scenario.name
     );
     assert!(
-        report.continuous_content,
-        "{}: content must remain continuous across resizes",
-        scenario.name
-    );
-    assert!(
         report.no_blank_frame,
         "{}: intermediate blank frames are forbidden",
-        scenario.name
-    );
-    assert!(
-        report.resize_count >= 20,
-        "{}: expected >=20 resizes, got {}",
-        scenario.name,
-        report.resize_count
-    );
-    assert!(
-        report.paste_count > 0,
-        "{}: fixture must observe paste (paste_count={})",
-        scenario.name,
-        report.paste_count
-    );
-    assert!(
-        report.cursor_moves > 0,
-        "{}: fixture must observe cursor movement (cursor_moves={})",
-        scenario.name,
-        report.cursor_moves
-    );
-    assert!(
-        report.saw_plugin_frame,
-        "{}: plugin frames must appear",
-        scenario.name
-    );
-    assert!(
-        report.saw_stream_and_tools,
-        "{}: long stream + tool updates required",
-        scenario.name
-    );
-    assert!(
-        report.finished_within_timeout,
-        "{}: hard draw/run timeout exceeded",
         scenario.name
     );
     assert!(
@@ -349,13 +376,6 @@ fn run_scenario(scenario: Scenario) {
     assert!(
         report.txn_count > 0,
         "{}: expected instrumented stage-3 transactions",
-        scenario.name
-    );
-
-    let text = report.final_vt_text.join("\n");
-    assert!(
-        text.contains("STATUS") || text.contains("FOOTER") || text.contains("DONE"),
-        "{}: avt final view missing fixture content: {text:?}",
         scenario.name
     );
 }
@@ -703,8 +723,9 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
         live_paste,
         Some(expected_live_paste),
         "expected exactly {expected_live_paste} live paste after readiness, got {live_paste:?} \
-         (live_cursor={live_cursor:?}, live_text={live_text:?}, raw={})",
-        String::from_utf8_lossy(&raw)
+         (live_cursor={live_cursor:?}, live_text={live_text:?}, raw_len={}, raw_tail={})",
+        raw.len(),
+        String::from_utf8_lossy(&raw[raw.len().saturating_sub(RAW_DIAG_TAIL)..])
             .escape_default()
             .collect::<String>()
     );
