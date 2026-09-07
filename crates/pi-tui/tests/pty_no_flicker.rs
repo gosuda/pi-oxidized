@@ -694,14 +694,24 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
     // and exact — a missing or malformed record is never a successful zero.
     let live_paste = parse_sidechannel_u32(&raw, b"PI_TUI_LIVE_PASTE=");
     let live_cursor = parse_sidechannel_u32(&raw, b"PI_TUI_LIVE_CURSOR=");
+    let live_text = parse_sidechannel_text(&raw, b"PI_TUI_LIVE_TEXT=");
+    // ConPTY re-synthesizes master writes as key records: the bracketed-paste
+    // markers are dropped and the payload is delivered as character presses,
+    // so on Windows the live witness is the pasted text, not a Paste event.
+    let expected_live_paste = u32::from(!cfg!(windows));
     assert_eq!(
         live_paste,
-        Some(1),
-        "expected exactly one live paste after readiness, got {live_paste:?} \
-         (live_cursor={live_cursor:?}, raw={})",
+        Some(expected_live_paste),
+        "expected exactly {expected_live_paste} live paste after readiness, got {live_paste:?} \
+         (live_cursor={live_cursor:?}, live_text={live_text:?}, raw={})",
         String::from_utf8_lossy(&raw)
             .escape_default()
             .collect::<String>()
+    );
+    let live_text = live_text.unwrap_or_else(|| panic!("missing live text record"));
+    assert!(
+        live_text.contains("PASTED-BLOCK-line1") && live_text.contains("line2"),
+        "expected the pasted payload to reach the fixture after readiness, got {live_text:?}"
     );
     assert_eq!(
         live_cursor,
@@ -932,6 +942,15 @@ fn parse_sidechannel_u32(raw: &[u8], key: &[u8]) -> Option<u32> {
         return None;
     }
     std::str::from_utf8(&raw[start..end]).ok()?.parse().ok()
+}
+
+fn parse_sidechannel_text(raw: &[u8], key: &[u8]) -> Option<String> {
+    let pos = find_subslice(raw, key)?;
+    let start = pos + key.len();
+    let len = raw[start..].iter().position(|byte| *byte == b'\x07')?;
+    std::str::from_utf8(&raw[start..start + len])
+        .ok()
+        .map(str::to_owned)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {

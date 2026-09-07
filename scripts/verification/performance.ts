@@ -2639,9 +2639,11 @@ if (import.meta.main) {
 		if (failure instanceof NoiseRejection) {
 			// Shared CI runners cannot meet lab-grade spread limits; record the
 			// rejection as an advisory warning there instead of failing the
-			// row. Local runs keep the strict gate.
+			// row. Local runs keep the strict gate. Only the noise verdict is
+			// downgraded: threshold blockers evaluated before the throw still fail.
 			if (isSharedCiEnvironment(process.env)) {
-				artifact.pass = true;
+				const blocked = artifact.blockers.length > 0;
+				artifact.pass = !blocked;
 				artifact.noise = {
 					rejections: failure.noisy,
 					remediation: REMEDIATION_LADDER,
@@ -2651,7 +2653,10 @@ if (import.meta.main) {
 				process.stderr.write(
 					`check 9 noise advisory (non-fatal on CI):\n${formatNoiseRejection(failure.noisy)}\nartifact: ${ARTIFACT_PATH}\n`,
 				);
-				process.exitCode = 0;
+				if (blocked) {
+					process.stderr.write(`check 9 failed:\n${artifact.blockers.join("\n")}\nartifact: ${ARTIFACT_PATH}\n`);
+				}
+				process.exitCode = blocked ? 1 : 0;
 			} else {
 				artifact.pass = false;
 				artifact.noise = {

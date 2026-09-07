@@ -21,6 +21,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use pi_tui::component::{Component, EventResult, UiEvent};
 use pi_tui::keys::{
     KeyId, MODIFY_OTHER_KEYS_OMISSION, key_matches, key_press, set_kitty_protocol_active,
+    should_dispatch_key_event,
 };
 use pi_tui::terminal::{
     ProbeSession, ReanchorCause, SettledBlock, TerminalCapabilities, TerminalGuard, TerminalInput,
@@ -180,6 +181,11 @@ impl Component for FixtureRoot {
                 EventResult::Render
             }
             UiEvent::Key(key) => {
+                // Same release filter as the product runtime: ConPTY and kitty
+                // both report key-up records, which are not input.
+                if !should_dispatch_key_event(key, false) {
+                    return EventResult::Ignored;
+                }
                 if key_matches(key, &KeyId::from("left"))
                     || key_matches(key, &KeyId::from("right"))
                     || key_matches(key, &KeyId::from("up"))
@@ -606,6 +612,7 @@ async fn run_fixture(
         // observed INPUT_READY — never the scripted fallback counts above.
         let paste_baseline = root.paste_count;
         let cursor_baseline = root.cursor_moves;
+        let editor_baseline = root.editor.len();
         {
             let mut out = io::stdout();
             out.write_all(b"\x1b]999;PI_TUI_INPUT_READY=1\x07")?;
@@ -619,6 +626,11 @@ async fn run_fixture(
             root.cursor_moves
                 .checked_sub(cursor_baseline)
                 .ok_or_else(|| io::Error::other("live cursor counter decreased"))?,
+            root.editor
+                .get(editor_baseline..)
+                .ok_or_else(|| io::Error::other("live editor text shrank"))?
+                .escape_default()
+                .collect::<String>(),
         ));
     }
 
@@ -634,16 +646,16 @@ async fn run_fixture(
             root.cursor_moves,
             root.resize_count
         );
-        if let Some((live_paste, live_cursor)) = live {
+        if let Some((live_paste, live_cursor, live_text)) = live {
             let _ = write!(
                 summary,
-                "\x1b]999;PI_TUI_LIVE_PASTE={live_paste}\x07\x1b]999;PI_TUI_LIVE_CURSOR={live_cursor}\x07"
+                "\x1b]999;PI_TUI_LIVE_PASTE={live_paste}\x07\x1b]999;PI_TUI_LIVE_CURSOR={live_cursor}\x07\x1b]999;PI_TUI_LIVE_TEXT={live_text}\x07"
             );
-            // Windows CI diagnostic: when no live paste was observed, publish
-            // the bounded escaped trace of every UiEvent received during the
-            // serve phase so the harness log shows exactly what arrived.
+            // Windows CI diagnostic: when neither a paste event nor its payload
+            // arrived as keystrokes, publish the bounded escaped trace of every
+            // UiEvent received during the serve phase.
             #[cfg(windows)]
-            if live_paste == 0 {
+            if live_paste == 0 && !live_text.contains("PASTED-BLOCK") {
                 let _ = write!(
                     summary,
                     "\x1b]999;PI_TUI_LIVE_TRACE={}\x07",
