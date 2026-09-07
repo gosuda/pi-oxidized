@@ -35,13 +35,6 @@ import {
 	type Frame,
 	type FrameHandler,
 	type Method,
-	type ProviderBeforePayloadRequest,
-	type ProviderBeforePayloadResponse,
-	type ProviderCallbackFlags,
-	type ProviderDeferredHandle,
-	type ProviderOnResponseRequest,
-	type ProviderOnResponseResponse,
-	type ProviderResponseWire,
 	PROTOCOL_VERSION,
 	ProtocolClient,
 } from "./protocol.ts";
@@ -55,7 +48,6 @@ import {
 	type LeanExtension,
 	type LeanFlag,
 	type LeanProvider,
-	type LeanProviderOptions,
 	type LeanShortcut,
 	type LeanTool,
 	parseLeanExtension,
@@ -105,124 +97,6 @@ interface RegisteredHook {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-const LEAN_PROVIDER_FETCH_DEFERRED_METHOD = "provider.fetchDeferred";
-const LEAN_PROVIDER_CANCEL_DEFERRED_METHOD = "provider.cancelDeferred";
-const LEAN_PROVIDER_BEFORE_PAYLOAD_METHOD = "provider.beforePayload";
-const LEAN_PROVIDER_ON_RESPONSE_METHOD = "provider.onResponse";
-const LEAN_PROVIDER_CALLBACK_TIMEOUT_MS = 30_000;
-
-type LeanProviderCallbackScope = {
-	readonly callId: string;
-	readonly requestId: number;
-	readonly providerId: string;
-	readonly model: unknown;
-	readonly controller: AbortController;
-	readonly callbacks: ProviderCallbackFlags;
-	closed: boolean;
-	callbackFailed: boolean;
-	callbackError?: unknown;
-};
-
-function leanResponseHeadersWire(value: unknown): Record<string, string> {
-	if (value === null || value === undefined) throw new Error("provider response headers are required");
-	const headers: Record<string, string> = {};
-	if (typeof value !== "object" || value === null) {
-		throw new Error("provider response headers must be Headers or an object");
-	}
-	const objectValue = value as { forEach?: unknown; [Symbol.iterator]?: unknown };
-	if (typeof objectValue.forEach === "function") {
-		(objectValue.forEach as (callback: (entry: unknown, name: string) => void) => void).call(
-			value,
-			(entry, name) => { headers[String(name)] = String(entry); },
-		);
-		return headers;
-	}
-	if (typeof objectValue[Symbol.iterator] === "function") {
-		const iterable = value as Iterable<unknown>;
-		for (const item of iterable) {
-			if (!Array.isArray(item) || item.length !== 2) continue;
-			headers[String(item[0])] = String(item[1]);
-		}
-		return headers;
-	}
-	for (const [name, entry] of Object.entries(value)) {
-		if (entry === undefined || entry === null) continue;
-		headers[name] = Array.isArray(entry)
-			? entry.map((part) => String(part)).join(", ")
-			: String(entry);
-	}
-	return headers;
-}
-
-function leanProviderResponseWire(value: unknown): ProviderResponseWire {
-	if (!isRecord(value) || typeof value["status"] !== "number" || !Number.isFinite(value["status"])) {
-		throw new Error("provider response status must be a finite number");
-	}
-	return { status: value["status"], headers: leanResponseHeadersWire(value["headers"]) };
-}
-
-function leanCallbackErrorEvent(
-	model: unknown,
-	providerId: string,
-	message: string,
-): Record<string, unknown> {
-	const modelRecord = isRecord(model) ? model : {};
-	const api = typeof modelRecord["api"] === "string" ? modelRecord["api"] : "custom";
-	const provider = typeof modelRecord["provider"] === "string"
-		? modelRecord["provider"]
-		: providerId;
-	const modelId = typeof modelRecord["id"] === "string" ? modelRecord["id"] : "";
-	return {
-		type: "error",
-		reason: "error",
-		error: {
-			role: "assistant",
-			content: [],
-			api,
-			provider,
-			model: modelId,
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "error",
-			errorMessage: message,
-			timestamp: Date.now(),
-		},
-	};
-}
-
-function requireLeanDeferredHandle(value: unknown): asserts value is ProviderDeferredHandle {
-	if (!isRecord(value)
-		|| typeof value["provider"] !== "string"
-		|| typeof value["modelId"] !== "string"
-		|| typeof value["api"] !== "string"
-		|| typeof value["id"] !== "string"
-		|| (value["expiresAt"] !== undefined
-			&& (typeof value["expiresAt"] !== "number" || !Number.isFinite(value["expiresAt"])))
-		|| (value["pollAfterMs"] !== undefined
-			&& (typeof value["pollAfterMs"] !== "number" || !Number.isFinite(value["pollAfterMs"])))) {
-		throw new Error("provider deferred handle is invalid");
-	}
-}
-function leanProviderCallbackFlags(value: unknown): ProviderCallbackFlags {
-	if (value === undefined) return { beforePayload: false, onResponse: false };
-	if (!isRecord(value)) throw new Error("provider callbacks must be an object");
-	if (value["beforePayload"] !== undefined && typeof value["beforePayload"] !== "boolean") {
-		throw new Error("provider callbacks.beforePayload must be a boolean");
-	}
-	if (value["onResponse"] !== undefined && typeof value["onResponse"] !== "boolean") {
-		throw new Error("provider callbacks.onResponse must be a boolean");
-	}
-	return {
-		beforePayload: value["beforePayload"] === true,
-		onResponse: value["onResponse"] === true,
-	};
 }
 
 
@@ -1039,12 +913,6 @@ export class LeanRunner {
 	private readonly inFlightTools = new Map<number, AbortController>();
 	/** In-flight provider.stream AbortControllers keyed by request id. */
 	private readonly inFlightProviders = new Map<number, AbortController>();
-	/** In-flight deferred fetch calls cancellable by provider.cancel. */
-	private readonly inFlightDeferredFetches = new Map<number, AbortController>();
-	/** Durable deferred-cancel operations, aborted only when the endpoint closes. */
-	private readonly inFlightDeferredCancels = new Map<number, AbortController>();
-	/** Endpoint-local native callback scopes keyed by originating call id. */
-	private readonly providerCallbackScopes = new Map<string, LeanProviderCallbackScope>();
 	/** Active shortcut handlers keyed by their resolved shortcut key. */
 	private readonly inFlightShortcuts = new Map<string, AbortController>();
 	/** System prompt mirrored from `session.update` control events. */
@@ -1274,9 +1142,6 @@ export class LeanRunner {
 				description: tool.description,
 				parameters: tool.parameters ?? {},
 			};
-			if (tool.constrainedSampling !== undefined) {
-				entry["constrainedSampling"] = tool.constrainedSampling;
-			}
 			if (tool.executionMode !== undefined) {
 				entry["executionMode"] = tool.executionMode;
 			}
@@ -1317,8 +1182,6 @@ export class LeanRunner {
 				streamSimple: typeof provider.streamSimple === "function",
 				extensionPath,
 			};
-			if (typeof provider.fetchDeferred === "function") entry["fetchDeferred"] = true;
-			if (typeof provider.cancelDeferred === "function") entry["cancelDeferred"] = true;
 			if (provider.baseUrl !== undefined) entry["baseUrl"] = provider.baseUrl;
 			if (provider.api !== undefined) entry["api"] = provider.api;
 			if (provider.displayName !== undefined) entry["displayName"] = provider.displayName;
@@ -1373,12 +1236,6 @@ export class LeanRunner {
 				return;
 			case "provider.stream":
 				await this.handleProviderStream(id, p);
-				return;
-			case LEAN_PROVIDER_FETCH_DEFERRED_METHOD:
-				await this.handleProviderFetchDeferred(id, p);
-				return;
-			case LEAN_PROVIDER_CANCEL_DEFERRED_METHOD:
-				await this.handleProviderCancelDeferred(id, p);
 				return;
 			case "flags.set":
 				await this.handleFlagsSet(id, p);
@@ -1580,435 +1437,49 @@ export class LeanRunner {
 		}
 	}
 
-	private registerProviderCallbackScope(
-		id: number,
-		p: Record<string, unknown>,
-		controller: AbortController,
-		options: Record<string, unknown>,
-	): { scope: LeanProviderCallbackScope | undefined; options: LeanProviderOptions } {
-		const callbacks = leanProviderCallbackFlags(p["callbacks"]);
-		if (!callbacks.beforePayload && !callbacks.onResponse) {
-			return { scope: undefined, options: options as LeanProviderOptions };
-		}
-		const callId = String(id);
-		if (this.providerCallbackScopes.has(callId)) {
-			throw new Error(`provider callback scope already exists: ${callId}`);
-		}
-		const scope: LeanProviderCallbackScope = {
-			callId,
-			requestId: id,
-			providerId: typeof p["providerId"] === "string"
-				? p["providerId"]
-				: typeof p["name"] === "string" ? p["name"] : "",
-			model: p["model"],
-			controller,
-			callbacks,
-			closed: false,
-			callbackFailed: false,
-		};
-		this.providerCallbackScopes.set(callId, scope);
-		controller.signal.addEventListener("abort", () => {
-			this.closeProviderCallbackScope(scope);
-		}, { once: true });
-		const scopedOptions = { ...options };
-		if (callbacks.beforePayload) {
-			scopedOptions["onPayload"] = (payload: unknown) =>
-				this.invokeProviderBeforePayload(scope, payload);
-		}
-		if (callbacks.onResponse) {
-			scopedOptions["onResponse"] = (response: unknown) =>
-				this.invokeProviderOnResponse(scope, response);
-		}
-		return { scope, options: scopedOptions as LeanProviderOptions };
-	}
-
-	private closeProviderCallbackScope(scope: LeanProviderCallbackScope): void {
-		if (scope.closed) return;
-		scope.closed = true;
-		if (this.providerCallbackScopes.get(scope.callId) === scope) {
-			this.providerCallbackScopes.delete(scope.callId);
-		}
-	}
-
-	private closeProviderCallbackScopeForRequest(requestId: number): void {
-		for (const scope of this.providerCallbackScopes.values()) {
-			if (scope.requestId === requestId) this.closeProviderCallbackScope(scope);
-		}
-	}
-
-	private requireProviderCallbackScope(scope: LeanProviderCallbackScope): void {
-		if (scope.closed || this.providerCallbackScopes.get(scope.callId) !== scope) {
-			throw new Error(`provider callback scope is closed: ${scope.callId}`);
-		}
-		if (scope.controller.signal.aborted) {
-			throw new Error(`provider callback scope aborted: ${scope.callId}`);
-		}
-	}
-
-	private async invokeProviderBeforePayload(
-		scope: LeanProviderCallbackScope,
-		payload: unknown,
-	): Promise<unknown> {
-		try {
-			this.requireProviderCallbackScope(scope);
-			const request: ProviderBeforePayloadRequest = { callId: scope.callId, payload };
-			const frame = await this.client.request(
-				LEAN_PROVIDER_BEFORE_PAYLOAD_METHOD,
-				request,
-				{ signal: scope.controller.signal, timeoutMs: LEAN_PROVIDER_CALLBACK_TIMEOUT_MS },
-			);
-			if (frame.method !== LEAN_PROVIDER_BEFORE_PAYLOAD_METHOD || !isRecord(frame.payload)
-				|| !Object.hasOwn(frame.payload, "payload")) {
-				throw new Error("provider.beforePayload response must contain payload");
-			}
-			const response: ProviderBeforePayloadResponse = { payload: frame.payload["payload"] };
-			return response.payload;
-		} catch (error) {
-			if (!scope.callbackFailed) scope.callbackError = error;
-			scope.callbackFailed = true;
-			this.closeProviderCallbackScope(scope);
-			throw error;
-		}
-	}
-
-	private async invokeProviderOnResponse(
-		scope: LeanProviderCallbackScope,
-		response: unknown,
-	): Promise<void> {
-		try {
-			this.requireProviderCallbackScope(scope);
-			const request: ProviderOnResponseRequest = {
-				callId: scope.callId,
-				response: leanProviderResponseWire(response),
-			};
-			const frame = await this.client.request(
-				LEAN_PROVIDER_ON_RESPONSE_METHOD,
-				request,
-				{ signal: scope.controller.signal, timeoutMs: LEAN_PROVIDER_CALLBACK_TIMEOUT_MS },
-			);
-			if (frame.method !== LEAN_PROVIDER_ON_RESPONSE_METHOD || !isRecord(frame.payload)) {
-				throw new Error("provider.onResponse response must be an object");
-			}
-			const _ack: ProviderOnResponseResponse = {};
-			void _ack;
-		} catch (error) {
-			if (!scope.callbackFailed) scope.callbackError = error;
-			scope.callbackFailed = true;
-			this.closeProviderCallbackScope(scope);
-			throw error;
-		}
-	}
-
-	private async emitProviderCallbackError(
-		id: number,
-		method: string,
-		scope: LeanProviderCallbackScope,
-		error: unknown,
-	): Promise<void> {
-		const message = error instanceof Error ? error.message : String(error);
-		await this.client.send({
-			id,
-			kind: "event",
-			method: "providerEvent",
-			payload: leanCallbackErrorEvent(scope.model, scope.providerId, message),
-		});
-		await this.client.respond(id, method, {});
-	}
-
 	private async handleProviderStream(id: number, p: Record<string, unknown>): Promise<void> {
 		const providerId = String(p["providerId"] ?? p["name"] ?? "");
 		const registered = this.providers.get(providerId);
 		if (registered === undefined || typeof registered.provider.streamSimple !== "function") {
-			await this.client.respondError(id, "provider.stream", {
+			await this.client.respondError(id, "provider.stream" as Method, {
 				code: "not_found",
 				message: `Provider not found or missing streamSimple: ${providerId}`,
 				retryable: false,
 			});
 			return;
 		}
-		const rawOptions = p["options"];
-		if (rawOptions !== undefined && !isRecord(rawOptions)) {
-			await this.client.respondError(id, "provider.stream", {
-				code: "invalid_arguments",
-				message: "provider.stream options must be an object",
-				retryable: false,
-			});
-			return;
-		}
-		try {
-			leanProviderCallbackFlags(p["callbacks"]);
-		} catch (error) {
-			await this.client.respondError(id, "provider.stream", {
-				code: "invalid_arguments",
-				message: error instanceof Error ? error.message : String(error),
-				retryable: false,
-			});
-			return;
-		}
+
 		const controller = new AbortController();
 		this.inFlightProviders.set(id, controller);
-		let scope: LeanProviderCallbackScope | undefined;
+		const options = {
+			...(isRecord(p["options"]) ? p["options"] : {}),
+			signal: controller.signal,
+		};
 		try {
-			const options: Record<string, unknown> = {
-				...(isRecord(rawOptions) ? rawOptions : {}),
-				signal: controller.signal,
-			};
-			const callbackSetup = this.registerProviderCallbackScope(id, p, controller, options);
-			scope = callbackSetup.scope;
-			const stream = registered.provider.streamSimple(
-				p["model"],
-				p["context"],
-				callbackSetup.options,
-			);
+			const stream = registered.provider.streamSimple(p["model"], p["context"], options);
 			for await (const event of stream) {
 				if (controller.signal.aborted) break;
 				await this.client.send({ id, kind: "event", method: "providerEvent", payload: event });
 			}
-			if (!controller.signal.aborted && scope?.callbackFailed) {
-				await this.emitProviderCallbackError(id, "provider.stream", scope, scope.callbackError);
-				return;
-			}
 			if (controller.signal.aborted) {
-				await this.client.respondError(id, "provider.stream", {
+				await this.client.respondError(id, "provider.stream" as Method, {
 					code: "cancelled",
 					message: "provider stream cancelled",
 					retryable: false,
 				});
 				return;
 			}
-			await this.client.respond(id, "provider.stream", {});
-		} catch (error) {
-			const cancelled = controller.signal.aborted || isStructuredAbortError(error);
-			const message = error instanceof Error ? error.message : String(error);
-			if (!cancelled && scope?.callbackFailed) {
-				await this.emitProviderCallbackError(id, "provider.stream", scope, scope.callbackError);
-				return;
-			}
-			await this.client.respondError(id, "provider.stream", {
+			await this.client.respond(id, "provider.stream" as Method, {});
+		} catch (err) {
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
+			const message = err instanceof Error ? err.message : String(err);
+			await this.client.respondError(id, "provider.stream" as Method, {
 				code: cancelled ? "cancelled" : "extension_error",
 				message: cancelled ? "provider stream cancelled" : message,
 				retryable: false,
 			});
 		} finally {
-			if (scope !== undefined) this.closeProviderCallbackScope(scope);
 			this.inFlightProviders.delete(id);
-		}
-	}
-
-	private async handleProviderFetchDeferred(id: number, p: Record<string, unknown>): Promise<void> {
-		const providerId = p["providerId"];
-		const registered = typeof providerId === "string" ? this.providers.get(providerId) : undefined;
-		if (typeof providerId !== "string" || registered === undefined) {
-			await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
-				code: "not_found",
-				message: `Provider not found: ${String(providerId ?? "")}`,
-				retryable: false,
-			});
-			return;
-		}
-		if (typeof registered.provider.fetchDeferred !== "function") {
-			await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
-				code: "unsupported_deferred_operation",
-				message: `Provider does not support deferred fetch: ${providerId}`,
-				retryable: false,
-			});
-			return;
-		}
-		const model = p["model"];
-		const rawOptions = p["options"];
-		const rawHandle: unknown = p["handle"];
-		let handle: ProviderDeferredHandle;
-		try {
-			requireLeanDeferredHandle(rawHandle);
-			handle = rawHandle;
-		} catch (error) {
-			await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
-				code: "invalid_arguments",
-				message: error instanceof Error ? error.message : String(error),
-				retryable: false,
-			});
-			return;
-		}
-		if (!isRecord(model) || (rawOptions !== undefined && !isRecord(rawOptions))) {
-			await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
-				code: "invalid_arguments",
-				message: "provider.fetchDeferred model/options are invalid",
-				retryable: false,
-			});
-			return;
-		}
-		try {
-			leanProviderCallbackFlags(p["callbacks"]);
-		} catch (error) {
-			await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
-				code: "invalid_arguments",
-				message: error instanceof Error ? error.message : String(error),
-				retryable: false,
-			});
-			return;
-		}
-		const controller = new AbortController();
-		this.inFlightDeferredFetches.set(id, controller);
-		let scope: LeanProviderCallbackScope | undefined;
-		try {
-			const options: Record<string, unknown> = {
-				...(isRecord(rawOptions) ? rawOptions : {}),
-				wait: 0,
-				signal: controller.signal,
-			};
-			const callbackSetup = this.registerProviderCallbackScope(id, p, controller, options);
-			scope = callbackSetup.scope;
-			const stream = registered.provider.fetchDeferred(
-				model,
-				handle,
-				callbackSetup.options,
-			);
-			for await (const event of stream) {
-				if (controller.signal.aborted) break;
-				await this.client.send({ id, kind: "event", method: "providerEvent", payload: event });
-			}
-			if (!controller.signal.aborted && scope?.callbackFailed) {
-				await this.emitProviderCallbackError(
-					id,
-					LEAN_PROVIDER_FETCH_DEFERRED_METHOD,
-					scope,
-					scope.callbackError,
-				);
-				return;
-			}
-			if (controller.signal.aborted) {
-				await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
-					code: "cancelled",
-					message: "provider deferred fetch cancelled",
-					retryable: false,
-				});
-				return;
-			}
-			await this.client.respond(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {});
-		} catch (error) {
-			const cancelled = controller.signal.aborted || isStructuredAbortError(error);
-			const message = error instanceof Error ? error.message : String(error);
-			if (!cancelled && scope?.callbackFailed) {
-				await this.emitProviderCallbackError(
-					id,
-					LEAN_PROVIDER_FETCH_DEFERRED_METHOD,
-					scope,
-					scope.callbackError,
-				);
-				return;
-			}
-			await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
-				code: cancelled ? "cancelled" : "extension_error",
-				message: cancelled ? "provider deferred fetch cancelled" : message,
-				retryable: false,
-			});
-		} finally {
-			if (scope !== undefined) this.closeProviderCallbackScope(scope);
-			this.inFlightDeferredFetches.delete(id);
-		}
-	}
-
-	private async handleProviderCancelDeferred(id: number, p: Record<string, unknown>): Promise<void> {
-		const providerId = p["providerId"];
-		const registered = typeof providerId === "string" ? this.providers.get(providerId) : undefined;
-		if (typeof providerId !== "string" || registered === undefined) {
-			await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
-				code: "not_found",
-				message: `Provider not found: ${String(providerId ?? "")}`,
-				retryable: false,
-			});
-			return;
-		}
-		if (typeof registered.provider.cancelDeferred !== "function") {
-			await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
-				code: "unsupported_deferred_operation",
-				message: `Provider does not support deferred cancellation: ${providerId}`,
-				retryable: false,
-			});
-			return;
-		}
-		const model = p["model"];
-		const rawOptions = p["options"];
-		const rawHandle: unknown = p["handle"];
-		let handle: ProviderDeferredHandle;
-		try {
-			requireLeanDeferredHandle(rawHandle);
-			handle = rawHandle;
-		} catch (error) {
-			await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
-				code: "invalid_arguments",
-				message: error instanceof Error ? error.message : String(error),
-				retryable: false,
-			});
-			return;
-		}
-		if (!isRecord(model) || (rawOptions !== undefined && !isRecord(rawOptions))) {
-			await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
-				code: "invalid_arguments",
-				message: "provider.cancelDeferred model/options are invalid",
-				retryable: false,
-			});
-			return;
-		}
-		try {
-			leanProviderCallbackFlags(p["callbacks"]);
-		} catch (error) {
-			await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
-				code: "invalid_arguments",
-				message: error instanceof Error ? error.message : String(error),
-				retryable: false,
-			});
-			return;
-		}
-		const controller = new AbortController();
-		this.inFlightDeferredCancels.set(id, controller);
-		let scope: LeanProviderCallbackScope | undefined;
-		try {
-			const options: Record<string, unknown> = {
-				...(isRecord(rawOptions) ? rawOptions : {}),
-				signal: controller.signal,
-			};
-			const callbackSetup = this.registerProviderCallbackScope(id, p, controller, options);
-			scope = callbackSetup.scope;
-			await registered.provider.cancelDeferred(model, handle, callbackSetup.options);
-			if (!controller.signal.aborted && scope?.callbackFailed) {
-				await this.emitProviderCallbackError(
-					id,
-					LEAN_PROVIDER_CANCEL_DEFERRED_METHOD,
-					scope,
-					scope.callbackError,
-				);
-				return;
-			}
-			if (controller.signal.aborted) {
-				await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
-					code: "cancelled",
-					message: "provider deferred cancellation cancelled",
-					retryable: false,
-				});
-				return;
-			}
-			await this.client.respond(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {});
-		} catch (error) {
-			const cancelled = controller.signal.aborted || isStructuredAbortError(error);
-			const message = error instanceof Error ? error.message : String(error);
-			if (!cancelled && scope?.callbackFailed) {
-				await this.emitProviderCallbackError(
-					id,
-					LEAN_PROVIDER_CANCEL_DEFERRED_METHOD,
-					scope,
-					scope.callbackError,
-				);
-				return;
-			}
-			await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
-				code: cancelled ? "cancelled" : "extension_error",
-				message: cancelled ? "provider deferred cancellation cancelled" : message,
-				retryable: false,
-			});
-		} finally {
-			if (scope !== undefined) this.closeProviderCallbackScope(scope);
-			this.inFlightDeferredCancels.delete(id);
 		}
 	}
 
@@ -2467,10 +1938,8 @@ export class LeanRunner {
 		if (!isRecord(payload)) return;
 		const requestId = typeof payload["id"] === "number" ? payload["id"] : undefined;
 		if (requestId === undefined) return;
-		this.closeProviderCallbackScopeForRequest(requestId);
 		this.inFlightTools.get(requestId)?.abort();
 		this.inFlightProviders.get(requestId)?.abort();
-		this.inFlightDeferredFetches.get(requestId)?.abort();
 	}
 
 	private emitExtensionError(path: string, event: string, message: string): void {
@@ -2508,12 +1977,6 @@ export class LeanRunner {
 		this.inFlightTools.clear();
 		for (const controller of this.inFlightProviders.values()) controller.abort();
 		this.inFlightProviders.clear();
-		for (const controller of this.inFlightDeferredFetches.values()) controller.abort();
-		this.inFlightDeferredFetches.clear();
-		for (const controller of this.inFlightDeferredCancels.values()) controller.abort();
-		this.inFlightDeferredCancels.clear();
-		for (const scope of this.providerCallbackScopes.values()) this.closeProviderCallbackScope(scope);
-		this.providerCallbackScopes.clear();
 		for (const controller of this.inFlightShortcuts.values()) controller.abort();
 		this.inFlightShortcuts.clear();
 		this.client.dispose(reason);
