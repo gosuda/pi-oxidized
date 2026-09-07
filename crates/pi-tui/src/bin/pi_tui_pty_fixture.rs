@@ -13,6 +13,7 @@ use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use pi_tui::component::{Component, EventResult, UiEvent};
 use pi_tui::keys::{
     KeyId, MODIFY_OTHER_KEYS_OMISSION, key_matches, key_press, set_kitty_protocol_active,
+    should_dispatch_key_event,
 };
 use pi_tui::terminal::{
     ProbeSession, ReanchorCause, SettledBlock, TerminalCapabilities, TerminalGuard, TerminalInput,
@@ -66,6 +68,10 @@ struct FixtureRoot {
     cursor_moves: u32,
     resize_count: u32,
     generation: u64,
+    /// Windows CI diagnostic: bounded escaped Debug trace of live `UiEvent`s
+    /// received during the serve phase.
+    #[cfg(windows)]
+    live_trace: Vec<String>,
 }
 
 impl FixtureRoot {
@@ -80,7 +86,36 @@ impl FixtureRoot {
             cursor_moves: 0,
             resize_count: 0,
             generation: 0,
+            #[cfg(windows)]
+            live_trace: Vec::new(),
         }
+    }
+
+    /// Records one received live event as an escaped, bounded Debug string.
+    /// `escape_default` guarantees no raw control bytes can enter the OSC
+    /// payload. Overlong entries and an over-capacity trace each get an
+    /// explicit truncation marker.
+    #[cfg(windows)]
+    fn record_live_event(&mut self, event: &UiEvent) {
+        const MAX_ENTRIES: usize = 128;
+        const MAX_CHARS: usize = 512;
+        const ENTRY_TRUNC: &str = "...ENTRY_TRUNCATED";
+        if self.live_trace.len() >= MAX_ENTRIES {
+            if let Some(last) = self.live_trace.last_mut() {
+                *last = "PI_TUI_LIVE_TRACE_TRUNCATED".to_string();
+            }
+            return;
+        }
+        // Escaped output is pure ASCII, so byte cuts stay on char boundaries.
+        let mut escaped: String = format!("{event:?}")
+            .escape_default()
+            .take(MAX_CHARS + 1)
+            .collect();
+        if escaped.len() > MAX_CHARS {
+            escaped.truncate(MAX_CHARS - ENTRY_TRUNC.len());
+            escaped.push_str(ENTRY_TRUNC);
+        }
+        self.live_trace.push(escaped);
     }
 
     fn lines(&self, width: u16) -> Vec<String> {
@@ -146,6 +181,11 @@ impl Component for FixtureRoot {
                 EventResult::Render
             }
             UiEvent::Key(key) => {
+                // Same release filter as the product runtime: ConPTY and kitty
+                // both report key-up records, which are not input.
+                if !should_dispatch_key_event(key, false) {
+                    return EventResult::Ignored;
+                }
                 if key_matches(key, &KeyId::from("left"))
                     || key_matches(key, &KeyId::from("right"))
                     || key_matches(key, &KeyId::from("up"))
@@ -193,6 +233,13 @@ fn fit(text: &str, width: usize) -> String {
 }
 
 /// Non-blocking stdin read for probe replies. Returns `None` when no data is ready.
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix arm can return real poll/read I/O errors; callers need one shared io::Result contract across platforms"
+    )
+)]
 fn read_stdin_nonblocking() -> io::Result<Option<Vec<u8>>> {
     #[cfg(unix)]
     {
@@ -555,11 +602,36 @@ async fn run_fixture(
     root.plugin = "DONE-MARKER".into();
     commit_with_deadline(&mut tui, Txn::Frame, &mut root, started)?;
 
+    let mut live = None;
     if serve {
         root.status = "serving".into();
         root.plugin = "SERVE-READY".into();
         commit_with_deadline(&mut tui, Txn::Frame, &mut root, started)?;
+        // Baseline the live-input boundary before announcing readiness, so the
+        // published deltas cover exactly the events consumed after the harness
+        // observed INPUT_READY — never the scripted fallback counts above.
+        let paste_baseline = root.paste_count;
+        let cursor_baseline = root.cursor_moves;
+        let editor_baseline = root.editor.len();
+        {
+            let mut out = io::stdout();
+            out.write_all(b"\x1b]999;PI_TUI_INPUT_READY=1\x07")?;
+            out.flush()?;
+        }
         serve_live_events(&mut input, &mut tui, &mut root, started).await?;
+        live = Some((
+            root.paste_count
+                .checked_sub(paste_baseline)
+                .ok_or_else(|| io::Error::other("live paste counter decreased"))?,
+            root.cursor_moves
+                .checked_sub(cursor_baseline)
+                .ok_or_else(|| io::Error::other("live cursor counter decreased"))?,
+            root.editor
+                .get(editor_baseline..)
+                .ok_or_else(|| io::Error::other("live editor text shrank"))?
+                .escape_default()
+                .collect::<String>(),
+        ));
     }
 
     // Publish write accounting on the wire for the harness (outside stage-3).
@@ -567,13 +639,30 @@ async fn run_fixture(
         let log = write_log
             .lock()
             .map_err(|_| io::Error::other("write log poisoned"))?;
-        let summary = format!(
+        let mut summary = format!(
             "\x1b]999;PI_TUI_TXN_COUNT={}\x07\x1b]999;PI_TUI_PASTE={}\x07\x1b]999;PI_TUI_CURSOR={}\x07\x1b]999;PI_TUI_RESIZE={}\x07",
             log.len(),
             root.paste_count,
             root.cursor_moves,
             root.resize_count
         );
+        if let Some((live_paste, live_cursor, live_text)) = live {
+            let _ = write!(
+                summary,
+                "\x1b]999;PI_TUI_LIVE_PASTE={live_paste}\x07\x1b]999;PI_TUI_LIVE_CURSOR={live_cursor}\x07\x1b]999;PI_TUI_LIVE_TEXT={live_text}\x07"
+            );
+            // Windows CI diagnostic: when neither a paste event nor its payload
+            // arrived as keystrokes, publish the bounded escaped trace of every
+            // UiEvent received during the serve phase.
+            #[cfg(windows)]
+            if live_paste == 0 && !live_text.contains("PASTED-BLOCK") {
+                let _ = write!(
+                    summary,
+                    "\x1b]999;PI_TUI_LIVE_TRACE={}\x07",
+                    root.live_trace.join("|")
+                );
+            }
+        }
         // Bypass Tui so accounting stays about stage-3 only; still sole post-probe
         // process stdout, just a harness side-channel.
         let mut out = io::stdout();
@@ -659,7 +748,11 @@ async fn serve_live_events(
         let event = match pending.take() {
             Some(event) => event,
             None => match input.recv().await {
-                Some(event) => event,
+                Some(event) => {
+                    #[cfg(windows)]
+                    root.record_live_event(&event);
+                    event
+                }
                 None => return Ok(()),
             },
         };
@@ -680,13 +773,13 @@ async fn serve_live_events(
 
         // Coalesce a back-to-back resize storm into one note_resize + Reanchor.
         let mut latest = (width, height);
-        let _ = root.handle_event(&UiEvent::Resize { width, height });
         tokio::task::yield_now().await;
         while let Some(next) = input.try_recv() {
+            #[cfg(windows)]
+            root.record_live_event(&next);
             match next {
                 UiEvent::Resize { width, height } => {
                     latest = (width, height);
-                    let _ = root.handle_event(&UiEvent::Resize { width, height });
                 }
                 other => {
                     pending = Some(other);
@@ -694,6 +787,10 @@ async fn serve_live_events(
                 }
             }
         }
+        let _ = root.handle_event(&UiEvent::Resize {
+            width: latest.0,
+            height: latest.1,
+        });
         tui.note_resize(latest.0.max(1), latest.1.max(1));
         commit_with_deadline(tui, Txn::Reanchor(ReanchorCause::Resize), root, started)?;
     }

@@ -285,6 +285,13 @@ impl Component for StateMatrixRoot {
 // ---------------------------------------------------------------------------
 
 /// Non-blocking stdin read for probe replies. Returns `None` when no data is ready.
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix arm can return real poll/read I/O errors; callers need one shared io::Result contract across platforms"
+    )
+)]
 fn read_stdin_nonblocking() -> io::Result<Option<Vec<u8>>> {
     #[cfg(unix)]
     {

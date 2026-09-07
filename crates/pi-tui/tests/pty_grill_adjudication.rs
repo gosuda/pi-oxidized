@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! PAR-PTY-GRILL (issue #46): host-tier PTY adjudication of landed T1–T3/T9
 //! runtime claims.
 //!
@@ -23,6 +22,8 @@
 //! - T4 (math): InlineMath/DisplayMath events are silently dropped — the
 //!   raw-literal fallback path is NOT implemented; ruled **unverified** and
 //!   re-scoped as an open parity gap.
+
+#![cfg(unix)]
 
 use std::io::{Read, Write};
 use std::path::PathBuf;

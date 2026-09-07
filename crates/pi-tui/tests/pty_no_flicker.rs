@@ -43,6 +43,14 @@ const HARD_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_IDLE: Duration = Duration::from_millis(300);
 const INITIAL_COLS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
+/// Whether the PTY master hands back the child's bytes verbatim. `ConPTY` is a
+/// renderer: it consumes the child's control sequences and re-synthesizes its
+/// own, so probe/sync/restore byte provenance is only observable on POSIX
+/// masters (see docs/REL-R3-conpty-witness-prototype.md §3.4/§3.6). Decoded
+/// frames and fixture side-channel counters remain the cross-platform evidence.
+const BYTE_TRANSPARENT_MASTER: bool = cfg!(not(windows));
+/// Longest raw-transcript tail included in assertion diagnostics.
+const RAW_DIAG_TAIL: usize = 4096;
 
 #[derive(Clone, Copy)]
 struct Scenario {
@@ -73,6 +81,13 @@ fn pty_no_flicker_sync_ignored_branch_single_write_no_clear() {
 fn pty_cursor_restore_after_success_abort_provider_error_panic_and_sigint() {
     for exit in ["success", "abort", "provider-error", "panic", "sigint"] {
         let report = drive_fixture(exit, true, false);
+        assert!(
+            report.finished_within_timeout,
+            "exit={exit}: fixture must terminate within the hard timeout"
+        );
+        if !BYTE_TRANSPARENT_MASTER {
+            continue;
+        }
         if exit == "panic" {
             assert_eq!(
                 report.emergency_restore_count,
@@ -237,6 +252,56 @@ fn key_matrix_linux_macos_windows_legacy_modifyotherkeys_omission() {
 #[allow(clippy::too_many_lines)]
 fn run_scenario(scenario: Scenario) {
     let report = drive_fixture(scenario.exit, scenario.sync, true);
+
+    assert!(
+        report.resize_count >= 20,
+        "{}: expected >=20 resizes, got {}",
+        scenario.name,
+        report.resize_count
+    );
+    assert!(
+        report.paste_count > 0,
+        "{}: fixture must observe paste (paste_count={})",
+        scenario.name,
+        report.paste_count
+    );
+    assert!(
+        report.cursor_moves > 0,
+        "{}: fixture must observe cursor movement (cursor_moves={})",
+        scenario.name,
+        report.cursor_moves
+    );
+    assert!(
+        report.saw_plugin_frame,
+        "{}: plugin frames must appear",
+        scenario.name
+    );
+    assert!(
+        report.saw_stream_and_tools,
+        "{}: long stream + tool updates required",
+        scenario.name
+    );
+    assert!(
+        report.continuous_content,
+        "{}: content must remain continuous across resizes",
+        scenario.name
+    );
+    assert!(
+        report.finished_within_timeout,
+        "{}: hard draw/run timeout exceeded",
+        scenario.name
+    );
+    let text = report.final_vt_text.join("\n");
+    assert!(
+        text.contains("STATUS") || text.contains("FOOTER") || text.contains("DONE"),
+        "{}: avt final view missing fixture content: {text:?}",
+        scenario.name
+    );
+
+    if !BYTE_TRANSPARENT_MASTER {
+        return;
+    }
+
     let audit = audit_bytes(&report.raw);
 
     assert_eq!(audit.clear_2j, 0, "{}: CSI 2J forbidden", scenario.name);
@@ -299,46 +364,8 @@ fn run_scenario(scenario: Scenario) {
         scenario.name
     );
     assert!(
-        report.continuous_content,
-        "{}: content must remain continuous across resizes",
-        scenario.name
-    );
-    assert!(
         report.no_blank_frame,
         "{}: intermediate blank frames are forbidden",
-        scenario.name
-    );
-    assert!(
-        report.resize_count >= 20,
-        "{}: expected >=20 resizes, got {}",
-        scenario.name,
-        report.resize_count
-    );
-    assert!(
-        report.paste_count > 0,
-        "{}: fixture must observe paste (paste_count={})",
-        scenario.name,
-        report.paste_count
-    );
-    assert!(
-        report.cursor_moves > 0,
-        "{}: fixture must observe cursor movement (cursor_moves={})",
-        scenario.name,
-        report.cursor_moves
-    );
-    assert!(
-        report.saw_plugin_frame,
-        "{}: plugin frames must appear",
-        scenario.name
-    );
-    assert!(
-        report.saw_stream_and_tools,
-        "{}: long stream + tool updates required",
-        scenario.name
-    );
-    assert!(
-        report.finished_within_timeout,
-        "{}: hard draw/run timeout exceeded",
         scenario.name
     );
     assert!(
@@ -349,13 +376,6 @@ fn run_scenario(scenario: Scenario) {
     assert!(
         report.txn_count > 0,
         "{}: expected instrumented stage-3 transactions",
-        scenario.name
-    );
-
-    let text = report.final_vt_text.join("\n");
-    assert!(
-        text.contains("STATUS") || text.contains("FOOTER") || text.contains("DONE"),
-        "{}: avt final view missing fixture content: {text:?}",
         scenario.name
     );
 }
@@ -395,6 +415,7 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
 
     let mut cmd = CommandBuilder::new(&binary);
     cmd.arg(format!("--exit={exit}"));
+    cmd.arg("--serve");
     if !sync {
         cmd.arg("--no-sync");
         cmd.env("PI_TUI_NO_SYNC", "1");
@@ -506,6 +527,47 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
         raw.len(),
         String::from_utf8_lossy(&raw[..raw.len().min(200)])
     );
+
+    // Input rendezvous: the fixture publishes a complete OSC-999 readiness
+    // record only after its scripted prelude and the live-counter baseline.
+    // Drain raw output through the same reader/VT path; child exit or hard
+    // timeout before readiness is a failure, not a skip.
+    let mut ready = false;
+    while started.elapsed() < HARD_TIMEOUT {
+        while let Ok(chunk) = rx.try_recv() {
+            raw.extend_from_slice(&chunk);
+            feed_vt(&mut vt, &chunk);
+            last_data = Instant::now();
+        }
+        if find_subslice(&raw, b"\x1b]999;PI_TUI_INPUT_READY=1\x07").is_some() {
+            ready = true;
+            break;
+        }
+        if child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        ready,
+        "fixture never published input readiness; raw_len={} head={:?}",
+        raw.len(),
+        String::from_utf8_lossy(&raw[..raw.len().min(200)])
+    );
+
+    // Exactly one paste and six cursor moves, delivered once, after readiness.
+    write_stimulus(
+        &mut writer,
+        child.as_mut(),
+        b"\x1b[200~PASTED-BLOCK-line1\nline2\x1b[201~",
+        "paste",
+    );
+    write_stimulus(
+        &mut writer,
+        child.as_mut(),
+        b"\x1b[D\x1b[C\x1b[A\x1b[B\x1b[H\x1b[F",
+        "cursor",
+    );
     painted = true;
 
     for (cols, rows) in resize_plan {
@@ -522,23 +584,6 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
             .unwrap_or_else(|err| panic!("resize failed: {err}"));
         resize_count = resize_count.saturating_add(1);
         vt.resize(usize::from(cols), usize::from(rows));
-
-        if resize_count == 5 {
-            writer
-                .write_all(b"\x1b[200~PASTED-BLOCK-line1\nline2\x1b[201~")
-                .unwrap_or_else(|err| panic!("paste write failed: {err}"));
-            writer
-                .flush()
-                .unwrap_or_else(|err| panic!("paste flush failed: {err}"));
-        }
-        if resize_count == 8 {
-            writer
-                .write_all(b"\x1b[D\x1b[C\x1b[A\x1b[B\x1b[H\x1b[F")
-                .unwrap_or_else(|err| panic!("cursor write failed: {err}"));
-            writer
-                .flush()
-                .unwrap_or_else(|err| panic!("cursor flush failed: {err}"));
-        }
 
         let slice_deadline = Instant::now() + Duration::from_millis(100);
         while Instant::now() < slice_deadline {
@@ -595,6 +640,11 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
         }
     }
 
+    // End the ordered input stream: Ctrl+D is the fixture's explicit serve
+    // terminator, sent through the still-owned master writer before waiting
+    // on child completion (writer Drop would only fire after the wait).
+    write_stimulus(&mut writer, child.as_mut(), b"\x04", "ctrl+d");
+
     while started.elapsed() < HARD_TIMEOUT {
         while let Ok(chunk) = rx.try_recv() {
             raw.extend_from_slice(&chunk);
@@ -620,10 +670,6 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
                 thread::sleep(Duration::from_millis(10));
             }
             break;
-        }
-
-        if find_subslice(&raw, b"DONE-MARKER").is_some() && last_data.elapsed() > READ_IDLE {
-            let _ = child.try_wait();
         }
 
         thread::sleep(Duration::from_millis(15));
@@ -657,11 +703,42 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
     });
     let row_erase_immediate_reflow = detect_row_erase_immediate_reflow(&raw, &txns);
 
-    let paste_count = parse_sidechannel_u32(&raw, b"PI_TUI_PASTE=");
-    let cursor_moves = parse_sidechannel_u32(&raw, b"PI_TUI_CURSOR=");
+    let paste_count = parse_sidechannel_u32(&raw, b"PI_TUI_PASTE=").unwrap_or(0);
+    let cursor_moves = parse_sidechannel_u32(&raw, b"PI_TUI_CURSOR=").unwrap_or(0);
     let txn_count = parse_sidechannel_u32(&raw, b"PI_TUI_TXN_COUNT=")
+        .unwrap_or(0)
         .max(u32::try_from(txns.len()).unwrap_or(u32::MAX));
-    let fixture_resize = parse_sidechannel_u32(&raw, b"PI_TUI_RESIZE=");
+    let fixture_resize = parse_sidechannel_u32(&raw, b"PI_TUI_RESIZE=").unwrap_or(0);
+
+    // Live-input provenance: the serve-phase deltas must be present, complete,
+    // and exact — a missing or malformed record is never a successful zero.
+    let live_paste = parse_sidechannel_u32(&raw, b"PI_TUI_LIVE_PASTE=");
+    let live_cursor = parse_sidechannel_u32(&raw, b"PI_TUI_LIVE_CURSOR=");
+    let live_text = parse_sidechannel_text(&raw, b"PI_TUI_LIVE_TEXT=");
+    // ConPTY re-synthesizes master writes as key records: the bracketed-paste
+    // markers are dropped and the payload is delivered as character presses,
+    // so on Windows the live witness is the pasted text, not a Paste event.
+    let expected_live_paste = u32::from(!cfg!(windows));
+    assert_eq!(
+        live_paste,
+        Some(expected_live_paste),
+        "expected exactly {expected_live_paste} live paste after readiness, got {live_paste:?} \
+         (live_cursor={live_cursor:?}, live_text={live_text:?}, raw_len={}, raw_tail={})",
+        raw.len(),
+        String::from_utf8_lossy(&raw[raw.len().saturating_sub(RAW_DIAG_TAIL)..])
+            .escape_default()
+            .collect::<String>()
+    );
+    let live_text = live_text.unwrap_or_else(|| panic!("missing live text record"));
+    assert!(
+        live_text.contains("PASTED-BLOCK-line1") && live_text.contains("line2"),
+        "expected the pasted payload to reach the fixture after readiness, got {live_text:?}"
+    );
+    assert_eq!(
+        live_cursor,
+        Some(6),
+        "expected exactly six live cursor moves after readiness, got {live_cursor:?}"
+    );
 
     let sole_stdout_owner = find_subslice(&raw, &probe_query_batch(true)).is_some()
         && audit.clear_2j == 0
@@ -734,6 +811,27 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
     }
 }
 
+/// Write harness input (paste / cursor keys / serve terminator) to the live
+/// fixture. Delivery is mandatory: readiness was already observed, so a
+/// write/flush failure or an already-exited child is a defect, not a race.
+fn write_stimulus(
+    writer: &mut impl Write,
+    child: &mut dyn portable_pty::Child,
+    bytes: &[u8],
+    what: &str,
+) {
+    assert!(
+        child.try_wait().ok().flatten().is_none(),
+        "{what} write skipped: fixture exited before input delivery"
+    );
+    writer
+        .write_all(bytes)
+        .unwrap_or_else(|err| panic!("{what} write failed: {err}"));
+    writer
+        .flush()
+        .unwrap_or_else(|err| panic!("{what} flush failed: {err}"));
+}
+
 fn disable_pty_echo(master: &dyn portable_pty::MasterPty) {
     // Best-effort: portable-pty's get_termios is read-only from the trait.
     // Clearing ECHO requires platform termios writes; when unavailable we rely
@@ -742,7 +840,6 @@ fn disable_pty_echo(master: &dyn portable_pty::MasterPty) {
     let _ = master.get_size();
     let _ = master;
 }
-
 fn snapshot_from_raw(raw: &[u8], cols: u16, rows: u16) -> Vec<String> {
     let mut vt = Vt::builder()
         .size(usize::from(cols.max(1)), usize::from(rows.max(1)))
@@ -855,19 +952,26 @@ fn detect_row_erase_immediate_reflow(raw: &[u8], txns: &[Vec<u8>]) -> bool {
     }
     audit_bytes(raw).clear_2j == 0 && audit_bytes(raw).clear_3j == 0
 }
-fn parse_sidechannel_u32(raw: &[u8], key: &[u8]) -> u32 {
-    let Some(pos) = find_subslice(raw, key) else {
-        return 0;
-    };
+fn parse_sidechannel_u32(raw: &[u8], key: &[u8]) -> Option<u32> {
+    let pos = find_subslice(raw, key)?;
     let start = pos + key.len();
     let mut end = start;
     while end < raw.len() && raw[end].is_ascii_digit() {
         end += 1;
     }
-    std::str::from_utf8(&raw[start..end])
+    if end == start || raw.get(end) != Some(&b'\x07') {
+        return None;
+    }
+    std::str::from_utf8(&raw[start..end]).ok()?.parse().ok()
+}
+
+fn parse_sidechannel_text(raw: &[u8], key: &[u8]) -> Option<String> {
+    let pos = find_subslice(raw, key)?;
+    let start = pos + key.len();
+    let len = raw[start..].iter().position(|byte| *byte == b'\x07')?;
+    std::str::from_utf8(&raw[start..start + len])
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+        .map(str::to_owned)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
