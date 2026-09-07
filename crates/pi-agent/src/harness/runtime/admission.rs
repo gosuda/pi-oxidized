@@ -198,6 +198,48 @@ struct RunAdmission {
     started_at: i64,
 }
 
+/// Commit admission writes with the run path's fault contract: the lane
+/// guard is released across the durable commit because fault broadcast
+/// re-locks lane data, a commit failure seals every lane against one shared
+/// fault, and the guard is re-acquired to re-verify idle before publishing.
+async fn commit_admission_writes<'a, Fut>(
+    lane: &'a LaneRuntime,
+    data: tokio::sync::MutexGuard<'a, LaneData>,
+    commit: Fut,
+    cx: &'a Context,
+) -> Result<tokio::sync::MutexGuard<'a, LaneData>, HarnessError>
+where
+    Fut: futures::future::Future<
+        Output = Result<crate::session::CommitResult, crate::session::SessionError>,
+    >,
+{
+    drop(data);
+    if let Err(error) = commit.await {
+        lane.owner
+            .fault(
+                HarnessFault {
+                    message: format!("session operation failed: {error}"),
+                    cause: Box::new(error),
+                },
+                cx,
+            )
+            .await;
+        let stored = lane.owner.fault.lock().ok().and_then(|slot| slot.clone());
+        return Err(match stored {
+            Some(fault) => sealed_rejection(&fault),
+            None => lane.owner.closed_error(),
+        });
+    }
+    let data = lane.data.lock().await;
+    if let Some(fault) = data.fault.clone() {
+        return Err(sealed_rejection(&fault));
+    }
+    if data.state.current_operation_id.is_some() {
+        return Err(lane.owner.closed_error());
+    }
+    Ok(data)
+}
+
 /// Materialize the selected inbox entries and the new prompt messages onto the
 /// branch, then commit the run's durable operation and lane state and publish
 /// both to the in-memory lane data.
@@ -275,32 +317,8 @@ async fn commit_run(
     writes.push(set_json(&operation_state(&admission.operation_id), &operation.state).map_err(map_session_error)?);
     writes.push(set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?);
     writes.push(set_json(&branch_tip(lane.name.as_str()), &parent).map_err(map_session_error)?);
-    // Release the lane lock across the durable commit: fault broadcast
-    // re-locks lane data, so holding the guard here would deadlock.
-    drop(data);
-    if let Err(error) = mutator.commit(writes, cx).await {
-        lane.owner
-            .fault(
-                HarnessFault {
-                    message: format!("session operation failed: {error}"),
-                    cause: Box::new(error),
-                },
-                cx,
-            )
-            .await;
-        let stored = lane.owner.fault.lock().ok().and_then(|slot| slot.clone());
-        return Err(match stored {
-            Some(fault) => sealed_rejection(&fault),
-            None => lane.owner.closed_error(),
-        });
-    }
-    let mut data = lane.data.lock().await;
-    if let Some(fault) = data.fault.clone() {
-        return Err(sealed_rejection(&fault));
-    }
-    if data.state.current_operation_id.is_some() {
-        return Err(lane.owner.closed_error());
-    }
+    let mut data =
+        commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
     data.tip = parent;
     data.state = next_state;
     data.operation = Some(operation);
@@ -315,7 +333,7 @@ async fn accept_compaction(
     cx: &Context,
 ) -> OperationAdmissionResult {
     let config = lane.owner.config_snapshot().await;
-    let mut data = lane.data.lock().await;
+    let data = lane.data.lock().await;
     ensure_idle(lane, &data)?;
     let branch = lane.branch(cx).await?;
     let entries = super::support::branch_entries(branch.as_ref(), cx)
@@ -376,7 +394,9 @@ async fn accept_compaction(
         set_json(&operation_preparation(&operation_id, &task_id), &durable).map_err(map_session_error)?,
         set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?,
     ];
-    lane.commit(writes, cx).await?;
+    let mutator = lane.owner.session.begin_mutation(cx).await.map_err(map_session_error)?;
+    let mut data =
+        commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
     data.state = next_state;
     data.operation = Some(operation);
     drop(data);
@@ -420,7 +440,7 @@ async fn accept_navigation(
         }
     }
     let config = lane.owner.config_snapshot().await;
-    let mut data = lane.data.lock().await;
+    let data = lane.data.lock().await;
     ensure_idle(lane, &data)?;
     let operation_id = match requested_id {
         Some(id) => id,
@@ -437,7 +457,7 @@ async fn accept_navigation(
     commit_navigation(
         lane,
         &config,
-        &mut data,
+        data,
         NavigationAdmission {
             operation_id: operation_id.clone(),
             target_id: target_id.clone(),
@@ -447,7 +467,6 @@ async fn accept_navigation(
         cx,
     )
     .await?;
-    drop(data);
     lane.state_changed.notify_waiters();
     lane.emit(
         HarnessEventPayload::NavigationStart {
@@ -479,7 +498,7 @@ struct NavigationAdmission {
 async fn commit_navigation(
     lane: &LaneRuntime,
     config: &RuntimeConfig,
-    data: &mut LaneData,
+    data: tokio::sync::MutexGuard<'_, LaneData>,
     admission: NavigationAdmission,
     cx: &Context,
 ) -> Result<(), HarnessError> {
@@ -563,7 +582,9 @@ async fn commit_navigation(
             .map_err(map_session_error)?,
         );
     }
-    lane.commit(writes, cx).await?;
+    let mutator = lane.owner.session.begin_mutation(cx).await.map_err(map_session_error)?;
+    let mut data =
+        commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
     data.state = next_state;
     data.operation = Some(operation);
     Ok(())

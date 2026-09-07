@@ -13,7 +13,7 @@ use futures::stream::BoxStream;
 use pi_agent::context::Context;
 use pi_agent::harness::api::{
     AcquireLaneOptions, AgentHarness, AgentHarnessBuilder, AgentHarnessOptions, AgentLane,
-    HarnessModels, HarnessResources, OperationRequest, PromptInput,
+    HarnessModels, HarnessResources, NavigateOptions, OperationRequest, PromptInput,
 };
 use pi_agent::harness::event::HarnessEventType;
 use pi_agent::harness::result::HarnessFault;
@@ -302,6 +302,68 @@ async fn admission_storage_fault_seals_all_lanes_and_preserves_one_fault() -> Re
         close?;
         assert!(matches!(after_close, Err(SessionError::Backend(failure)) if failure.code == StorageErrorCode::Closed), "explicit close must reject later session reads");
         assert!(matches!(backend_after_close, Err(SessionError::Backend(failure)) if failure.code == StorageErrorCode::Closed), "explicit close must actually close the storage backend");
+        Ok::<(), Box<dyn Error>>(())
+    }).await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn navigation_storage_fault_seals_all_lanes() -> Result<(), Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let cx = Context::background();
+        let fixture = arm_admission_fixture(&cx).await?;
+        let AdmissionFixture {
+            storage, session, harness, main, other, main_name, ..
+        } = fixture;
+        let faults = Arc::new(AtomicUsize::new(0));
+        let observed = faults.clone();
+        let _listener = harness.events().on(HarnessEventType::Fault, Arc::new(move |_, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }))?;
+        // No target and no summary: the only storage touch is the commit.
+        storage.armed.store(true, Ordering::SeqCst);
+        let operation_id = OperationId::from("failed-navigation");
+        let first = main.accept(OperationRequest::Navigation {
+            operation_id: Some(operation_id.clone()),
+            target_id: None,
+            options: NavigateOptions::default(),
+        }, &cx).await;
+        let later = other.accept(OperationRequest::Prompt {
+            operation_id: Some(OperationId::from("later-admission")),
+            prompt: PromptInput::Text { text: "later".to_owned(), images: Vec::new() },
+        }, &cx).await;
+        let main_state = session.get_value(&address::lane_state(&main_name), &cx).await;
+        let operation = session.get_value(&address::operation_meta(&operation_id), &cx).await;
+        let close = harness.close(&cx).await;
+        assert!(first.is_err(), "failed navigation must reject");
+        assert!(later.is_err(), "storage fault must reject admission on another lane");
+        assert!(
+            !storage.armed.load(Ordering::SeqCst),
+            "navigation must reach the storage boundary"
+        );
+        assert_eq!(faults.load(Ordering::SeqCst), 1, "faulted navigation admits one fault event");
+        assert!(
+            matches!(main_state?, Some(state) if state.value.current_operation_id.is_none()),
+            "failed navigation must leave durable lane state idle"
+        );
+        assert!(operation?.is_none(), "failed navigation must not publish operation metadata");
+        let first_error = first.err().ok_or("missing initial rejection")?;
+        let later_error = later.err().ok_or("missing subsequent rejection")?;
+        let first_fault = cause_in_chain::<HarnessFault>(&first_error)
+            .ok_or("initial rejection must retain a typed HarnessFault")?;
+        let later_fault = cause_in_chain::<HarnessFault>(&later_error)
+            .ok_or("subsequent rejection must retain the same typed HarnessFault")?;
+        assert!(
+            std::ptr::eq(first_fault, later_fault),
+            "all faulted calls must reject the same fault object"
+        );
+        let session_cause = cause_in_chain::<SessionError>(&first_error)
+            .ok_or("fault must retain the typed session failure")?;
+        assert!(matches!(
+            session_cause, SessionError::Backend(failure) if failure.code == StorageErrorCode::Io
+        ));
+        close?;
         Ok::<(), Box<dyn Error>>(())
     }).await??;
     Ok(())
