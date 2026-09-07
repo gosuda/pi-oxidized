@@ -50,7 +50,7 @@ The allowlisted bridge and host-control method set is fixed and ordered.
   serialized names as the TypeScript allowlist. Their representation and
   internal order are not observable compatibility properties.
 - Additional open control methods ride the JSONL envelope:
-  `providers.update`, `session.*`, `ui.*`, and `theme.*`. The host publishes the live provider registry through `providers.update`
+  `providers.update`, `session.*`, `ui.*`, and `theme.*`. Deferred-provider control methods are also serialized boundaries: `provider.fetchDeferred` (host → provider request), `provider.cancelDeferred` (host → provider request), `provider.beforePayload` (provider → host request), and `provider.onResponse` (provider → host request). Their payloads are JSON objects carrying the provider identifier and operation-specific deferred handle/model or response data; `provider.fetchDeferred` returns a `ProviderDeferredHandle` (with the provider's handle and optional callback flags), `provider.cancelDeferred` carries that handle and an optional reason, `provider.beforePayload` returns the transformed payload, and `provider.onResponse` returns an acknowledgement. These methods are optional and apply only to hosts that advertise deferred-provider support; failures are returned as correlated `error` frames and callbacks are not invoked after cancellation. The host publishes the live provider registry through `providers.update`
   (`packages/extension-host/src/host.ts::PROVIDERS_UPDATE_METHOD`; emitted by
   `::emitProvidersUpdate` as
   `{ method: "providers.update", payload: { providers } }`).
