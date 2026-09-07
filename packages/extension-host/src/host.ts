@@ -17,14 +17,24 @@ import {
 	type Frame,
 	type FrameHandler,
 	type Method,
+	type ProviderBeforePayloadRequest,
+	type ProviderBeforePayloadResponse,
+	type ProviderCallbackFlags,
+	type ProviderCancelDeferredRequest,
+	type ProviderDeferredHandle,
+	type ProviderDeferredOptions,
+	type ProviderFetchDeferredRequest,
+	type ProviderOnResponseRequest,
+	type ProviderOnResponseResponse,
+	type ProviderResponseWire,
 	PROTOCOL_VERSION,
 } from "@earendil-works/pi-tui-protocol";
 
 import { COMPATIBILITY_VERSION } from "./version.ts";
 import { parseAnsiLines } from "./sanitize.ts";
 import type { StyledRun, UiSlot, SlotPlacement, OverlayOptions } from "./protocol.ts";
+import { FacetHostBridge } from "./facet-host.ts";
 import { createExtensionJiti } from "./virtual-modules.ts";
-
 import {
 	ExtensionRunner,
 	loadExtensionFromFactory,
@@ -48,7 +58,12 @@ import type {
 	ToolDefinition,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
-import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type {
+	Context,
+	DeferredHandle,
+	Model,
+	SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
@@ -494,6 +509,134 @@ type ProviderRegistration = {
 	readonly config: ProviderConfig;
 	readonly order: number;
 };
+type ProviderCallbackScope = {
+	readonly callId: string;
+	readonly requestId: number;
+	readonly providerId: string;
+	readonly model: unknown;
+	readonly controller: AbortController;
+	readonly callbacks: ProviderCallbackFlags;
+	closed: boolean;
+	callbackFailed: boolean;
+	callbackError?: unknown;
+};
+
+const PROVIDER_FETCH_DEFERRED_METHOD = "provider.fetchDeferred";
+const PROVIDER_CANCEL_DEFERRED_METHOD = "provider.cancelDeferred";
+const PROVIDER_BEFORE_PAYLOAD_METHOD = "provider.beforePayload";
+const PROVIDER_ON_RESPONSE_METHOD = "provider.onResponse";
+
+function providerCallbackFlags(value: unknown): ProviderCallbackFlags {
+	if (value === undefined) return { beforePayload: false, onResponse: false };
+	if (!isRecord(value)) throw new Error("provider callbacks must be an object");
+	if (value["beforePayload"] !== undefined && typeof value["beforePayload"] !== "boolean") {
+		throw new Error("provider callbacks.beforePayload must be a boolean");
+	}
+	if (value["onResponse"] !== undefined && typeof value["onResponse"] !== "boolean") {
+		throw new Error("provider callbacks.onResponse must be a boolean");
+	}
+	return {
+		beforePayload: value["beforePayload"] === true,
+		onResponse: value["onResponse"] === true,
+	};
+}
+
+function responseHeadersWire(value: unknown): Record<string, string> {
+	if (value === null || value === undefined) {
+		throw new Error("provider response headers are required");
+	}
+	const headers: Record<string, string> = {};
+	if (typeof value === "object" && value !== null) {
+		const objectValue = value as { forEach?: unknown; [Symbol.iterator]?: unknown };
+		const forEach = objectValue.forEach;
+		if (typeof forEach === "function") {
+			(forEach as (callback: (entry: unknown, name: string) => void) => void).call(
+				value,
+				(entry, name) => { headers[String(name)] = String(entry); },
+			);
+			return headers;
+		}
+		const iterator = objectValue[Symbol.iterator];
+		if (typeof iterator === "function") {
+			const iterable = value as Iterable<unknown>;
+			for (const item of iterable) {
+				if (!Array.isArray(item) || item.length !== 2) continue;
+				headers[String(item[0])] = String(item[1]);
+			}
+			return headers;
+		}
+		if (isRecord(value)) {
+			for (const [name, entry] of Object.entries(value)) {
+				if (entry === undefined || entry === null) continue;
+				headers[name] = Array.isArray(entry)
+					? entry.map((part) => String(part)).join(", ")
+					: String(entry);
+			}
+			return headers;
+		}
+	}
+	throw new Error("provider response headers must be Headers or an object");
+}
+
+function providerResponseWire(value: unknown): ProviderResponseWire {
+	if (!isRecord(value) || typeof value["status"] !== "number" || !Number.isFinite(value["status"])) {
+		throw new Error("provider response status must be a finite number");
+	}
+	return {
+		status: value["status"],
+		headers: responseHeadersWire(value["headers"]),
+	};
+}
+
+function requireDeferredHandle(value: unknown): asserts value is ProviderDeferredHandle {
+	if (!isRecord(value)
+		|| typeof value["provider"] !== "string"
+		|| typeof value["modelId"] !== "string"
+		|| typeof value["api"] !== "string"
+		|| typeof value["id"] !== "string"
+		|| (value["expiresAt"] !== undefined
+			&& (typeof value["expiresAt"] !== "number" || !Number.isFinite(value["expiresAt"])))
+		|| (value["pollAfterMs"] !== undefined
+			&& (typeof value["pollAfterMs"] !== "number" || !Number.isFinite(value["pollAfterMs"])))) {
+		throw new Error("provider deferred handle is invalid");
+	}
+	// Assertion narrows in place: callers keep the original object and its opaque metadata.
+}
+
+function providerCallbackErrorEvent(
+	model: unknown,
+	providerId: string,
+	message: string,
+): Record<string, unknown> {
+	const modelRecord = isRecord(model) ? model : {};
+	const api = typeof modelRecord["api"] === "string" ? modelRecord["api"] : "custom";
+	const provider = typeof modelRecord["provider"] === "string"
+		? modelRecord["provider"]
+		: providerId;
+	const modelId = typeof modelRecord["id"] === "string" ? modelRecord["id"] : "";
+	return {
+		type: "error",
+		reason: "error",
+		error: {
+			role: "assistant",
+			content: [],
+			api,
+			provider,
+			model: modelId,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: message,
+			timestamp: Date.now(),
+		},
+	};
+}
 
 type ProviderRegistrationOperation =
 	| ({ readonly kind: "register"; readonly extensionPath: string } & ProviderRegistration)
@@ -518,6 +661,7 @@ type ProviderLoadScope = {
  */
 export class ExtensionHost {
 	private readonly client: ProtocolClient;
+	private readonly facetBridge: FacetHostBridge;
 	private readonly slots = new Map<string, SlotEntry>();
 	private nextGeneration = 1;
 	private state: HostState = HostState.WAITING_HELLO;
@@ -527,6 +671,15 @@ export class ExtensionHost {
 	private hasLoadedProtocolExtensions = false;
 	/** Captured custom providers (rebuilt from the current extension set on each rebuild). */
 	private readonly providers = new Map<string, ProviderConfig>();
+	private readonly inFlightTools = new Map<number, AbortController>();
+	/** In-flight provider.stream AbortControllers keyed by request id. */
+	private readonly inFlightProviders = new Map<number, AbortController>();
+	/** In-flight deferred fetch calls cancellable by provider.cancel. */
+	private readonly inFlightDeferredFetches = new Map<number, AbortController>();
+	/** Durable deferred-cancel operations, aborted only when the endpoint closes. */
+	private readonly inFlightDeferredCancels = new Map<number, AbortController>();
+	/** Endpoint-local native callback scopes keyed by originating call id. */
+	private readonly providerCallbackScopes = new Map<string, ProviderCallbackScope>();
 	/**
 	 * Provider registrations captured per extension path during factory
 	 * execution, used to rebuild this.providers from the current extension
@@ -538,9 +691,6 @@ export class ExtensionHost {
 	private readonly latestExtensionLoadTokenByPath = new Map<string, number>();
 	private nextExtensionLoadToken = 0;
 	private nextProviderRegistrationOrder = 0;
-	private readonly inFlightTools = new Map<number, AbortController>();
-	/** In-flight provider.stream AbortControllers keyed by request id. */
-	private readonly inFlightProviders = new Map<number, AbortController>();
 	/** Active shortcut handlers keyed by their resolved shortcut key (single-flight). */
 	private readonly inFlightShortcuts = new Map<string, AbortController>();
 	private loadOptions: LoadOptions | undefined;
@@ -597,6 +747,43 @@ export class ExtensionHost {
 	constructor(stdin: ByteReadable, stdout: ByteWritable) {
 		const onFrame: FrameHandler = (frame) => this.onInbound(frame);
 		this.client = new ProtocolClient(stdout, { onFrame });
+		this.facetBridge = new FacetHostBridge({
+			rpc: {
+				request: async (method, payload, options) =>
+					(await this.client.request(method, payload, options)).payload,
+				send: (method, payload) => this.client.send({
+					id: 0,
+					kind: "event",
+					method: method as Method,
+					payload,
+				}),
+			},
+			select: async (title, items, selectedValue, signal) => {
+				const frame = await this.client.request(
+					"select",
+					{
+						title,
+						options: items.map((item) => item.value),
+						...(selectedValue === undefined ? {} : { selectedValue }),
+					},
+					{ timeoutMs: EXTENSION_HOOK_TIMEOUT_MS, signal },
+				);
+				if (!isRecord(frame.payload)) throw new Error("select response must be an object");
+				const value = frame.payload["value"];
+				return typeof value === "string" ? value : undefined;
+			},
+			showStatus: (message) => {
+				this.client.send({
+					id: 0,
+					kind: "event",
+					method: "notify" as Method,
+					payload: { message, type: "info" },
+				}).catch(() => void 0);
+			},
+			onError: (error) => {
+				this.emitExtensionError("<facet-host>", "service", error.message);
+			},
+		});
 		this.client.start(stdin);
 	}
 
@@ -762,6 +949,11 @@ export class ExtensionHost {
 
 	private async handleRequest(frame: Frame): Promise<void> {
 		const { id, method, payload } = frame;
+		if (this.facetBridge.handlesRequest(method)) {
+			const result = await this.facetBridge.handleRequest(method, payload);
+			await this.client.respond(id, method as Method, result);
+			return;
+		}
 		const p = payload as Record<string, unknown>;
 
 		switch (method) {
@@ -806,6 +998,12 @@ export class ExtensionHost {
 				return;
 			case "provider.stream":
 				await this.handleProviderStream(id, p);
+				return;
+			case PROVIDER_FETCH_DEFERRED_METHOD:
+				await this.handleProviderFetchDeferred(id, p);
+				return;
+			case PROVIDER_CANCEL_DEFERRED_METHOD:
+				await this.handleProviderCancelDeferred(id, p);
 				return;
 			default:
 				if (this.runner?.hasHandlers(method)) {
@@ -1879,6 +2077,8 @@ export class ExtensionHost {
 							name: native.name,
 							baseUrl: native.baseUrl,
 							streamSimple: native.streamSimple,
+							fetchDeferred: native.fetchDeferred,
+							cancelDeferred: native.cancelDeferred,
 						});
 					}
 				},
@@ -1965,6 +2165,8 @@ export class ExtensionHost {
 						name: native.name,
 						baseUrl: native.baseUrl,
 						streamSimple: native.streamSimple,
+						fetchDeferred: native.fetchDeferred,
+						cancelDeferred: native.cancelDeferred,
 					},
 					extensionPath: operation.extensionPath,
 					order: operation.order,
@@ -2074,6 +2276,8 @@ export class ExtensionHost {
 				name,
 				streamSimple: typeof config.streamSimple === "function",
 			};
+			if (typeof config.fetchDeferred === "function") entry["fetchDeferred"] = true;
+			if (typeof config.cancelDeferred === "function") entry["cancelDeferred"] = true;
 			if (config.baseUrl !== undefined) entry["baseUrl"] = config.baseUrl;
 			if (config.api !== undefined) entry["api"] = config.api;
 			if (config.name !== undefined) entry["displayName"] = config.name;
@@ -2109,6 +2313,9 @@ export class ExtensionHost {
 				description: def.description,
 				parameters: def.parameters ?? {},
 			};
+			if (def.constrainedSampling !== undefined) {
+				entry["constrainedSampling"] = def.constrainedSampling;
+			}
 			if (def.executionMode !== undefined) {
 				entry["executionMode"] = def.executionMode;
 			}
@@ -2181,6 +2388,18 @@ export class ExtensionHost {
 	}
 
 	private handleControlEvent(frame: Frame): void {
+		if (frame.method === "facet.service.update") {
+			try {
+				this.facetBridge.handleEvent(frame.method, frame.payload);
+			} catch (error) {
+				this.emitExtensionError(
+					"<facet-host>",
+					"service.update",
+					error instanceof Error ? error.message : String(error),
+				);
+			}
+			return;
+		}
 		if (frame.method === "theme.update") {
 			this.applyThemeUpdate(frame.payload as ThemeUpdatePayload);
 			return;
@@ -2205,8 +2424,10 @@ export class ExtensionHost {
 		const payload = frame.payload as Record<string, unknown>;
 		const requestId = typeof payload["id"] === "number" ? payload["id"] : undefined;
 		if (requestId === undefined) return;
+		this.closeProviderCallbackScopeForRequest(requestId);
 		this.inFlightTools.get(requestId)?.abort();
 		this.inFlightProviders.get(requestId)?.abort();
+		this.inFlightDeferredFetches.get(requestId)?.abort();
 	}
 
 	/**
@@ -2516,13 +2737,169 @@ export class ExtensionHost {
 		}
 	}
 
+	private registerProviderCallbackScope(
+		id: number,
+		p: Record<string, unknown>,
+		controller: AbortController,
+		options: Record<string, unknown>,
+	): { scope: ProviderCallbackScope | undefined; options: Record<string, unknown> } {
+		const callbacks = providerCallbackFlags(p["callbacks"]);
+		if (!callbacks.beforePayload && !callbacks.onResponse) {
+			return { scope: undefined, options };
+		}
+		const callId = String(id);
+		if (this.providerCallbackScopes.has(callId)) {
+			throw new Error(`provider callback scope already exists: ${callId}`);
+		}
+		const scope: ProviderCallbackScope = {
+			callId,
+			requestId: id,
+			providerId: typeof p["providerId"] === "string"
+				? p["providerId"]
+				: typeof p["name"] === "string" ? p["name"] : "",
+			model: p["model"],
+			controller,
+			callbacks,
+			closed: false,
+			callbackFailed: false,
+		};
+		this.providerCallbackScopes.set(callId, scope);
+		controller.signal.addEventListener("abort", () => {
+			this.closeProviderCallbackScope(scope);
+		}, { once: true });
+		const scopedOptions = { ...options };
+		if (callbacks.beforePayload) {
+			scopedOptions["onPayload"] = (payload: unknown) =>
+				this.invokeProviderBeforePayload(scope, payload);
+		}
+		if (callbacks.onResponse) {
+			scopedOptions["onResponse"] = (response: unknown) =>
+				this.invokeProviderOnResponse(scope, response);
+		}
+		return { scope, options: scopedOptions };
+	}
+
+	private closeProviderCallbackScope(scope: ProviderCallbackScope): void {
+		if (scope.closed) return;
+		scope.closed = true;
+		if (this.providerCallbackScopes.get(scope.callId) === scope) {
+			this.providerCallbackScopes.delete(scope.callId);
+		}
+	}
+
+	private closeProviderCallbackScopeForRequest(requestId: number): void {
+		for (const scope of this.providerCallbackScopes.values()) {
+			if (scope.requestId === requestId) this.closeProviderCallbackScope(scope);
+		}
+	}
+
+	private requireProviderCallbackScope(scope: ProviderCallbackScope): void {
+		if (scope.closed || this.providerCallbackScopes.get(scope.callId) !== scope) {
+			throw new Error(`provider callback scope is closed: ${scope.callId}`);
+		}
+		if (scope.controller.signal.aborted) {
+			throw new Error(`provider callback scope aborted: ${scope.callId}`);
+		}
+	}
+
+	private async invokeProviderBeforePayload(
+		scope: ProviderCallbackScope,
+		payload: unknown,
+	): Promise<unknown> {
+		try {
+			this.requireProviderCallbackScope(scope);
+			const request: ProviderBeforePayloadRequest = { callId: scope.callId, payload };
+			const frame = await this.client.request(
+				PROVIDER_BEFORE_PAYLOAD_METHOD,
+				request,
+				{ signal: scope.controller.signal, timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+			);
+			if (frame.method !== PROVIDER_BEFORE_PAYLOAD_METHOD || !isRecord(frame.payload)
+				|| !Object.hasOwn(frame.payload, "payload")) {
+				throw new Error("provider.beforePayload response must contain payload");
+			}
+			const response: ProviderBeforePayloadResponse = {
+				payload: frame.payload["payload"],
+			};
+			return response.payload;
+		} catch (error) {
+			if (!scope.callbackFailed) scope.callbackError = error;
+			scope.callbackFailed = true;
+			this.closeProviderCallbackScope(scope);
+			throw error;
+		}
+	}
+
+	private async invokeProviderOnResponse(
+		scope: ProviderCallbackScope,
+		response: unknown,
+	): Promise<void> {
+		try {
+			this.requireProviderCallbackScope(scope);
+			const request: ProviderOnResponseRequest = {
+				callId: scope.callId,
+				response: providerResponseWire(response),
+			};
+			const frame = await this.client.request(
+				PROVIDER_ON_RESPONSE_METHOD,
+				request,
+				{ signal: scope.controller.signal, timeoutMs: EXTENSION_HOOK_TIMEOUT_MS },
+			);
+			if (frame.method !== PROVIDER_ON_RESPONSE_METHOD || !isRecord(frame.payload)) {
+				throw new Error("provider.onResponse response must be an object");
+			}
+			const _ack: ProviderOnResponseResponse = {};
+			void _ack;
+		} catch (error) {
+			if (!scope.callbackFailed) scope.callbackError = error;
+			scope.callbackFailed = true;
+			this.closeProviderCallbackScope(scope);
+			throw error;
+		}
+	}
+
+	private async emitProviderCallbackError(
+		id: number,
+		method: string,
+		scope: ProviderCallbackScope,
+		error: unknown,
+	): Promise<void> {
+		const message = error instanceof Error ? error.message : String(error);
+		await this.client.send({
+			id,
+			kind: "event",
+			method: "providerEvent",
+			payload: providerCallbackErrorEvent(scope.model, scope.providerId, message),
+		});
+		await this.client.respond(id, method, {});
+	}
+
 	private async handleProviderStream(id: number, p: Record<string, unknown>): Promise<void> {
 		const providerId = String(p["providerId"] ?? p["name"] ?? "");
 		const config = this.providers.get(providerId);
 		if (config === undefined || typeof config.streamSimple !== "function") {
-			await this.client.respondError(id, "provider.stream" as Method, {
+			await this.client.respondError(id, "provider.stream", {
 				code: "not_found",
 				message: `Provider not found or missing streamSimple: ${providerId}`,
+				retryable: false,
+			});
+			return;
+		}
+		const rawOptions = p["options"];
+		if (rawOptions !== undefined && !isRecord(rawOptions)) {
+			await this.client.respondError(id, "provider.stream", {
+				code: "invalid_arguments",
+				message: "provider.stream options must be an object",
+				retryable: false,
+			});
+			return;
+		}
+		try {
+			providerCallbackFlags(p["callbacks"]);
+		} catch (error) {
+			await this.client.respondError(id, "provider.stream", {
+				code: "invalid_arguments",
+				message: error instanceof Error ? error.message : String(error),
 				retryable: false,
 			});
 			return;
@@ -2530,15 +2907,19 @@ export class ExtensionHost {
 
 		const controller = new AbortController();
 		this.inFlightProviders.set(id, controller);
-		const options = {
-			...((p["options"] as Record<string, unknown> | undefined) ?? {}),
-			signal: controller.signal,
-		};
+		let scope: ProviderCallbackScope | undefined;
 		try {
-			const stream = config.streamSimple(p["model"] as Model<string>, p["context"] as Context, options as SimpleStreamOptions);
+			const options: Record<string, unknown> = {
+				...(isRecord(rawOptions) ? rawOptions : {}),
+				signal: controller.signal,
+			};
+			const callbackSetup = this.registerProviderCallbackScope(id, p, controller, options);
+			scope = callbackSetup.scope;
+			const model = p["model"] as Model<string>;
+			const context = p["context"] as Context;
+			const stream = config.streamSimple(model, context, callbackSetup.options as SimpleStreamOptions);
 			for await (const event of stream) {
 				if (controller.signal.aborted) break;
-				// Stream-correlated providerEvent carries the AssistantMessageEvent payload.
 				await this.client.send({
 					id,
 					kind: "event",
@@ -2546,25 +2927,278 @@ export class ExtensionHost {
 					payload: event,
 				});
 			}
+			if (!controller.signal.aborted && scope?.callbackFailed) {
+				await this.emitProviderCallbackError(id, "provider.stream", scope, scope.callbackError);
+				return;
+			}
 			if (controller.signal.aborted) {
-				await this.client.respondError(id, "provider.stream" as Method, {
+				await this.client.respondError(id, "provider.stream", {
 					code: "cancelled",
 					message: "provider stream cancelled",
 					retryable: false,
 				});
 				return;
 			}
-			await this.client.respond(id, "provider.stream" as Method, {});
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
-			await this.client.respondError(id, "provider.stream" as Method, {
+			await this.client.respond(id, "provider.stream", {});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const cancelled = controller.signal.aborted || isStructuredAbortError(error);
+			if (!cancelled && scope?.callbackFailed) {
+				await this.emitProviderCallbackError(id, "provider.stream", scope, scope.callbackError);
+				return;
+			}
+			await this.client.respondError(id, "provider.stream", {
 				code: cancelled ? "cancelled" : "extension_error",
 				message: cancelled ? "provider stream cancelled" : message,
 				retryable: false,
 			});
 		} finally {
+			if (scope !== undefined) this.closeProviderCallbackScope(scope);
 			this.inFlightProviders.delete(id);
+		}
+	}
+
+	private async handleProviderFetchDeferred(id: number, p: Record<string, unknown>): Promise<void> {
+		const providerId = p["providerId"];
+		const config = typeof providerId === "string" ? this.providers.get(providerId) : undefined;
+		if (typeof providerId !== "string" || config === undefined) {
+			await this.client.respondError(id, PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: "not_found",
+				message: `Provider not found: ${String(providerId ?? "")}`,
+				retryable: false,
+			});
+			return;
+		}
+		if (typeof config.fetchDeferred !== "function") {
+			await this.client.respondError(id, PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: "unsupported_deferred_operation",
+				message: `Provider does not support deferred fetch: ${providerId}`,
+				retryable: false,
+			});
+			return;
+		}
+		const model = p["model"];
+		const rawOptions = p["options"];
+		const rawHandle: unknown = p["handle"];
+		let handle: ProviderDeferredHandle;
+		try {
+			requireDeferredHandle(rawHandle);
+			handle = rawHandle;
+		} catch (error) {
+			await this.client.respondError(id, PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: "invalid_arguments",
+				message: error instanceof Error ? error.message : String(error),
+				retryable: false,
+			});
+			return;
+		}
+		if (!isRecord(model) || (rawOptions !== undefined && !isRecord(rawOptions))) {
+			await this.client.respondError(id, PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: "invalid_arguments",
+				message: "provider.fetchDeferred model/options are invalid",
+				retryable: false,
+			});
+			return;
+		}
+		let callbacks: ProviderCallbackFlags;
+		try {
+			callbacks = providerCallbackFlags(p["callbacks"]);
+		} catch (error) {
+			await this.client.respondError(id, PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: "invalid_arguments",
+				message: error instanceof Error ? error.message : String(error),
+				retryable: false,
+			});
+			return;
+		}
+		const request: ProviderFetchDeferredRequest = {
+			providerId,
+			model,
+			handle,
+			options: {
+				...(isRecord(rawOptions) ? rawOptions : {}),
+				wait: 0,
+			} as ProviderDeferredOptions,
+			callbacks,
+		};
+		const controller = new AbortController();
+		this.inFlightDeferredFetches.set(id, controller);
+		let scope: ProviderCallbackScope | undefined;
+		try {
+			const options: Record<string, unknown> = {
+				...request.options,
+				signal: controller.signal,
+			};
+			const callbackSetup = this.registerProviderCallbackScope(id, p, controller, options);
+			scope = callbackSetup.scope;
+			const stream = await config.fetchDeferred(
+				request.model as Model<string>,
+				request.handle as DeferredHandle,
+				callbackSetup.options as SimpleStreamOptions,
+			);
+			for await (const event of stream) {
+				if (controller.signal.aborted) break;
+				await this.client.send({
+					id,
+					kind: "event",
+					method: "providerEvent",
+					payload: event,
+				});
+			}
+			if (!controller.signal.aborted && scope?.callbackFailed) {
+				await this.emitProviderCallbackError(
+					id,
+					PROVIDER_FETCH_DEFERRED_METHOD,
+					scope,
+					scope.callbackError,
+				);
+				return;
+			}
+			if (controller.signal.aborted) {
+				await this.client.respondError(id, PROVIDER_FETCH_DEFERRED_METHOD, {
+					code: "cancelled",
+					message: "provider deferred fetch cancelled",
+					retryable: false,
+				});
+				return;
+			}
+			await this.client.respond(id, PROVIDER_FETCH_DEFERRED_METHOD, {});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const cancelled = controller.signal.aborted || isStructuredAbortError(error);
+			if (!cancelled && scope?.callbackFailed) {
+				await this.emitProviderCallbackError(
+					id,
+					PROVIDER_FETCH_DEFERRED_METHOD,
+					scope,
+					scope.callbackError,
+				);
+				return;
+			}
+			await this.client.respondError(id, PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: cancelled ? "cancelled" : "extension_error",
+				message: cancelled ? "provider deferred fetch cancelled" : message,
+				retryable: false,
+			});
+		} finally {
+			if (scope !== undefined) this.closeProviderCallbackScope(scope);
+			this.inFlightDeferredFetches.delete(id);
+		}
+	}
+
+	private async handleProviderCancelDeferred(id: number, p: Record<string, unknown>): Promise<void> {
+		const providerId = p["providerId"];
+		const config = typeof providerId === "string" ? this.providers.get(providerId) : undefined;
+		if (typeof providerId !== "string" || config === undefined) {
+			await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: "not_found",
+				message: `Provider not found: ${String(providerId ?? "")}`,
+				retryable: false,
+			});
+			return;
+		}
+		if (typeof config.cancelDeferred !== "function") {
+			await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: "unsupported_deferred_operation",
+				message: `Provider does not support deferred cancellation: ${providerId}`,
+				retryable: false,
+			});
+			return;
+		}
+		const model = p["model"];
+		const rawOptions = p["options"];
+		const rawHandle: unknown = p["handle"];
+		let handle: ProviderDeferredHandle;
+		try {
+			requireDeferredHandle(rawHandle);
+			handle = rawHandle;
+		} catch (error) {
+			await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: "invalid_arguments",
+				message: error instanceof Error ? error.message : String(error),
+				retryable: false,
+			});
+			return;
+		}
+		if (!isRecord(model) || (rawOptions !== undefined && !isRecord(rawOptions))) {
+			await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: "invalid_arguments",
+				message: "provider.cancelDeferred model/options are invalid",
+				retryable: false,
+			});
+			return;
+		}
+		let callbacks: ProviderCallbackFlags;
+		try {
+			callbacks = providerCallbackFlags(p["callbacks"]);
+		} catch (error) {
+			await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: "invalid_arguments",
+				message: error instanceof Error ? error.message : String(error),
+				retryable: false,
+			});
+			return;
+		}
+		const request: ProviderCancelDeferredRequest = {
+			providerId,
+			model,
+			handle,
+			options: (isRecord(rawOptions) ? rawOptions : {}) as ProviderDeferredOptions,
+			callbacks,
+		};
+		const controller = new AbortController();
+		this.inFlightDeferredCancels.set(id, controller);
+		let scope: ProviderCallbackScope | undefined;
+		try {
+			const options: Record<string, unknown> = {
+				...request.options,
+				signal: controller.signal,
+			};
+			const callbackSetup = this.registerProviderCallbackScope(id, p, controller, options);
+			scope = callbackSetup.scope;
+			await config.cancelDeferred(
+				request.model as Model<string>,
+				request.handle as DeferredHandle,
+				callbackSetup.options as SimpleStreamOptions,
+			);
+			if (!controller.signal.aborted && scope?.callbackFailed) {
+				await this.emitProviderCallbackError(
+					id,
+					PROVIDER_CANCEL_DEFERRED_METHOD,
+					scope,
+					scope.callbackError,
+				);
+				return;
+			}
+			if (controller.signal.aborted) {
+				await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
+					code: "cancelled",
+					message: "provider deferred cancellation cancelled",
+					retryable: false,
+				});
+				return;
+			}
+			await this.client.respond(id, PROVIDER_CANCEL_DEFERRED_METHOD, {});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const cancelled = controller.signal.aborted || isStructuredAbortError(error);
+			if (!cancelled && scope?.callbackFailed) {
+				await this.emitProviderCallbackError(
+					id,
+					PROVIDER_CANCEL_DEFERRED_METHOD,
+					scope,
+					scope.callbackError,
+				);
+				return;
+			}
+			await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: cancelled ? "cancelled" : "extension_error",
+				message: cancelled ? "provider deferred cancellation cancelled" : message,
+				retryable: false,
+			});
+		} finally {
+			if (scope !== undefined) this.closeProviderCallbackScope(scope);
+			this.inFlightDeferredCancels.delete(id);
 		}
 	}
 
@@ -3161,6 +3795,12 @@ export class ExtensionHost {
 		this.inFlightTools.clear();
 		for (const controller of this.inFlightProviders.values()) controller.abort();
 		this.inFlightProviders.clear();
+		for (const controller of this.inFlightDeferredFetches.values()) controller.abort();
+		this.inFlightDeferredFetches.clear();
+		for (const controller of this.inFlightDeferredCancels.values()) controller.abort();
+		this.inFlightDeferredCancels.clear();
+		for (const scope of this.providerCallbackScopes.values()) this.closeProviderCallbackScope(scope);
+		this.providerCallbackScopes.clear();
 		for (const controller of this.inFlightShortcuts.values()) controller.abort();
 		this.inFlightShortcuts.clear();
 		for (const scope of this.activeProviderLoadScopeByPath.values()) scope.phase = "aborted";
@@ -3175,6 +3815,13 @@ export class ExtensionHost {
 		const waiters = this.idleWaiters.splice(0);
 		for (const waiter of waiters) waiter.reject(new Error(reason));
 		for (const key of [...this.slots.keys()]) this.disposeSlot(key);
+		void this.facetBridge.dispose().catch((error: unknown) => {
+			this.emitExtensionError(
+				"<facet-host>",
+				"dispose",
+				error instanceof Error ? error.message : String(error),
+			);
+		});
 		this.client.dispose(reason);
 	}
 
