@@ -2,12 +2,17 @@
 //!
 //! The bus binds recipients synchronously.  Admission therefore has no async
 //! gap: an event is either in the owned delivery queue before [`emit`] returns,
-//! or it was rejected because the bus had already been closed.  A single bus
 //! worker drains that queue in order while each watcher owns an independent
-//! serialized worker for its listener.
+//! serialized worker for its listener.  A listener that emits and awaits a
+//! nested event is dispatched inline on the worker's poll chain instead of
+//! queueing behind itself, so nested events overtake earlier batches that are
+//! admitted but not yet in delivery.  Outside any Tokio runtime, admission
+//! drives the drain synchronously so a dropped future cannot strand an
+//! admitted event.
 
 use futures::future::{BoxFuture, FutureExt, ready};
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -63,9 +68,12 @@ impl Drop for Unsubscribe {
 pub struct HarnessEventBus {
     core: Arc<BusCore>,
 }
-
 struct BusCore {
     state: Mutex<BusState>,
+    /// Identity of the task currently running [`drain`], used to detect a
+    /// listener reentering the bus with an awaited emit.  `None` while no
+    /// drain is in flight.
+    drain_task: Mutex<Option<tokio::task::Id>>,
 }
 
 struct BusState {
@@ -126,6 +134,7 @@ impl HarnessEventBus {
                     closed: None,
                     next_id: 0,
                 }),
+                drain_task: Mutex::new(None),
             }),
         }
     }
@@ -179,8 +188,20 @@ impl HarnessEventBus {
     ///
     /// Ordinary listeners are copied in registration order, followed by watch
     /// recipients, for each event.  No listener lookup occurs while delivering
-    /// the batch.
+    /// the batch.  Outside a Tokio runtime the batch is delivered
+    /// synchronously before this returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no Tokio runtime is available and a one-shot current-thread
+    /// runtime cannot be built to drive the drain (resource exhaustion while
+    /// creating the executor).  Silently stranding the admitted batch would
+    /// violate the delivery guarantee, so this fails loudly instead.
     #[must_use]
+    #[allow(
+        clippy::panic,
+        reason = "fail loudly on executor collapse rather than strand admitted events"
+    )]
     pub fn emit_batch(&self, events: Vec<HarnessEvent>, cx: &Context) -> BoxFuture<'static, ()> {
         if events.is_empty() {
             return ready(()).boxed();
@@ -217,6 +238,19 @@ impl HarnessEventBus {
                     }
                 })
                 .collect::<Vec<_>>();
+        // A listener may reenter the bus while the drain worker is suspended
+        // inside it.  Queue such nested batches at the front; the returned
+        // future delivers them inline (see `deliver_reentrant_batch`) instead
+        // of waiting for a worker that cannot run until the emitting listener
+        // returns.
+        if reentrant_from_drain(&self.core) {
+            state.queue.push_front(DeliveryItem::Batch {
+                events: bound,
+                done: Some(done),
+            });
+            drop(state);
+            return deliver_reentrant_batch(Arc::clone(&self.core), observation).boxed();
+        }
         state.queue.push_back(DeliveryItem::Batch {
             events: bound,
             done: Some(done),
@@ -229,8 +263,20 @@ impl HarnessEventBus {
         drop(state);
 
         if should_schedule && !spawn_drain(Arc::clone(&self.core)) {
-            let mut state = lock_unpoisoned(&self.core.state);
-            state.worker_scheduled = false;
+            // No Tokio runtime is available, so a dropped future would strand
+            // the admitted batch forever.  Drive the drain to completion on
+            // this thread: admission keeps guaranteeing delivery.
+            INLINE_DRAIN.with(|active| active.set(true));
+            let _inline_guard = InlineDrainGuard;
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(drain(Arc::clone(&self.core))),
+                // Without an executor there is no way to honor the delivery
+                // guarantee; fail loudly rather than strand the event.
+                Err(error) => panic!("transient bus drain runtime failed to build: {error}"),
+            }
         }
 
         let core = Arc::clone(&self.core);
@@ -422,6 +468,10 @@ fn spawn_drain(core: Arc<BusCore>) -> bool {
 }
 
 async fn drain(core: Arc<BusCore>) {
+    // Record the draining task so reentrant emits from delivered listeners
+    // are recognized; the no-runtime inline drain is recognized through
+    // `INLINE_DRAIN` because `block_on` has no task id.
+    *lock_unpoisoned(&core.drain_task) = tokio::task::try_id();
     loop {
         let item = {
             let mut state = lock_unpoisoned(&core.state);
@@ -431,6 +481,7 @@ async fn drain(core: Arc<BusCore>) {
                 // `worker_scheduled` could strand a queued observation.
                 state.running = false;
                 state.worker_scheduled = false;
+                *lock_unpoisoned(&core.drain_task) = None;
                 if state.closed.is_some() {
                     state.listeners.clear();
                     state.watchers.clear();
@@ -475,6 +526,79 @@ async fn deliver_bound(core: &Arc<BusCore>, bound: BoundEvent) {
             }
             Recipient::Watcher(watcher) => {
                 watcher.push(bound.event.clone(), bound.context.clone());
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Whether this thread is driving a no-runtime inline [`drain`] via
+    /// `emit_batch`.  Inside such a drain the thread only ever executes the
+    /// drain's poll chain, so the flag identifies reentrant emits exactly.
+    static INLINE_DRAIN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Restores [`INLINE_DRAIN`] on scope exit, including through unwinding.
+struct InlineDrainGuard;
+
+impl Drop for InlineDrainGuard {
+    fn drop(&mut self) {
+        INLINE_DRAIN.with(|active| active.set(false));
+    }
+}
+
+/// Returns whether the caller is a delivered listener running inside the
+/// drain's poll chain.  The spawned worker is recognized by its Tokio task
+/// id; the no-runtime inline drain by the [`INLINE_DRAIN`] thread flag.
+fn reentrant_from_drain(core: &BusCore) -> bool {
+    if INLINE_DRAIN.with(Cell::get) {
+        return true;
+    }
+    let Some(task_id) = tokio::task::try_id() else {
+        return false;
+    };
+    lock_unpoisoned(&core.drain_task).is_some_and(|drain_id| drain_id == task_id)
+}
+
+/// Delivers queued items inline until the calling emit's own batch completes.
+///
+/// Runs on the drain's poll chain: a listener emitted an event and awaits its
+/// delivery while the worker is suspended inside that listener.  Items are
+/// consumed from the front so the nested batch keeps queue order relative to
+/// anything an earlier abandoned nested emit left queued.  Dropping the
+/// future stays safe: the batch remains admitted and the suspended worker
+/// delivers it once the emitting listener returns.
+async fn deliver_reentrant_batch(core: Arc<BusCore>, observation: oneshot::Receiver<()>) {
+    let mut observation = observation;
+    loop {
+        match observation.try_recv() {
+            // Delivered by an enclosing inline dispatch, or the sender went
+            // away; completion is observed either way.
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            _ => return,
+        }
+        let item = {
+            let mut state = lock_unpoisoned(&core.state);
+            state.queue.pop_front()
+        };
+        let Some(item) = item else {
+            return;
+        };
+        match item {
+            DeliveryItem::Batch { events, done } => {
+                for bound in events {
+                    deliver_bound(&core, bound).await;
+                }
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+            }
+            DeliveryItem::Barrier(mut barrier) => {
+                if let Some(barrier) = barrier.take() {
+                    let _ = AssertUnwindSafe(async move { barrier() })
+                        .catch_unwind()
+                        .await;
+                }
             }
         }
     }
@@ -1152,9 +1276,44 @@ fn panic_message(panic: &(dyn Any + Send)) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, reason = "bus tests use contextual fixture failures")]
 mod tests {
     use super::{Arc, EventFilter, HarnessError, HarnessEventBus};
+    use crate::context::Context;
+    use crate::harness::event::{
+        EventListener, HandlerErrorKind, HarnessEvent, HarnessEventPayload, HarnessEventType,
+    };
+    use futures::future::FutureExt;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    fn fault_event(code: &str) -> HarnessEvent {
+        HarnessEvent::global(HarnessEventPayload::Fault {
+            code: code.to_owned(),
+            message: "test fault".to_owned(),
+        })
+    }
+
+    fn handler_error_event() -> HarnessEvent {
+        HarnessEvent::global(HarnessEventPayload::HandlerError {
+            kind: HandlerErrorKind::Event {
+                event: "fault".to_owned(),
+            },
+            error: "nested emit".to_owned(),
+            stack: None,
+        })
+    }
+
+    fn flag_listener(flag: &Arc<AtomicBool>) -> EventListener {
+        let flag = Arc::clone(flag);
+        Arc::new(move |_event: HarnessEvent, _context: Context| {
+            let flag = Arc::clone(&flag);
+            async move {
+                flag.store(true, Ordering::Release);
+            }
+            .boxed()
+        })
+    }
 
     #[test]
     fn dropping_watch_handle_releases_the_registration() -> Result<(), HarnessError> {
@@ -1170,5 +1329,62 @@ mod tests {
         drop(marker);
         assert!(weak.upgrade().is_none());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn listener_emitting_and_awaiting_does_not_deadlock() {
+        let bus = HarnessEventBus::new();
+        let context = Context::background();
+        let nested_delivered = Arc::new(AtomicBool::new(false));
+        let outer_completed = Arc::new(AtomicBool::new(false));
+
+        let nested_flag = Arc::clone(&nested_delivered);
+        let _nested_guard = bus
+            .on(HarnessEventType::HandlerError, flag_listener(&nested_flag))
+            .expect("nested registration");
+
+        let outer_bus = bus.clone();
+        let outer_flag = Arc::clone(&outer_completed);
+        let _outer_guard = bus
+            .on(
+                HarnessEventType::Fault,
+                Arc::new(move |_event: HarnessEvent, context: Context| {
+                    let bus = outer_bus.clone();
+                    let outer_flag = Arc::clone(&outer_flag);
+                    let nested = handler_error_event();
+                    async move {
+                        bus.emit(nested, &context).await;
+                        outer_flag.store(true, Ordering::Release);
+                    }
+                    .boxed()
+                }),
+            )
+            .expect("outer registration");
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            bus.emit(fault_event("outer"), &context),
+        )
+        .await
+        .expect("reentrant emit must not deadlock");
+
+        assert!(nested_delivered.load(Ordering::Acquire));
+        assert!(outer_completed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn emit_outside_runtime_delivers_without_awaiting() {
+        let bus = HarnessEventBus::new();
+        let delivered = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&delivered);
+        let _listener_guard = bus
+            .on(HarnessEventType::Fault, flag_listener(&flag))
+            .expect("registration");
+
+        drop(bus.emit(fault_event("no-runtime"), &Context::background()));
+        assert!(
+            delivered.load(Ordering::Acquire),
+            "dropping the future must not strand the admitted event"
+        );
     }
 }

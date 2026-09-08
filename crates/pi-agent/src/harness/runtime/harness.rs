@@ -23,7 +23,7 @@ use crate::harness::event::{
 };
 use crate::harness::hooks::HookRegistry;
 use crate::harness::result::{HarnessError, HarnessFault, LaneInfo, OpenOperation};
-use crate::session::traits::Session;
+use crate::session::traits::{Session, SessionReaderExt};
 use crate::session::{
     CompactionSettings, HarnessRetryPolicy, HarnessStreamOptions, LaneName, LaneState,
 };
@@ -242,10 +242,28 @@ impl AgentHarness for HarnessRuntime {
                 super::support::set_json(&super::support::lane_branch_tip_address(name), &tip)
                     .map_err(map_session_error)?,
             ];
-            mutator
-                .commit(writes, cx)
-                .await
-                .map_err(map_session_error)?;
+            // A failed metadata commit leaves a durable branch with no lane
+            // metadata and there is no delete_branch to undo it: the name can
+            // never be retried or restored. Seal the harness against one
+            // shared fault, like commit_admission_writes. The registry guard
+            // is released first because fault broadcast re-locks it through
+            // lane_snapshot.
+            if let Err(error) = mutator.commit(writes, cx).await {
+                drop(lanes);
+                self.fault(
+                    HarnessFault {
+                        message: format!("session operation failed: {error}"),
+                        cause: Box::new(error),
+                    },
+                    cx,
+                )
+                .await;
+                let stored = self.fault.lock().ok().and_then(|slot| slot.clone());
+                return Err(match stored {
+                    Some(fault) => super::support::sealed_rejection(&fault),
+                    None => self.closed_error(),
+                });
+            }
             let data = super::support::LaneData::new(lane_config, tip, lane_state);
             let lane = LaneRuntime::new(Arc::new(self.clone_ref()), name.clone(), data);
             lanes.insert(name.clone(), Arc::clone(&lane));
@@ -253,6 +271,10 @@ impl AgentHarness for HarnessRuntime {
                 name.clone(),
                 HarnessEventPayload::LaneCreated { at: parent },
             );
+            // emit waits for listener delivery on the serialized drain worker;
+            // the registry guard must be released first so a LaneCreated
+            // listener can call back into `lanes()` without deadlocking.
+            drop(lanes);
             self.events.emit(event, cx).await;
             Ok(lane as Arc<dyn crate::harness::api::AgentLane>)
         })
@@ -373,7 +395,41 @@ impl AgentHarness for HarnessRuntime {
                 return Err(self.closed_error());
             }
             validate_tools(&tools)?;
-            self.config.write().await.tools = tools;
+            // Reject removals still referenced by a lane's persisted
+            // active_tool_names; a swapped-out name fails closed at
+            // generation. The lane registry and config write locks are held
+            // across check-and-swap: `lane()` takes `lanes` before reading
+            // config and `set_active_tools` reads config before committing
+            // lane metadata, so this order cannot invert and no lane can
+            // start referencing a removed tool mid-swap. Lane metadata is
+            // read through the session, which never waits on harness locks.
+            let lanes = self.lanes.lock().await;
+            let mut config = self.config.write().await;
+            let offered: std::collections::BTreeSet<&str> =
+                tools.iter().map(|tool| tool.name()).collect();
+            for name in lanes.keys() {
+                let stored = self
+                    .session
+                    .get_value(&super::support::lane_config_address(name), cx)
+                    .await
+                    .map_err(map_session_error)?;
+                let active = stored.map_or_else(Vec::new, |stored| stored.value.active_tool_names);
+                if let Some(in_use) = active
+                    .iter()
+                    .find(|active| !offered.contains(active.as_str()))
+                {
+                    return Err(HarnessError::InvalidLane {
+                        lane: name.clone(),
+                        reason: "tool_in_use".to_owned(),
+                        message: format!(
+                            "tool \"{in_use}\" is still active on lane \"{name}\" and cannot be removed"
+                        ),
+                    });
+                }
+            }
+            config.tools = tools;
+            drop(config);
+            drop(lanes);
             self.events
                 .emit(
                     HarnessEvent::global(HarnessEventPayload::ConfigUpdate {

@@ -1071,10 +1071,23 @@ impl DeltaDecoder {
 
     /// Decodes one ordered wire batch into complete operations.
     ///
+    /// Batches are transactional: dictionary mutations from a rejected batch
+    /// are rolled back, so dictionary ids defined only by the failed batch
+    /// cannot be resolved by a later update.
+    ///
     /// # Errors
     /// Returns `DeltaError` when a dictionary id is unresolved or a resolved
     /// path is reserved or empty.
     pub fn decode(&mut self, wire: &[WireOp]) -> Result<Vec<DeltaOp>, DeltaError> {
+        let dictionary = self.paths.clone();
+        let result = self.decode_batch(wire);
+        if result.is_err() {
+            self.paths = dictionary;
+        }
+        result
+    }
+
+    fn decode_batch(&mut self, wire: &[WireOp]) -> Result<Vec<DeltaOp>, DeltaError> {
         let mut previous: Option<StatePath> = None;
         let mut output = Vec::with_capacity(wire.len());
         for op in wire {
@@ -1987,6 +2000,7 @@ fn integer(value: u64) -> JsInteger {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, reason = "decoder tests use contextual fixture failures")]
 mod tests {
     use super::*;
     use crate::service::value::{JsonError, ValueError, parse_json, stringify_json};
@@ -2223,6 +2237,43 @@ mod tests {
         assert_eq!(
             ops,
             vec![DeltaOp::Set(path(vec![PathSegment::key("a")])?, json("1")?)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_batch_does_not_leak_its_dictionary_entries() -> TestResult {
+        let mut decoder = DeltaDecoder::new();
+        let good = vec![
+            WireOp::from_json(&json(r##"["#",0,["a"]]"##)?)?,
+            WireOp::from_json(&json(r#"["s",0,1]"#)?)?,
+        ];
+        assert_eq!(
+            decoder.decode(&good)?,
+            vec![DeltaOp::Set(path(vec![PathSegment::key("a")])?, json("1")?)]
+        );
+
+        let rejected = vec![
+            WireOp::from_json(&json(r##"["#",1,["b"]]"##)?)?,
+            WireOp::from_json(&json(r#"["s",9,1]"#)?)?,
+        ];
+        assert_eq!(
+            decoder.decode(&rejected).expect_err("unresolved id"),
+            DeltaError::PathId(int(9.0)?)
+        );
+
+        // The rejected batch's Define must not survive into later updates.
+        let later = vec![WireOp::from_json(&json(r#"["s",1,1]"#)?)?];
+        assert_eq!(
+            decoder.decode(&later).expect_err("rejected id"),
+            DeltaError::PathId(int(1.0)?)
+        );
+
+        // Previously accepted dictionary entries still resolve.
+        let again = vec![WireOp::from_json(&json(r#"["s",0,2]"#)?)?];
+        assert_eq!(
+            decoder.decode(&again)?,
+            vec![DeltaOp::Set(path(vec![PathSegment::key("a")])?, json("2")?)]
         );
         Ok(())
     }

@@ -212,6 +212,7 @@ impl ReplicatedState {
         &self,
         listener: ReplicatedStateListener,
     ) -> Result<Arc<dyn Fn() + Send + Sync>, ServiceError> {
+        let transition = lock(&self.transition_gate);
         let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
         let (current, listener_for_call) = {
             let inner = lock(&self.inner);
@@ -236,6 +237,7 @@ impl ReplicatedState {
                 },
             );
         }
+        drop(transition);
         Ok(remove_listener(&self.listeners, id))
     }
 
@@ -585,16 +587,17 @@ fn remove_listener<T: ?Sized + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
     use super::{
-        MutableReplicatedState, ReplicatedStateDelivery, ReplicatedStateDeliveryKind,
-        ReplicatedStateListener, lock,
+        MutableReplicatedState, ReplicatedState, ReplicatedStateDelivery,
+        ReplicatedStateDeliveryKind, ReplicatedStateListener, lock,
     };
     use crate::context::Context;
-    use crate::service::value::{JsObject, JsString, JsonValue};
+    use crate::service::delta::DeltaOp;
+    use crate::service::value::{JsInteger, JsObject, JsString, JsonValue};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn object(number: f64) -> JsonValue {
         JsonValue::Object(JsObject::from([(
@@ -871,6 +874,75 @@ mod tests {
         assert_eq!(helper_results, [Some(true), Some(true)]);
         assert_eq!(*lock(&updates_a), vec![1.0, 2.0]);
         assert_eq!(*lock(&updates_b), vec![1.0, 2.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn subscribe_hydration_does_not_regress_after_concurrent_update() -> Result<(), String> {
+        let state = Arc::new(ReplicatedState::default());
+        state
+            .hydrate(
+                JsInteger::zero(),
+                &[DeltaOp::Replace(object(0.0))],
+                &Context::background(),
+            )
+            .map_err(|error| format!("initial hydration failed: {error}"))?;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (hydration_started_tx, hydration_started_rx) = mpsc::channel();
+        let (hydration_release_tx, hydration_release_rx) = mpsc::channel();
+        let release = Arc::new(Mutex::new(Some(hydration_release_rx)));
+        let events_for_listener = Arc::clone(&events);
+        let release_for_listener = Arc::clone(&release);
+        let listener = Arc::new(
+            move |_value: Arc<JsonValue>, _context: Context, delivery: ReplicatedStateDelivery| {
+                if delivery.kind == ReplicatedStateDeliveryKind::Hydrate {
+                    let _ = hydration_started_tx.send(());
+                    if let Some(release) = lock(&release_for_listener).take() {
+                        let _ = release.recv();
+                    }
+                }
+                lock(&events_for_listener).push(delivery.sequence);
+            },
+        );
+
+        let state_for_subscription = Arc::clone(&state);
+        let subscription = thread::spawn(move || state_for_subscription.subscribe(listener));
+        if let Err(error) = hydration_started_rx.recv_timeout(Duration::from_secs(1)) {
+            let _ = hydration_release_tx.send(());
+            let _ = subscription.join();
+            return Err(format!("hydration did not start: {error}"));
+        }
+
+        let update_done = Arc::new(AtomicBool::new(false));
+        let update_done_for_thread = Arc::clone(&update_done);
+        let state_for_update = Arc::clone(&state);
+        let updater = thread::spawn(move || {
+            let result = state_for_update.update(
+                JsInteger::one(),
+                &[DeltaOp::Replace(object(1.0))],
+                &Context::background(),
+            );
+            update_done_for_thread.store(true, Ordering::Release);
+            result
+        });
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while !update_done.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+
+        let _ = hydration_release_tx.send(());
+        let remove = subscription
+            .join()
+            .map_err(|_| "subscription thread panicked".to_owned())?
+            .map_err(|error| format!("subscription failed: {error}"))?;
+        updater
+            .join()
+            .map_err(|_| "update thread panicked".to_owned())?
+            .map_err(|error| format!("concurrent update failed: {error}"))?;
+        remove();
+
+        assert_eq!(*lock(&events), vec![JsInteger::zero(), JsInteger::one()]);
         Ok(())
     }
 }

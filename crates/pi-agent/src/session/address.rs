@@ -6,9 +6,8 @@ use serde::{Deserialize, Serialize};
 use super::DurableStructuralPreparation;
 use super::{
     EntryId, LaneConfiguration, LaneName, OperationId, OperationMeta, OperationResultRecord,
-    OperationState, PendingEntry, ScanOrder,
+    OperationState, PendingEntry, ScanOrder, StagedToolResult,
 };
-use crate::tool::AgentToolResult;
 
 /// Which durable sub-space an address names: a single value or an append-only list.
 ///
@@ -302,9 +301,11 @@ fn list_address<T>(namespace: &'static str, key: impl Into<Cow<'static, str>>) -
 
 /// The frozen `pi.*` address helpers below name one durable slot each, so no
 /// caller hand-writes a namespace string. Composite keys join their identifier
-/// parts with `:`; a key ending in `:` is a scan prefix matching every slot
-/// under the preceding part. Namespaces are literals and keys are built from
-/// identifier strings, so construction cannot fail and these helpers unwrap.
+/// parts with `:`; operation ids are validated at admission to exclude the
+/// separator and control characters because cleanup prefixes match by key
+/// prefix. A key ending in `:` is a scan prefix matching every slot under the
+/// preceding part. Namespaces are literals and keys are built from identifier
+/// strings, so construction cannot fail and these helpers unwrap.
 /// Current tip entry of one branch lane, or `None` when the lane is empty.
 #[must_use]
 pub fn branch_tip(branch: &str) -> Value<Option<EntryId>> {
@@ -397,12 +398,12 @@ pub fn pending_entry(entry: &EntryId) -> Value<PendingEntry> {
 }
 /// Tool output staged for one invocation before its entry commits.
 #[must_use]
-pub fn pending_tool_output(op: &OperationId, inv: &EntryId) -> Value<AgentToolResult> {
+pub fn pending_tool_output(op: &OperationId, inv: &EntryId) -> Value<StagedToolResult> {
     address("pi.pending.tool_output", format!("{op}:{inv}"))
 }
 /// Prefix over [`pending_tool_output`] for one operation.
 #[must_use]
-pub fn pending_tool_output_prefix(op: &OperationId) -> Value<AgentToolResult> {
+pub fn pending_tool_output_prefix(op: &OperationId) -> Value<StagedToolResult> {
     address("pi.pending.tool_output", format!("{op}:"))
 }
 /// Assistant reply frames staged for one response, so a resumed run can continue

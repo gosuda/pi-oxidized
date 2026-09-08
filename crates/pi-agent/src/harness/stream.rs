@@ -258,16 +258,14 @@ pub(crate) async fn stream_harness_deferred(
     let (stream, metadata) = gate.admit(|| {
         let metadata = Arc::new(Mutex::new(AssistantResponseMetadata::default()));
         let on_response = response_callback(Arc::clone(&metadata), config.on_response.clone());
-        let mut native_options = native_stream_options(
+        let native_options = deferred_poll_options(native_stream_options(
             &config.stream_options,
             config.thinking_level,
             config.session_id.clone(),
             admitted_context.token().cloned(),
             config.on_payload.clone(),
             on_response,
-        );
-        native_options
-            .insert_extra_if_absent_with(pi_ai::StreamOptionKey::WAIT, || Value::from(0_u64));
+        ));
         let stream = config
             .models
             .fetch_deferred(&config.model, handle, native_options);
@@ -282,6 +280,15 @@ pub(crate) async fn stream_harness_deferred(
         metadata,
     )
     .await
+}
+
+/// Options for one deferred poll: a single non-waiting fetch.
+///
+/// `wait = 0` is forced rather than defaulted so a caller-supplied value
+/// cannot turn the one-shot status check into a long-poll.
+fn deferred_poll_options(mut options: pi_ai::StreamOptions) -> pi_ai::StreamOptions {
+    options.insert_extra(pi_ai::StreamOptionKey::WAIT, Value::from(0_u64));
+    options
 }
 
 /// Consume provider events and run the terminal lifecycle in order.
@@ -809,6 +816,19 @@ mod tests {
         assert_eq!(
             apply_stream_options_patch(&object, &create_stream_options_patch(&object, &windowed)),
             windowed
+        );
+    }
+
+    #[test]
+    fn deferred_poll_options_overrides_a_caller_supplied_wait() {
+        let mut options = pi_ai::StreamOptions::default();
+        options.insert_extra(pi_ai::StreamOptionKey::WAIT, Value::from(30_u64));
+
+        let options = deferred_poll_options(options);
+
+        assert_eq!(
+            options.extra_value(pi_ai::StreamOptionKey::WAIT),
+            Some(&Value::from(0_u64))
         );
     }
 }

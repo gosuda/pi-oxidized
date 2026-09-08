@@ -557,9 +557,13 @@ async fn start_singleton(
             display_js(&binding.service_id)
         )));
     }
-    binding
+    if let Err(error) = binding
         .facade
-        .install(&snapshot.instances[0], &Context::background())?;
+        .install(&snapshot.instances[0], &Context::background())
+    {
+        subscription.close(Context::background()).await?;
+        return Err(error);
+    }
     *lock(&binding.subscription) = Some(Arc::clone(&subscription));
     subscription.activate();
     Ok(())
@@ -701,7 +705,12 @@ impl KeyedBinding {
             )));
         }
         for instance in &snapshot.instances {
-            self.spawn_instance(instance, &Context::background())?;
+            if let Err(error) = self.spawn_instance(instance, &Context::background()) {
+                let tasks = self.deactivate_instances();
+                cancel_and_drain(tasks).await;
+                subscription.close(Context::background()).await?;
+                return Err(error);
+            }
         }
         *lock(&self.subscription) = Some(Arc::clone(&subscription));
         subscription.activate();
@@ -949,14 +958,23 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures::FutureExt;
+    use futures::future::BoxFuture;
 
     use super::*;
+    use crate::service::delta::{DeltaOp, PathSegment, StatePath};
     use crate::service::provider::{
         RemoteServiceProvider, ServiceDefinition, ServiceImplementation, ServiceMember,
         ServiceMethod,
     };
     use crate::service::replicated::ReplicatedStateDeliveryKind;
-    use crate::service::value::{JsObject, JsonValue};
+    use crate::service::transport::{
+        RemoteServiceTransport, ServiceSubscription, ServiceUpdateListener,
+    };
+    use crate::service::value::{JsInteger, JsObject, JsonValue};
+    use crate::service::wire::{
+        ServiceCall, ServiceInstanceAddress, ServiceInstanceSnapshot, ServiceMemberSnapshot,
+        ServiceSubscriptionSnapshot,
+    };
 
     fn definition(id: &JsString, mode: ServiceMode) -> ServiceDefinition {
         ServiceDefinition {
@@ -983,6 +1001,165 @@ mod tests {
 
     fn implementation(member: ServiceMember) -> ServiceImplementation {
         BTreeMap::from([(JsString::from_utf8("member"), member)])
+    }
+
+    struct TrackingSubscription {
+        snapshot: Arc<ServiceSubscriptionSnapshot<DeltaOp>>,
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl ServiceSubscription for TrackingSubscription {
+        fn snapshot(&self) -> &ServiceSubscriptionSnapshot<DeltaOp> {
+            self.snapshot.as_ref()
+        }
+
+        fn activate(&self) {}
+
+        fn close(&self, _context: Context) -> BoxFuture<'_, Result<(), ServiceError>> {
+            self.closes.fetch_add(1, Ordering::AcqRel);
+            async { Ok(()) }.boxed()
+        }
+    }
+
+    struct TrackingTransport {
+        snapshot: Arc<ServiceSubscriptionSnapshot<DeltaOp>>,
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl RemoteServiceTransport for TrackingTransport {
+        fn invoke(
+            &self,
+            _call: ServiceCall,
+            _context: Context,
+        ) -> BoxFuture<'_, Result<Option<JsonValue>, ServiceError>> {
+            async { Err(ServiceError::local("test transport does not invoke")) }.boxed()
+        }
+
+        fn subscribe(
+            &self,
+            _service_id: JsString,
+            _mode: ServiceMode,
+            _listener: ServiceUpdateListener,
+            _context: Context,
+        ) -> BoxFuture<'_, Result<Arc<dyn ServiceSubscription>, ServiceError>> {
+            let subscription = TrackingSubscription {
+                snapshot: Arc::clone(&self.snapshot),
+                closes: Arc::clone(&self.closes),
+            };
+            async move { Ok(Arc::new(subscription) as Arc<dyn ServiceSubscription>) }.boxed()
+        }
+    }
+
+    fn tracking_transport(
+        snapshot: ServiceSubscriptionSnapshot<DeltaOp>,
+    ) -> (Arc<dyn RemoteServiceTransport>, Arc<AtomicUsize>) {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(TrackingTransport {
+            snapshot: Arc::new(snapshot),
+            closes: Arc::clone(&closes),
+        });
+        (transport, closes)
+    }
+
+    #[tokio::test]
+    async fn singleton_install_failure_closes_subscription() {
+        let service_id = JsString::from_utf8("singleton");
+        let snapshot = ServiceSubscriptionSnapshot {
+            service_id: service_id.clone(),
+            mode: ServiceMode::Singleton,
+            instances: vec![ServiceInstanceSnapshot {
+                instance: None,
+                members: vec![ServiceMemberSnapshot::State {
+                    name: JsString::from_utf8("member"),
+                    sequence: JsInteger::zero(),
+                    ops: vec![DeltaOp::Replace(object(1.0))],
+                }],
+            }],
+        };
+        let (transport, closes) = tracking_transport(snapshot);
+        let mut options = BindingOptions::new(vec![service_id.clone()], transport);
+        options.bound = false;
+        let binding = RemoteServiceBinding::new(options).expect("binding");
+        let facade = binding.use_service(&service_id).expect("facade");
+        let _ = facade
+            .member("member")
+            .expect("member")
+            .invoke(Vec::new(), Context::background())
+            .await;
+
+        binding
+            .rebind(true, Context::background())
+            .await
+            .expect_err("singleton install should fail");
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        binding
+            .dispose(Context::background())
+            .await
+            .expect("dispose");
+    }
+
+    #[tokio::test]
+    async fn keyed_start_failure_closes_subscription_and_rolls_back_instances() {
+        let service_id = JsString::from_utf8("keyed");
+        let first_address = ServiceInstanceAddress {
+            key: JsString::from_utf8("first"),
+            generation: JsInteger::one(),
+        };
+        let second_address = ServiceInstanceAddress {
+            key: JsString::from_utf8("second"),
+            generation: JsInteger::one(),
+        };
+        let invalid_path = StatePath::new([PathSegment::key("number")]).expect("state path");
+        let snapshot = ServiceSubscriptionSnapshot {
+            service_id: service_id.clone(),
+            mode: ServiceMode::Keyed,
+            instances: vec![
+                ServiceInstanceSnapshot {
+                    instance: Some(first_address),
+                    members: vec![ServiceMemberSnapshot::Method {
+                        name: JsString::from_utf8("member"),
+                    }],
+                },
+                ServiceInstanceSnapshot {
+                    instance: Some(second_address),
+                    members: vec![ServiceMemberSnapshot::State {
+                        name: JsString::from_utf8("member"),
+                        sequence: JsInteger::zero(),
+                        ops: vec![DeltaOp::Delete(invalid_path)],
+                    }],
+                },
+            ],
+        };
+        let (transport, closes) = tracking_transport(snapshot);
+        let mut options = BindingOptions::new(vec![service_id.clone()], transport);
+        options.bound = false;
+        let binding = RemoteServiceBinding::new(options).expect("binding");
+        let observation = binding
+            .observe_keyed(
+                &service_id,
+                Arc::new(|_facade, _context| async { Ok(()) }.boxed()),
+            )
+            .expect("observation");
+        let keyed = lock(&binding.inner.keyed)
+            .get(&service_id)
+            .cloned()
+            .expect("keyed binding");
+
+        binding
+            .rebind(true, Context::background())
+            .await
+            .expect_err("keyed install should fail");
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert!(lock(&keyed.instances).is_empty());
+
+        observation
+            .close(Context::background())
+            .await
+            .expect("close observation");
+        binding
+            .dispose(Context::background())
+            .await
+            .expect("dispose");
     }
 
     #[tokio::test]

@@ -352,6 +352,13 @@ pub fn find_cut_point(
     let end_index = end_index.min(entries.len());
     let start_index = start_index.min(end_index);
     let cut_points = find_valid_cut_points(entries, start_index, end_index);
+    if keep_recent_tokens == 0 {
+        return CutPointResult {
+            first_kept_entry_index: end_index,
+            turn_start_index: None,
+            is_split_turn: false,
+        };
+    }
     if cut_points.is_empty() {
         return CutPointResult {
             first_kept_entry_index: start_index,
@@ -363,10 +370,17 @@ pub fn find_cut_point(
     let mut accumulated_tokens = 0_u64;
     let mut cut_index = cut_points[0];
     for index in (start_index..end_index).rev() {
-        let Entry::Message { message, .. } = &entries[index] else {
-            continue;
-        };
-        accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(message));
+        match &entries[index] {
+            Entry::Message { message, .. } => {
+                accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(message));
+            }
+            Entry::BranchSummary { summary, .. } => {
+                let summary_message = create_branch_summary_message(summary, None, 0);
+                accumulated_tokens =
+                    accumulated_tokens.saturating_add(estimate_tokens(&summary_message));
+            }
+            _ => {}
+        }
         if accumulated_tokens >= keep_recent_tokens {
             if let Some(candidate) = cut_points
                 .iter()
@@ -1046,27 +1060,17 @@ async fn complete_simple(
     options: StreamOptions,
 ) -> Result<AssistantMessage, ProviderError> {
     let mut stream = models.stream(model, ai_context, options);
-    let mut partial = None;
     while let Some(event) = stream.next().await {
         let event = event?;
         match event {
-            AssistantMessageEvent::Start { partial: value }
-            | AssistantMessageEvent::TextStart { partial: value, .. }
-            | AssistantMessageEvent::ThinkingStart { partial: value, .. }
-            | AssistantMessageEvent::ToolCallStart { partial: value, .. }
-            | AssistantMessageEvent::TextEnd { partial: value, .. }
-            | AssistantMessageEvent::ThinkingEnd { partial: value, .. }
-            | AssistantMessageEvent::ToolCallEnd { partial: value, .. }
-            | AssistantMessageEvent::TextDelta { partial: value, .. }
-            | AssistantMessageEvent::ThinkingDelta { partial: value, .. }
-            | AssistantMessageEvent::ToolCallDelta { partial: value, .. } => {
-                partial = Some(value.as_ref().clone());
-            }
             AssistantMessageEvent::Done { message, .. } => return Ok(message),
             AssistantMessageEvent::Error { error, .. } => return Ok(error),
+            _ => {}
         }
     }
-    partial.ok_or_else(|| ProviderError::new("stream ended before a terminal response event"))
+    Err(ProviderError::new(
+        "stream ended before a terminal response event",
+    ))
 }
 
 const NON_RETRYABLE: &[&str] = &[
@@ -1342,10 +1346,20 @@ fn add_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, reason = "failure-shape assertions diverge with context")]
 mod tests {
     use super::*;
-    use pi_ai::{AssistantContent, AssistantMessage, TextContent};
+    use futures::stream::{self, BoxStream, StreamExt};
+    use pi_ai::{AssistantContent, AssistantMessage, Provider, TextContent};
     use serde_json::{Map, Value};
+    use std::sync::Arc;
+
+    fn user(text: &str) -> AgentMessage {
+        AgentMessage::Llm(Box::new(Message::User(pi_ai::UserMessage::new(
+            pi_ai::UserMessageContent::Text(text.to_owned()),
+            1,
+        ))))
+    }
 
     fn assistant(text: &str, stop_reason: StopReason, usage: Usage) -> AgentMessage {
         let mut message = AssistantMessage::new("api", "provider", "model", 1);
@@ -1467,5 +1481,122 @@ mod tests {
         let durable = preparation.to_durable();
         let recovered = CompactionPreparation::from_durable(durable).expect("compaction variant");
         assert_eq!(recovered, preparation);
+    }
+    #[test]
+    fn cut_point_counts_branch_summary_toward_retained_budget() {
+        let entries = vec![
+            Entry::Message {
+                base: base("u"),
+                message: user("u"),
+                terminate: false,
+            },
+            Entry::Message {
+                base: base("a1"),
+                message: assistant("a1", StopReason::Stop, Usage::default()),
+                terminate: false,
+            },
+            Entry::BranchSummary {
+                base: base("b"),
+                from_id: None,
+                summary: "1234567890".to_owned(),
+                details: None,
+                usage: None,
+                from_hook: false,
+            },
+            Entry::Message {
+                base: base("a2"),
+                message: assistant("a2", StopReason::Stop, Usage::default()),
+                terminate: false,
+            },
+        ];
+        // The branch summary contributes 10 UTF-16 code units / 4 = 3 tokens.
+        // With a budget of 2, accumulating from the newest entry reaches the
+        // budget at the BranchSummary, so the boundary is the BranchSummary.
+        let cut = find_cut_point(&entries, 0, entries.len(), 2);
+        assert_eq!(cut.first_kept_entry_index, 2);
+    }
+
+    #[test]
+    fn cut_point_with_zero_budget_selects_empty_retained_tail() {
+        let entries = vec![
+            Entry::Message {
+                base: base("u"),
+                message: user("u"),
+                terminate: false,
+            },
+            Entry::Message {
+                base: base("a"),
+                message: assistant("a", StopReason::Stop, Usage::default()),
+                terminate: false,
+            },
+        ];
+        let cut = find_cut_point(&entries, 0, entries.len(), 0);
+        assert_eq!(cut.first_kept_entry_index, entries.len());
+        assert_eq!(cut.turn_start_index, None);
+        assert!(!cut.is_split_turn);
+    }
+
+    #[tokio::test]
+    async fn complete_simple_exhaustion_with_partial_is_retryable_provider_error() {
+        struct PartialProvider;
+
+        impl Provider for PartialProvider {
+            fn stream(
+                &self,
+                _model: &pi_ai::Model,
+                _context: pi_ai::Context,
+                _options: pi_ai::StreamOptions,
+            ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+                let partial = Arc::new(AssistantMessage::new("api", "provider", "model", 1));
+                stream::iter(vec![Ok(AssistantMessageEvent::TextStart {
+                    content_index: 0,
+                    partial,
+                })])
+                .boxed()
+            }
+        }
+
+        impl HarnessModels for PartialProvider {
+            fn get_model(&self, _provider: &str, _model_id: &str) -> Option<Model> {
+                None
+            }
+        }
+
+        let models: Arc<dyn HarnessModels> = Arc::new(PartialProvider);
+        let model = Model {
+            id: "model".to_owned(),
+            name: "model".to_owned(),
+            api: "openai".to_owned(),
+            provider: "openai".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: Vec::new(),
+            cost: pi_ai::ModelCost::default(),
+            context_window: 0,
+            max_tokens: 0,
+            headers: None,
+            compat: None,
+            extra: std::collections::BTreeMap::default(),
+        };
+
+        let result = complete_simple(
+            &models,
+            &model,
+            AiContext::default(),
+            StreamOptions::default(),
+        )
+        .await;
+
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(message) => panic!("expected provider error, got {message:?}"),
+        };
+        assert!(
+            error
+                .to_ascii_lowercase()
+                .contains("stream ended before a terminal response event"),
+            "unexpected error: {error}"
+        );
     }
 }

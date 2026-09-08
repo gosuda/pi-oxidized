@@ -17,8 +17,8 @@ use crate::session::address::{
 use crate::session::operation::{
     CheckpointData, Continuation, Control, DeferredScope, GenerationContext, Operation,
     OperationError, OperationIntent, OperationKind, OperationScope, OperationState, ReplayPolicy,
-    RetryWait, SummaryContext, SummaryGenerationScope, SummaryRequestRef, ToolBatch, ToolCall,
-    ToolCallStatus,
+    RetryWait, StagedToolResult, SummaryContext, SummaryGenerationScope, SummaryRequestRef,
+    ToolBatch, ToolCall, ToolCallStatus,
 };
 use crate::session::traits::SessionReaderExt;
 use crate::session::{
@@ -1783,6 +1783,11 @@ async fn publish_deferred_response(
         .await
         .ok_or_else(|| invariant("deferred operation disappeared before publication"))?
         .state;
+    if matches!(&pending.scope().control, Control::CancelRequested { .. }) {
+        let response_id = pending_response_id(&pending)?;
+        let record = publish_interrupted(lane, operation, &response_id, cx).await?;
+        return Ok(DriveStep::Settled(record));
+    }
     publish_response(lane, operation, pending, response, cx).await
 }
 
@@ -2116,7 +2121,7 @@ async fn recover_sequential_tool(
         .await?;
         return Ok(SequentialToolOutcome::Settled(failure));
     };
-    let call_terminate = staged.terminate.unwrap_or(false);
+    let call_terminate = staged.result.terminate.unwrap_or(false);
     Ok(SequentialToolOutcome::Ready(
         native_tool_result(call, &staged, call_terminate),
         call_terminate,
@@ -2304,7 +2309,7 @@ async fn commit_parallel_tool_result(
     current: CurrentOperation<'_>,
     batch: &mut ToolBatch,
     index: usize,
-    result: (pi_ai::ToolResultMessage, bool, AgentToolResult),
+    result: (pi_ai::ToolResultMessage, bool, StagedToolResult),
 ) -> Result<ParallelToolResult, HarnessError> {
     let (message, call_terminate, durable) = result;
     if boundary_cancelled(current.lane, current.controller).await {
@@ -2405,7 +2410,7 @@ async fn execute_tool(
     call: &pi_ai::ToolCall,
     controller: &DriveController,
     cx: &Context,
-) -> Result<(pi_ai::ToolResultMessage, bool, AgentToolResult), HarnessError> {
+) -> Result<(pi_ai::ToolResultMessage, bool, StagedToolResult), HarnessError> {
     let config = lane.owner.config_snapshot().await;
     let tool = config.tools.iter().find(|tool| tool.name() == call.name);
     let invocation = Invocation {
@@ -2492,11 +2497,14 @@ async fn execute_tool(
         .await;
     }
     let terminate = result.terminate.unwrap_or(false);
-    let durable = AgentToolResult {
-        content: result.content.clone(),
-        details: result.details.clone(),
-        added_tool_names: result.added_tool_names.clone(),
-        terminate: Some(terminate),
+    let durable = StagedToolResult {
+        result: AgentToolResult {
+            content: result.content.clone(),
+            details: result.details.clone(),
+            added_tool_names: result.added_tool_names.clone(),
+            terminate: Some(terminate),
+        },
+        is_error,
     };
     let message = pi_ai::ToolResultMessage::new(
         call.id.clone(),
@@ -2526,7 +2534,7 @@ async fn staged_tool_result(
     operation_id: &OperationId,
     result_entry_id: &EntryId,
     cx: &Context,
-) -> Result<Option<AgentToolResult>, HarnessError> {
+) -> Result<Option<StagedToolResult>, HarnessError> {
     lane.owner
         .session
         .get_value(&pending_tool_output(operation_id, result_entry_id), cx)
@@ -2537,21 +2545,20 @@ async fn staged_tool_result(
 
 fn native_tool_result(
     call: &pi_ai::ToolCall,
-    result: &AgentToolResult,
+    staged: &StagedToolResult,
     terminate: bool,
 ) -> pi_ai::ToolResultMessage {
     let mut message = pi_ai::ToolResultMessage::new(
         call.id.clone(),
         call.name.clone(),
-        result.content.clone(),
-        false,
+        staged.result.content.clone(),
+        staged.is_error,
         crate::message::now_millis(),
     );
-    message.details = Some(result.details.clone());
+    message.details = Some(staged.result.details.clone());
     message
         .added_tool_names
-        .clone_from(&result.added_tool_names);
-    message.is_error = false;
+        .clone_from(&staged.result.added_tool_names);
     let _ = terminate;
     message
 }
@@ -3818,10 +3825,9 @@ async fn drain_inbox(
             .map_err(map_session_error)?,
     );
     writes.push(set_json(&branch_tip(lane.name.as_str()), &parent).map_err(map_session_error)?);
-    mutator
-        .commit(writes, cx)
-        .await
-        .map_err(map_session_error)?;
+    if let Err(error) = mutator.commit(writes, cx).await {
+        return Err(lane.commit_fault(error, cx).await);
+    }
     data.tip = parent;
     data.state = next_state;
     drop(data);
@@ -4435,5 +4441,55 @@ impl ToolInvocation for Invocation<'_> {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Map;
+
+    use super::*;
+
+    fn tool_call() -> pi_ai::ToolCall {
+        pi_ai::ToolCall::new("call-1", "failing_tool", Map::new())
+    }
+
+    /// A staged failure must recover as an error result, not be committed as
+    /// a success.
+    #[test]
+    fn recovered_tool_result_restores_the_staged_error_flag() -> Result<(), serde_json::Error> {
+        let staged = StagedToolResult {
+            result: AgentToolResult {
+                content: vec![pi_ai::ToolResultContent::Text(pi_ai::TextContent::new(
+                    "tool exploded",
+                ))],
+                ..AgentToolResult::default()
+            },
+            is_error: true,
+        };
+        // Recovery reads the staged record through its serialized form.
+        let staged: StagedToolResult = serde_json::from_value(serde_json::to_value(&staged)?)?;
+
+        let message = native_tool_result(&tool_call(), &staged, false);
+
+        assert!(message.is_error);
+        Ok(())
+    }
+
+    /// Records staged before the flag existed carry no `isError` key and must
+    /// keep recovering as successful results.
+    #[test]
+    fn staged_record_without_flag_recovers_as_success() -> Result<(), serde_json::Error> {
+        let stored = serde_json::to_value(AgentToolResult {
+            content: vec![pi_ai::ToolResultContent::Text(pi_ai::TextContent::new(
+                "ok",
+            ))],
+            ..AgentToolResult::default()
+        })?;
+        let staged: StagedToolResult = serde_json::from_value(stored)?;
+
+        assert!(!staged.is_error);
+        assert!(!native_tool_result(&tool_call(), &staged, false).is_error);
+        Ok(())
     }
 }

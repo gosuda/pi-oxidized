@@ -58,7 +58,6 @@ pub(crate) struct LaneData {
     pub(crate) state: LaneState,
     pub(crate) operation: Option<Operation>,
     pub(crate) last_result: Option<OperationResultRecord>,
-    pub(crate) fault: Option<Arc<HarnessFault>>,
 }
 
 impl LaneData {
@@ -69,7 +68,6 @@ impl LaneData {
             state,
             operation: None,
             last_result: None,
-            fault: None,
         }
     }
 }

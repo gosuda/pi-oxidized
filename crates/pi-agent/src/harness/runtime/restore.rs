@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::context::Context;
+use crate::context::{Context, telemetry_context};
 use crate::session::address::{
     branch_tip_inventory_prefix, lane_config, lane_state, operation_meta, operation_result,
     operation_state,
@@ -57,16 +57,19 @@ pub(crate) async fn restore_session(
     let mut lanes = Vec::with_capacity(names.len());
     let mut open = Vec::new();
     for name in names {
-        let config = session
-            .get_value(&lane_config(&name), cx)
-            .await?
-            .ok_or_else(|| SessionError::Invariant(format!("lane {name} has no configuration")))?
-            .value;
-        let state = session
-            .get_value(&lane_state(&name), cx)
-            .await?
-            .ok_or_else(|| SessionError::Invariant(format!("lane {name} has no state")))?
-            .value;
+        // A lane whose metadata commit failed leaves only the durable branch
+        // tip behind and there is no delete_branch to clean it up; skip the
+        // orphan so the surviving lanes still restore.
+        let Some(config) = session.get_value(&lane_config(&name), cx).await? else {
+            report_orphaned_lane(cx, &name, "lane configuration");
+            continue;
+        };
+        let Some(state) = session.get_value(&lane_state(&name), cx).await? else {
+            report_orphaned_lane(cx, &name, "lane state");
+            continue;
+        };
+        let config = config.value;
+        let state = state.value;
         let tip = session
             .get_value(&crate::session::address::branch_tip(name.as_str()), cx)
             .await?
@@ -168,4 +171,35 @@ fn validate_state_intent(
         )));
     }
     Ok(())
+}
+
+/// Records a skipped metadata-less branch on telemetry so the dropped lane
+/// stays diagnosable without failing the whole restore.
+fn report_orphaned_lane(cx: &Context, name: &LaneName, missing: &str) {
+    let parent = telemetry_context(cx);
+    let mut attributes = crate::telemetry::SpanAttributes::new();
+    attributes.insert(
+        "pi.lane.name".to_owned(),
+        crate::telemetry::AttributeValue::Str(name.as_str().to_owned()),
+    );
+    attributes.insert(
+        "pi.restore.missing".to_owned(),
+        crate::telemetry::AttributeValue::Str(missing.to_owned()),
+    );
+    let span = crate::telemetry::start_span_contained(
+        &*parent,
+        crate::telemetry::SpanOptions {
+            name: "pi.harness.restore".to_owned(),
+            attributes,
+        },
+    );
+    crate::telemetry::set_status_contained(
+        &*span,
+        crate::telemetry::SpanStatus::Error {
+            name: Some("orphaned_lane".to_owned()),
+            message: Some(format!(
+                "lane {name} has a durable branch but no {missing}; skipping"
+            )),
+        },
+    );
 }

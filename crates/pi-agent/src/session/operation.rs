@@ -6,7 +6,7 @@ use super::configuration::{
 };
 use super::{EntryId, LaneConfiguration, LaneName, OperationId, UsageId};
 use crate::queue::QueueMode;
-use crate::tool::ToolExecutionMode;
+use crate::tool::{AgentToolResult, ToolExecutionMode};
 
 /// Cancellation flag carried by every operation leaf, orthogonal to the leaf
 /// itself: a cancel request preempts the dispatcher rather than adding states.
@@ -636,6 +636,24 @@ pub enum ReplayPolicy {
     Never,
     /// Tag `"safe"` — re-running is safe, so recovery may re-issue the call.
     Safe,
+}
+
+/// Tool result staged at `pending_tool_output` before its result entry
+/// commits.
+///
+/// The error flag is decided by the executor, not the tool, so it lives on
+/// this durable envelope instead of on [`AgentToolResult`]. Records staged
+/// before the flag existed carry no `isError` key and deserialize with
+/// `is_error = false`, preserving the previous recovery behavior.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagedToolResult {
+    /// Tool-produced result payload.
+    #[serde(flatten)]
+    pub result: AgentToolResult,
+    /// Whether the tool call ended in an error.
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 /// Where a summary task's result must land, decided when the task is created.

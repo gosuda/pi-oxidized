@@ -31,6 +31,8 @@ use crate::telemetry::{
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// A handler failure accepted by the hook boundary.
 pub type HookError = Box<dyn Error + Send + Sync + 'static>;
@@ -917,16 +919,23 @@ impl HookRegistry {
     ///
     /// # Errors
     ///
-    /// Returns [`HookRunError::Gate`] when the gate rejects admission or the
-    /// registry is closed, and [`HookRunError::Handler`] when a fail-closed
-    /// `before_drive` handler fails.
+    /// Returns [`HookRunError::Gate`] when the gate rejects admission, the
+    /// registry is closed, or the caller's context is already cancelled, and
+    /// [`HookRunError::Handler`] when a fail-closed `before_drive` handler fails.
     pub async fn run_with_gate<H: Hook>(
         &self,
         event: H::Event,
         gate: &Gate,
         cx: &Context,
     ) -> HookRunResult<H::Result> {
-        let admitted_context = cx.with_cancellation(gate.token().clone());
+        if cx.is_cancelled() {
+            return Err(HookRunError::Gate(GateRejection::Closed(
+                cancellation_fault(),
+            )));
+        }
+
+        let (admitted_token, _link) = combined_cancellation(cx.token(), gate.token());
+        let admitted_context = cx.with_cancellation(admitted_token);
         let aggregate = gate.admit(|| H::aggregate(self, event, admitted_context))?;
         aggregate.await
     }
@@ -1502,6 +1511,66 @@ impl HookRegistry {
     }
 }
 
+/// Creates a token cancelled by `parent` (the caller's context token, when
+/// present) and `gate`. Cancelling the returned token does not affect either
+/// parent; dropping the returned [`CancelLink`] aborts the background task.
+fn combined_cancellation(
+    parent: Option<&CancellationToken>,
+    gate: &CancellationToken,
+) -> (CancellationToken, CancelLink) {
+    let Some(parent) = parent else {
+        return (gate.child_token(), CancelLink::none());
+    };
+
+    let combined = parent.child_token();
+    if combined.is_cancelled() {
+        return (combined, CancelLink::none());
+    }
+
+    if gate.is_cancelled() {
+        combined.cancel();
+        return (combined, CancelLink::none());
+    }
+
+    let combined_for_task = combined.clone();
+    let gate = gate.clone();
+    let handle = tokio::spawn(async move {
+        gate.cancelled().await;
+        combined_for_task.cancel();
+    });
+
+    (combined, CancelLink::some(handle))
+}
+
+/// Aborts a background cancellation-link task when the hook admission finishes.
+struct CancelLink(Option<JoinHandle<()>>);
+
+impl CancelLink {
+    fn none() -> Self {
+        Self(None)
+    }
+
+    fn some(handle: JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+}
+
+impl Drop for CancelLink {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// A harness fault describing a pre-cancelled caller context.
+fn cancellation_fault() -> Arc<HarnessFault> {
+    Arc::new(HarnessFault {
+        message: "caller context was cancelled".to_owned(),
+        cause: Box::new(crate::context::Cancelled),
+    })
+}
+
 impl std::fmt::Debug for HookRegistry {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1511,10 +1580,13 @@ impl std::fmt::Debug for HookRegistry {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, reason = "hook tests use contextual fixture failures")]
 mod tests {
     use super::*;
     use crate::message::user_text;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
 
     type TestResult = Result<(), String>;
 
@@ -1643,5 +1715,105 @@ mod tests {
         assert!(fault.cause.downcast_ref::<TestHandlerError>().is_some());
         assert!(matches!(gate.admit(|| ()), Ok(())));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn caller_cancel_during_hook_observes_cancellation() {
+        let registry =
+            HookRegistry::new(|_event, _context| -> BoxFuture<'static, ()> { Box::pin(async {}) });
+
+        let seen_cancellation = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let handler: BeforeRunHook = Arc::new({
+            let seen_cancellation = Arc::clone(&seen_cancellation);
+            let started = Arc::clone(&started);
+            move |_event: BeforeRunEvent, context: Context| {
+                let seen_cancellation = Arc::clone(&seen_cancellation);
+                let started = Arc::clone(&started);
+                Box::pin(async move {
+                    started.store(true, Ordering::SeqCst);
+                    while context
+                        .race(tokio::time::sleep(Duration::from_millis(20)))
+                        .await
+                        .is_ok()
+                    {
+                    }
+                    seen_cancellation.store(context.is_cancelled(), Ordering::SeqCst);
+                    Ok::<_, HookError>(None)
+                })
+            }
+        });
+        let _subscription = registry
+            .on::<BeforeRun>(handler, None)
+            .expect("register handler");
+
+        let (gate, _control) = super::super::gate::create_gate();
+        let caller_token = CancellationToken::new();
+        let cx = Context::background().with_cancellation(caller_token.clone());
+        let event = BeforeRunEvent {
+            lane: LaneName::from("lane"),
+            run_id: "run".to_owned(),
+            prompt: Vec::new(),
+            resources: HarnessResources::default(),
+        };
+
+        let cancel_task = tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                while !started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            caller_token.cancel();
+        });
+
+        let result = registry.run_with_gate::<BeforeRun>(event, &gate, &cx).await;
+        cancel_task.await.ok();
+
+        assert!(
+            seen_cancellation.load(Ordering::SeqCst),
+            "handler must observe caller cancellation"
+        );
+        assert!(result.is_ok(), "run_with_gate should complete: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_caller_never_starts_handler() {
+        let registry =
+            HookRegistry::new(|_event, _context| -> BoxFuture<'static, ()> { Box::pin(async {}) });
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler: BeforeRunHook = Arc::new({
+            let calls = Arc::clone(&calls);
+            move |_event: BeforeRunEvent, _context: Context| {
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, HookError>(None)
+                })
+            }
+        });
+        let _subscription = registry
+            .on::<BeforeRun>(handler, None)
+            .expect("register handler");
+
+        let (gate, _control) = super::super::gate::create_gate();
+        let caller_token = CancellationToken::new();
+        caller_token.cancel();
+        let cx = Context::background().with_cancellation(caller_token);
+        let event = BeforeRunEvent {
+            lane: LaneName::from("lane"),
+            run_id: "run".to_owned(),
+            prompt: Vec::new(),
+            resources: HarnessResources::default(),
+        };
+
+        let result = registry.run_with_gate::<BeforeRun>(event, &gate, &cx).await;
+
+        assert!(
+            matches!(result, Err(HookRunError::Gate(_))),
+            "pre-cancelled caller must fail: {result:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "handler must not start");
     }
 }

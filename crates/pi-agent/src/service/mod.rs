@@ -2,6 +2,7 @@
 
 pub mod binding;
 pub mod delta;
+pub mod endpoint;
 pub mod error;
 pub mod provider;
 pub mod replicated;

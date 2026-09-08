@@ -1,14 +1,15 @@
 //! Durable lane implementation and public `AgentLane` delegation.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::context::Context;
 use crate::message::AgentMessage;
+use crate::session::address::{pending_assistant_frames, pending_tool_output};
 use crate::session::traits::{Branch, SessionReaderExt};
 use crate::session::{
     BranchScan, Entry, EntryId, LaneConfiguration, LaneName, ModelIdentity, OperationId,
-    OperationResultRecord, Write,
+    OperationResultRecord, SessionError, ToolCallStatus, Write,
 };
 use futures::future::BoxFuture;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -17,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use super::harness::HarnessRuntime;
 use super::support::{
     LaneData, assistant_message, custom_entry_write, entry_write, map_session_error, new_entry_id,
-    operation_kind, pending_entry_write, pending_write, read_pending, set_json,
+    operation_kind, pending_entry_write, pending_write, read_pending, sealed_rejection, set_json,
 };
 use crate::harness::api::{
     AgentLane, DriveOptions, IdleJob, NavigateOptions, OperationRequest, PromptInput, QueueInput,
@@ -35,6 +36,7 @@ use crate::harness::result::{
 };
 use crate::harness::snapshot::{
     LaneQueuedItem, LaneSnapshot, LaneSnapshotDeferred, LaneSnapshotOperation, LaneSnapshotRetry,
+    LaneSnapshotTool,
 };
 
 /// Controls and gate for one synchronously-admitted drive.
@@ -68,6 +70,10 @@ pub(crate) struct LaneRuntime {
     pub(crate) idle: Notify,
     pub(crate) state_changed: Notify,
     pub(crate) sealed: AtomicBool,
+    /// First sealing fault recorded for this lane. Kept behind a synchronous
+    /// mutex so `seal` never awaits `data` while a caller holds that guard
+    /// across a durable commit.
+    pub(crate) fault: Mutex<Option<Arc<HarnessFault>>>,
 }
 
 impl LaneRuntime {
@@ -80,6 +86,7 @@ impl LaneRuntime {
             idle: Notify::new(),
             state_changed: Notify::new(),
             sealed: AtomicBool::new(false),
+            fault: Mutex::new(None),
         })
     }
 
@@ -96,14 +103,12 @@ impl LaneRuntime {
         }
         Ok(())
     }
-
     pub(crate) async fn seal(&self, fault: Arc<HarnessFault>) {
         self.sealed.store(true, Ordering::Release);
+        if let Ok(mut slot) = self.fault.lock()
+            && slot.is_none()
         {
-            let mut data = self.data.lock().await;
-            if data.fault.is_none() {
-                data.fault = Some(Arc::clone(&fault));
-            }
+            *slot = Some(Arc::clone(&fault));
         }
         if let Some(drive) = self.active_drive.lock().await.as_ref() {
             drive.close_signal.cancel();
@@ -125,7 +130,6 @@ impl LaneRuntime {
                 message: "lane branch is missing from session".to_owned(),
             })
     }
-
     pub(crate) async fn commit(
         &self,
         writes: Vec<Write>,
@@ -137,7 +141,47 @@ impl LaneRuntime {
             .begin_mutation(cx)
             .await
             .map_err(map_session_error)?;
-        mutator.commit(writes, cx).await.map_err(map_session_error)
+        match mutator.commit(writes, cx).await {
+            Ok(result) => Ok(result),
+            Err(error) => Err(self.commit_fault(error, cx).await),
+        }
+    }
+
+    /// Returns the fault that sealed this lane, when one was recorded.
+    pub(crate) fn sealed_fault(&self) -> Option<Arc<HarnessFault>> {
+        self.fault.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Routes a durable-commit failure through the shared fault boundary.
+    ///
+    /// The first recorded fault wins: when one is already stored the harness
+    /// is sealed and broadcasting again would only duplicate the fault event,
+    /// so the stored fault is reused for the rejection. Callers may hold the
+    /// lane `data` guard across the commit; the broadcast never awaits it
+    /// because `seal` records the lane fault in a synchronous slot.
+    pub(crate) async fn commit_fault(&self, error: SessionError, cx: &Context) -> HarnessError {
+        if self
+            .owner
+            .fault
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .is_none()
+        {
+            self.owner
+                .fault(
+                    HarnessFault {
+                        message: format!("session operation failed: {error}"),
+                        cause: Box::new(error),
+                    },
+                    cx,
+                )
+                .await;
+        }
+        match self.owner.fault.lock().ok().and_then(|slot| slot.clone()) {
+            Some(fault) => sealed_rejection(&fault),
+            None => self.owner.closed_error(),
+        }
     }
 
     pub(crate) async fn emit(&self, payload: HarnessEventPayload, cx: &Context) {
@@ -209,10 +253,12 @@ impl LaneRuntime {
             .await
             .map_err(map_session_error)?;
         let queues = read_queue_snapshot(self, &data.state.inbox, cx).await?;
-        let operation = data
-            .operation
-            .as_ref()
-            .map(|operation| snapshot_operation(operation, &transcript));
+        let operation = match data.operation.as_ref() {
+            Some(operation) => Some(
+                snapshot_operation(self.owner.session.as_ref(), operation, &transcript, cx).await?,
+            ),
+            None => None,
+        };
         Ok(LaneSnapshot {
             lane: self.name.clone(),
             transcript,
@@ -227,7 +273,7 @@ impl LaneRuntime {
                 .map_err(map_session_error)?,
             operation,
             queues,
-            faulted: data.fault.is_some(),
+            faulted: self.sealed_fault().is_some(),
         })
     }
 }
@@ -950,10 +996,12 @@ fn captured_model(state: &crate::session::OperationState) -> Option<ModelIdentit
     }
 }
 
-fn snapshot_operation(
+async fn snapshot_operation(
+    session: &dyn crate::session::Session,
     operation: &crate::session::Operation,
     transcript: &[Entry],
-) -> LaneSnapshotOperation {
+    cx: &Context,
+) -> Result<LaneSnapshotOperation, HarnessError> {
     let retry = match &operation.state {
         crate::session::OperationState::AssistantRetryWait {
             generation_context,
@@ -987,7 +1035,45 @@ fn snapshot_operation(
             }),
         _ => None,
     };
-    LaneSnapshotOperation {
+    // A response in flight keeps its frames staged so a watcher attaching
+    // mid-stream observes the partial assistant message instead of an empty
+    // baseline that later events cannot repair.
+    let streaming_message = match &operation.state {
+        crate::session::OperationState::AssistantEffectPending {
+            response_entry_id, ..
+        }
+        | crate::session::OperationState::DeferredEffectPending {
+            response_entry_id, ..
+        } => {
+            let frames = session
+                .read_list(
+                    &pending_assistant_frames(&operation.meta.operation_id, response_entry_id),
+                    None,
+                    cx,
+                )
+                .await
+                .map_err(map_session_error)?
+                .into_iter()
+                .map(|element| element.value)
+                .collect::<Vec<_>>();
+            if frames.is_empty() {
+                None
+            } else {
+                Some(
+                    crate::harness::stream::reduce_persisted_frames(&frames)
+                        .map_err(map_session_error)?,
+                )
+            }
+        }
+        _ => None,
+    };
+    let running_tools = match &operation.state {
+        crate::session::OperationState::Tools { batch, .. } => {
+            snapshot_running_tools(session, operation, batch, transcript, cx).await?
+        }
+        _ => Vec::new(),
+    };
+    Ok(LaneSnapshotOperation {
         id: operation.meta.operation_id.clone(),
         kind: operation_kind(&operation.meta.intent),
         started_at: operation.meta.started_at,
@@ -998,9 +1084,64 @@ fn snapshot_operation(
         },
         retry,
         deferred,
-        streaming_message: None,
-        running_tools: Vec::new(),
+        streaming_message,
+        running_tools,
+    })
+}
+
+/// Rebuilds the watcher-visible tool list for an operation parked in
+/// `OperationState::Tools`: calls still executing become `Running`, calls
+/// whose outcome is staged but not yet committed keep that staged result, and
+/// planned or already-committed calls are left to events and the transcript.
+async fn snapshot_running_tools(
+    session: &dyn crate::session::Session,
+    operation: &crate::session::Operation,
+    batch: &crate::session::ToolBatch,
+    transcript: &[Entry],
+    cx: &Context,
+) -> Result<Vec<LaneSnapshotTool>, HarnessError> {
+    let Some(message) = transcript
+        .iter()
+        .find(|entry| entry.id() == &batch.assistant_entry_id)
+        .and_then(Entry::message)
+        .and_then(assistant_message)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut tools = Vec::new();
+    for record in &batch.calls {
+        let result = match &record.status {
+            ToolCallStatus::EffectPending { .. } => Some(None),
+            // The staged result is not yet committed, so the call stays
+            // `Running` with its produced result rather than reporting a
+            // settled state the commit may still abort.
+            ToolCallStatus::OutcomeReady { .. } => Some(
+                session
+                    .get_value(
+                        &pending_tool_output(&operation.meta.operation_id, &record.result_entry_id),
+                        cx,
+                    )
+                    .await
+                    .map_err(map_session_error)?
+                    .map(|stored| stored.value.result),
+            ),
+            ToolCallStatus::Planned | ToolCallStatus::Completed { .. } => None,
+        };
+        let Some(result) = result else { continue };
+        let Some(pi_ai::AssistantContent::ToolCall(call)) = usize::try_from(record.source_index)
+            .ok()
+            .and_then(|index| message.content.get(index))
+        else {
+            continue;
+        };
+        tools.push(LaneSnapshotTool::Running {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            args: call.arguments.clone(),
+            result,
+        });
     }
+    Ok(tools)
 }
 
 pub(crate) async fn read_queue_snapshot(

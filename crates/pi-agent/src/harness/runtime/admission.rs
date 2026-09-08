@@ -6,11 +6,13 @@ use crate::context::Context;
 use crate::message::AgentMessage;
 use crate::queue::QueueMode;
 use crate::session::address::{
-    branch_tip, lane_state, operation_meta, operation_preparation, operation_state, pending_entry,
+    branch_tip, lane_state, operation_meta, operation_preparation, operation_result,
+    operation_state, pending_entry,
 };
 use crate::session::operation::{
     Control, Operation, OperationIntent, OperationKind, OperationState, ResultBoundary, SummaryTask,
 };
+use crate::session::traits::{SessionReader, SessionReaderExt};
 use crate::session::{
     BranchScan, CompactionReason, Entry, EntryId, InboxItem, InboxItemKind, LaneName, LaneState,
     NewUsageRow, OperationId, PendingEntry, ScanOrder, Write,
@@ -141,7 +143,7 @@ async fn accept_run(
     }
     let config = lane.owner.config_snapshot().await;
     let data = lane.data.lock().await;
-    if let Some(fault) = data.fault.clone() {
+    if let Some(fault) = lane.sealed_fault() {
         return Err(sealed_rejection(&fault));
     }
     ensure_idle(lane, &data)?;
@@ -149,13 +151,11 @@ async fn accept_run(
         Some(id) => id,
         None => new_operation_id(lane.owner.session.as_ref()).map_err(map_session_error)?,
     };
-    if operation_id.as_str().is_empty() {
-        return Err(HarnessError::InvalidMessage {
-            lane: lane.name.clone(),
-            reason: "operation_id".to_owned(),
-            message: "operation id cannot be empty".to_owned(),
-        });
-    }
+    validate_operation_id(&operation_id).map_err(|error| HarnessError::InvalidMessage {
+        lane: lane.name.clone(),
+        reason: error.reason.to_owned(),
+        message: error.message,
+    })?;
     let started_at = crate::message::now_millis();
     let selected = select_inbox(
         &data.state.inbox,
@@ -198,6 +198,117 @@ struct RunAdmission {
     selected: Vec<InboxItem>,
     started_at: i64,
 }
+/// Rejection details for an operation id that cannot enter the durable key space.
+struct InvalidOperationId {
+    reason: &'static str,
+    message: String,
+}
+
+/// Reject operation ids whose characters would make durable composite keys
+/// ambiguous or unsafe to expose in logs and event payloads.
+fn validate_operation_id(operation_id: &OperationId) -> Result<(), InvalidOperationId> {
+    let value = operation_id.as_str();
+    if value.is_empty() {
+        return Err(InvalidOperationId {
+            reason: "operation_id",
+            message: "operation id cannot be empty".to_owned(),
+        });
+    }
+    if let Some(character) = value
+        .chars()
+        .find(|character| *character == ':' || character.is_control())
+    {
+        let message = if character == ':' {
+            format!("operation id {value:?} contains reserved ':' key separator")
+        } else {
+            format!("operation id {value:?} contains control character {character:?}")
+        };
+        return Err(InvalidOperationId {
+            reason: "operation_id",
+            message,
+        });
+    }
+    Ok(())
+}
+
+/// Checks every session-wide operation slot while holding the session mutation
+/// guard. The guard serializes this read with the reservation writes, so a
+/// caller id cannot race another lane into the same metadata, state, or result
+/// slots.
+async fn operation_id_is_used(
+    reader: &dyn SessionReader,
+    operation_id: &OperationId,
+    cx: &Context,
+) -> Result<bool, HarnessError> {
+    if reader
+        .get_value(&operation_meta(operation_id), cx)
+        .await
+        .map_err(map_session_error)?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    if reader
+        .get_value(&operation_state(operation_id), cx)
+        .await
+        .map_err(map_session_error)?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    Ok(reader
+        .get_value(&operation_result(operation_id), cx)
+        .await
+        .map_err(map_session_error)?
+        .is_some())
+}
+
+fn operation_id_reuse_error(lane: &LaneName, operation_id: &OperationId) -> HarnessError {
+    HarnessError::InvalidMessage {
+        lane: lane.clone(),
+        reason: "operation_id_reuse".to_owned(),
+        message: format!(
+            "operation id {operation_id} is already used by an active, durable, or settled operation"
+        ),
+    }
+}
+
+fn navigation_operation_id_reuse_error(
+    lane: &LaneName,
+    operation_id: &OperationId,
+) -> HarnessError {
+    HarnessError::InvalidNavigation {
+        lane: lane.clone(),
+        reason: "operation_id_reuse".to_owned(),
+        message: format!(
+            "operation id {operation_id} is already used by an active, durable, or settled operation"
+        ),
+    }
+}
+
+async fn reject_operation_id_reuse(
+    reader: &dyn SessionReader,
+    lane: &LaneName,
+    operation_id: &OperationId,
+    cx: &Context,
+) -> Result<(), HarnessError> {
+    if operation_id_is_used(reader, operation_id, cx).await? {
+        return Err(operation_id_reuse_error(lane, operation_id));
+    }
+    Ok(())
+}
+
+async fn reject_navigation_operation_id_reuse(
+    reader: &dyn SessionReader,
+    lane: &LaneName,
+    operation_id: &OperationId,
+    cx: &Context,
+) -> Result<(), HarnessError> {
+    if operation_id_is_used(reader, operation_id, cx).await? {
+        return Err(navigation_operation_id_reuse_error(lane, operation_id));
+    }
+    Ok(())
+}
 
 /// Commit admission writes with the run path's fault contract: the lane
 /// guard is released across the durable commit because fault broadcast
@@ -232,7 +343,7 @@ where
         });
     }
     let data = lane.data.lock().await;
-    if let Some(fault) = data.fault.clone() {
+    if let Some(fault) = lane.sealed_fault() {
         return Err(sealed_rejection(&fault));
     }
     if data.state.current_operation_id.is_some() {
@@ -257,6 +368,7 @@ async fn commit_run(
         .begin_mutation(cx)
         .await
         .map_err(map_session_error)?;
+    reject_operation_id_reuse(&*mutator, &lane.name, &admission.operation_id, cx).await?;
     let pending = read_pending(&*mutator, &admission.selected, cx)
         .await
         .map_err(map_session_error)?;
@@ -363,13 +475,11 @@ async fn accept_compaction(
         Some(id) => id,
         None => new_operation_id(lane.owner.session.as_ref()).map_err(map_session_error)?,
     };
-    if operation_id.as_str().is_empty() {
-        return Err(HarnessError::InvalidMessage {
-            lane: lane.name.clone(),
-            reason: "operation_id".to_owned(),
-            message: "operation id cannot be empty".to_owned(),
-        });
-    }
+    validate_operation_id(&operation_id).map_err(|error| HarnessError::InvalidMessage {
+        lane: lane.name.clone(),
+        reason: error.reason.to_owned(),
+        message: error.message,
+    })?;
     let task_id = format!("{operation_id}:summary");
     let started_at = crate::message::now_millis();
     let meta = super::support::operation_meta(
@@ -412,6 +522,7 @@ async fn accept_compaction(
         .begin_mutation(cx)
         .await
         .map_err(map_session_error)?;
+    reject_operation_id_reuse(&*mutator, &lane.name, &operation_id, cx).await?;
     let mut data = commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
     data.state = next_state;
     data.operation = Some(operation);
@@ -462,13 +573,12 @@ async fn accept_navigation(
         Some(id) => id,
         None => new_operation_id(lane.owner.session.as_ref()).map_err(map_session_error)?,
     };
-    if operation_id.as_str().is_empty() {
-        return Err(HarnessError::InvalidNavigation {
-            lane: lane.name.clone(),
-            reason: "operation_id".to_owned(),
-            message: "operation id cannot be empty".to_owned(),
-        });
-    }
+    validate_operation_id(&operation_id).map_err(|error| HarnessError::InvalidNavigation {
+        lane: lane.name.clone(),
+        reason: error.reason.to_owned(),
+        message: error.message,
+    })?;
+
     let started_at = crate::message::now_millis();
     commit_navigation(
         lane,
@@ -601,6 +711,8 @@ async fn commit_navigation(
         .begin_mutation(cx)
         .await
         .map_err(map_session_error)?;
+    reject_navigation_operation_id_reuse(&*mutator, &lane.name, &admission.operation_id, cx)
+        .await?;
     let mut data = commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
     data.state = next_state;
     data.operation = Some(operation);
@@ -811,10 +923,9 @@ pub(crate) async fn request_abort(
             .map_err(map_session_error)?,
     );
     writes.push(set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?);
-    mutator
-        .commit(writes, cx)
-        .await
-        .map_err(map_session_error)?;
+    if let Err(error) = mutator.commit(writes, cx).await {
+        return Err(lane.commit_fault(error, cx).await);
+    }
     data.state = next_state;
     data.operation = Some(next_operation);
     drop(data);

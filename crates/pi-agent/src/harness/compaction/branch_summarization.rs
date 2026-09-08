@@ -11,8 +11,8 @@ use serde_json::Value;
 use crate::context::Context;
 use crate::message::AgentMessage;
 use crate::session::{
-    Branch, BranchScan, DurableStructuralPreparation, Entry, EntryId, HarnessRetryPolicy,
-    ScanOrder, Session, SessionError,
+    Branch, BranchScan, DurableStructuralPreparation, Entry, EntryCursor, EntryId,
+    HarnessRetryPolicy, LIST_READ_MAX_LIMIT, ScanOrder, Session, SessionError,
 };
 
 use super::messages::{
@@ -160,33 +160,24 @@ pub async fn collect_entries_for_branch_summary(
             common_ancestor_id: None,
         });
     };
-    let old_path = branch
-        .find_entries(
-            Some(&BranchScan {
-                start: Some(old_tip_id.clone()),
-                order: Some(ScanOrder::Desc),
-                ..BranchScan::default()
-            }),
-            cx,
-        )
-        .await?
-        .into_iter()
-        .map(|entry| entry.id().clone())
-        .collect::<HashSet<_>>();
-    let target_path = branch
-        .find_entries(
-            Some(&BranchScan {
-                start: Some(target_id.clone()),
-                order: Some(ScanOrder::Desc),
-                ..BranchScan::default()
-            }),
-            cx,
-        )
-        .await?;
-    let common_ancestor_id = target_path
-        .iter()
-        .find(|entry| old_path.contains(entry.id()))
-        .map(|entry| entry.id().clone());
+    // Both ancestry scans page until the common ancestor is found or the root
+    // is reached; relying on one backend read window would silently miss an
+    // ancestor deeper than the window and walk the abandoned path to root.
+    let mut old_path = HashSet::new();
+    scan_branch_ancestry(branch, old_tip_id, cx, |page| {
+        old_path.extend(page.iter().map(|entry| entry.id().clone()));
+        true
+    })
+    .await?;
+    let mut common_ancestor_id = None;
+    scan_branch_ancestry(branch, target_id, cx, |page| {
+        if let Some(entry) = page.iter().find(|entry| old_path.contains(entry.id())) {
+            common_ancestor_id = Some(entry.id().clone());
+            return false;
+        }
+        true
+    })
+    .await?;
 
     let mut entries = Vec::new();
     let mut current = Some(old_tip_id.clone());
@@ -207,40 +198,59 @@ pub async fn collect_entries_for_branch_summary(
     })
 }
 
+/// Pages through the ancestry from `start` (newest first) so the walk is not
+/// bounded by the backend's read window.
+///
+/// `visit` receives each non-empty page and returns whether to keep scanning;
+/// the walk also stops once the root entry is reached or the backend stops
+/// advancing the cursor.
+async fn scan_branch_ancestry(
+    branch: &dyn Branch,
+    start: &EntryId,
+    cx: &Context,
+    mut visit: impl FnMut(&[Entry]) -> bool,
+) -> Result<(), SessionError> {
+    let mut cursor = None;
+    loop {
+        let page = branch
+            .find_entries(
+                Some(&BranchScan {
+                    start: Some(start.clone()),
+                    order: Some(ScanOrder::Desc),
+                    limit: Some(LIST_READ_MAX_LIMIT),
+                    cursor,
+                    ..BranchScan::default()
+                }),
+                cx,
+            )
+            .await?;
+        let Some(last) = page.last() else {
+            break;
+        };
+        let next = EntryCursor { seq: last.seq() };
+        let keep_going = visit(&page)
+            && last.parent_id().is_some()
+            && cursor.is_none_or(|previous: EntryCursor| next.seq < previous.seq);
+        if !keep_going {
+            break;
+        }
+        cursor = Some(next);
+    }
+    Ok(())
+}
+
 /// Selects branch entries in chronological order within `token_budget`.
 #[must_use]
 pub fn prepare_branch_entries(entries: &[Entry], token_budget: u64) -> BranchPreparation {
-    let mut file_ops = FileOperations::default();
-    for entry in entries {
-        let Entry::BranchSummary {
-            details: Some(details),
-            ..
-        } = entry
-        else {
-            continue;
-        };
-        let Some(object) = details.as_object() else {
-            continue;
-        };
-        if let Some(paths) = object.get("readFiles").and_then(Value::as_array) {
-            file_ops
-                .read
-                .extend(paths.iter().filter_map(Value::as_str).map(str::to_owned));
-        }
-        if let Some(paths) = object.get("modifiedFiles").and_then(Value::as_array) {
-            file_ops
-                .edited
-                .extend(paths.iter().filter_map(Value::as_str).map(str::to_owned));
-        }
-    }
-
+    // Selection runs newest-first; file operations are collected afterwards
+    // from the selected entries only, so the metadata never covers messages or
+    // inherited branch-summary details outside the prepared range.
     let mut selected_reverse = Vec::new();
     let mut total_tokens = 0_u64;
     for entry in entries.iter().rev() {
         let Some(message) = get_message_from_entry(entry) else {
             continue;
         };
-        extract_file_ops_from_message(&message, &mut file_ops);
         let tokens = estimate_tokens(&message);
         if token_budget > 0 && total_tokens.saturating_add(tokens) > token_budget {
             if matches!(
@@ -248,17 +258,40 @@ pub fn prepare_branch_entries(entries: &[Entry], token_budget: u64) -> BranchPre
                 Entry::Compaction { .. } | Entry::BranchSummary { .. }
             ) && total_tokens.saturating_mul(10) < token_budget.saturating_mul(9)
             {
-                selected_reverse.push(message);
                 total_tokens = total_tokens.saturating_add(tokens);
+                selected_reverse.push((entry, message));
             }
             break;
         }
-        selected_reverse.push(message);
         total_tokens = total_tokens.saturating_add(tokens);
+        selected_reverse.push((entry, message));
     }
-    selected_reverse.reverse();
+
+    let mut file_ops = FileOperations::default();
+    let mut messages = Vec::with_capacity(selected_reverse.len());
+    for (entry, message) in selected_reverse.into_iter().rev() {
+        if let Entry::BranchSummary {
+            details: Some(details),
+            ..
+        } = entry
+            && let Some(object) = details.as_object()
+        {
+            if let Some(paths) = object.get("readFiles").and_then(Value::as_array) {
+                file_ops
+                    .read
+                    .extend(paths.iter().filter_map(Value::as_str).map(str::to_owned));
+            }
+            if let Some(paths) = object.get("modifiedFiles").and_then(Value::as_array) {
+                file_ops
+                    .edited
+                    .extend(paths.iter().filter_map(Value::as_str).map(str::to_owned));
+            }
+        }
+        extract_file_ops_from_message(&message, &mut file_ops);
+        messages.push(message);
+    }
     BranchPreparation {
-        messages: selected_reverse,
+        messages,
         file_ops,
         total_tokens,
     }
@@ -452,7 +485,13 @@ pub async fn generate_branch_summary_with_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_ai::{Message, TextContent};
+    use futures::future::BoxFuture;
+    use pi_ai::{Message, TextContent, UserMessage, UserMessageContent};
+
+    use crate::session::{
+        LIST_READ_DEFAULT_LIMIT, LaneName, MemoryStorage, SessionMetadata, StorageBackedSession,
+        UuidV7Generator,
+    };
 
     fn base(id: &str) -> crate::session::EntryBase {
         crate::session::EntryBase {
@@ -505,5 +544,170 @@ mod tests {
             0,
         );
         assert!(prep.messages.is_empty());
+    }
+
+    /// A branch handle that clamps every scan to `page` entries, simulating a
+    /// backend whose read window is smaller than the ancestry depth.
+    struct SmallPageBranch {
+        inner: Arc<dyn Branch>,
+        page: u32,
+    }
+
+    impl Branch for SmallPageBranch {
+        fn name(&self) -> &LaneName {
+            self.inner.name()
+        }
+
+        fn get_tip_id<'a>(
+            &'a self,
+            cx: &'a Context,
+        ) -> BoxFuture<'a, Result<Option<EntryId>, SessionError>> {
+            self.inner.get_tip_id(cx)
+        }
+
+        fn find_entries<'a>(
+            &'a self,
+            q: Option<&'a BranchScan>,
+            cx: &'a Context,
+        ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+            Box::pin(async move {
+                let mut q = q.cloned().unwrap_or_default();
+                q.limit = Some(q.limit.unwrap_or(LIST_READ_DEFAULT_LIMIT).min(self.page));
+                self.inner.find_entries(Some(&q), cx).await
+            })
+        }
+
+        fn find_entry<'a>(
+            &'a self,
+            q: Option<&'a BranchScan>,
+            cx: &'a Context,
+        ) -> BoxFuture<'a, Result<Option<Entry>, SessionError>> {
+            self.inner.find_entry(q, cx)
+        }
+
+        fn append_message<'a>(
+            &'a self,
+            message: AgentMessage,
+            cx: &'a Context,
+        ) -> BoxFuture<'a, Result<EntryId, SessionError>> {
+            self.inner.append_message(message, cx)
+        }
+
+        fn append_custom_entry<'a>(
+            &'a self,
+            custom_type: &'a str,
+            data: Option<Value>,
+            cx: &'a Context,
+        ) -> BoxFuture<'a, Result<EntryId, SessionError>> {
+            self.inner.append_custom_entry(custom_type, data, cx)
+        }
+    }
+
+    #[test]
+    fn excluded_entries_do_not_contribute_file_operations() {
+        // A branch summary priced out of the budget must not leak its recorded
+        // file lists into the preparation metadata.
+        let excluded = Entry::BranchSummary {
+            base: base("excluded-summary"),
+            from_id: None,
+            summary: "s".repeat(400),
+            details: Some(serde_json::json!({
+                "readFiles": ["excluded-read.txt"],
+                "modifiedFiles": ["excluded-mod.txt"],
+            })),
+            usage: None,
+            from_hook: false,
+        };
+        let kept_summary = Entry::BranchSummary {
+            base: base("kept-summary"),
+            from_id: None,
+            summary: "s".repeat(40),
+            details: Some(serde_json::json!({
+                "readFiles": ["kept-read.txt"],
+                "modifiedFiles": [],
+            })),
+            usage: None,
+            from_hook: false,
+        };
+        let kept_message = Entry::Message {
+            base: base("kept-message"),
+            message: AgentMessage::Llm(Box::new(Message::User(UserMessage::new(
+                UserMessageContent::Text("u".repeat(400)),
+                1,
+            )))),
+            terminate: false,
+        };
+        // Newest-first selection keeps the 100-token message and the 10-token
+        // summary inside a 110-token budget; the oldest 100-token summary
+        // overflows it past the 90% rescue threshold and is dropped.
+        let prep = prepare_branch_entries(&[excluded, kept_summary, kept_message], 110);
+        assert_eq!(prep.messages.len(), 2);
+        assert!(prep.file_ops.read.contains("kept-read.txt"));
+        assert!(!prep.file_ops.read.contains("excluded-read.txt"));
+        assert!(!prep.file_ops.edited.contains("excluded-mod.txt"));
+    }
+
+    #[tokio::test]
+    async fn common_ancestor_beyond_one_scan_window_is_found() -> Result<(), SessionError> {
+        // With a backend window smaller than the distance to the common
+        // ancestor, collection must keep paging instead of walking the
+        // abandoned path to the root.
+        let cx = Context::background();
+        let session = StorageBackedSession::new(
+            SessionMetadata {
+                id: "branch-ancestry-pagination".to_owned(),
+                created_at: 1,
+                storage_version: MemoryStorage::STORAGE_VERSION,
+                cwd: None,
+                parent_session_id: None,
+                legacy_parent_session_path: None,
+            },
+            Arc::new(MemoryStorage::new()),
+            Arc::new(UuidV7Generator::new()),
+            None,
+        );
+        let main = session
+            .create_branch(&LaneName::from("main"), None, &cx)
+            .await?;
+        let message = || {
+            AgentMessage::Llm(Box::new(Message::User(UserMessage::new(
+                UserMessageContent::Text("hi".to_owned()),
+                1,
+            ))))
+        };
+        let mut shared = Vec::new();
+        for _ in 0..4 {
+            shared.push(main.append_message(message(), &cx).await?);
+        }
+        let old_tip = main.append_message(message(), &cx).await?;
+        let ancestor = shared[2].clone();
+        let other = session
+            .create_branch(&LaneName::from("other"), Some(&ancestor), &cx)
+            .await?;
+        let mut target = ancestor.clone();
+        for _ in 0..2 {
+            target = other.append_message(message(), &cx).await?;
+        }
+
+        let paged = SmallPageBranch {
+            inner: main,
+            page: 2,
+        };
+        let collected = collect_entries_for_branch_summary(
+            &paged,
+            session.as_ref(),
+            Some(&old_tip),
+            &target,
+            &cx,
+        )
+        .await?;
+        assert_eq!(collected.common_ancestor_id.as_ref(), Some(&ancestor));
+        let ids: Vec<EntryId> = collected
+            .entries
+            .iter()
+            .map(|entry| entry.id().clone())
+            .collect();
+        assert_eq!(ids, [shared[3].clone(), old_tip]);
+        Ok(())
     }
 }
