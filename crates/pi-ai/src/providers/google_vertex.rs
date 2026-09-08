@@ -446,7 +446,7 @@ async fn run_request(
     }
     let auth = resolve_auth(&options, token_provider.as_ref()).await?;
     let thinking = thinking_config(&model, &options)?;
-    let mut payload = build_request_body(&model, &context, &options, thinking);
+    let mut payload = build_request_body(&model, &context, &options, thinking)?;
     if let Some(callback) = &options.on_payload {
         callback(&mut payload, &model)
             .await

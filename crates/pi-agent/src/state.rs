@@ -227,12 +227,12 @@ mod tests {
     fn assistant_with_error(error: &str) -> AgentMessage {
         let mut message = AssistantMessage::new("unknown", "unknown", "unknown", 1);
         message.error_message = Some(error.to_owned());
-        AgentMessage::Llm(Box::new(Message::Assistant(message)))
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(message))))
     }
 
     fn assistant_ok() -> AgentMessage {
-        AgentMessage::Llm(Box::new(Message::Assistant(AssistantMessage::new(
-            "unknown", "unknown", "unknown", 1,
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+            AssistantMessage::new("unknown", "unknown", "unknown", 1),
         ))))
     }
 

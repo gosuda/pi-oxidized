@@ -575,7 +575,7 @@ fn replace_last_assistant(context: &mut AgentContext, message: AssistantMessage)
 }
 
 fn assistant_agent_message(message: AssistantMessage) -> AgentMessage {
-    AgentMessage::Llm(Box::new(Message::Assistant(message)))
+    AgentMessage::Llm(Box::new(Message::Assistant(Box::new(message))))
 }
 
 fn tool_result_agent_message(message: ToolResultMessage) -> AgentMessage {
@@ -944,6 +944,7 @@ mod tests {
         AgentLoopConfig {
             model: sample_model(),
             reasoning: None,
+            tool_choice: None,
             temperature: None,
             max_tokens: None,
             session_id: None,

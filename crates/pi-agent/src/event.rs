@@ -107,8 +107,8 @@ mod tests {
     }
 
     fn assistant_message() -> AgentMessage {
-        AgentMessage::Llm(Box::new(Message::Assistant(AssistantMessage::new(
-            "api", "provider", "model", 2,
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+            AssistantMessage::new("api", "provider", "model", 2),
         ))))
     }
 

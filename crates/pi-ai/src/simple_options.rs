@@ -5,7 +5,7 @@
 
 use crate::estimate::estimate_context_tokens;
 use crate::provider::StreamOptions;
-use crate::types::{Context, Model, ThinkingLevel};
+use crate::types::{Context, Model, ThinkingLevel, ToolChoice};
 use serde::Deserialize;
 
 /// Safety margin reserved between context usage and the output budget.
@@ -113,9 +113,9 @@ pub fn clamp_max_tokens_to_context(model: &Model, context: &Context, max_tokens:
 
 /// Unified simple-stream options (TS `SimpleStreamOptions`).
 ///
-/// Extends the transport [`StreamOptions`] surface with reasoning effort and
-/// optional custom thinking budgets. Product code maps these through the
-/// typed provider-option vocabulary for the adapters that consume them.
+/// Extends the transport [`StreamOptions`] surface with reasoning effort,
+/// tool choice, and optional custom thinking budgets. Product code maps these
+/// through the typed provider-option vocabulary for the adapters that consume them.
 #[derive(Clone, Default)]
 pub struct SimpleStreamOptions {
     /// Base stream options (temperature, headers, timeouts, …).
@@ -124,6 +124,8 @@ pub struct SimpleStreamOptions {
     pub reasoning: Option<ThinkingLevel>,
     /// Custom token budgets for thinking levels.
     pub thinking_budgets: Option<ThinkingBudgets>,
+    /// Provider-neutral tool selection.
+    pub tool_choice: Option<ToolChoice>,
 }
 
 /// Build transport stream options from simple options, clamping max tokens.

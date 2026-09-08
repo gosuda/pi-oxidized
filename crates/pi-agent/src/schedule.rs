@@ -226,16 +226,35 @@ async fn execute_tool_calls_sequential(
                 is_error: immediate.is_error,
             },
             Preparation::Prepared(prepared) => {
+                // The finalizer owns the cancellation handshake for the
+                // after-hook: the hook gets one completion-biased poll after
+                // the token fires, then a hook that ignores cancellation is
+                // force-settled instead of hanging the sequential batch. The
+                // hook still runs once, on the executed outcome.
+                let tool_call = prepared.tool_call.clone();
                 let executed = execute_prepared_tool_call(&prepared, cancel, emit).await;
-                finalize_executed_tool_call(
+                let finalize = finalize_executed_tool_call(
                     current_context,
                     assistant_message,
                     prepared,
                     executed,
                     config.after_tool_call.clone(),
                     cancel.clone(),
-                )
-                .await
+                );
+                // A ready finalizer owns the real result even if cancellation is also ready.
+                let settled = tokio::select! {
+                    biased;
+                    finalized = finalize => Some(finalized),
+                    () = cancel.cancelled() => None,
+                };
+                match settled {
+                    Some(finalized) => finalized,
+                    None => FinalizedOutcome {
+                        tool_call,
+                        result: error_tool_result("Operation aborted"),
+                        is_error: true,
+                    },
+                }
             }
         };
 
@@ -379,42 +398,70 @@ impl ParallelBatch {
                 let updates = ToolUpdates::new(move |partial| {
                     let _ = update_tx.try_send(ParallelUpdate { index, partial });
                 });
+                let tool_call = prepared.tool_call.clone();
 
-                let executed = match prepared
-                    .tool
-                    .execute(
-                        &prepared.tool_call.id,
-                        prepared.args.clone(),
+                // The worker owns the whole cancellation handshake —
+                // admission, execution, and finalize — by racing the full
+                // body against the token with completion-biased polling: the
+                // body is always given one poll first, so a cooperative tool
+                // observes cancellation and keeps its real outcome, while a
+                // body still pending after that poll (tool or after-hook
+                // ignoring the token) is force-aborted here.
+                let body = async {
+                    if cancel.is_cancelled() {
+                        return FinalizedOutcome {
+                            tool_call: tool_call.clone(),
+                            result: error_tool_result("Operation aborted"),
+                            is_error: true,
+                        };
+                    }
+                    let executed = match prepared
+                        .tool
+                        .execute(
+                            &prepared.tool_call.id,
+                            prepared.args.clone(),
+                            cancel.clone(),
+                            updates.clone(),
+                        )
+                        .await
+                    {
+                        Ok(result) => {
+                            updates.stop_accepting();
+                            ExecutedOutcome {
+                                result,
+                                is_error: false,
+                            }
+                        }
+                        Err(error) => {
+                            updates.stop_accepting();
+                            ExecutedOutcome {
+                                result: AgentToolResult::from(error),
+                                is_error: true,
+                            }
+                        }
+                    };
+
+                    finalize_executed_tool_call(
+                        context.as_ref(),
+                        assistant.as_ref(),
+                        prepared,
+                        executed,
+                        after_tool_call,
                         cancel.clone(),
-                        updates.clone(),
                     )
                     .await
-                {
-                    Ok(result) => {
-                        updates.stop_accepting();
-                        ExecutedOutcome {
-                            result,
-                            is_error: false,
-                        }
-                    }
-                    Err(error) => {
-                        updates.stop_accepting();
-                        ExecutedOutcome {
-                            result: AgentToolResult::from(error),
-                            is_error: true,
-                        }
-                    }
                 };
-
-                finalize_executed_tool_call(
-                    context.as_ref(),
-                    assistant.as_ref(),
-                    prepared,
-                    executed,
-                    after_tool_call,
-                    cancel,
-                )
-                .await
+                let settled = cancel.run_until_cancelled(body).await;
+                if let Some(finalized) = settled {
+                    finalized
+                } else {
+                    updates.stop_accepting();
+                    FinalizedOutcome {
+                        tool_call,
+                        result: error_tool_result("Operation aborted"),
+                        is_error: true,
+                    }
+                }
             };
             ParallelWorkerResult {
                 index,
@@ -439,13 +486,16 @@ impl ParallelBatch {
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => {
-                    // Prefer the real outcome of any worker that already
-                    // finished (its side effects happened); only still-running
-                    // workers are aborted and synthesized as aborted.
-                    self.workers.abort_all();
+                    // Cancellation stops further spawns; each live worker now
+                    // settles on its own: a cooperative tool observes the
+                    // token through its own worker select and keeps its real
+                    // outcome, a tool that ignores it is force-aborted by
+                    // that same select. Only queued jobs that were never
+                    // spawned stay pending and are paired with a synthesized
+                    // abort below.
                     while let Some(joined) = self.workers.join_next().await {
+                        drain_parallel_updates(update_rx, slots, emit);
                         if let Ok(worker) = joined {
-                            drain_parallel_updates(update_rx, slots, emit);
                             settle_worker(slots, worker, emit);
                         }
                     }
@@ -674,32 +724,54 @@ async fn execute_prepared_tool_call(
     let args = prepared.args.clone();
     let tool_call_id = prepared.tool_call.id.clone();
     let cancel = cancel.clone();
-    let worker_cancel = cancel.clone();
 
-    // Owned task: a non-cooperative tool is force-aborted on cancellation (and
-    // on drop through JoinSet) instead of hanging the sequential batch.
+    // Owned task that owns the execution cancellation handshake with an
+    // admission gate: a worker prepared before cancellation never starts its
+    // tool, the live tool future is always given one completion-biased poll
+    // after the token fires (a cooperative tool observes cancellation and
+    // keeps its real outcome), and a tool still pending after that poll
+    // ignored the token and is force-aborted here instead of hanging the
+    // sequential batch.
     let mut worker = JoinSet::new();
     worker.spawn(async move {
         let updates = ToolUpdates::new(move |partial| {
             let _ = update_tx.send(partial);
         });
-        match tool
-            .execute(&tool_call_id, args, worker_cancel, updates.clone())
-            .await
-        {
-            Ok(result) => {
-                updates.stop_accepting();
-                ExecutedOutcome {
-                    result,
-                    is_error: false,
+        let body = async {
+            if cancel.is_cancelled() {
+                return ExecutedOutcome {
+                    result: error_tool_result("Operation aborted"),
+                    is_error: true,
+                };
+            }
+            match tool
+                .execute(&tool_call_id, args, cancel.clone(), updates.clone())
+                .await
+            {
+                Ok(result) => {
+                    updates.stop_accepting();
+                    ExecutedOutcome {
+                        result,
+                        is_error: false,
+                    }
+                }
+                Err(error) => {
+                    updates.stop_accepting();
+                    ExecutedOutcome {
+                        result: AgentToolResult::from(error),
+                        is_error: true,
+                    }
                 }
             }
-            Err(error) => {
-                updates.stop_accepting();
-                ExecutedOutcome {
-                    result: AgentToolResult::from(error),
-                    is_error: true,
-                }
+        };
+        let executed = cancel.run_until_cancelled(body).await;
+        if let Some(outcome) = executed {
+            outcome
+        } else {
+            updates.stop_accepting();
+            ExecutedOutcome {
+                result: error_tool_result("Operation aborted"),
+                is_error: true,
             }
         }
     });
@@ -707,24 +779,6 @@ async fn execute_prepared_tool_call(
     loop {
         tokio::select! {
             biased;
-            () = cancel.cancelled() => {
-                // A worker that already finished keeps its real outcome; only
-                // a still-running tool is force-aborted and synthesized.
-                worker.abort_all();
-                let mut ready = None;
-                while let Some(joined) = worker.join_next().await {
-                    if let Ok(outcome) = joined {
-                        ready = Some(outcome);
-                    }
-                }
-                while let Ok(partial) = update_rx.try_recv() {
-                    emit_tool_execution_update(&tool_call, partial, emit);
-                }
-                return ready.unwrap_or_else(|| ExecutedOutcome {
-                    result: error_tool_result("Operation aborted"),
-                    is_error: true,
-                });
-            }
             joined = worker.join_next() => {
                 while let Ok(partial) = update_rx.try_recv() {
                     emit_tool_execution_update(&tool_call, partial, emit);
@@ -872,6 +926,7 @@ mod tests {
     use futures::future::BoxFuture;
     use pi_ai::{ImageContent, Model, ModelCost, ModelInput, TextContent, ToolResultContent};
     use serde_json::json;
+    use tokio::sync::Notify;
     use tokio::time::{sleep, timeout};
 
     use crate::config::{AfterToolCallResult, BeforeToolCallResult, default_convert_to_llm_hook};
@@ -902,6 +957,7 @@ mod tests {
         AgentLoopConfig {
             model: sample_model(),
             reasoning: None,
+            tool_choice: None,
             temperature: None,
             max_tokens: None,
             session_id: None,
@@ -1157,6 +1213,67 @@ mod tests {
                     details: json!({}),
                     added_tool_names: None,
                     terminate,
+                })
+            })
+        }
+    }
+
+    /// Tool that fires one notify at its actual execute start and then pends
+    /// until the run token fires — proves the scheduler gives a live tool its
+    /// post-cancellation poll.
+    struct CancellationTool {
+        name: String,
+        parameters: Value,
+        started: Arc<Notify>,
+        cancel_seen: Arc<AtomicBool>,
+    }
+
+    impl AgentTool for CancellationTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn label(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &'static str {
+            "cancellation"
+        }
+
+        fn parameters(&self) -> &Value {
+            &self.parameters
+        }
+
+        fn execution_mode(&self) -> Option<ToolExecutionMode> {
+            None
+        }
+
+        fn validate_arguments(
+            &self,
+            args: &Map<String, Value>,
+        ) -> Result<Map<String, Value>, ToolError> {
+            Ok(args.clone())
+        }
+
+        fn execute(
+            &self,
+            _tool_call_id: &str,
+            _args: Map<String, Value>,
+            cancel: CancellationToken,
+            _updates: ToolUpdates,
+        ) -> BoxFuture<'static, Result<AgentToolResult, ToolError>> {
+            let started = Arc::clone(&self.started);
+            let cancel_seen = Arc::clone(&self.cancel_seen);
+            Box::pin(async move {
+                started.notify_one();
+                cancel.cancelled().await;
+                cancel_seen.store(true, Ordering::SeqCst);
+                Ok(AgentToolResult {
+                    content: vec![ToolResultContent::Text(TextContent::new("cancel-ok"))],
+                    details: json!({}),
+                    added_tool_names: None,
+                    terminate: None,
                 })
             })
         }
@@ -1494,11 +1611,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_reaches_running_tool() -> TestResult {
+        let started = Arc::new(Notify::new());
         let cancel_seen = Arc::new(AtomicBool::new(false));
-        let tool = RecordingTool {
-            delay: Duration::from_millis(200),
+        let tool = CancellationTool {
+            name: "cancel-me".to_owned(),
+            parameters: json!({"type":"object","properties":{}}),
+            started: Arc::clone(&started),
             cancel_seen: Arc::clone(&cancel_seen),
-            ..RecordingTool::new("cancel-me")
         };
         let context = context_with(vec![Arc::new(tool)]);
         let assistant = assistant_with_calls(vec![ToolCall::new("c1", "cancel-me", Map::new())]);
@@ -1511,16 +1630,23 @@ mod tests {
             execute_tool_calls(&context, &assistant, &config, &cancel_task, &emit).await
         });
 
-        sleep(Duration::from_millis(20)).await;
+        started.notified().await;
         cancel.cancel();
-        let batch = run
+        let batch = timeout(Duration::from_secs(1), run)
             .await
+            .map_err(|_| "cancelled batch did not settle".to_owned())?
             .map_err(|error| format!("join failed: {error}"))?
             .map_err(|error| error.to_string())?;
         if batch.messages.len() != 1 {
             return Err(format!(
                 "expected one cancelled result, got {}",
                 batch.messages.len()
+            ));
+        }
+        if batch.messages[0].is_error {
+            return Err(format!(
+                "observing tool result fabricated as abort: {:?}",
+                batch.messages[0]
             ));
         }
         if !cancel_seen.load(Ordering::SeqCst) {

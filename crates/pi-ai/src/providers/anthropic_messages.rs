@@ -9,6 +9,7 @@ use futures::StreamExt;
 use reqwest::{Client, Request};
 use serde_json::{Map, Value, json};
 
+use crate::constrained_sampling::{ConstrainedSamplingError, resolve_json_schema_strict_sampling};
 use crate::provider::{Provider, StreamOptionKey, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DoneReason,
@@ -109,7 +110,9 @@ async fn run_stream(
         return Err(AdapterError::Cancelled);
     }
 
-    let mut payload = build_payload(model, &context, options);
+    let mut payload = build_payload(model, &context, options)
+        .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+
     if let Some(callback) = &options.on_payload {
         callback(&mut payload, model)
             .await
@@ -179,7 +182,7 @@ async fn run_stream(
         StopReason::Stop => DoneReason::Stop,
         StopReason::Length => DoneReason::Length,
         StopReason::ToolUse => DoneReason::ToolUse,
-        StopReason::Error | StopReason::Aborted => {
+        StopReason::Error | StopReason::Aborted | StopReason::Pending | StopReason::Deferred => {
             return Err(AdapterError::Protocol(
                 "invalid Anthropic terminal state".to_owned(),
             ));
@@ -259,7 +262,11 @@ impl ClientRequest {
     }
 }
 
-fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> Value {
+fn build_payload(
+    model: &Model,
+    context: &Context,
+    options: &StreamOptions,
+) -> Result<Value, ConstrainedSamplingError> {
     let cache_control = cache_control(model, options);
     let mut payload = Map::new();
     payload.insert("model".to_owned(), Value::String(model.id.clone()));
@@ -283,7 +290,7 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
 
     insert_temperature(&mut payload, model, options);
     insert_thinking(&mut payload, model, options);
-    insert_tools(&mut payload, model, context, cache_control.as_ref());
+    insert_tools(&mut payload, model, context, cache_control.as_ref())?;
 
     if let Some(metadata) = &options.metadata
         && let Some(user_id) = metadata.get("user_id").and_then(Value::as_str)
@@ -300,7 +307,7 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
             },
         );
     }
-    Value::Object(payload)
+    Ok(Value::Object(payload))
 }
 
 fn insert_temperature(payload: &mut Map<String, Value>, model: &Model, options: &StreamOptions) {
@@ -366,18 +373,21 @@ fn insert_tools(
     model: &Model,
     context: &Context,
     cache_control: Option<&Value>,
-) {
+) -> Result<(), ConstrainedSamplingError> {
     let Some(tools) = context.tools.as_deref() else {
-        return;
+        return Ok(());
     };
     if tools.is_empty() {
-        return;
+        return Ok(());
     }
 
+    let supports_strict_tools = compat_bool(model, "supportsStrictTools", false);
     let mut converted: Vec<Value> = tools
         .iter()
         .map(|tool| {
-            let mut input_schema = tool.parameters.clone();
+            let resolved = resolve_json_schema_strict_sampling(tool, supports_strict_tools)?;
+            let strict = resolved.is_some();
+            let mut input_schema = resolved.unwrap_or_else(|| tool.parameters.clone());
             if !input_schema.is_object() {
                 input_schema = json!({});
             }
@@ -393,18 +403,22 @@ fn insert_tools(
                 "description": tool.description,
                 "input_schema": input_schema,
             });
+            if strict {
+                value["strict"] = Value::Bool(true);
+            }
             if compat_bool(model, "supportsEagerToolInputStreaming", true) {
                 value["eager_input_streaming"] = Value::Bool(true);
             }
-            value
+            Ok(value)
         })
-        .collect();
+        .collect::<Result<_, ConstrainedSamplingError>>()?;
     if compat_bool(model, "supportsCacheControlOnTools", true)
         && let (Some(last), Some(cache)) = (converted.last_mut(), cache_control)
     {
         last["cache_control"] = cache.clone();
     }
     payload.insert("tools".to_owned(), Value::Array(converted));
+    Ok(())
 }
 
 fn cache_control(model: &Model, options: &StreamOptions) -> Option<Value> {
@@ -1156,13 +1170,18 @@ enum AdapterError {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
 
     use super::*;
     use crate::types::{
-        ModelCost, ModelInput, TextContent, Tool, ToolResultMessage, Usage, UserMessage,
+        ConstrainedSampling, ConstrainedSamplingConfig, ModelCost, ModelInput, StrictMode,
+        TextContent, Tool, ToolResultMessage, Usage, UserMessage,
     };
 
     fn model() -> Model {
@@ -1269,7 +1288,7 @@ mod tests {
                     UserMessageContent::Text("hello".to_owned()),
                     0,
                 )),
-                Message::Assistant({
+                Message::Assistant(Box::new({
                     let mut message =
                         AssistantMessage::new("anthropic-messages", "anthropic", "old", 0);
                     message
@@ -1281,7 +1300,7 @@ mod tests {
                         Map::new(),
                     )));
                     message
-                }),
+                })),
                 Message::ToolResult(ToolResultMessage::new(
                     "bad id/with punctuation and a suffix that makes this identifier much longer than sixty four characters",
                     "read",
@@ -1294,6 +1313,7 @@ mod tests {
                 name: "read".to_owned(),
                 description: "read a file".to_owned(),
                 parameters: json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
+                constrained_sampling: None,
             }]),
         };
         let mut options = StreamOptions {
@@ -1302,7 +1322,8 @@ mod tests {
         };
         options.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(true));
         options.insert_extra(StreamOptionKey::THINKING_BUDGET_TOKENS, Value::from(2048));
-        let payload = build_payload(&model(), &context, &options);
+        let payload = build_payload(&model(), &context, &options)
+            .expect("ordinary Anthropic payload conversion should succeed");
         assert_eq!(payload["system"][0]["cache_control"]["ttl"], "1h");
         assert_eq!(payload["thinking"]["budget_tokens"], 2048);
         assert_eq!(payload["tools"][0]["eager_input_streaming"], true);
@@ -1319,6 +1340,59 @@ mod tests {
         assert_eq!(payload["messages"][2]["content"][0]["tool_use_id"], tool_id);
     }
     #[test]
+    fn strict_tools_transform_schema_and_require_failures_are_fallible() {
+        let tool = Tool {
+            name: "lookup".into(),
+            description: "Lookup".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            constrained_sampling: Some(ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema {
+                    strict: StrictMode::Prefer,
+                },
+            )),
+        };
+        let context = Context {
+            tools: Some(vec![tool]),
+            ..Context::default()
+        };
+        let mut strict_model = model();
+        strict_model.compat = Some(json!({"supportsStrictTools": true}));
+        let payload = build_payload(&strict_model, &context, &StreamOptions::default())
+            .expect("strict Anthropic payload should succeed");
+        assert_eq!(payload["tools"][0]["strict"], true);
+        assert_eq!(
+            payload["tools"][0]["input_schema"]["additionalProperties"],
+            false
+        );
+
+        let required = Tool {
+            constrained_sampling: Some(ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema {
+                    strict: StrictMode::Require,
+                },
+            )),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"$ref": "#/$defs/path"}}
+            }),
+            ..context.tools.as_ref().expect("tool exists")[0].clone()
+        };
+        let required_context = Context {
+            tools: Some(vec![required]),
+            ..Context::default()
+        };
+        let error = build_payload(&strict_model, &required_context, &StreamOptions::default())
+            .expect_err("unsupported required strict schema must fail");
+        assert_eq!(
+            error.to_string(),
+            "Tool \"lookup\" requires JSON-schema constrained sampling, but $ref schemas are unsupported."
+        );
+    }
+    #[test]
     fn temperature_yields_to_thinking_and_thinking_requests_default() {
         let context = Context::default();
 
@@ -1327,7 +1401,8 @@ mod tests {
             temperature: Some(0.7),
             ..StreamOptions::default()
         };
-        let payload = build_payload(&model(), &context, &options);
+        let payload = build_payload(&model(), &context, &options)
+            .expect("ordinary Anthropic payload conversion should succeed");
         assert_eq!(payload["temperature"], 0.7);
 
         // Enabled thinking omits temperature and defaults budget and display.
@@ -1336,7 +1411,8 @@ mod tests {
             ..StreamOptions::default()
         };
         thinking.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(true));
-        let payload = build_payload(&model(), &context, &thinking);
+        let payload = build_payload(&model(), &context, &thinking)
+            .expect("ordinary Anthropic payload conversion should succeed");
         assert!(payload.get("temperature").is_none());
         assert_eq!(payload["thinking"]["type"], "enabled");
         assert_eq!(payload["thinking"]["budget_tokens"], 1024);
@@ -1348,7 +1424,8 @@ mod tests {
         let mut options = StreamOptions::default();
         options.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(true));
         options.insert_extra(StreamOptionKey::EFFORT, Value::String("high".to_owned()));
-        let payload = build_payload(&adaptive, &context, &options);
+        let payload = build_payload(&adaptive, &context, &options)
+            .expect("ordinary Anthropic payload conversion should succeed");
         assert_eq!(payload["thinking"]["type"], "adaptive");
         assert_eq!(payload["output_config"]["effort"], "high");
     }
@@ -1360,7 +1437,8 @@ mod tests {
         options.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(false));
 
         // Plain reasoning model: explicit disable is sent (upstream parity).
-        let payload = build_payload(&model(), &context, &options);
+        let payload = build_payload(&model(), &context, &options)
+            .expect("ordinary Anthropic payload conversion should succeed");
         assert_eq!(payload["thinking"]["type"], "disabled");
 
         // off:null pins the level as unsupported: the disable is omitted.
@@ -1369,7 +1447,8 @@ mod tests {
             ModelThinkingLevel::Off,
             None,
         )]));
-        let payload = build_payload(&adaptive, &context, &options);
+        let payload = build_payload(&adaptive, &context, &options)
+            .expect("ordinary Anthropic payload conversion should succeed");
         assert!(payload.get("thinking").is_none());
     }
 

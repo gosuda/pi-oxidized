@@ -13,11 +13,10 @@ use super::config_value::resolve_config_value;
 use super::env_keys::{env_api_key_auth, is_ambient_auth_marker};
 use super::error::AuthError;
 use super::http::AuthHttpClient;
-use super::oauth::radius::RadiusOAuthOptions;
+use super::oauth::radius::{DEFAULT_RADIUS_GATEWAY, RadiusOAuth, RadiusOAuthOptions};
 use super::oauth::{
     anthropic::AnthropicOAuth, github_copilot::GitHubCopilotOAuth, kimi_coding::KimiCodingOAuth,
-    openai_codex::OpenAiCodexOAuth, openrouter::OpenRouterOAuth, radius::RadiusOAuth,
-    xai::XaiOAuth,
+    openai_codex::OpenAiCodexOAuth, openrouter::OpenRouterOAuth, xai::XaiOAuth,
 };
 use super::types::{
     ApiKeyAuth, ApiKeyCredential, AuthCheck, AuthContext, AuthInteraction, AuthResult, ModelAuth,
@@ -343,7 +342,7 @@ fn build_openrouter_oauth() -> Arc<dyn OAuthAuth> {
 fn build_radius_oauth() -> Arc<dyn OAuthAuth> {
     let options = RadiusOAuthOptions {
         name: "Radius".to_owned(),
-        gateway: "https://radius.pi.dev".to_owned(),
+        gateway: DEFAULT_RADIUS_GATEWAY.to_owned(),
     };
     RadiusOAuth::new(options.clone()).map_or_else(
         |_| {

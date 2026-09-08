@@ -11,6 +11,10 @@ use serde_json::{Map, Value, json};
 use super::{
     calculate_cost, parse_streaming_json, sanitize_surrogates, short_hash, transform_messages,
 };
+use crate::constrained_sampling::{
+    GrammarToolInputBuffer, grammar_tool_input, resolve_grammar_constrained_sampling,
+    resolve_json_schema_strict_sampling,
+};
 use crate::providers::stream_state::{AssistantState, ProviderEventSender};
 use crate::types::{
     AssistantContent, AssistantMessage, Context, DoneReason, ErrorReason, Message, Model,
@@ -27,6 +31,10 @@ pub(crate) struct ConvertMessagesOptions {
     pub(crate) include_system_prompt: bool,
     /// Tools that are replayed through Responses' deferred tool-search items.
     pub(crate) deferred_tools: BTreeMap<String, Tool>,
+    /// Grammar tool names and their single string input property.
+    pub(crate) grammar_tool_input_properties: BTreeMap<String, String>,
+    /// Tool conversion policy for deferred tools.
+    pub(crate) tool_options: ConvertToolsOptions,
 }
 
 impl Default for ConvertMessagesOptions {
@@ -34,6 +42,8 @@ impl Default for ConvertMessagesOptions {
         Self {
             include_system_prompt: true,
             deferred_tools: BTreeMap::new(),
+            grammar_tool_input_properties: BTreeMap::new(),
+            tool_options: ConvertToolsOptions::default(),
         }
     }
 }
@@ -43,6 +53,10 @@ impl Default for ConvertMessagesOptions {
 pub(crate) struct ConvertToolsOptions {
     /// Value of the Responses `strict` field. `None` encodes JSON null.
     pub(crate) strict: Option<bool>,
+    /// Whether the provider accepts the Responses `strict` field.
+    pub(crate) supports_strict_mode: bool,
+    /// Whether the provider accepts `OpenAI` grammar custom tools.
+    pub(crate) supports_openai_grammar_tools: bool,
     /// Mark the tools as deferred-loading results.
     pub(crate) defer_loading: bool,
 }
@@ -51,6 +65,8 @@ impl Default for ConvertToolsOptions {
     fn default() -> Self {
         Self {
             strict: Some(false),
+            supports_strict_mode: true,
+            supports_openai_grammar_tools: false,
             defer_loading: false,
         }
     }
@@ -65,6 +81,8 @@ pub(crate) struct ProcessOptions {
     pub(crate) apply_service_tier_pricing: bool,
     /// Treat a response tier of `default` as the requested tier (Codex behavior).
     pub(crate) default_service_tier_uses_request: bool,
+    /// Grammar tool names and their single string input property.
+    pub(crate) grammar_tool_input_properties: BTreeMap<String, String>,
 }
 
 /// Error raised by response conversion or semantic event processing.
@@ -84,7 +102,7 @@ pub(crate) fn convert_messages(
     context: &Context,
     allowed_tool_call_providers: &BTreeSet<String>,
     options: &ConvertMessagesOptions,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, crate::constrained_sampling::ConstrainedSamplingError> {
     let mut normalize = |id: &str, target: &Model, source: &AssistantMessage| {
         normalize_tool_call_id(id, target, source, allowed_tool_call_providers)
     };
@@ -107,9 +125,14 @@ pub(crate) fn convert_messages(
     for (message_index, message) in transformed.iter().enumerate() {
         match message {
             Message::User(user) => convert_user_message(user, &mut input),
-            Message::Assistant(assistant) => {
-                convert_assistant_message(model, assistant, message_index, &mut input);
-            }
+            Message::Assistant(assistant) => convert_assistant_message(
+                model,
+                assistant,
+                message_index,
+                &options.deferred_tools,
+                &options.grammar_tool_input_properties,
+                &mut input,
+            )?,
             Message::ToolResult(result) => convert_tool_result_message(
                 model,
                 result,
@@ -117,10 +140,10 @@ pub(crate) fn convert_messages(
                 options,
                 &mut loaded_tool_names,
                 &mut input,
-            ),
+            )?,
         }
     }
-    input
+    Ok(input)
 }
 
 fn convert_user_message(user: &crate::types::UserMessage, input: &mut Vec<Value>) {
@@ -158,11 +181,13 @@ fn convert_assistant_message(
     model: &Model,
     assistant: &AssistantMessage,
     message_index: usize,
+    deferred_tools: &BTreeMap<String, Tool>,
+    grammar_tool_input_properties: &BTreeMap<String, String>,
     input: &mut Vec<Value>,
-) {
-    let different_model = assistant.model != model.id
-        && assistant.provider == model.provider
-        && assistant.api == model.api;
+) -> Result<(), crate::constrained_sampling::ConstrainedSamplingError> {
+    let same_provider_and_api = assistant.provider == model.provider && assistant.api == model.api;
+    let same_model = same_provider_and_api && assistant.model == model.id;
+    let different_model = same_provider_and_api && assistant.model != model.id;
     let mut text_block_index = 0_u64;
     for block in &assistant.content {
         match block {
@@ -205,23 +230,46 @@ fn convert_assistant_message(
             }
             AssistantContent::ToolCall(tool_call) => {
                 let (call_id, mut item_id) = split_tool_id(&tool_call.id);
-                if different_model && item_id.as_deref().is_some_and(|id| id.starts_with("fc_")) {
+                let custom_input_property = grammar_tool_input_properties.get(&tool_call.name);
+                if (different_model && item_id.as_deref().is_some_and(|id| id.starts_with("fc_")))
+                    || (custom_input_property.is_none()
+                        && item_id.as_deref().is_some_and(|id| !id.starts_with("fc_")))
+                {
                     item_id = None;
                 }
-                let mut item = json!({
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": tool_call.name,
-                    "arguments": serde_json::to_string(&tool_call.arguments)
-                        .unwrap_or_else(|_| "{}".to_owned()),
-                });
+                let can_replay_namespace =
+                    same_model || deferred_tools.contains_key(&tool_call.name);
+                let mut item = if let Some(property) = custom_input_property {
+                    json!({
+                        "type": "custom_tool_call",
+                        "call_id": call_id,
+                        "name": tool_call.name,
+                        "input": sanitize_surrogates(grammar_tool_input(
+                            &tool_call.name,
+                            &tool_call.arguments,
+                            property,
+                        )?),
+                    })
+                } else {
+                    json!({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": tool_call.name,
+                        "arguments": serde_json::to_string(&tool_call.arguments)
+                            .unwrap_or_else(|_| "{}".to_owned()),
+                    })
+                };
                 if let Some(item_id) = item_id {
                     item["id"] = Value::String(item_id);
+                }
+                if can_replay_namespace && let Some(namespace) = tool_call.namespace.as_deref() {
+                    item["namespace"] = Value::String(namespace.to_owned());
                 }
                 input.push(item);
             }
         }
     }
+    Ok(())
 }
 
 fn convert_tool_result_message(
@@ -231,7 +279,7 @@ fn convert_tool_result_message(
     options: &ConvertMessagesOptions,
     loaded_tool_names: &mut BTreeSet<String>,
     input: &mut Vec<Value>,
-) {
+) -> Result<(), crate::constrained_sampling::ConstrainedSamplingError> {
     let (call_id, _) = split_tool_id(&result.tool_call_id);
     let text = result
         .content
@@ -277,8 +325,16 @@ fn convert_tool_result_message(
             NO_TOOL_OUTPUT.to_owned()
         })
     };
+    let output_type = if options
+        .grammar_tool_input_properties
+        .contains_key(&result.tool_name)
+    {
+        "custom_tool_call_output"
+    } else {
+        "function_call_output"
+    };
     input.push(json!({
-        "type": "function_call_output",
+        "type": output_type,
         "call_id": call_id,
         "output": output,
     }));
@@ -304,48 +360,77 @@ fn convert_tool_result_message(
             "status": "completed",
             "arguments": {"query": names.join(" "), "limit": names.len()},
         }));
+        let mut tool_options = options.tool_options;
+        tool_options.defer_loading = true;
         input.push(json!({
             "type": "tool_search_output",
             "call_id": search_call_id,
             "execution": "client",
             "status": "completed",
-            "tools": convert_tools(
-                &deferred,
-                ConvertToolsOptions { strict: Some(false), defer_loading: true },
-            ),
+            "tools": convert_tools(&deferred, tool_options)?,
         }));
     }
+    Ok(())
 }
 
-/// Convert native tool definitions to `OpenAI` Responses function tools.
-pub(crate) fn convert_tools(tools: &[Tool], options: ConvertToolsOptions) -> Vec<Value> {
+/// Convert native tool definitions to `OpenAI` Responses tools.
+pub(crate) fn convert_tools(
+    tools: &[Tool],
+    options: ConvertToolsOptions,
+) -> Result<Vec<Value>, crate::constrained_sampling::ConstrainedSamplingError> {
     tools
         .iter()
         .map(|tool| {
+            if let Some(grammar) =
+                resolve_grammar_constrained_sampling(tool, options.supports_openai_grammar_tools)?
+            {
+                let mut value = json!({
+                    "type": "custom",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "format": {
+                        "type": "grammar",
+                        "syntax": grammar.syntax,
+                        "definition": grammar.definition,
+                    },
+                });
+                if options.defer_loading {
+                    value["defer_loading"] = Value::Bool(true);
+                }
+                return Ok(value);
+            }
+            let constrained =
+                resolve_json_schema_strict_sampling(tool, options.supports_strict_mode)?;
+            let strict = constrained.is_some().then_some(true).or(options.strict);
+            let parameters = constrained.unwrap_or_else(|| tool.parameters.clone());
             let mut value = json!({
                 "type": "function",
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.parameters,
-                "strict": options.strict,
+                "parameters": parameters,
             });
+            if options.supports_strict_mode {
+                value["strict"] = strict.map_or(Value::Null, Value::Bool);
+            }
             if options.defer_loading {
                 value["defer_loading"] = Value::Bool(true);
             }
-            value
+            Ok(value)
         })
         .collect()
 }
 
-/// Stateful converter from raw Responses stream events to native semantic events.
-pub(crate) struct ResponsesStreamProcessor {
-    model: Model,
-    sender: ProviderEventSender,
-    state: AssistantState,
-    slots: BTreeMap<u64, OutputSlot>,
-    reasoning_blocks_by_id: BTreeMap<String, u64>,
-    options: ProcessOptions,
-    saw_terminal: bool,
+#[derive(Clone, Debug)]
+struct CustomToolInput {
+    property: String,
+    input: String,
+    buffer: GrammarToolInputBuffer,
+}
+
+#[derive(Clone, Debug)]
+enum ToolCallState {
+    Function(StreamingArguments),
+    Custom(CustomToolInput),
 }
 
 #[derive(Clone, Debug)]
@@ -358,7 +443,7 @@ enum OutputSlot {
     },
     ToolCall {
         content_index: u64,
-        arguments: StreamingArguments,
+        state: Box<ToolCallState>,
     },
 }
 
@@ -865,6 +950,17 @@ fn value_at_path_mut<'a>(
     Some(value)
 }
 
+/// Converts provider Responses events into semantic assistant-message events.
+pub(crate) struct ResponsesStreamProcessor {
+    model: Model,
+    sender: ProviderEventSender,
+    state: AssistantState,
+    slots: BTreeMap<u64, OutputSlot>,
+    reasoning_blocks_by_id: BTreeMap<String, u64>,
+    options: ProcessOptions,
+    saw_terminal: bool,
+}
+
 impl ResponsesStreamProcessor {
     /// Create a processor for one response stream.
     pub(crate) fn new(
@@ -924,6 +1020,12 @@ impl ResponsesStreamProcessor {
             }
             "response.function_call_arguments.delta" => self.tool_delta(&event).await?,
             "response.function_call_arguments.done" => self.tool_arguments_done(&event).await?,
+            "response.custom_tool_call_input.delta" => {
+                self.custom_tool_input_delta(&event, false).await?;
+            }
+            "response.custom_tool_call_input.done" => {
+                self.custom_tool_input_delta(&event, true).await?;
+            }
             "response.output_item.done" => self.output_item_done(&event).await?,
             "response.completed" | "response.incomplete" | "response.failed" => {
                 self.saw_terminal = true;
@@ -988,6 +1090,9 @@ impl ResponsesStreamProcessor {
     pub(crate) fn message(&self) -> AssistantMessage {
         Arc::unwrap_or_clone(self.state.snapshot())
     }
+    pub(crate) fn grammar_tool_input_properties(&self) -> &BTreeMap<String, String> {
+        &self.options.grammar_tool_input_properties
+    }
 
     async fn create_slot(&mut self, event: &Value) -> Result<(), ResponsesError> {
         let Some(output_index) = output_index(event) else {
@@ -1014,17 +1119,60 @@ impl ResponsesStreamProcessor {
                 let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
                 let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
                 let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                let namespace = item
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let semantic = self
                     .state
-                    .start_tool_call(format!("{call_id}|{item_id}"), name)
+                    .start_tool_call(format!("{call_id}|{item_id}"), name, namespace)
                     .map_err(state_error)?;
                 let content_index = event_content_index(&semantic)?;
                 self.sender.event(semantic).await.map_err(send_error)?;
                 OutputSlot::ToolCall {
                     content_index,
-                    arguments: StreamingArguments::from_initial(
+                    state: Box::new(ToolCallState::Function(StreamingArguments::from_initial(
                         item.get("arguments").and_then(Value::as_str).unwrap_or(""),
-                    ),
+                    ))),
+                }
+            }
+            Some("custom_tool_call") => {
+                let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+                let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                let property = self
+                    .options
+                    .grammar_tool_input_properties
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| "input".to_owned());
+                let namespace = item
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let input = item.get("input").and_then(Value::as_str).unwrap_or("");
+                let started = self
+                    .state
+                    .start_tool_call(format!("{call_id}|{item_id}"), name, namespace)
+                    .map_err(state_error)?;
+                let content_index = event_content_index(&started)?;
+                let custom_input = CustomToolInput {
+                    property: property.clone(),
+                    input: input.to_owned(),
+                    buffer: GrammarToolInputBuffer::default(),
+                };
+                self.set_tool_arguments(
+                    content_index,
+                    Map::from_iter([(property, Value::String(input.to_owned()))]),
+                )?;
+                let semantic = crate::types::AssistantMessageEvent::ToolCallStart {
+                    content_index,
+                    partial: self.state.snapshot(),
+                };
+                self.sender.event(semantic).await.map_err(send_error)?;
+                OutputSlot::ToolCall {
+                    content_index,
+                    state: Box::new(ToolCallState::Custom(custom_input)),
                 }
             }
             _ => return Ok(()),
@@ -1062,14 +1210,17 @@ impl ResponsesStreamProcessor {
         };
         let Some(OutputSlot::ToolCall {
             content_index,
-            arguments,
+            state,
         }) = self.slots.get_mut(&output_index)
         else {
             return Ok(());
         };
+        let ToolCallState::Function(arguments) = state.as_mut() else {
+            return Ok(());
+        };
         arguments.push(delta);
-        let content_index = *content_index;
         let parsed = arguments.current();
+        let content_index = *content_index;
         self.set_tool_arguments(content_index, parsed)?;
         let semantic = self
             .state
@@ -1089,19 +1240,76 @@ impl ResponsesStreamProcessor {
             .to_owned();
         let Some(OutputSlot::ToolCall {
             content_index,
-            arguments,
+            state,
         }) = self.slots.get_mut(&output_index)
         else {
             return Ok(());
         };
-        let content_index = *content_index;
+        let ToolCallState::Function(arguments) = state.as_mut() else {
+            return Ok(());
+        };
         let previous = arguments.raw.clone();
         let parsed = arguments.replace_with_final(final_arguments.clone());
+        let content_index = *content_index;
         self.set_tool_arguments(content_index, parsed)?;
         if let Some(delta) = final_arguments
             .strip_prefix(&previous)
             .filter(|delta| !delta.is_empty())
         {
+            let semantic = self
+                .state
+                .tool_call_delta(content_index, delta)
+                .map_err(state_error)?;
+            self.sender.event(semantic).await.map_err(send_error)?;
+        }
+        Ok(())
+    }
+    async fn custom_tool_input_delta(
+        &mut self,
+        event: &Value,
+        close: bool,
+    ) -> Result<(), ResponsesError> {
+        let Some(output_index) = output_index(event) else {
+            return Ok(());
+        };
+        let (content_index, property, next_input, delta) = {
+            let Some(OutputSlot::ToolCall {
+                content_index,
+                state,
+            }) = self.slots.get_mut(&output_index)
+            else {
+                return Ok(());
+            };
+            let ToolCallState::Custom(custom_input) = state.as_mut() else {
+                return Ok(());
+            };
+            let next_input = if close {
+                event
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&custom_input.input)
+                    .to_owned()
+            } else {
+                let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                format!("{}{}", custom_input.input, delta)
+            };
+            let delta = custom_input
+                .buffer
+                .append(&custom_input.property, &next_input, close)
+                .map_err(state_error)?;
+            next_input.clone_into(&mut custom_input.input);
+            (
+                *content_index,
+                custom_input.property.clone(),
+                next_input,
+                delta,
+            )
+        };
+        self.set_tool_arguments(
+            content_index,
+            Map::from_iter([(property, Value::String(next_input))]),
+        )?;
+        if let Some(delta) = delta {
             let semantic = self
                 .state
                 .tool_call_delta(content_index, delta)
@@ -1126,58 +1334,144 @@ impl ResponsesStreamProcessor {
             OutputSlot::Thinking { content_index }
                 if item.get("type").and_then(Value::as_str) == Some("reasoning") =>
             {
-                let summary = joined_text(item.get("summary"));
-                let content = joined_text(item.get("content"));
-                let final_text = if summary.is_empty() { content } else { summary };
-                let signature = serde_json::to_string(item).unwrap_or_else(|_| "{}".to_owned());
-                self.update_content(content_index, |block| {
-                    if let AssistantContent::Thinking(thinking) = block {
-                        thinking.thinking = final_text;
-                        thinking.thinking_signature = Some(signature);
-                    }
-                })?;
-                if let Some(id) = item.get("id").and_then(Value::as_str) {
-                    self.reasoning_blocks_by_id
-                        .insert(id.to_owned(), content_index);
-                }
-                let semantic = self
-                    .state
-                    .end_thinking(content_index)
-                    .map_err(state_error)?;
-                self.sender.event(semantic).await.map_err(send_error)?;
+                self.finish_thinking_item(content_index, item).await?;
             }
             OutputSlot::Text { content_index }
                 if item.get("type").and_then(Value::as_str) == Some("message") =>
             {
-                let final_text = joined_output_text(item.get("content"));
-                let id = item.get("id").and_then(Value::as_str).unwrap_or("");
-                let phase = item.get("phase").and_then(Value::as_str);
-                let signature = encode_text_signature(id, phase);
-                self.update_content(content_index, |block| {
-                    if let AssistantContent::Text(text) = block {
-                        text.text = final_text;
-                        text.text_signature = Some(signature);
-                    }
-                })?;
-                let semantic = self.state.end_text(content_index).map_err(state_error)?;
-                self.sender.event(semantic).await.map_err(send_error)?;
+                self.finish_text_item(content_index, item).await?;
             }
             OutputSlot::ToolCall {
                 content_index,
-                arguments,
-            } if item.get("type").and_then(Value::as_str) == Some("function_call") => {
-                let final_json = item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&arguments.raw);
-                let semantic = self
-                    .state
-                    .end_tool_call(content_index, parse_streaming_json(final_json))
-                    .map_err(state_error)?;
-                self.sender.event(semantic).await.map_err(send_error)?;
-            }
+                state,
+            } => match *state {
+                ToolCallState::Function(arguments)
+                    if item.get("type").and_then(Value::as_str) == Some("function_call") =>
+                {
+                    self.finish_function_tool_call(content_index, arguments, item)
+                        .await?;
+                }
+                ToolCallState::Custom(custom_input)
+                    if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") =>
+                {
+                    self.finish_custom_tool_call(content_index, custom_input, item)
+                        .await?;
+                }
+                _ => {}
+            },
             _ => {}
         }
+        Ok(())
+    }
+
+    async fn finish_thinking_item(
+        &mut self,
+        content_index: u64,
+        item: &Value,
+    ) -> Result<(), ResponsesError> {
+        let summary = joined_text(item.get("summary"));
+        let content = joined_text(item.get("content"));
+        let final_text = if summary.is_empty() { content } else { summary };
+        let signature = serde_json::to_string(item).unwrap_or_else(|_| "{}".to_owned());
+        self.update_content(content_index, |block| {
+            if let AssistantContent::Thinking(thinking) = block {
+                thinking.thinking = final_text;
+                thinking.thinking_signature = Some(signature);
+            }
+        })?;
+        if let Some(id) = item.get("id").and_then(Value::as_str) {
+            self.reasoning_blocks_by_id
+                .insert(id.to_owned(), content_index);
+        }
+        let semantic = self
+            .state
+            .end_thinking(content_index)
+            .map_err(state_error)?;
+        self.sender.event(semantic).await.map_err(send_error)?;
+        Ok(())
+    }
+
+    async fn finish_text_item(
+        &mut self,
+        content_index: u64,
+        item: &Value,
+    ) -> Result<(), ResponsesError> {
+        let final_text = joined_output_text(item.get("content"));
+        let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+        let phase = item.get("phase").and_then(Value::as_str);
+        let signature = encode_text_signature(id, phase);
+        self.update_content(content_index, |block| {
+            if let AssistantContent::Text(text) = block {
+                text.text = final_text;
+                text.text_signature = Some(signature);
+            }
+        })?;
+        let semantic = self.state.end_text(content_index).map_err(state_error)?;
+        self.sender.event(semantic).await.map_err(send_error)?;
+        Ok(())
+    }
+
+    async fn finish_function_tool_call(
+        &mut self,
+        content_index: u64,
+        arguments: StreamingArguments,
+        item: &Value,
+    ) -> Result<(), ResponsesError> {
+        let final_json = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or(&arguments.raw);
+        if let Some(namespace) = item.get("namespace").and_then(Value::as_str) {
+            self.update_content(content_index, |block| {
+                if let AssistantContent::ToolCall(call) = block {
+                    call.namespace = Some(namespace.to_owned());
+                }
+            })?;
+        }
+        let semantic = self
+            .state
+            .end_tool_call(content_index, parse_streaming_json(final_json))
+            .map_err(state_error)?;
+        self.sender.event(semantic).await.map_err(send_error)?;
+        Ok(())
+    }
+
+    async fn finish_custom_tool_call(
+        &mut self,
+        content_index: u64,
+        mut custom_input: CustomToolInput,
+        item: &Value,
+    ) -> Result<(), ResponsesError> {
+        let final_input = item
+            .get("input")
+            .and_then(Value::as_str)
+            .unwrap_or(&custom_input.input)
+            .to_owned();
+        if let Some(namespace) = item.get("namespace").and_then(Value::as_str) {
+            self.update_content(content_index, |block| {
+                if let AssistantContent::ToolCall(call) = block {
+                    call.namespace = Some(namespace.to_owned());
+                }
+            })?;
+        }
+        if let Some(delta) = custom_input
+            .buffer
+            .append(&custom_input.property, &final_input, true)
+            .map_err(state_error)?
+        {
+            let semantic = self
+                .state
+                .tool_call_delta(content_index, delta)
+                .map_err(state_error)?;
+            self.sender.event(semantic).await.map_err(send_error)?;
+        }
+        let arguments = Map::from_iter([(custom_input.property, Value::String(final_input))]);
+        self.set_tool_arguments(content_index, arguments.clone())?;
+        let semantic = self
+            .state
+            .end_tool_call(content_index, arguments)
+            .map_err(state_error)?;
+        self.sender.event(semantic).await.map_err(send_error)?;
         Ok(())
     }
 
@@ -1534,6 +1828,10 @@ fn state_error(error: impl std::fmt::Display) -> ResponsesError {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test fixtures assert conversion succeeds for valid provider data"
+)]
 mod tests {
     use std::num::NonZeroUsize;
 
@@ -1625,11 +1923,16 @@ mod tests {
                 name: "read".into(),
                 description: "Read".into(),
                 parameters: json!({"type":"object"}),
+                constrained_sampling: None,
             }],
             ConvertToolsOptions::default(),
-        );
+        )
+        .expect("ordinary tools remain infallible");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["name"], "read");
-        assert_eq!(tools[0]["strict"], false);
+        assert_eq!(tools[0]["strict"], Value::Bool(false));
+        assert_eq!(tools[0]["parameters"], json!({"type":"object"}));
         assert!(tools[0].get("function").is_none());
     }
 

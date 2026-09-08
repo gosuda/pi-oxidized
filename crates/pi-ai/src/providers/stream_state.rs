@@ -261,14 +261,13 @@ impl AssistantState {
         &mut self,
         id: impl Into<String>,
         name: impl Into<String>,
+        namespace: Option<String>,
     ) -> Result<AssistantMessageEvent, AssistantStateError> {
+        let mut tool_call = ToolCall::new(id, name, Map::new());
+        tool_call.namespace = namespace;
         self.message
             .content
-            .push(AssistantContent::ToolCall(ToolCall::new(
-                id,
-                name,
-                Map::new(),
-            )));
+            .push(AssistantContent::ToolCall(tool_call));
         let content_index = self.last_index()?;
         Ok(AssistantMessageEvent::ToolCallStart {
             content_index,
@@ -311,6 +310,7 @@ impl AssistantState {
             DoneReason::Stop => StopReason::Stop,
             DoneReason::Length => StopReason::Length,
             DoneReason::ToolUse => StopReason::ToolUse,
+            DoneReason::Deferred => StopReason::Deferred,
         };
         self.message.error_message = None;
         Arc::unwrap_or_clone(self.snapshot())
@@ -575,7 +575,17 @@ mod tests {
     fn state_keeps_scratch_json_out_of_canonical_message() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut state = AssistantState::new(AssistantMessage::new("api", "provider", "model", 1));
-        let _start = state.start_tool_call("call", "read")?;
+        let start = state.start_tool_call("call", "read", Some("fs".to_owned()))?;
+        let AssistantMessageEvent::ToolCallStart { partial, .. } = &start else {
+            return Err("expected tool call start".into());
+        };
+        assert_eq!(
+            partial.content.first().and_then(|block| match block {
+                AssistantContent::ToolCall(tool_call) => tool_call.namespace.as_deref(),
+                _ => None,
+            }),
+            Some("fs")
+        );
         let _delta = state.tool_call_delta(0, "{\"path\":")?;
         assert!(!serde_json::to_string(state.message())?.contains("partial"));
         let mut arguments = Map::new();
@@ -583,6 +593,17 @@ mod tests {
         let _end = state.end_tool_call(0, arguments)?;
         let final_message = state.finish(DoneReason::ToolUse);
         assert_eq!(final_message.stop_reason, StopReason::ToolUse);
+        let AssistantContent::ToolCall(tool_call) = &final_message.content[0] else {
+            return Err("expected tool call content".into());
+        };
+        assert_eq!(tool_call.namespace.as_deref(), Some("fs"));
         Ok(())
+    }
+
+    #[test]
+    fn finish_preserves_deferred_terminal_reason() {
+        let mut state = AssistantState::new(AssistantMessage::new("api", "provider", "model", 1));
+        let final_message = state.finish(DoneReason::Deferred);
+        assert_eq!(final_message.stop_reason, StopReason::Deferred);
     }
 }

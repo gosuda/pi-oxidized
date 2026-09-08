@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Unexpected};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Number, Value};
 
 /// Open API identifier used to select a provider transport implementation.
@@ -56,6 +57,27 @@ pub enum ModelThinkingLevel {
 /// that level as unsupported and is encoded as JSON `null`.
 pub type ThinkingLevelMap = BTreeMap<ModelThinkingLevel, Option<String>>;
 
+/// Provider-neutral tool selection for simple requests.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoice {
+    /// Let the provider decide whether to call tools.
+    Auto,
+    /// Forbid tool calls for this request.
+    None,
+}
+
+impl ToolChoice {
+    /// Wire spelling written into provider payloads.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+        }
+    }
+}
+
 /// Prompt-cache retention preference.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -104,6 +126,12 @@ pub enum StopReason {
     /// The provider requested one or more tools.
     #[serde(rename = "toolUse")]
     ToolUse,
+    /// The response is still being assembled.
+    #[serde(rename = "pending")]
+    Pending,
+    /// The provider accepted the request for deferred completion.
+    #[serde(rename = "deferred")]
+    Deferred,
     /// The provider failed.
     #[serde(rename = "error")]
     Error,
@@ -124,6 +152,9 @@ pub enum DoneReason {
     /// The provider requested one or more tools.
     #[serde(rename = "toolUse")]
     ToolUse,
+    /// The provider accepted the request for deferred completion.
+    #[serde(rename = "deferred")]
+    Deferred,
 }
 
 /// Failed stream termination reason.
@@ -253,10 +284,13 @@ pub struct ToolCall {
     /// Google-specific opaque signature for reusing thought context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+    /// `OpenAI` Responses namespace for dynamically loaded or namespaced tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 impl ToolCall {
-    /// Creates a tool invocation with object arguments and no thought signature.
+    /// Creates a tool invocation with object arguments and no provider metadata.
     #[must_use]
     pub fn new(
         id: impl Into<String>,
@@ -269,6 +303,7 @@ impl ToolCall {
             name: name.into(),
             arguments,
             thought_signature: None,
+            namespace: None,
         }
     }
 }
@@ -442,6 +477,29 @@ enum AssistantRole {
     Assistant,
 }
 
+/// Provider metadata used to poll a response that settles asynchronously.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeferredHandle {
+    /// Provider that owns the deferred response.
+    pub provider: String,
+    /// Model identifier used by the provider.
+    pub model_id: String,
+    /// API shape used for the request.
+    pub api: String,
+    /// Provider token, such as a response or batch identifier.
+    pub id: String,
+    /// Optional expiry timestamp supplied by the provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<f64>,
+    /// Suggested delay before polling again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_after_ms: Option<f64>,
+    /// Provider conversion data needed to reconstruct the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
 /// A provider-produced assistant message.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -461,6 +519,9 @@ pub struct AssistantMessage {
     /// Provider-specific response or message identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+    /// Exact provider-native effort level used for this response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_thinking_level: Option<String>,
     /// Redacted provider and runtime diagnostics.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<Vec<AssistantMessageDiagnostic>>,
@@ -468,9 +529,18 @@ pub struct AssistantMessage {
     pub usage: Usage,
     /// Terminal response reason.
     pub stop_reason: StopReason,
+    /// Provider handle for a response settled asynchronously.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<DeferredHandle>,
     /// Error description for failed or aborted responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Provider-native stop reason retained for diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_stop_reason: Option<String>,
+    /// Provider indication that the model explicitly ended its turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_turn: Option<bool>,
     /// Unix timestamp in milliseconds.
     pub timestamp: i64,
 }
@@ -492,10 +562,14 @@ impl AssistantMessage {
             model: model.into(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
+            end_turn: None,
             timestamp,
         }
     }
@@ -560,13 +634,96 @@ pub enum Message {
     /// User-authored message.
     User(UserMessage),
     /// Provider-produced assistant message.
-    Assistant(AssistantMessage),
+    Assistant(Box<AssistantMessage>),
     /// Tool execution result.
     ToolResult(ToolResultMessage),
 }
 
+/// Strictness requested for JSON-schema constrained sampling.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StrictMode {
+    /// Use strict sampling where the provider and schema allow it, else fall back.
+    Prefer,
+    /// Fail the request when strict sampling is unavailable.
+    Require,
+}
+
+/// Provider-specific grammar encodings of one intended language.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct GrammarVariants {
+    /// Lark grammar for `OpenAI` custom tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_lark: Option<String>,
+    /// Regular-expression grammar for `OpenAI` custom tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_regex: Option<String>,
+}
+
+/// Provider-side constrained sampling requested for one tool.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub enum ConstrainedSamplingConfig {
+    /// JSON-schema constrained sampling (provider `strict` mode).
+    #[serde(rename = "json_schema")]
+    JsonSchema {
+        /// Behavior when strict sampling is unavailable.
+        strict: StrictMode,
+    },
+    /// Grammar constrained sampling through provider custom tools.
+    #[serde(rename = "grammar")]
+    Grammar {
+        /// Provider-specific grammar encodings.
+        variants: GrammarVariants,
+    },
+}
+
+/// A tool's constrained-sampling request, or an explicit opt-out.
+///
+/// [`Self::Disabled`] is the wire literal `false`. It is semantically identical
+/// to the field being absent; it exists so an extension's explicit opt-out
+/// round-trips through the registry snapshot and the pi-messages request body.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConstrainedSampling {
+    /// Explicitly disabled (`false`).
+    Disabled,
+    /// Requested configuration.
+    Config(ConstrainedSamplingConfig),
+}
+
+// `ConstrainedSampling` gets the only hand-written serde in this module,
+// because `#[serde(untagged)]` over a bool variant would also accept `true`.
+impl Serialize for ConstrainedSampling {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Disabled => serializer.serialize_bool(false),
+            Self::Config(config) => config.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConstrainedSampling {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Flag(bool),
+            Config(ConstrainedSamplingConfig),
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Flag(false) => Ok(Self::Disabled),
+            Wire::Flag(true) => Err(de::Error::invalid_value(
+                Unexpected::Bool(true),
+                &"false or a constrained-sampling config",
+            )),
+            Wire::Config(config) => Ok(Self::Config(config)),
+        }
+    }
+}
+
 /// Tool definition made available to a provider.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Tool {
     /// Unique tool name.
     pub name: String,
@@ -574,6 +731,11 @@ pub struct Tool {
     pub description: String,
     /// TypeBox-compatible JSON Schema for tool arguments.
     pub parameters: Value,
+    /// Optional provider-side constrained sampling request.
+    ///
+    /// `false` on the wire disables it explicitly, equivalent to leaving it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained_sampling: Option<ConstrainedSampling>,
 }
 
 /// Complete provider input context.
@@ -845,7 +1007,7 @@ mod tests {
             .is_err()
         );
 
-        let assistant = Message::Assistant(assistant());
+        let assistant = Message::Assistant(Box::new(assistant()));
         let assistant_json = serde_json::to_value(&assistant)?;
         assert_eq!(assistant_json["role"], "assistant");
         assert_eq!(
@@ -1043,6 +1205,93 @@ mod tests {
         })?;
         invalid_done["reason"] = json!("error");
         assert!(serde_json::from_value::<AssistantMessageEvent>(invalid_done).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn constrained_sampling_false_round_trips_as_disabled() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_eq!(
+            serde_json::to_value(ConstrainedSampling::Disabled)?,
+            json!(false)
+        );
+        assert_eq!(
+            serde_json::from_value::<ConstrainedSampling>(json!(false))?,
+            ConstrainedSampling::Disabled
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn constrained_sampling_true_is_rejected() {
+        assert!(serde_json::from_value::<ConstrainedSampling>(json!(true)).is_err());
+    }
+
+    #[test]
+    fn constrained_sampling_config_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let json_schema = ConstrainedSampling::Config(ConstrainedSamplingConfig::JsonSchema {
+            strict: StrictMode::Prefer,
+        });
+        let encoded = serde_json::to_value(&json_schema)?;
+        assert_eq!(encoded, json!({"type": "json_schema", "strict": "prefer"}));
+        assert_eq!(
+            serde_json::from_value::<ConstrainedSampling>(encoded)?,
+            json_schema
+        );
+
+        let grammar = ConstrainedSampling::Config(ConstrainedSamplingConfig::Grammar {
+            variants: GrammarVariants {
+                openai_lark: Some("start: /[a-z]+/".into()),
+                openai_regex: None,
+            },
+        });
+        let encoded = serde_json::to_value(&grammar)?;
+        assert_eq!(
+            encoded,
+            json!({"type": "grammar", "variants": {"openai_lark": "start: /[a-z]+/"}})
+        );
+        assert_eq!(
+            serde_json::from_value::<ConstrainedSampling>(encoded)?,
+            grammar
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tool_omits_constrained_sampling_when_absent_and_uses_camel_case()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tool = Tool {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: json!({"type": "object"}),
+            constrained_sampling: None,
+        };
+        let encoded = serde_json::to_value(&tool)?;
+        assert!(encoded.get("constrainedSampling").is_none());
+        assert_eq!(serde_json::from_value::<Tool>(encoded)?, tool);
+
+        let disabled = Tool {
+            constrained_sampling: Some(ConstrainedSampling::Disabled),
+            ..tool
+        };
+        let encoded = serde_json::to_value(&disabled)?;
+        assert_eq!(encoded["constrainedSampling"], json!(false));
+        assert_eq!(serde_json::from_value::<Tool>(encoded)?, disabled);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_choice_serde_is_lowercase_and_as_str_matches_wire()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(serde_json::to_value(ToolChoice::Auto)?, json!("auto"));
+        assert_eq!(serde_json::to_value(ToolChoice::None)?, json!("none"));
+        assert_eq!(
+            serde_json::from_value::<ToolChoice>(json!("auto"))?,
+            ToolChoice::Auto
+        );
+        assert_eq!(ToolChoice::Auto.as_str(), "auto");
+        assert_eq!(ToolChoice::None.as_str(), "none");
+        assert!(serde_json::from_value::<ToolChoice>(json!("required")).is_err());
         Ok(())
     }
 }

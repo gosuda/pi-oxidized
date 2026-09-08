@@ -9,6 +9,7 @@ use futures::{StreamExt, stream::BoxStream};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
+use crate::constrained_sampling::resolve_json_schema_strict_sampling;
 use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DoneReason,
@@ -123,7 +124,9 @@ async fn run_request(
             StreamFailure::error(format!("No API key for provider: {}", model.provider))
         })?;
 
-    let mut payload = build_payload(model, &context, options);
+    let mut payload = build_payload(model, &context, options)
+        .map_err(|error| StreamFailure::error(error.to_string()))?;
+
     if let Some(callback) = &options.on_payload {
         callback(&mut payload, model)
             .await
@@ -240,7 +243,11 @@ fn should_cache(options: &StreamOptions) -> bool {
         && options.session_id.as_ref().is_some_and(|id| !id.is_empty())
 }
 
-fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> Value {
+fn build_payload(
+    model: &Model,
+    context: &Context,
+    options: &StreamOptions,
+) -> Result<Value, crate::constrained_sampling::ConstrainedSamplingError> {
     let mut id_map = MistralToolIdMap::default();
     let messages = transform_messages(&context.messages, model, |id, _, _| id_map.normalize(id));
     let mut payload = Map::new();
@@ -260,25 +267,24 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
         }
     }
     if let Some(tools) = context.tools.as_ref().filter(|tools| !tools.is_empty()) {
-        payload.insert(
-            "tools".into(),
-            Value::Array(
-                tools
-                    .iter()
-                    .map(|tool| {
-                        json!({
-                            "type": "function",
-                            "function": {
-                                "name": tool.name,
-                                "description": tool.description,
-                                "parameters": tool.parameters,
-                                "strict": false
-                            }
-                        })
-                    })
-                    .collect(),
-            ),
-        );
+        let converted = tools
+            .iter()
+            .map(|tool| {
+                let resolved = resolve_json_schema_strict_sampling(tool, true)?;
+                let strict = resolved.is_some();
+                let parameters = resolved.unwrap_or_else(|| tool.parameters.clone());
+                Ok(json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": parameters,
+                        "strict": strict
+                    }
+                }))
+            })
+            .collect::<Result<Vec<_>, crate::constrained_sampling::ConstrainedSamplingError>>()?;
+        payload.insert("tools".into(), Value::Array(converted));
     }
     if let Some(temperature) = options.temperature.and_then(serde_json::Number::from_f64) {
         payload.insert("temperature".into(), Value::Number(temperature));
@@ -296,7 +302,7 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
             Value::String(options.session_id.clone().unwrap_or_default()),
         );
     }
-    Value::Object(payload)
+    Ok(Value::Object(payload))
 }
 
 fn apply_reasoning_options(
@@ -619,7 +625,9 @@ async fn consume_response(
         StopReason::Length => DoneReason::Length,
         StopReason::ToolUse => DoneReason::ToolUse,
         StopReason::Stop => DoneReason::Stop,
-        StopReason::Error => return Err(StreamFailure::error("An unknown error occurred")),
+        StopReason::Error | StopReason::Pending | StopReason::Deferred => {
+            return Err(StreamFailure::error("An unknown error occurred"));
+        }
         StopReason::Aborted => return Err(StreamFailure::aborted()),
     };
     sender
@@ -1022,9 +1030,15 @@ fn content_block_mut(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
 mod tests {
     use super::*;
-    use crate::types::{ModelCost, Tool, UserMessage};
+    use crate::types::{
+        ConstrainedSampling, ConstrainedSamplingConfig, ModelCost, StrictMode, Tool, UserMessage,
+    };
     use futures::StreamExt;
     use std::collections::BTreeMap;
 
@@ -1085,6 +1099,7 @@ mod tests {
                 name: "read".to_owned(),
                 description: "Read a file".to_owned(),
                 parameters: json!({"type": "object"}),
+                constrained_sampling: None,
             }]),
         };
         let mut options = StreamOptions {
@@ -1094,7 +1109,8 @@ mod tests {
             ..StreamOptions::default()
         };
         options.insert_extra(StreamOptionKey::REASONING, Value::String("high".into()));
-        let payload = build_payload(&model("mistral-small-latest", true), &context, &options);
+        let payload = build_payload(&model("mistral-small-latest", true), &context, &options)
+            .expect("ordinary Mistral payload conversion should succeed");
         assert_eq!(payload["max_tokens"], 123);
         assert_eq!(payload["reasoning_effort"], "high");
         assert!(payload.get("prompt_mode").is_none());
@@ -1105,7 +1121,8 @@ mod tests {
         options.extra.clear();
         options.insert_extra(StreamOptionKey::REASONING, Value::String("high".into()));
         context.tools = None;
-        let payload = build_payload(&model("magistral-medium", true), &context, &options);
+        let payload = build_payload(&model("magistral-medium", true), &context, &options)
+            .expect("ordinary Mistral payload conversion should succeed");
         assert_eq!(payload["prompt_mode"], "reasoning");
         assert!(payload.get("reasoning_effort").is_none());
 
@@ -1118,6 +1135,64 @@ mod tests {
                 .get("x-affinity")
                 .and_then(|value| value.to_str().ok()),
             Some("session-1")
+        );
+    }
+    #[test]
+    fn strict_tools_transform_parameters_and_require_errors() {
+        let strict_tool = Tool {
+            name: "lookup".into(),
+            description: "Lookup".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            constrained_sampling: Some(ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema {
+                    strict: StrictMode::Prefer,
+                },
+            )),
+        };
+        let context = Context {
+            tools: Some(vec![strict_tool]),
+            ..Context::default()
+        };
+        let payload = build_payload(
+            &model("mistral-small-latest", false),
+            &context,
+            &StreamOptions::default(),
+        )
+        .expect("strict Mistral payload should succeed");
+        assert_eq!(payload["tools"][0]["function"]["strict"], true);
+        assert_eq!(
+            payload["tools"][0]["function"]["parameters"]["additionalProperties"],
+            false
+        );
+
+        let required_context = Context {
+            tools: Some(vec![Tool {
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"path": {"$ref": "#/$defs/path"}}
+                }),
+                constrained_sampling: Some(ConstrainedSampling::Config(
+                    ConstrainedSamplingConfig::JsonSchema {
+                        strict: StrictMode::Require,
+                    },
+                )),
+                ..context.tools.as_ref().expect("tool exists")[0].clone()
+            }]),
+            ..Context::default()
+        };
+        let error = build_payload(
+            &model("mistral-small-latest", false),
+            &required_context,
+            &StreamOptions::default(),
+        )
+        .expect_err("unsupported required strict schema must fail");
+        assert_eq!(
+            error.to_string(),
+            "Tool \"lookup\" requires JSON-schema constrained sampling, but $ref schemas are unsupported."
         );
     }
 
@@ -1157,7 +1232,8 @@ mod tests {
             &model("mistral-small-2603", true),
             &Context::default(),
             &reasoning_options("high"),
-        );
+        )
+        .expect("ordinary Mistral payload conversion should succeed");
         assert_eq!(payload["reasoning_effort"], "high");
         assert_eq!(payload.get("prompt_mode"), None);
         // Every other reasoning model gets prompt-mode reasoning instead.
@@ -1165,7 +1241,8 @@ mod tests {
             &model("mistral-large-latest", true),
             &Context::default(),
             &reasoning_options("high"),
-        );
+        )
+        .expect("ordinary Mistral payload conversion should succeed");
         assert_eq!(payload["prompt_mode"], "reasoning");
         assert_eq!(payload.get("reasoning_effort"), None);
         // Off and none levels send neither control.
@@ -1173,7 +1250,8 @@ mod tests {
             &model("mistral-small-2603", true),
             &Context::default(),
             &reasoning_options("off"),
-        );
+        )
+        .expect("ordinary Mistral payload conversion should succeed");
         assert_eq!(payload.get("reasoning_effort"), None);
         assert_eq!(payload.get("prompt_mode"), None);
         // Explicit overrides win over level routing.
@@ -1186,7 +1264,8 @@ mod tests {
             &model("mistral-small-2603", true),
             &Context::default(),
             &options,
-        );
+        )
+        .expect("ordinary Mistral payload conversion should succeed");
         assert_eq!(payload["prompt_mode"], "custom");
         let mut options = StreamOptions::default();
         options.insert_extra(
@@ -1197,7 +1276,8 @@ mod tests {
             &model("mistral-large-latest", true),
             &Context::default(),
             &options,
-        );
+        )
+        .expect("ordinary Mistral payload conversion should succeed");
         assert_eq!(payload["reasoning_effort"], "low");
 
         // Cache key needs a retention and a nonempty session id.
@@ -1210,14 +1290,16 @@ mod tests {
             &model("mistral-large-latest", true),
             &Context::default(),
             &cached,
-        );
+        )
+        .expect("ordinary Mistral payload conversion should succeed");
         assert_eq!(payload["prompt_cache_key"], "session");
         cached.session_id = Some(String::new());
         let payload = build_payload(
             &model("mistral-large-latest", true),
             &Context::default(),
             &cached,
-        );
+        )
+        .expect("ordinary Mistral payload conversion should succeed");
         assert_eq!(payload.get("prompt_cache_key"), None);
     }
 

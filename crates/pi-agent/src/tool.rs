@@ -3,7 +3,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 
 use futures::future::BoxFuture;
-use pi_ai::{TextContent, Tool, ToolResultContent};
+use pi_ai::{ConstrainedSampling, TextContent, Tool, ToolResultContent};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -206,6 +206,14 @@ pub trait AgentTool: Send + Sync {
         None
     }
 
+    /// Provider-side constrained sampling requested for this tool.
+    ///
+    /// `None` leaves the decision to the provider. `Some(ConstrainedSampling::Disabled)`
+    /// is an explicit opt-out that round-trips on the wire.
+    fn constrained_sampling(&self) -> Option<ConstrainedSampling> {
+        None
+    }
+
     /// Optional compatibility shim for raw tool-call arguments before validation.
     ///
     /// # Errors
@@ -266,12 +274,14 @@ pub fn to_pi_tool(tool: &dyn AgentTool) -> Tool {
         name: tool.name().to_owned(),
         description: tool.description().to_owned(),
         parameters: tool.parameters().clone(),
+        constrained_sampling: tool.constrained_sampling(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_ai::{ConstrainedSamplingConfig, StrictMode};
     use serde_json::json;
 
     struct StrictTool {
@@ -280,6 +290,7 @@ mod tests {
         description: String,
         parameters: Value,
         mode: Option<ToolExecutionMode>,
+        constrained_sampling: Option<ConstrainedSampling>,
     }
 
     impl AgentTool for StrictTool {
@@ -301,6 +312,10 @@ mod tests {
 
         fn execution_mode(&self) -> Option<ToolExecutionMode> {
             self.mode
+        }
+
+        fn constrained_sampling(&self) -> Option<ConstrainedSampling> {
+            self.constrained_sampling.clone()
         }
 
         fn prepare_arguments(
@@ -382,6 +397,7 @@ mod tests {
                 "required": ["path"]
             }),
             mode: Some(ToolExecutionMode::Sequential),
+            constrained_sampling: None,
         };
 
         assert_eq!(tool.execution_mode(), Some(ToolExecutionMode::Sequential));
@@ -400,7 +416,47 @@ mod tests {
         assert_eq!(pi_tool.name, "strict");
         assert_eq!(pi_tool.description, "requires path");
         assert_eq!(pi_tool.parameters, tool.parameters);
+        assert_eq!(pi_tool.constrained_sampling, None);
         Ok(())
+    }
+
+    #[test]
+    fn to_pi_tool_forwards_overridden_constrained_sampling() {
+        let tool = StrictTool {
+            name: "grammar".to_owned(),
+            label: "Grammar".to_owned(),
+            description: "grammar tool".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "code": { "type": "string" } },
+                "required": ["code"]
+            }),
+            mode: None,
+            constrained_sampling: Some(ConstrainedSampling::Config(ConstrainedSamplingConfig::JsonSchema {
+                strict: StrictMode::Prefer,
+            })),
+        };
+        let pi_tool = to_pi_tool(&tool);
+        assert_eq!(
+            pi_tool.constrained_sampling,
+            Some(ConstrainedSampling::Config(ConstrainedSamplingConfig::JsonSchema {
+                strict: StrictMode::Prefer,
+            }))
+        );
+    }
+
+    #[test]
+    fn to_pi_tool_forwards_explicit_disabled() {
+        let tool = StrictTool {
+            name: "disabled".to_owned(),
+            label: "Disabled".to_owned(),
+            description: "opts out".to_owned(),
+            parameters: json!({ "type": "object" }),
+            mode: None,
+            constrained_sampling: Some(ConstrainedSampling::Disabled),
+        };
+        let pi_tool = to_pi_tool(&tool);
+        assert_eq!(pi_tool.constrained_sampling, Some(ConstrainedSampling::Disabled));
     }
 
     #[test]

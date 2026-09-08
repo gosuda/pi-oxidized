@@ -288,7 +288,7 @@ mod tests {
                     UserMessageContent::Text("Hello".into()),
                     1,
                 )),
-                Message::Assistant(assistant),
+                Message::Assistant(Box::new(assistant)),
                 Message::User(UserMessage::new(
                     UserMessageContent::Text("continue".into()),
                     3,
@@ -318,6 +318,7 @@ mod tests {
                 name: "bash".into(),
                 description: "run".into(),
                 parameters: serde_json::json!({"type": "object"}),
+                constrained_sampling: None,
             }]),
         };
         let estimate = estimate_context_tokens(&context);

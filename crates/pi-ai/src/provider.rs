@@ -8,13 +8,21 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::types::{AssistantMessageEvent, CacheRetention, Context, Model, Transport};
+use crate::types::{
+    AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DeferredHandle, ErrorReason,
+    Model, StopReason, Transport,
+};
+
+pub(crate) mod deferred;
+
+pub use deferred::{CancelDeferredFn, DeferredCallbacks, FetchDeferredFn};
 
 /// A provider implementation that materializes an assistant response as an
 /// asynchronous stream of events.
@@ -37,6 +45,60 @@ pub trait Provider: Send + Sync {
         context: Context,
         options: StreamOptions,
     ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>>;
+
+    /// Deferred-response callbacks registered by this provider, if any.
+    ///
+    /// Default: `None` — the provider does not support deferred responses.
+    /// Capability is derived from the presence of each callback in the
+    /// returned record; there is no separate flag to keep in sync. The record
+    /// travels inside the provider object, so provider replacement or
+    /// removal drops stale callbacks with it.
+    fn deferred(&self) -> Option<&DeferredCallbacks> {
+        None
+    }
+
+    /// Poll a provider-owned deferred response once without waiting.
+    ///
+    /// This is a single status check (`wait = 0`), never a fresh generation.
+    /// The default dispatches to the registered [`DeferredCallbacks::fetch`]
+    /// callback; when absent, the returned stream terminates with the
+    /// source's unsupported error event
+    /// (`Provider {provider} does not support deferred responses`), matching
+    /// how `lazyStream` surfaces a thrown `ModelsError`.
+    fn fetch_deferred(
+        &self,
+        model: &Model,
+        handle: DeferredHandle,
+        options: StreamOptions,
+    ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+        match self
+            .deferred()
+            .and_then(|callbacks| callbacks.fetch.clone())
+        {
+            Some(fetch) => fetch(model, handle, options),
+            None => deferred::unsupported_fetch_stream(model, None),
+        }
+    }
+
+    /// Best-effort cancellation of a provider-owned deferred response.
+    ///
+    /// The default dispatches to the registered [`DeferredCallbacks::cancel`]
+    /// callback; when absent it fails with the source's unsupported error
+    /// (`Provider {provider} does not support deferred responses`).
+    fn cancel_deferred(
+        &self,
+        model: &Model,
+        handle: DeferredHandle,
+        options: StreamOptions,
+    ) -> BoxFuture<'static, Result<(), ProviderError>> {
+        match self
+            .deferred()
+            .and_then(|callbacks| callbacks.cancel.clone())
+        {
+            Some(cancel) => cancel(model, handle, options),
+            None => deferred::unsupported_cancel_future(model, None),
+        }
+    }
 }
 
 /// An undeliverable stream infrastructure failure.
@@ -163,6 +225,12 @@ impl StreamOptionKey {
     pub const TOOL_CHOICE: Self = Self("toolChoice");
     /// Google snake-case tool-selection fallback.
     pub const TOOL_CHOICE_SNAKE_CASE: Self = Self("tool_choice");
+    /// Deferred fetch long-poll bound in milliseconds (`wait`).
+    ///
+    /// `DeferredFetchOptions.wait` in the TypeScript source. Default `0`
+    /// performs one status check; deferred fetch is always a non-waiting
+    /// poll, never a fresh generation.
+    pub const WAIT: Self = Self("wait");
 
     /// Return the serialized option name.
     #[must_use]
@@ -288,10 +356,54 @@ impl StreamOptions {
     }
 }
 
+/// A stream that terminates with a single provider-level error event.
+///
+/// This mirrors how the TypeScript `lazyStream` surfaces a thrown
+/// `ModelsError`: one `AssistantMessageEvent::Error` carrying a synthetic
+/// error message stamped with the model's provider metadata.
+pub(crate) fn error_event_stream(
+    model: &Model,
+    message: String,
+) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+    let mut error = AssistantMessage::new(
+        model.api.clone(),
+        model.provider.clone(),
+        model.id.clone(),
+        now_millis(),
+    );
+    error.stop_reason = StopReason::Error;
+    error.error_message = Some(message);
+    Box::pin(futures::stream::once(async move {
+        Ok(AssistantMessageEvent::Error {
+            reason: ErrorReason::Error,
+            error,
+        })
+    }))
+}
+
+pub(crate) fn now_millis() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
+#[expect(
+    clippy::panic,
+    reason = "unit tests assert on unexpected dispatch shapes"
+)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
     use super::*;
-    use crate::types::{AssistantMessage, ErrorReason, StopReason};
+    use crate::types::{DoneReason, ModelCost, ModelInput};
     use futures::stream::StreamExt;
 
     /// A provider returning an empty stream is enough to prove trait object
@@ -307,6 +419,100 @@ mod tests {
         ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
             futures::stream::empty().boxed()
         }
+    }
+
+    struct DeferredFixtureProvider {
+        deferred: DeferredCallbacks,
+    }
+
+    impl Provider for DeferredFixtureProvider {
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: Context,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+            futures::stream::empty().boxed()
+        }
+
+        fn deferred(&self) -> Option<&DeferredCallbacks> {
+            Some(&self.deferred)
+        }
+    }
+
+    fn test_model() -> Model {
+        Model {
+            id: "test-model".into(),
+            name: "Test model".into(),
+            api: "custom-api".into(),
+            provider: "custom-provider".into(),
+            base_url: "https://example.test".into(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            context_window: 32_000,
+            max_tokens: 4_096,
+            headers: None,
+            compat: None,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    /// What a registered fetch callback observed about one dispatch.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RecordedFetch {
+        provider: String,
+        handle: String,
+        has_signal: bool,
+        timeout_ms: Option<u64>,
+        has_headers: bool,
+    }
+
+    fn deferred_handle(id: &str) -> DeferredHandle {
+        DeferredHandle {
+            provider: "custom-provider".into(),
+            model_id: "test-model".into(),
+            api: "custom-api".into(),
+            id: id.into(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: None,
+        }
+    }
+
+    fn recording_fetch(calls: Arc<Mutex<Vec<RecordedFetch>>>) -> FetchDeferredFn {
+        Arc::new(
+            move |model: &Model,
+                  handle: DeferredHandle,
+                  options: StreamOptions|
+                  -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+                if let Ok(mut calls) = calls.lock() {
+                    calls.push(RecordedFetch {
+                        provider: model.provider.clone(),
+                        handle: handle.id,
+                        has_signal: options.signal.is_some(),
+                        timeout_ms: options.timeout_ms,
+                        has_headers: options.headers.is_some(),
+                    });
+                }
+                let model = model.clone();
+                futures::stream::once(async move {
+                    let mut message = AssistantMessage::new(
+                        model.api.clone(),
+                        model.provider.clone(),
+                        model.id.clone(),
+                        0,
+                    );
+                    message.stop_reason = StopReason::Stop;
+                    Ok(AssistantMessageEvent::Done {
+                        reason: DoneReason::Stop,
+                        message,
+                    })
+                })
+                .boxed()
+            },
+        )
     }
 
     #[test]
@@ -446,6 +652,7 @@ mod tests {
             (StreamOptionKey::THINKING_ENABLED, "thinkingEnabled"),
             (StreamOptionKey::TOOL_CHOICE, "toolChoice"),
             (StreamOptionKey::TOOL_CHOICE_SNAKE_CASE, "tool_choice"),
+            (StreamOptionKey::WAIT, "wait"),
         ] {
             assert_eq!(key.as_str(), wire_name);
         }
@@ -468,6 +675,107 @@ mod tests {
         assert_eq!(
             options.extra_value(StreamOptionKey::REASONING),
             Some(&Value::String("low".to_owned()))
+        );
+    }
+    #[tokio::test]
+    async fn absent_deferred_callbacks_are_source_unsupported() {
+        let provider = NullProvider;
+        let model = test_model();
+        assert!(provider.deferred().is_none());
+
+        let events = provider
+            .fetch_deferred(
+                &model,
+                deferred_handle("handle-1"),
+                StreamOptions::default(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        match events.as_slice() {
+            [Ok(AssistantMessageEvent::Error { reason, error })] => {
+                assert_eq!(*reason, ErrorReason::Error);
+                assert_eq!(error.stop_reason, StopReason::Error);
+                assert_eq!(error.provider, "custom-provider");
+                assert_eq!(error.api, "custom-api");
+                assert_eq!(
+                    error.error_message.as_deref(),
+                    Some("Provider custom-provider does not support deferred responses")
+                );
+            }
+            other => panic!("expected unsupported error event, got {other:?}"),
+        }
+
+        let error = provider
+            .cancel_deferred(
+                &model,
+                deferred_handle("handle-1"),
+                StreamOptions::default(),
+            )
+            .await
+            .expect_err("absent cancel must fail");
+        assert_eq!(
+            error.message(),
+            "Provider custom-provider does not support deferred responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_fetch_receives_handle_and_request_options() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = DeferredFixtureProvider {
+            deferred: DeferredCallbacks {
+                fetch: Some(recording_fetch(Arc::clone(&calls))),
+                cancel: None,
+            },
+        };
+        let deferred = provider.deferred().expect("fixture registers callbacks");
+        assert!(deferred.supports_fetch());
+        assert!(!deferred.supports_cancel());
+
+        let signal = CancellationToken::new();
+        let mut headers = BTreeMap::new();
+        headers.insert("x-test".to_owned(), Some("value".to_owned()));
+        let options = StreamOptions {
+            signal: Some(signal),
+            timeout_ms: Some(42),
+            headers: Some(headers),
+            ..StreamOptions::default()
+        };
+
+        let events = provider
+            .fetch_deferred(&test_model(), deferred_handle("handle-7"), options)
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(
+            calls.lock().map(|calls| calls.clone()).unwrap_or_default(),
+            vec![RecordedFetch {
+                provider: "custom-provider".to_owned(),
+                handle: "handle-7".to_owned(),
+                has_signal: true,
+                timeout_ms: Some(42),
+                has_headers: true,
+            }]
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(AssistantMessageEvent::Done {
+                reason: DoneReason::Stop,
+                message,
+            })] if message.provider == "custom-provider" && message.api == "custom-api"
+        ));
+
+        let error = provider
+            .cancel_deferred(
+                &test_model(),
+                deferred_handle("handle-7"),
+                StreamOptions::default(),
+            )
+            .await
+            .expect_err("fetch-only registration must not imply cancel");
+        assert_eq!(
+            error.message(),
+            "Provider custom-provider does not support deferred responses"
         );
     }
 }
