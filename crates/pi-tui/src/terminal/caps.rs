@@ -77,7 +77,9 @@ pub struct TerminalCapabilities {
     pub hyperlinks: bool,
     /// Truecolor (24-bit) support.
     pub true_color: bool,
-    /// DEC synchronized output (`CSI ? 2026`).
+    /// DEC synchronized output (`CSI ? 2026`); granted only for terminals
+    /// known to support it. Unknown terminals (ConPTY fallback among them)
+    /// keep unwrapped frames; `PI_TUI_NO_SYNC` forces it off everywhere.
     pub sync_output: bool,
     /// Active keyboard protocol.
     pub keyboard_protocol: KeyboardProtocol,
@@ -93,7 +95,7 @@ impl Default for TerminalCapabilities {
             images: None,
             hyperlinks: false,
             true_color: false,
-            sync_output: true,
+            sync_output: false,
             keyboard_protocol: KeyboardProtocol::Legacy,
             cell: CellDimensions::default(),
             dark_background: None,
@@ -232,14 +234,14 @@ where
     P: Fn() -> bool,
 {
     let mut caps = TerminalCapabilities::default();
-    if env("PI_TUI_NO_SYNC").is_some_and(|value| {
+    // `PI_TUI_NO_SYNC` escape hatch: synchronized output stays off even in a
+    // known-support row below, so the flag must survive the per-row grants.
+    let sync_disabled = env("PI_TUI_NO_SYNC").is_some_and(|value| {
         matches!(
             value.as_str(),
             "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
         )
-    }) {
-        caps.sync_output = false;
-    }
+    });
 
     let term = env("TERM").map(|v| v.to_ascii_lowercase());
     let term_program = env("TERM_PROGRAM").map(|v| v.to_ascii_lowercase());
@@ -251,15 +253,16 @@ where
     // Authority order — first match wins (matches TS `detectCapabilities`).
 
     // 1. tmux: images off (unreliable under multiplexer), hyperlinks only
-    //    when the tmux client forwards them.
+    //    when the tmux client forwards them. tmux implements DEC 2026 (3.2+).
     if has_marker(&env, "TMUX") || term.as_deref().is_some_and(|t| t.starts_with("tmux")) {
         caps.images = None;
         caps.true_color = has_true_color_hint;
         caps.hyperlinks = tmux_forwards_hyperlink();
+        caps.sync_output = !sync_disabled;
         return caps;
     }
 
-    // 2. screen: does not forward OSC 8 hyperlinks.
+    // 2. screen: does not forward OSC 8 hyperlinks and has no DEC 2026 support.
     if term.as_deref().is_some_and(|t| t.starts_with("screen")) {
         caps.images = None;
         caps.true_color = has_true_color_hint;
@@ -272,6 +275,7 @@ where
         caps.images = Some(ImageProtocol::Kitty);
         caps.true_color = true;
         caps.hyperlinks = true;
+        caps.sync_output = !sync_disabled;
         return caps;
     }
 
@@ -283,6 +287,7 @@ where
         caps.images = Some(ImageProtocol::Kitty);
         caps.true_color = true;
         caps.hyperlinks = true;
+        caps.sync_output = !sync_disabled;
         return caps;
     }
 
@@ -291,6 +296,7 @@ where
         caps.images = Some(ImageProtocol::Kitty);
         caps.true_color = true;
         caps.hyperlinks = true;
+        caps.sync_output = !sync_disabled;
         return caps;
     }
 
@@ -302,6 +308,7 @@ where
         caps.images = Some(ImageProtocol::Kitty);
         caps.true_color = true;
         caps.hyperlinks = true;
+        caps.sync_output = !sync_disabled;
         return caps;
     }
 
@@ -310,6 +317,7 @@ where
         caps.images = Some(ImageProtocol::ITerm2);
         caps.true_color = true;
         caps.hyperlinks = true;
+        caps.sync_output = !sync_disabled;
         return caps;
     }
 
@@ -318,6 +326,7 @@ where
         caps.images = None;
         caps.true_color = true;
         caps.hyperlinks = true;
+        caps.sync_output = !sync_disabled;
         return caps;
     }
 
@@ -326,6 +335,7 @@ where
         caps.images = None;
         caps.true_color = true;
         caps.hyperlinks = true;
+        caps.sync_output = !sync_disabled;
         return caps;
     }
 
@@ -334,10 +344,11 @@ where
         caps.images = None;
         caps.true_color = true;
         caps.hyperlinks = true;
+        caps.sync_output = !sync_disabled;
         return caps;
     }
 
-    // 11. JetBrains.
+    // 11. JetBrains. Conservative: JediTerm DEC 2026 support is unverified.
     if terminal_emulator.as_deref() == Some("jetbrains-jediterm") {
         caps.images = None;
         caps.true_color = true;
@@ -347,7 +358,9 @@ where
 
     // 12. Unknown: be conservative. CMUX alone, VTE-only, Apple Terminal,
     //     and 256color TERM do not grant capabilities. Truecolor only from
-    //     the COLORTERM hint.
+    //     the COLORTERM hint. Synchronized output stays off for unknown
+    //     terminals (including bare ConPTY), so DEC 2026 wrappers are never
+    //     emitted where support is unproven.
     caps.images = None;
     caps.true_color = has_true_color_hint;
     caps.hyperlinks = false;
@@ -498,6 +511,7 @@ mod tests {
         assert_eq!(caps.images, None);
         assert!(!caps.hyperlinks);
         assert!(!caps.true_color);
+        assert!(!caps.sync_output);
     }
 
     #[test]
@@ -520,6 +534,15 @@ mod tests {
         assert!(!caps.true_color);
         assert!(!caps.hyperlinks);
         assert_eq!(caps.images, None);
+        assert!(!caps.sync_output);
+    }
+
+    #[test]
+    fn bare_xterm_256color_conpty_fallback_disables_sync_output() {
+        // rel-r3 witness row: bare TERM=xterm-256color with no terminal markers
+        // must not emit DEC 2026 wrappers (ConhostVtDec2026Fallback, section 3.6).
+        let caps = detect_with(env_from(&[("TERM", "xterm-256color")]), || false);
+        assert!(!caps.sync_output);
     }
 
     #[test]
@@ -655,6 +678,7 @@ mod tests {
         );
         assert!(caps.hyperlinks);
         assert_eq!(caps.images, None);
+        assert!(caps.sync_output);
     }
 
     #[test]
@@ -668,6 +692,7 @@ mod tests {
         );
         assert!(!caps.hyperlinks);
         assert_eq!(caps.images, None);
+        assert!(caps.sync_output);
     }
 
     #[test]
@@ -676,8 +701,10 @@ mod tests {
         let caps_true = detect_with(&env, || true);
         assert!(caps_true.hyperlinks);
         assert_eq!(caps_true.images, None);
+        assert!(caps_true.sync_output);
         let caps_false = detect_with(&env, || false);
         assert!(!caps_false.hyperlinks);
+        assert!(caps_false.sync_output);
     }
 
     #[test]
@@ -750,7 +777,7 @@ mod tests {
         let caps = detect_with(env_from(&[("KITTY_WINDOW_ID", "1")]), || false);
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
-        assert!(caps.true_color);
+        assert!(caps.sync_output);
     }
 
     #[test]
@@ -768,6 +795,7 @@ mod tests {
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
         assert!(caps.true_color);
+        assert!(caps.sync_output);
     }
 
     #[test]
@@ -807,6 +835,7 @@ mod tests {
         let caps = detect_with(env_from(&[("WEZTERM_PANE", "0")]), || false);
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
+        assert!(caps.sync_output);
     }
 
     #[test]
@@ -824,6 +853,7 @@ mod tests {
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.true_color);
         assert!(caps.hyperlinks);
+        assert!(caps.sync_output);
     }
 
     #[test]
@@ -856,6 +886,7 @@ mod tests {
         assert_eq!(caps.images, Some(ImageProtocol::ITerm2));
         assert!(caps.hyperlinks);
         assert!(caps.true_color);
+        assert!(caps.sync_output);
     }
 
     #[test]
@@ -876,6 +907,7 @@ mod tests {
         assert!(caps.true_color);
         assert!(caps.hyperlinks);
         assert_eq!(caps.images, None);
+        assert!(caps.sync_output);
     }
 
     // -- Authority row 9: VS Code --
@@ -886,6 +918,7 @@ mod tests {
         assert!(caps.hyperlinks);
         assert!(caps.true_color);
         assert_eq!(caps.images, None);
+        assert!(caps.sync_output);
     }
 
     // -- Authority row 10: Alacritty --
@@ -896,6 +929,7 @@ mod tests {
         assert!(caps.hyperlinks);
         assert!(caps.true_color);
         assert_eq!(caps.images, None);
+        assert!(caps.sync_output);
     }
 
     // -- Authority row 11: JetBrains --
@@ -912,6 +946,7 @@ mod tests {
         assert!(caps.true_color);
         assert!(!caps.hyperlinks);
         assert_eq!(caps.images, None);
+        assert!(!caps.sync_output);
     }
 
     // -- Authority ordering: earlier rows win --
@@ -948,17 +983,26 @@ mod tests {
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
     }
 
-    // -- sync_output behavior unchanged --
+    // -- sync_output: conservative default, knowledge-driven grants --
 
     #[test]
-    fn default_sync_output_is_enabled() {
+    fn default_sync_output_is_conservative() {
         let caps = TerminalCapabilities::default();
-        assert!(caps.sync_output);
+        assert!(!caps.sync_output);
     }
 
     #[test]
     fn pi_tui_no_sync_disables_sync_output() {
         let caps = detect_with(env_from(&[("PI_TUI_NO_SYNC", "1")]), || false);
+        assert!(!caps.sync_output);
+    }
+
+    #[test]
+    fn pi_tui_no_sync_overrides_known_support_row() {
+        let caps = detect_with(
+            env_from(&[("KITTY_WINDOW_ID", "1"), ("PI_TUI_NO_SYNC", "1")]),
+            || false,
+        );
         assert!(!caps.sync_output);
     }
 
