@@ -644,7 +644,7 @@ mod tests {
             assistant.stop_reason = pi_ai::StopReason::Stop;
             manager
                 .append_message(&pi_agent::AgentMessage::Llm(Box::new(
-                    pi_ai::Message::Assistant(assistant),
+                    pi_ai::Message::Assistant(Box::new(assistant)),
                 )))
                 .map_err(|error| context(error, "seed assistant append"))?;
             let session_file = std::path::PathBuf::from(

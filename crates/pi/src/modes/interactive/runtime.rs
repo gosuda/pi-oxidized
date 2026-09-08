@@ -6327,14 +6327,14 @@ fn project_assistant_message(
     if finished {
         view.messages
             .push(MessageView::Assistant(AssistantMessageView {
-                message: assistant_message.clone(),
+                message: (**assistant_message).clone(),
                 hide_thinking: false,
                 hidden_thinking_label: String::new(),
                 streaming: false,
             }));
     } else {
         view.messages
-            .push(MessageView::streaming_assistant(assistant_message.clone()));
+            .push(MessageView::streaming_assistant((**assistant_message).clone()));
     }
 }
 
@@ -6695,7 +6695,7 @@ fn message_view_from_agent(message: &pi_agent::AgentMessage) -> Option<MessageVi
             }
             pi_ai::Message::Assistant(am) => Some(MessageView::Assistant(
                 super::messages::AssistantMessageView {
-                    message: am.clone(),
+                    message: (**am).clone(),
                     hide_thinking: false,
                     hidden_thinking_label: String::new(),
                     streaming: false,

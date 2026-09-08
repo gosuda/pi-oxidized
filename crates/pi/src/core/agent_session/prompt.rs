@@ -1337,9 +1337,9 @@ mod tests {
         manager
             .append_message(&pi_agent::user_text("hi", std::iter::empty()))
             .test_context("append user")?;
-        let assistant = AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(assistant_text(
+        let assistant = AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(Box::new(assistant_text(
             "answer",
-        ))));
+        )))));
         manager
             .append_message(&assistant)
             .test_context("append assistant")?;
@@ -1421,7 +1421,7 @@ mod tests {
             .test_context("append existing user")?;
         manager
             .append_message(&AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(
-                assistant_text("existing answer"),
+                Box::new(assistant_text("existing answer")),
             ))))
             .test_context("append existing assistant")?;
         let before_count = manager.get_entries().len();
@@ -1896,7 +1896,7 @@ mod tests {
         // file so the directory blocker makes every later append fail.
         manager
             .append_message(&AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(
-                assistant_text("seed answer"),
+                Box::new(assistant_text("seed answer")),
             ))))
             .test_context("seed assistant append")?;
         let session_file = std::path::PathBuf::from(

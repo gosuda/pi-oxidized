@@ -215,14 +215,14 @@ mod tests {
                 .push(AssistantContent::Text(TextContent::new(text)));
         }
         msg.stop_reason = reason;
-        AgentMessage::Llm(Box::new(Message::Assistant(msg)))
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(msg))))
     }
 
     fn assistant_error(message: &str) -> AgentMessage {
         let mut msg = AssistantMessage::new("api", "provider", "model", 2);
         msg.stop_reason = StopReason::Error;
         msg.error_message = Some(message.to_owned());
-        AgentMessage::Llm(Box::new(Message::Assistant(msg)))
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(msg))))
     }
 
     #[tokio::test]
@@ -263,7 +263,7 @@ mod tests {
     async fn text_aborted_without_error_message_uses_request_prefix() -> TestResult {
         let mut msg = AssistantMessage::new("api", "provider", "model", 2);
         msg.stop_reason = StopReason::Aborted;
-        let message = AgentMessage::Llm(Box::new(Message::Assistant(msg)));
+        let message = AgentMessage::Llm(Box::new(Message::Assistant(Box::new(msg))));
         let events = vec![AgentSessionEvent::AgentEnd {
             messages: vec![message],
             will_retry: false,
@@ -287,7 +287,7 @@ mod tests {
         let final_msg = assistant_with("Hello", StopReason::Stop);
         let events = vec![
             AgentSessionEvent::MessageStart {
-                message: AgentMessage::Llm(Box::new(Message::Assistant(partial))),
+                message: AgentMessage::Llm(Box::new(Message::Assistant(Box::new(partial)))),
             },
             AgentSessionEvent::MessageEnd {
                 message: final_msg.clone(),

@@ -1440,7 +1440,7 @@ mod tests {
         msg.content = vec![AssistantContent::Text(TextContent::new(text))];
         msg.usage = usage;
         msg.stop_reason = stop;
-        pi_agent::AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(msg)))
+        pi_agent::AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(Box::new(msg))))
     }
 
     fn assistant_overflow_message() -> AssistantMessage {
@@ -2094,7 +2094,7 @@ mod tests {
         let session = session_with_history(8_192, summary_stream_fn("overflow recovery")).await?;
         let overflow_assistant = assistant_overflow_message();
         let overflow_msg = pi_agent::AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(
-            overflow_assistant.clone(),
+            Box::new(overflow_assistant.clone()),
         )));
         session.agent.push_message(overflow_msg.clone());
         {
@@ -2815,7 +2815,7 @@ mod tests {
                 ))));
             assistant.stop_reason = StopReason::Stop;
             messages.push(pi_agent::AgentMessage::Llm(Box::new(
-                pi_ai::Message::Assistant(assistant),
+                pi_ai::Message::Assistant(Box::new(assistant)),
             )));
         }
         config.messages = messages;

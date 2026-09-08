@@ -798,7 +798,7 @@ mod tests {
                 pi_ai::UserMessage::new(pi_ai::UserMessageContent::Text("hello".into()), 0),
             ))))?;
             sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                assistant_with_usage("hi back", Usage::default()),
+                Box::new(assistant_with_usage("hi back", Usage::default())),
             ))))?;
             sm.append_message(&AgentMessage::Llm(Box::new(Message::User(
                 pi_ai::UserMessage::new(pi_ai::UserMessageContent::Text("second".into()), 1),
@@ -825,10 +825,10 @@ mod tests {
 
         session
             .agent
-            .push_message(AgentMessage::Llm(Box::new(Message::Assistant(aborted))));
+            .push_message(AgentMessage::Llm(Box::new(Message::Assistant(Box::new(aborted)))));
         session
             .agent
-            .push_message(AgentMessage::Llm(Box::new(Message::Assistant(good))));
+            .push_message(AgentMessage::Llm(Box::new(Message::Assistant(Box::new(good)))));
 
         let text = session.get_last_assistant_text();
         assert_eq!(text.as_deref(), Some("real text"));
@@ -842,7 +842,7 @@ mod tests {
         aborted.stop_reason = pi_ai::StopReason::Aborted;
         session
             .agent
-            .push_message(AgentMessage::Llm(Box::new(Message::Assistant(aborted))));
+            .push_message(AgentMessage::Llm(Box::new(Message::Assistant(Box::new(aborted)))));
         let text = session.get_last_assistant_text();
         assert_eq!(text, None);
         Ok(())
@@ -924,7 +924,7 @@ mod tests {
         {
             let mut sm = session.session_manager.lock().await;
             sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                assistant_with_usage("reply", Usage::default()),
+                Box::new(assistant_with_usage("reply", Usage::default())),
             ))))?;
         }
         let result = session
@@ -953,10 +953,10 @@ mod tests {
         let (id1, _id2) = {
             let mut sm = session.session_manager.lock().await;
             let a = sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                assistant_with_usage("first", Usage::default()),
+                Box::new(assistant_with_usage("first", Usage::default())),
             ))))?;
             let b = sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                assistant_with_usage("second", Usage::default()),
+                Box::new(assistant_with_usage("second", Usage::default())),
             ))))?;
             (a, b)
         };
@@ -983,7 +983,7 @@ mod tests {
         let id = {
             let mut sm = session.session_manager.lock().await;
             sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                assistant_with_usage("hi", Usage::default()),
+                Box::new(assistant_with_usage("hi", Usage::default())),
             ))))?
         };
         session
@@ -1011,13 +1011,13 @@ mod tests {
         let target = {
             let mut sm = session.session_manager.lock().await;
             sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                assistant_with_usage("first", Usage::default()),
+                Box::new(assistant_with_usage("first", Usage::default())),
             ))))?
         };
         {
             let mut sm = session.session_manager.lock().await;
             sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                assistant_with_usage("second", Usage::default()),
+                Box::new(assistant_with_usage("second", Usage::default())),
             ))))?;
         }
         let mut empty_model = test_model();
@@ -1044,10 +1044,10 @@ mod tests {
         let target = {
             let mut manager = session.session_manager.lock().await;
             let target = manager.append_message(&AgentMessage::Llm(Box::new(
-                Message::Assistant(assistant_with_usage("first", Usage::default())),
+                Message::Assistant(Box::new(assistant_with_usage("first", Usage::default()))),
             )))?;
             manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                assistant_with_usage("second", Usage::default()),
+                Box::new(assistant_with_usage("second", Usage::default())),
             ))))?;
             target
         };
@@ -1198,7 +1198,7 @@ mod tests {
                 serde_json::Map::new(),
             )));
         assistant.stop_reason = pi_ai::StopReason::Stop;
-        sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(assistant))))?;
+        sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(assistant)))))?;
         Ok(())
     }
 
@@ -1409,10 +1409,10 @@ mod tests {
         let target = {
             let mut manager = session.session_manager.lock().await;
             let target = manager.append_message(&AgentMessage::Llm(Box::new(
-                Message::Assistant(assistant_with_usage("first", Usage::default())),
+                Message::Assistant(Box::new(assistant_with_usage("first", Usage::default()))),
             )))?;
             manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                assistant_with_usage("second", Usage::default()),
+                Box::new(assistant_with_usage("second", Usage::default())),
             ))))?;
             target
         };
@@ -1554,10 +1554,10 @@ mod tests {
         let target = {
             let mut manager = session.session_manager.lock().await;
             let target = manager.append_message(&AgentMessage::Llm(Box::new(
-                Message::Assistant(assistant_with_usage("first", Usage::default())),
+                Message::Assistant(Box::new(assistant_with_usage("first", Usage::default()))),
             )))?;
             manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                assistant_with_usage("second", Usage::default()),
+                Box::new(assistant_with_usage("second", Usage::default())),
             ))))?;
             target
         };
@@ -1646,10 +1646,10 @@ mod tests {
         let target = {
             let mut manager = session.session_manager.lock().await;
             let target = manager.append_message(&AgentMessage::Llm(Box::new(
-                Message::Assistant(assistant_with_usage("first", Usage::default())),
+                Message::Assistant(Box::new(assistant_with_usage("first", Usage::default()))),
             )))?;
             manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                assistant_with_usage("second", Usage::default()),
+                Box::new(assistant_with_usage("second", Usage::default())),
             ))))?;
             target
         };

@@ -578,7 +578,7 @@ async fn fork_at_clones_branch_and_returns_no_selected_text() -> TestResult {
         let sm = session.session_manager();
         let mut sm = sm.lock().await;
         sm.append_message(&pi_agent::AgentMessage::Llm(Box::new(
-            pi_ai::Message::Assistant({
+            pi_ai::Message::Assistant(Box::new({
                 let mut a = pi_ai::AssistantMessage::new(
                     "test-api",
                     "test-provider",
@@ -587,7 +587,7 @@ async fn fork_at_clones_branch_and_returns_no_selected_text() -> TestResult {
                 );
                 a.stop_reason = pi_ai::StopReason::Stop;
                 a
-            }),
+            })),
         )))?
     };
     let outcome = runtime.fork(&entry_id, ForkPosition::At).await?;
@@ -624,7 +624,7 @@ async fn fork_before_non_user_entry_errors() -> TestResult {
         let sm = session.session_manager();
         let mut sm = sm.lock().await;
         sm.append_message(&pi_agent::AgentMessage::Llm(Box::new(
-            pi_ai::Message::Assistant({
+            pi_ai::Message::Assistant(Box::new({
                 let mut a = pi_ai::AssistantMessage::new(
                     "test-api",
                     "test-provider",
@@ -633,7 +633,7 @@ async fn fork_before_non_user_entry_errors() -> TestResult {
                 );
                 a.stop_reason = pi_ai::StopReason::Stop;
                 a
-            }),
+            })),
         )))?
     };
     let Err(err) = runtime.fork(&entry_id, ForkPosition::Before).await else {
@@ -1502,7 +1502,7 @@ async fn fork_passes_fork_reason_and_emits_typed_shutdown() -> TestResult {
         let sm = session.session_manager();
         let mut sm = sm.lock().await;
         sm.append_message(&pi_agent::AgentMessage::Llm(Box::new(
-            pi_ai::Message::Assistant({
+            pi_ai::Message::Assistant(Box::new({
                 let mut a = pi_ai::AssistantMessage::new(
                     "test-api",
                     "test-provider",
@@ -1511,7 +1511,7 @@ async fn fork_passes_fork_reason_and_emits_typed_shutdown() -> TestResult {
                 );
                 a.stop_reason = pi_ai::StopReason::Stop;
                 a
-            }),
+            })),
         )))?
     };
     runtime.fork(&entry_id, ForkPosition::At).await?;
@@ -1819,7 +1819,7 @@ async fn replacement_preparations_snapshot_live_extension_flags() -> TestResult 
         let sm = session.session_manager();
         let mut sm = sm.lock().await;
         sm.append_message(&pi_agent::AgentMessage::Llm(Box::new(
-            pi_ai::Message::Assistant({
+            pi_ai::Message::Assistant(Box::new({
                 let mut a = pi_ai::AssistantMessage::new(
                     "test-api",
                     "test-provider",
@@ -1828,7 +1828,7 @@ async fn replacement_preparations_snapshot_live_extension_flags() -> TestResult 
                 );
                 a.stop_reason = pi_ai::StopReason::Stop;
                 a
-            }),
+            })),
         )))?
     };
     runner.set_flag("mode", serde_json::Value::String("live3".to_owned()));
