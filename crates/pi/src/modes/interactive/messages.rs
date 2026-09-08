@@ -41,7 +41,7 @@ pub enum MessageView {
     /// User-authored message.
     User(UserMessageView),
     /// Assistant message (text + thinking + stop-reason errors).
-    Assistant(AssistantMessageView),
+    Assistant(Box<AssistantMessageView>),
     /// Tool execution block.
     Tool(ToolMessageView),
     /// Bash execution (`!`/`!!`) block.
@@ -144,12 +144,12 @@ impl MessageView {
     /// Build a streaming assistant tail view-model.
     #[must_use]
     pub fn streaming_assistant(message: AssistantMessage) -> Self {
-        Self::Assistant(AssistantMessageView {
+        Self::Assistant(Box::new(AssistantMessageView {
             message,
             hide_thinking: false,
             hidden_thinking_label: "Thinking…".to_owned(),
             streaming: true,
-        })
+        }))
     }
 }
 

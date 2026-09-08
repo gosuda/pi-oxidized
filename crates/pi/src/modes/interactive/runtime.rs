@@ -6326,12 +6326,12 @@ fn project_assistant_message(
 
     if finished {
         view.messages
-            .push(MessageView::Assistant(AssistantMessageView {
+            .push(MessageView::Assistant(Box::new(AssistantMessageView {
                 message: (**assistant_message).clone(),
                 hide_thinking: false,
                 hidden_thinking_label: String::new(),
                 streaming: false,
-            }));
+            })));
     } else {
         view.messages
             .push(MessageView::streaming_assistant((**assistant_message).clone()));
@@ -6693,14 +6693,14 @@ fn message_view_from_agent(message: &pi_agent::AgentMessage) -> Option<MessageVi
                     text: user_message_text(user),
                 }))
             }
-            pi_ai::Message::Assistant(am) => Some(MessageView::Assistant(
+            pi_ai::Message::Assistant(am) => Some(MessageView::Assistant(Box::new(
                 super::messages::AssistantMessageView {
                     message: (**am).clone(),
                     hide_thinking: false,
                     hidden_thinking_label: String::new(),
                     streaming: false,
                 },
-            )),
+            ))),
             pi_ai::Message::ToolResult(_) => None,
         },
         pi_agent::AgentMessage::Custom(custom) => Some(message_view_from_custom(custom)),
@@ -11026,7 +11026,7 @@ mod tests {
         let (mut rt, _log) = make_runtime();
         rt.view
             .messages
-            .push(MessageView::Assistant(AssistantMessageView {
+            .push(MessageView::Assistant(Box::new(AssistantMessageView {
                 message: AssistantMessage::new(
                     "test-api",
                     "test-provider",
@@ -11036,7 +11036,7 @@ mod tests {
                 hide_thinking: false,
                 hidden_thinking_label: "Thinking hidden".to_owned(),
                 streaming: false,
-            }));
+            })));
         project_event(
             &mut rt.view,
             &AgentSessionEvent::ToolExecutionStart {
@@ -12674,12 +12674,12 @@ mod tests {
             .push(AssistantContent::Text(TextContent::new("hi")));
         rt.view
             .messages
-            .push(MessageView::Assistant(AssistantMessageView {
+            .push(MessageView::Assistant(Box::new(AssistantMessageView {
                 message,
                 hide_thinking: true,
                 hidden_thinking_label: "Custom label".to_owned(),
                 streaming: false,
-            }));
+            })));
 
         let outcome = rt.dispatch_action(ViewAction::Reload).await;
 

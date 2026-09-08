@@ -163,12 +163,12 @@ fn error_state_snapshot() {
     msg.error_message = Some("provider returned 500".to_owned());
     state
         .messages
-        .push(StateMessageView::Assistant(AssistantMessageView {
+        .push(StateMessageView::Assistant(Box::new(AssistantMessageView {
             message: msg,
             hide_thinking: false,
             hidden_thinking_label: "Thinking…".to_owned(),
             streaming: false,
-        }));
+        })));
     insta::assert_snapshot!("error_state_widths", triple_plain(&state));
 }
 
@@ -344,12 +344,12 @@ fn shared_left_edge_at_column_two() {
     }));
     state
         .messages
-        .push(StateMessageView::Assistant(AssistantMessageView {
+        .push(StateMessageView::Assistant(Box::new(AssistantMessageView {
             message: assistant_text("assistant prose"),
             hide_thinking: false,
             hidden_thinking_label: "Thinking…".to_owned(),
             streaming: false,
-        }));
+        })));
     state.pending = PendingQueue {
         steering: vec![PendingMessage {
             kind: PendingKind::Steering,
@@ -393,7 +393,7 @@ fn user_and_assistant_messages_snapshot() {
     }));
     state
         .messages
-        .push(StateMessageView::Assistant(AssistantMessageView {
+        .push(StateMessageView::Assistant(Box::new(AssistantMessageView {
             message: assistant_with_thinking(
                 "Let me consider the structure.",
                 "Here is the explanation:\n\n- point one\n- point two",
@@ -401,7 +401,7 @@ fn user_and_assistant_messages_snapshot() {
             hide_thinking: false,
             hidden_thinking_label: "Thinking…".to_owned(),
             streaming: false,
-        }));
+        })));
     insta::assert_snapshot!("user_assistant_messages", triple_plain(&state));
 }
 
@@ -410,12 +410,12 @@ fn hidden_thinking_renders_label() {
     let mut state = base_state();
     state
         .messages
-        .push(StateMessageView::Assistant(AssistantMessageView {
+        .push(StateMessageView::Assistant(Box::new(AssistantMessageView {
             message: assistant_with_thinking("hidden reasoning", "visible answer"),
             hide_thinking: true,
             hidden_thinking_label: "Thinking…".to_owned(),
             streaming: false,
-        }));
+        })));
     let buf = render_view(&state, 80, 40);
     let plain = snapshot_buffer_plain(&buf, 80, 40).join("\n");
     assert!(
@@ -459,12 +459,12 @@ fn length_stop_reason_renders_error() {
     msg.stop_reason = StopReason::Length;
     state
         .messages
-        .push(StateMessageView::Assistant(AssistantMessageView {
+        .push(StateMessageView::Assistant(Box::new(AssistantMessageView {
             message: msg,
             hide_thinking: false,
             hidden_thinking_label: "Thinking…".to_owned(),
             streaming: false,
-        }));
+        })));
     let buf = render_view(&state, 80, 30);
     let plain = snapshot_buffer_plain(&buf, 80, 30).join("\n");
     assert!(
