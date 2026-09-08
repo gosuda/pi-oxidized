@@ -3,3 +3,5 @@ node_modules/
 packages/extension-host/dist/
 .outline/
 scripts/verification/fixtures/execution-map/.staging/
+dist/
+/clone_ref
