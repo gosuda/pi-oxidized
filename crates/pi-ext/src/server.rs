@@ -563,6 +563,12 @@ pub struct ProviderDeferredCall {
 
 impl ProviderDeferredCall {
     /// Await host-side payload mutation for this deferred call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtensionFault`] when no `beforePayload` callback is
+    /// advertised, when the payload fails to encode, or when the host
+    /// answers with an error or the request times out.
     pub async fn before_payload(&self, payload: &mut Value) -> Result<(), ExtensionFault> {
         let callbacks = self.callback_context.as_ref().ok_or_else(|| {
             ExtensionFault::new(
@@ -574,6 +580,12 @@ impl ProviderDeferredCall {
     }
 
     /// Await host-side response metadata acknowledgement for this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtensionFault`] when no `onResponse` callback is
+    /// advertised, when the request fails to encode, or when the host
+    /// answers with an error or the request times out.
     pub async fn on_response(&self, response: &ProviderResponse) -> Result<(), ExtensionFault> {
         let callbacks = self.callback_context.as_ref().ok_or_else(|| {
             ExtensionFault::new(
@@ -721,7 +733,7 @@ impl ProviderCallbackRouter {
                 }
             }
         }
-        let response = tokio::time::timeout(deadline, async {
+        tokio::time::timeout(deadline, async {
             tokio::select! {
                 biased;
                 () = self.closed.cancelled() => Err(ExtensionFault::new("endpoint_closed", "provider callback endpoint closed")),
@@ -730,8 +742,7 @@ impl ProviderCallbackRouter {
             }
         })
         .await
-        .map_err(|_| ExtensionFault::new("timeout", "provider callback timed out"))?;
-        response
+        .map_err(|_| ExtensionFault::new("timeout", "provider callback timed out"))?
     }
 }
 
@@ -759,6 +770,12 @@ pub struct ProviderCallbackContext {
 
 impl ProviderCallbackContext {
     /// Await host-side payload mutation for the originating provider call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtensionFault`] when the payload fails to encode, when the
+    /// host answers with an error, or when the request times out or the
+    /// endpoint closes.
     pub async fn before_payload(&self, payload: &mut Value) -> Result<(), ExtensionFault> {
         let request = ProviderBeforePayloadRequest {
             call_id: self.origin_id.to_string(),
@@ -782,6 +799,12 @@ impl ProviderCallbackContext {
         Ok(())
     }
     /// Await host-side response acknowledgement for the originating call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtensionFault`] when the request fails to encode, when the
+    /// host answers with an error, or when the request times out or the
+    /// endpoint closes.
     pub async fn on_response(&self, response: &ProviderResponse) -> Result<(), ExtensionFault> {
         let request = ProviderOnResponseRequest {
             call_id: self.origin_id.to_string(),
@@ -866,6 +889,12 @@ impl ProviderEventSink {
         }
     }
     /// Await host-side mutation of the payload for this provider call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtensionFault`] when no `beforePayload` callback is
+    /// advertised, when the payload fails to encode, or when the host
+    /// answers with an error or the request times out.
     pub async fn before_payload(&self, payload: &mut Value) -> Result<(), ExtensionFault> {
         let callbacks = self.callbacks.as_ref().ok_or_else(|| {
             ExtensionFault::new(
@@ -877,6 +906,12 @@ impl ProviderEventSink {
     }
 
     /// Await host-side acknowledgement of response metadata for this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtensionFault`] when no `onResponse` callback is
+    /// advertised, when the request fails to encode, or when the host
+    /// answers with an error or the request times out.
     pub async fn on_response(&self, response: &ProviderResponse) -> Result<(), ExtensionFault> {
         let callbacks = self.callbacks.as_ref().ok_or_else(|| {
             ExtensionFault::new(
@@ -2897,6 +2932,7 @@ async fn execute_tool_request<E: NativeExtension>(
 /// Run one provider stream or deferred fetch call: forward correlated
 /// `providerEvent` frames while the operation is active, honor
 /// `provider.cancel`, then send the terminal frame.
+#[allow(clippy::too_many_lines, reason = "provider request setup decodes flags, stream, and deferred shapes inline")]
 async fn execute_provider_request<E: NativeExtension>(
     runtime: &ServerRuntime<E>,
     id: FrameId,
@@ -2964,7 +3000,7 @@ async fn execute_provider_request<E: NativeExtension>(
     let callback_context =
         provider_callback_context(runtime, id, callback_flags, token.clone());
     if let Some(call) = deferred_call.as_mut() {
-        call.callback_context = callback_context.clone();
+        call.callback_context.clone_from(&callback_context);
     }
     let (event_tx, mut event_rx) = mpsc::channel::<OutboundFrame>(runtime.update_capacity.max(1));
     let (done_tx, mut done_rx) = oneshot::channel::<()>();
@@ -6840,6 +6876,7 @@ mod tests {
             tx,
             cancel: CancellationToken::new(),
             invalid: Arc::clone(&invalid),
+            callbacks: None,
         };
         assert!(sink.send(demo_event("queued")).await);
         assert!(!invalid.load(AtomicOrdering::SeqCst));
