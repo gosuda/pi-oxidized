@@ -171,7 +171,8 @@ impl RoutedServerServiceAttachment for ProviderAttachment {
 ///
 /// Subscription ids are converted from canonical UTF-16 to a Rust `String` at
 /// this boundary.  An invalid id is reported as a local `ServiceError`; the
-/// endpoint schedules the publisher future and ignores delivery errors.
+/// endpoint publishes updates through one ordered worker per subscription and
+/// terminates a subscription whose delivery fails.
 fn adapt_publisher(publish: PublishUpdate) -> ServiceUpdatePublisher {
     Arc::new(move |subscription_id: JsString, update, context| {
         let id = match subscription_id.try_to_utf8() {
