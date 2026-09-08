@@ -5887,6 +5887,13 @@
 			]
 		},
 		{
+			"from": "pi-agent",
+			"to": "uuid",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
 			"from": "pi-ai",
 			"to": "aws-config",
 			"kinds": [
