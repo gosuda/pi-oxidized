@@ -52,8 +52,7 @@ pub enum AssistantMessageFrame {
         #[serde(rename = "contentIndex")]
         content_index: u64,
         /// Block as observed when it opened, including text the provider had
-        /// already produced. Later delta frames carry only what this snapshot
-        /// does not already cover.
+        /// already produced. Later delta frames append newly emitted text.
         content: TextContent,
     },
     /// Appends text to a text content block.
@@ -63,9 +62,7 @@ pub enum AssistantMessageFrame {
         /// that block's start frame.
         #[serde(rename = "contentIndex")]
         content_index: u64,
-        /// Text to append. Offsets are counted in UTF-16 units to match the
-        /// TypeScript runtime, and any leading portion already covered by an
-        /// earlier snapshot is stripped before the frame is emitted.
+        /// Newly emitted text to append to the block.
         delta: String,
     },
     /// Completes a text content block.
@@ -93,7 +90,7 @@ pub enum AssistantMessageFrame {
         content_index: u64,
         /// Reasoning block as observed when it opened, including thinking text
         /// already produced and any signature or redaction marker attached to
-        /// it. Later delta frames carry only the uncovered remainder.
+        /// it. Later delta frames append newly emitted reasoning text.
         content: ThinkingContent,
     },
     /// Appends text to a thinking content block.
@@ -103,8 +100,7 @@ pub enum AssistantMessageFrame {
         /// claimed by that block's start frame.
         #[serde(rename = "contentIndex")]
         content_index: u64,
-        /// Reasoning text to append, with any leading portion already covered
-        /// by an earlier snapshot stripped and offsets counted in UTF-16 units.
+        /// Newly emitted reasoning text to append to the block.
         delta: String,
     },
     /// Completes a thinking content block.
@@ -217,18 +213,8 @@ impl AssistantMessageFrameError {
 
 #[derive(Clone, Debug)]
 enum EncoderBlockState {
-    Text {
-        /// Number of UTF-16 code units already present at text-start.
-        covered_chars: usize,
-        /// Number of UTF-16 code units accounted for in emitted deltas.
-        delta_chars: usize,
-    },
-    Thinking {
-        /// Number of UTF-16 code units already present at thinking-start.
-        covered_chars: usize,
-        /// Number of UTF-16 code units accounted for in emitted deltas.
-        delta_chars: usize,
-    },
+    Text,
+    Thinking,
     ToolCall {
         caught_up: bool,
         catchup_json: String,
@@ -238,15 +224,17 @@ enum EncoderBlockState {
 
 /// Encodes one assistant event stream into compact replay frames.
 ///
-/// The provider's `partial` message remains a shared live accumulator. The
-/// encoder keeps per-block offsets so an event already visible in an older
-/// queued snapshot is not emitted a second time. `done` and `error` mark the
-/// stream terminally and produce no frame.
+/// The provider's `partial` message remains a shared live accumulator.
+/// Text and thinking deltas carry only the newly emitted content, while
+/// tool-call deltas may be folded against an earlier snapshot until they
+/// catch up. `done` and `error` mark the stream terminally and produce no
+/// frame.
 #[derive(Clone, Debug, Default)]
 pub struct AssistantMessageFrameEncoder {
     started: bool,
     terminal: bool,
     blocks: HashMap<u64, EncoderBlockState>,
+    next_content_index: u64,
 }
 
 impl AssistantMessageFrameEncoder {
@@ -258,8 +246,9 @@ impl AssistantMessageFrameEncoder {
 
     /// Encodes one event, accepting either an owned event or a borrowed event.
     ///
-    /// `Ok(None)` is returned for terminal events and for deltas covered by a
-    /// previously observed snapshot. Terminal events are never persisted as
+    /// `Ok(None)` is returned for terminal events and for deltas that do not
+    /// produce a frame (empty text/thinking deltas, or tool-call deltas already
+    /// subsumed by an earlier snapshot). Terminal events are never persisted as
     /// frames.
     ///
     /// # Errors
@@ -383,13 +372,7 @@ impl AssistantMessageFrameEncoder {
                 content_kind(block)
             )));
         };
-        self.start_block(
-            content_index,
-            EncoderBlockState::Text {
-                covered_chars: utf16_len(&content.text),
-                delta_chars: 0,
-            },
-        )?;
+        self.start_block(content_index, EncoderBlockState::Text)?;
         Ok(Some(AssistantMessageFrame::TextStart {
             content_index,
             content: content.clone(),
@@ -429,13 +412,7 @@ impl AssistantMessageFrameEncoder {
                 content_kind(block)
             )));
         };
-        self.start_block(
-            content_index,
-            EncoderBlockState::Thinking {
-                covered_chars: utf16_len(&content.thinking),
-                delta_chars: 0,
-            },
-        )?;
+        self.start_block(content_index, EncoderBlockState::Thinking)?;
         Ok(Some(AssistantMessageFrame::ThinkingStart {
             content_index,
             content: content.clone(),
@@ -532,7 +509,14 @@ impl AssistantMessageFrameEncoder {
                 "Assistant message block {content_index} starts more than once"
             )));
         }
+        if content_index != self.next_content_index {
+            return Err(frame_error(format!(
+                "Cannot start assistant message block at index {content_index}: expected {}",
+                self.next_content_index
+            )));
+        }
         self.blocks.insert(content_index, state);
+        self.next_content_index += 1;
         Ok(())
     }
 
@@ -576,37 +560,18 @@ impl AssistantMessageFrameEncoder {
         delta: &str,
         kind: TextBlockKind,
     ) -> Result<Option<AssistantMessageFrame>, AssistantMessageFrameError> {
-        let state = self.block(content_index, kind.encoder_kind())?;
-        let (covered_chars, delta_chars) = match state {
-            EncoderBlockState::Text {
-                covered_chars,
-                delta_chars,
-            } if kind == TextBlockKind::Text => (covered_chars, delta_chars),
-            EncoderBlockState::Thinking {
-                covered_chars,
-                delta_chars,
-            } if kind == TextBlockKind::Thinking => (covered_chars, delta_chars),
-            EncoderBlockState::Text { .. }
-            | EncoderBlockState::Thinking { .. }
-            | EncoderBlockState::ToolCall { .. } => {
-                return Err(frame_error("Unreachable text encoder state"));
-            }
-        };
-        let delta_start = *delta_chars;
-        *delta_chars = (*delta_chars).saturating_add(utf16_len(delta));
-        let covered = (*covered_chars).saturating_sub(delta_start);
-        if covered >= utf16_len(delta) {
+        self.block(content_index, kind.encoder_kind())?;
+        if delta.is_empty() {
             return Ok(None);
         }
-        let uncovered = utf16_suffix(delta, covered);
         Ok(Some(match kind {
             TextBlockKind::Text => AssistantMessageFrame::TextDelta {
                 content_index,
-                delta: uncovered,
+                delta: delta.to_owned(),
             },
             TextBlockKind::Thinking => AssistantMessageFrame::ThinkingDelta {
                 content_index,
-                delta: uncovered,
+                delta: delta.to_owned(),
             },
         }))
     }
@@ -683,8 +648,8 @@ impl EncoderKind {
 impl EncoderBlockState {
     const fn encoder_kind(&self) -> EncoderKind {
         match self {
-            Self::Text { .. } => EncoderKind::Text,
-            Self::Thinking { .. } => EncoderKind::Thinking,
+            Self::Text => EncoderKind::Text,
+            Self::Thinking => EncoderKind::Thinking,
             Self::ToolCall { .. } => EncoderKind::ToolCall,
         }
     }
@@ -1344,38 +1309,6 @@ fn is_json_prefix(snapshot: &Value, current: &Value) -> bool {
     }
 }
 
-fn utf16_len(value: &str) -> usize {
-    value.encode_utf16().count()
-}
-
-/// Returns a suffix using JavaScript's UTF-16 offset semantics. Rust strings
-/// cannot contain an isolated surrogate; if a source offset falls inside an
-/// astral scalar, `from_utf16_lossy` makes that otherwise unrepresentable
-/// boundary explicit rather than slicing at a byte offset.
-fn utf16_suffix(value: &str, offset: usize) -> String {
-    if offset == 0 {
-        return value.to_owned();
-    }
-    let total = utf16_len(value);
-    if offset >= total {
-        return String::new();
-    }
-
-    let mut consumed = 0;
-    for (byte_index, character) in value.char_indices() {
-        let units = character.len_utf16();
-        if consumed + units == offset {
-            return value[byte_index + character.len_utf8()..].to_owned();
-        }
-        if consumed + units > offset {
-            let suffix = value.encode_utf16().skip(offset).collect::<Vec<_>>();
-            return String::from_utf16_lossy(&suffix);
-        }
-        consumed += units;
-    }
-    String::new()
-}
-
 fn frame_error(message: impl Into<String>) -> AssistantMessageFrameError {
     AssistantMessageFrameError::new(message)
 }
@@ -1514,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn encoder_uses_utf16_offsets_for_emoji_catchup() {
+    fn prepopulated_text_start_with_emoji_and_deltas_replays_complete() {
         let start_partial = assistant_with_content(Vec::new());
         let text_partial =
             assistant_with_content(vec![AssistantContent::Text(TextContent::new("😀"))]);
@@ -1532,28 +1465,67 @@ mod tests {
             })
             .expect("text start should encode")
             .expect("text start frame");
-        let delta = encoder
+        let delta1 = encoder
             .encode(AssistantMessageEvent::TextDelta {
                 content_index: 0,
-                delta: "😀x".into(),
+                delta: "x".into(),
+                partial: text_partial.clone(),
+            })
+            .expect("first delta should encode")
+            .expect("first delta frame");
+        let delta2 = encoder
+            .encode(AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "y".into(),
                 partial: text_partial,
             })
-            .expect("delta should encode")
-            .expect("uncovered delta");
+            .expect("second delta should encode")
+            .expect("second delta frame");
         assert_eq!(
-            delta,
+            delta1,
             AssistantMessageFrame::TextDelta {
                 content_index: 0,
-                delta: "x".into()
+                delta: "x".into(),
             }
         );
-        let reduced = reduce_assistant_message_frames([start, text_start, delta])
+        assert_eq!(
+            delta2,
+            AssistantMessageFrame::TextDelta {
+                content_index: 0,
+                delta: "y".into(),
+            }
+        );
+        let reduced = reduce_assistant_message_frames([start, text_start, delta1, delta2])
             .expect("frames should reduce")
             .expect("start frame should be present");
         let AssistantContent::Text(text) = &reduced.content[0] else {
             panic!("expected text block");
         };
-        assert_eq!(text.text, "😀x");
+        assert_eq!(text.text, "😀xy");
+    }
+
+    #[test]
+    fn encoder_rejects_out_of_order_block_starts() {
+        let mut encoder = AssistantMessageFrameEncoder::new();
+        encoder
+            .encode(AssistantMessageEvent::Start {
+                partial: assistant_with_content(Vec::new()),
+            })
+            .expect("start should encode");
+        let two_blocks = assistant_with_content(vec![
+            AssistantContent::Text(TextContent::new("a")),
+            AssistantContent::Text(TextContent::new("b")),
+        ]);
+        let error = encoder
+            .encode(AssistantMessageEvent::TextStart {
+                content_index: 1,
+                partial: two_blocks,
+            })
+            .expect_err("out-of-order start must be rejected");
+        assert_eq!(
+            error.message(),
+            "Cannot start assistant message block at index 1: expected 0"
+        );
     }
 
     #[test]

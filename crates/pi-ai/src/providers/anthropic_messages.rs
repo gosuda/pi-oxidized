@@ -290,14 +290,25 @@ fn build_payload(
 
     insert_temperature(&mut payload, model, options);
     insert_thinking(&mut payload, model, options);
-    insert_tools(&mut payload, model, context, cache_control.as_ref())?;
+    let tool_choice = options.extra_value(StreamOptionKey::TOOL_CHOICE);
+    // Anthropic rejects `{"type": "none"}`; the neutral choice is expressed by
+    // withholding the tool definitions entirely.
+    let tools_forbidden = tool_choice.is_some_and(|choice| {
+        choice.as_str() == Some("none")
+            || choice.get("type").and_then(Value::as_str) == Some("none")
+    });
+    if !tools_forbidden {
+        insert_tools(&mut payload, model, context, cache_control.as_ref())?;
+    }
 
     if let Some(metadata) = &options.metadata
         && let Some(user_id) = metadata.get("user_id").and_then(Value::as_str)
     {
         payload.insert("metadata".to_owned(), json!({ "user_id": user_id }));
     }
-    if let Some(tool_choice) = options.extra_value(StreamOptionKey::TOOL_CHOICE) {
+    if let Some(tool_choice) = tool_choice
+        && !tools_forbidden
+    {
         payload.insert(
             "tool_choice".to_owned(),
             if let Some(kind) = tool_choice.as_str() {
@@ -1181,7 +1192,7 @@ mod tests {
     use super::*;
     use crate::types::{
         ConstrainedSampling, ConstrainedSamplingConfig, ModelCost, ModelInput, StrictMode,
-        TextContent, Tool, ToolResultMessage, Usage, UserMessage,
+        TextContent, Tool, ToolChoice, ToolResultMessage, Usage, UserMessage,
     };
 
     fn model() -> Model {
@@ -1450,6 +1461,42 @@ mod tests {
         let payload = build_payload(&adaptive, &context, &options)
             .expect("ordinary Anthropic payload conversion should succeed");
         assert!(payload.get("thinking").is_none());
+    }
+
+    #[test]
+    fn tool_choice_none_omits_tool_choice_and_tools() {
+        let context = Context {
+            tools: Some(vec![Tool {
+                name: "read".to_owned(),
+                description: "read a file".to_owned(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+                constrained_sampling: None,
+            }]),
+            ..Context::default()
+        };
+        let mut options = StreamOptions::default();
+        options.insert_extra(
+            StreamOptionKey::TOOL_CHOICE,
+            Value::String(ToolChoice::None.as_str().to_owned()),
+        );
+        let payload = build_payload(&model(), &context, &options)
+            .expect("neutral tool choice payload should succeed");
+        assert!(payload.get("tool_choice").is_none());
+        assert!(payload.get("tools").is_none());
+
+        // A supported choice still selects among the advertised tools.
+        options.insert_extra(
+            StreamOptionKey::TOOL_CHOICE,
+            Value::String(ToolChoice::Auto.as_str().to_owned()),
+        );
+        let payload = build_payload(&model(), &context, &options)
+            .expect("auto tool choice payload should succeed");
+        assert_eq!(payload["tool_choice"], json!({ "type": "auto" }));
+        assert_eq!(payload["tools"][0]["name"], "read");
     }
 
     #[test]
