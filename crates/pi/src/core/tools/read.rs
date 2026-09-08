@@ -16,7 +16,10 @@ use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 use pi_agent::{AgentTool, AgentToolResult, ToolError, ToolUpdates};
-use pi_ai::types::{ImageContent, Model, ModelInput, TextContent, ToolResultContent};
+use pi_ai::{
+    ConstrainedSampling, ConstrainedSamplingConfig, ImageContent, Model, ModelInput, StrictMode,
+    TextContent, ToolResultContent,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -166,6 +169,14 @@ impl AgentTool for ReadTool {
 
     fn parameters(&self) -> &Value {
         &self.parameters
+    }
+
+    fn constrained_sampling(&self) -> Option<ConstrainedSampling> {
+        Some(ConstrainedSampling::Config(
+            ConstrainedSamplingConfig::JsonSchema {
+                strict: StrictMode::Prefer,
+            },
+        ))
     }
 
     fn validate_arguments(

@@ -14,22 +14,29 @@
 //! Image support reuses [`super::image::process_image`] so no external image
 //! binaries are spawned.
 
-use std::fs;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io;
 use std::time::Duration;
 
 use base64::Engine;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::image::{convert_to_png, detect_supported_image_mime, extension_for_image_mime};
+
+/// Maximum clipboard payload accepted from a command backend.
+pub const MAX_CLIPBOARD_BYTES: usize = 50 * 1024 * 1024;
 
 /// Maximum base64 length for an OSC 52 copy. Larger payloads are skipped to
 /// avoid desynchronizing terminal rendering.
 pub const MAX_OSC52_ENCODED_LENGTH: usize = 100_000;
 
-/// Shell-tool spawn timeout for the synchronous clipboard helpers.
+/// Shell-tool timeout for clipboard helpers.
 pub const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
+
+const CLIPBOARD_IMAGE_LIST_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Platform discriminator selectable independently of the host for tests.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -99,21 +106,62 @@ pub fn is_remote_session(env: &dyn ClipboardEnv) -> bool {
         || env.get("MOSH_CONNECTION").is_some()
 }
 
-/// Errors returned by clipboard copy.
-#[derive(Debug, thiserror::Error)]
+/// Errors returned by an asynchronous clipboard operation.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ClipboardError {
+    /// The caller cancelled the operation; any child was killed and reaped.
+    #[error("Clipboard operation cancelled")]
+    Cancelled,
+    /// A command exceeded [`CLIPBOARD_TIMEOUT`].
+    #[error("Clipboard command timed out: {program}")]
+    TimedOut {
+        /// Command whose deadline expired.
+        program: String,
+    },
+    /// A command started but failed, exited unsuccessfully, or returned bad
+    /// output.
+    #[error("Clipboard command failed: {program}: {message}")]
+    Process {
+        /// Command whose operation failed.
+        program: String,
+        /// Stable failure detail for diagnostics and tests.
+        message: String,
+    },
+    /// A command produced more than the clipboard output limit.
+    #[error("Clipboard command output exceeded the limit: {program}")]
+    OutputTooLarge {
+        /// Command whose output exceeded the limit.
+        program: String,
+    },
     /// Every copy path (native, shell tool, OSC 52) failed.
     #[error("Failed to copy to clipboard")]
     Failed,
 }
 
-/// A clipboard image and its MIME type.
+/// Result of a clipboard read. An empty clipboard is not an unavailable
+/// backend, and a backend failure is not a successful empty read.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClipboardImage {
-    /// Raw image bytes.
-    pub bytes: Vec<u8>,
-    /// Canonical MIME type.
-    pub mime: String,
+pub enum ClipboardReadResult<T> {
+    /// The backend returned a value.
+    Value(T),
+    /// The backend successfully answered but had no value in the requested
+    /// format.
+    Empty,
+    /// No selected backend could be started or no display/backend applies.
+    Unavailable,
+    /// A selected backend started but failed, timed out, was cancelled, or
+    /// returned invalid/oversized data.
+    Failed(ClipboardError),
+}
+
+/// Result of a clipboard write. OSC 52 is returned for the existing terminal
+/// writer; this module never writes terminal bytes directly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClipboardCopyResult {
+    /// A platform clipboard command accepted the text.
+    Command,
+    /// The caller must send this sequence through its sole terminal writer.
+    Osc52(String),
 }
 
 /// A resolved clipboard write argv (program + args) with an optional fallback.
@@ -123,7 +171,7 @@ pub struct WriteCommand {
     pub program: String,
     /// Argv excluding the program name.
     pub args: Vec<String>,
-    /// Optional secondary argv tried when the primary is missing.
+    /// Optional secondary argv tried when the primary is unavailable or fails.
     pub fallback: Option<(String, Vec<String>)>,
 }
 
@@ -140,42 +188,49 @@ impl WriteCommand {
 /// Selected write command argv for `platform`/`env`, or `None` when no shell
 /// tool applies (forcing the OSC 52 / failure path).
 ///
-/// The argv matches the TypeScript reference's selection order exactly:
-/// - Darwin → `pbcopy`
-/// - Windows → `clip`
-/// - Unix → Termux (`termux-clipboard-set`) if `TERMUX_VERSION` set, else
-///   Wayland (`wl-copy`) when `is_wayland_session` and `WAYLAND_DISPLAY`,
-///   else X11 (`xclip -selection clipboard`, which the reference falls back
-///   from to `xsel --clipboard --input`).
+/// This compatibility selector returns the first command in the same order as
+/// [`clipboard_write_commands`]. Its X11 entry retains the `xsel` fallback.
 #[must_use]
 pub fn clipboard_write_command(
     platform: ClipboardPlatform,
     env: &dyn ClipboardEnv,
 ) -> Option<WriteCommand> {
+    clipboard_write_commands(platform, env).into_iter().next()
+}
+
+/// Resolve every command attempted by the text writer, in reference order.
+///
+/// Linux intentionally retains all applicable branches: Termux, Wayland, and
+/// X11 may coexist, and a failed earlier backend must not prevent the later
+/// fallback.
+#[must_use]
+pub fn clipboard_write_commands(
+    platform: ClipboardPlatform,
+    env: &dyn ClipboardEnv,
+) -> Vec<WriteCommand> {
     match platform {
-        ClipboardPlatform::Darwin => Some(WriteCommand::new("pbcopy", vec![])),
-        ClipboardPlatform::Windows => Some(WriteCommand::new("clip", vec![])),
+        ClipboardPlatform::Darwin => vec![WriteCommand::new("pbcopy", vec![])],
+        ClipboardPlatform::Windows => vec![WriteCommand::new("clip", vec![])],
         ClipboardPlatform::Unix => {
+            let mut commands = Vec::new();
             if env.get("TERMUX_VERSION").is_some() {
-                return Some(WriteCommand::new("termux-clipboard-set", vec![]));
+                commands.push(WriteCommand::new("termux-clipboard-set", vec![]));
             }
-            let has_wayland = env.get("WAYLAND_DISPLAY").is_some();
-            let has_x11 = env.get("DISPLAY").is_some();
-            if is_wayland_session(env) && has_wayland {
-                Some(WriteCommand::new("wl-copy", vec![]))
-            } else if has_x11 {
-                let mut cmd = WriteCommand::new(
+            if env.get("WAYLAND_DISPLAY").is_some() {
+                commands.push(WriteCommand::new("wl-copy", vec![]));
+            }
+            if env.get("DISPLAY").is_some() {
+                let mut x11 = WriteCommand::new(
                     "xclip",
                     vec!["-selection".to_owned(), "clipboard".to_owned()],
                 );
-                cmd.fallback = Some((
+                x11.fallback = Some((
                     "xsel".to_owned(),
                     vec!["--clipboard".to_owned(), "--input".to_owned()],
                 ));
-                Some(cmd)
-            } else {
-                None
+                commands.push(x11);
             }
+            commands
         }
     }
 }
@@ -191,83 +246,257 @@ pub fn osc52_encode(text: &str) -> Option<String> {
     Some(format!("\x1b]52;c;{encoded}\x07"))
 }
 
-/// Copy `text` with an explicit platform/env and OSC 52 sink.
+#[derive(Debug)]
+enum ProcessResult {
+    Success(Vec<u8>),
+    Unavailable,
+    Failed(ClipboardError),
+}
+
+async fn stop_child(child: &mut Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+async fn read_child_output(
+    mut stdout: tokio::process::ChildStdout,
+    program: String,
+) -> Result<Vec<u8>, ClipboardError> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = stdout
+            .read(&mut buffer)
+            .await
+            .map_err(|error| ClipboardError::Process {
+                program: program.clone(),
+                message: error.to_string(),
+            })?;
+        if read == 0 {
+            break;
+        }
+        if read > MAX_CLIPBOARD_BYTES.saturating_sub(output.len()) {
+            return Err(ClipboardError::OutputTooLarge { program });
+        }
+        output.extend_from_slice(&buffer[..read]);
+    }
+    Ok(output)
+}
+async fn cancel_tasks(
+    writer: Option<JoinHandle<Result<(), io::Error>>>,
+    output: Option<JoinHandle<Result<Vec<u8>, ClipboardError>>>,
+) {
+    if let Some(writer) = writer {
+        writer.abort();
+        let _ = writer.await;
+    }
+    if let Some(output) = output {
+        output.abort();
+        let _ = output.await;
+    }
+}
+
+/// Spawn one clipboard helper with bounded output, timeout, cancellation, and
+/// child reaping. Missing executables are unavailable; started-but-failed
+/// commands remain failures for the caller to report after fallback ordering.
+async fn run_process(
+    program: &str,
+    args: &[String],
+    input: Option<&[u8]>,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> ProcessResult {
+    if cancel.is_cancelled() {
+        return ProcessResult::Failed(ClipboardError::Cancelled);
+    }
+
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(if input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(if input.is_some() {
+            std::process::Stdio::null()
+        } else {
+            std::process::Stdio::piped()
+        })
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return ProcessResult::Unavailable;
+        }
+        Err(error) => {
+            return ProcessResult::Failed(ClipboardError::Process {
+                program: program.to_owned(),
+                message: error.to_string(),
+            });
+        }
+    };
+
+    let mut writer = input.map(|bytes| {
+        let bytes = bytes.to_vec();
+        let Some(mut stdin) = child.stdin.take() else {
+            return tokio::spawn(async { Ok::<(), io::Error>(()) });
+        };
+        tokio::spawn(async move {
+            // A writer may exit before consuming all input; the exit status
+            // remains authoritative, matching the reference command helper.
+            let _ = stdin.write_all(&bytes).await;
+            drop(stdin);
+            Ok::<(), io::Error>(())
+        })
+    });
+    let mut output_task = child
+        .stdout
+        .take()
+        .map(|stdout| tokio::spawn(read_child_output(stdout, program.to_owned())));
+
+    let mut deadline = Box::pin(tokio::time::sleep(timeout));
+    let status = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            stop_child(&mut child).await;
+            cancel_tasks(writer.take(), output_task.take()).await;
+            return ProcessResult::Failed(ClipboardError::Cancelled);
+        }
+        () = &mut deadline => {
+            stop_child(&mut child).await;
+            cancel_tasks(writer.take(), output_task.take()).await;
+            return ProcessResult::Failed(ClipboardError::TimedOut { program: program.to_owned() });
+        }
+        status = child.wait() => status,
+    };
+
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            stop_child(&mut child).await;
+            cancel_tasks(writer.take(), output_task.take()).await;
+            return ProcessResult::Failed(ClipboardError::Process {
+                program: program.to_owned(),
+                message: error.to_string(),
+            });
+        }
+    };
+    if let Some(writer) = writer {
+        writer.abort();
+        let _ = writer.await;
+    }
+    let output = if let Some(task) = output_task.take() {
+        match task.await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => return ProcessResult::Failed(error),
+            Err(error) => {
+                return ProcessResult::Failed(ClipboardError::Process {
+                    program: program.to_owned(),
+                    message: error.to_string(),
+                });
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if status.success() {
+        ProcessResult::Success(output)
+    } else {
+        ProcessResult::Failed(ClipboardError::Process {
+            program: program.to_owned(),
+            message: format!("exit status {status}"),
+        })
+    }
+}
+
+fn merge_process_results(first: ProcessResult, second: ProcessResult) -> ProcessResult {
+    match second {
+        ProcessResult::Success(output) => ProcessResult::Success(output),
+        ProcessResult::Failed(error) => ProcessResult::Failed(error),
+        ProcessResult::Unavailable => first,
+    }
+}
+
+async fn run_write_command(
+    cmd: &WriteCommand,
+    text: &str,
+    cancel: &CancellationToken,
+) -> ProcessResult {
+    let first = run_process(
+        &cmd.program,
+        &cmd.args,
+        Some(text.as_bytes()),
+        cancel,
+        CLIPBOARD_TIMEOUT,
+    )
+    .await;
+    if matches!(
+        &first,
+        ProcessResult::Success(_) | ProcessResult::Failed(ClipboardError::Cancelled)
+    ) {
+        return first;
+    }
+    let Some((program, args)) = &cmd.fallback else {
+        return first;
+    };
+    let second = run_process(
+        program,
+        args,
+        Some(text.as_bytes()),
+        cancel,
+        CLIPBOARD_TIMEOUT,
+    )
+    .await;
+    merge_process_results(first, second)
+}
+
+/// Copy `text` without blocking the product runtime.
 ///
-/// Tries the selected shell tool (and its fallback) first: emitting OSC 52
-/// before a tool copy can make terminals write the native clipboard twice,
-/// and large payloads can desynchronize rendering. The sink receives the
-/// encoded sequence when the OSC 52 path triggers — callers pass the
-/// terminal's stdout handle; tests inject a capturing closure so the
-/// decision logic is exercised without side effects.
+/// Platform commands run before OSC 52. Remote sessions return an OSC 52
+/// operation even after a successful command so the controlling terminal also
+/// receives the text. The returned sequence must be written through the
+/// product's sole terminal writer; this module never writes stdout.
 ///
 /// # Errors
 ///
-/// Returns [`ClipboardError::Failed`] when neither the selected platform tool
-/// (including its fallback) nor OSC 52 can accept the text.
-pub fn copy_to_clipboard_with(
+/// Returns [`ClipboardError::Cancelled`] or [`ClipboardError::TimedOut`] when
+/// the selected operation is interrupted, and preserves the final command
+/// failure when OSC 52 is unavailable.
+pub async fn copy_to_clipboard_with(
     text: &str,
     platform: ClipboardPlatform,
     env: &dyn ClipboardEnv,
-    emit_osc52: &mut dyn FnMut(&str),
-) -> Result<(), ClipboardError> {
-    let mut copied = false;
-
-    if let Some(cmd) = clipboard_write_command(platform, env)
-        && run_write_command(&cmd, text)
-    {
-        copied = true;
-    }
-
-    if (is_remote_session(env) || !copied)
-        && let Some(sequence) = osc52_encode(text)
-    {
-        emit_osc52(&sequence);
-        copied = true;
-    }
-
-    if copied {
-        Ok(())
-    } else {
-        Err(ClipboardError::Failed)
-    }
-}
-
-fn run_write_command(cmd: &WriteCommand, text: &str) -> bool {
-    if pipe_to(&cmd.program, &cmd.args, text) {
-        return true;
-    }
-    if let Some((program, args)) = &cmd.fallback {
-        return pipe_to(program, args, text);
-    }
-    false
-}
-
-/// Pipe `text` to `program args` stdin within [`CLIPBOARD_TIMEOUT`]. Returns
-/// `false` on spawn failure, timeout, or nonzero exit.
-fn pipe_to(program: &str, args: &[String], text: &str) -> bool {
-    let Ok(mut child) = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    if let Some(mut stdin) = child.stdin.take()
-        && stdin.write_all(text.as_bytes()).is_err()
-    {
-        // EPIPE on early exit (e.g. wl-copy) is non-fatal; stdin is dropped.
-    }
-    match wait_timeout::ChildExt::wait_timeout(&mut child, CLIPBOARD_TIMEOUT) {
-        Ok(Some(status)) => status.success(),
-        Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            false
+    cancel: &CancellationToken,
+) -> Result<ClipboardCopyResult, ClipboardError> {
+    let mut last_failure = None;
+    for command in clipboard_write_commands(platform, env) {
+        match run_write_command(&command, text, cancel).await {
+            ProcessResult::Success(_) => {
+                if cancel.is_cancelled() {
+                    return Err(ClipboardError::Cancelled);
+                }
+                if is_remote_session(env) {
+                    return osc52_encode(text)
+                        .map(ClipboardCopyResult::Osc52)
+                        .ok_or(ClipboardError::Failed);
+                }
+                return Ok(ClipboardCopyResult::Command);
+            }
+            ProcessResult::Unavailable => {}
+            ProcessResult::Failed(error @ ClipboardError::Cancelled) => return Err(error),
+            ProcessResult::Failed(error) => last_failure = Some(error),
         }
-        Err(_) => false,
     }
+
+    if cancel.is_cancelled() {
+        return Err(ClipboardError::Cancelled);
+    }
+    if let Some(sequence) = osc52_encode(text) {
+        return Ok(ClipboardCopyResult::Osc52(sequence));
+    }
+    Err(last_failure.unwrap_or(ClipboardError::Failed))
 }
 
 /// A resolved clipboard read argv with an optional fallback.
@@ -292,83 +521,117 @@ impl ReadCommand {
 }
 
 /// Selected read command argv for `platform`/`env`, or `None`.
+///
+/// This compatibility selector returns the first command in the same order as
+/// [`clipboard_read_commands`]. Its X11 entry retains the `xsel` fallback.
 #[must_use]
 pub fn clipboard_read_command(
     platform: ClipboardPlatform,
     env: &dyn ClipboardEnv,
 ) -> Option<ReadCommand> {
+    clipboard_read_commands(platform, env).into_iter().next()
+}
+
+/// Resolve every command attempted by the text reader, in reference order.
+#[must_use]
+pub fn clipboard_read_commands(
+    platform: ClipboardPlatform,
+    env: &dyn ClipboardEnv,
+) -> Vec<ReadCommand> {
     match platform {
-        ClipboardPlatform::Darwin => Some(ReadCommand::new("pbpaste", vec![])),
-        ClipboardPlatform::Windows => Some(ReadCommand::new(
+        ClipboardPlatform::Darwin => vec![ReadCommand::new("pbpaste", vec![])],
+        ClipboardPlatform::Windows => vec![ReadCommand::new(
             "powershell",
             vec![
                 "-NoProfile".to_owned(),
                 "-Command".to_owned(),
                 "Get-Clipboard".to_owned(),
             ],
-        )),
+        )],
         ClipboardPlatform::Unix => {
-            if is_wayland_session(env) && env.get("WAYLAND_DISPLAY").is_some() {
-                Some(ReadCommand::new(
+            let mut commands = Vec::new();
+            if env.get("TERMUX_VERSION").is_some() {
+                commands.push(ReadCommand::new("termux-clipboard-get", vec![]));
+            }
+            if env.get("WAYLAND_DISPLAY").is_some() {
+                commands.push(ReadCommand::new(
                     "wl-paste",
-                    vec!["--no-newline".to_owned()],
-                ))
-            } else if env.get("DISPLAY").is_some() {
-                let mut cmd = ReadCommand::new(
+                    vec!["--no-newline".to_owned(), "--type".to_owned(), "text".to_owned()],
+                ));
+            }
+            if env.get("DISPLAY").is_some() {
+                let mut x11 = ReadCommand::new(
                     "xclip",
                     vec![
                         "-selection".to_owned(),
                         "clipboard".to_owned(),
-                        "-o".to_owned(),
+                        "-out".to_owned(),
                     ],
                 );
-                cmd.fallback = Some((
+                x11.fallback = Some((
                     "xsel".to_owned(),
                     vec!["--clipboard".to_owned(), "--output".to_owned()],
                 ));
-                Some(cmd)
-            } else {
-                None
+                commands.push(x11);
             }
+            commands
         }
     }
 }
 
-/// Read plain text from the clipboard on the host.
-#[must_use]
-pub fn read_clipboard_text() -> Option<String> {
-    read_clipboard_text_with(ClipboardPlatform::host(), &HostEnv)
+async fn run_read_command(
+    cmd: &ReadCommand,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> ProcessResult {
+    let first = run_process(&cmd.program, &cmd.args, None, cancel, timeout).await;
+    if matches!(&first, ProcessResult::Success(_) | ProcessResult::Failed(ClipboardError::Cancelled)) {
+        return first;
+    }
+    let Some((program, args)) = &cmd.fallback else {
+        return first;
+    };
+    let second = run_process(program, args, None, cancel, timeout).await;
+    merge_process_results(first, second)
 }
 
-/// Read plain text with an explicit platform/env.
-pub fn read_clipboard_text_with(
+/// Read plain text from the host clipboard with a cancellation-aware async
+/// fallback chain.
+#[must_use]
+pub async fn read_clipboard_text(cancel: &CancellationToken) -> ClipboardReadResult<String> {
+    let env = HostEnv;
+    read_clipboard_text_with(ClipboardPlatform::host(), &env, cancel).await
+}
+
+/// Read plain text with an explicit platform/env and cancellation token.
+///
+/// A successful empty command result stops the chain. This prevents an empty
+/// Wayland or X11 selection from falling through to stale clipboard contents.
+pub async fn read_clipboard_text_with(
     platform: ClipboardPlatform,
     env: &dyn ClipboardEnv,
-) -> Option<String> {
-    let cmd = clipboard_read_command(platform, env)?;
-    if let Some(text) = capture(&cmd.program, &cmd.args)
-        && !text.is_empty()
-    {
-        return Some(text);
+    cancel: &CancellationToken,
+) -> ClipboardReadResult<String> {
+    if cancel.is_cancelled() {
+        return ClipboardReadResult::Failed(ClipboardError::Cancelled);
     }
-    if let Some((program, args)) = &cmd.fallback {
-        return capture(program, args).filter(|t| !t.is_empty());
+    let mut failure = None;
+    for command in clipboard_read_commands(platform, env) {
+        match run_read_command(&command, cancel, CLIPBOARD_TIMEOUT).await {
+            ProcessResult::Success(bytes) => {
+                if bytes.is_empty() {
+                    return ClipboardReadResult::Empty;
+                }
+                return ClipboardReadResult::Value(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            ProcessResult::Unavailable => {}
+            ProcessResult::Failed(error @ ClipboardError::Cancelled) => {
+                return ClipboardReadResult::Failed(error);
+            }
+            ProcessResult::Failed(error) => failure = Some(error),
+        }
     }
-    None
-}
-
-fn capture(program: &str, args: &[String]) -> Option<String> {
-    let output = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    failure.map_or(ClipboardReadResult::Unavailable, ClipboardReadResult::Failed)
 }
 
 /// Returns `true` on WSL using `WSL_DISTRO_NAME`, `WSLENV`, or `/proc/version`.
@@ -413,166 +676,304 @@ fn base_mime(mime: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Read an image from the clipboard, converting unsupported formats to PNG.
-///
-/// The argv selection mirrors `readClipboardImage`: Wayland/WSL → `wl-paste`
-/// then `xclip`; WSL also tries PowerShell (Windows clipboard); plain X11
-/// falls back to `xclip` directly. Termux yields no image. Unsupported MIME is
-/// converted via [`maybe_convert_to_png`].
-#[must_use]
-pub fn read_clipboard_image() -> Option<ClipboardImage> {
-    read_clipboard_image_with(ClipboardPlatform::host(), &HostEnv)
+fn image_conversion_failure() -> ClipboardError {
+    ClipboardError::Process {
+        program: "clipboard image conversion".to_owned(),
+        message: "unsupported image format".to_owned(),
+    }
 }
 
-/// Read a clipboard image with an explicit platform/env.
-pub fn read_clipboard_image_with(
-    platform: ClipboardPlatform,
-    env: &dyn ClipboardEnv,
-) -> Option<ClipboardImage> {
-    if env.get("TERMUX_VERSION").is_some() {
-        return None;
-    }
-    let raw = read_clipboard_image_raw(platform, env)?;
-    let (bytes, mime) = maybe_convert_to_png(&raw.bytes, &raw.mime)?;
-    Some(ClipboardImage { bytes, mime })
+fn finalize_image(
+    result: ClipboardReadResult<ClipboardImage>,
+) -> ClipboardReadResult<ClipboardImage> {
+    let ClipboardReadResult::Value(image) = result else {
+        return result;
+    };
+    let Some((bytes, mime)) = maybe_convert_to_png(&image.bytes, &image.mime) else {
+        return ClipboardReadResult::Failed(image_conversion_failure());
+    };
+    ClipboardReadResult::Value(ClipboardImage { bytes, mime })
 }
 
-fn read_clipboard_image_raw(
-    platform: ClipboardPlatform,
-    env: &dyn ClipboardEnv,
-) -> Option<ClipboardImage> {
-    if !matches!(platform, ClipboardPlatform::Unix) {
-        return None;
+async fn read_wl_paste_image(cancel: &CancellationToken) -> ClipboardReadResult<ClipboardImage> {
+    let list = run_process(
+        "wl-paste",
+        &["--list-types".to_owned()],
+        None,
+        cancel,
+        CLIPBOARD_IMAGE_LIST_TIMEOUT,
+    )
+    .await;
+    let types = match list {
+        ProcessResult::Success(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        ProcessResult::Unavailable => return ClipboardReadResult::Unavailable,
+        ProcessResult::Failed(error) => return ClipboardReadResult::Failed(error),
+    };
+    let Some(selected) = select_preferred_image_mime(&types) else {
+        return ClipboardReadResult::Empty;
+    };
+    let data = run_process(
+        "wl-paste",
+        &[
+            "--type".to_owned(),
+            selected.clone(),
+            "--no-newline".to_owned(),
+        ],
+        None,
+        cancel,
+        CLIPBOARD_TIMEOUT,
+    )
+    .await;
+    match data {
+        ProcessResult::Success(bytes) if bytes.is_empty() => ClipboardReadResult::Empty,
+        ProcessResult::Success(bytes) => ClipboardReadResult::Value(ClipboardImage {
+            bytes,
+            mime: base_mime(&selected),
+        }),
+        ProcessResult::Unavailable => ClipboardReadResult::Unavailable,
+        ProcessResult::Failed(error) => ClipboardReadResult::Failed(error),
     }
-    let wayland = is_wayland_session(env);
-    let wsl = is_wsl(env);
-
-    // Mirrors readClipboardImage from the TypeScript reference:
-    //  - on Wayland or WSL, try wl-paste first, then xclip
-    //  - on WSL, also fall back to PowerShell (Windows clipboard)
-    //  - on plain X11 (or any non-Wayland Linux) fall back to xclip.
-    // The reference tries nativeClipboard before xclip, but this port has no
-    // native addon, so xclip is the plain-X11 fallback.
-    let mut image = None;
-    if wayland || wsl {
-        image = wl_paste_image().or_else(xclip_image);
-    }
-    if image.is_none() && wsl {
-        image = read_clipboard_image_via_powershell();
-    }
-    if image.is_none() && !wayland {
-        image = xclip_image();
-    }
-    image
 }
 
-fn wl_paste_image() -> Option<ClipboardImage> {
-    let list = Command::new("wl-paste")
-        .arg("--list-types")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !list.status.success() {
-        return None;
-    }
-    let selected = select_preferred_image_mime(&String::from_utf8_lossy(&list.stdout))?;
-    let data = Command::new("wl-paste")
-        .args(["--type", &selected, "--no-newline"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !data.status.success() || data.stdout.is_empty() {
-        return None;
-    }
-    Some(ClipboardImage {
-        bytes: data.stdout,
-        mime: base_mime(&selected),
-    })
-}
+async fn read_xclip_image(cancel: &CancellationToken) -> ClipboardReadResult<ClipboardImage> {
+    let targets = run_process(
+        "xclip",
+        &[
+            "-selection".to_owned(),
+            "clipboard".to_owned(),
+            "-t".to_owned(),
+            "TARGETS".to_owned(),
+            "-o".to_owned(),
+        ],
+        None,
+        cancel,
+        CLIPBOARD_IMAGE_LIST_TIMEOUT,
+    )
+    .await;
 
-fn xclip_image() -> Option<ClipboardImage> {
-    for mime in ["image/png", "image/jpeg", "image/webp", "image/gif"] {
-        let data = Command::new("xclip")
-            .args(["-selection", "clipboard", "-t", mime, "-o"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if data.status.success() && !data.stdout.is_empty() {
-            return Some(ClipboardImage {
-                bytes: data.stdout,
-                mime: mime.to_owned(),
-            });
+    let mut failure = None;
+    let mut saw_empty = false;
+    let mut candidate_types = Vec::new();
+    match targets {
+        ProcessResult::Success(bytes) => {
+            candidate_types = String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if !candidate_types.is_empty()
+                && select_preferred_image_mime(&candidate_types.join("\n")).is_none()
+            {
+                return ClipboardReadResult::Empty;
+            }
+        }
+        ProcessResult::Unavailable => {}
+        ProcessResult::Failed(error @ ClipboardError::Cancelled) => {
+            return ClipboardReadResult::Failed(error);
+        }
+        ProcessResult::Failed(error) => failure = Some(error),
+    }
+
+    let preferred = select_preferred_image_mime(&candidate_types.join("\n"));
+    let mut try_types = Vec::new();
+    if let Some(preferred) = preferred {
+        try_types.push(preferred);
+    }
+    for supported in ["image/png", "image/jpeg", "image/webp", "image/gif"] {
+        if !try_types.iter().any(|mime| mime == supported) {
+            try_types.push(supported.to_owned());
         }
     }
-    None
+
+    for mime in try_types {
+        let data = run_process(
+            "xclip",
+            &[
+                "-selection".to_owned(),
+                "clipboard".to_owned(),
+                "-t".to_owned(),
+                mime.clone(),
+                "-o".to_owned(),
+            ],
+            None,
+            cancel,
+            CLIPBOARD_TIMEOUT,
+        )
+        .await;
+        match data {
+            ProcessResult::Success(bytes) if bytes.is_empty() => saw_empty = true,
+            ProcessResult::Success(bytes) => {
+                return ClipboardReadResult::Value(ClipboardImage {
+                    bytes,
+                    mime: base_mime(&mime),
+                });
+            }
+            ProcessResult::Unavailable => {}
+            ProcessResult::Failed(error @ ClipboardError::Cancelled) => {
+                return ClipboardReadResult::Failed(error);
+            }
+            ProcessResult::Failed(error) => failure = Some(error),
+        }
+    }
+    if let Some(error) = failure {
+        ClipboardReadResult::Failed(error)
+    } else if saw_empty {
+        ClipboardReadResult::Empty
+    } else {
+        ClipboardReadResult::Unavailable
+    }
 }
 
 /// On WSL, the Linux clipboard often does not receive image data copied in
-/// Windows (e.g. Win+Shift+S). PowerShell can reach the Windows clipboard
-/// directly, so save a PNG to a temporary file and read it back.
-fn read_clipboard_image_via_powershell() -> Option<ClipboardImage> {
+/// Windows (for example, Win+Shift+S). PowerShell can reach the Windows
+/// clipboard directly, so save a PNG to a temporary file and read it back.
+async fn read_clipboard_image_via_powershell(
+    cancel: &CancellationToken,
+) -> ClipboardReadResult<ClipboardImage> {
     let tmp_file = std::env::temp_dir().join(format!("pi-wsl-clip-{}.png", Uuid::new_v4()));
-
-    let win_path = {
-        let output = Command::new("wslpath")
-            .args(["-w", tmp_file.to_str()?])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
+    let result = async {
+        let path = tmp_file.to_str().ok_or_else(|| {
+            ClipboardReadResult::Failed(ClipboardError::Process {
+                program: "wslpath".to_owned(),
+                message: "temporary path is not valid UTF-8".to_owned(),
+            })
+        })?;
+        let path_result = run_process(
+            "wslpath",
+            &["-w".to_owned(), path.to_owned()],
+            None,
+            cancel,
+            CLIPBOARD_IMAGE_LIST_TIMEOUT,
+        )
+        .await;
+        let win_path = match path_result {
+            ProcessResult::Success(bytes) => String::from_utf8_lossy(&bytes).trim().to_owned(),
+            ProcessResult::Unavailable => return Ok(ClipboardReadResult::Unavailable),
+            ProcessResult::Failed(error) => return Ok(ClipboardReadResult::Failed(error)),
+        };
+        if win_path.is_empty() {
+            return Ok(ClipboardReadResult::Empty);
         }
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    };
 
-    if win_path.is_empty() {
-        return None;
-    }
-
-    let quoted = win_path.replace('\'', "''");
-    let script = format!(
-        "Add-Type -AssemblyName System.Windows.Forms; \
-         Add-Type -AssemblyName System.Drawing; \
-         $path = '{quoted}'; \
-         $img = [System.Windows.Forms.Clipboard]::GetImage(); \
-         if ($img) {{ $img.Save($path, [System.Drawing.Imaging.ImageFormat]::Png); Write-Output 'ok' }} else {{ Write-Output 'empty' }}"
-    );
-
-    let result = Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-
-    let image = result.ok().and_then(|output| {
-        if !output.status.success() {
-            return None;
+        let quoted = win_path.replace('\'', "''");
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             Add-Type -AssemblyName System.Drawing; \
+             $path = '{quoted}'; \
+             $img = [System.Windows.Forms.Clipboard]::GetImage(); \
+             if ($img) {{ $img.Save($path, [System.Drawing.Imaging.ImageFormat]::Png); Write-Output 'ok' }} else {{ Write-Output 'empty' }}"
+        );
+        let powershell = run_process(
+            "powershell.exe",
+            &[
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                script,
+            ],
+            None,
+            cancel,
+            CLIPBOARD_TIMEOUT,
+        )
+        .await;
+        let output = match powershell {
+            ProcessResult::Success(bytes) => String::from_utf8_lossy(&bytes).trim().to_owned(),
+            ProcessResult::Unavailable => return Ok(ClipboardReadResult::Unavailable),
+            ProcessResult::Failed(error) => return Ok(ClipboardReadResult::Failed(error)),
+        };
+        if output == "empty" {
+            return Ok(ClipboardReadResult::Empty);
         }
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if text != "ok" {
-            return None;
+        if output != "ok" {
+            return Ok(ClipboardReadResult::Failed(ClipboardError::Process {
+                program: "powershell.exe".to_owned(),
+                message: "clipboard image command returned an unknown result".to_owned(),
+            }));
         }
-        let bytes = fs::read(&tmp_file).ok()?;
+        let bytes = tokio::fs::read(&tmp_file).await.map_err(|error| {
+            ClipboardReadResult::Failed(ClipboardError::Process {
+                program: "powershell.exe".to_owned(),
+                message: error.to_string(),
+            })
+        })?;
         if bytes.is_empty() {
-            return None;
+            return Ok(ClipboardReadResult::Empty);
         }
-        Some(ClipboardImage {
+        Ok(ClipboardReadResult::Value(ClipboardImage {
             bytes,
             mime: "image/png".to_owned(),
-        })
-    });
+        }))
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&tmp_file).await;
+    match result {
+        Ok(value) | Err(value) => value,
+    }
+}
 
-    let _ = fs::remove_file(&tmp_file);
-    image
+/// Read an image from the host clipboard, converting unsupported formats to
+/// PNG. Linux command fallbacks preserve the reference's empty/unavailable
+/// distinction; native Rust APIs are intentionally not guessed or installed.
+#[must_use]
+pub async fn read_clipboard_image(
+    cancel: &CancellationToken,
+) -> ClipboardReadResult<ClipboardImage> {
+    let env = HostEnv;
+    read_clipboard_image_with(ClipboardPlatform::host(), &env, cancel).await
+}
+
+/// Read an image with an explicit platform/env and cancellation token.
+pub async fn read_clipboard_image_with(
+    platform: ClipboardPlatform,
+    env: &dyn ClipboardEnv,
+    cancel: &CancellationToken,
+) -> ClipboardReadResult<ClipboardImage> {
+    if cancel.is_cancelled() {
+        return ClipboardReadResult::Failed(ClipboardError::Cancelled);
+    }
+    if env.get("TERMUX_VERSION").is_some() {
+        return ClipboardReadResult::Empty;
+    }
+    if !matches!(platform, ClipboardPlatform::Unix) {
+        return ClipboardReadResult::Unavailable;
+    }
+
+    let wayland = env.get("WAYLAND_DISPLAY").is_some();
+    let wsl = is_wsl(env);
+    let mut image = if wayland || wsl {
+        read_wl_paste_image(cancel).await
+    } else {
+        ClipboardReadResult::Unavailable
+    };
+    if cancel.is_cancelled() {
+        return ClipboardReadResult::Failed(ClipboardError::Cancelled);
+    }
+
+    // A failed/unavailable Wayland backend may fall through to X11. An empty
+    // Wayland selection must not expose stale X11 contents.
+    if matches!(
+        &image,
+        ClipboardReadResult::Unavailable | ClipboardReadResult::Failed(_)
+    ) {
+        image = read_xclip_image(cancel).await;
+    }
+    if cancel.is_cancelled() {
+        return ClipboardReadResult::Failed(ClipboardError::Cancelled);
+    }
+    if wsl && !matches!(&image, ClipboardReadResult::Value(_)) {
+        let powershell = read_clipboard_image_via_powershell(cancel).await;
+        if matches!(
+            &powershell,
+            ClipboardReadResult::Value(_) | ClipboardReadResult::Empty
+        ) || matches!(&image, ClipboardReadResult::Unavailable)
+        {
+            image = powershell;
+        }
+    }
+    if cancel.is_cancelled() {
+        return ClipboardReadResult::Failed(ClipboardError::Cancelled);
+    }
+    finalize_image(image)
 }
 
 fn select_preferred_image_mime(types_output: &str) -> Option<String> {
@@ -673,6 +1074,38 @@ mod tests {
     }
 
     #[test]
+    fn unix_write_commands_keep_reference_order() {
+        let env = MapEnv::default()
+            .set("TERMUX_VERSION", "1.0")
+            .set("WAYLAND_DISPLAY", "wayland-0")
+            .set("DISPLAY", ":0");
+        let commands = clipboard_write_commands(ClipboardPlatform::Unix, &env);
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.program.as_str())
+                .collect::<Vec<_>>(),
+            vec!["termux-clipboard-set", "wl-copy", "xclip"]
+        );
+    }
+
+    #[test]
+    fn unix_read_commands_keep_reference_order() {
+        let env = MapEnv::default()
+            .set("TERMUX_VERSION", "1.0")
+            .set("WAYLAND_DISPLAY", "wayland-0")
+            .set("DISPLAY", ":0");
+        let commands = clipboard_read_commands(ClipboardPlatform::Unix, &env);
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.program.as_str())
+                .collect::<Vec<_>>(),
+            vec!["termux-clipboard-get", "wl-paste", "xclip"]
+        );
+    }
+
+    #[test]
     fn unix_xclip_when_display_only_with_xsel_fallback() -> TestResult {
         let env = MapEnv::default().set("DISPLAY", ":0");
         let cmd = required(
@@ -707,44 +1140,59 @@ mod tests {
         assert!(osc52_encode(&big).is_none());
     }
 
-    #[test]
-    fn osc52_fallback_emits_sequence_when_no_tool_applies() -> TestResult {
+    #[tokio::test]
+    async fn osc52_fallback_returns_sequence_when_no_tool_applies() -> TestResult {
         let env = MapEnv::default();
-        let mut emitted = Vec::new();
-        let result = copy_to_clipboard_with("hi", ClipboardPlatform::Unix, &env, &mut |seq| {
-            emitted.push(seq.to_owned());
-        });
-        assert!(result.is_ok());
+        let cancel = CancellationToken::new();
+        let result =
+            copy_to_clipboard_with("hi", ClipboardPlatform::Unix, &env, &cancel).await?;
         assert_eq!(
-            emitted,
-            vec![required(osc52_encode("hi"), "OSC 52 sequence")?]
+            result,
+            ClipboardCopyResult::Osc52(required(osc52_encode("hi"), "OSC 52 sequence")?)
         );
         Ok(())
     }
 
-    #[test]
-    fn osc52_emits_in_remote_session() {
+    #[tokio::test]
+    async fn osc52_returns_in_remote_session() -> TestResult {
         let env = MapEnv::default().set("SSH_CONNECTION", "1.2.3.4");
-        let mut emitted = Vec::new();
-        let result = copy_to_clipboard_with("hi", ClipboardPlatform::Unix, &env, &mut |seq| {
-            emitted.push(seq.to_owned());
-        });
-        assert!(result.is_ok());
-        assert_eq!(emitted.len(), 1);
+        let cancel = CancellationToken::new();
+        let result =
+            copy_to_clipboard_with("hi", ClipboardPlatform::Unix, &env, &cancel).await?;
+        assert!(matches!(result, ClipboardCopyResult::Osc52(_)));
+        Ok(())
     }
 
-    #[test]
-    fn oversize_without_tool_errors_without_emit() {
+    #[tokio::test]
+    async fn oversize_without_tool_errors_without_operation() {
         let env = MapEnv::default();
-        let mut emitted = 0;
+        let cancel = CancellationToken::new();
         let result = copy_to_clipboard_with(
             &"a".repeat(MAX_OSC52_ENCODED_LENGTH * 3 / 4 + 1),
             ClipboardPlatform::Unix,
             &env,
-            &mut |_| emitted += 1,
-        );
+            &cancel,
+        )
+        .await;
         assert!(matches!(result, Err(ClipboardError::Failed)));
-        assert_eq!(emitted, 0);
+    }
+    #[tokio::test]
+    async fn pre_cancelled_operations_report_cancellation() {
+        let env = MapEnv::default();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            copy_to_clipboard_with("hi", ClipboardPlatform::Unix, &env, &cancel).await,
+            Err(ClipboardError::Cancelled)
+        ));
+        assert!(matches!(
+            read_clipboard_text_with(ClipboardPlatform::Unix, &env, &cancel).await,
+            ClipboardReadResult::Failed(ClipboardError::Cancelled)
+        ));
+        assert!(matches!(
+            read_clipboard_image_with(ClipboardPlatform::Unix, &env, &cancel).await,
+            ClipboardReadResult::Failed(ClipboardError::Cancelled)
+        ));
     }
 
     #[test]
@@ -775,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn read_wayland_is_wl_paste_no_newline() -> TestResult {
+    fn read_wayland_is_wl_paste_text_no_newline() -> TestResult {
         let env = MapEnv::default()
             .set("WAYLAND_DISPLAY", "wayland-0")
             .set("XDG_SESSION_TYPE", "wayland");
@@ -784,7 +1232,7 @@ mod tests {
             "Wayland read command",
         )?;
         assert_eq!(cmd.program, "wl-paste");
-        assert_eq!(cmd.args, vec!["--no-newline"]);
+        assert_eq!(cmd.args, vec!["--no-newline", "--type", "text"]);
         Ok(())
     }
 
@@ -817,17 +1265,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_image_returns_none_on_non_unix() {
+    #[tokio::test]
+    async fn read_image_is_unavailable_on_non_unix() {
         let env = MapEnv::default();
-        assert!(read_clipboard_image_with(ClipboardPlatform::Darwin, &env).is_none());
-        assert!(read_clipboard_image_with(ClipboardPlatform::Windows, &env).is_none());
+        let cancel = CancellationToken::new();
+        assert!(matches!(
+            read_clipboard_image_with(ClipboardPlatform::Darwin, &env, &cancel).await,
+            ClipboardReadResult::Unavailable
+        ));
+        assert!(matches!(
+            read_clipboard_image_with(ClipboardPlatform::Windows, &env, &cancel).await,
+            ClipboardReadResult::Unavailable
+        ));
     }
 
-    #[test]
-    fn read_image_returns_none_for_termux() {
+    #[tokio::test]
+    async fn read_image_is_empty_for_termux() {
         let env = MapEnv::default().set("TERMUX_VERSION", "1.0");
-        assert!(read_clipboard_image_with(ClipboardPlatform::Unix, &env).is_none());
+        let cancel = CancellationToken::new();
+        assert!(matches!(
+            read_clipboard_image_with(ClipboardPlatform::Unix, &env, &cancel).await,
+            ClipboardReadResult::Empty
+        ));
     }
 
     #[test]

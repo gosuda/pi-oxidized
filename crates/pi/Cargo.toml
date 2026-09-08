@@ -21,6 +21,7 @@ dirs = "=6.0.0"
 jiff = "=0.2.35"
 indexmap = { version = "=2.14.0", features = ["serde"] }
 memchr = "=2.8.3"
+percent-encoding = { version = "=2.3.2", default-features = false }
 pi-agent = { version = "=0.1.0", path = "../pi-agent" }
 pi-ai = { version = "=0.1.0", path = "../pi-ai" }
 pi-ext = { version = "=0.1.0", path = "../pi-ext" }
@@ -29,6 +30,7 @@ ratatui = { version = "=0.30.2", default-features = false, features = ["crosster
 semver = "=1.0.28"
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "system-proxy"] }
 regex = "=1.13.1"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive", "rc"] }
 schemars = "=1.2.2"
 same-file = "=1.0.6"

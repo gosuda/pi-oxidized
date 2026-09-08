@@ -147,21 +147,30 @@ impl TerminalInput {
     ///
     /// Returns `Ok(Some(dark))` when OSC 11 classified a polarity, or `Ok(None)`
     /// on timeout / no-TTY / unparseable reply (caller keeps its prior value).
-    /// Interleaved keystrokes are reinjected through the resume path.
+    /// The requery drives the SAME persistent reader the stream uses; keys
+    /// typed during the requery (and any pending CSI/UTF-8/paste state) stay
+    /// queued in the shared parser and are delivered after resume.
     ///
     /// # Errors
     ///
     /// Returns an I/O error if pause/resume fails or writing the query fails.
-    /// On write failure the stream is still resumed (best-effort empty reinject)
-    /// so the input task is never left paused.
+    /// On write failure the stream is still resumed (empty reinject) so the
+    /// input task is never left paused. A latched reply protocol error is
+    /// surfaced to the caller AFTER in-place recovery, so the session stays
+    /// usable.
     pub async fn requery_background<W: Write>(&self, output: &mut W) -> io::Result<Option<bool>> {
         self.pause().await?;
         match probe_background(output) {
-            Ok((dark, reinject)) => {
-                self.resume(reinject).await?;
+            Ok(dark) => {
+                self.resume(Vec::new()).await?;
                 Ok(dark)
             }
             Err(error) => {
+                if crossterm::event::reply::is_protocol_error(&error) {
+                    // Defined recovery: clear the latch so the resumed stream
+                    // starts healthy; the error still reaches the caller.
+                    crossterm::event::reply::recover_protocol_error();
+                }
                 let _ = self.resume(Vec::new()).await;
                 Err(error)
             }
@@ -198,6 +207,10 @@ async fn input_task_with_factory<S, F>(
                     reinject,
                     acknowledged,
                 }) => {
+                    // Defined recovery: a latched reply protocol error (from
+                    // a recognized malformed or oversized reply) clears here
+                    // so the recreated stream starts healthy.
+                    crossterm::event::reply::recover_protocol_error();
                     stream = Some(make_stream());
                     for event in reinject {
                         if tx.send(event).is_err() {
@@ -250,7 +263,16 @@ async fn input_task_with_factory<S, F>(
                     return;
                 }
             }
-            InputWake::Event(Some(Err(_))) => {
+            InputWake::Event(Some(Err(error))) => {
+                if crossterm::event::reply::is_protocol_error(&error) {
+                    // Recognized malformed or oversized reply framing: stop
+                    // decoding and park until a control message. A later
+                    // resume recovers the parser (defined session recovery);
+                    // keys are never replayed and nothing is discarded
+                    // silently (the tty is simply not read while parked).
+                    stream = None;
+                    paused = true;
+                }
                 // Transient read errors are ignored; EOF ends the task.
             }
         }
@@ -266,7 +288,7 @@ pub fn map_event(event: Event) -> Option<UiEvent> {
         Event::FocusGained => Some(UiEvent::FocusGained),
         Event::FocusLost => Some(UiEvent::FocusLost),
         Event::Resize(width, height) => Some(UiEvent::Resize { width, height }),
-        Event::Mouse(_) => None,
+        Event::Mouse(mouse) => Some(UiEvent::Mouse(mouse)),
     }
 }
 
@@ -290,7 +312,9 @@ pub fn try_map_next() -> io::Result<Option<UiEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
 
     #[test]
     fn maps_key_paste_focus_resize() {
@@ -309,6 +333,13 @@ mod tests {
                 height: 24
             })
         );
+        let mouse = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(map_event(mouse), Some(UiEvent::Mouse(_))));
     }
     #[tokio::test]
     async fn pause_resume_acknowledges_and_reinjects() -> io::Result<()> {
@@ -333,13 +364,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requery_background_resume_reinjects_from_chunks() -> io::Result<()> {
-        // Exercise the pause → reinject → resume control path that requery_background
-        // uses; classification itself is unit-tested via probe_background_from_chunks.
+    async fn protocol_error_parks_stream_and_resume_recovers() -> io::Result<()> {
+        // A latched reply protocol error stops decoding and parks the task;
+        // a resume recovers the parser and a fresh stream stays live. Keys
+        // are never replayed and nothing is silently discarded.
+        let protocol_message =
+            "crossterm reply protocol error: malformed OSC 11 reply framing (test)";
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
-        tokio::spawn(input_task_with_factory(events_tx, control_rx, || {
-            futures::stream::pending::<io::Result<Event>>()
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_calls = std::sync::Arc::clone(&calls);
+        tokio::spawn(input_task_with_factory(events_tx, control_rx, move || {
+            factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(futures::stream::iter(vec![Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                protocol_message,
+            ))]))
+                as std::pin::Pin<Box<dyn futures::Stream<Item = io::Result<Event>> + Send>>
         }));
         let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
         let mut input = TerminalInput {
@@ -349,17 +390,21 @@ mod tests {
             control_rx: None,
         };
 
+        // Give the task a tick to hit the error and park.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            input.try_recv().is_none(),
+            "the protocol error must not surface as a key event"
+        );
+
+        // Pause still works while parked, and resume recovers.
         input.pause().await?;
-        let (dark, reinject) = crate::terminal::probe::probe_background_from_chunks([
-            b"z".as_slice(),
-            b"\x1b]11;#ffffff\x07".as_slice(),
-        ]);
-        assert_eq!(dark, Some(false));
-        input.resume(reinject).await?;
-        assert!(matches!(
-            input.recv().await,
-            Some(UiEvent::Key(k)) if k.code == KeyCode::Char('z')
-        ));
+        input.resume(Vec::new()).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "resume must recreate the stream after recovery"
+        );
         input.shutdown();
         Ok(())
     }

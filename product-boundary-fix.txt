@@ -1,0 +1,75 @@
+Product boundary fix — runtime.rs slot release test
+
+Failure
+-------
+The new test `release_reaches_terminal_input_then_focused_slot_editor_unchanged`
+in `crates/pi/src/modes/interactive/runtime.rs` was constructing a raw
+`pi_ext::protocol::Frame { kind: pi_ext::protocol::FrameKind::Event, ... }` to
+register a focusable slot. `Frame` and `FrameKind` are not in the
+`interactive/runtime.rs` allowance in `crates/pi/src/modes/wire_boundary.rs`, so
+the `modes_consume_only_ledgered_pi_ext_symbols` gate failed.
+
+Missing fixture contract
+------------------------
+The existing core test fixture `slot_frame` in
+`crates/pi/src/core/extension_runtime_set/mod.rs` built a `uiSlot` `Frame` but
+hard-coded:
+- `generation: 1`
+- `placement: "aboveEditor"`
+- `height: 1`
+- a single run line containing the supplied `text`
+- `focusable: false`
+
+The runtime test needed `focusable: true` (key `release.check`, text `focused`,
+generation `1`). The fixture could not represent a focusable slot without
+broadening.
+
+Change
+------
+- `crates/pi/src/core/extension_runtime_set/mod.rs` (`#[cfg(test)] mod tests`):
+  - Broadened `slot_frame` from `fn slot_frame(key, text)` to
+    `pub(crate) fn slot_frame(key, text, focusable: bool) -> Frame`.
+  - Replaced the hard-coded `"focusable": false` with the parameter.
+  - Updated all 8 existing in-module `slot_frame(...)` callers to pass `false`,
+    preserving their exact prior payload.
+
+- `crates/pi/src/modes/interactive/runtime.rs` (same test):
+  - Replaced the raw `pi_ext::protocol::Frame` / `FrameKind::Event` construction
+    with the core-owned fixture:
+
+    ```rust
+    ext_host
+        .emit(crate::core::extension_runtime_set::tests::slot_frame(
+            "release.check",
+            "focused",
+            true,
+        ))
+        .await;
+    ```
+
+  - Kept the existing `project_extension_slot` projection with the same
+    `SanitizedSlot` (key `release.check`, generation `1`, focusable `true`),
+    preserving terminal-input-then-uiEvent ordering and the unchanged editor.
+
+No production wire API was introduced. The fixture stays inside the existing
+`#[cfg(test)]` module and is only made `pub(crate)` so the runtime test can reach
+it.
+
+Why not a separate `focused_slot_frame` helper
+----------------------------------------------
+A separate `focused_slot_frame` would have been a one-use wrapper/duplicate of
+`slot_frame` and would not reuse the existing fixture as the task instructs.
+Broadening `slot_frame` with a `focusable` parameter keeps a single source of
+truth for slot-frame construction while adding the one missing capability.
+
+Verification
+------------
+- `grep` of `crates/pi/src/modes/interactive/runtime.rs` for
+  `pi_ext::protocol::Frame` and `pi_ext::protocol::FrameKind` returns no
+  matches.
+- The emitted `uiSlot` frame still carries key `release.check`, generation `1`,
+  placement `aboveEditor`, `focusable: true`, and runs `[[{"text": "focused"}]]`.
+- Existing core fixture callers remain on the same function and produce the same
+  payload by passing `false`.
+- No cargo, rustc, clippy, rustfmt, bun, or commit commands were run per
+  instruction.

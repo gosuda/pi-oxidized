@@ -26,7 +26,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::task::JoinHandle;
 
+use ratatui::layout::Size;
+
 use crate::component::UiEvent;
+use crate::terminal::ScreenMode;
 use crate::terminal::caps::TerminalCapabilities;
 use crate::terminal::guard::TerminalGuard;
 use crate::terminal::input::TerminalInput;
@@ -77,13 +80,13 @@ impl<W: Write> TerminalSession<W> {
         enable_kitty: bool,
         probe_caps: TerminalCapabilities,
     ) -> io::Result<(Self, TerminalInput)> {
-        let probe_written = probe_write_batch(guard.writer_mut())?;
+        let issued = probe_write_batch(guard.writer_mut())?;
         let probe_yield = Arc::new(AtomicBool::new(false));
-        let probe_task = probe_written.then(|| {
+        let probe_task = issued.map(|issued| {
             let mut caps = probe_caps;
             let yield_now = Arc::clone(&probe_yield);
             tokio::task::spawn_blocking(move || {
-                probe_collect_replies_with_yield(&mut caps, &yield_now)
+                probe_collect_replies_with_yield(&mut caps, &yield_now, &issued)
                     .map(|pending| (caps, pending))
             })
         });
@@ -119,7 +122,15 @@ impl<W: Write> TerminalSession<W> {
         match self.probe_task.take() {
             Some(handle) => match handle.await {
                 Ok(Ok(joined)) => Ok(joined),
-                Ok(Err(error)) => Err(format!("terminal probe failed: {error}")),
+                Ok(Err(error)) => {
+                    // Defined recovery on a latched reply protocol error:
+                    // clear the latch so a session retry starts healthy; the
+                    // failure still surfaces to the caller.
+                    if crossterm::event::reply::is_protocol_error(&error) {
+                        crossterm::event::reply::recover_protocol_error();
+                    }
+                    Err(format!("terminal probe failed: {error}"))
+                }
                 Err(error) => Err(format!("terminal probe task failed: {error}")),
             },
             None => Ok((fallback_caps, Vec::new())),
@@ -132,7 +143,6 @@ impl<W: Write> TerminalSession<W> {
     pub fn start_input(&mut self, input: &mut TerminalInput) {
         input.start();
     }
-
     /// Pause the input reader and restore terminal modes for an external
     /// editor. The product runs the editor between this and
     /// [`Self::resume_from_editor`].
@@ -149,21 +159,87 @@ impl<W: Write> TerminalSession<W> {
         Ok(())
     }
 
+    /// Pause the sole reader, switch guard-owned screen modes, query the
+    /// terminal's current dimensions, and resume the same reader.
+    ///
+    /// The pause acknowledgment is awaited before any mode bytes are written;
+    /// no second event stream or probe reader is created.
+    ///
+    /// # Errors
+    ///
+    /// Returns a string when pausing or resuming input, changing terminal
+    /// modes, querying terminal dimensions, or restoring the previous mode
+    /// fails.
+    pub async fn switch_screen_mode(
+        &mut self,
+        input: &TerminalInput,
+        mode: ScreenMode,
+    ) -> Result<Size, String> {
+        input
+            .pause()
+            .await
+            .map_err(|e| format!("pause terminal input for screen-mode switch: {e}"))?;
+
+        let previous_mode = self.guard.screen_mode();
+        let mut lifecycle = self
+            .guard
+            .set_screen_mode(mode)
+            .map_err(|e| format!("switch terminal to {mode}: {e}"))
+            .and_then(|()| {
+                fresh_terminal_size()
+                    .map_err(|e| format!("query terminal size after switching to {mode}: {e}"))
+            });
+
+        if lifecycle.is_err()
+            && previous_mode != mode
+            && let Err(error) = self.guard.set_screen_mode(previous_mode)
+        {
+            lifecycle = Err(format!(
+                "{}; failed to restore {previous_mode} after the failed switch: {error}",
+                lifecycle
+                    .err()
+                    .unwrap_or_else(|| "screen-mode switch failed".to_owned())
+            ));
+        }
+
+        let resumed = input
+            .resume(Vec::new())
+            .await
+            .map_err(|e| format!("resume terminal input after screen-mode switch: {e}"));
+
+        let size = lifecycle?;
+        resumed?;
+        self.guard
+            .set_viewport_bottom_row(size.height.saturating_sub(1));
+        Ok(size)
+    }
+
     /// Re-activate terminal modes and resume the input reader after an
     /// external editor returns.
     ///
     /// # Errors
     ///
-    /// Returns a string when guard re-activation or input resume fails.
-    pub async fn resume_from_editor(&mut self, input: &TerminalInput) -> Result<(), String> {
-        self.guard
+    /// Returns a string when guard re-activation, size querying, or input
+    /// resume fails. The dimensions are queried only after mode restoration.
+    pub async fn resume_from_editor(&mut self, input: &TerminalInput) -> Result<Size, String> {
+        let lifecycle = self
+            .guard
             .resume(self.enable_kitty)
-            .map_err(|e| format!("terminal resume after editor failed: {e}"))?;
-        input
+            .map_err(|e| format!("terminal resume after editor failed: {e}"))
+            .and_then(|()| {
+                fresh_terminal_size()
+                    .map_err(|e| format!("query terminal size after editor: {e}"))
+            });
+        let resumed = input
             .resume(Vec::new())
             .await
-            .map_err(|e| format!("resume terminal input after editor: {e}"))?;
-        Ok(())
+            .map_err(|e| format!("resume terminal input after editor: {e}"));
+
+        let size = lifecycle?;
+        resumed?;
+        self.guard
+            .set_viewport_bottom_row(size.height.saturating_sub(1));
+        Ok(size)
     }
 
     /// Suspend terminal modes and raise SIGTSTP (ctrl+Z path). Does NOT
@@ -176,13 +252,18 @@ impl<W: Write> TerminalSession<W> {
         self.guard.suspend()
     }
 
-    /// Re-activate terminal modes after SIGCONT.
+    /// Re-activate modes after SIGCONT and return freshly queried dimensions.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error when terminal modes cannot be re-enabled.
-    pub fn resume(&mut self) -> io::Result<()> {
-        self.guard.resume(self.enable_kitty)
+    /// Returns an I/O error when terminal modes cannot be re-enabled or the
+    /// terminal size cannot be queried.
+    pub fn resume(&mut self) -> io::Result<Size> {
+        self.guard.resume(self.enable_kitty)?;
+        let size = fresh_terminal_size()?;
+        self.guard
+            .set_viewport_bottom_row(size.height.saturating_sub(1));
+        Ok(size)
     }
 
     /// Restore terminal modes. The input reader is stopped by dropping the
@@ -193,9 +274,20 @@ impl<W: Write> TerminalSession<W> {
         self.guard.restore();
     }
 
+    /// Current guard-owned screen mode.
+    #[must_use]
+    pub fn screen_mode(&self) -> ScreenMode {
+        self.guard.screen_mode()
+    }
+
     /// Borrow the guard for viewport updates (operations that do not
     /// involve the input reader).
     pub fn guard_mut(&mut self) -> &mut TerminalGuard<W> {
         &mut self.guard
     }
+}
+
+
+fn fresh_terminal_size() -> io::Result<Size> {
+    crossterm::terminal::size().map(|(width, height)| Size::new(width, height))
 }

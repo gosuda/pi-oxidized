@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
-	"capturedAt": "2026-08-30",
-	"captureHead": "14ed8987638b70a661cbddeb7bae1de2141dbe1a",
-	"contentSha256": "e743f5ad9a13d4e7180bad6a2ccb69e8ed9708c38fd8817923b8f9a69ada13c8",
+	"capturedAt": "2026-09-06",
+	"captureHead": "68b684b3e7799353bd8446e17f32c4efd0c6c034",
+	"contentSha256": "9950adce9ef7e0f44c7c705fd2beaf9772a37f2905fca5b957282600eb37ccf2",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.98.0",
@@ -700,7 +700,7 @@
 					"name": "crossterm",
 					"version": "0.29.0",
 					"license": "MIT",
-					"source": "registry",
+					"source": "path",
 					"direct": true,
 					"devOnly": false
 				},
@@ -709,8 +709,8 @@
 					"version": "0.9.1",
 					"license": "MIT",
 					"source": "registry",
-					"direct": false,
-					"devOnly": false
+					"direct": true,
+					"devOnly": true
 				},
 				{
 					"name": "crypto-common",
@@ -2116,8 +2116,8 @@
 					"name": "pi-bench-alloc",
 					"version": "0.1.0",
 					"license": "MIT",
-					"source": "workspace",
-					"direct": false,
+					"source": "path",
+					"direct": true,
 					"devOnly": false
 				},
 				{
@@ -4023,6 +4023,224 @@
 					"source": "registry",
 					"direct": false,
 					"devOnly": false
+				}
+			],
+			"vendorPins": [
+				{
+					"path": "vendor/crossterm-0.29.0/.cargo_vcs_info.json",
+					"sha256": "c36e7cbcffc6c12772c1e6f9205c9eeb139af7d9dd702f9dcdb266e8f03d43ad"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/Cargo.toml",
+					"sha256": "fe17aaa5081f4d433222e8668723baa1a031ad23996db73f25db5b374741b6b5"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/Cargo.toml.orig",
+					"sha256": "8d87a16b486f2543653f1bf0dad9960134f7bb6c5baa0543f0796d946e46bc96"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/LICENSE",
+					"sha256": "3fea97e00df9a8e30027f4298d6941b6970c542ffd49de68b4a2bcafedcbfe02"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/VENDORED.txt",
+					"sha256": "a98e6d26acb0d3ee02198a1732658fda57bfbfd6be335a90e43e98d449160fb0"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/ansi_support.rs",
+					"sha256": "448fb698820e6ec484ca9af2fb1787bd116151bd7ecc094619fb6d6fb82c26f0"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/clipboard.rs",
+					"sha256": "bafe97119af69b28a84e99305b231a47452d6878458884c739febb6e7cc2b482"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/command.rs",
+					"sha256": "d708a54f5817b2d482db0405d622c1c0c9f27ed8dc5bcba622a84e25bbaba6d8"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/cursor.rs",
+					"sha256": "9da6d3829ca686c6fb1349b3df89a66275d1188f987866d4ba14fb1c48e812ed"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/cursor/sys.rs",
+					"sha256": "ba420a9c7e3d7a5f3c63d9477e6f203b41ffd179e905783b0d6e99453a097e17"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/cursor/sys/unix.rs",
+					"sha256": "58a01b9ff63dabf2643bcdf061a30c53004ea3a2901ac63df32295ad0d7a49f4"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/cursor/sys/windows.rs",
+					"sha256": "be4241a9eda7664fc7ebf2b81f74a71272ab858b8019bdf9cf52d432ebf8a2c8"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event.rs",
+					"sha256": "9fe5492083db815cb9f14dbd92a9f8cacbb6e4075fb365376be05b45bf763263"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/filter.rs",
+					"sha256": "b5252ef197551d18228e3b94bfe10712dca9c1d8f4debeb42f7738ea3419e2e8"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/read.rs",
+					"sha256": "0f75e87ff2375062456001165fc15f80e2a54fe721043bd9d96048167d57b2c2"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/reply.rs",
+					"sha256": "a8b377c7144029df470ef374a683e267756fd21ced3e5c33a24beac4777e460c"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/source.rs",
+					"sha256": "2a7d864c24a3d703c9f908b93926ec98d122e578a2da499787af4d26140b13ce"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/source/unix.rs",
+					"sha256": "41f1657521bd0b1da2a50e519a337477e435fe6f8b8281fd1c888119ddc60ca9"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/source/unix/mio.rs",
+					"sha256": "c1bbf72d800b37bce3ad7d4e8c43ff3dcb262afe588a277bb36e6d7557f5cb78"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/source/unix/parser.rs",
+					"sha256": "887879e97a26d30e1713e562dc3503be665803b0358eb94cbbdb5ca284589dc2"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/source/unix/tty.rs",
+					"sha256": "c7c269b7da493057c4d95f06392c216f7fffefad85f1efaf2a13d83217a2b833"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/source/windows.rs",
+					"sha256": "a72c54493d59a4644f3c7d963a97fc33c4bba026271a8ff0c33c3b9c8272b0ea"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/stream.rs",
+					"sha256": "03cea949ceff61a3c701e338442bd7073ae1e001e6b79ee7ee22e0c57ccf70a5"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/sys.rs",
+					"sha256": "83178ce09bde11cebbd0e88d4b8bfa04b9ca09c063e9fe6ddc42b0a9f7f30f94"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/sys/unix.rs",
+					"sha256": "d59069208030bf35a8c49868f0afaef619b65f761abd7249c267f97226cc9d4a"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/sys/unix/parse.rs",
+					"sha256": "d20567f6ddd092767021f63ce8737b096c6f37ea3591f7acf7038ad3652c1275"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker.rs",
+					"sha256": "ee4a3919a6efd345c36b439646b34d8d653949d002b0151816b7dc75a5037a00"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker/mio.rs",
+					"sha256": "b804a0fc038efd7e4c330c728631c4fb993f61462b7c95922dbcca347ef26d83"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker/tty.rs",
+					"sha256": "e4aa438fdff35d01fef23917461479f29539d76e8ff7c4f37e170dc1f959e2bb"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/sys/windows.rs",
+					"sha256": "7dac602a97be6ddb3549503f243538b9f26f1f2fbadf72676b4159271cf886ac"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/sys/windows/parse.rs",
+					"sha256": "ae94dac1df1ea51f5568413c6c52eadace7cc2271e52dc44528295591c72f1dc"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/sys/windows/poll.rs",
+					"sha256": "758b62859494a4899bbc5cac5cbda4fb64546fbf86f61158a392287a2b93f803"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/sys/windows/waker.rs",
+					"sha256": "482694d0c7c4958389888cf4936ef232726f98c01456537ae85cad28fab50f46"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/event/timeout.rs",
+					"sha256": "3925941551c65ee91d73c9a6329ae04a4e25993a3592dfab02d3eb866ada6004"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/lib.rs",
+					"sha256": "5a1b80d777521a592afe5740d5b74ad92cae3728434e7b1d000d68891ec56c04"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/macros.rs",
+					"sha256": "0920397c6549ad356e49de43032c587104a4f25d6ffcff2a42b8798770c97767"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/style.rs",
+					"sha256": "bb7f3340bd97727bf71c0ea55833f07fdfc4ed97d66dc9696e3757efca356494"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/style/attributes.rs",
+					"sha256": "b6fcf6c4078b3766dd357a519ec188f78a64566fd805c93c9bc64bf1a521a64d"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/style/content_style.rs",
+					"sha256": "d66fe8512fb24a3c6da1e5643d3de67f490095dc1ecb0b9de7ab6483d96cf53e"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/style/styled_content.rs",
+					"sha256": "a2767a96d4cf32ebc34291be68e3f34b51f3f92bb15800e157eaea3ee6bfcfbe"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/style/stylize.rs",
+					"sha256": "513a0606ac5bbcfcaa5ae2a24d800719df91df978d3c460266b2a71ce120eecd"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/style/sys.rs",
+					"sha256": "903a72d85b9e8f8338c07e1fed63bbe60b17c4f55717235a991e644ec9fe23c8"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/style/sys/windows.rs",
+					"sha256": "faed0c37988eb4c8dfae350ad7e467e1b99fe9bf93e3f4e4d0f0b68f7d625971"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/style/types.rs",
+					"sha256": "a67aa3d3a6d3aa0146da820c48d1cbed707126e1ba29aef24aa9aa711f07cb3e"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/style/types/attribute.rs",
+					"sha256": "65ec6a50426c99bf4a5a841507c63076a09f03c0036cd406e623a00453414e53"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/style/types/color.rs",
+					"sha256": "cf89ee2d48e0f34c459351ca68434f4b5feeefb0d5e651b31863c3aa0b13f837"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/style/types/colored.rs",
+					"sha256": "de1e14c130d45886f2cfcb71ae4450faf15960599f211da94feb426cec3a63da"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/style/types/colors.rs",
+					"sha256": "413d455e4ea18e34bb034cd751b2bafe526de142609d6953f4b31c6fdeaadf81"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/terminal.rs",
+					"sha256": "a2c2be0e684ead8096db2804a0ca45112fac10cee7633c1f08092d7ac85fd759"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/terminal/sys.rs",
+					"sha256": "aac896a84c47fb830f71f3cf3627db6a4ca67e51c289a54297ee66b6b191e9e9"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/terminal/sys/file_descriptor.rs",
+					"sha256": "dfe7c23834cb47ca9531db0bb6b20c4ff6fc433ce3b433e0ce3da4d8ad1ede74"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/terminal/sys/unix.rs",
+					"sha256": "2afd2359fd2d047a682a3cb664fb656cd4b6a0c39567ddb8dd49dca6779d45f3"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/terminal/sys/windows.rs",
+					"sha256": "9854180b52eca2335d329ab5a0382c2f88a8ee20f7f7c18b0211210a39617508"
+				},
+				{
+					"path": "vendor/crossterm-0.29.0/src/tty.rs",
+					"sha256": "2586695bed85f0b8aa84f49dd80fe973f4a78258d43d37a0bb709e87f74394d0"
 				}
 			]
 		},
@@ -6923,5 +7141,413 @@
 				"x86_64-pc-windows-msvc"
 			]
 		}
+	},
+	"stagedInputProvenance": {
+		"schema": "pi.deps.staged-inputs.v1",
+		"mode": "staged",
+		"baseHead": "68b684b3e7799353bd8446e17f32c4efd0c6c034",
+		"objectFormat": "sha1",
+		"pathspecs": [
+			".cargo/config",
+			".cargo/config.toml",
+			".gitattributes",
+			".github/workflows/release-verification.yml",
+			"Cargo.lock",
+			"Cargo.toml",
+			"bun.lock",
+			"crates/pi-agent/Cargo.toml",
+			"crates/pi-ai/Cargo.toml",
+			"crates/pi-ext/Cargo.toml",
+			"crates/pi-tui/Cargo.toml",
+			"crates/pi/Cargo.toml",
+			"package.json",
+			"packages/extension-host/bun.lock",
+			"packages/extension-host/package.json",
+			"packages/pi-tui-protocol/package.json",
+			"rust-toolchain.toml",
+			"scripts/release/runtime.ts",
+			"scripts/release/targets.ts",
+			"scripts/verification/capture-inputs.ts",
+			"scripts/verification/deps-sbom.ts",
+			"scripts/verification/vendor-provenance.ts",
+			"vendor/*/.cargo_vcs_info.json",
+			"vendor/*/Cargo.toml",
+			"vendor/*/Cargo.toml.orig",
+			"vendor/*/LICENSE",
+			"vendor/*/VENDORED.txt",
+			"vendor/*/src/**"
+		],
+		"entries": [
+			{
+				"path": ".gitattributes",
+				"mode": "100644",
+				"blob": "eb96df24e9085424e37e7b373b597b2c076ce236"
+			},
+			{
+				"path": ".github/workflows/release-verification.yml",
+				"mode": "100644",
+				"blob": "c4003e97a0b67796232124c6fb1cfd3a219d3255"
+			},
+			{
+				"path": "Cargo.lock",
+				"mode": "100644",
+				"blob": "9333ac98336c46f81aa8403d81f2f1ac960a14dc"
+			},
+			{
+				"path": "Cargo.toml",
+				"mode": "100644",
+				"blob": "c0e6de4d99ab5107a1da12f519ac5c9ad8c8ea52"
+			},
+			{
+				"path": "bun.lock",
+				"mode": "100644",
+				"blob": "e822c661d810b9e80b9e8828f23c5f229d7e0b78"
+			},
+			{
+				"path": "crates/pi-agent/Cargo.toml",
+				"mode": "100644",
+				"blob": "f4e4d8996c3237e3ed53e7df7db5dc83d41f642f"
+			},
+			{
+				"path": "crates/pi-ai/Cargo.toml",
+				"mode": "100644",
+				"blob": "b570a34245f834068d37e4376c4745ebd511a2f6"
+			},
+			{
+				"path": "crates/pi-ext/Cargo.toml",
+				"mode": "100644",
+				"blob": "c5d897145de7d25924914a501938197022c6adac"
+			},
+			{
+				"path": "crates/pi-tui/Cargo.toml",
+				"mode": "100644",
+				"blob": "4c84cd072a48d37bbac43ea42831cd582beeb9b1"
+			},
+			{
+				"path": "crates/pi/Cargo.toml",
+				"mode": "100644",
+				"blob": "1df2a6cd10941d1201b37c82ce553b18523f00ba"
+			},
+			{
+				"path": "package.json",
+				"mode": "100644",
+				"blob": "fb13e61d1e73a3939974609322284ed61c80ebba"
+			},
+			{
+				"path": "packages/extension-host/bun.lock",
+				"mode": "100644",
+				"blob": "8b6718961e3117bdfcb818f15db79985802557d9"
+			},
+			{
+				"path": "packages/extension-host/package.json",
+				"mode": "100644",
+				"blob": "0816c493f840e6b7655d9d0e6a87938fb2fa1296"
+			},
+			{
+				"path": "packages/pi-tui-protocol/package.json",
+				"mode": "100644",
+				"blob": "d660aa05561e638bcbdf89d4ed5b1c9141db3aab"
+			},
+			{
+				"path": "rust-toolchain.toml",
+				"mode": "100644",
+				"blob": "aa20bc990d6f843fffb559d502c73c74132111d0"
+			},
+			{
+				"path": "scripts/release/runtime.ts",
+				"mode": "100644",
+				"blob": "1c81245fc7bbfb83b4699d9fb4aceaa6ebef8254"
+			},
+			{
+				"path": "scripts/release/targets.ts",
+				"mode": "100644",
+				"blob": "6cd0c5fdc5858f64767653c07d44a7afcd848089"
+			},
+			{
+				"path": "scripts/verification/capture-inputs.ts",
+				"mode": "100755",
+				"blob": "d8e64837354b3c88059100a2a77a86a6bf44b21a"
+			},
+			{
+				"path": "scripts/verification/deps-sbom.ts",
+				"mode": "100755",
+				"blob": "15134e9db2186e95e8b083d6dbc2a36c4afba553"
+			},
+			{
+				"path": "scripts/verification/vendor-provenance.ts",
+				"mode": "100644",
+				"blob": "1ef194ad86a5088a07b175ee90cb6119aa552035"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/.cargo_vcs_info.json",
+				"mode": "100644",
+				"blob": "a421cb9dbe09d2052e12bc77903f2aba495fee31"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/Cargo.toml",
+				"mode": "100644",
+				"blob": "8eaf70543ef9775a234d34ba0feae422ea8c2a84"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/Cargo.toml.orig",
+				"mode": "100644",
+				"blob": "41c3797dd9ebdc751273ee5d0554f58d76b7e9d0"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/LICENSE",
+				"mode": "100644",
+				"blob": "8b02a7fcef9fa4f7b7c5782e85ac25de76643235"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/VENDORED.txt",
+				"mode": "100644",
+				"blob": "4aa29fe9282d869232676dc438553ced4838159f"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/ansi_support.rs",
+				"mode": "100644",
+				"blob": "fc2f6f14473bbac5a29ef5337889be6e7b60a483"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/clipboard.rs",
+				"mode": "100644",
+				"blob": "75913112d71d128febbea1e928e9419f47c0757f"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/command.rs",
+				"mode": "100644",
+				"blob": "0a04fc5fbc6308c9021fd7356369eac4d59597f8"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/cursor.rs",
+				"mode": "100644",
+				"blob": "24796dc4506c43c80a7b2cf5e48ccf3134b6add5"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/cursor/sys.rs",
+				"mode": "100644",
+				"blob": "1623740a74bf4e40987338542ce64e0352b5b4a9"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/cursor/sys/unix.rs",
+				"mode": "100644",
+				"blob": "473421207ecf8442d410b556276189c645a77459"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/cursor/sys/windows.rs",
+				"mode": "100644",
+				"blob": "575346d48826a3fd02988847c1e471a2bcfeb869"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event.rs",
+				"mode": "100644",
+				"blob": "0df62d9d7c7a8d151d30b8e5508529d97932a73f"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/filter.rs",
+				"mode": "100644",
+				"blob": "cd7abce2b995c808449f573715ec2800fdd403b3"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/read.rs",
+				"mode": "100644",
+				"blob": "827c59b28304d62291de2abd9edda57d401b561f"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/reply.rs",
+				"mode": "100644",
+				"blob": "7f3f017b15c2e52657ac1e65f8a493cfec0a1693"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/source.rs",
+				"mode": "100644",
+				"blob": "0a26dd3ebebb96903de34d603570fec7cfddedd3"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/source/unix.rs",
+				"mode": "100644",
+				"blob": "3e36b62f5d2343666934626a60018da0b9a83ecf"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/source/unix/mio.rs",
+				"mode": "100644",
+				"blob": "4b6d0ee2253d25b8e52edb2c21ab95d69b553fba"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/source/unix/parser.rs",
+				"mode": "100644",
+				"blob": "d5d8cc12e5920f2d9d6a3e6829776918d8ab8f3d"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/source/unix/tty.rs",
+				"mode": "100644",
+				"blob": "307187eaf11d964ca2c1f623cd07ca8418db2a26"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/source/windows.rs",
+				"mode": "100644",
+				"blob": "fa40cc5027773d0e2f825ac955237d1ae289debf"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/stream.rs",
+				"mode": "100644",
+				"blob": "54c552a1e21b326ee7816b5e4ed1be80661b30dc"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/sys.rs",
+				"mode": "100644",
+				"blob": "bd79307351ad9e3179df7371d7ac56524b0c696f"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/sys/unix.rs",
+				"mode": "100644",
+				"blob": "2106ca0cc5bf09073efc4da7fc148372c2005e44"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/sys/unix/parse.rs",
+				"mode": "100644",
+				"blob": "14da692d35e731e7dec1b79d282aa5bd89feacf6"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker.rs",
+				"mode": "100644",
+				"blob": "1c55f3b801ae307ca8e1b6231f6a9005d1664e86"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker/mio.rs",
+				"mode": "100644",
+				"blob": "025db73d27b576138036a7ea5b58a9c3d28008ee"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker/tty.rs",
+				"mode": "100644",
+				"blob": "8fda30b64f442e043bf7116c5e860d6e3a8d2d36"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/sys/windows.rs",
+				"mode": "100644",
+				"blob": "d405ae821818ffbbda04e7a09d9ca977c2477680"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/sys/windows/parse.rs",
+				"mode": "100644",
+				"blob": "97677ecf6fce2ee5a78d29ec060c343d1d9637dd"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/sys/windows/poll.rs",
+				"mode": "100644",
+				"blob": "84d9bf76bb4e5fde6d9991061a3656f51dea2549"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/sys/windows/waker.rs",
+				"mode": "100644",
+				"blob": "9ec582bf4b06e1a31c14e0c488c856e600c3b7fa"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/event/timeout.rs",
+				"mode": "100644",
+				"blob": "f266d28dcc907f7bf27d6a9fe4899c89bbe6a3b6"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/lib.rs",
+				"mode": "100644",
+				"blob": "96818291d72fe1b5e5a29e769a58308206d49a19"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/macros.rs",
+				"mode": "100644",
+				"blob": "47ded98594abcd396d684948655472f268cc52a0"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/style.rs",
+				"mode": "100644",
+				"blob": "034b54ad69e4d6482f8c13c0615c411b688a8e67"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/style/attributes.rs",
+				"mode": "100644",
+				"blob": "83dea3edc5586dcb784be3891a2f339d1d808625"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/style/content_style.rs",
+				"mode": "100644",
+				"blob": "6e99bb6665a2cfde27a9134a88987559b7dbdd6d"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/style/styled_content.rs",
+				"mode": "100644",
+				"blob": "39ebe0dbef8d1f1b5f6f0ede7085453b5a0c9aa4"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/style/stylize.rs",
+				"mode": "100644",
+				"blob": "fcb12da5c4265fece31e991ec3bed3d6dca7735d"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/style/sys.rs",
+				"mode": "100644",
+				"blob": "5a5427620ee0e1c39db943259d9a27fc2373ca7f"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/style/sys/windows.rs",
+				"mode": "100644",
+				"blob": "f5e48b77db12f414308d5e00942c104809f85bbb"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/style/types.rs",
+				"mode": "100644",
+				"blob": "7cd7d6eec7e99750f601d6e1be98aaa559634759"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/style/types/attribute.rs",
+				"mode": "100644",
+				"blob": "d2f57f607a788d5560018ea85177461d94b927ec"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/style/types/color.rs",
+				"mode": "100644",
+				"blob": "00d50a65649c10e3736157e0338ebd49185c118d"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/style/types/colored.rs",
+				"mode": "100644",
+				"blob": "47f35666895f6875c43743f07df5c037b0f03129"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/style/types/colors.rs",
+				"mode": "100644",
+				"blob": "0b4afbf0cc43f73d76521e6073295cf9a303f6cd"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/terminal.rs",
+				"mode": "100644",
+				"blob": "3aebc1f8ef1f52595d636d65c5b20cc0e4b37dc5"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/terminal/sys.rs",
+				"mode": "100644",
+				"blob": "9dde47d0e98e42ba18bb68ff4331e848ec105581"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/terminal/sys/file_descriptor.rs",
+				"mode": "100644",
+				"blob": "baff266c67cbd0e90f3a3d7ad2c0bc9ecdee124f"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/terminal/sys/unix.rs",
+				"mode": "100644",
+				"blob": "f4ada1569b9d4d5b9c86a76a3f12d02fa6cfe58e"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/terminal/sys/windows.rs",
+				"mode": "100644",
+				"blob": "cd71fab8c239a388d40693953ae4375f24003890"
+			},
+			{
+				"path": "vendor/crossterm-0.29.0/src/tty.rs",
+				"mode": "100644",
+				"blob": "5a710b4abd4f2a106f52b1054eac8ca469d53367"
+			}
+		]
 	}
 }

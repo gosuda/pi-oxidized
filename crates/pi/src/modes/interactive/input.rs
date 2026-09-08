@@ -200,6 +200,9 @@ impl InputMapper {
                 // No app-level action; the runtime uses these as a heuristic
                 // to re-probe terminal light/dark on FocusGained.
             }
+            UiEvent::Mouse(_) => {
+                // Native fullscreen owns pointer routing before app actions.
+            }
             UiEvent::Key(key) => {
                 if !editor_consumed {
                     self.map_key(*key, view, editor_text, expanded_text, state, &mut out);
@@ -440,6 +443,7 @@ pub fn dismissable_overlay_kinds() -> &'static [OverlayKind] {
         OverlayKind::Changelog,
         OverlayKind::FirstTimeSetup,
         OverlayKind::Login,
+        OverlayKind::TranscriptSearch,
         OverlayKind::Extension,
     ]
 }

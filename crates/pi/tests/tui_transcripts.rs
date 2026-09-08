@@ -123,6 +123,7 @@ impl From<RecordingError> for CorpusError {
             RecordingError::Driver(error) => Self::Driver(error.to_string()),
             RecordingError::Transcript(error) => Self::Transcript(error.to_string()),
             RecordingError::FinishBeforeClose => Self::Driver(error.to_string()),
+            RecordingError::UnrecordedObservation(_) => Self::Transcript(error.to_string()),
         }
     }
 }

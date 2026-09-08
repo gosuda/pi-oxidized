@@ -974,7 +974,7 @@ fn parse_sidechannel_text(raw: &[u8], key: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+fn find_subslice<T: PartialEq>(haystack: &[T], needle: &[T]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
@@ -1030,4 +1030,1189 @@ fn fixture_bin_name() -> &'static str {
     } else {
         "pi_tui_pty_fixture"
     }
+}
+
+#[cfg(windows)]
+mod windows_raw_record {
+    use std::cell::Cell;
+    use std::io::{self, Write, stdout};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use crossterm_winapi::{
+        Console, ConsoleMode, ControlKeyState, EventFlags, Handle, InputRecord,
+    };
+    use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+    use serde::{Deserialize, Serialize};
+
+    use super::{
+        HARD_TIMEOUT, INITIAL_COLS, INITIAL_ROWS, READ_IDLE, find_subslice, write_stimulus,
+    };
+
+    const NOT_RAW_MASK: u32 = 0x0007;
+    const VT_INPUT: u32 = 0x0200;
+    const CHILD_RECORD_LIMIT: usize = 4096;
+    const TRANSCRIPT_LIMIT: usize = 1_048_576;
+    const CHILD_POLL_INTERVAL_MS: u64 = 5;
+    const DEFAULT_CHILD_DEADLINE_MS: u64 = 15000;
+
+    const RECORD_PREFIX: &[u8] = b"\x1b]999;PI_TUI_RAW_RECORD=";
+    const READY_PREFIX: &[u8] = b"\x1b]999;PI_TUI_RAW_RECORD_READY";
+
+    // crossterm_winapi 0.9.1's From<INPUT_RECORD> impl discards the raw
+    // WINDOW_BUFFER_SIZE_RECORD dwSize and substitutes the live screen-buffer
+    // size at read time, so resize coordinates cannot be captured verbatim
+    // through the approved safe wrapper. These notes keep the report honest
+    // about that derived provenance instead of claiming raw fidelity.
+    const RESIZE_FIDELITY_NOTE: &str = "unavailable: crossterm_winapi 0.9.1 replaces WindowBufferSizeEvent dwSize with the live screen-buffer size at read time; observed_screen_x/y are read-time screen values, not the record's original coordinates";
+    const STIMULUS_INJECTION_NOTE: &str = "direct master-writer injection; bypasses the Windows Terminal clipboard-paste relay that an outward \x1b[?2004h would arm; no manual-clipboard-paste claim";
+    const FULL_LOSSLESS_NOTE: &str = "unproven: raw resize coordinate fidelity is unavailable through the approved safe wrapper (see resize_coordinate_fidelity); a demonstrated verdict covers raw key-record paste-delimiter retention only, not full lossless-record feasibility";
+    const NEGOTIATION_NOTE: &str = "no \x1b[?2004h or \x1b[?9001h was emitted by the child and none was observed from the host; a teardown \x1b[?9001l would not prove \x1b[?9001h was negotiated; no negotiation is invented";
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+    pub struct RecordEntry {
+        pub idx: usize,
+        pub variant: String,
+        pub key_down: Option<bool>,
+        pub repeat_count: Option<u16>,
+        pub virtual_key_code: Option<u16>,
+        pub virtual_scan_code: Option<u16>,
+        pub u_char: Option<u16>,
+        pub control_key_state: Option<u32>,
+        pub mouse_x: Option<i16>,
+        pub mouse_y: Option<i16>,
+        pub button_state: Option<i32>,
+        pub mouse_control_key_state: Option<u32>,
+        pub event_flags: Option<u32>,
+        pub observed_screen_x: Option<i16>,
+        pub observed_screen_y: Option<i16>,
+        pub focus_set: Option<bool>,
+        pub menu_command_id: Option<u32>,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct LifecycleEntry {
+        pub stage: String,
+        pub arm: String,
+        pub original: u32,
+        pub baseline: u32,
+        pub requested: u32,
+        pub active: Option<u32>,
+        pub restored: Option<u32>,
+        pub error: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct TerminationEntry {
+        pub cause: String,
+        pub record_count: usize,
+        pub message: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    pub enum Event {
+        #[serde(rename = "record")]
+        Record(RecordEntry),
+        #[serde(rename = "lifecycle")]
+        Lifecycle(LifecycleEntry),
+        #[serde(rename = "termination")]
+        Termination(TerminationEntry),
+    }
+
+    #[derive(Clone, Debug, Serialize)]
+    pub struct ArmReport {
+        pub arm: String,
+        pub completed: bool,
+        pub original: Option<u32>,
+        pub baseline: Option<u32>,
+        pub requested: Option<u32>,
+        pub active: Option<u32>,
+        pub restored: Option<u32>,
+        pub record_count: usize,
+        pub records: Vec<RecordEntry>,
+        pub transcript_bytes: usize,
+        pub transcript_limit_exceeded: bool,
+        pub record_limit_exceeded: bool,
+        pub child_deadline_exceeded: bool,
+        pub child_terminated_normally: bool,
+        pub termination_cause: Option<String>,
+        pub termination_message: Option<String>,
+        pub opener_found: bool,
+        pub closer_found: bool,
+        pub payload_found: bool,
+        pub opener_position: Option<usize>,
+        pub payload_position: Option<usize>,
+        pub closer_position: Option<usize>,
+        pub delimiter_order_verified: bool,
+        pub navigation_inputs_identified: usize,
+        pub resize_requests_sent: usize,
+        pub resize_records_observed: usize,
+        pub resize_coordinate_fidelity: &'static str,
+        pub bracketed_paste_2004_observed: bool,
+        pub mode_9001_observed: bool,
+        pub line_break_codepoint: Option<String>,
+        pub stop_cause: Option<String>,
+        // Full lossless-record feasibility: never above "inconclusive"
+        // because raw resize-coordinate fidelity is unavailable.
+        pub feasibility: String,
+        // Separately gated exact key-record evidence: "demonstrated" only
+        // when every key-boundary check passed; never a stand-in for the
+        // full feasibility verdict.
+        pub exact_key_evidence: String,
+        // Explicit answer to "is the raw record stream proven lossless?":
+        // "refuted" when information loss was demonstrated, "inconclusive"
+        // when fully assessed but raw resize-coordinate fidelity is
+        // unavailable, "not_applicable" for the idle arm, "not_reached" when
+        // environmental/setup failures prevented assessment.
+        pub full_lossless_feasibility: String,
+    }
+
+    #[derive(Clone, Debug, Serialize)]
+    pub struct FinalReport {
+        pub arms: Vec<ArmReport>,
+        pub cross_arm_baseline_consistent: Option<bool>,
+        pub bracketed_paste_2004_emitted: bool,
+        pub mode_9001_emitted: bool,
+        pub negotiation_note: &'static str,
+        pub limitations: Vec<&'static str>,
+    }
+
+    const RESIZE_PLAN: [(u16, u16); 24] = [
+        (80, 24),
+        (40, 12),
+        (20, 8),
+        (12, 6),
+        (10, 5),
+        (8, 4),
+        (16, 10),
+        (32, 14),
+        (64, 20),
+        (100, 30),
+        (120, 40),
+        (200, 50),
+        (24, 8),
+        (18, 7),
+        (14, 6),
+        (11, 5),
+        (9, 4),
+        (28, 12),
+        (48, 16),
+        (72, 22),
+        (96, 28),
+        (160, 36),
+        (60, 18),
+        (80, 24),
+    ];
+
+    struct ModeGuard {
+        cm: ConsoleMode,
+        original: u32,
+        restored: Cell<bool>,
+    }
+
+    impl ModeGuard {
+        fn new(cm: ConsoleMode, original: u32) -> Self {
+            Self {
+                cm,
+                original,
+                restored: Cell::new(false),
+            }
+        }
+
+        fn set(&self, mode: u32) -> io::Result<()> {
+            self.cm.set_mode(mode)
+        }
+
+        fn mode(&self) -> io::Result<u32> {
+            self.cm.mode()
+        }
+
+        fn restore(&self) -> io::Result<u32> {
+            if self.restored.get() {
+                return self.cm.mode();
+            }
+            self.cm.set_mode(self.original)?;
+            let m = self.cm.mode()?;
+            self.restored.set(true);
+            Ok(m)
+        }
+    }
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            let _ = self.restore();
+        }
+    }
+
+    fn control_key_state_value(state: ControlKeyState) -> u32 {
+        (0..32).fold(0u32, |acc, bit| {
+            let mask = 1u32 << bit;
+            if state.has_state(mask) {
+                acc | mask
+            } else {
+                acc
+            }
+        })
+    }
+
+    fn event_flags_value(flags: EventFlags) -> u32 {
+        match flags {
+            EventFlags::PressOrRelease => 0x0000,
+            EventFlags::MouseMoved => 0x0001,
+            EventFlags::DoubleClick => 0x0002,
+            EventFlags::MouseWheeled => 0x0004,
+            EventFlags::MouseHwheeled => 0x0008,
+            EventFlags::Unknown => 0x0021,
+        }
+    }
+
+    fn convert_record(record: InputRecord, idx: usize) -> RecordEntry {
+        match record {
+            InputRecord::KeyEvent(k) => RecordEntry {
+                idx,
+                variant: "KeyEvent".into(),
+                key_down: Some(k.key_down),
+                repeat_count: Some(k.repeat_count),
+                virtual_key_code: Some(k.virtual_key_code),
+                virtual_scan_code: Some(k.virtual_scan_code),
+                u_char: Some(k.u_char),
+                control_key_state: Some(control_key_state_value(k.control_key_state)),
+                ..RecordEntry::default()
+            },
+            InputRecord::MouseEvent(m) => RecordEntry {
+                idx,
+                variant: "MouseEvent".into(),
+                mouse_x: Some(m.mouse_position.x),
+                mouse_y: Some(m.mouse_position.y),
+                button_state: Some(m.button_state.state()),
+                mouse_control_key_state: Some(control_key_state_value(m.control_key_state)),
+                event_flags: Some(event_flags_value(m.event_flags)),
+                ..RecordEntry::default()
+            },
+            InputRecord::WindowBufferSizeEvent(w) => RecordEntry {
+                idx,
+                variant: "WindowBufferSizeEvent".into(),
+                // crossterm_winapi 0.9.1 overwrites the record's dwSize with
+                // the live screen-buffer size at read time; these are observed
+                // screen values, not the record's original coordinates.
+                observed_screen_x: Some(w.size.x),
+                observed_screen_y: Some(w.size.y),
+                ..RecordEntry::default()
+            },
+            InputRecord::FocusEvent(f) => RecordEntry {
+                idx,
+                variant: "FocusEvent".into(),
+                focus_set: Some(f.set_focus),
+                ..RecordEntry::default()
+            },
+            InputRecord::MenuEvent(m) => RecordEntry {
+                idx,
+                variant: "MenuEvent".into(),
+                menu_command_id: Some(m.command_id),
+                ..RecordEntry::default()
+            },
+        }
+    }
+
+    fn is_terminator(entry: &RecordEntry) -> bool {
+        entry.variant == "KeyEvent" && entry.key_down == Some(true) && entry.u_char == Some(0x0004)
+    }
+
+    fn write_osc999_line(prefix: &[u8], body: &[u8]) {
+        let mut out = stdout().lock();
+        out.write_all(prefix).expect("write prefix");
+        out.write_all(body).expect("write body");
+        out.write_all(b"\x07").expect("write bel");
+        out.flush().expect("flush");
+    }
+
+    fn emit_event(event: &Event, prefix: &[u8]) {
+        let json = serde_json::to_string(event).expect("serialize event");
+        write_osc999_line(prefix, json.as_bytes());
+    }
+
+    fn emit_ready(arm: &str, active: u32) {
+        let body = format!("=1;arm={arm};active={active}");
+        write_osc999_line(READY_PREFIX, body.as_bytes());
+    }
+
+    fn emit_lifecycle_and_finish(
+        arm: &str,
+        original: u32,
+        baseline: u32,
+        requested: u32,
+        guard: &ModeGuard,
+        termination: TerminationEntry,
+    ) {
+        let mut termination = termination;
+        let mut errors: Vec<String> = Vec::new();
+
+        let restored = match guard.restore() {
+            Ok(m) => Some(m),
+            Err(e) => {
+                errors.push(format!("restore failed: {e}"));
+                None
+            }
+        };
+
+        // The post-restore mode is observed evidence: a failed read is
+        // recorded as an error and reported as `None`, never fabricated
+        // as a mode word.
+        let active = match guard.mode() {
+            Ok(m) => Some(m),
+            Err(e) => {
+                errors.push(format!("read post-restore mode failed: {e}"));
+                None
+            }
+        };
+
+        if let Some(m) = restored
+            && m != original
+        {
+            errors.push(format!("restored {m:#06x} != original {original:#06x}"));
+        }
+
+        let error = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        };
+        if let Some(e) = &error {
+            termination.message = Some(match termination.message.take() {
+                Some(prev) => format!("{prev}; {e}"),
+                None => e.clone(),
+            });
+        }
+
+        emit_event(
+            &Event::Lifecycle(LifecycleEntry {
+                stage: "teardown".into(),
+                arm: arm.into(),
+                original,
+                baseline,
+                requested,
+                active,
+                restored,
+                error,
+            }),
+            RECORD_PREFIX,
+        );
+        emit_event(&Event::Termination(termination), RECORD_PREFIX);
+    }
+
+    pub fn run_child() {
+        let arm = std::env::var("PI_TUI_RAW_RECORD_ARM")
+            .unwrap_or_else(|e| panic!("PI_TUI_RAW_RECORD_ARM must be set to A, B, or IDLE: {e}"));
+
+        assert!(
+            matches!(arm.as_str(), "A" | "B" | "IDLE"),
+            "PI_TUI_RAW_RECORD_ARM must be A, B, or IDLE, got {arm}"
+        );
+
+        let deadline_ms: u64 = match std::env::var("PI_TUI_RAW_RECORD_DEADLINE_MS") {
+            Ok(s) => s.parse().unwrap_or_else(|e| {
+                panic!("PI_TUI_RAW_RECORD_DEADLINE_MS {s:?} is not a u64: {e}")
+            }),
+            Err(std::env::VarError::NotPresent) => DEFAULT_CHILD_DEADLINE_MS,
+            Err(e) => panic!("PI_TUI_RAW_RECORD_DEADLINE_MS is not readable: {e}"),
+        };
+        let deadline = Duration::from_millis(deadline_ms);
+
+        let in_handle = match Handle::current_in_handle() {
+            Ok(h) => h,
+            Err(e) => {
+                emit_event(
+                    &Event::Termination(TerminationEntry {
+                        cause: "error".into(),
+                        record_count: 0,
+                        message: Some(format!("current_in_handle failed: {e}")),
+                    }),
+                    RECORD_PREFIX,
+                );
+                return;
+            }
+        };
+
+        let cm = ConsoleMode::from(in_handle.clone());
+        let console = Console::from(in_handle);
+
+        let original = match cm.mode() {
+            Ok(m) => m,
+            Err(e) => {
+                emit_event(
+                    &Event::Termination(TerminationEntry {
+                        cause: "error".into(),
+                        record_count: 0,
+                        message: Some(format!("read original mode failed: {e}")),
+                    }),
+                    RECORD_PREFIX,
+                );
+                return;
+            }
+        };
+
+        let baseline = original & !NOT_RAW_MASK;
+        let requested = match arm.as_str() {
+            "B" => baseline | VT_INPUT,
+            _ => baseline,
+        };
+
+        let guard = ModeGuard::new(cm, original);
+
+        let mut termination = TerminationEntry {
+            cause: "inconclusive".into(),
+            record_count: 0,
+            message: None,
+        };
+
+        if let Err(e) = guard.set(requested) {
+            termination.cause = "error".into();
+            termination.message = Some(format!("set_mode({requested:#06x}) failed: {e}"));
+            emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
+            return;
+        }
+
+        let active = match guard.mode() {
+            Ok(m) => m,
+            Err(e) => {
+                termination.cause = "error".into();
+                termination.message = Some(format!("read active mode failed: {e}"));
+                emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
+                return;
+            }
+        };
+
+        emit_event(
+            &Event::Lifecycle(LifecycleEntry {
+                stage: "setup".into(),
+                arm: arm.clone(),
+                original,
+                baseline,
+                requested,
+                active: Some(active),
+                restored: None,
+                error: if active == requested {
+                    None
+                } else {
+                    Some(format!(
+                        "active {active:#06x} != requested {requested:#06x}"
+                    ))
+                },
+            }),
+            RECORD_PREFIX,
+        );
+
+        if active != requested {
+            termination.cause = "inconclusive".into();
+            termination.message = Some(format!(
+                "mode setup mismatch: active {active:#06x} != requested {requested:#06x}"
+            ));
+            emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
+            return;
+        }
+
+        emit_ready(&arm, active);
+        emit_event(
+            &Event::Lifecycle(LifecycleEntry {
+                stage: "ready".into(),
+                arm: arm.clone(),
+                original,
+                baseline,
+                requested,
+                active: Some(active),
+                restored: None,
+                error: None,
+            }),
+            RECORD_PREFIX,
+        );
+
+        let started = Instant::now();
+        let mut record_count: usize = 0;
+        while started.elapsed() < deadline {
+            let count = match console.number_of_console_input_events() {
+                Ok(0) => {
+                    thread::sleep(Duration::from_millis(CHILD_POLL_INTERVAL_MS));
+                    continue;
+                }
+                Ok(c) => c,
+                Err(e) => {
+                    termination.cause = "error".into();
+                    termination.message =
+                        Some(format!("number_of_console_input_events failed: {e}"));
+                    break;
+                }
+            };
+
+            for _ in 0..count {
+                if started.elapsed() >= deadline {
+                    break;
+                }
+                if record_count >= CHILD_RECORD_LIMIT {
+                    termination.cause = "record_limit".into();
+                    termination.message =
+                        Some(format!("reached record limit {CHILD_RECORD_LIMIT}"));
+                    break;
+                }
+
+                match console.read_single_input_event() {
+                    Ok(record) => {
+                        record_count += 1;
+                        let entry = convert_record(record, record_count);
+                        let term = is_terminator(&entry);
+                        emit_event(&Event::Record(entry), RECORD_PREFIX);
+                        if term {
+                            termination.cause = "normal".into();
+                            termination.message =
+                                Some(format!("saw Ctrl+D terminator at record {record_count}"));
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        termination.cause = "error".into();
+                        termination.message = Some(format!("read_single_input_event failed: {e}"));
+                        break;
+                    }
+                }
+            }
+
+            if !matches!(termination.cause.as_str(), "inconclusive") {
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(CHILD_POLL_INTERVAL_MS));
+        }
+
+        if termination.cause == "inconclusive" {
+            termination.cause = "deadline".into();
+            termination.message = Some(format!(
+                "reached child deadline {} ms",
+                deadline.as_millis()
+            ));
+        }
+        termination.record_count = record_count;
+
+        emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
+    }
+
+    fn drain_pending(rx: &mpsc::Receiver<Vec<u8>>, raw: &mut Vec<u8>) {
+        while let Ok(chunk) = rx.try_recv() {
+            raw.extend_from_slice(&chunk);
+        }
+    }
+
+    const NAV_VK_CODES: [u16; 6] = [0x25, 0x27, 0x26, 0x28, 0x24, 0x23];
+    const NAV_CSI_FINALS: [u16; 6] = [0x44, 0x43, 0x41, 0x42, 0x48, 0x46];
+
+    struct KeyEvidence {
+        opener_pos: Option<usize>,
+        payload_pos: Option<usize>,
+        closer_pos: Option<usize>,
+        line_break: Option<String>,
+        navigation_identified: usize,
+    }
+
+    fn analyze_key_records(records: &[RecordEntry]) -> KeyEvidence {
+        let key_chars: Vec<u16> = records
+            .iter()
+            .filter(|r| r.variant == "KeyEvent" && r.key_down == Some(true))
+            .filter_map(|r| r.u_char)
+            .collect();
+
+        let opener = [0x001Bu16, 0x005B, 0x0032, 0x0030, 0x0030, 0x007E];
+        let closer = [0x001B, 0x005B, 0x0032, 0x0030, 0x0031, 0x007E];
+
+        let opener_pos = find_subslice(&key_chars, &opener);
+        let closer_pos = find_subslice(&key_chars, &closer);
+
+        let payload_lf: Vec<u16> = b"PASTED-BLOCK-line1\nline2"
+            .iter()
+            .map(|&b| u16::from(b))
+            .collect();
+        let payload_cr: Vec<u16> = b"PASTED-BLOCK-line1\rline2"
+            .iter()
+            .map(|&b| u16::from(b))
+            .collect();
+        let payload_crlf: Vec<u16> = b"PASTED-BLOCK-line1\r\nline2"
+            .iter()
+            .map(|&b| u16::from(b))
+            .collect();
+
+        let (payload_pos, line_break) = if let Some(p) = find_subslice(&key_chars, &payload_lf) {
+            (Some(p), Some("LF".into()))
+        } else if let Some(p) = find_subslice(&key_chars, &payload_cr) {
+            (Some(p), Some("CR".into()))
+        } else if let Some(p) = find_subslice(&key_chars, &payload_crlf) {
+            (Some(p), Some("CRLF".into()))
+        } else {
+            (None, None)
+        };
+
+        // A navigation input is identifiable either as a translated VK
+        // key-down record or as its raw CSI final in the u_char stream;
+        // which form arrives is itself evidence, so neither is prescribed.
+        let mut navigation_identified = 0usize;
+        for (vk, final_byte) in NAV_VK_CODES.iter().zip(NAV_CSI_FINALS.iter()) {
+            let by_vk = records.iter().any(|r| {
+                r.variant == "KeyEvent"
+                    && r.key_down == Some(true)
+                    && r.virtual_key_code == Some(*vk)
+            });
+            let by_csi = find_subslice(&key_chars, &[0x001B, 0x005B, *final_byte]).is_some();
+            if by_vk || by_csi {
+                navigation_identified += 1;
+            }
+        }
+
+        KeyEvidence {
+            opener_pos,
+            payload_pos,
+            closer_pos,
+            line_break,
+            navigation_identified,
+        }
+    }
+
+    /// Parses the delimited record stream. Every prefixed record must be
+    /// well-formed: a truncated record, invalid UTF-8, or invalid JSON is
+    /// a named failure, never a silent skip, because a skipped record is
+    /// indistinguishable from dropped evidence. Events parsed before a
+    /// failure are retained for the report alongside the failure.
+    fn parse_events(raw: &[u8]) -> (Vec<Event>, Option<String>) {
+        let mut events = Vec::new();
+        let mut idx = 0;
+        while let Some(rel) = find_subslice(&raw[idx..], RECORD_PREFIX) {
+            let start = idx + rel + RECORD_PREFIX.len();
+            let Some(end_rel) = raw
+                .get(start..)
+                .and_then(|tail| tail.iter().position(|&b| b == 0x07))
+            else {
+                return (
+                    events,
+                    Some(format!(
+                        "truncated record at byte {start}: prefix without BEL terminator"
+                    )),
+                );
+            };
+            let end = start + end_rel;
+            let s = match std::str::from_utf8(&raw[start..end]) {
+                Ok(s) => s,
+                Err(e) => {
+                    return (
+                        events,
+                        Some(format!("record at byte {start} is not valid UTF-8: {e}")),
+                    );
+                }
+            };
+            match serde_json::from_str::<Event>(s) {
+                Ok(ev) => events.push(ev),
+                Err(e) => {
+                    return (
+                        events,
+                        Some(format!("record at byte {start} is not valid JSON: {e}")),
+                    );
+                }
+            }
+            idx = end + 1;
+        }
+        (events, None)
+    }
+
+    fn run_arm(pty_system: &NativePtySystem, arm: &str, has_stimulus: bool) -> ArmReport {
+        let mut report = ArmReport {
+            arm: arm.into(),
+            completed: false,
+            original: None,
+            baseline: None,
+            requested: None,
+            active: None,
+            restored: None,
+            record_count: 0,
+            records: Vec::new(),
+            transcript_bytes: 0,
+            transcript_limit_exceeded: false,
+            record_limit_exceeded: false,
+            child_deadline_exceeded: false,
+            child_terminated_normally: false,
+            termination_cause: None,
+            termination_message: None,
+            opener_found: false,
+            closer_found: false,
+            payload_found: false,
+            opener_position: None,
+            payload_position: None,
+            closer_position: None,
+            delimiter_order_verified: false,
+            navigation_inputs_identified: 0,
+            resize_requests_sent: 0,
+            resize_records_observed: 0,
+            resize_coordinate_fidelity: RESIZE_FIDELITY_NOTE,
+            bracketed_paste_2004_observed: false,
+            mode_9001_observed: false,
+            line_break_codepoint: None,
+            stop_cause: None,
+            feasibility: "inconclusive".into(),
+            exact_key_evidence: "not_reached".into(),
+            full_lossless_feasibility: "not_reached".into(),
+        };
+
+        let pair = match pty_system.openpty(PtySize {
+            rows: INITIAL_ROWS,
+            cols: INITIAL_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                report.stop_cause = Some(format!("openpty failed: {e}"));
+                return report;
+            }
+        };
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut cmd = CommandBuilder::new(&exe);
+        cmd.arg("--exact");
+        cmd.arg("windows_raw_input_record_child");
+        cmd.arg("--ignored");
+        cmd.arg("--nocapture");
+        cmd.arg("--test-threads=1");
+        cmd.env("PI_TUI_RAW_RECORD_ARM", arm);
+        cmd.env(
+            "PI_TUI_RAW_RECORD_DEADLINE_MS",
+            if has_stimulus { "15000" } else { "3000" },
+        );
+        cmd.env("NO_COLOR", "1");
+
+        let mut child = match pair.slave.spawn_command(cmd) {
+            Ok(c) => c,
+            Err(e) => {
+                report.stop_cause = Some(format!("spawn_command failed: {e}"));
+                return report;
+            }
+        };
+        drop(pair.slave);
+
+        let mut writer = pair.master.take_writer().expect("take writer");
+        let mut reader = pair.master.try_clone_reader().expect("clone reader");
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let reader_thread = thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let mut raw: Vec<u8> = Vec::new();
+        let mut ready = false;
+
+        let ready_pat = format!("\x1b]999;PI_TUI_RAW_RECORD_READY=1;arm={arm}").into_bytes();
+
+        while started.elapsed() < HARD_TIMEOUT && !ready {
+            drain_pending(&rx, &mut raw);
+            if raw.len() > TRANSCRIPT_LIMIT {
+                report.transcript_limit_exceeded = true;
+                break;
+            }
+            if find_subslice(&raw, &ready_pat).is_some() {
+                ready = true;
+                break;
+            }
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        if ready && has_stimulus {
+            write_stimulus(
+                &mut writer,
+                child.as_mut(),
+                b"\x1b[200~PASTED-BLOCK-line1\nline2\x1b[201~",
+                "paste",
+            );
+            write_stimulus(
+                &mut writer,
+                child.as_mut(),
+                b"\x1b[D\x1b[C\x1b[A\x1b[B\x1b[H\x1b[F",
+                "cursor",
+            );
+
+            for (cols, rows) in RESIZE_PLAN {
+                if started.elapsed() > HARD_TIMEOUT {
+                    break;
+                }
+                if let Err(e) = pair.master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                }) {
+                    report.stop_cause = Some(format!("resize failed: {e}"));
+                    break;
+                }
+                report.resize_requests_sent += 1;
+                let slice_deadline = Instant::now() + Duration::from_millis(50);
+                while Instant::now() < slice_deadline {
+                    drain_pending(&rx, &mut raw);
+                    if raw.len() > TRANSCRIPT_LIMIT {
+                        report.transcript_limit_exceeded = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                if report.transcript_limit_exceeded {
+                    break;
+                }
+            }
+
+            if !report.transcript_limit_exceeded {
+                write_stimulus(&mut writer, child.as_mut(), b"\x04", "ctrl+d");
+            }
+        }
+
+        let mut child_exited = false;
+        while started.elapsed() < HARD_TIMEOUT {
+            drain_pending(&rx, &mut raw);
+            if raw.len() > TRANSCRIPT_LIMIT {
+                report.transcript_limit_exceeded = true;
+                break;
+            }
+            if child.try_wait().ok().flatten().is_some() {
+                child_exited = true;
+                let drain_until = Instant::now() + READ_IDLE;
+                while Instant::now() < drain_until {
+                    drain_pending(&rx, &mut raw);
+                    thread::sleep(Duration::from_millis(10));
+                }
+                break;
+            }
+            thread::sleep(Duration::from_millis(15));
+        }
+
+        if !child_exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            report.stop_cause = Some("child did not exit before HARD_TIMEOUT".into());
+        }
+        drop(writer);
+        let _ = reader_thread.join();
+        drain_pending(&rx, &mut raw);
+
+        report.transcript_bytes = raw.len();
+        if raw.len() > TRANSCRIPT_LIMIT {
+            report.transcript_limit_exceeded = true;
+        }
+
+        let (events, parse_failure) = parse_events(&raw);
+        let mut lifecycles: Vec<LifecycleEntry> = Vec::new();
+        let mut records: Vec<RecordEntry> = Vec::new();
+        let mut termination: Option<TerminationEntry> = None;
+
+        for ev in events {
+            match ev {
+                Event::Lifecycle(l) => lifecycles.push(l),
+                Event::Record(r) => records.push(r),
+                Event::Termination(t) => termination = Some(t),
+            }
+        }
+
+        let setup = lifecycles.iter().find(|l| l.stage == "setup");
+        let teardown = lifecycles.iter().find(|l| l.stage == "teardown");
+
+        if let Some(s) = setup {
+            report.original = Some(s.original);
+            report.baseline = Some(s.baseline);
+            report.requested = Some(s.requested);
+            report.active = s.active;
+        }
+
+        if let Some(t) = teardown {
+            report.restored = t.restored;
+        }
+
+        if let Some(t) = &termination {
+            report.record_count = t.record_count;
+            report.child_terminated_normally = t.cause == "normal";
+            report.termination_cause = Some(t.cause.clone());
+            report.termination_message.clone_from(&t.message);
+            report.record_limit_exceeded = t.cause == "record_limit";
+            report.child_deadline_exceeded = t.cause == "deadline";
+        }
+
+        // Record indexes are a contiguous 1-based sequence assigned by the
+        // child, and the termination entry carries the child's own record
+        // count. A gap or a disagreement means records were dropped between
+        // child and parent, in which case no evidence-based verdict may
+        // stand.
+        let record_evidence_error = if records.iter().enumerate().any(|(pos, r)| r.idx != pos + 1) {
+            Some("record index sequence is not contiguous from 1; records were dropped".to_string())
+        } else {
+            match termination.as_ref().map(|t| t.record_count) {
+                Some(n) if n == records.len() => None,
+                Some(n) => Some(format!(
+                    "termination record_count {n} != {} parsed records; records were dropped",
+                    records.len()
+                )),
+                None => Some(
+                    "termination record missing; child record count cannot be cross-checked".into(),
+                ),
+            }
+        };
+        let evidence_failures: Vec<String> = [parse_failure, record_evidence_error]
+            .into_iter()
+            .flatten()
+            .collect();
+
+        let evidence = analyze_key_records(&records);
+        report.opener_found = evidence.opener_pos.is_some();
+        report.closer_found = evidence.closer_pos.is_some();
+        report.payload_found = evidence.payload_pos.is_some();
+        report.opener_position = evidence.opener_pos;
+        report.payload_position = evidence.payload_pos;
+        report.closer_position = evidence.closer_pos;
+        report.delimiter_order_verified = matches!(
+            (evidence.opener_pos, evidence.payload_pos, evidence.closer_pos),
+            (Some(o), Some(p), Some(c)) if o < p && p < c
+        );
+        report.navigation_inputs_identified = evidence.navigation_identified;
+        report.line_break_codepoint = evidence.line_break;
+        // The observed resize count is recorded as-is: the OS may coalesce
+        // the 24 resize requests, so no one-record-per-request correspondence
+        // is assumed.
+        report.resize_records_observed = records
+            .iter()
+            .filter(|r| r.variant == "WindowBufferSizeEvent")
+            .count();
+        report.bracketed_paste_2004_observed = find_subslice(&raw, b"\x1b[?2004h").is_some()
+            || find_subslice(&raw, b"\x1b[?2004l").is_some();
+        report.mode_9001_observed = find_subslice(&raw, b"\x1b[?9001h").is_some()
+            || find_subslice(&raw, b"\x1b[?9001l").is_some();
+        let last_record_is_terminator = records.last().is_some_and(is_terminator);
+        let lifecycle_errors: Vec<String> =
+            lifecycles.iter().filter_map(|l| l.error.clone()).collect();
+        report.records = records;
+
+        report.completed = child_exited && !report.transcript_limit_exceeded;
+
+        if !report.completed {
+            report.feasibility = "failed".into();
+            if report.stop_cause.is_none() {
+                report.stop_cause = Some("child did not complete".into());
+            }
+        } else if !evidence_failures.is_empty() {
+            // A rejected record or a broken record-index sequence means
+            // evidence was dropped in transit; dropped evidence can never
+            // produce a verdict.
+            report.feasibility = "failed".into();
+            let failure = evidence_failures.join("; ");
+            report.stop_cause = Some(match report.stop_cause.take() {
+                Some(prev) => format!("{prev}; {failure}"),
+                None => failure,
+            });
+        } else if report.record_limit_exceeded {
+            report.feasibility = "failed".into();
+            report.stop_cause = Some("record count exceeded 4096".into());
+        } else if report.active != report.requested {
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+            if report.stop_cause.is_none() {
+                report.stop_cause = Some("active mode did not match requested".into());
+            }
+        } else if report.stop_cause.is_some() {
+            // A retained mid-plan cause (for example a resize failure) is an
+            // environmental/delivery defect; never clobber it with a verdict.
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+        } else if arm == "IDLE" {
+            report.feasibility = "nonblocking_idle".into();
+            report.exact_key_evidence = "not_applicable".into();
+        } else if report.original.is_some_and(|o| o & VT_INPUT != 0) {
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+            report.stop_cause = Some(
+                "baseline already has ENABLE_VIRTUAL_TERMINAL_INPUT (0x0200); no A/B contrast"
+                    .into(),
+            );
+        } else if !report.child_terminated_normally {
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+            report.stop_cause = Some(format!(
+                "child did not stop on a recorded Ctrl+D terminator (termination cause: {})",
+                report
+                    .termination_cause
+                    .as_deref()
+                    .unwrap_or("none recorded")
+            ));
+        } else if !last_record_is_terminator {
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+            report.stop_cause =
+                Some("ordered Ctrl+D terminator record not retained as final record".into());
+        } else if !matches!((report.original, report.restored), (Some(o), Some(r)) if o == r) {
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+            report.stop_cause = Some("exact original input mode restore not observed".into());
+        } else if !lifecycle_errors.is_empty() {
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+            report.stop_cause = Some(format!(
+                "lifecycle errors retained: {}",
+                lifecycle_errors.join("; ")
+            ));
+        } else if evidence.opener_pos.is_none() || evidence.closer_pos.is_none() {
+            // Setup, delivery, and termination are verified, so a missing
+            // delimiter is verified information loss, not an environmental
+            // failure.
+            report.feasibility = "incomplete".into();
+            report.exact_key_evidence = "incomplete".into();
+            let missing = match (evidence.opener_pos.is_none(), evidence.closer_pos.is_none()) {
+                (true, true) => "ESC[200~ opener and ESC[201~ closer",
+                (true, false) => "ESC[200~ opener",
+                _ => "ESC[201~ closer",
+            };
+            report.stop_cause = Some(format!("missing genuine {missing} delimiter"));
+        } else if evidence.payload_pos.is_none() {
+            report.feasibility = "incomplete".into();
+            report.exact_key_evidence = "incomplete".into();
+            report.stop_cause = Some("exact paste payload not found in raw key records".into());
+        } else if !report.delimiter_order_verified {
+            report.feasibility = "incomplete".into();
+            report.exact_key_evidence = "incomplete".into();
+            report.stop_cause = Some(format!(
+                "delimiter/payload ordering not retained: opener@{:?} payload@{:?} closer@{:?}",
+                evidence.opener_pos, evidence.payload_pos, evidence.closer_pos
+            ));
+        } else if evidence.navigation_identified < 6 {
+            report.feasibility = "incomplete".into();
+            report.exact_key_evidence = "incomplete".into();
+            report.stop_cause = Some(format!(
+                "only {} of six navigation inputs identifiable in raw records",
+                evidence.navigation_identified
+            ));
+        } else if report.resize_records_observed == 0 {
+            report.feasibility = "incomplete".into();
+            report.exact_key_evidence = "incomplete".into();
+            report.stop_cause = Some("no WindowBufferSizeEvent records retained".into());
+        } else {
+            // Every key-boundary check passed: exact key evidence is
+            // demonstrated. Full lossless-record feasibility remains
+            // inconclusive because raw resize-coordinate fidelity is
+            // unavailable through the approved safe wrapper; the narrower
+            // result is never substituted for it.
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "demonstrated".into();
+            report.stop_cause = Some(FULL_LOSSLESS_NOTE.into());
+        }
+
+        report.full_lossless_feasibility = match report.feasibility.as_str() {
+            // Verified information loss refutes full lossless-record
+            // feasibility outright.
+            "incomplete" => "refuted".into(),
+            // The idle arm does not exercise the record path.
+            "nonblocking_idle" => "not_applicable".into(),
+            // A fully assessed arm still cannot prove lossless capture:
+            // raw resize-coordinate fidelity is unavailable through the
+            // approved safe wrapper.
+            "inconclusive" if report.exact_key_evidence == "demonstrated" => "inconclusive".into(),
+            // Environmental/setup/termination failures never reached the
+            // full-lossless assessment.
+            _ => "not_reached".into(),
+        };
+
+        report
+    }
+
+    pub fn run_parent() {
+        let pty_system = NativePtySystem::default();
+        let arms = [("A", true), ("B", true), ("IDLE", false)];
+        let mut arm_reports = Vec::new();
+
+        for (arm, has_stimulus) in arms {
+            let report = run_arm(&pty_system, arm, has_stimulus);
+            arm_reports.push(report);
+        }
+
+        // The A/B contrast is only valid when both fresh ConPTY children
+        // inherited the same baseline mode word.
+        let cross_arm_baseline_consistent = match (arm_reports[0].baseline, arm_reports[1].baseline)
+        {
+            (Some(a), Some(b)) => Some(a == b),
+            _ => None,
+        };
+        if cross_arm_baseline_consistent == Some(false) {
+            for r in arm_reports.iter_mut().take(2) {
+                if r.exact_key_evidence == "demonstrated" {
+                    r.exact_key_evidence = "inconclusive".into();
+                    r.full_lossless_feasibility = "not_reached".into();
+                    r.stop_cause = Some(
+                        "cross-arm baseline mismatch: arms A and B observed different baseline mode words; no valid A/B contrast"
+                            .into(),
+                    );
+                }
+            }
+        }
+
+        let final_report = FinalReport {
+            arms: arm_reports,
+            cross_arm_baseline_consistent,
+            bracketed_paste_2004_emitted: false,
+            mode_9001_emitted: false,
+            negotiation_note: NEGOTIATION_NOTE,
+            limitations: vec![
+                STIMULUS_INJECTION_NOTE,
+                RESIZE_FIDELITY_NOTE,
+                FULL_LOSSLESS_NOTE,
+            ],
+        };
+        let json = serde_json::to_string_pretty(&final_report).expect("serialize final report");
+
+        let mut out = stdout().lock();
+        out.write_all(json.as_bytes()).expect("write final report");
+        out.write_all(b"\n").expect("write newline");
+        out.flush().expect("flush final report");
+
+        for r in &final_report.arms {
+            assert!(r.completed, "arm {} did not complete", r.arm);
+            assert!(
+                !r.transcript_limit_exceeded,
+                "arm {} exceeded 1 MiB transcript limit",
+                r.arm
+            );
+            assert!(
+                !r.record_limit_exceeded,
+                "arm {} exceeded 4096 record limit",
+                r.arm
+            );
+            match (r.original, r.restored) {
+                (Some(o), Some(rst)) => {
+                    assert_eq!(o, rst, "arm {} did not restore exact original mode", r.arm);
+                }
+                _ => panic!("arm {} missing mode restoration words", r.arm),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_raw_input_records_vt_mode_ab() {
+    windows_raw_record::run_parent();
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "helper entry point: the parent test `windows_raw_input_records_vt_mode_ab` spawns this \
+ by name under a private ConPTY environment and reserved env contract"]
+fn windows_raw_input_record_child() {
+    windows_raw_record::run_child();
 }

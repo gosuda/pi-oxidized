@@ -409,6 +409,22 @@ pub fn paint_lines_keyed(area: Rect, buf: &mut Buffer, lines: &[KeyedLine]) {
         paint_line_with_key(area.x, y, width, buf, &keyed.line, keyed.key);
     }
 }
+/// Paint one pre-keyed display row into `area`.
+///
+/// The [`KeyedLine`] key is passed to the existing keyed painter so frame
+/// claims, memo validation, and OSC 8 annotations follow the same path as the
+/// regular multi-row renderer. The line must have been keyed for `area.width`;
+/// a mismatch is handled by the keyed painter's width validation.
+pub fn paint_keyed_line(area: Rect, buf: &mut Buffer, line: &KeyedLine) {
+    paint_line_with_key(
+        area.x,
+        area.y,
+        usize::from(area.width),
+        buf,
+        line.line(),
+        line.key(),
+    );
+}
 
 /// Paint a single ANSI-capable line starting at `(x, y)`.
 ///

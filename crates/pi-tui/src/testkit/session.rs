@@ -32,6 +32,11 @@ pub enum RecordingError {
     /// The artifact was requested before the child closed successfully.
     #[error("recording cannot finish before the session closes successfully")]
     FinishBeforeClose,
+    /// The session closed while output drained by noncanonical observation
+    /// was never folded into a recorded boundary; the transcript must not
+    /// finalize with silently discarded evidence.
+    #[error("session closed with {0} unrecorded observed output bytes")]
+    UnrecordedObservation(usize),
 }
 
 /// Couples one live driver session to its canonical transcript recorder.
@@ -39,6 +44,10 @@ pub struct RecordingSession<S: DriverSession> {
     session: Option<S>,
     recorder: TranscriptRecorder,
     closed: bool,
+    /// Raw output drained by [`RecordingSession::observe_frame_until`],
+    /// retained in arrival order until the next recorded output boundary
+    /// folds it into the canonical transcript.
+    deferred: Vec<u8>,
 }
 
 impl<S: DriverSession> RecordingSession<S> {
@@ -53,6 +62,7 @@ impl<S: DriverSession> RecordingSession<S> {
             session: Some(session),
             recorder,
             closed: false,
+            deferred: Vec::new(),
         })
     }
 
@@ -90,8 +100,14 @@ impl<S: DriverSession> RecordingSession<S> {
         F: FnMut(&[u8]) -> bool,
     {
         let session = self.session.as_mut().ok_or(DriverError::Closed)?;
-        let batch = session.read_output(policy, predicate)?;
-        self.recorder.output(&[batch.bytes.as_slice()], context)?;
+        let mut batch = session.read_output(policy, predicate)?;
+        self.recorder
+            .output(&[self.deferred.as_slice(), batch.bytes.as_slice()], context)?;
+        if !self.deferred.is_empty() {
+            let mut bytes = std::mem::take(&mut self.deferred);
+            bytes.extend_from_slice(&batch.bytes);
+            batch.bytes = bytes;
+        }
         Ok(batch)
     }
 
@@ -100,11 +116,16 @@ impl<S: DriverSession> RecordingSession<S> {
     /// # Errors
     ///
     /// Returns [`RecordingError::Driver`] if close fails or the session was
-    /// already consumed, and [`RecordingError::Transcript`] if the exit event
-    /// cannot be recorded.
+    /// already consumed, [`RecordingError::UnrecordedObservation`] when
+    /// observed output was never folded into a recorded boundary (the child
+    /// is still cleaned up first), and [`RecordingError::Transcript`] if the
+    /// exit event cannot be recorded.
     pub fn close(&mut self) -> Result<ExitStatus, RecordingError> {
         let session = self.session.take().ok_or(DriverError::Closed)?;
         let status = session.close()?;
+        if !self.deferred.is_empty() {
+            return Err(RecordingError::UnrecordedObservation(self.deferred.len()));
+        }
         self.recorder
             .exit(i32::try_from(status.code).ok(), status.success())?;
         self.closed = true;
@@ -248,9 +269,48 @@ impl<S: RenderSession> RecordingSession<S> {
         self.record_frame(frame, context)
     }
 
+    /// Observes the live viewport until `predicate` holds, subject to
+    /// `ceiling`, without recording a canonical boundary.
+    ///
+    /// This is NOT a canonical quiescence checkpoint: it drives
+    /// [`RenderSession::read_settled_frame_where`] with a private zero-quiet
+    /// policy purely as an observation primitive, so the predicate is
+    /// evaluated against the current viewport as output arrives rather than
+    /// after a quiet window. No Snapshot/Output event and no settle-window
+    /// timing entry is emitted, and no input is recorded.
+    ///
+    /// Raw bytes drained while observing are retained in arrival order and
+    /// prepended to the next recorded output boundary
+    /// ([`Self::read_output`], [`Self::read_settled_frame`],
+    /// [`Self::read_settled_frame_where`]), so the following canonical
+    /// checkpoint still captures every byte exactly once and its output
+    /// audit stays complete. Repeated observations concatenate retained
+    /// bytes without loss or duplication. A failed observation leaves
+    /// retained bytes untouched; closing with unrecorded observed output
+    /// fails closed via [`RecordingError::UnrecordedObservation`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordingError::Driver`] when the observation ceiling
+    /// elapses, the reader fails, or the session is closed.
+    pub fn observe_frame_until<F>(
+        &mut self,
+        ceiling: Duration,
+        predicate: F,
+    ) -> Result<TerminalSnapshot, RecordingError>
+    where
+        F: FnMut(&TerminalSnapshot) -> bool,
+    {
+        let session = self.session.as_mut().ok_or(DriverError::Closed)?;
+        let policy = SettlePolicy::new(Duration::ZERO, ceiling)?;
+        let frame = session.read_settled_frame_where(&policy, predicate)?;
+        self.deferred.extend_from_slice(&frame.batch.bytes);
+        Ok(frame.snapshot)
+    }
+
     fn record_frame(
         &mut self,
-        frame: SettledFrame,
+        mut frame: SettledFrame,
         context: &NormalizationContext,
     ) -> Result<SettledFrame, RecordingError> {
         Geometry::new(frame.snapshot.geometry.cols, frame.snapshot.geometry.rows)?;
@@ -260,13 +320,18 @@ impl<S: RenderSession> RecordingSession<S> {
         let cursor_row = u16::try_from(frame.snapshot.cursor_row)
             .map_err(|_| DriverError::InvalidSpec("snapshot cursor row exceeds u16".to_owned()))?;
         self.recorder.output_and_snapshot(
-            &[frame.batch.bytes.as_slice()],
+            &[self.deferred.as_slice(), frame.batch.bytes.as_slice()],
             frame.snapshot.geometry.cols,
             frame.snapshot.geometry.rows,
             [cursor_col, cursor_row],
             frame.snapshot.lines.clone(),
             context,
         )?;
+        if !self.deferred.is_empty() {
+            let mut bytes = std::mem::take(&mut self.deferred);
+            bytes.extend_from_slice(&frame.batch.bytes);
+            frame.batch.bytes = bytes;
+        }
         Ok(frame)
     }
 }
@@ -398,9 +463,13 @@ impl ReaderPump {
                                     idx = abs + query.len();
                                 }
                             }
-                            let take = chunk.len().min(MAX_QUERY_LEN - 1);
+                            // Retain the tail of the combined scan, not of
+                            // this chunk alone: a query fragmented across
+                            // three or more reads otherwise loses its
+                            // earlier prefix and is never answered.
+                            let take = scan.len().min(MAX_QUERY_LEN - 1);
                             residual.clear();
-                            residual.extend_from_slice(&chunk[chunk.len() - take..]);
+                            residual.extend_from_slice(&scan[scan.len() - take..]);
                         }
 
                         if tx.send(Ok(chunk.to_vec())).is_err() {
@@ -767,6 +836,7 @@ mod tests {
         cursor_row: usize,
         chunks: Vec<Vec<u8>>,
         raw_log: Vec<u8>,
+        policies: Vec<SettlePolicy>,
     }
 
     impl Default for FakeRender {
@@ -780,6 +850,7 @@ mod tests {
                 cursor_row: 2,
                 chunks: Vec::new(),
                 raw_log: Vec::new(),
+                policies: Vec::new(),
             }
         }
     }
@@ -844,17 +915,15 @@ mod tests {
 
         fn read_settled_frame_where<F>(
             &mut self,
-            _policy: &SettlePolicy,
+            policy: &SettlePolicy,
             mut predicate: F,
         ) -> Result<SettledFrame, DriverError>
         where
             F: FnMut(&TerminalSnapshot) -> bool,
         {
+            self.policies.push(*policy);
             let mut drained = Vec::new();
-            while !self.chunks.is_empty() {
-                let chunk = self.chunks.remove(0);
-                drained.extend_from_slice(&chunk);
-                self.raw_log.extend_from_slice(&chunk);
+            loop {
                 let snapshot = snapshot_from_raw(&self.raw_log, self.geometry);
                 if predicate(&snapshot) {
                     return Ok(SettledFrame {
@@ -862,8 +931,13 @@ mod tests {
                         snapshot,
                     });
                 }
+                if self.chunks.is_empty() {
+                    return Err(DriverError::SettleCeiling("fake drained".to_owned()));
+                }
+                let chunk = self.chunks.remove(0);
+                drained.extend_from_slice(&chunk);
+                self.raw_log.extend_from_slice(&chunk);
             }
-            Err(DriverError::SettleCeiling("fake drained".to_owned()))
         }
     }
 
@@ -1405,6 +1479,403 @@ mod tests {
             b"\x1b[1;1R",
             "expected one DSR reply for split query"
         );
+    }
+
+    /// Runs a responder pump over `input` delivered as the given reads;
+    /// returns (forwarded output bytes, reply bytes).
+    fn run_probe_pump(chunks: Vec<Vec<u8>>) -> (Vec<u8>, Vec<u8>) {
+        struct SplitReader {
+            chunks: Vec<Vec<u8>>,
+            idx: usize,
+        }
+        impl Read for SplitReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.idx >= self.chunks.len() {
+                    return Ok(0);
+                }
+                let chunk = &self.chunks[self.idx];
+                let n = chunk.len().min(buf.len());
+                buf[..n].copy_from_slice(&chunk[..n]);
+                self.idx += 1;
+                Ok(n)
+            }
+        }
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pump = ReaderPump::from_reader_with_probe_responder(
+            SplitReader { chunks, idx: 0 },
+            DsrSink(std::sync::Arc::clone(&received)),
+            CapabilityProfile::Xterm256Color,
+        );
+        let mut collected = Vec::new();
+        while let Ok(Ok(chunk)) = pump.rx.recv_timeout(Duration::from_secs(1)) {
+            collected.extend_from_slice(&chunk);
+        }
+        let replies = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (collected, replies)
+    }
+
+    /// The closed query table paired with the profile's expected replies.
+    const PROBE_QUERIES: &[(&[u8], &[u8])] = &[
+        (b"\x1b[?u", b"\x1b[?0u"),
+        (b"\x1b[c", b"\x1b[?1;2c"),
+        (b"\x1b[16t", b"\x1b[6;10;20t"),
+        (b"\x1b]11;?\x07", b"\x1b]11;rgb:0000/0000/0000\x07"),
+        (b"\x1b]11;?\x1b\\", b"\x1b]11;rgb:0000/0000/0000\x07"),
+        (b"\x1b[6n", b"\x1b[1;1R"),
+    ];
+
+    /// Every probe query is answered exactly once when delivered one byte
+    /// per read: the residual must accumulate across more than two chunks.
+    #[test]
+    fn probe_responder_recognizes_byte_at_a_time_queries() {
+        for &(query, reply) in PROBE_QUERIES {
+            let chunks: Vec<Vec<u8>> = query.iter().map(|byte| vec![*byte]).collect();
+            let (collected, replies) = run_probe_pump(chunks);
+            assert_eq!(collected, query, "output bytes must pass through unchanged");
+            assert_eq!(replies, reply, "expected exactly one reply for {query:?}");
+        }
+    }
+
+    /// Every two-part split of every probe query is answered exactly once.
+    #[test]
+    fn probe_responder_recognizes_all_two_part_splits() {
+        for &(query, reply) in PROBE_QUERIES {
+            for split in 1..query.len() {
+                let (collected, replies) =
+                    run_probe_pump(vec![query[..split].to_vec(), query[split..].to_vec()]);
+                assert_eq!(collected, query);
+                assert_eq!(
+                    replies, reply,
+                    "expected exactly one reply for {query:?} split at {split}"
+                );
+            }
+        }
+    }
+
+    /// Every three-part split of every probe query is answered exactly
+    /// once — the regression the chunk-only residual missed.
+    #[test]
+    fn probe_responder_recognizes_all_three_part_splits() {
+        for &(query, reply) in PROBE_QUERIES {
+            for first in 1..query.len() - 1 {
+                for second in first + 1..query.len() {
+                    let (collected, replies) = run_probe_pump(vec![
+                        query[..first].to_vec(),
+                        query[first..second].to_vec(),
+                        query[second..].to_vec(),
+                    ]);
+                    assert_eq!(collected, query);
+                    assert_eq!(
+                        replies, reply,
+                        "expected exactly one reply for {query:?} split at {first},{second}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Partial or unrelated bytes never produce a reply, and no reply is
+    /// sent before a query completes.
+    #[test]
+    fn probe_responder_ignores_partial_and_unrelated_bytes() {
+        let (collected, replies) = run_probe_pump(vec![
+            b"noise".to_vec(),
+            b"\x1b]11;".to_vec(),
+            b"more".to_vec(),
+        ]);
+        assert_eq!(collected, b"noise\x1b]11;more");
+        assert!(replies.is_empty(), "unexpected replies: {replies:?}");
+    }
+
+    /// Observation drains bytes into a deferred buffer that the next
+    /// recorded boundary folds into the canonical transcript exactly once.
+    #[test]
+    fn observe_frame_until_defers_bytes_into_next_recorded_boundary() -> Result<(), RecordingError>
+    {
+        let context = NormalizationContext::default();
+        let mut session = RecordingSession::new(
+            FakeRender {
+                chunks: vec![b"obs-a ".to_vec(), b"obs-b ".to_vec(), b"final".to_vec()],
+                ..FakeRender::default()
+            },
+            recorder(DriverKind::PosixPty),
+            vec!["pi".to_owned()],
+            &context,
+        )?;
+        let observed = session.observe_frame_until(Duration::from_secs(5), |snap| {
+            snap.lines.iter().any(|line| line.contains("obs-b"))
+        })?;
+        assert!(observed.lines.iter().any(|line| line.contains("obs-b")));
+        assert_eq!(session.deferred, b"obs-a obs-b ");
+        let frame = session.read_settled_frame_where(
+            &SettlePolicy::default(),
+            |snap| snap.lines.iter().any(|line| line.contains("final")),
+            &context,
+        )?;
+        assert_eq!(frame.batch.bytes, b"obs-a obs-b final");
+        assert!(session.deferred.is_empty());
+        session.close()?;
+        let artifact = session.finish()?;
+        assert_eq!(
+            kinds(&artifact),
+            vec![
+                EventKind::Spawn,
+                EventKind::Output,
+                EventKind::Snapshot,
+                EventKind::Exit,
+            ]
+        );
+        assert_eq!(artifact.timing.output_audits.len(), 1);
+        assert_eq!(
+            artifact.timing.output_audits[0].raw_bytes_b64,
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b"obs-a obs-b final"
+            )
+        );
+        Ok(())
+    }
+
+    /// Repeated observations concatenate retained bytes without loss or
+    /// duplication.
+    #[test]
+    fn repeated_observations_concatenate_deferred_bytes() -> Result<(), RecordingError> {
+        let context = NormalizationContext::default();
+        let mut session = RecordingSession::new(
+            FakeRender {
+                chunks: vec![
+                    b"o1 ".to_vec(),
+                    b"o2 ".to_vec(),
+                    b"o3 ".to_vec(),
+                    b"end".to_vec(),
+                ],
+                ..FakeRender::default()
+            },
+            recorder(DriverKind::PosixPty),
+            vec!["pi".to_owned()],
+            &context,
+        )?;
+        session.observe_frame_until(Duration::from_secs(5), |snap| {
+            snap.lines.iter().any(|line| line.contains("o1"))
+        })?;
+        session.observe_frame_until(Duration::from_secs(5), |snap| {
+            snap.lines.iter().any(|line| line.contains("o3"))
+        })?;
+        assert_eq!(session.deferred, b"o1 o2 o3 ");
+        let frame = session.read_settled_frame_where(
+            &SettlePolicy::default(),
+            |snap| snap.lines.iter().any(|line| line.contains("end")),
+            &context,
+        )?;
+        assert_eq!(frame.batch.bytes, b"o1 o2 o3 end");
+        session.close()?;
+        let artifact = session.finish()?;
+        assert_eq!(artifact.timing.output_audits.len(), 1);
+        assert_eq!(
+            artifact.timing.output_audits[0].raw_bytes_b64,
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"o1 o2 o3 end")
+        );
+        Ok(())
+    }
+
+    /// Closing with observed-but-unrecorded output fails closed while the
+    /// child is still cleaned up.
+    #[test]
+    fn close_with_unrecorded_observation_fails_closed() -> Result<(), RecordingError> {
+        let context = NormalizationContext::default();
+        let mut session = RecordingSession::new(
+            FakeRender {
+                chunks: vec![b"seen".to_vec()],
+                ..FakeRender::default()
+            },
+            recorder(DriverKind::PosixPty),
+            vec!["pi".to_owned()],
+            &context,
+        )?;
+        session.observe_frame_until(Duration::from_secs(5), |snap| {
+            snap.lines.iter().any(|line| line.contains("seen"))
+        })?;
+        assert!(matches!(
+            session.close(),
+            Err(RecordingError::UnrecordedObservation(4))
+        ));
+        assert!(matches!(
+            session.finish(),
+            Err(RecordingError::FinishBeforeClose)
+        ));
+        Ok(())
+    }
+
+    /// A failed observation leaves retained bytes untouched; the next
+    /// recorded boundary still folds them in.
+    #[test]
+    fn failed_observation_preserves_deferred_evidence() -> Result<(), RecordingError> {
+        let context = NormalizationContext::default();
+        let mut session = RecordingSession::new(
+            FakeRender {
+                chunks: vec![b"kept".to_vec()],
+                inner: FakeDriver {
+                    output: b"tail".to_vec(),
+                    ..FakeDriver::default()
+                },
+                ..FakeRender::default()
+            },
+            recorder(DriverKind::PosixPty),
+            vec!["pi".to_owned()],
+            &context,
+        )?;
+        session.observe_frame_until(Duration::from_secs(5), |snap| {
+            snap.lines.iter().any(|line| line.contains("kept"))
+        })?;
+        assert!(matches!(
+            session.observe_frame_until(Duration::from_secs(5), |snap| {
+                snap.lines.iter().any(|line| line.contains("never"))
+            }),
+            Err(RecordingError::Driver(_))
+        ));
+        assert_eq!(session.deferred, b"kept");
+        let batch = session.read_output(&SettlePolicy::default(), |b| b == b"tail", &context)?;
+        assert_eq!(batch.bytes, b"kepttail");
+        session.close()?;
+        let artifact = session.finish()?;
+        assert_eq!(
+            kinds(&artifact),
+            vec![EventKind::Spawn, EventKind::Output, EventKind::Exit]
+        );
+        assert_eq!(artifact.timing.output_audits.len(), 1);
+        assert_eq!(
+            artifact.timing.output_audits[0].raw_bytes_b64,
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"kepttail")
+        );
+        Ok(())
+    }
+
+    /// Observation runs under a private zero-quiet policy; the following
+    /// canonical settle still uses the caller's policy.
+    #[test]
+    fn observation_uses_zero_quiet_policy_only() -> Result<(), RecordingError> {
+        let context = NormalizationContext::default();
+        let mut session = RecordingSession::new(
+            FakeRender {
+                chunks: vec![b"now".to_vec(), b"later".to_vec()],
+                ..FakeRender::default()
+            },
+            recorder(DriverKind::PosixPty),
+            vec!["pi".to_owned()],
+            &context,
+        )?;
+        session.observe_frame_until(Duration::from_secs(7), |snap| {
+            snap.lines.iter().any(|line| line.contains("now"))
+        })?;
+        session.read_settled_frame_where(
+            &SettlePolicy::default(),
+            |snap| snap.lines.iter().any(|line| line.contains("later")),
+            &context,
+        )?;
+        let policies = &session
+            .session
+            .as_ref()
+            .ok_or(DriverError::Closed)?
+            .policies;
+        assert_eq!(policies.len(), 2);
+        assert_eq!(policies[0].quiet, Duration::ZERO);
+        assert_eq!(policies[0].ceiling, Duration::from_secs(7));
+        assert_eq!(policies[1], SettlePolicy::default());
+        session.close()?;
+        Ok(())
+    }
+
+    /// An observation whose predicate already holds drains nothing and
+    /// defers nothing.
+    #[test]
+    fn observation_with_no_new_output_defers_nothing() -> Result<(), RecordingError> {
+        let context = NormalizationContext::default();
+        let mut session = RecordingSession::new(
+            FakeRender {
+                chunks: vec![b"done".to_vec()],
+                ..FakeRender::default()
+            },
+            recorder(DriverKind::PosixPty),
+            vec!["pi".to_owned()],
+            &context,
+        )?;
+        session.read_settled_frame_where(
+            &SettlePolicy::default(),
+            |snap| snap.lines.iter().any(|line| line.contains("done")),
+            &context,
+        )?;
+        let observed = session.observe_frame_until(Duration::from_secs(5), |snap| {
+            snap.lines.iter().any(|line| line.contains("done"))
+        })?;
+        assert!(observed.lines.iter().any(|line| line.contains("done")));
+        assert!(session.deferred.is_empty());
+        session.close()?;
+        let artifact = session.finish()?;
+        assert_eq!(
+            kinds(&artifact),
+            vec![
+                EventKind::Spawn,
+                EventKind::Output,
+                EventKind::Snapshot,
+                EventKind::Exit,
+            ]
+        );
+        Ok(())
+    }
+
+    /// Observation does not change the canonical bytes: a session that
+    /// observes mid-stream records the same output as one that settles
+    /// directly over the same partition.
+    #[test]
+    fn observation_preserves_canonical_bytes_across_partitions() -> Result<(), RecordingError> {
+        let context = NormalizationContext::default();
+        let mut observed = RecordingSession::new(
+            FakeRender {
+                chunks: vec![b"ab".to_vec(), b"cd".to_vec()],
+                ..FakeRender::default()
+            },
+            recorder(DriverKind::PosixPty),
+            vec!["pi".to_owned()],
+            &context,
+        )?;
+        observed.observe_frame_until(Duration::from_secs(5), |snap| {
+            snap.lines.iter().any(|line| line.contains("ab"))
+        })?;
+        observed.read_settled_frame_where(
+            &SettlePolicy::default(),
+            |snap| snap.lines.iter().any(|line| line.contains("cd")),
+            &context,
+        )?;
+        observed.close()?;
+        let observed_artifact = observed.finish()?;
+        let mut direct = RecordingSession::new(
+            FakeRender {
+                chunks: vec![b"abcd".to_vec()],
+                ..FakeRender::default()
+            },
+            recorder(DriverKind::PosixPty),
+            vec!["pi".to_owned()],
+            &context,
+        )?;
+        direct.read_settled_frame_where(
+            &SettlePolicy::default(),
+            |snap| snap.lines.iter().any(|line| line.contains("cd")),
+            &context,
+        )?;
+        direct.close()?;
+        let direct_artifact = direct.finish()?;
+        assert_eq!(
+            observed_artifact.timing.output_audits[0].raw_bytes_b64,
+            direct_artifact.timing.output_audits[0].raw_bytes_b64
+        );
+        assert_eq!(
+            observed_artifact.canonical.events,
+            direct_artifact.canonical.events
+        );
+        Ok(())
     }
 
     /// Writer sink that captures bytes for DSR reply verification.

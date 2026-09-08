@@ -1,657 +1,1030 @@
-//! Protocol message schemas — portable mirror of upstream `schemas.ts`.
+//! Strict native remote protocol v8 schemas.
 //!
-//! Every type uses serde tags matching the upstream CBOR map key order.
+//! The remote protocol carries routing and opaque service values only. Session,
+//! model, transcript, and service-domain records belong to the service payload,
+//! not to this envelope module.
 
-use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 
-/// Protocol version (currently 1).
-pub const PROTOCOL_VERSION: u32 = 1;
+use serde::de::DeserializeOwned;
+use serde::ser::{SerializeStruct, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
-// ---------------------------------------------------------------------------
-// Error codes
-// ---------------------------------------------------------------------------
+use pi_agent::service::value::JsonValue;
 
-/// Typed error codes exchanged in `ProtocolError`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProtocolErrorCode {
-    /// Protocol version mismatch.
-    Version,
-    /// Server is busy and cannot accept the request.
-    Busy,
-    /// Session is locked by another client.
-    SessionLocked,
-    /// Referenced session was not found.
-    NotFound,
-    /// Request was malformed or invalid.
-    InvalidRequest,
-    /// Requested feature is not implemented.
-    NotImplemented,
-    /// Internal server error.
-    InternalError,
-}
+use crate::remote::serde_cbor::{opaque_json, CborValue, CborValueDeserializer, OpaqueJson};
+
+/// Protocol version implemented by the native remote wire.
+pub const PROTOCOL_VERSION: u64 = 8;
+
+/// Protocol error codes are open, non-empty strings.
+///
+/// This alias intentionally has no closed list of variants. The codec checks
+/// the non-empty invariant at the protocol boundary.
+pub type ProtocolErrorCode = String;
 
 /// A protocol-level error returned by the server.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProtocolError {
-    /// Machine-readable error code.
+    /// Open machine-readable error code.
     pub code: ProtocolErrorCode,
     /// Human-readable error description.
     pub message: String,
-    /// Optional structured details about the error.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub details: Option<JsonValue>,
 }
 
-// ---------------------------------------------------------------------------
-// Common value types
-// ---------------------------------------------------------------------------
+/// Error returned when a server identifier is not a canonical lowercase UUIDv4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerIdError;
 
-/// A JSON value, preserving insertion order for maps.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum JsonValue {
-    /// JSON null.
-    Null,
-    /// JSON boolean.
-    Bool(bool),
-    /// JSON integer.
-    Int(i64),
-    /// JSON floating-point number.
-    Float(f64),
-    /// JSON string.
-    String(String),
-    /// JSON array.
-    Array(Vec<JsonValue>),
-    /// JSON object with insertion-ordered keys.
-    Object(IndexMap<String, JsonValue>),
-}
-
-impl JsonValue {
-    /// Returns the JSON null value.
-    #[must_use]
-    pub fn null() -> Self {
-        Self::Null
+impl fmt::Display for ServerIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("server id must be a lowercase UUIDv4")
     }
 }
 
-// ---------------------------------------------------------------------------
-// Thinking level
-// ---------------------------------------------------------------------------
+impl std::error::Error for ServerIdError {}
 
-/// Verbosity of chain-of-thought exposure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ThinkingLevel {
-    /// No chain-of-thought.
-    Off,
-    /// Minimal chain-of-thought.
-    Minimal,
-    /// Low chain-of-thought.
-    Low,
-    /// Medium chain-of-thought.
-    Medium,
-    /// High chain-of-thought.
-    High,
-    /// Extra-high chain-of-thought.
-    Xhigh,
-    /// Maximum chain-of-thought.
-    Max,
+/// The server identity used to fence every remote route.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ServerId(String);
+
+impl ServerId {
+    /// Creates a server identifier after validating its exact wire spelling.
+    pub fn new(value: impl Into<String>) -> Result<Self, ServerIdError> {
+        let value = value.into();
+        if is_server_id(&value) {
+            Ok(Self(value))
+        } else {
+            Err(ServerIdError)
+        }
+    }
+
+    /// Borrows the canonical UUIDv4 spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Session phase
-// ---------------------------------------------------------------------------
+impl TryFrom<String> for ServerId {
+    type Error = ServerIdError;
 
-/// Lifecycle phase of a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionPhase {
-    /// Session is idle, waiting for input.
-    Idle,
-    /// Session is processing a turn.
-    Turn,
-    /// Session is compacting its context.
-    Compaction,
-    /// Session is generating a branch summary.
-    BranchSummary,
-    /// Session is retrying a failed request.
-    Retry,
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Model reference / metadata
-// ---------------------------------------------------------------------------
+impl TryFrom<&str> for ServerId {
+    type Error = ServerIdError;
 
-/// A reference to a model by provider and id.
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl FromStr for ServerId {
+    type Err = ServerIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value)
+    }
+}
+
+impl From<ServerId> for String {
+    fn from(value: ServerId) -> Self {
+        value.0
+    }
+}
+
+impl AsRef<str> for ServerId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for ServerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ServerId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Returns whether `value` is an exact lowercase UUIDv4 server identifier.
+#[must_use]
+pub fn is_server_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            if byte != b'-' {
+                return false;
+            }
+            continue;
+        }
+        if index == 14 {
+            if byte != b'4' {
+                return false;
+            }
+            continue;
+        }
+        if index == 19 {
+            if !matches!(byte, b'8' | b'9' | b'a' | b'b') {
+                return false;
+            }
+            continue;
+        }
+        if !matches!(byte, b'0'..=b'9' | b'a'..=b'f') {
+            return false;
+        }
+    }
+    true
+}
+
+/// A server-wide route fenced to one logical server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelRef {
-    /// Provider identifier (e.g. `"anthropic"`).
-    pub provider: String,
-    /// Model identifier within the provider.
-    pub id: String,
+#[serde(deny_unknown_fields)]
+pub struct ServerTarget {
+    /// Fenced server identity.
+    #[serde(rename = "serverId")]
+    pub server_id: ServerId,
 }
 
-/// Cost breakdown for a model.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModelCost {
-    /// Cost per input token in USD.
-    pub input: f64,
-    /// Cost per output token in USD.
-    pub output: f64,
-    /// Cost per cache-read token in USD.
-    #[serde(rename = "cacheRead")]
-    pub cache_read: f64,
-    /// Cost per cache-write token in USD.
-    #[serde(rename = "cacheWrite")]
-    pub cache_write: f64,
-}
-
-/// Metadata about a model.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModelMetadata {
-    /// Provider identifier.
-    pub provider: String,
-    /// Model identifier within the provider.
-    pub id: String,
-    /// Human-readable display name.
-    pub name: String,
-    /// API wire format identifier.
-    pub api: String,
-    /// Whether the model supports reasoning/thinking.
-    pub reasoning: bool,
-    /// Accepted input modalities (e.g. `"text"`, `"image"`).
-    pub input: Vec<String>,
-    /// Maximum context window in tokens.
-    #[serde(rename = "contextWindow")]
-    pub context_window: u64,
-    /// Maximum output tokens per response.
-    #[serde(rename = "maxTokens")]
-    pub max_tokens: u64,
-    /// Per-token cost breakdown.
-    pub cost: ModelCost,
-    /// Thinking levels the model supports.
-    #[serde(rename = "supportedThinkingLevels")]
-    pub supported_thinking_levels: Vec<ThinkingLevel>,
-    /// Whether the provider credentials are valid.
-    pub authenticated: bool,
-}
-
-// ---------------------------------------------------------------------------
-// Usage / token accounting
-// ---------------------------------------------------------------------------
-
-/// Token usage for a single model invocation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Usage {
-    /// Input tokens consumed.
-    pub input: u64,
-    /// Output tokens generated.
-    pub output: u64,
-    /// Cache-read tokens.
-    #[serde(rename = "cacheRead")]
-    pub cache_read: u64,
-    /// Cache-write tokens.
-    #[serde(rename = "cacheWrite")]
-    pub cache_write: u64,
-    /// Reasoning tokens consumed (if supported).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<u64>,
-    /// Total tokens (input + output + cache).
-    #[serde(rename = "totalTokens")]
-    pub total_tokens: u64,
-    /// Dollar-cost breakdown for this invocation.
-    pub cost: UsageCost,
-}
-
-/// Cost breakdown for a usage entry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UsageCost {
-    /// Cost of input tokens in USD.
-    pub input: f64,
-    /// Cost of output tokens in USD.
-    pub output: f64,
-    /// Cost of cache-read tokens in USD.
-    #[serde(rename = "cacheRead")]
-    pub cache_read: f64,
-    /// Cost of cache-write tokens in USD.
-    #[serde(rename = "cacheWrite")]
-    pub cache_write: f64,
-    /// Total cost in USD.
-    pub total: f64,
-}
-
-// ---------------------------------------------------------------------------
-// Content blocks
-// ---------------------------------------------------------------------------
-
-/// Text content block.
+/// A session route fenced to a server, durable session, and live attachment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TextContent {
-    /// Block type tag (always `"text"`).
-    #[serde(rename = "type")]
-    pub type_field: String,
-    /// The text payload.
-    pub text: String,
-}
-
-/// Thinking content block.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThinkingContent {
-    /// Block type tag (always `"thinking"`).
-    #[serde(rename = "type")]
-    pub type_field: String,
-    /// The chain-of-thought text.
-    pub thinking: String,
-    /// Whether the thinking was redacted by the provider.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub redacted: Option<bool>,
-}
-
-/// Image content block.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageContent {
-    /// Block type tag (always `"image"`).
-    #[serde(rename = "type")]
-    pub type_field: String,
-    /// Base64-encoded image data.
-    pub data: String,
-    /// MIME type of the image (e.g. `"image/png"`).
-    #[serde(rename = "mimeType")]
-    pub mime_type: String,
-}
-
-/// Tool call content block.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolCallContent {
-    /// Block type tag (always `"tool_call"`).
-    #[serde(rename = "type")]
-    pub type_field: String,
-    /// Unique identifier for the tool call.
-    #[serde(rename = "toolCallId")]
-    pub tool_call_id: String,
-    /// Name of the tool being called.
-    #[serde(rename = "toolName")]
-    pub tool_name: String,
-    /// Tool input arguments as a JSON value.
-    pub input: JsonValue,
-}
-
-/// User content block (text or image).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum UserContent {
-    /// Text content from the user.
-    Text(TextContent),
-    /// Image content from the user.
-    Image(ImageContent),
-}
-
-/// Assistant content block (text, thinking, or tool call).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum AssistantContent {
-    /// Text generated by the assistant.
-    Text(TextContent),
-    /// Chain-of-thought from the assistant.
-    Thinking(ThinkingContent),
-    /// Tool call initiated by the assistant.
-    ToolCall(ToolCallContent),
-}
-
-/// Tool content block (text or image).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ToolContent {
-    /// Text output from a tool.
-    Text(TextContent),
-    /// Image output from a tool.
-    Image(ImageContent),
-}
-
-// ---------------------------------------------------------------------------
-// Transcript
-// ---------------------------------------------------------------------------
-
-/// User transcript item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UserTranscriptItem {
-    /// Item type tag (always `"user"`).
-    #[serde(rename = "type")]
-    pub type_field: String,
-    /// Content blocks in this user message.
-    pub content: Vec<UserContent>,
-}
-
-/// Assistant transcript item.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AssistantTranscriptItem {
-    /// Item type tag (always `"assistant"`).
-    #[serde(rename = "type")]
-    pub type_field: String,
-    /// Content blocks in this assistant response.
-    pub content: Vec<AssistantContent>,
-}
-
-/// Tool transcript item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolTranscriptItem {
-    /// Item type tag (always `"tool"`).
-    #[serde(rename = "type")]
-    pub type_field: String,
-    /// Identifier of the tool call this result corresponds to.
-    #[serde(rename = "toolCallId")]
-    pub tool_call_id: String,
-    /// Content blocks returned by the tool.
-    pub content: Vec<ToolContent>,
-}
-
-/// A single transcript entry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum TranscriptItem {
-    /// User message.
-    User(UserTranscriptItem),
-    /// Assistant response.
-    Assistant(AssistantTranscriptItem),
-    /// Tool result.
-    Tool(ToolTranscriptItem),
-}
-
-/// Progress notification for a transcript item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TranscriptProgress {
-    /// Current session phase.
-    pub phase: SessionPhase,
-    /// Optional human-readable progress message.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Session metadata / snapshot
-// ---------------------------------------------------------------------------
-
-/// Metadata about a session.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionMetadata {
-    /// Unique session identifier.
+#[serde(deny_unknown_fields)]
+pub struct SessionTarget {
+    /// Fenced server identity.
+    #[serde(rename = "serverId")]
+    pub server_id: ServerId,
+    /// Durable session identifier.
     #[serde(rename = "sessionId")]
     pub session_id: String,
-    /// Current model reference.
-    pub model: ModelRef,
-    /// Current thinking level.
-    #[serde(rename = "thinkingLevel")]
-    pub thinking_level: ThinkingLevel,
-    /// Whether the session is locked by a client.
-    pub locked: bool,
-    /// Monotonic revision number for optimistic concurrency.
-    pub revision: u64,
-    /// Full transcript of the session.
-    pub transcript: Vec<TranscriptItem>,
-    /// Queued steer messages awaiting processing.
-    #[serde(rename = "queuedSteer")]
-    pub queued_steer: Vec<UserTranscriptItem>,
-    /// Number of queued steer messages.
-    #[serde(rename = "queuedSteerCount")]
-    pub queued_steer_count: u64,
+    /// Server-issued attachment identity for this live route.
+    #[serde(rename = "attachmentId")]
+    pub attachment_id: String,
 }
 
-/// Full session snapshot (same as `SessionMetadata` in upstream).
-pub type SessionSnapshot = SessionMetadata;
-
-/// Server snapshot returned in the initial hello.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ServerSnapshot {
-    /// Unique server instance identifier.
-    #[serde(rename = "serverId")]
-    pub server_id: String,
-    /// Protocol version the server speaks.
-    #[serde(rename = "protocolVersion")]
-    pub protocol_version: u32,
-    /// Server-wide monotonic revision counter.
-    pub revision: u64,
-    /// All sessions currently managed by the server.
-    pub sessions: Vec<SessionMetadata>,
-    /// Available models on the server.
-    pub models: Vec<ModelMetadata>,
+/// A server-wide or session-scoped route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RpcTarget {
+    /// Server-wide route.
+    Server(ServerTarget),
+    /// Session route.
+    Session(SessionTarget),
 }
 
-// ---------------------------------------------------------------------------
-// Commands (client → server)
-// ---------------------------------------------------------------------------
-
-/// A command sent from client to server.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-pub enum Command {
-    /// List all sessions.
-    List,
-    /// Create a new session.
-    Create {
-        /// Optional working directory for the session.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cwd: Option<String>,
-        /// Optional human-readable name for the session.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        /// Optional initial model reference.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model: Option<ModelRef>,
-        /// Optional initial thinking level.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[serde(rename = "thinkingLevel")]
-        thinking_level: Option<ThinkingLevel>,
-    },
-    /// Attach to an existing session.
-    Attach {
-        /// Session to attach to.
-        #[serde(rename = "sessionId")]
-        session_id: String,
-    },
-    /// Detach from a session.
-    Detach {
-        /// Session to detach from.
-        #[serde(rename = "sessionId")]
-        session_id: String,
-    },
-    /// Send a prompt to a session.
-    Prompt {
-        /// Target session.
-        #[serde(rename = "sessionId")]
-        session_id: String,
-        /// Prompt text.
-        text: String,
-    },
-    /// Steer (interject into) a running session.
-    Steer {
-        /// Target session.
-        #[serde(rename = "sessionId")]
-        session_id: String,
-        /// Steer text.
-        text: String,
-    },
-    /// Abort the current turn of a session.
-    Abort {
-        /// Target session.
-        #[serde(rename = "sessionId")]
-        session_id: String,
-    },
-    /// Change the model of a session.
-    #[serde(rename = "set_model")]
-    SetModel {
-        /// Target session.
-        #[serde(rename = "sessionId")]
-        session_id: String,
-        /// New model reference.
-        model: ModelRef,
-    },
-    /// Change the thinking level of a session.
-    #[serde(rename = "set_thinking")]
-    SetThinking {
-        /// Target session.
-        #[serde(rename = "sessionId")]
-        session_id: String,
-        /// New thinking level.
-        #[serde(rename = "thinkingLevel")]
-        thinking_level: ThinkingLevel,
-    },
+/// The first client envelope used to negotiate a protocol version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientHello {
+    /// Non-negative integer offered by the client.
+    pub version: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Command results (server → client)
-// ---------------------------------------------------------------------------
-
-/// Result of a command execution.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-pub enum CommandResult {
-    /// Result of `List` — all sessions.
-    List {
-        /// All sessions on the server.
-        sessions: Vec<SessionMetadata>,
-    },
-    /// Result of `Create` — the new session.
-    Create {
-        /// The created session snapshot.
-        session: SessionSnapshot,
-    },
-    /// Result of `Attach` — the attached session.
-    Attach {
-        /// The attached session snapshot.
-        session: SessionSnapshot,
-    },
-    /// Result of `Detach`.
-    Detach {
-        /// Session that was detached.
-        #[serde(rename = "sessionId")]
-        session_id: String,
-    },
-    /// Result of `Prompt` — updated session.
-    Prompt {
-        /// Updated session snapshot.
-        session: SessionSnapshot,
-    },
-    /// Result of `Steer` — updated session.
-    Steer {
-        /// Updated session snapshot.
-        session: SessionSnapshot,
-    },
-    /// Result of `Abort` — updated session.
-    Abort {
-        /// Updated session snapshot.
-        session: SessionSnapshot,
-    },
-    /// Result of `SetModel` — updated session.
-    #[serde(rename = "set_model")]
-    SetModel {
-        /// Updated session snapshot.
-        session: SessionSnapshot,
-    },
-    /// Result of `SetThinking` — updated session.
-    #[serde(rename = "set_thinking")]
-    SetThinking {
-        /// Updated session snapshot.
-        session: SessionSnapshot,
-    },
+/// A client request envelope carrying an opaque service call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestEnvelope {
+    /// Correlation identifier.
+    pub id: String,
+    /// Fenced route for the call.
+    pub target: RpcTarget,
+    /// Strict JSON service call owned by the service layer.
+    pub call: JsonValue,
 }
 
-// ---------------------------------------------------------------------------
-// Server events (server → client, unsolicited)
-// ---------------------------------------------------------------------------
-
-/// An unsolicited event from the server.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerEvent {
-    /// Initial server snapshot sent on connection.
-    #[serde(rename = "server_snapshot")]
-    ServerSnapshot {
-        /// Full server state snapshot.
-        snapshot: ServerSnapshot,
-    },
-    /// Updated session snapshot.
-    #[serde(rename = "session_snapshot")]
-    SessionSnapshot {
-        /// Updated session state.
-        snapshot: SessionSnapshot,
-    },
-    /// Progress update for a session.
-    #[serde(rename = "session_progress")]
-    SessionProgress {
-        /// Session that produced the progress.
-        #[serde(rename = "sessionId")]
-        session_id: String,
-        /// Progress details.
-        progress: TranscriptProgress,
-    },
-    /// Session was removed.
-    #[serde(rename = "session_removed")]
-    SessionRemoved {
-        /// Session that was removed.
-        #[serde(rename = "sessionId")]
-        session_id: String,
-    },
+/// A client cancellation envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelEnvelope {
+    /// Correlation identifier of the request to cancel.
+    pub id: String,
+    /// Fenced route for the cancellation.
+    pub target: RpcTarget,
 }
 
-// ---------------------------------------------------------------------------
-// Top-level messages
-// ---------------------------------------------------------------------------
+/// A successful server handshake envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerHello {
+    /// Server protocol version. A valid server hello always carries 8.
+    pub version: u64,
+    /// Server identity used to fence routes.
+    pub server_id: ServerId,
+}
 
-/// A message from the client to the server.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientMessage {
-    /// Initial handshake.
-    Hello {
-        /// Client protocol version.
-        version: u32,
-    },
-    /// Command request.
-    Request {
-        /// Unique request identifier.
+/// A failed server handshake envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerHelloError {
+    /// Protocol error explaining why negotiation failed.
+    pub error: ProtocolError,
+}
+
+/// A response to a request, split so success and failure cannot be mixed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResponseEnvelope {
+    /// Successful response; `None` means the result key is absent.
+    Success {
+        /// Correlation identifier.
         id: String,
-        /// The command to execute.
-        request: Command,
+        /// Optional result. `Some(JsonValue::Null)` is an explicit JSON null.
+        result: Option<JsonValue>,
     },
-}
-
-/// A message from the server to the client.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMessage {
-    /// Successful handshake response.
-    Hello {
-        /// Server protocol version.
-        version: u32,
-        /// Unique connection identifier.
-        #[serde(rename = "connectionId")]
-        connection_id: String,
-        /// Initial server state.
-        snapshot: ServerSnapshot,
-    },
-    /// Failed handshake response.
-    HelloError {
-        /// Error details.
+    /// Failed response.
+    Error {
+        /// Correlation identifier.
+        id: String,
+        /// Protocol error returned by the service endpoint.
         error: ProtocolError,
     },
-    /// Response to a command request.
-    Response {
-        /// Request identifier this response corresponds to.
+}
+
+/// A service subscription update carrying an opaque strict JSON value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServiceEventEnvelope {
+    /// Subscription receiving this update.
+    pub subscription_id: String,
+    /// Service-defined update payload.
+    pub update: JsonValue,
+}
+
+/// An out-of-band update to the selected session route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentEnvelope {
+    /// Current attachment route, or `None` when detached.
+    pub attachment: Option<SessionTarget>,
+}
+
+/// A message sent from a client to a remote server.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientMessage {
+    /// Initial version negotiation.
+    Hello {
+        /// Non-negative integer offered by the client.
+        version: u64,
+    },
+    /// Opaque service request.
+    Request {
+        /// Correlation identifier.
         id: String,
-        /// Whether the command succeeded.
-        ok: bool,
-        /// Command result on success.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        result: Option<CommandResult>,
-        /// Error on failure.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<ProtocolError>,
+        /// Fenced route for the call.
+        target: RpcTarget,
+        /// Strict JSON service call.
+        call: JsonValue,
     },
-    /// Unsolicited server event.
-    Event {
-        /// The event payload.
-        event: ServerEvent,
+    /// Cancellation of a request at a fenced route.
+    Cancel {
+        /// Correlation identifier.
+        id: String,
+        /// Fenced route for the cancellation.
+        target: RpcTarget,
     },
+}
+
+/// A message sent from a remote server to a client.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerMessage {
+    /// Successful version negotiation.
+    Hello {
+        /// Server protocol version, exactly 8 for a valid message.
+        version: u64,
+        /// Server identity used to fence routes.
+        server_id: ServerId,
+    },
+    /// Failed version negotiation.
+    HelloError {
+        /// Protocol error explaining the rejection.
+        error: ProtocolError,
+    },
+    /// Successful request response.
+    Response {
+        /// Correlation identifier.
+        id: String,
+        /// Optional result; `Some(JsonValue::Null)` is explicit JSON null.
+        result: Option<JsonValue>,
+    },
+    /// Failed request response.
+    ResponseError {
+        /// Correlation identifier.
+        id: String,
+        /// Protocol error returned by the endpoint.
+        error: ProtocolError,
+    },
+    /// Opaque service subscription update.
+    ServiceUpdate {
+        /// Subscription receiving this update.
+        subscription_id: String,
+        /// Service-defined update payload.
+        update: JsonValue,
+    },
+    /// Attachment route switch, including an explicit detached `None` state.
+    Attachment {
+        /// Current session route, or `None` when detached.
+        attachment: Option<SessionTarget>,
+    },
+}
+
+impl From<ClientHello> for ClientMessage {
+    fn from(value: ClientHello) -> Self {
+        Self::Hello {
+            version: value.version,
+        }
+    }
+}
+
+impl From<RequestEnvelope> for ClientMessage {
+    fn from(value: RequestEnvelope) -> Self {
+        Self::Request {
+            id: value.id,
+            target: value.target,
+            call: value.call,
+        }
+    }
+}
+
+impl From<CancelEnvelope> for ClientMessage {
+    fn from(value: CancelEnvelope) -> Self {
+        Self::Cancel {
+            id: value.id,
+            target: value.target,
+        }
+    }
+}
+
+impl From<ServerHello> for ServerMessage {
+    fn from(value: ServerHello) -> Self {
+        Self::Hello {
+            version: value.version,
+            server_id: value.server_id,
+        }
+    }
+}
+
+impl From<ServerHelloError> for ServerMessage {
+    fn from(value: ServerHelloError) -> Self {
+        Self::HelloError { error: value.error }
+    }
+}
+
+impl From<ResponseEnvelope> for ServerMessage {
+    fn from(value: ResponseEnvelope) -> Self {
+        match value {
+            ResponseEnvelope::Success { id, result } => Self::Response { id, result },
+            ResponseEnvelope::Error { id, error } => Self::ResponseError { id, error },
+        }
+    }
+}
+
+impl From<ServiceEventEnvelope> for ServerMessage {
+    fn from(value: ServiceEventEnvelope) -> Self {
+        Self::ServiceUpdate {
+            subscription_id: value.subscription_id,
+            update: value.update,
+        }
+    }
+}
+
+impl From<AttachmentEnvelope> for ServerMessage {
+    fn from(value: AttachmentEnvelope) -> Self {
+        Self::Attachment {
+            attachment: value.attachment,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientHelloWire {
+    #[serde(rename = "type")]
+    type_field: String,
+    version: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestWire {
+    #[serde(rename = "type")]
+    type_field: String,
+    id: String,
+    target: RpcTarget,
+    #[serde(deserialize_with = "opaque_json::deserialize")]
+    call: JsonValue,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelWire {
+    #[serde(rename = "type")]
+    type_field: String,
+    id: String,
+    target: RpcTarget,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerHelloWire {
+    #[serde(rename = "type")]
+    type_field: String,
+    version: u64,
+    #[serde(rename = "serverId")]
+    server_id: ServerId,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerHelloErrorWire {
+    #[serde(rename = "type")]
+    type_field: String,
+    error: ProtocolError,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponseSuccessWire {
+    #[serde(rename = "type")]
+    type_field: String,
+    id: String,
+    ok: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_json")]
+    result: Option<JsonValue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponseErrorWire {
+    #[serde(rename = "type")]
+    type_field: String,
+    id: String,
+    ok: bool,
+    error: ProtocolError,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceEventWire {
+    #[serde(rename = "type")]
+    type_field: String,
+    #[serde(rename = "subscriptionId")]
+    subscription_id: String,
+    #[serde(deserialize_with = "opaque_json::deserialize")]
+    update: JsonValue,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttachmentWire {
+    #[serde(rename = "type")]
+    type_field: String,
+    attachment: Option<SessionTarget>,
+}
+
+fn deserialize_optional_json<'de, D>(deserializer: D) -> Result<Option<JsonValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    opaque_json::deserialize(deserializer).map(Some)
+}
+
+fn object_type(value: &CborValue) -> Result<&str, String> {
+    let CborValue::Map(entries) = value else {
+        return Err("protocol message must be an object".to_owned());
+    };
+    entries
+        .iter()
+        .find(|(key, _)| key == "type")
+        .and_then(|(_, value)| match value {
+            CborValue::Text(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| "protocol message type must be a string".to_owned())
+}
+
+fn decode_wire<T: DeserializeOwned>(value: CborValue) -> Result<T, String> {
+    T::deserialize(CborValueDeserializer { value }).map_err(|error| error.to_string())
+}
+
+fn require_type(actual: &str, expected: &str) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("expected message type `{expected}`"))
+    }
+}
+
+fn parse_client_value(value: CborValue) -> Result<ClientMessage, String> {
+    let type_name = object_type(&value)?;
+    match type_name {
+        "hello" => {
+            let wire: ClientHelloWire = decode_wire(value)?;
+            require_type(&wire.type_field, "hello")?;
+            Ok(ClientMessage::Hello {
+                version: wire.version,
+            })
+        }
+        "request" => {
+            let wire: RequestWire = decode_wire(value)?;
+            require_type(&wire.type_field, "request")?;
+            Ok(ClientMessage::Request {
+                id: wire.id,
+                target: wire.target,
+                call: wire.call,
+            })
+        }
+        "cancel" => {
+            let wire: CancelWire = decode_wire(value)?;
+            require_type(&wire.type_field, "cancel")?;
+            Ok(ClientMessage::Cancel {
+                id: wire.id,
+                target: wire.target,
+            })
+        }
+        _ => Err(format!("unknown variant `{type_name}`")),
+    }
+}
+
+fn parse_response_value(value: CborValue) -> Result<ResponseEnvelope, String> {
+    let type_name = object_type(&value)?;
+    require_type(type_name, "response")?;
+    let ok = match &value {
+        CborValue::Map(entries) => entries
+            .iter()
+            .find(|(key, _)| key == "ok")
+            .and_then(|(_, value)| match value {
+                CborValue::Bool(value) => Some(*value),
+                _ => None,
+            }),
+        _ => None,
+    }
+    .ok_or_else(|| "response field `ok` must be a boolean".to_owned())?;
+    if ok {
+        let wire: ResponseSuccessWire = decode_wire(value)?;
+        require_type(&wire.type_field, "response")?;
+        if !wire.ok {
+            return Err("response success must carry ok=true".to_owned());
+        }
+        Ok(ResponseEnvelope::Success {
+            id: wire.id,
+            result: wire.result,
+        })
+    } else {
+        let wire: ResponseErrorWire = decode_wire(value)?;
+        require_type(&wire.type_field, "response")?;
+        if wire.ok {
+            return Err("response error must carry ok=false".to_owned());
+        }
+        Ok(ResponseEnvelope::Error {
+            id: wire.id,
+            error: wire.error,
+        })
+    }
+}
+
+fn parse_server_value(value: CborValue) -> Result<ServerMessage, String> {
+    let type_name = object_type(&value)?;
+    match type_name {
+        "hello" => {
+            let wire: ServerHelloWire = decode_wire(value)?;
+            require_type(&wire.type_field, "hello")?;
+            Ok(ServerMessage::Hello {
+                version: wire.version,
+                server_id: wire.server_id,
+            })
+        }
+        "hello_error" => {
+            let wire: ServerHelloErrorWire = decode_wire(value)?;
+            require_type(&wire.type_field, "hello_error")?;
+            Ok(ServerMessage::HelloError { error: wire.error })
+        }
+        "response" => match parse_response_value(value)? {
+            ResponseEnvelope::Success { id, result } => Ok(ServerMessage::Response { id, result }),
+            ResponseEnvelope::Error { id, error } => Ok(ServerMessage::ResponseError { id, error }),
+        },
+        "service_update" => {
+            let wire: ServiceEventWire = decode_wire(value)?;
+            require_type(&wire.type_field, "service_update")?;
+            Ok(ServerMessage::ServiceUpdate {
+                subscription_id: wire.subscription_id,
+                update: wire.update,
+            })
+        }
+        "attachment" => {
+            let wire: AttachmentWire = decode_wire(value)?;
+            require_type(&wire.type_field, "attachment")?;
+            Ok(ServerMessage::Attachment {
+                attachment: wire.attachment,
+            })
+        }
+        _ => Err(format!("unknown variant `{type_name}`")),
+    }
+}
+
+impl Serialize for ClientHello {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("ClientHello", 2)?;
+        state.serialize_field("type", "hello")?;
+        state.serialize_field("version", &self.version)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientHello {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = CborValue::deserialize(deserializer)?;
+        let wire: ClientHelloWire = decode_wire(value).map_err(serde::de::Error::custom)?;
+        require_type(&wire.type_field, "hello").map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            version: wire.version,
+        })
+    }
+}
+
+impl Serialize for RequestEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("RequestEnvelope", 4)?;
+        state.serialize_field("type", "request")?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("target", &self.target)?;
+        state.serialize_field("call", &OpaqueJson(&self.call))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = CborValue::deserialize(deserializer)?;
+        let wire: RequestWire = decode_wire(value).map_err(serde::de::Error::custom)?;
+        require_type(&wire.type_field, "request").map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            id: wire.id,
+            target: wire.target,
+            call: wire.call,
+        })
+    }
+}
+
+impl Serialize for CancelEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("CancelEnvelope", 3)?;
+        state.serialize_field("type", "cancel")?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("target", &self.target)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CancelEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = CborValue::deserialize(deserializer)?;
+        let wire: CancelWire = decode_wire(value).map_err(serde::de::Error::custom)?;
+        require_type(&wire.type_field, "cancel").map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            id: wire.id,
+            target: wire.target,
+        })
+    }
+}
+
+impl Serialize for ServerHello {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("ServerHello", 3)?;
+        state.serialize_field("type", "hello")?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("serverId", &self.server_id)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerHello {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = CborValue::deserialize(deserializer)?;
+        let wire: ServerHelloWire = decode_wire(value).map_err(serde::de::Error::custom)?;
+        require_type(&wire.type_field, "hello").map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            version: wire.version,
+            server_id: wire.server_id,
+        })
+    }
+}
+
+impl Serialize for ServerHelloError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("ServerHelloError", 2)?;
+        state.serialize_field("type", "hello_error")?;
+        state.serialize_field("error", &self.error)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerHelloError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = CborValue::deserialize(deserializer)?;
+        let wire: ServerHelloErrorWire = decode_wire(value).map_err(serde::de::Error::custom)?;
+        require_type(&wire.type_field, "hello_error").map_err(serde::de::Error::custom)?;
+        Ok(Self { error: wire.error })
+    }
+}
+
+impl Serialize for ResponseEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Success { id, result } => {
+                let field_count = if result.is_some() { 4 } else { 3 };
+                let mut state = serializer.serialize_struct("ResponseEnvelope", field_count)?;
+                state.serialize_field("type", "response")?;
+                state.serialize_field("id", id)?;
+                state.serialize_field("ok", &true)?;
+                if let Some(result) = result {
+                    state.serialize_field("result", &OpaqueJson(result))?;
+                }
+                state.end()
+            }
+            Self::Error { id, error } => {
+                let mut state = serializer.serialize_struct("ResponseEnvelope", 4)?;
+                state.serialize_field("type", "response")?;
+                state.serialize_field("id", id)?;
+                state.serialize_field("ok", &false)?;
+                state.serialize_field("error", error)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ResponseEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        parse_response_value(CborValue::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for ServiceEventEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("ServiceEventEnvelope", 3)?;
+        state.serialize_field("type", "service_update")?;
+        state.serialize_field("subscriptionId", &self.subscription_id)?;
+        state.serialize_field("update", &OpaqueJson(&self.update))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ServiceEventEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = CborValue::deserialize(deserializer)?;
+        let wire: ServiceEventWire = decode_wire(value).map_err(serde::de::Error::custom)?;
+        require_type(&wire.type_field, "service_update").map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            subscription_id: wire.subscription_id,
+            update: wire.update,
+        })
+    }
+}
+
+impl Serialize for AttachmentEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("AttachmentEnvelope", 2)?;
+        state.serialize_field("type", "attachment")?;
+        state.serialize_field("attachment", &self.attachment)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AttachmentEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = CborValue::deserialize(deserializer)?;
+        let wire: AttachmentWire = decode_wire(value).map_err(serde::de::Error::custom)?;
+        require_type(&wire.type_field, "attachment").map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            attachment: wire.attachment,
+        })
+    }
+}
+
+impl Serialize for ClientMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Hello { version } => {
+                let mut state = serializer.serialize_struct("ClientHello", 2)?;
+                state.serialize_field("type", "hello")?;
+                state.serialize_field("version", version)?;
+                state.end()
+            }
+            Self::Request { id, target, call } => {
+                let mut state = serializer.serialize_struct("RequestEnvelope", 4)?;
+                state.serialize_field("type", "request")?;
+                state.serialize_field("id", id)?;
+                state.serialize_field("target", target)?;
+                state.serialize_field("call", &OpaqueJson(call))?;
+                state.end()
+            }
+            Self::Cancel { id, target } => {
+                let mut state = serializer.serialize_struct("CancelEnvelope", 3)?;
+                state.serialize_field("type", "cancel")?;
+                state.serialize_field("id", id)?;
+                state.serialize_field("target", target)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        parse_client_value(CborValue::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for ServerMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Hello { version, server_id } => {
+                let mut state = serializer.serialize_struct("ServerHello", 3)?;
+                state.serialize_field("type", "hello")?;
+                state.serialize_field("version", version)?;
+                state.serialize_field("serverId", server_id)?;
+                state.end()
+            }
+            Self::HelloError { error } => {
+                let mut state = serializer.serialize_struct("ServerHelloError", 2)?;
+                state.serialize_field("type", "hello_error")?;
+                state.serialize_field("error", error)?;
+                state.end()
+            }
+            Self::Response { id, result } => {
+                let field_count = if result.is_some() { 4 } else { 3 };
+                let mut state = serializer.serialize_struct("ResponseEnvelope", field_count)?;
+                state.serialize_field("type", "response")?;
+                state.serialize_field("id", id)?;
+                state.serialize_field("ok", &true)?;
+                if let Some(result) = result {
+                    state.serialize_field("result", &OpaqueJson(result))?;
+                }
+                state.end()
+            }
+            Self::ResponseError { id, error } => {
+                let mut state = serializer.serialize_struct("ResponseEnvelope", 4)?;
+                state.serialize_field("type", "response")?;
+                state.serialize_field("id", id)?;
+                state.serialize_field("ok", &false)?;
+                state.serialize_field("error", error)?;
+                state.end()
+            }
+            Self::ServiceUpdate {
+                subscription_id,
+                update,
+            } => {
+                let mut state = serializer.serialize_struct("ServiceEventEnvelope", 3)?;
+                state.serialize_field("type", "service_update")?;
+                state.serialize_field("subscriptionId", subscription_id)?;
+                state.serialize_field("update", &OpaqueJson(update))?;
+                state.end()
+            }
+            Self::Attachment { attachment } => {
+                let mut state = serializer.serialize_struct("AttachmentEnvelope", 2)?;
+                state.serialize_field("type", "attachment")?;
+                state.serialize_field("attachment", attachment)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        parse_server_value(CborValue::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_ids_require_canonical_lowercase_uuidv4() {
+        assert!(is_server_id("00000000-0000-4000-8000-000000000001"));
+        assert!(!is_server_id("00000000-0000-7000-8000-000000000001"));
+        assert!(!is_server_id("00000000-0000-4000-7000-000000000001"));
+        assert!(!is_server_id("00000000-0000-4000-8000-00000000000A"));
+    }
+
+    #[test]
+    fn response_result_distinguishes_absence_from_null() {
+        let absent = CborValue::Map(vec![
+            ("type".to_owned(), CborValue::Text("response".to_owned())),
+            ("id".to_owned(), CborValue::Text("request-1".to_owned())),
+            ("ok".to_owned(), CborValue::Bool(true)),
+        ]);
+        let explicit_null = CborValue::Map(vec![
+            ("type".to_owned(), CborValue::Text("response".to_owned())),
+            ("id".to_owned(), CborValue::Text("request-1".to_owned())),
+            ("ok".to_owned(), CborValue::Bool(true)),
+            ("result".to_owned(), CborValue::Null),
+        ]);
+        let absent = parse_response_value(absent).expect("valid response");
+        let explicit_null = parse_response_value(explicit_null).expect("valid response");
+        assert!(matches!(absent, ResponseEnvelope::Success { result: None, .. }));
+        assert!(matches!(
+            explicit_null,
+            ResponseEnvelope::Success {
+                result: Some(JsonValue::Null),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn known_envelopes_reject_unknown_fields() {
+        let value = CborValue::Map(vec![
+            ("type".to_owned(), CborValue::Text("request".to_owned())),
+            ("id".to_owned(), CborValue::Text("request-1".to_owned())),
+            (
+                "target".to_owned(),
+                CborValue::Map(vec![(
+                    "serverId".to_owned(),
+                    CborValue::Text("00000000-0000-4000-8000-000000000001".to_owned()),
+                )]),
+            ),
+            ("call".to_owned(), CborValue::Map(Vec::new())),
+            ("extra".to_owned(), CborValue::Bool(true)),
+        ]);
+        assert!(parse_client_value(value).is_err());
+    }
 }

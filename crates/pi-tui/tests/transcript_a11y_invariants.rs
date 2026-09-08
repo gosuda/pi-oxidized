@@ -300,6 +300,7 @@ impl From<RecordingError> for CorpusError {
             RecordingError::FinishBeforeClose => {
                 Self::Transcript("recording cannot finish before close".to_owned())
             }
+            RecordingError::UnrecordedObservation(_) => Self::Transcript(error.to_string()),
         }
     }
 }

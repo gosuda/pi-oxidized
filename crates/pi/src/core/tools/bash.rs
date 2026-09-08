@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use pi_agent::{AgentTool, AgentToolResult, ToolError, ToolUpdates};
-use pi_ai::ToolResultContent;
+use pi_ai::{ConstrainedSampling, ConstrainedSamplingConfig, StrictMode, ToolResultContent};
 use pi_ai::types::TextContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -480,6 +480,14 @@ impl AgentTool for BashTool {
 
     fn parameters(&self) -> &Value {
         &self.parameters
+    }
+
+    fn constrained_sampling(&self) -> Option<ConstrainedSampling> {
+        Some(ConstrainedSampling::Config(
+            ConstrainedSamplingConfig::JsonSchema {
+                strict: StrictMode::Prefer,
+            },
+        ))
     }
 
     fn validate_arguments(

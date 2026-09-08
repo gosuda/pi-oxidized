@@ -6,7 +6,9 @@ use serde::ser::{
     SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
     SerializeTupleStruct, SerializeTupleVariant,
 };
-use serde::{Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use pi_agent::service::value::{JsObject, JsString, JsonValue};
 
 // ---------------------------------------------------------------------------
 // CborValue
@@ -23,6 +25,361 @@ pub enum CborValue {
     Bytes(Vec<u8>),
     Array(Vec<CborValue>),
     Map(Vec<(String, CborValue)>),
+}
+// ---------------------------------------------------------------------------
+// CborValue deserialization
+// ---------------------------------------------------------------------------
+
+struct CborValueVisitor;
+
+impl<'de> serde::de::Visitor<'de> for CborValueVisitor {
+    type Value = CborValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a strict CBOR value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(CborValue::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        if value < 0 {
+            Ok(CborValue::NInt(value))
+        } else {
+            Ok(CborValue::UInt(
+                u64::try_from(value).map_err(|_| E::custom("integer is outside CBOR range"))?,
+            ))
+        }
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(CborValue::UInt(value))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(CborValue::Float(value))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(CborValue::Text(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(CborValue::Text(value))
+    }
+
+    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(CborValue::Bytes(value.to_vec()))
+    }
+
+    fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(CborValue::Bytes(value))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(CborValue::Null)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(CborValue::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(Self)
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(Self)
+    }
+
+    fn visit_seq<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(access.size_hint().unwrap_or(0));
+        while let Some(value) = access.next_element()? {
+            values.push(value);
+        }
+        Ok(CborValue::Array(values))
+    }
+
+    fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut entries = Vec::with_capacity(access.size_hint().unwrap_or(0));
+        while let Some(key) = access.next_key::<CborValue>()? {
+            let CborValue::Text(key) = key else {
+                return Err(<A::Error as serde::de::Error>::custom(
+                    "CBOR map keys must be strings",
+                ));
+            };
+            entries.push((key, access.next_value()?));
+        }
+        Ok(CborValue::Map(entries))
+    }
+}
+
+impl<'de> Deserialize<'de> for CborValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(CborValueVisitor)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical JsonValue adapter
+// ---------------------------------------------------------------------------
+
+/// Borrowed serializer wrapper for an opaque canonical service value.
+pub(crate) struct OpaqueJson<'a>(pub &'a JsonValue);
+
+impl Serialize for OpaqueJson<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        opaque_json::serialize(self.0, serializer)
+    }
+}
+
+/// Serde adapter for canonical Chord values carried in opaque envelopes.
+pub(crate) mod opaque_json {
+    use super::{JsObject, JsString, JsonValue};
+    use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+    use serde::ser::{SerializeMap, SerializeSeq, Serializer};
+
+    const BYTE_STRING_ERROR: &str = "protocol values must be strict JSON: byte strings are not permitted";
+    const UNICODE_ERROR: &str = "CBOR text strings must contain valid Unicode scalar values";
+    const DUPLICATE_KEY_ERROR: &str = "CBOR map contains a duplicate key";
+
+    pub(crate) fn serialize<S>(value: &JsonValue, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            JsonValue::Null => serializer.serialize_unit(),
+            JsonValue::Bool(value) => serializer.serialize_bool(*value),
+            JsonValue::Number(value) => serializer.serialize_f64(*value),
+            JsonValue::String(value) => {
+                let value =
+                    value.try_to_utf8().map_err(|_| {
+                        <S::Error as serde::ser::Error>::custom(UNICODE_ERROR)
+                    })?;
+                serializer.serialize_str(&value)
+            }
+            JsonValue::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(&super::OpaqueJson(value))?;
+                }
+                sequence.end()
+            }
+            JsonValue::Object(entries) => {
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    let key = key.try_to_utf8().map_err(|_| {
+                        <S::Error as serde::ser::Error>::custom(UNICODE_ERROR)
+                    })?;
+                    map.serialize_entry(&key, &super::OpaqueJson(value))?;
+                }
+                map.end()
+            }
+        }
+    }
+
+    struct JsonValueSeed;
+
+    impl<'de> DeserializeSeed<'de> for JsonValueSeed {
+        type Value = JsonValue;
+
+        fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(JsonValueVisitor)
+        }
+    }
+    struct JsonValueVisitor;
+
+    impl<'de> Visitor<'de> for JsonValueVisitor {
+        type Value = JsonValue;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a strict JSON value")
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue::Null)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue::Null)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(Self)
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue::Bool(value))
+        }
+
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "CBOR decoder bounds integers to the exact binary64 JSON range"
+        )]
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue::Number(value as f64))
+        }
+
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "CBOR decoder bounds integers to the exact binary64 JSON range"
+        )]
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue::Number(value as f64))
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue::Number(value))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue::String(JsString::from_utf8(value)))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue::String(JsString::from_utf8(&value)))
+        }
+
+        fn visit_bytes<E>(self, _value: &[u8]) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Err(E::custom(BYTE_STRING_ERROR))
+        }
+
+        fn visit_byte_buf<E>(self, _value: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Err(E::custom(BYTE_STRING_ERROR))
+        }
+
+        fn visit_char<E>(self, value: char) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue::String(JsString::from_utf8(&value.to_string())))
+        }
+
+        fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(Self)
+        }
+
+        fn visit_seq<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values = Vec::with_capacity(access.size_hint().unwrap_or(0));
+            while let Some(value) = access.next_element_seed(JsonValueSeed)? {
+                values.push(value);
+            }
+            Ok(JsonValue::Array(values))
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut object = JsObject::new();
+            while let Some(key) = access.next_key::<String>()? {
+                let value = access.next_value_seed(JsonValueSeed)?;
+                if object.insert(JsString::from_utf8(&key), value).is_some() {
+                    return Err(<A::Error as serde::de::Error>::custom(DUPLICATE_KEY_ERROR));
+                }
+            }
+            Ok(JsonValue::Object(object))
+        }
+    }
+
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<JsonValue, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(JsonValueVisitor)
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -103,10 +460,9 @@ impl Serializer for CborValueSerializer {
     fn serialize_i32(self, v: i32) -> Result<CborValue, SerError> {
         self.serialize_i64(i64::from(v))
     }
-    #[expect(clippy::cast_sign_loss, reason = "bounded by preceding v >= 0 check")]
     fn serialize_i64(self, v: i64) -> Result<CborValue, SerError> {
-        if v >= 0 {
-            Ok(CborValue::UInt(v as u64))
+        if let Ok(value) = u64::try_from(v) {
+            Ok(CborValue::UInt(value))
         } else {
             Ok(CborValue::NInt(v))
         }
@@ -296,15 +652,18 @@ impl SerializeMap for MapSer {
         Ok(())
     }
     fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), SerError> {
-        let k = self
+        let key = self
             .next_key
             .take()
             .ok_or_else(|| SerError::custom("value without key"))?;
-        let v = value.serialize(CborValueSerializer)?;
-        let CborValue::Text(ks) = k else {
+        let value = value.serialize(CborValueSerializer)?;
+        let CborValue::Text(key) = key else {
             return Err(SerError::custom("map keys must be strings"));
         };
-        self.entries.push((ks, v));
+        if self.entries.iter().any(|(seen, _)| seen == &key) {
+            return Err(SerError::custom("map contains a duplicate key"));
+        }
+        self.entries.push((key, value));
         Ok(())
     }
     fn end(self) -> Result<CborValue, SerError> {
@@ -431,21 +790,14 @@ impl<'de> serde::de::EnumAccess<'de> for EnumAccess {
 impl<'de> Deserializer<'de> for CborValueDeserializer {
     type Error = SerError;
 
-    #[expect(
-        clippy::cast_possible_wrap,
-        reason = "bounded by preceding i64::try_from check"
-    )]
     fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, SerError> {
         match self.value {
             CborValue::Null => visitor.visit_unit(),
             CborValue::Bool(b) => visitor.visit_bool(b),
-            CborValue::UInt(n) => {
-                if i64::try_from(n).is_ok() {
-                    visitor.visit_i64(n as i64)
-                } else {
-                    visitor.visit_u64(n)
-                }
-            }
+            CborValue::UInt(n) => match i64::try_from(n) {
+                Ok(value) => visitor.visit_i64(value),
+                Err(_) => visitor.visit_u64(n),
+            },
             CborValue::NInt(n) => visitor.visit_i64(n),
             CborValue::Float(f) => visitor.visit_f64(f),
             CborValue::Text(s) => visitor.visit_string(s),
@@ -481,13 +833,12 @@ impl<'de> Deserializer<'de> for CborValueDeserializer {
     fn deserialize_i32<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, SerError> {
         self.deserialize_i64(v)
     }
-    #[expect(
-        clippy::cast_possible_wrap,
-        reason = "bounded by preceding i64::try_from guard"
-    )]
     fn deserialize_i64<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, SerError> {
         match self.value {
-            CborValue::UInt(n) if i64::try_from(n).is_ok() => v.visit_i64(n as i64),
+            CborValue::UInt(n) => match i64::try_from(n) {
+                Ok(value) => v.visit_i64(value),
+                Err(_) => Err(SerError::custom("expected i64")),
+            },
             CborValue::NInt(n) => v.visit_i64(n),
             _ => Err(SerError::custom("expected i64")),
         }

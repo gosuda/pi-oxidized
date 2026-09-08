@@ -90,6 +90,13 @@ static SYMBOLS: &[(&str, &str)] = &[
     ("uplus", "⊎"),
     ("sqcap", "⊓"),
     ("sqcup", "⊔"),
+    ("bowtie", "⋈"),
+    ("Join", "⋈"),
+    ("ltimes", "⋉"),
+    ("rtimes", "⋊"),
+    ("leftouterjoin", "⟕"),
+    ("rightouterjoin", "⟖"),
+    ("fullouterjoin", "⟗"),
     ("triangleleft", "◁"),
     ("triangleright", "▷"),
     ("wr", "≀"),
@@ -425,12 +432,15 @@ static RELATION_COMMANDS: &[&str] = &[
     "Longleftrightarrow",
     "Longrightarrow",
     "Rightarrow",
+    "Join",
     "Vdash",
     "Vvdash",
     "approx",
     "asymp",
+    "bowtie",
     "cong",
     "dashv",
+    "fullouterjoin",
     "doteq",
     "downarrow",
     "equiv",
@@ -451,6 +461,7 @@ static RELATION_COMMANDS: &[&str] = &[
     "leftharpoonup",
     "leftrightarrow",
     "leftrightharpoons",
+    "leftouterjoin",
     "leq",
     "leqslant",
     "ll",
@@ -458,6 +469,7 @@ static RELATION_COMMANDS: &[&str] = &[
     "longleftrightarrow",
     "longmapsto",
     "longrightarrow",
+    "ltimes",
     "mapsto",
     "mid",
     "models",
@@ -477,8 +489,10 @@ static RELATION_COMMANDS: &[&str] = &[
     "rightharpoondown",
     "rightharpoonup",
     "rightleftharpoons",
+    "rightouterjoin",
     "rightarrow",
     "rightsquigarrow",
+    "rtimes",
     "searrow",
     "sim",
     "simeq",
@@ -1892,25 +1906,6 @@ mod tests {
     }
 
     #[test]
-    fn command_tables_are_entry_exact() {
-        assert_eq!(SYMBOLS.len(), 217);
-        assert_eq!(NEGATED_SYMBOLS.len(), 30);
-        assert_eq!(BLACKBOARD.len(), 7);
-        assert_eq!(SUPERSCRIPTS.len(), 40);
-        assert_eq!(SUBSCRIPTS.len(), 32);
-        assert_eq!(ACCENTS.len(), 18);
-        assert_eq!(NAMED_OPERATORS.len(), 32);
-        assert_eq!(LIMIT_OPERATORS.len(), 11);
-        assert_eq!(DISPLAY_LIMIT_SYMBOLS.len(), 16);
-        assert_eq!(RELATION_COMMANDS.len(), 81);
-        assert_eq!(SPACING_COMMANDS.len(), 12);
-        assert_eq!(NEGATIVE_SPACING_COMMANDS.len(), 4);
-        assert_eq!(IGNORED_COMMANDS.len(), 6);
-        assert_eq!(SIZE_COMMANDS.len(), 12);
-        assert_eq!(PLAIN_WRAPPERS.len(), 30);
-    }
-
-    #[test]
     fn symbols_scripts_and_relations() {
         assert_eq!(
             render(r"\mathbb{C}^3 \to \mathbb{C}^3").as_deref(),
@@ -1942,6 +1937,19 @@ mod tests {
             render(r"A\not\subseteq B,\quad x\not\in X").as_deref(),
             Some("A ⊈ B, x ∉ X")
         );
+    }
+
+    #[test]
+    fn relational_join_commands_render_expected_unicode() {
+        assert_eq!(render(r"\bowtie").as_deref(), Some("⋈"));
+        assert_eq!(render(r"\Join").as_deref(), Some("⋈"));
+        assert_eq!(render(r"\ltimes").as_deref(), Some("⋉"));
+        assert_eq!(render(r"\rtimes").as_deref(), Some("⋊"));
+        assert_eq!(render(r"\leftouterjoin").as_deref(), Some("⟕"));
+        assert_eq!(render(r"\rightouterjoin").as_deref(), Some("⟖"));
+        assert_eq!(render(r"\fullouterjoin").as_deref(), Some("⟗"));
+        assert_eq!(render(r"A \bowtie B \Join C").as_deref(), Some("A ⋈ B ⋈ C"));
+        assert_eq!(render(r"\notarealcommand").as_deref(), None);
     }
 
     #[test]

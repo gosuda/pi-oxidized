@@ -59,10 +59,31 @@
  * Output schema: pi.deps.exposure.v1.
  */
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, posix, relative, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import {
+	existsSync,
+	linkSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
+import {
+	assertCaptureOutputPathsDisjoint,
+	beginRelevantInputObservation,
+	beginStagedInputCapture,
+	parseStagedInputProvenance,
+	STAGED_INPUT_PROVENANCE_SCHEMA,
+	type StagedInputCapture,
+	type StagedInputProvenance,
+} from "./capture-inputs.ts";
+import { assertCompiledVendorCoverage, vendorInputScopes, readVendorSourcePins } from "./vendor-provenance.ts";
 
 import type { hostBundleCommands } from "../release/host.ts";
 import type { planFor, TARGET_PLANS } from "../release/targets.ts";
@@ -412,6 +433,7 @@ export interface ReferenceManifest {
 	readonly captureHead: string | undefined;
 	/** Porcelain output recorded when capture ran with --allow-dirty-relevant. */
 	readonly relevantTreeStatus: string | undefined;
+	readonly stagedInputProvenance: StagedInputProvenance | undefined;
 	readonly metafile: {
 		readonly projectionPath: string;
 		readonly sha256: string;
@@ -427,6 +449,8 @@ export interface ReferenceManifest {
 	};
 	readonly npmSurfaces: readonly ReferenceNpmSurface[];
 	readonly cargoFiles: readonly ReferenceFilePin[];
+	/** Tracked vendored source / manifest / provenance / license file pins. */
+	readonly vendorFiles?: readonly ReferenceFilePin[];
 	readonly authority: readonly ReferenceFilePin[];
 }
 
@@ -466,13 +490,44 @@ export function parseReferenceManifest(text: string, what: string): ReferenceMan
 		return { path: reqString(record, "path", what), sha256: reqSha256(record, "sha256", what) };
 	};
 	const headValue = optString(json, "captureHead");
+	const relevantTreeStatus = optString(json, "relevantTreeStatus");
+	const stagedRaw = json["stagedInputProvenance"];
+	const stagedInputProvenance: StagedInputProvenance | undefined =
+		stagedRaw === undefined ? undefined : parseStagedInputProvenance(stagedRaw, `${what} stagedInputProvenance`);
+	if (stagedInputProvenance !== undefined) {
+		if (json["relevantTreeStatus"] !== undefined) {
+			throw new ExposureError(`${what}: stagedInputProvenance is incompatible with relevantTreeStatus (dirty exception)`);
+		}
+		if (headValue === undefined) {
+			throw new ExposureError(`${what}: stagedInputProvenance requires captureHead`);
+		}
+		if (headValue !== stagedInputProvenance.baseHead) {
+			throw new ExposureError(`${what}: captureHead does not match stagedInputProvenance.baseHead`);
+		}
+	}
+	function parseProjectionBasename(name: string, label: string): string {
+		if (name.length === 0) {
+			throw new ExposureError(`${what}: ${label} projection path must not be empty`);
+		}
+		if (name.includes("\0")) {
+			throw new ExposureError(`${what}: ${label} projection path must not contain NUL`);
+		}
+		if (name.includes("/") || name.includes("\\")) {
+			throw new ExposureError(`${what}: ${label} projection path must be a single basename, not a path`);
+		}
+		if (name === "." || name === "..") {
+			throw new ExposureError(`${what}: ${label} projection path must not be "." or ".."`);
+		}
+		return name;
+	}
 	return {
 		schema: REFERENCE_SCHEMA,
 		capturedAt: reqString(json, "capturedAt", what),
 		captureHead: headValue,
-		relevantTreeStatus: optString(json, "relevantTreeStatus"),
+		relevantTreeStatus,
+		stagedInputProvenance,
 		metafile: {
-			projectionPath: reqString(metafile, "projectionPath", what),
+			projectionPath: parseProjectionBasename(reqString(metafile, "projectionPath", what), "metafile"),
 			sha256: reqSha256(metafile, "sha256", what),
 			entry: reqString(metafile, "entry", what),
 			hostDirRel: reqString(metafile, "hostDirRel", what),
@@ -480,14 +535,17 @@ export function parseReferenceManifest(text: string, what: string): ReferenceMan
 			metafileSha256: reqSha256(metafile, "metafileSha256", what),
 		},
 		cargo: {
-			projectionPath: reqString(cargo, "projectionPath", what),
+			projectionPath: parseProjectionBasename(reqString(cargo, "projectionPath", what), "cargo"),
 			sha256: reqSha256(cargo, "sha256", what),
 			argv: reqStringArray(cargo, "argv", what),
 		},
 		npmSurfaces,
 		cargoFiles: cargoFilesRaw.map((entry, index) => pin(entry, `cargoFiles[${index}]`)),
-		authority: authorityRaw.map((entry, index) => pin(entry, `authority[${index}]`)),
-	};
+		vendorFiles: Array.isArray(json["vendorFiles"])
+			? json["vendorFiles"].map((entry, index) => pin(entry, `vendorFiles[${index}]`))
+			: undefined,
+	authority: authorityRaw.map((entry, index) => pin(entry, `authority[${index}]`)),
+};
 }
 
 export interface MetafileProjection {
@@ -572,18 +630,21 @@ export function projectCargoMetadata(rawText: string, argv: readonly string[], w
 	const json = parseJson(rawText, what);
 	const packagesRaw = json["packages"];
 	if (!Array.isArray(packagesRaw)) throw new ExposureError(`${what}: packages must be an array`);
+	const workspaceMembersRaw = json["workspace_members"];
+	if (!Array.isArray(workspaceMembersRaw)) throw new ExposureError(`${what}: workspace_members must be an array`);
 	const nameById = new Map<string, string>();
-	const members: string[] = [];
-	const workspaceRoot = optString(json, "workspace_root");
 	for (const entry of packagesRaw) {
 		const record = asRecord(entry, `${what} packages[]`);
 		const id = reqString(record, "id", what);
 		const name = reqString(record, "name", what);
 		nameById.set(id, name);
-		const manifestPath = optString(record, "manifest_path");
-		if (workspaceRoot !== undefined && manifestPath !== undefined && manifestPath.startsWith(workspaceRoot)) {
-			members.push(name);
-		}
+	}
+	const members: string[] = [];
+	for (const id of workspaceMembersRaw) {
+		if (typeof id !== "string") throw new ExposureError(`${what}: workspace_members entries must be strings`);
+		const name = nameById.get(id);
+		if (name === undefined) throw new ExposureError(`${what}: unknown workspace member id ${id}`);
+		members.push(name);
 	}
 	const resolveRaw = json["resolve"];
 	const resolve = asRecord(resolveRaw, `${what} resolve`);
@@ -1418,20 +1479,19 @@ export async function classify(options: ClassifyOptions): Promise<ExposureReport
 	// Cargo.toml-only edge/feature change fail closed even when Cargo.lock
 	// is untouched.
 	const crossIdentity = await guard("E1", (): CheckResult => {
+		const vendorFiles = manifest.vendorFiles ?? [];
 		if (options.subject.kind === "npm") {
-			const drifted = driftedPins(root, manifest.cargoFiles);
+			const drifted = driftedPins(root, [...manifest.cargoFiles, ...vendorFiles]);
 			if (drifted.length > 0) {
 				return undecidable(
-					`npm subject but Rust inputs drifted since capture: ${drifted.join(", ")} (Cargo.toml-only changes fail closed)`,
+					`npm subject but Rust inputs drifted since capture: ${drifted.join(", ")} (Cargo.toml-only or vendored-source changes fail closed)`,
 				);
 			}
 		} else if (options.subject.kind === "crate") {
-			const drifted = driftedPins(
-				root,
-				manifest.npmSurfaces.map((surface) => ({ path: surface.path, sha256: surface.sha256 })),
-			);
+			const npmPins = manifest.npmSurfaces.map((surface) => ({ path: surface.path, sha256: surface.sha256 }));
+			const drifted = driftedPins(root, [...npmPins, ...vendorFiles]);
 			if (drifted.length > 0) {
-				return undecidable(`crate subject but npm surfaces drifted since capture: ${drifted.join(", ")}`);
+				return undecidable(`crate subject but npm surfaces or vendored source drifted since capture: ${drifted.join(", ")}`);
 			}
 		}
 		return pass("cross-ecosystem inputs unchanged since reference capture");
@@ -1575,13 +1635,12 @@ function finalizeWithChecks(input: {
 	};
 }
 
-export interface CaptureOptions {
-	/** Record (rather than refuse) a dirty relevant tree; provenance is stored in the manifest. */
-	readonly allowDirtyRelevant?: boolean;
-}
+export type CaptureOptions =
+	| { readonly inputMode: "staged"; readonly allowDirtyRelevant?: never }
+	| { readonly inputMode?: "committed"; readonly allowDirtyRelevant?: boolean };
 
 export function assertRelevantTreeClean(root: string, allowDirtyRelevant: boolean): string | undefined {
-	const status = gitOutput(root, ["status", "--porcelain", "--", ...RELEVANT_PATHSPECS]);
+	const status = gitOutput(root, ["status", "--porcelain", "--", ...relevantPathspecs(root)]);
 	if (status.trim().length === 0) return undefined;
 	if (!allowDirtyRelevant) {
 		throw new ExposureError(
@@ -1594,25 +1653,35 @@ export function assertRelevantTreeClean(root: string, allowDirtyRelevant: boolea
 // ---------------------------------------------------------------------------
 // capture-reference
 // ---------------------------------------------------------------------------
-
-const RELEVANT_PATHSPECS = [
+function relevantPathspecs(root: string): readonly string[] {
+	return [
 	"package.json",
 	"packages/extension-host/package.json",
 	"packages/pi-tui-protocol/package.json",
 	"packages/*/package.json",
+	"packages/*/tsconfig*.json",
 	"bun.lock",
 	"packages/extension-host/bun.lock",
+	".gitattributes",
+	"rust-toolchain.toml",
+	".cargo/config",
+	".cargo/config.toml",
+	"bunfig.toml",
+	"packages/extension-host/bunfig.toml",
 	"Cargo.toml",
 	"Cargo.lock",
 	"crates/*/Cargo.toml",
+	...vendorInputScopes(root),
 	"scripts/release",
 	"scripts/package-release.ts",
 	"scripts/build-extension-host.ts",
 	"scripts/verification/dependency-exposure.ts",
+	"scripts/verification/capture-inputs.ts",
+	"scripts/verification/vendor-provenance.ts",
 	"packages/extension-host/src",
 	"packages/pi-tui-protocol/src",
-] as const;
-
+	];
+}
 function gitOutput(root: string, args: readonly string[]): string {
 	const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
 	if (result.status !== 0 || result.stdout === null) {
@@ -1632,131 +1701,344 @@ function listCargoFiles(root: string): string[] {
 	}
 	return paths.sort();
 }
+function isInsideDir(parent: string, file: string): boolean {
+	const rel = relative(resolve(parent), resolve(file));
+	return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+function captureBuildArgv(root: string, triple: string, stagingDir: string): { argv: string[]; bunTarget: string; hostBinaryName: string } {
+	const program = `import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+async function main() {
+	const [r, t, s] = process.argv.slice(2);
+	if (typeof r !== "string" || r.length === 0 || typeof t !== "string" || t.length === 0 || typeof s !== "string" || s.length === 0) {
+		throw new Error("capture-argv: expected three non-empty positional arguments");
+	}
+	// Repository root is a runtime positional argument, so dynamic import is required.
+	const targets = await import(pathToFileURL(join(r, "scripts/release/targets.ts")).href);
+	const host = await import(pathToFileURL(join(r, "scripts/release/host.ts")).href);
+	const plan = targets.planFor(t);
+	const commands = host.hostBundleCommands(plan, s);
+	const argv = [...commands.compiled, \`--metafile=\${join(s, "metafile.json")}\`];
+	const payload = { argv, bunTarget: plan.bunTarget, hostBinaryName: plan.hostBinaryName };
+	process.stdout.write(JSON.stringify(payload) + "\\n");
+}
+
+await main();
+`;
+	const helperPath = join(stagingDir, "capture-argv.ts");
+	writeFileSync(helperPath, program);
+	const child = spawnSync("bun", [helperPath, root, triple, stagingDir], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 30_000,
+	});
+	if (child.status !== 0 || child.error !== undefined) {
+		throw new ExposureError(
+			`capture-argv subprocess failed: ${child.error !== undefined ? errorText(child.error) : (child.stderr ?? "").slice(0, 500)}`,
+		);
+	}
+	const lines = (child.stdout ?? "").split("\n").filter((line) => line.trim().length > 0);
+	const last = lines[lines.length - 1];
+	if (last === undefined) throw new ExposureError("capture-argv subprocess produced no output");
+	let payload: unknown;
+	try {
+		payload = JSON.parse(last);
+	} catch (error) {
+		throw new ExposureError(`capture-argv output is not valid JSON: ${errorText(error)} (${last.slice(0, 200)})`);
+	}
+	const record = asRecord(payload, "capture-argv output");
+	const argv = reqStringArray(record, "argv", "capture-argv output");
+	const bunTarget = reqString(record, "bunTarget", "capture-argv output");
+	const hostBinaryName = reqString(record, "hostBinaryName", "capture-argv output");
+	if (argv[0] !== "build") throw new ExposureError(`capture-argv argv must start with "build", got ${String(argv[0])}`);
+	const targetIdx = argv.indexOf("--target");
+	if (targetIdx === -1 || argv[targetIdx + 1] !== bunTarget) {
+		throw new ExposureError(`capture-argv missing or mismatched --target ${bunTarget}`);
+	}
+	const outfileIdx = argv.indexOf("--outfile");
+	if (outfileIdx === -1) throw new ExposureError("capture-argv missing --outfile");
+	const outfile = argv[outfileIdx + 1];
+	if (outfile === undefined) throw new ExposureError("capture-argv missing --outfile value");
+	const metafileToken = argv.find((token) => token.startsWith("--metafile="));
+	if (metafileToken === undefined) throw new ExposureError("capture-argv missing --metafile");
+	const metafilePath = metafileToken.slice("--metafile=".length);
+	if (!isInsideDir(stagingDir, outfile)) throw new ExposureError(`capture-argv --outfile escapes staging: ${outfile}`);
+	if (!isInsideDir(stagingDir, metafilePath)) throw new ExposureError(`capture-argv --metafile escapes staging: ${metafilePath}`);
+	if (resolve(outfile) !== resolve(join(stagingDir, hostBinaryName))) {
+		throw new ExposureError(`capture-argv --outfile ${outfile} does not match expected ${hostBinaryName}`);
+	}
+	return { argv, bunTarget, hostBinaryName };
+}
+
+function installImmutableProjection(stagingPath: string, canonicalPath: string, expectedSha: string): void {
+	try {
+		linkSync(stagingPath, canonicalPath);
+	} catch (linkError) {
+		let installed = false;
+		try {
+			if (existsSync(canonicalPath) && statSync(canonicalPath).isFile()) {
+				installed = sha256Text(readFileSync(canonicalPath, "utf8")) === expectedSha;
+			}
+		} catch {
+			installed = false;
+		}
+		if (!installed) {
+			throw new ExposureError(
+				`immutable projection install failed for ${canonicalPath}: ${errorText(linkError)}`,
+			);
+		}
+	}
+}
 
 export async function captureReference(
 	root: string,
 	outDir: string,
-	options?: CaptureOptions,
+	options: CaptureOptions = {},
 ): Promise<ReferenceManifest> {
-	const relevantTreeStatus = assertRelevantTreeClean(root, options?.allowDirtyRelevant === true);
-	const hostDir = join(root, HOST_PACKAGE_DIR);
+	// Runtime invalid mode rejection.
+	const rawMode = (options as Record<string, unknown>)["inputMode"];
+	if (rawMode !== undefined && rawMode !== "staged" && rawMode !== "committed") {
+		throw new ExposureError(`invalid capture inputMode: ${String(rawMode)}`);
+	}
+	const isStaged = rawMode === "staged";
+	if (isStaged && (options as Record<string, unknown>)["allowDirtyRelevant"] === true) {
+		throw new ExposureError("staged mode is incompatible with --allow-dirty-relevant");
+	}
+	const allowDirtyRelevant = !isStaged && options.allowDirtyRelevant === true;
+	const inputPaths = relevantPathspecs(root);
+	readVendorSourcePins(root);
+
+	let relevantTreeStatus: string | undefined;
+	let stagedHandle: StagedInputCapture | undefined;
+	let observationHandle: { assertUnchanged(): void } | undefined;
+	let captureHead: string;
+
+	// 1. Input mode guards and provenance/observation handles.
+	//    Strict staged/committed capture uses the helper's provenance.baseHead;
+	//    the existing dep-field-free dirty exception begins observation before
+	//    reading the manifest metadata it will store, so final assertUnchanged
+	//    brackets those reads too.
+	if (isStaged) {
+		stagedHandle = beginStagedInputCapture(root, inputPaths);
+		captureHead = stagedHandle.provenance.baseHead;
+	} else if (allowDirtyRelevant) {
+		observationHandle = beginRelevantInputObservation(root, inputPaths);
+		relevantTreeStatus = assertRelevantTreeClean(root, true);
+		captureHead = gitOutput(root, ["rev-parse", "HEAD"]).trim();
+	} else {
+		const status = assertRelevantTreeClean(root, false);
+		if (status !== undefined) {
+			throw new ExposureError(`relevant tree unexpectedly dirty: ${status}`);
+		}
+		stagedHandle = beginStagedInputCapture(root, inputPaths);
+		captureHead = stagedHandle.provenance.baseHead;
+	}
+
+	// Output containment guard before any build directories or files are created.
+	const finalOutDir = resolve(outDir);
+	assertCaptureOutputPathsDisjoint(root, inputPaths, [join(finalOutDir, "reference.json")]);
+
 	mkdirSync(outDir, { recursive: true });
-	// 1. Authority argv (trusted pre-change tree; byte pinning happens below).
-	// Dynamic by design: capture runs on the clean pre-change tree, and these
-	// modules are the same byte-pinned authorities classification loads.
-	const hostUrl = new URL(`file://${join(root, "scripts/release/host.ts")}`).href;
-	const hostModule = (await import(hostUrl)) as HostAuthority;
-	const targetsUrl = new URL(`file://${join(root, "scripts/release/targets.ts")}`).href;
-	const targetsModule = (await import(targetsUrl)) as TargetsAuthority;
+
 	const triple = localRustTriple();
 	if (triple === undefined) throw new ExposureError("cannot map the local platform to a release triple");
-	const plan = targetsModule.planFor(triple);
-	// Stage outside the repo tree: the staging paths are pinned into the
-	// committed argv, so an in-repo staging dir would bake the author's
-	// checkout path into the bundle and leave build residue in the tree.
-	const staging = join(tmpdir(), "exposure-capture-staging");
-	mkdirSync(staging, { recursive: true });
-	const commands = hostModule.hostBundleCommands(plan, join(staging, plan.hostBinaryName));
-	const argv = [...commands.compiled, `--metafile=${join(staging, "metafile.json")}`];
 
-	// 2. Run the authority bun build once, on the trusted pre-change tree.
-	const build = spawnSync("bun", argv, { cwd: hostDir, encoding: "utf8", timeout: 10 * 60_000 });
-	if (build.status !== 0) {
-		throw new ExposureError(`bun build (authority argv) failed: ${(build.stderr ?? "").slice(0, 800)}`);
-	}
-	const metafileText = readFileSync(join(staging, "metafile.json"), "utf8");
-	const metafile = parseJson(metafileText, "metafile.json");
-	const inputsRaw = metafile["inputs"];
-	const inputsRecord = asRecord(inputsRaw, "metafile inputs");
-	const inputs: Record<string, string> = {};
-	for (const path of Object.keys(inputsRecord)) {
-		// The provider-data manifest embeds its own generation timestamp
-		// (generatedAt), so its digest changes on every data hydration and
-		// can never reproduce a capture. Pinning it tests recency, not
-		// integrity. The manifest's source files are pinned individually
-		// below, so skipping it loses no coverage.
-		if (path.endsWith("packages/ai/src/providers/data/.manifest.json")) continue;
-		// The live provider catalogs beside it are hydrated from the vendor
-		// APIs on every data hydration (the whole directory is generated and
-		// gitignored upstream), so their digests drift with each hydration
-		// and can never reproduce a capture either. They carry model-list
-		// data, not staged code, so skipping them loses no exposure signal.
-		if (path.includes("packages/ai/src/providers/data/") && path.endsWith(".json")) continue;
-		inputs[path] = sha256FileAt(resolve(hostDir, path));
-	}
-	const metafileProjection: MetafileProjection = {
-		schema: METAFILE_PROJECTION_SCHEMA,
-		entry: "./src/main.ts",
-		hostDirRel: HOST_PACKAGE_DIR,
-		argv,
-		metafileSha256: sha256Text(metafileText),
-		inputs,
+	// 2. Build scratch and authority argv from a fresh subprocess. The triple
+	//    guard above runs before any run-owned path exists, and every path
+	//    created below joins the registry; one force-removal helper owns all
+	//    of them, so no failure between publish staging and the canonical
+	//    rename can orphan scratch, staging, or the prepared reference temp.
+	const buildScratch = mkdtempSync(join(tmpdir(), "exposure-capture-"));
+	const runOwnedPaths: string[] = [buildScratch];
+	const removeRunOwnedPaths = (): void => {
+		for (const runOwnedPath of runOwnedPaths) {
+			try { rmSync(runOwnedPath, { recursive: true, force: true }); } catch {}
+		}
 	};
-	const metafileProjectionText = `${JSON.stringify(metafileProjection, null, "\t")}\n`;
-	writeFileSync(join(outDir, "metafile-projection.json"), metafileProjectionText);
 
-	// 3. cargo metadata for the pre-change graph.
-	const cargoRaw = spawnSync("cargo", [...CARGO_METADATA_ARGV], {
-		cwd: root,
-		encoding: "utf8",
-		timeout: 120_000,
-		maxBuffer: 64 * 1024 * 1024,
-		killSignal: "SIGKILL",
-	});
-	if (cargoRaw.status !== 0) {
-		throw new ExposureError(`cargo metadata failed: ${(cargoRaw.stderr ?? "").slice(0, 800)}`);
-	}
-	const cargoGraph = projectCargoMetadata(cargoRaw.stdout ?? "", CARGO_METADATA_ARGV, "cargo metadata");
-	const cargoProjectionText = `${JSON.stringify(
-		{
+	try {
+		const { argv } = captureBuildArgv(root, triple, buildScratch);
+		const metafilePath = join(buildScratch, "metafile.json");
+
+		// 3. Run the authority bun build once, on the trusted tree.
+		const hostDir = join(root, HOST_PACKAGE_DIR);
+		const build = spawnSync("bun", argv, { cwd: hostDir, encoding: "utf8", timeout: 10 * 60_000 });
+		if (build.status !== 0) {
+			throw new ExposureError(`bun build (authority argv) failed: ${(build.stderr ?? "").slice(0, 800)}`);
+		}
+		const metafileText = readFileSync(metafilePath, "utf8");
+		const metafile = parseJson(metafileText, "metafile.json");
+		const inputsRaw = metafile["inputs"];
+		const inputsRecord = asRecord(inputsRaw, "metafile inputs");
+		const inputs: Record<string, string> = {};
+		for (const path of Object.keys(inputsRecord)) {
+			// The provider-data manifest embeds its own generation timestamp
+			// (generatedAt), so its digest changes on every data hydration and
+			// can never reproduce a capture. Pinning it tests recency, not
+			// integrity. The manifest's source files are pinned individually
+			// below, so skipping it loses no coverage.
+			if (path.endsWith("packages/ai/src/providers/data/.manifest.json")) continue;
+			// The live provider catalogs beside it are hydrated from the vendor
+			// APIs on every data hydration (the whole directory is generated and
+			// gitignored upstream), so their digests drift with each hydration
+			// and can never reproduce a capture either. They carry model-list
+			// data, not staged code, so skipping them loses no exposure signal.
+			if (path.includes("packages/ai/src/providers/data/") && path.endsWith(".json")) continue;
+			inputs[path] = sha256FileAt(resolve(hostDir, path));
+		}
+		const metafileProjection: MetafileProjection = {
+			schema: METAFILE_PROJECTION_SCHEMA,
+			entry: "./src/main.ts",
+			hostDirRel: HOST_PACKAGE_DIR,
+			argv,
+			metafileSha256: sha256Text(metafileText),
+			inputs,
+		};
+		const metafileProjectionText = `${JSON.stringify(metafileProjection, null, "\t")}\n`;
+
+		// 4. cargo metadata for the pre-change graph.
+		const cargoRaw = spawnSync("cargo", [...CARGO_METADATA_ARGV], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 120_000,
+			maxBuffer: 64 * 1024 * 1024,
+			killSignal: "SIGKILL",
+		});
+		if (cargoRaw.status !== 0) {
+			throw new ExposureError(`cargo metadata failed: ${(cargoRaw.stderr ?? "").slice(0, 800)}`);
+		}
+		const cargoGraph = projectCargoMetadata(cargoRaw.stdout ?? "", CARGO_METADATA_ARGV, "cargo metadata");
+		const cargoProjection: CargoGraphProjection = {
 			schema: CARGO_GRAPH_PROJECTION_SCHEMA,
 			argv: [...CARGO_METADATA_ARGV],
 			workspaceMembers: cargoGraph.workspaceMembers,
 			edges: cargoGraph.edges,
-		},
-		null,
-		"\t",
-	)}\n`;
-	writeFileSync(join(outDir, "cargo-graph-projection.json"), cargoProjectionText);
+		};
+		const cargoProjectionText = `${JSON.stringify(cargoProjection, null, "\t")}\n`;
 
-	// 4. Surfaces + authority + cargo file pins.
-	const surfaces = loadNpmSurfaces(root);
-	const manifest: ReferenceManifest = {
-		schema: REFERENCE_SCHEMA,
-		capturedAt: new Date().toISOString(),
-		captureHead: gitOutput(root, ["rev-parse", "HEAD"]).trim(),
-		relevantTreeStatus,
-		metafile: {
-			projectionPath: "metafile-projection.json",
-			sha256: sha256Text(metafileProjectionText),
-			entry: "./src/main.ts",
-			hostDirRel: HOST_PACKAGE_DIR,
-			argv,
-			metafileSha256: metafileProjection.metafileSha256,
-		},
-		cargo: {
-			projectionPath: "cargo-graph-projection.json",
-			sha256: sha256Text(cargoProjectionText),
-			argv: [...CARGO_METADATA_ARGV],
-		},
-		npmSurfaces: surfaces.map((surface) => ({
-			path: surface.relPath,
-			sha256: surface.sha256,
-			packageName: surface.packageName,
-			depFields: surface.depFields,
-		})),
-		cargoFiles: listCargoFiles(root).map((path) => ({
+		// 5. Surfaces + authority + cargo file pins.
+		const surfaces = loadNpmSurfaces(root);
+		const cargoFiles = listCargoFiles(root).map((path) => ({
 			path,
 			sha256: sha256FileAt(join(root, path)),
-		})),
-		authority: AUTHORITY_REL_PATHS.map((path) => ({
+		}));
+		const vendorFiles = readVendorSourcePins(root).map((pin) => ({
+			path: pin.path,
+			sha256: pin.sha256,
+		}));
+		const metadata = parseJson(cargoRaw.stdout ?? "", "cargo metadata");
+		const packages = metadata["packages"];
+		if (!Array.isArray(packages)) throw new ExposureError("cargo metadata: missing packages");
+		assertCompiledVendorCoverage(root, packages.map((entry) => {
+			const pkg = asRecord(entry, "cargo metadata package");
+			const source = pkg["source"];
+			if (source !== null && typeof source !== "string") throw new ExposureError("cargo metadata package: invalid source");
+			return {
+				name: reqString(pkg, "name", "cargo metadata package"),
+				manifest_path: reqString(pkg, "manifest_path", "cargo metadata package"),
+				source,
+			};
+		}), vendorFiles);
+		const authority = AUTHORITY_REL_PATHS.map((path) => ({
 			path,
 			sha256: sha256FileAt(join(root, path)),
-		})),
-	};
-	const manifestText = `${JSON.stringify(manifest, null, "\t")}\n`;
-	writeFileSync(join(outDir, "reference.json"), manifestText);
-	return manifest;
+		}));
+
+		// 6. Immediate postcheck: inputs stable (brackets all input/pin reads above).
+		if (stagedHandle !== undefined) stagedHandle.assertUnchanged();
+		if (observationHandle !== undefined) observationHandle.assertUnchanged();
+
+		// 7. Compute final manifest with hash-named immutable projections.
+		const metaSha = sha256Text(metafileProjectionText);
+		const cargoSha = sha256Text(cargoProjectionText);
+		const manifest: ReferenceManifest = {
+			schema: REFERENCE_SCHEMA,
+			capturedAt: new Date().toISOString(),
+			captureHead,
+			relevantTreeStatus,
+			stagedInputProvenance: isStaged ? stagedHandle?.provenance : undefined,
+			metafile: {
+				projectionPath: `metafile-projection.${metaSha}.json`,
+				sha256: metaSha,
+				entry: "./src/main.ts",
+				hostDirRel: HOST_PACKAGE_DIR,
+				argv,
+				metafileSha256: metafileProjection.metafileSha256,
+			},
+			cargo: {
+				projectionPath: `cargo-graph-projection.${cargoSha}.json`,
+				sha256: cargoSha,
+				argv: [...CARGO_METADATA_ARGV],
+			},
+			npmSurfaces: surfaces.map((surface) => ({
+				path: surface.relPath,
+				sha256: surface.sha256,
+				packageName: surface.packageName,
+				depFields: surface.depFields,
+			})),
+			cargoFiles,
+			vendorFiles,
+			authority,
+		};
+
+		// 8. Validate final output paths before publication staging.
+		const metafileOutPath = join(finalOutDir, manifest.metafile.projectionPath);
+		const cargoOutPath = join(finalOutDir, manifest.cargo.projectionPath);
+		const referenceOutPath = join(finalOutDir, "reference.json");
+		assertCaptureOutputPathsDisjoint(root, inputPaths, [metafileOutPath, cargoOutPath, referenceOutPath]);
+
+		// 9. Stage the complete bundle under outDir.
+		const publishStaging = mkdtempSync(join(finalOutDir, "exposure-staging-"));
+		runOwnedPaths.push(publishStaging);
+		const stagingMetaPath = join(publishStaging, manifest.metafile.projectionPath);
+		const stagingCargoPath = join(publishStaging, manifest.cargo.projectionPath);
+		const stagingReferencePath = join(publishStaging, "reference.json");
+		writeFileSync(stagingMetaPath, metafileProjectionText);
+		writeFileSync(stagingCargoPath, cargoProjectionText);
+		writeFileSync(stagingReferencePath, `${JSON.stringify(manifest, null, "\t")}\n`);
+
+		// 10. Validate the prepared bundle with loadReferenceBundle before selection.
+		let bundle: ReferenceBundle;
+		try {
+			bundle = loadReferenceBundle(publishStaging);
+		} catch (error) {
+			throw new ExposureError(`prepared bundle failed validation: ${errorText(error)}`);
+		}
+		if (bundle.manifest.metafile.sha256 !== metaSha) throw new ExposureError("prepared metafile hash mismatch");
+		if (bundle.manifest.cargo.sha256 !== cargoSha) throw new ExposureError("prepared cargo hash mismatch");
+
+		// 11. Install each projection into outDir with a no-replace hard link.
+		installImmutableProjection(stagingMetaPath, metafileOutPath, metaSha);
+		installImmutableProjection(stagingCargoPath, cargoOutPath, cargoSha);
+
+		// 12. Move prepared reference to a unique temp file inside outDir. The
+		//     sweep before the commit point clears the build scratch and the
+		//     publish staging (the canonical hard links survive; only staging
+		//     links go). The reference temp joins the registry only after that
+		//     sweep, so it stays owned by the finally through the commit
+		//     window and is swept on every error path.
+		const referenceTemp = join(finalOutDir, `reference-staging-${randomUUID()}.json`);
+		renameSync(stagingReferencePath, referenceTemp);
+		removeRunOwnedPaths();
+		runOwnedPaths.push(referenceTemp);
+
+		// 13. Final staged assertUnchanged immediately precedes the single rename.
+		if (stagedHandle !== undefined) stagedHandle.assertUnchanged();
+		if (observationHandle !== undefined) observationHandle.assertUnchanged();
+
+		// 14. Atomic canonical selection: one renameSync over reference.json.
+		renameSync(referenceTemp, referenceOutPath);
+
+		return manifest;
+	} finally {
+		// Error-path sweep of the same run-owned registry; force-removal
+		// ignores paths the commit-point sweep already cleared, and removal
+		// failures are discarded so cleanup can never mask the publication
+		// outcome or touch the installed immutable outputs.
+		removeRunOwnedPaths();
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1807,15 +2089,20 @@ export async function selfCheck(referenceDir: string, tmpDir: string): Promise<S
 		detail: bunRuntime.verdict.reason,
 	});
 
-	// Synthetic fail-closed probe: tamper the canonical reference copy so the
-	// cargo projection no longer matches its pinned hash; classification must
-	// fail closed to Class S instead of exempting.
+	// Synthetic fail-closed probe: load the manifest, copy reference.json plus the
+	// manifest-selected projection basenames, then tamper the cargo projection so
+	// its hash no longer matches; classification must fail closed to Class S.
+	const bundle = loadReferenceBundle(referenceDir);
 	const tamperedDir = join(tmpDir, "tampered-reference");
 	mkdirSync(tamperedDir, { recursive: true });
-	for (const name of ["reference.json", "metafile-projection.json", "cargo-graph-projection.json"]) {
+	for (const name of ["reference.json", bundle.manifest.metafile.projectionPath, bundle.manifest.cargo.projectionPath]) {
 		writeFileSync(join(tamperedDir, name), readFileSync(join(referenceDir, name)));
 	}
-	const cargoPath = join(tamperedDir, "cargo-graph-projection.json");
+	// The probe is only meaningful if the copied bundle is complete and valid:
+	// a missing manifest-selected file would fail closed for the wrong reason
+	// and masquerade as tamper detection.
+	loadReferenceBundle(tamperedDir);
+	const cargoPath = join(tamperedDir, bundle.manifest.cargo.projectionPath);
 	writeFileSync(cargoPath, `${readFileSync(cargoPath, "utf8")}\n`);
 	const probe = await classify({ subject: parseSubject("npm:@types/bun"), referenceDir: tamperedDir });
 	outcomes.push({
@@ -1837,7 +2124,7 @@ function usage(): never {
 	process.stderr.write(
 		[
 			"usage:",
-			"  dependency-exposure.ts capture-reference --out <dir>",
+			"  dependency-exposure.ts capture-reference --out <dir> [--staged-inputs | --allow-dirty-relevant]",
 			"  dependency-exposure.ts classify --subject <kind:name> --reference <dir> [--cargo-metadata-file <path>] [--emit-ledger-row]",
 			"  dependency-exposure.ts self-check [--reference <dir>]",
 			"",
@@ -1846,12 +2133,88 @@ function usage(): never {
 	process.exit(2);
 }
 
-function argValue(args: readonly string[], name: string): string | undefined {
-	const index = args.indexOf(name);
-	if (index === -1) return undefined;
+function nextFlagValue(args: readonly string[], index: number, what: string): string {
 	const value = args[index + 1];
-	if (value === undefined || value.startsWith("--")) return undefined;
+	if (value === undefined || value.startsWith("--")) {
+		process.stderr.write(`${what}: missing value\n`);
+		usage();
+	}
 	return value;
+}
+
+interface FlagSpec {
+	readonly flag: string;
+	readonly takesValue: boolean;
+}
+
+/** Shared flag loop: unknown or repeated flags and missing values are usage errors. */
+function parseCommandFlags(
+	args: readonly string[],
+	what: string,
+	specs: readonly FlagSpec[],
+): { values: ReadonlyMap<string, string>; present: ReadonlySet<string> } {
+	const specByFlag = new Map(specs.map((spec) => [spec.flag, spec]));
+	const values = new Map<string, string>();
+	const present = new Set<string>();
+	for (let i = 1; i < args.length; i += 1) {
+		const arg = args[i];
+		const spec = typeof arg === "string" ? specByFlag.get(arg) : undefined;
+		if (spec === undefined || present.has(spec.flag)) usage();
+		present.add(spec.flag);
+		if (spec.takesValue) {
+			values.set(spec.flag, nextFlagValue(args, i, `${what} ${spec.flag}`));
+			i += 1;
+		}
+	}
+	return { values, present };
+}
+
+function parseCaptureReferenceFlags(args: readonly string[]): {
+	out: string;
+	inputMode: "staged" | "committed";
+	allowDirtyRelevant: boolean;
+} {
+	const { values, present } = parseCommandFlags(args, "capture-reference", [
+		{ flag: "--out", takesValue: true },
+		{ flag: "--staged-inputs", takesValue: false },
+		{ flag: "--allow-dirty-relevant", takesValue: false },
+	]);
+	const out = values.get("--out");
+	if (out === undefined) usage();
+	const inputMode: "staged" | "committed" = present.has("--staged-inputs") ? "staged" : "committed";
+	const allowDirtyRelevant = present.has("--allow-dirty-relevant");
+	if (inputMode === "staged" && allowDirtyRelevant) usage();
+	return { out, inputMode, allowDirtyRelevant };
+}
+
+function parseClassifyFlags(args: readonly string[]): {
+	subject: string;
+	referenceDir: string;
+	cargoMetadataFile: string | undefined;
+	emitLedgerRow: boolean;
+} {
+	const { values, present } = parseCommandFlags(args, "classify", [
+		{ flag: "--subject", takesValue: true },
+		{ flag: "--reference", takesValue: true },
+		{ flag: "--cargo-metadata-file", takesValue: true },
+		{ flag: "--emit-ledger-row", takesValue: false },
+	]);
+	const subject = values.get("--subject");
+	const referenceDir = values.get("--reference");
+	if (subject === undefined || referenceDir === undefined) usage();
+	return {
+		subject,
+		referenceDir,
+		cargoMetadataFile: values.get("--cargo-metadata-file"),
+		emitLedgerRow: present.has("--emit-ledger-row"),
+	};
+}
+
+function parseSelfCheckFlags(args: readonly string[]): { referenceDir: string | undefined } {
+	const { values } = parseCommandFlags(args, "self-check", [
+		{ flag: "--reference", takesValue: true },
+	]);
+	return { referenceDir: values.get("--reference") };
 }
 
 function renderReport(report: ExposureReport): string {
@@ -1882,37 +2245,36 @@ async function main(): Promise<number> {
 	const args = process.argv.slice(2);
 	const command = args[0];
 	if (command === "capture-reference") {
-		const out = argValue(args, "--out");
-		if (out === undefined) usage();
-		const manifest = await captureReference(REPO_ROOT, resolve(out), {
-			allowDirtyRelevant: args.includes("--allow-dirty-relevant"),
-		});
-		const bundle = await loadReferenceBundle(resolve(out));
+		const { out, inputMode, allowDirtyRelevant } = parseCaptureReferenceFlags(args);
+		const captureOptions: CaptureOptions =
+			inputMode === "staged" ? { inputMode: "staged" } : { inputMode: "committed", allowDirtyRelevant };
+		const manifest = await captureReference(REPO_ROOT, resolve(out), captureOptions);
+		const modeLabel = manifest.stagedInputProvenance !== undefined
+			? "staged index provenance"
+			: manifest.relevantTreeStatus !== undefined
+				? "dep-field-free dirty exception"
+				: "committed";
 		process.stdout.write(
-			`captured reference at ${resolve(out)} (head ${manifest.captureHead ?? "?"}, ${Object.keys(bundle.metafile.inputs).length} metafile inputs${manifest.relevantTreeStatus !== undefined ? ", DIRTY-RELEVANT-RECORDED" : ""})\n`,
+			`captured reference at ${resolve(out)} (head ${manifest.captureHead ?? "?"}, ${modeLabel})\n`,
 		);
 		return 0;
 	}
 	if (command === "classify") {
-		const subjectRaw = argValue(args, "--subject");
-		const referenceDir = argValue(args, "--reference");
-		if (subjectRaw === undefined || referenceDir === undefined) usage();
+		const { subject, referenceDir, cargoMetadataFile, emitLedgerRow } = parseClassifyFlags(args);
 		const report = await classify({
-			subject: parseSubject(subjectRaw),
+			subject: parseSubject(subject),
 			referenceDir: resolve(referenceDir),
-			cargoMetadataFile:
-				argValue(args, "--cargo-metadata-file") === undefined
-					? undefined
-					: resolve(argValue(args, "--cargo-metadata-file") as string),
+			cargoMetadataFile: cargoMetadataFile !== undefined ? resolve(cargoMetadataFile) : undefined,
 		});
 		process.stdout.write(`${renderReport(report)}\n${report.sentinel}\n`);
-		if (args.includes("--emit-ledger-row")) {
+		if (emitLedgerRow) {
 			process.stdout.write(`ledger-row: ${ledgerRow(report)}\n`);
 		}
 		return 0;
 	}
 	if (command === undefined || command === "self-check") {
-		const referenceDir = resolve(argValue(args, "--reference") ?? CANONICAL_REFERENCE_DIR);
+		const { referenceDir: referenceDirRaw } = parseSelfCheckFlags(args);
+		const referenceDir = resolve(referenceDirRaw ?? CANONICAL_REFERENCE_DIR);
 		const tmpDir = join(REPO_ROOT, "target", "dependency-exposure-selfcheck");
 		const outcomes = await selfCheck(referenceDir, tmpDir);
 		for (const outcome of outcomes) {

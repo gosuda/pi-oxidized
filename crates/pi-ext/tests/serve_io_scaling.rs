@@ -132,6 +132,7 @@ impl ScalingAdapter {
             description: format!("{name} description"),
             parameters: json!({ "type": "object" }),
             execution_mode: None,
+            constrained_sampling: None,
         }
     }
 }

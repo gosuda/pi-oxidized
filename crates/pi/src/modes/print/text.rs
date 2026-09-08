@@ -133,7 +133,7 @@ impl TextRenderer {
         };
 
         match assistant.stop_reason {
-            StopReason::Error | StopReason::Aborted | StopReason::Pending => {
+            StopReason::Error | StopReason::Aborted => {
                 let message = assistant.error_message.clone().unwrap_or_else(|| {
                     format!("Request {}", stop_reason_wire(assistant.stop_reason))
                 });
@@ -142,7 +142,7 @@ impl TextRenderer {
                 sink.flush().await?;
                 Ok(TextOutcome::FAILURE)
             }
-            StopReason::Stop | StopReason::Length | StopReason::ToolUse | StopReason::Deferred => {
+            StopReason::Stop | StopReason::Length | StopReason::ToolUse => {
                 for content in &assistant.content {
                     if let pi_ai::AssistantContent::Text(text_block) = content {
                         sink.write_stdout(&text_block.text).await?;
@@ -193,8 +193,6 @@ fn stop_reason_wire(reason: StopReason) -> &'static str {
         StopReason::ToolUse => "toolUse",
         StopReason::Error => "error",
         StopReason::Aborted => "aborted",
-        StopReason::Pending => "pending",
-        StopReason::Deferred => "deferred",
     }
 }
 

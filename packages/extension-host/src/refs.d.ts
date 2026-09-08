@@ -14,7 +14,9 @@ declare module "@earendil-works/pi-coding-agent" {
 	}
 	import type {
 		AssistantMessageEventStream,
+		ConstrainedSamplingConfig,
 		Context,
+		DeferredHandle,
 		ImageContent,
 		Model,
 		SimpleStreamOptions,
@@ -238,6 +240,7 @@ declare module "@earendil-works/pi-coding-agent" {
 		label: string;
 		description: string;
 		parameters: TParams;
+		constrainedSampling?: false | ConstrainedSamplingConfig;
 		executionMode?: ToolExecutionMode;
 		prepareArguments?: (args: unknown) => TParams;
 		execute(
@@ -316,6 +319,16 @@ declare module "@earendil-works/pi-coding-agent" {
 			context: Context,
 			options?: SimpleStreamOptions,
 		) => AssistantMessageEventStream;
+		fetchDeferred?: (
+			model: Model<string>,
+			handle: DeferredHandle,
+			options?: SimpleStreamOptions,
+		) => AssistantMessageEventStream;
+		cancelDeferred?: (
+			model: Model<string>,
+			handle: DeferredHandle,
+			options?: SimpleStreamOptions,
+		) => void | Promise<void>;
 		headers?: Record<string, string>;
 		authHeader?: boolean;
 		models?: ProviderModelConfig[];
@@ -632,12 +645,18 @@ declare module "@earendil-works/pi-ai" {
 		};
 	}
 	export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted" | "deferred";
+	export type GrammarFormat = "openai_lark" | "openai_regex";
+	export type GrammarVariants = Partial<Record<GrammarFormat, string>>;
+	export type ConstrainedSamplingConfig =
+		| { type: "json_schema"; strict: "prefer" | "require" }
+		| { type: "grammar"; variants: GrammarVariants };
 
-	/** Bridge-local tool shape mirroring the pinned pi-ai Tool (name/description/parameters). */
+	/** Bridge-local tool shape mirroring the pinned pi-ai Tool. */
 	export interface Tool<TParameters = unknown> {
 		name: string;
 		description: string;
 		parameters: TParameters;
+		constrainedSampling?: false | ConstrainedSamplingConfig;
 	}
 
 	/** Bridge-local message shapes mirroring the pinned pi-ai types. */
@@ -684,8 +703,23 @@ declare module "@earendil-works/pi-ai" {
 		contextWindow: number;
 		maxTokens: number;
 	}
+	export interface DeferredHandle {
+		provider: string;
+		modelId: string;
+		api: string;
+		id: string;
+		expiresAt?: number;
+		pollAfterMs?: number;
+		data?: unknown;
+	}
+	export interface ProviderResponse {
+		status: number;
+		headers: Headers | Record<string, string>;
+	}
 	export interface SimpleStreamOptions {
 		signal?: AbortSignal;
+		onPayload?: (payload: unknown) => unknown | Promise<unknown>;
+		onResponse?: (response: ProviderResponse) => void | Promise<void>;
 		[key: string]: unknown;
 	}
 

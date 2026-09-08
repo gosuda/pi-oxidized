@@ -348,7 +348,15 @@ where
         return caps;
     }
 
-    // 11. JetBrains. Conservative: JediTerm DEC 2026 support is unverified.
+    // 11. Zed.
+    if term_program.as_deref() == Some("zed") {
+        caps.images = None;
+        caps.true_color = true;
+        caps.hyperlinks = true;
+        return caps;
+    }
+
+    // 12. JetBrains. Conservative: JediTerm DEC 2026 support is unverified.
     if terminal_emulator.as_deref() == Some("jetbrains-jediterm") {
         caps.images = None;
         caps.true_color = true;
@@ -356,7 +364,7 @@ where
         return caps;
     }
 
-    // 12. Unknown: be conservative. CMUX alone, VTE-only, Apple Terminal,
+    // 13. Unknown: be conservative. CMUX alone, VTE-only, Apple Terminal,
     //     and 256color TERM do not grant capabilities. Truecolor only from
     //     the COLORTERM hint. Synchronized output stays off for unknown
     //     terminals (including bare ConPTY), so DEC 2026 wrappers are never
@@ -932,7 +940,28 @@ mod tests {
         assert!(caps.sync_output);
     }
 
-    // -- Authority row 11: JetBrains --
+    // -- Authority row 11: Zed --
+
+    #[test]
+    fn zed_enables_hyperlinks() {
+        let caps = detect_with(env_from(&[("TERM_PROGRAM", "zed")]), || false);
+        assert!(caps.hyperlinks);
+        assert!(caps.true_color);
+        assert_eq!(caps.images, None);
+    }
+
+    #[test]
+    fn pi_image_protocol_overrides_zed_default() {
+        let caps = detect_with(
+            env_from(&[("TERM_PROGRAM", "zed"), ("PI_IMAGE_PROTOCOL", "kitty")]),
+            || false,
+        );
+        assert_eq!(caps.images, Some(ImageProtocol::Kitty));
+        assert!(caps.hyperlinks);
+        assert!(caps.true_color);
+    }
+
+    // -- Authority row 12: JetBrains --
 
     #[test]
     fn jetbrains_truecolor_without_hyperlinks() {
@@ -978,6 +1007,15 @@ mod tests {
     fn kitty_takes_precedence_over_iterm2() {
         let caps = detect_with(
             env_from(&[("KITTY_WINDOW_ID", "1"), ("TERM_PROGRAM", "iterm.app")]),
+            || false,
+        );
+        assert_eq!(caps.images, Some(ImageProtocol::Kitty));
+    }
+
+    #[test]
+    fn kitty_takes_precedence_over_zed() {
+        let caps = detect_with(
+            env_from(&[("KITTY_WINDOW_ID", "1"), ("TERM_PROGRAM", "zed")]),
             || false,
         );
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));

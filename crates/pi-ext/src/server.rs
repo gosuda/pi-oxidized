@@ -26,8 +26,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::{
     FutureExt,
@@ -41,13 +42,18 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use pi_ai::types::AssistantMessageEvent;
+use pi_ai::ConstrainedSampling;
+use pi_ai::provider::ProviderResponse;
+use pi_ai::types::{AssistantMessageEvent, DeferredHandle, Model};
 
 use crate::adapters::methods;
 use crate::protocol::{
     ErrorPayload, FLAGS_SET_METHOD, FlagValueWire, FlagsSetRequest, Frame, FrameDecoder, FrameId,
-    FrameKind, Hello, HelloAck, Method, PROTOCOL_VERSION, SHORTCUT_EXECUTE_METHOD,
-    TerminalInputResult, ThemeUpdate, ToolUpdate, encode_frame, from_payload, to_payload,
+    FrameKind, Hello, HelloAck, Method, PROTOCOL_VERSION, ProviderBeforePayloadRequest,
+    ProviderBeforePayloadResponse, ProviderCallbackFlags, ProviderOnResponseRequest,
+    ProviderOnResponseResponse, ProviderResponseWire, PROVIDER_BEFORE_PAYLOAD_METHOD,
+    PROVIDER_ON_RESPONSE_METHOD, SHORTCUT_EXECUTE_METHOD, TerminalInputResult, ThemeUpdate,
+    ToolUpdate, encode_frame, from_payload, to_payload,
 };
 
 /// Test-only timing instrumentation for the extension RPC dispatch bench
@@ -198,6 +204,9 @@ pub struct ToolSnapshotEntry {
     /// Optional execution-mode override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_mode: Option<ToolExecutionModeWire>,
+    /// Optional provider-side constrained sampling request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained_sampling: Option<ConstrainedSampling>,
 }
 
 /// Slash-command entry in the `extensions.load` snapshot.
@@ -269,8 +278,14 @@ pub struct ProviderSnapshotEntry {
     /// Provider id.
     pub name: String,
     /// Whether the endpoint holds a live `streamSimple` handler.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stream_simple: bool,
+    /// Whether the endpoint holds a live `fetchDeferred` handler.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fetch_deferred: bool,
+    /// Whether the endpoint holds a live `cancelDeferred` handler.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancel_deferred: bool,
     /// Optional base URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -310,6 +325,8 @@ impl fmt::Debug for ProviderSnapshotEntry {
         f.debug_struct("ProviderSnapshotEntry")
             .field("name", &self.name)
             .field("stream_simple", &self.stream_simple)
+            .field("fetch_deferred", &self.fetch_deferred)
+            .field("cancel_deferred", &self.cancel_deferred)
             .field("base_url", &self.base_url)
             .field("api", &self.api)
             .field("display_name", &self.display_name)
@@ -527,6 +544,46 @@ pub struct ProviderStreamCall {
     /// Prepared stream options (open JSON).
     pub options: Value,
 }
+/// A single `provider.fetchDeferred` invocation.
+#[derive(Debug, Clone)]
+pub struct ProviderDeferredCall {
+    /// Provider registration id.
+    pub provider_id: String,
+    /// Validated model descriptor from the canonical `pi_ai` domain type.
+    pub model: Model,
+    /// Complete validated deferred handle, including opaque conversion data.
+    pub handle: DeferredHandle,
+    /// Prepared request options (including `wait: 0` for fetch).
+    pub options: Value,
+    /// Callback availability advertised by the host.
+    pub callbacks: ProviderCallbackFlags,
+    /// Awaited callback requester tied to this originating provider frame.
+    pub callback_context: Option<ProviderCallbackContext>,
+}
+
+impl ProviderDeferredCall {
+    /// Await host-side payload mutation for this deferred call.
+    pub async fn before_payload(&self, payload: &mut Value) -> Result<(), ExtensionFault> {
+        let callbacks = self.callback_context.as_ref().ok_or_else(|| {
+            ExtensionFault::new(
+                "extension_error",
+                "provider beforePayload callback is not advertised",
+            )
+        })?;
+        callbacks.before_payload(payload).await
+    }
+
+    /// Await host-side response metadata acknowledgement for this call.
+    pub async fn on_response(&self, response: &ProviderResponse) -> Result<(), ExtensionFault> {
+        let callbacks = self.callback_context.as_ref().ok_or_else(|| {
+            ExtensionFault::new(
+                "extension_error",
+                "provider onResponse callback is not advertised",
+            )
+        })?;
+        callbacks.on_response(response).await
+    }
+}
 
 /// One item in the shared outbound queue. Event sinks retain their validated
 /// wire bytes; other responses stay structured for fallback encoding.
@@ -539,6 +596,215 @@ enum OutboundFrame {
 impl From<Frame> for OutboundFrame {
     fn from(frame: Frame) -> Self {
         Self::Structured(frame)
+    }
+}
+
+/// Awaited callback response routing for one native endpoint.
+///
+/// Callback request ids are independent from the originating provider call
+/// id. The route map is owned by this endpoint runtime and is drained on
+/// response, cancellation, timeout, or teardown.
+#[derive(Debug)]
+struct ProviderCallbackRouter {
+    next_id: AtomicU64,
+    pending: Mutex<HashMap<FrameId, oneshot::Sender<Result<Value, ExtensionFault>>>>,
+    closed: CancellationToken,
+}
+
+impl Default for ProviderCallbackRouter {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            closed: CancellationToken::new(),
+        }
+    }
+}
+
+impl ProviderCallbackRouter {
+    fn allocate(&self) -> (FrameId, oneshot::Receiver<Result<Value, ExtensionFault>>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed).max(1);
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, tx);
+        (id, rx)
+    }
+
+    fn remove(&self, id: FrameId) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+    }
+
+    fn complete(&self, frame: Frame) -> bool {
+        let sender = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&frame.id);
+        let Some(sender) = sender else {
+            return false;
+        };
+        let result = if frame.kind == FrameKind::Error {
+            match from_payload::<ErrorPayload>(&frame.payload) {
+                Err(error) => Err(ExtensionFault::new("extension_error", error.to_string())),
+                Ok(error) => Err(ExtensionFault::new(error.code, error.message)),
+            }
+        } else {
+            Ok(frame.payload)
+        };
+        let _ = sender.send(result);
+        true
+    }
+
+    fn close(&self) {
+        self.closed.cancel();
+        let pending = std::mem::take(
+            &mut *self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for sender in pending.into_values() {
+            let _ = sender.send(Err(ExtensionFault::new(
+                "endpoint_closed",
+                "provider callback endpoint closed",
+            )));
+        }
+    }
+
+    async fn request(
+        &self,
+        out_tx: &mpsc::Sender<OutboundFrame>,
+        method: &str,
+        payload: Value,
+        deadline: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<Value, ExtensionFault> {
+        if self.closed.is_cancelled() {
+            return Err(ExtensionFault::new(
+                "endpoint_closed",
+                "provider callback endpoint closed",
+            ));
+        }
+        if cancel.is_cancelled() {
+            return Err(ExtensionFault::new(
+                "cancelled",
+                "provider callback cancelled",
+            ));
+        }
+        let (id, response) = self.allocate();
+        let _route = ProviderCallbackRoute {
+            router: self,
+            id,
+        };
+        let frame = Frame {
+            id,
+            kind: FrameKind::Req,
+            method: method.to_owned(),
+            payload,
+        };
+        tokio::select! {
+            biased;
+            () = self.closed.cancelled() => {
+                return Err(ExtensionFault::new("endpoint_closed", "provider callback endpoint closed"));
+            }
+            () = cancel.cancelled() => {
+                return Err(ExtensionFault::new("cancelled", "provider callback cancelled"));
+            }
+            result = out_tx.send(frame.into()) => {
+                if result.is_err() {
+                    return Err(ExtensionFault::new("endpoint_closed", "provider callback endpoint closed"));
+                }
+            }
+        }
+        let response = tokio::time::timeout(deadline, async {
+            tokio::select! {
+                biased;
+                () = self.closed.cancelled() => Err(ExtensionFault::new("endpoint_closed", "provider callback endpoint closed")),
+                () = cancel.cancelled() => Err(ExtensionFault::new("cancelled", "provider callback cancelled")),
+                result = response => result.map_err(|_| ExtensionFault::new("endpoint_closed", "provider callback response channel closed"))?,
+            }
+        })
+        .await
+        .map_err(|_| ExtensionFault::new("timeout", "provider callback timed out"))?;
+        response
+    }
+}
+
+/// Removes one callback route if its awaited request is dropped.
+struct ProviderCallbackRoute<'a> {
+    router: &'a ProviderCallbackRouter,
+    id: FrameId,
+}
+
+impl Drop for ProviderCallbackRoute<'_> {
+    fn drop(&mut self) {
+        self.router.remove(self.id);
+    }
+}
+
+/// Callback request context tied to one originating provider frame id.
+#[derive(Clone, Debug)]
+pub struct ProviderCallbackContext {
+    router: Arc<ProviderCallbackRouter>,
+    out_tx: mpsc::Sender<OutboundFrame>,
+    origin_id: FrameId,
+    deadline: Duration,
+    cancel: CancellationToken,
+}
+
+impl ProviderCallbackContext {
+    /// Await host-side payload mutation for the originating provider call.
+    pub async fn before_payload(&self, payload: &mut Value) -> Result<(), ExtensionFault> {
+        let request = ProviderBeforePayloadRequest {
+            call_id: self.origin_id.to_string(),
+            payload: payload.clone(),
+        };
+        let wire = to_payload(&request)
+            .map_err(|error| ExtensionFault::new("extension_error", error.to_string()))?;
+        let response = self
+            .router
+            .request(
+                &self.out_tx,
+                PROVIDER_BEFORE_PAYLOAD_METHOD,
+                wire,
+                self.deadline,
+                &self.cancel,
+            )
+            .await?;
+        let response = from_payload::<ProviderBeforePayloadResponse>(&response)
+            .map_err(|error| ExtensionFault::new("extension_error", error.to_string()))?;
+        *payload = response.payload;
+        Ok(())
+    }
+    /// Await host-side response acknowledgement for the originating call.
+    pub async fn on_response(&self, response: &ProviderResponse) -> Result<(), ExtensionFault> {
+        let request = ProviderOnResponseRequest {
+            call_id: self.origin_id.to_string(),
+            response: ProviderResponseWire {
+                status: response.status,
+                headers: response.headers.clone(),
+            },
+        };
+        let payload = to_payload(&request)
+            .map_err(|error| ExtensionFault::new("extension_error", error.to_string()))?;
+        let response = self
+            .router
+            .request(
+                &self.out_tx,
+                PROVIDER_ON_RESPONSE_METHOD,
+                payload,
+                self.deadline,
+                &self.cancel,
+            )
+            .await?;
+        from_payload::<ProviderOnResponseResponse>(&response)
+            .map_err(|error| ExtensionFault::new("extension_error", error.to_string()))?;
+        Ok(())
     }
 }
 
@@ -555,12 +821,12 @@ impl From<Frame> for OutboundFrame {
 /// releases its in-flight slot. Not `Clone`: the server's `done_tx`
 /// signal — not sink drop — bounds the forwarder's lifetime. Events
 /// queued before `stream_provider` returns are flushed before the
-/// terminal frame; post-return sends from a detached sink are ignored.
 pub struct ProviderEventSink {
     id: FrameId,
     tx: mpsc::Sender<OutboundFrame>,
     cancel: CancellationToken,
     invalid: Arc<AtomicBool>,
+    callbacks: Option<ProviderCallbackContext>,
 }
 
 impl ProviderEventSink {
@@ -598,6 +864,27 @@ impl ProviderEventSink {
             () = self.cancel.cancelled() => false,
             result = self.tx.send(OutboundFrame::Encoded(encoded)) => result.is_ok(),
         }
+    }
+    /// Await host-side mutation of the payload for this provider call.
+    pub async fn before_payload(&self, payload: &mut Value) -> Result<(), ExtensionFault> {
+        let callbacks = self.callbacks.as_ref().ok_or_else(|| {
+            ExtensionFault::new(
+                "extension_error",
+                "provider beforePayload callback is not advertised",
+            )
+        })?;
+        callbacks.before_payload(payload).await
+    }
+
+    /// Await host-side acknowledgement of response metadata for this call.
+    pub async fn on_response(&self, response: &ProviderResponse) -> Result<(), ExtensionFault> {
+        let callbacks = self.callbacks.as_ref().ok_or_else(|| {
+            ExtensionFault::new(
+                "extension_error",
+                "provider onResponse callback is not advertised",
+            )
+        })?;
+        callbacks.on_response(response).await
     }
 }
 
@@ -719,6 +1006,45 @@ pub trait NativeExtension: Send + Sync + 'static {
                 "provider not found: {}",
                 call.provider_id
             )))
+        })
+    }
+
+    /// Poll one provider-owned deferred response without starting a new
+    /// generation (`provider.fetchDeferred`).
+    ///
+    /// Events use the same bounded `providerEvent` sink as ordinary
+    /// streaming. The default is a typed unsupported-operation fault.
+    fn fetch_deferred(
+        &self,
+        _context: Arc<NativeExtensionContext>,
+        call: ProviderDeferredCall,
+        events: ProviderEventSink,
+        cancel: CancellationToken,
+    ) -> NativeFuture<Result<Value, ExtensionFault>> {
+        let _ = (events, cancel);
+        Box::pin(async move {
+            Err(ExtensionFault::new(
+                "unsupported_deferred_operation",
+                format!("provider does not support deferred fetch: {}", call.provider_id),
+            ))
+        })
+    }
+
+    /// Cancel one provider-owned deferred response
+    /// (`provider.cancelDeferred`).
+    ///
+    /// The default is a typed unsupported-operation fault; endpoints must
+    /// override this method when their snapshot advertises the capability.
+    fn cancel_deferred(
+        &self,
+        _context: Arc<NativeExtensionContext>,
+        call: ProviderDeferredCall,
+    ) -> NativeFuture<Result<(), ExtensionFault>> {
+        Box::pin(async move {
+            Err(ExtensionFault::new(
+                "unsupported_deferred_operation",
+                format!("provider does not support deferred cancel: {}", call.provider_id),
+            ))
         })
     }
 
@@ -1174,6 +1500,8 @@ where
         rejection_flusher.abort();
         writer_task.abort();
     }
+    // Wake native provider callback requests before aborting request futures.
+    runtime.callback_router.close();
 
     // Teardown: close the job channel, cancel cooperative executions,
     // abort the request worker (dropping pending FuturesUnordered futures,
@@ -1306,10 +1634,11 @@ impl ThemeDispatch {
         let mut state = self.lock();
         state.pending = Some(update);
         if state.active {
-            return false;
+            true
+        } else {
+            state.active = true;
+            false
         }
-        state.active = true;
-        true
     }
 
     /// Take the next update, or atomically retire this supervisor episode.
@@ -1359,6 +1688,8 @@ struct ServerRuntime<E: NativeExtension> {
     context: Mutex<Option<Arc<NativeExtensionContext>>>,
     /// Shared outbound (server → client) frame channel.
     out_tx: mpsc::Sender<OutboundFrame>,
+    /// Shared awaited callback router for provider calls.
+    callback_router: Arc<ProviderCallbackRouter>,
     /// Bound on queued per-call streaming updates/events.
     update_capacity: usize,
     /// Server-side deadline for native callbacks without explicit cancellation.
@@ -1393,6 +1724,7 @@ impl<E: NativeExtension> ServerRuntime<E> {
                 in_flight: Mutex::new(HashMap::new()),
                 context: Mutex::new(None),
                 out_tx,
+                callback_router: Arc::new(ProviderCallbackRouter::default()),
                 update_capacity: config.update_capacity,
                 lifecycle_deadline: config.lifecycle_deadline,
                 max_in_flight: config.max_in_flight.max(1),
@@ -1743,7 +2075,9 @@ fn dispatch_request<E: NativeExtension>(
     // Register cancellation before handoff so the next frame can find it.
     let kind = match frame.method.as_str() {
         methods::TOOL_EXECUTE => Some(InFlightKind::Tool),
-        methods::PROVIDER_STREAM => Some(InFlightKind::Provider),
+        methods::PROVIDER_STREAM | methods::PROVIDER_FETCH_DEFERRED => {
+            Some(InFlightKind::Provider)
+        }
         _ => None,
     };
     let token = kind.map(|kind| {
@@ -1844,7 +2178,9 @@ fn dispatch_ready<E: NativeExtension>(
             }
             _ => {}
         },
-        FrameKind::Res | FrameKind::Error => {}
+        FrameKind::Res | FrameKind::Error => {
+            let _ = runtime.callback_router.complete(frame);
+        }
     }
     Ok(())
 }
@@ -1909,8 +2245,15 @@ async fn handle_request_dispatch<E: NativeExtension>(
             return;
         }
         methods::PROVIDER_STREAM => {
-            execute_provider_request(&runtime, id, &method, frame.payload, token).await;
+            execute_provider_request(&runtime, id, &method, frame.payload, token, false).await;
             return;
+        }
+        methods::PROVIDER_FETCH_DEFERRED => {
+            execute_provider_request(&runtime, id, &method, frame.payload, token, true).await;
+            return;
+        }
+        methods::PROVIDER_CANCEL_DEFERRED => {
+            handle_cancel_deferred(&runtime, id, &method, &frame.payload).await
         }
         COMMAND_EXECUTE_METHOD => handle_command(&runtime, id, &method, &frame.payload).await,
         FLAGS_SET_METHOD => handle_flags_set(&runtime, id, &method, &frame.payload).await,
@@ -2006,6 +2349,24 @@ fn callback_context<E: NativeExtension>(
             "extensions.load must succeed before invoking native callbacks",
             false,
         )
+    })
+}
+
+fn provider_callback_context<E: NativeExtension>(
+    runtime: &ServerRuntime<E>,
+    origin_id: FrameId,
+    flags: ProviderCallbackFlags,
+    cancel: CancellationToken,
+) -> Option<ProviderCallbackContext> {
+    if !flags.before_payload && !flags.on_response {
+        return None;
+    }
+    Some(ProviderCallbackContext {
+        router: Arc::clone(&runtime.callback_router),
+        out_tx: runtime.out_tx.clone(),
+        origin_id,
+        deadline: runtime.lifecycle_deadline,
+        cancel,
     })
 }
 
@@ -2302,11 +2663,81 @@ async fn handle_render_html<E: NativeExtension>(
     }
 }
 
+fn parse_provider_deferred_call(payload: &Value) -> Result<ProviderDeferredCall, String> {
+    let provider_id = payload
+        .get("providerId")
+        .or_else(|| payload.get("name"))
+        .and_then(Value::as_str)
+        .filter(|provider_id| !provider_id.is_empty())
+        .ok_or_else(|| "provider deferred request requires providerId".to_owned())?
+        .to_owned();
+    let model_value = payload
+        .get("model")
+        .ok_or_else(|| "provider deferred request requires model".to_owned())?;
+    let model = from_payload::<Model>(model_value)
+        .map_err(|error| format!("invalid provider deferred model: {error}"))?;
+    let handle_value = payload
+        .get("handle")
+        .ok_or_else(|| "provider deferred request requires handle".to_owned())?;
+    let handle = from_payload::<DeferredHandle>(handle_value)
+        .map_err(|error| format!("invalid provider deferred handle: {error}"))?;
+    let options = payload
+        .get("options")
+        .cloned()
+        .filter(Value::is_object)
+        .ok_or_else(|| "provider deferred request requires options".to_owned())?;
+    let callbacks = payload
+        .get("callbacks")
+        .map(from_payload::<ProviderCallbackFlags>)
+        .transpose()
+        .map_err(|error| format!("invalid provider callback flags: {error}"))?
+        .unwrap_or_default();
+    Ok(ProviderDeferredCall {
+        provider_id,
+        model,
+        handle,
+        options,
+        callbacks,
+        callback_context: None,
+    })
+}
+
+/// `provider.cancelDeferred`: await the native cancellation callback and
+/// publish its terminal acknowledgement only after it settles.
+async fn handle_cancel_deferred<E: NativeExtension>(
+    runtime: &ServerRuntime<E>,
+    id: FrameId,
+    method: &str,
+    payload: &Value,
+) -> Frame {
+    let context = match callback_context(runtime, id, method) {
+        Ok(context) => context,
+        Err(terminal) => return terminal,
+    };
+    let mut call = match parse_provider_deferred_call(payload) {
+        Ok(call) => call,
+        Err(message) => return error_frame(id, method, "invalid_request", &message, false),
+    };
+    let cancel = CancellationToken::new();
+    call.callback_context =
+        provider_callback_context(runtime, id, call.callbacks, cancel.clone());
+    match await_callback(
+        runtime.lifecycle_deadline,
+        runtime.extension.cancel_deferred(context, call),
+    )
+    .await
+    {
+        Ok(Ok(())) => res_frame(id, method, json!({})),
+        Ok(Err(fault)) => fault_frame(id, method, &fault),
+        Err(_) => callback_timeout_frame(id, method),
+    }
+}
+
 /// Lifecycle hook (open method strings): run the advertised handler with a
 /// bounded sink for unsolicited id-`0` events, under a finite server-side
 /// deadline. A hook that never resolves is dropped at the deadline so its
-/// in-flight permit is released and the peer receives a correlated
-/// `timeout` error instead of the request running forever.
+/// in-flight permit is released and the peer receives a correlated `timeout`
+/// error instead of the request running forever.
 async fn handle_lifecycle<E: NativeExtension>(
     runtime: &ServerRuntime<E>,
     id: FrameId,
@@ -2463,17 +2894,16 @@ async fn execute_tool_request<E: NativeExtension>(
     let _ = runtime.out_tx.send(terminal.into()).await;
 }
 
-/// Run one `provider.stream` call: forward correlated `providerEvent`
-/// frames while the stream is active, honor `provider.cancel`, then send
-/// the terminal frame. Terminal precedence is `invalid_payload` (an event
-/// failed encode pre-validation — never report success after loss) over
-/// `cancelled` over the returned value/fault.
+/// Run one provider stream or deferred fetch call: forward correlated
+/// `providerEvent` frames while the operation is active, honor
+/// `provider.cancel`, then send the terminal frame.
 async fn execute_provider_request<E: NativeExtension>(
     runtime: &ServerRuntime<E>,
     id: FrameId,
     method: &str,
     payload: Value,
     token: Option<CancellationToken>,
+    deferred: bool,
 ) {
     let context = match callback_context(runtime, id, method) {
         Ok(context) => context,
@@ -2483,21 +2913,59 @@ async fn execute_provider_request<E: NativeExtension>(
             return;
         }
     };
-    let call = ProviderStreamCall {
-        provider_id: payload
-            .get("providerId")
-            .or_else(|| payload.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        model: payload.get("model").cloned().unwrap_or(Value::Null),
-        context: payload.get("context").cloned().unwrap_or(Value::Null),
-        options: payload.get("options").cloned().unwrap_or(Value::Null),
+    let callback_flags = match payload.get("callbacks") {
+        Some(value) => match from_payload::<ProviderCallbackFlags>(value) {
+            Ok(flags) => flags,
+            Err(error) => {
+                remove_in_flight(runtime, id);
+                let message = format!("invalid provider callback flags: {error}");
+                let _ = runtime
+                    .out_tx
+                    .send(error_frame(id, method, "invalid_request", &message, false).into())
+                    .await;
+                return;
+            }
+        },
+        None => ProviderCallbackFlags::default(),
     };
-
+    let stream_call = if deferred {
+        None
+    } else {
+        Some(ProviderStreamCall {
+            provider_id: payload
+                .get("providerId")
+                .or_else(|| payload.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            model: payload.get("model").cloned().unwrap_or(Value::Null),
+            context: payload.get("context").cloned().unwrap_or(Value::Null),
+            options: payload.get("options").cloned().unwrap_or(Value::Null),
+        })
+    };
+    let mut deferred_call = if deferred {
+        match parse_provider_deferred_call(&payload) {
+            Ok(call) => Some(call),
+            Err(message) => {
+                remove_in_flight(runtime, id);
+                let _ = runtime
+                    .out_tx
+                    .send(error_frame(id, method, "invalid_request", &message, false).into())
+                    .await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
     // The token was registered by the dispatcher before this task spawned,
     // so an early `provider.cancel` is never lost.
     let token = token.unwrap_or_default();
+    let callback_context =
+        provider_callback_context(runtime, id, callback_flags, token.clone());
+    if let Some(call) = deferred_call.as_mut() {
+        call.callback_context = callback_context.clone();
+    }
     let (event_tx, mut event_rx) = mpsc::channel::<OutboundFrame>(runtime.update_capacity.max(1));
     let (done_tx, mut done_rx) = oneshot::channel::<()>();
     let invalid = Arc::new(AtomicBool::new(false));
@@ -2506,6 +2974,7 @@ async fn execute_provider_request<E: NativeExtension>(
         tx: event_tx,
         cancel: token.clone(),
         invalid: Arc::clone(&invalid),
+        callbacks: callback_context,
     };
 
     // Match the tool forwarder: completion, not sender ownership, defines the
@@ -2538,10 +3007,26 @@ async fn execute_provider_request<E: NativeExtension>(
         })
     };
 
-    let result = runtime
-        .extension
-        .stream_provider(context, call, sink, token.clone())
-        .await;
+    let result = match deferred_call {
+        Some(call) => {
+            runtime
+                .extension
+                .fetch_deferred(context, call, sink, token.clone())
+                .await
+        }
+        None => match stream_call {
+            Some(call) => {
+                runtime
+                    .extension
+                    .stream_provider(context, call, sink, token.clone())
+                    .await
+            }
+            None => Err(ExtensionFault::new(
+                "invalid_request",
+                "ordinary provider stream call missing",
+            )),
+        },
+    };
     let _ = done_tx.send(());
 
     // The done signal closes the receiver and flushes all events accepted
@@ -2558,7 +3043,17 @@ async fn execute_provider_request<E: NativeExtension>(
             false,
         )
     } else if token.is_cancelled() {
-        error_frame(id, method, "cancelled", "provider stream cancelled", false)
+        error_frame(
+            id,
+            method,
+            "cancelled",
+            if deferred {
+                "provider deferred fetch cancelled"
+            } else {
+                "provider stream cancelled"
+            },
+            false,
+        )
     } else {
         match result {
             Ok(value) => res_frame(id, method, value),
@@ -2906,6 +3401,7 @@ mod tests {
             description: format!("{name} description"),
             parameters: json!({ "type": "object" }),
             execution_mode: None,
+            constrained_sampling: None,
         }
     }
 
@@ -5779,6 +6275,264 @@ mod tests {
         let load = client.recv().await?;
         assert_eq!(load.id, 3);
         assert_eq!(load.kind, FrameKind::Res);
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// A `ProviderCallbackRouter` rejects responses with no pending route and
+    /// settles a matching response once; a duplicate is ignored.
+    #[tokio::test]
+    async fn provider_callback_router_rejects_unknown_and_settles_known() -> R {
+        let router = Arc::new(ProviderCallbackRouter::default());
+        let router2 = Arc::clone(&router);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutboundFrame>(1);
+        let cancel = CancellationToken::new();
+
+        let request = tokio::spawn(async move {
+            router2
+                .request(
+                    &out_tx,
+                    PROVIDER_BEFORE_PAYLOAD_METHOD,
+                    json!({ "callId": "7", "payload": { "original": true } }),
+                    Duration::from_secs(5),
+                    &cancel,
+                )
+                .await
+        });
+
+        let outbound = out_rx
+            .recv()
+            .await
+            .ok_or("callback request frame not queued")?;
+        let frame = match outbound {
+            OutboundFrame::Structured(f) => f,
+            OutboundFrame::Encoded(bytes) => {
+                decode_frame_str(std::str::from_utf8(&bytes)?.trim_end())?
+            }
+        };
+        assert_eq!(frame.kind, FrameKind::Req);
+        assert_eq!(frame.method, PROVIDER_BEFORE_PAYLOAD_METHOD);
+
+        // An unrelated response id is ignored.
+        assert!(!router.complete(Frame {
+            id: 999,
+            kind: FrameKind::Res,
+            method: PROVIDER_BEFORE_PAYLOAD_METHOD.to_owned(),
+            payload: json!({ "payload": { "mutated": true } }),
+        }));
+
+        // The matching response settles the awaited request.
+        assert!(router.complete(Frame {
+            id: frame.id,
+            kind: FrameKind::Res,
+            method: frame.method.clone(),
+            payload: json!({ "payload": { "mutated": true } }),
+        }));
+        let value = tokio::time::timeout(TIMEOUT, request).await???;
+        assert_eq!(value, json!({ "payload": { "mutated": true } }));
+
+        // A late duplicate for the same id is ignored.
+        assert!(!router.complete(Frame {
+            id: frame.id,
+            kind: FrameKind::Res,
+            method: frame.method,
+            payload: json!({}),
+        }));
+
+        Ok(())
+    }
+
+    /// Provider whose `fetchDeferred` exercises both awaited callbacks and
+    /// returns the host-mutated payload so the round-trip is observable.
+    struct CallbackProviderExtension {
+        started: Arc<Notify>,
+        result: Arc<Mutex<Option<Value>>>,
+    }
+
+    impl CallbackProviderExtension {
+        fn new() -> (Self, Arc<Notify>, Arc<Mutex<Option<Value>>>) {
+            let started = Arc::new(Notify::new());
+            let result = Arc::new(Mutex::new(None));
+            (
+                Self {
+                    started: Arc::clone(&started),
+                    result: Arc::clone(&result),
+                },
+                started,
+                result,
+            )
+        }
+    }
+
+    impl NativeExtension for CallbackProviderExtension {
+        fn snapshot(&self) -> RegistrySnapshot {
+            RegistrySnapshot {
+                providers: vec![ProviderSnapshotEntry {
+                    name: "callbackProv".to_owned(),
+                    fetch_deferred: true,
+                    ..ProviderSnapshotEntry::default()
+                }],
+                ..RegistrySnapshot::default()
+            }
+        }
+
+        fn prepare_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            name: String,
+            _args: Value,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(name)) })
+        }
+
+        fn validate_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            name: String,
+            _args: Value,
+            _tool_call_id: Option<String>,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(name)) })
+        }
+
+        fn execute_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            call: ToolCall,
+            _updates: ToolUpdateSink,
+            _cancel: CancellationToken,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(call.name)) })
+        }
+
+        fn fetch_deferred(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            call: ProviderDeferredCall,
+            _events: ProviderEventSink,
+            _cancel: CancellationToken,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            let started = Arc::clone(&self.started);
+            let result = Arc::clone(&self.result);
+            Box::pin(async move {
+                started.notify_one();
+                let mut payload = call
+                    .options
+                    .get("testPayload")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                call.before_payload(&mut payload).await?;
+                let response = ProviderResponse {
+                    status: 200,
+                    headers: BTreeMap::new(),
+                };
+                call.on_response(&response).await?;
+                *result
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(payload.clone());
+                Ok(payload)
+            })
+        }
+    }
+
+    /// `provider.fetchDeferred` routes real `beforePayload` and `onResponse`
+    /// callbacks over independent frame ids, returning the mutated payload.
+    #[tokio::test]
+    async fn provider_deferred_callbacks_round_trip_and_mutate_payload() -> R {
+        let (ext, started, result) = CallbackProviderExtension::new();
+        let (mut client, server) = spawn_raw(ext, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        client
+            .send(&Frame {
+                id: 2,
+                kind: FrameKind::Req,
+                method: methods::PROVIDER_FETCH_DEFERRED.to_owned(),
+                payload: json!({
+                    "providerId": "callbackProv",
+                    "model": {
+                        "id": "m",
+                        "name": "m",
+                        "api": "openai",
+                        "provider": "test",
+                        "baseUrl": "",
+                        "reasoning": false,
+                        "input": ["text"],
+                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                        "contextWindow": 1,
+                        "maxTokens": 1,
+                    },
+                    "handle": { "provider": "test", "modelId": "m", "api": "openai", "id": "h1" },
+                    "options": { "wait": 0, "testPayload": { "original": true } },
+                    "callbacks": { "beforePayload": true, "onResponse": true },
+                }),
+            })
+            .await?;
+
+        tokio::time::timeout(TIMEOUT, started.notified()).await?;
+
+        // beforePayload callback: server asks the host to mutate the payload.
+        let before_req = client.recv().await?;
+        assert_eq!(before_req.kind, FrameKind::Req);
+        assert_eq!(before_req.method, PROVIDER_BEFORE_PAYLOAD_METHOD);
+        let before = from_payload::<ProviderBeforePayloadRequest>(&before_req.payload)?;
+        assert_eq!(before.call_id, "2");
+        assert_eq!(before.payload, json!({ "original": true }));
+        assert_ne!(before_req.id, 2, "callback frame id is independent");
+
+        client
+            .send(&Frame {
+                id: before_req.id,
+                kind: FrameKind::Res,
+                method: before_req.method.clone(),
+                payload: json!({ "payload": { "mutated": true } }),
+            })
+            .await?;
+
+        // onResponse callback: server asks the host to acknowledge metadata.
+        let on_req = client.recv().await?;
+        assert_eq!(on_req.kind, FrameKind::Req);
+        assert_eq!(on_req.method, PROVIDER_ON_RESPONSE_METHOD);
+        let on = from_payload::<ProviderOnResponseRequest>(&on_req.payload)?;
+        assert_eq!(on.call_id, "2");
+        assert_eq!(on.response.status, 200);
+        assert_ne!(
+            on_req.id,
+            before_req.id,
+            "each callback request has an independent id"
+        );
+
+        client
+            .send(&Frame {
+                id: on_req.id,
+                kind: FrameKind::Res,
+                method: on_req.method.clone(),
+                payload: json!({}),
+            })
+            .await?;
+
+        // Terminal response for the originating fetchDeferred carries the
+        // payload the host replaced during beforePayload.
+        let terminal = client.recv().await?;
+        assert_eq!(terminal.id, 2);
+        assert_eq!(terminal.kind, FrameKind::Res);
+        assert_eq!(terminal.method, methods::PROVIDER_FETCH_DEFERRED);
+        assert_eq!(terminal.payload, json!({ "mutated": true }));
+
+        assert_eq!(
+            result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or("missing callback result")?,
+            json!({ "mutated": true })
+        );
+
         drop(client);
         let result = tokio::time::timeout(TIMEOUT, server).await??;
         assert!(result.is_ok());

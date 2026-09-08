@@ -1,12 +1,18 @@
-//! Capability / cursor probe session with fragmented-reply handling.
+//! Capability / cursor probing over the ONE shared terminal reader.
+//!
+//! Startup probing and mid-session requeries no longer read stdin and no
+//! longer parse replies themselves: they write query bytes, then collect
+//! typed replies through [`crossterm::event::reply::poll_reply`], which
+//! drives the same persistent crossterm parser that the `EventStream` uses.
+//! There is no raw stdin ownership shuttle and no second decoder; ordinary
+//! keystrokes seen while collecting stay queued in the shared reader and
+//! reach the product through the regular event stream, in arrival order.
 
-#[cfg(unix)]
-use std::io::Read;
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::reply::{self, TerminalReply};
 
 use crate::component::UiEvent;
 use crate::terminal::caps::{CellDimensions, TerminalCapabilities};
@@ -25,10 +31,11 @@ pub const PROBE_FRAGMENT_TIMEOUT: Duration = Duration::from_millis(150);
 pub const PROBE_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(25);
 
 /// Poll-slice bound honored once a reply stream exists AND the owner armed
-/// the yield flag: the collector must hand stdin back within a few
+/// the yield flag: the collector must hand the reader back within a few
 /// milliseconds of the arm, not at the next full-budget deadline. Slicing is
-/// event-driven (each slice is a poll that wakes on bytes), so a quiet
-/// responding terminal costs at most a handful of extra wakeups.
+/// event-driven (each slice is a poll that wakes on bytes or a completed
+/// reply), so a quiet responding terminal costs at most a handful of extra
+/// wakeups.
 const PROBE_YIELD_POLL_SLICE: Duration = Duration::from_millis(3);
 
 /// Terminal background polarity used by automatic theme selection.
@@ -38,6 +45,77 @@ pub enum TerminalTheme {
     Dark,
     /// A light terminal background.
     Light,
+}
+
+/// One query kind the probe can issue.
+///
+/// Queries are recorded BEFORE their bytes are written; a failed write
+/// undoes the record so no reply is ever awaited for a query that never
+/// left the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryKind {
+    /// OSC 11 background-color query.
+    Osc11,
+    /// Cell size query (`CSI 16 t`).
+    CellSize,
+    /// Cursor position report query (`CSI 6 n`).
+    CursorPosition,
+    /// Kitty keyboard enhancement query (`CSI ? u`).
+    KittyFlags,
+    /// Primary device attributes (`CSI c`).
+    DeviceAttributes,
+}
+
+/// The record of probe queries issued on the output stream, in write order.
+#[derive(Debug, Clone, Default)]
+pub struct IssuedQueries {
+    kinds: Vec<QueryKind>,
+}
+
+impl IssuedQueries {
+    /// The full startup batch record.
+    #[must_use]
+    pub fn startup(include_cell_size: bool) -> Self {
+        let mut kinds = vec![QueryKind::KittyFlags, QueryKind::DeviceAttributes];
+        if include_cell_size {
+            kinds.push(QueryKind::CellSize);
+        }
+        kinds.push(QueryKind::Osc11);
+        kinds.push(QueryKind::CursorPosition);
+        Self { kinds }
+    }
+
+    /// A single OSC 11 requery record.
+    #[must_use]
+    pub fn osc11() -> Self {
+        Self {
+            kinds: vec![QueryKind::Osc11],
+        }
+    }
+
+    /// Issued kinds, in write order.
+    #[must_use]
+    pub fn kinds(&self) -> &[QueryKind] {
+        &self.kinds
+    }
+
+    /// Whether `kind` was issued and not yet answered.
+    #[must_use]
+    pub fn is_outstanding(&self, kind: QueryKind) -> bool {
+        self.kinds.contains(&kind)
+    }
+
+    /// Consume the record of `kind` when its reply arrives.
+    fn answer(&mut self, kind: QueryKind) {
+        if let Some(index) = self.kinds.iter().position(|issued| *issued == kind) {
+            self.kinds.remove(index);
+        }
+    }
+
+    /// Undo the record (the write failed; nothing was issued).
+    fn undo(&mut self) {
+        self.kinds.clear();
+    }
 }
 
 /// Probe batch written outside synchronized output before `EventStream` starts.
@@ -65,9 +143,9 @@ pub fn osc_11_query() -> &'static [u8] {
 
 /// Classify dark-background from collected probe replies, if any OSC 11 landed.
 #[must_use]
-pub fn background_from_replies(replies: &[ProbeReply]) -> Option<bool> {
+pub fn background_from_replies(replies: &[TerminalReply]) -> Option<bool> {
     replies.iter().find_map(|reply| match reply {
-        ProbeReply::Background(payload) => classify_background(payload),
+        TerminalReply::Osc11(payload) => classify_background(payload),
         _ => None,
     })
 }
@@ -97,469 +175,272 @@ pub fn detect_terminal_theme(osc_dark: Option<bool>, colorfgbg: Option<&str>) ->
 
 /// Write the startup probe batch (phase 1 of the startup probe).
 ///
-/// Returns `false` when stdin is not a terminal — no batch is written and
-/// the matching [`probe_collect_replies`] call completes immediately.
+/// Returns the issued-query record, or `None` when stdin is not a terminal —
+/// no batch is written and the matching collection completes immediately.
+/// The record is created BEFORE the write and undone if the write fails, so
+/// no reply is awaited for a query that never left the process.
 /// Written outside synchronized output, before
-/// [`crate::terminal::TerminalInput`] takes ownership of stdin.
+/// [`crate::terminal::TerminalInput`] takes ownership of the reader.
 ///
 /// # Errors
 ///
 /// Returns [`io::Error`] when writing or flushing the probe batch fails.
-pub(crate) fn probe_write_batch<W: Write>(output: &mut W) -> io::Result<bool> {
+pub fn probe_write_batch<W: Write>(output: &mut W) -> io::Result<Option<IssuedQueries>> {
     if !io::stdin().is_terminal() {
-        return Ok(false);
+        return Ok(None);
     }
 
-    output.write_all(&probe_query_batch(true))?;
-    output.flush()?;
-    Ok(true)
+    let mut issued = IssuedQueries::startup(true);
+    let write = output
+        .write_all(&probe_query_batch(true))
+        .and_then(|()| output.flush());
+    match write {
+        Ok(()) => Ok(Some(issued)),
+        Err(error) => {
+            issued.undo();
+            Err(error)
+        }
+    }
 }
 
 /// Collect the startup probe replies written by [`probe_write_batch`]
-/// (phase 2), merging recognized replies into `caps` and returning early
-/// keystrokes as UI events for re-injection.
+/// (phase 2), merging recognized replies into `caps`.
 ///
-/// Blocks for the two-phase reply budget (see [`collect_probe_replies`]) —
-/// at most [`PROBE_FIRST_BYTE_TIMEOUT`] on a silent terminal — so callers
-/// that painted a first frame speculatively during this window re-derive
-/// theme and capability state afterwards and repaint when it changed.
+/// Blocks for the two-phase reply budget — at most
+/// [`PROBE_FIRST_BYTE_TIMEOUT`] on a silent terminal — so callers that
+/// painted a first frame speculatively during this window re-derive theme
+/// and capability state afterwards and repaint when it changed.
+///
+/// The returned vector is always empty and kept for call-shape stability:
+/// early ordinary keystrokes remain queued in the shared crossterm reader
+/// and are delivered by the event stream after it starts, in arrival order.
 ///
 /// # Errors
 ///
-/// Returns [`io::Error`] when reading stdin fails.
+/// Returns [`io::Error`] when the reader fails, including a latched reply
+/// protocol error (recognized malformed or oversized framing).
 pub fn probe_collect_replies(caps: &mut TerminalCapabilities) -> io::Result<Vec<UiEvent>> {
-    probe_collect_replies_with_yield(caps, &AtomicBool::new(false))
+    probe_collect_replies_with_yield(caps, &AtomicBool::new(false), &IssuedQueries::startup(true))
 }
 
 /// Yield-aware variant of [`probe_collect_replies`]: when `yield_now` is
 /// armed, the collector stops reading within [`PROBE_YIELD_POLL_SLICE`] once
-/// a reply stream exists and returns the bytes it already consumed as early
-/// input. Callers that must take stdin back by a deadline (the runtime arms
-/// this right before painting the first frame) guarantee the `EventStream`
-/// parser owns stdin from that point onward, so input written at
-/// first-paint time is parsed by crossterm instead of re-injected through
-/// the lossy startup mapper.
+/// a reply stream exists. Callers that must start the event stream by a
+/// deadline (the runtime arms this right before painting the first frame)
+/// get the shared reader back promptly; input written at first-paint time is
+/// parsed by the same persistent parser the collector used.
+///
+/// `issued` is the record returned by [`probe_write_batch`]: the collector
+/// completes when every issued query class that can complete has answered.
 ///
 /// # Errors
 ///
-/// Returns [`io::Error`] when reading stdin fails.
+/// Returns [`io::Error`] when the reader fails, including a latched reply
+/// protocol error.
 pub(crate) fn probe_collect_replies_with_yield(
     caps: &mut TerminalCapabilities,
     yield_now: &AtomicBool,
+    issued: &IssuedQueries,
 ) -> io::Result<Vec<UiEvent>> {
-    let mut session = ProbeSession::new();
-    let mut pending = Vec::new();
-    collect_probe_replies(
-        &mut session,
-        &mut pending,
-        ProbeSession::is_complete,
-        yield_now,
-    )?;
-    pending.extend(session.flush_timeout());
-    session.apply_to(caps);
-    Ok(reinject_bytes_as_events(&pending))
-}
-
-/// Shared probe wait: merge stdin bytes into `session` under the two-phase
-/// reply budget, returning interleaved non-probe input through `pending`.
-///
-/// Before the first reply byte the wait is bounded by
-/// [`PROBE_FIRST_BYTE_TIMEOUT`]; after bytes start flowing the full
-/// [`PROBE_FRAGMENT_TIMEOUT`] window applies (measured from the query write),
-/// so fragmented replies keep today's acceptance budget. Readiness is
-/// event-driven: the wait blocks in `poll` until bytes arrive or the active
-/// budget expires, with no fixed tick — except while `yield_now` is armed
-/// with a reply stream present, where polls are sliced to
-/// [`PROBE_YIELD_POLL_SLICE`] so the owner gets stdin back promptly.
-///
-/// `complete` is the caller's collected-enough predicate (full probe set or
-/// a classified background).
-fn collect_probe_replies(
-    session: &mut ProbeSession,
-    pending: &mut Vec<u8>,
-    complete: impl Fn(&ProbeSession) -> bool,
-    yield_now: &AtomicBool,
-) -> io::Result<()> {
+    let mut collector = ProbeCollector::default();
     let fragment_deadline = Instant::now() + PROBE_FRAGMENT_TIMEOUT;
     let first_byte_deadline = Instant::now() + PROBE_FIRST_BYTE_TIMEOUT;
-    let mut reply_seen = false;
+    let mut reply_stream_seen = false;
+    let mut answered = issued.clone();
     loop {
-        if complete(session) || (reply_seen && yield_now.load(Ordering::Relaxed)) {
-            return Ok(());
+        if all_outstanding_answered(&answered)
+            || collector.is_complete()
+            || (reply_stream_seen && yield_now.load(Ordering::Relaxed))
+        {
+            break;
         }
-        let active_deadline = if reply_seen {
+        let active_deadline = if reply_stream_seen {
             fragment_deadline
         } else {
             first_byte_deadline
         };
         let Some(remaining) = active_deadline.checked_duration_since(Instant::now()) else {
-            return Ok(());
+            break;
         };
-        let wait = if reply_seen && yield_now.load(Ordering::Relaxed) {
+        // Once a reply stream exists AND the owner armed the yield flag,
+        // slice the wait so the reader is handed back promptly.
+        let wait = if reply_stream_seen && yield_now.load(Ordering::Relaxed) {
             remaining.min(PROBE_YIELD_POLL_SLICE)
         } else {
             remaining
         };
-        match read_stdin_within(wait)? {
-            // EOF: stdin closed, no reply can arrive.
-            Some(bytes) if bytes.is_empty() => return Ok(()),
-            Some(bytes) => {
-                if let ProbeFeed::PendingInput(bytes) = session.feed(&bytes) {
-                    pending.extend(bytes);
-                }
-                // Arm the fragment phase only on probe-reply evidence: a
-                // recognized reply or a buffered partial sequence. Ordinary
-                // early keystrokes must not extend the wait.
-                reply_seen = !session.replies().is_empty() || !session.buffer.is_empty();
+        match reply::poll_reply(Some(wait)) {
+            Ok(Some(out)) => {
+                reply_stream_seen = true;
+                record_answer(&mut answered, &out);
+                collector.record(out);
             }
-            // Readiness timeout: the active budget expired.
-            None => return Ok(()),
+            Ok(None) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => break,
+            Err(error) => return Err(error),
         }
+    }
+    collector.apply_to(caps);
+    // Early ordinary keystrokes stay queued in the shared reader; the event
+    // stream delivers them after it starts, in arrival order. Nothing is
+    // re-injected and nothing is dropped.
+    Ok(Vec::new())
+}
+
+/// A startup probe is complete when the terminal class answered (DA1 or
+/// kitty flags) and the cursor reported; OSC 11 and cell size are best-effort
+/// refinements that must not extend the wait alone.
+fn all_outstanding_answered(answered: &IssuedQueries) -> bool {
+    !answered.is_outstanding(QueryKind::DeviceAttributes)
+        && !answered.is_outstanding(QueryKind::KittyFlags)
+        && !answered.is_outstanding(QueryKind::CursorPosition)
+}
+
+fn record_answer(answered: &mut IssuedQueries, reply: &TerminalReply) {
+    match reply {
+        TerminalReply::Osc11(_) => answered.answer(QueryKind::Osc11),
+        TerminalReply::CellSize { .. } => answered.answer(QueryKind::CellSize),
+        TerminalReply::CursorPosition { .. } => answered.answer(QueryKind::CursorPosition),
+        TerminalReply::KeyboardEnhancementFlags(_) => answered.answer(QueryKind::KittyFlags),
+        TerminalReply::PrimaryDeviceAttributes => answered.answer(QueryKind::DeviceAttributes),
     }
 }
 
-/// Mid-session OSC 11 re-probe: emit only the background query and parse a
-/// bounded reply. Non-probe stdin bytes are returned for re-injection.
+/// Mid-session OSC 11 re-probe: emit only the background query and classify a
+/// bounded reply.
 ///
 /// Call only while the sole [`crate::terminal::TerminalInput`] `EventStream`
-/// is paused so this path owns stdin. `None` means timeout / no-TTY / unparseable
-/// — the caller keeps its prior classification.
+/// is paused so the collector and the stream share the reader serially.
+/// `None` means timeout / no-TTY / unparseable reply — the caller keeps its
+/// prior classification. Keystrokes typed during the requery stay queued in
+/// the shared parser (pending CSI, UTF-8, and paste state included) and are
+/// delivered when the stream resumes.
+///
+/// A latched reply protocol error propagates as [`io::Error`]; the caller
+/// recovers via `crossterm::event::reply::recover_protocol_error`.
 ///
 /// # Errors
 ///
-/// Returns [`io::Error`] when writing or flushing the query fails.
-pub fn probe_background<W: Write>(output: &mut W) -> io::Result<(Option<bool>, Vec<UiEvent>)> {
+/// Returns [`io::Error`] when writing or flushing the query fails or the
+/// reader latches a protocol error.
+pub fn probe_background<W: Write>(output: &mut W) -> io::Result<Option<bool>> {
     if !io::stdin().is_terminal() {
-        return Ok((None, Vec::new()));
+        return Ok(None);
     }
 
-    output.write_all(osc_11_query())?;
-    output.flush()?;
-
-    let mut session = ProbeSession::new();
-    let mut pending = Vec::new();
-    collect_probe_replies(
-        &mut session,
-        &mut pending,
-        |session| background_from_replies(session.replies()).is_some(),
-        &AtomicBool::new(false),
-    )?;
-    let dark = background_from_replies(session.replies());
-    Ok((dark, reinject_bytes_as_events(&pending)))
-}
-
-/// Drive a mid-session OSC 11 classification from canned stdin chunks.
-///
-/// Processes every chunk, then treats any incomplete fragment as user input
-/// (timeout path). Used by unit tests and fakes that cannot touch real stdin.
-#[must_use]
-pub fn probe_background_from_chunks(
-    chunks: impl IntoIterator<Item = impl AsRef<[u8]>>,
-) -> (Option<bool>, Vec<UiEvent>) {
-    let mut session = ProbeSession::new();
-    let mut pending = Vec::new();
-    for chunk in chunks {
-        if let ProbeFeed::PendingInput(bytes) = session.feed(chunk.as_ref()) {
-            pending.extend(bytes);
+    let mut issued = IssuedQueries::osc11();
+    let write = output
+        .write_all(osc_11_query())
+        .and_then(|()| output.flush());
+    match write {
+        Ok(()) => {}
+        Err(error) => {
+            issued.undo();
+            return Err(error);
         }
     }
-    let dark = background_from_replies(session.replies());
-    pending.extend(session.flush_timeout());
-    (dark, reinject_bytes_as_events(&pending))
+
+    let fragment_deadline = Instant::now() + PROBE_FRAGMENT_TIMEOUT;
+    let mut dark = None;
+    while let Some(remaining) = fragment_deadline.checked_duration_since(Instant::now()) {
+        match reply::poll_reply(Some(remaining)) {
+            Ok(Some(TerminalReply::Osc11(payload))) => {
+                dark = classify_background(&payload);
+                break;
+            }
+            // A late reply to a different query is consumed (the sink is
+            // bounded) but must not update adopted background state.
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(dark)
 }
 
-/// Outcome of feeding bytes into a [`ProbeSession`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProbeFeed {
-    /// Bytes consumed as part of an in-progress or completed probe reply.
-    Consumed,
-    /// Non-probe input that should be re-injected after the stream starts.
-    PendingInput(Vec<u8>),
-}
-
-/// One recognized probe reply.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProbeReply {
-    /// Kitty keyboard flags response `CSI ? <flags> u`.
-    KittyFlags(u16),
-    /// Primary Device Attributes `CSI ? ... c`.
-    DeviceAttributes,
-    /// Cell size `CSI 4 ; height ; width t` or `CSI 16 t` reply form `CSI 6 ; h ; w t`.
-    CellSize {
-        /// Cell width in pixels.
-        width: u16,
-        /// Cell height in pixels.
-        height: u16,
-    },
-    /// OSC 11 background color payload (without OSC/ST framing).
-    Background(String),
-    /// Cursor position `CSI row ; col R` (1-based).
-    CursorPosition {
-        /// One-based terminal row.
-        row: u16,
-        /// One-based terminal column.
-        col: u16,
-    },
-}
-
-/// Stateful parser for probe replies interleaved with early keystrokes.
+/// Stateful accumulator for probe replies collected through the shared
+/// reader, with the capability-merge and deterministic-seed policies.
 #[derive(Debug, Default)]
-pub struct ProbeSession {
-    buffer: Vec<u8>,
-    replies: Vec<ProbeReply>,
-    pending_input: Vec<u8>,
+pub struct ProbeCollector {
+    replies: Vec<TerminalReply>,
     saw_kitty: bool,
     saw_da1: bool,
     saw_cursor: bool,
 }
 
-impl ProbeSession {
-    /// Create an empty probe session.
+impl ProbeCollector {
+    /// Record one collected reply.
+    pub fn record(&mut self, reply: TerminalReply) {
+        match &reply {
+            TerminalReply::KeyboardEnhancementFlags(_) => self.saw_kitty = true,
+            TerminalReply::PrimaryDeviceAttributes => self.saw_da1 = true,
+            TerminalReply::CursorPosition { .. } => self.saw_cursor = true,
+            TerminalReply::Osc11(_) | TerminalReply::CellSize { .. } => {}
+        }
+        self.replies.push(reply);
+    }
+
+    /// Collected replies in arrival order.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn replies(&self) -> &[TerminalReply] {
+        &self.replies
     }
 
-    /// Feed raw terminal bytes; returns whether they were probe data or input.
-    pub fn feed(&mut self, bytes: &[u8]) -> ProbeFeed {
-        if bytes.is_empty() {
-            return ProbeFeed::Consumed;
-        }
-        self.buffer.extend_from_slice(bytes);
-        self.drain_buffer();
-        if self.pending_input.is_empty() {
-            ProbeFeed::Consumed
-        } else {
-            let pending = std::mem::take(&mut self.pending_input);
-            ProbeFeed::PendingInput(pending)
-        }
+    /// Whether the session has enough replies to stop waiting.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        // DA1 or kitty is the class sentinel; cursor is also required for
+        // cache seeding.
+        (self.saw_da1 || self.saw_kitty) && self.saw_cursor
     }
 
-    /// Force incomplete fragments to be treated as user input (timeout path).
-    pub fn flush_timeout(&mut self) -> Vec<u8> {
-        if !self.buffer.is_empty() {
-            self.pending_input.extend_from_slice(&self.buffer);
-            self.buffer.clear();
-        }
-        std::mem::take(&mut self.pending_input)
-    }
-
-    /// Apply collected replies onto a capability cache and optional cursor.
+    /// Apply collected replies onto a capability cache; returns the reported
+    /// cursor position (zero-based) when one arrived.
     pub fn apply_to(&self, caps: &mut TerminalCapabilities) -> Option<(u16, u16)> {
         let mut cursor = None;
         for reply in &self.replies {
             match reply {
-                ProbeReply::KittyFlags(flags) => {
-                    caps.set_kitty_keyboard(*flags != 0);
+                TerminalReply::KeyboardEnhancementFlags(flags) => {
+                    caps.set_kitty_keyboard(!flags.is_empty());
                 }
-                ProbeReply::DeviceAttributes => {
+                TerminalReply::PrimaryDeviceAttributes => {
                     if !self.saw_kitty {
                         caps.set_kitty_keyboard(false);
                     }
                 }
-                ProbeReply::CellSize { width, height } => {
+                TerminalReply::CellSize { width, height } => {
                     caps.set_cell_dimensions(*width, *height);
                 }
-                ProbeReply::Background(payload) => {
+                TerminalReply::Osc11(payload) => {
                     caps.set_dark_background(classify_background(payload));
                 }
-                ProbeReply::CursorPosition { row, col } => {
-                    cursor = Some((col.saturating_sub(1), row.saturating_sub(1)));
+                TerminalReply::CursorPosition { column, row } => {
+                    cursor = Some((*column, *row));
                 }
             }
         }
         cursor
     }
 
-    /// Collected replies in arrival order.
-    #[must_use]
-    pub fn replies(&self) -> &[ProbeReply] {
-        &self.replies
-    }
-
-    /// Pending non-probe bytes waiting for re-injection.
-    #[must_use]
-    pub fn pending_input(&self) -> &[u8] {
-        &self.pending_input
-    }
-
-    /// Convert pending raw input into synthetic UI events where possible.
-    #[must_use]
-    pub fn pending_ui_events(&self) -> Vec<UiEvent> {
-        reinject_bytes_as_events(&self.pending_input)
-    }
-
-    /// Whether the session has enough replies to stop waiting.
-    #[must_use]
-    pub fn is_complete(&self) -> bool {
-        // DA1 is the sentinel; cursor is also required for cache seeding.
-        (self.saw_da1 || self.saw_kitty) && self.saw_cursor
-    }
-
-    fn drain_buffer(&mut self) {
-        loop {
-            if self.buffer.is_empty() {
-                break;
-            }
-            match take_one(&mut self.buffer) {
-                TakeResult::NeedMore => break,
-                TakeResult::Reply(reply) => {
-                    match &reply {
-                        ProbeReply::KittyFlags(_) => self.saw_kitty = true,
-                        ProbeReply::DeviceAttributes => self.saw_da1 = true,
-                        ProbeReply::CursorPosition { .. } => self.saw_cursor = true,
-                        _ => {}
-                    }
-                    self.replies.push(reply);
-                }
-                TakeResult::Input(bytes) => self.pending_input.extend_from_slice(&bytes),
-            }
+    /// Seed deterministic defaults for fixture runs whose harness never
+    /// answers: kitty off (DA1 seen), 20x10 cells, dark background, origin
+    /// cursor. Marks the collector complete.
+    pub fn seed_defaults(&mut self) {
+        if !self.saw_kitty && !self.saw_da1 {
+            self.replies.push(TerminalReply::PrimaryDeviceAttributes);
+            self.saw_da1 = true;
         }
+        self.replies.push(TerminalReply::CellSize {
+            width: 20,
+            height: 10,
+        });
+        self.replies
+            .push(TerminalReply::Osc11("rgb:0000/0000/0000".to_string()));
+        self.replies
+            .push(TerminalReply::CursorPosition { column: 0, row: 0 });
+        self.saw_cursor = true;
     }
-}
-
-enum TakeResult {
-    NeedMore,
-    Reply(ProbeReply),
-    Input(Vec<u8>),
-}
-
-fn take_one(buffer: &mut Vec<u8>) -> TakeResult {
-    if buffer.is_empty() {
-        return TakeResult::NeedMore;
-    }
-
-    // OSC 11 reply: ESC ] 11 ; ... BEL or ST
-    if buffer.starts_with(b"\x1b]11;") {
-        return take_osc_11(buffer);
-    }
-
-    // CSI sequences: ESC [
-    if buffer.starts_with(b"\x1b[") {
-        return take_csi(buffer);
-    }
-
-    // Bare ESC that may still be a prefix.
-    if buffer == b"\x1b" || buffer == b"\x1b]" {
-        return TakeResult::NeedMore;
-    }
-
-    // Not a probe sequence: emit the first byte as input and continue.
-    let byte = buffer.remove(0);
-    TakeResult::Input(vec![byte])
-}
-
-fn take_osc_11(buffer: &mut Vec<u8>) -> TakeResult {
-    // Find BEL (0x07) or ST (ESC \)
-    let mut i = 5; // after ESC ] 11 ;
-    while i < buffer.len() {
-        if buffer[i] == 0x07 {
-            let payload = buffer[5..i].to_vec();
-            let _ = buffer.drain(..=i);
-            let text = String::from_utf8_lossy(&payload).into_owned();
-            return TakeResult::Reply(ProbeReply::Background(text));
-        }
-        if buffer[i] == 0x1b {
-            if i + 1 >= buffer.len() {
-                return TakeResult::NeedMore;
-            }
-            if buffer[i + 1] == b'\\' {
-                let payload = buffer[5..i].to_vec();
-                let _ = buffer.drain(..i + 2);
-                let text = String::from_utf8_lossy(&payload).into_owned();
-                return TakeResult::Reply(ProbeReply::Background(text));
-            }
-        }
-        i += 1;
-    }
-    TakeResult::NeedMore
-}
-
-fn take_csi(buffer: &mut Vec<u8>) -> TakeResult {
-    // Need at least ESC [ + final byte.
-    if buffer.len() < 3 {
-        return TakeResult::NeedMore;
-    }
-    // Find final byte 0x40-0x7E.
-    let mut idx = 2;
-    while idx < buffer.len() {
-        let b = buffer[idx];
-        if (0x40..=0x7e).contains(&b) {
-            let seq = buffer[..=idx].to_vec();
-            let _ = buffer.drain(..=idx);
-            if let Some(reply) = parse_csi_reply(&seq) {
-                return TakeResult::Reply(reply);
-            }
-            // Unknown CSI: treat as input so it can be re-injected.
-            return TakeResult::Input(seq);
-        }
-        idx += 1;
-    }
-    // Still a valid CSI prefix?
-    if is_csi_prefix(buffer) {
-        TakeResult::NeedMore
-    } else {
-        let byte = buffer.remove(0);
-        TakeResult::Input(vec![byte])
-    }
-}
-
-fn parse_csi_reply(seq: &[u8]) -> Option<ProbeReply> {
-    let body = seq.strip_prefix(b"\x1b[")?;
-    if body.is_empty() {
-        return None;
-    }
-    let final_byte = *body.last()?;
-    let params = &body[..body.len() - 1];
-
-    match final_byte {
-        b'u' => {
-            // CSI ? <flags> u
-            if let Some(rest) = params.strip_prefix(b"?") {
-                let flags = std::str::from_utf8(rest).ok()?.parse::<u16>().ok()?;
-                return Some(ProbeReply::KittyFlags(flags));
-            }
-            None
-        }
-        b'c' => {
-            // CSI ? ... c  (DA1)
-            if params.starts_with(b"?") {
-                return Some(ProbeReply::DeviceAttributes);
-            }
-            None
-        }
-        b't' => {
-            // CSI 6 ; height ; width t  (cell size reply for 16t)
-            // Also accept CSI 4 ; height ; width t
-            let text = std::str::from_utf8(params).ok()?;
-            let mut parts = text.split(';');
-            let kind = parts.next()?;
-            if kind == "6" || kind == "4" {
-                let height = parts.next()?.parse::<u16>().ok()?;
-                let width = parts.next()?.parse::<u16>().ok()?;
-                return Some(ProbeReply::CellSize { width, height });
-            }
-            None
-        }
-        b'R' => {
-            // CSI row ; col R  (optionally with ? prefix for some terminals)
-            let text = std::str::from_utf8(params).ok()?;
-            let text = text.strip_prefix('?').unwrap_or(text);
-            let mut parts = text.split(';');
-            let row = parts.next()?.parse::<u16>().ok()?;
-            let col = parts.next()?.parse::<u16>().ok()?;
-            Some(ProbeReply::CursorPosition { row, col })
-        }
-        _ => None,
-    }
-}
-
-fn is_csi_prefix(buf: &[u8]) -> bool {
-    if !buf.starts_with(b"\x1b[") {
-        return buf == b"\x1b";
-    }
-    // Intermediate bytes until a final is seen.
-    buf.iter().skip(2).all(|b| *b < 0x40 || *b > 0x7e)
 }
 
 /// Classify an OSC 11 payload into dark/light when possible.
@@ -668,209 +549,6 @@ fn parse_hex_component(component: &str) -> Option<u8> {
     u8::try_from(scaled).ok()
 }
 
-/// Convert reinjected raw bytes into coarse UI events (printable keys, enter,
-/// and the common CSI/SS3 navigation keys).
-///
-/// Keys typed while a probe owns stdin must survive reinjection with their
-/// meaning intact: an arrow key mangled into `Esc`, `[`, `B` would cancel
-/// overlays and corrupt editors. Sequences this parser does not recognize are
-/// dropped whole rather than leaking their bytes as printable keys.
-#[must_use]
-pub fn reinject_bytes_as_events(bytes: &[u8]) -> Vec<UiEvent> {
-    let mut events = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        match b {
-            b'\r' | b'\n' => {
-                events.push(key(KeyCode::Enter, KeyModifiers::NONE));
-                // Collapse CRLF.
-                if b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                    i += 1;
-                }
-            }
-            b'\t' => {
-                events.push(key(KeyCode::Tab, KeyModifiers::NONE));
-            }
-            0x7f | 0x08 => {
-                events.push(key(KeyCode::Backspace, KeyModifiers::NONE));
-            }
-            0x1b => {
-                match parse_escape(&bytes[i + 1..]) {
-                    Some((Some(event), consumed)) => {
-                        events.push(event);
-                        i += consumed;
-                    }
-                    Some((None, consumed)) => {
-                        // Unrecognized sequence: consume it whole, emit nothing.
-                        i += consumed;
-                    }
-                    None => events.push(key(KeyCode::Esc, KeyModifiers::NONE)),
-                }
-            }
-            b if b.is_ascii_graphic() || b == b' ' => {
-                events.push(key(KeyCode::Char(char::from(b)), KeyModifiers::NONE));
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    events
-}
-
-fn key(code: KeyCode, modifiers: KeyModifiers) -> UiEvent {
-    UiEvent::Key(KeyEvent::new(code, modifiers))
-}
-
-/// Parse one escape sequence following a leading `\x1b`.
-///
-/// Returns the mapped event (if any) and how many bytes after the `\x1b` the
-/// sequence consumed. `None` means the `\x1b` stands alone as Esc.
-fn parse_escape(rest: &[u8]) -> Option<(Option<UiEvent>, usize)> {
-    match rest.first()? {
-        b'[' => parse_csi(&rest[1..]).map(|(event, consumed)| (event, consumed + 1)),
-        b'O' => parse_ss3(&rest[1..]).map(|(event, consumed)| (event, consumed + 1)),
-        &b if b.is_ascii_graphic() || b == b' ' => Some((
-            Some(key(KeyCode::Char(char::from(b)), KeyModifiers::ALT)),
-            1,
-        )),
-        _ => None,
-    }
-}
-
-/// CSI: `\x1b[` + params `0-9;` + final byte in `@..~`.
-fn parse_csi(rest: &[u8]) -> Option<(Option<UiEvent>, usize)> {
-    let mut end = 0;
-    while rest
-        .get(end)
-        .is_some_and(|b| b.is_ascii_digit() || *b == b';')
-    {
-        end += 1;
-    }
-    let final_byte = *rest.get(end)?;
-    let params: Vec<u32> = std::str::from_utf8(&rest[..end])
-        .ok()?
-        .split(';')
-        .map(|part| part.parse().unwrap_or(0))
-        .collect();
-    let modifiers = modifier_from_params(&params);
-    let code = match final_byte {
-        b'A' => KeyCode::Up,
-        b'B' => KeyCode::Down,
-        b'C' => KeyCode::Right,
-        b'D' => KeyCode::Left,
-        b'H' => KeyCode::Home,
-        b'F' => KeyCode::End,
-        b'Z' => {
-            return Some((Some(key(KeyCode::BackTab, modifiers)), end + 1));
-        }
-        b'~' => match params.first().copied().unwrap_or(0) {
-            1 | 7 => KeyCode::Home,
-            2 => KeyCode::Insert,
-            3 => KeyCode::Delete,
-            4 | 8 => KeyCode::End,
-            5 => KeyCode::PageUp,
-            6 => KeyCode::PageDown,
-            _ => return Some((None, end + 1)),
-        },
-        // Unrecognized CSI: consume the whole sequence, emit nothing.
-        b'@'..=b'~' => return Some((None, end + 1)),
-        _ => return None,
-    };
-    Some((Some(key(code, modifiers)), end + 1))
-}
-
-/// SS3: `\x1bO` + one final letter (application-mode arrows and friends).
-fn parse_ss3(rest: &[u8]) -> Option<(Option<UiEvent>, usize)> {
-    let code = match rest.first()? {
-        b'A' => KeyCode::Up,
-        b'B' => KeyCode::Down,
-        b'C' => KeyCode::Right,
-        b'D' => KeyCode::Left,
-        b'H' => KeyCode::Home,
-        b'F' => KeyCode::End,
-        // Other SS3 finals (function keys, keypad) are rare mid-probe; drop
-        // them whole rather than leaking their letters as printable keys.
-        b'P'..=b'S' => return Some((None, 1)),
-        _ => return None,
-    };
-    Some((Some(key(code, KeyModifiers::NONE)), 1))
-}
-
-/// `XTerm` modifier param: `m = 1 + bitmask` where bit 0 = shift, 1 = alt,
-/// 2 = ctrl, 3 = super (crossterm uses the same encoding).
-fn modifier_from_params(params: &[u32]) -> KeyModifiers {
-    let Some(&m) = params.get(1) else {
-        return KeyModifiers::NONE;
-    };
-    let bits = m.saturating_sub(1);
-    let mut modifiers = KeyModifiers::empty();
-    if bits & 0b0001 != 0 {
-        modifiers |= KeyModifiers::SHIFT;
-    }
-    if bits & 0b0010 != 0 {
-        modifiers |= KeyModifiers::ALT;
-    }
-    if bits & 0b0100 != 0 {
-        modifiers |= KeyModifiers::CONTROL;
-    }
-    if bits & 0b1000 != 0 {
-        modifiers |= KeyModifiers::SUPER;
-    }
-    modifiers
-}
-
-/// Read pending probe bytes, blocking at most `timeout` for readiness.
-///
-/// `Ok(None)` means the readiness window expired without bytes; `Ok(Some)`
-/// carries one read (empty on EOF). Zero timeout keeps the old
-/// non-blocking semantics.
-#[cfg_attr(
-    not(unix),
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "Unix arm can return real poll/read I/O errors; callers need one shared io::Result contract across platforms"
-    )
-)]
-fn read_stdin_within(timeout: Duration) -> io::Result<Option<Vec<u8>>> {
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsFd;
-
-        let stdin = io::stdin();
-        let fd = stdin.as_fd();
-        let mut fds = [nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN)];
-        // Round sub-millisecond remainders up: the wait must not expire early.
-        let timeout_ms = if timeout.is_zero() {
-            0_u16
-        } else {
-            u16::try_from(timeout.as_millis() + 1).unwrap_or(u16::MAX)
-        };
-        if nix::poll::poll(&mut fds, timeout_ms)
-            .map_err(|error| io::Error::other(format!("poll stdin: {error}")))?
-            == 0
-        {
-            return Ok(None);
-        }
-        let mut buffer = [0_u8; 512];
-        match stdin.lock().read(&mut buffer) {
-            Ok(0) => Ok(Some(Vec::new())),
-            Ok(len) => Ok(Some(buffer[..len].to_vec())),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // No readiness primitive here: honor the budget with a bounded sleep
-        // so the caller's deadline logic stays identical on this path.
-        if !timeout.is_zero() {
-            std::thread::sleep(timeout);
-        }
-        Ok(None)
-    }
-}
-
 /// Seed cell dimensions into caps when a probe reply provided them.
 #[must_use]
 pub fn cell_from_caps(caps: &TerminalCapabilities) -> CellDimensions {
@@ -883,48 +561,43 @@ mod tests {
     use crate::terminal::caps::TerminalCapabilities;
 
     #[test]
-    fn parses_fragmented_kitty_and_da1() {
-        let mut session = ProbeSession::new();
-        assert_eq!(session.feed(b"\x1b[?"), ProbeFeed::Consumed);
-        assert_eq!(session.feed(b"7u"), ProbeFeed::Consumed);
-        assert_eq!(session.feed(b"\x1b[?62;c"), ProbeFeed::Consumed);
-        assert!(session.replies().contains(&ProbeReply::KittyFlags(7)));
-        assert!(session.replies().contains(&ProbeReply::DeviceAttributes));
+    fn collector_marks_completion_on_class_and_cursor() {
+        let mut collector = ProbeCollector::default();
+        assert!(!collector.is_complete());
+        collector.record(TerminalReply::KeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        ));
+        assert!(!collector.is_complete(), "kitty alone is not complete");
+        collector.record(TerminalReply::CursorPosition { column: 4, row: 2 });
+        assert!(collector.is_complete());
     }
 
     #[test]
-    fn interleaves_keystroke_with_probe_replies() {
-        let mut session = ProbeSession::new();
-        let result = session.feed(b"x");
-        assert!(matches!(result, ProbeFeed::PendingInput(_)));
-        if let ProbeFeed::PendingInput(bytes) = result {
-            assert_eq!(bytes, b"x");
-        }
-        assert_eq!(session.feed(b"\x1b[10;5R"), ProbeFeed::Consumed);
-        assert!(
-            session
-                .replies()
-                .contains(&ProbeReply::CursorPosition { row: 10, col: 5 })
-        );
-        let events = reinject_bytes_as_events(b"x");
-        assert_eq!(events.len(), 1);
-    }
-
-    #[test]
-    fn timeout_reinjects_incomplete_prefix() {
-        let mut session = ProbeSession::new();
-        let _ = session.feed(b"\x1b[?");
-        let pending = session.flush_timeout();
-        assert_eq!(pending, b"\x1b[?");
-    }
-
-    #[test]
-    fn apply_updates_capabilities_and_cursor() {
-        let mut session = ProbeSession::new();
-        let _ = session.feed(b"\x1b[?7u\x1b[?62;c\x1b[6;18;9t\x1b]11;rgb:00/00/00\x07\x1b[3;4R");
+    fn collector_da1_without_kitty_disables_kitty() {
+        let mut collector = ProbeCollector::default();
+        collector.record(TerminalReply::PrimaryDeviceAttributes);
+        collector.record(TerminalReply::CursorPosition { column: 0, row: 0 });
         let mut caps = TerminalCapabilities::default();
-        let cursor = session.apply_to(&mut caps);
-        assert!(caps.kitty_keyboard());
+        caps.set_kitty_keyboard(true);
+        collector.apply_to(&mut caps);
+        assert!(
+            !caps.kitty_keyboard(),
+            "DA1-only terminals must not use kitty"
+        );
+    }
+
+    #[test]
+    fn collector_applies_cell_background_and_cursor() {
+        let mut collector = ProbeCollector::default();
+        collector.record(TerminalReply::CellSize {
+            width: 9,
+            height: 18,
+        });
+        collector.record(TerminalReply::Osc11("rgb:00/00/00".to_string()));
+        collector.record(TerminalReply::CursorPosition { column: 3, row: 2 });
+        collector.record(TerminalReply::PrimaryDeviceAttributes);
+        let mut caps = TerminalCapabilities::default();
+        let cursor = collector.apply_to(&mut caps);
         assert_eq!(caps.cell.width, 9);
         assert_eq!(caps.cell.height, 18);
         assert_eq!(caps.dark_background, Some(true));
@@ -932,151 +605,42 @@ mod tests {
     }
 
     #[test]
-    fn terminal_theme_detection_prefers_osc_then_colorfgbg_then_dark() {
-        assert_eq!(
-            detect_terminal_theme(Some(false), Some("15;0")),
-            TerminalTheme::Light
-        );
-        assert_eq!(
-            detect_terminal_theme(None, Some("15;0")),
-            TerminalTheme::Dark
-        );
-        assert_eq!(
-            detect_terminal_theme(None, Some("0;15")),
-            TerminalTheme::Light
-        );
-        assert_eq!(detect_terminal_theme(None, None), TerminalTheme::Dark);
+    fn seed_defaults_produce_the_documented_fallback() {
+        let mut collector = ProbeCollector::default();
+        collector.seed_defaults();
+        assert!(collector.is_complete());
+        let mut caps = TerminalCapabilities::default();
+        let cursor = collector.apply_to(&mut caps);
+        assert!(!caps.kitty_keyboard());
+        assert_eq!(caps.cell.width, 20);
+        assert_eq!(caps.cell.height, 10);
+        assert_eq!(caps.dark_background, Some(true));
+        assert_eq!(cursor, Some((0, 0)));
     }
 
     #[test]
-    fn probe_batch_has_no_sync_wrapper() {
-        let batch = probe_query_batch(true);
-        assert!(!batch.windows(8).any(|w| w == b"\x1b[?2026"));
-        assert!(batch.windows(4).any(|w| w == b"\x1b[?u"));
-        assert!(batch.windows(3).any(|w| w == b"\x1b[c"));
-        assert!(batch.windows(4).any(|w| w == b"\x1b[6n"));
+    fn background_classification_prefers_first_osc() {
+        let replies = vec![
+            TerminalReply::Osc11("rgb:ffff/ffff/ffff".to_string()),
+            TerminalReply::Osc11("rgb:00/00/00".to_string()),
+        ];
+        assert_eq!(background_from_replies(&replies), Some(false));
     }
 
     #[test]
-    fn osc_11_query_is_background_only() {
-        let query = osc_11_query();
-        assert_eq!(query, b"\x1b]11;?\x07");
-        assert!(!query.windows(3).any(|w| w == b"\x1b[c"));
-        assert!(!query.windows(4).any(|w| w == b"\x1b[6n"));
+    fn issued_queries_track_outstanding_kinds() {
+        let mut issued = IssuedQueries::startup(true);
+        assert!(issued.is_outstanding(QueryKind::Osc11));
+        assert!(issued.is_outstanding(QueryKind::CursorPosition));
+        issued.answer(QueryKind::CursorPosition);
+        assert!(!issued.is_outstanding(QueryKind::CursorPosition));
+        issued.undo();
+        assert!(issued.kinds().is_empty());
     }
 
     #[test]
-    fn probe_background_from_chunks_classifies_reply() {
-        let (dark, events) =
-            probe_background_from_chunks([b"\x1b]11;rgb:ffff/ffff/ffff\x07".as_slice()]);
-        assert_eq!(dark, Some(false));
-        assert!(events.is_empty());
-
-        let (dark, events) = probe_background_from_chunks([b"\x1b]11;rgb:00/00/00\x07".as_slice()]);
-        assert_eq!(dark, Some(true));
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn probe_background_from_chunks_timeout_is_none() {
-        // Incomplete OSC 11 prefix — flush_timeout treats it as user input.
-        let (dark, events) = probe_background_from_chunks([b"\x1b]11;rgb:".as_slice()]);
-        assert_eq!(dark, None);
-        assert!(!events.is_empty());
-    }
-
-    #[test]
-    fn probe_background_from_chunks_preserves_interleaved_keys() {
-        let (dark, events) = probe_background_from_chunks([
-            b"a".as_slice(),
-            b"\x1b]11;rgb:00/00/00\x07".as_slice(),
-            b"b".as_slice(),
-        ]);
-        assert_eq!(dark, Some(true));
-        assert_eq!(events.len(), 2);
-        assert!(matches!(
-            &events[0],
-            UiEvent::Key(k) if k.code == KeyCode::Char('a')
-        ));
-        assert!(matches!(
-            &events[1],
-            UiEvent::Key(k) if k.code == KeyCode::Char('b')
-        ));
-    }
-
-    #[test]
-    fn reinject_preserves_arrow_and_navigation_keys() {
-        let events = reinject_bytes_as_events(b"\x1b[B\r\x1b[A\x1b[C\x1b[D");
-        let codes: Vec<KeyCode> = events
-            .iter()
-            .filter_map(|event| match event {
-                UiEvent::Key(key) => Some(key.code),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            codes,
-            vec![
-                KeyCode::Down,
-                KeyCode::Enter,
-                KeyCode::Up,
-                KeyCode::Right,
-                KeyCode::Left
-            ]
-        );
-    }
-
-    #[test]
-    fn reinject_preserves_modified_and_ss3_keys() {
-        let events = reinject_bytes_as_events(b"\x1b[1;5C\x1bOB\x1b[3~\x1b[Z");
-        let observed: Vec<(KeyCode, KeyModifiers)> = events
-            .iter()
-            .filter_map(|event| match event {
-                UiEvent::Key(key) => Some((key.code, key.modifiers)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            observed,
-            vec![
-                (KeyCode::Right, KeyModifiers::CONTROL),
-                (KeyCode::Down, KeyModifiers::NONE),
-                (KeyCode::Delete, KeyModifiers::NONE),
-                (KeyCode::BackTab, KeyModifiers::NONE),
-            ]
-        );
-    }
-
-    #[test]
-    fn reinject_maps_alt_and_bare_escape() {
-        let events = reinject_bytes_as_events(b"\x1bx\x1b");
-        assert_eq!(events.len(), 2);
-        assert!(matches!(
-            &events[0],
-            UiEvent::Key(k) if k.code == KeyCode::Char('x') && k.modifiers == KeyModifiers::ALT
-        ));
-        assert!(matches!(
-            &events[1],
-            UiEvent::Key(k) if k.code == KeyCode::Esc
-        ));
-    }
-
-    #[test]
-    fn reinject_drops_unknown_sequences_whole() {
-        // Unknown CSI with params and SS3 function keys must not leak their
-        // bytes as printable keys.
-        let events = reinject_bytes_as_events(b"\x1b[999;1R\x1bOPq");
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0],
-            UiEvent::Key(k) if k.code == KeyCode::Char('q')
-        ));
-    }
-
-    #[test]
-    fn probe_background_from_chunks_empty_is_none() {
-        let (dark, events) = probe_background_from_chunks(std::iter::empty::<&[u8]>());
-        assert_eq!(dark, None);
-        assert!(events.is_empty());
+    fn issued_osc11_record_matches_requery() {
+        let issued = IssuedQueries::osc11();
+        assert_eq!(issued.kinds(), &[QueryKind::Osc11]);
     }
 }

@@ -45,16 +45,22 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, poll_fn};
-use pi_ai::AssistantMessage;
+use pi_ai::{AssistantContent, AssistantMessage};
 use pi_ai::auth::types::AuthSelectOption;
 use pi_ai::auth::{
     AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthType, default_provider_auth,
 };
+use pi_tui::alt_screen::{
+    DocumentBlock, DocumentBlockId, FullscreenEffect, FullscreenOptions, FullscreenViewport,
+    TranscriptSearch, transcript_search_rect,
+};
 use pi_tui::component::{Component, EventResult, UiEvent};
-use pi_tui::components::editor::{Editor, EditorOptions};
+use pi_tui::components::editor::{BorderActivity, Editor, EditorOptions};
 use pi_tui::keys::{
     ParsedKeyId, encode_key_event, key_matches_parsed, parse_key_id, set_kitty_protocol_active,
+    should_dispatch_key_event,
 };
+use pi_tui::terminal::ScreenMode;
 use pi_tui::terminal::caps::{TerminalCapabilities, TerminalCapabilityOverrides};
 use pi_tui::terminal::input::TerminalInput;
 use pi_tui::terminal::probe::{TerminalTheme, detect_terminal_theme};
@@ -83,7 +89,9 @@ use pi_ext::protocol::{
 };
 use pi_ext::sanitize::SanitizedSlot;
 
-use crate::core::settings::{DoubleEscapeAction, ThemeMode};
+use crate::core::settings::{
+    DoubleEscapeAction, FullscreenExitOutput, FullscreenScrollbar, ThemeMode,
+};
 
 use super::input::{InputMapper, InputState};
 use super::messages::{AssistantMessageView, MessageView};
@@ -393,6 +401,39 @@ pub trait SessionHost: Send + Sync + 'static {
 
     /// Cycle the active model in the given direction.
     fn cycle_model(&self, forward: bool) -> BoxFuture<'_, Result<(), String>>;
+    /// Current thinking level for the active session.
+    fn current_thinking_level(&self) -> pi_ai::ModelThinkingLevel {
+        pi_ai::ModelThinkingLevel::Off
+    }
+
+    /// Thinking levels available for the active model, in cycle order.
+    fn available_thinking_levels(&self) -> Vec<pi_ai::ModelThinkingLevel> {
+        vec![
+            pi_ai::ModelThinkingLevel::Off,
+            pi_ai::ModelThinkingLevel::Minimal,
+            pi_ai::ModelThinkingLevel::Low,
+            pi_ai::ModelThinkingLevel::Medium,
+            pi_ai::ModelThinkingLevel::High,
+            pi_ai::ModelThinkingLevel::Xhigh,
+            pi_ai::ModelThinkingLevel::Max,
+        ]
+    }
+
+    /// Global thinking default, when one has been configured.
+    fn default_thinking_level(&self) -> Option<pi_ai::ModelThinkingLevel> {
+        None
+    }
+
+    /// Set the thinking level for the active session without changing the
+    /// global default.
+    fn set_thinking_level(
+        &self,
+        _level: pi_ai::ModelThinkingLevel,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async {
+            Err("thinking level selection is unavailable".to_owned())
+        })
+    }
 
     /// Reload extensions / resources / keybindings.
     fn reload(&self) -> BoxFuture<'_, Result<Vec<String>, String>>;
@@ -497,6 +538,11 @@ pub trait SessionHost: Send + Sync + 'static {
     /// and disable the guard on contention). Callers canonicalize the result
     /// when building the session selector.
     fn current_session_file(&self) -> BoxFuture<'_, Option<String>> {
+        Box::pin(async { None })
+    }
+    /// Build the existing CLI-style resume command when this session is
+    /// persisted and its session file still exists.
+    fn resume_command(&self) -> BoxFuture<'_, Option<String>> {
         Box::pin(async { None })
     }
 
@@ -635,6 +681,12 @@ pub trait SessionHost: Send + Sync + 'static {
         persist: bool,
     ) -> BoxFuture<'_, Result<(), String>>;
 
+    /// Persist the current thinking level as the default.
+    fn persist_thinking_level(
+        &self,
+        level: pi_ai::ModelThinkingLevel,
+    ) -> BoxFuture<'_, Result<(), String>>;
+
     /// Refresh model catalogs and availability. When `options.providers` is
     /// `Some`, only those providers are recomposed and re-probed.
     fn refresh_models(
@@ -695,6 +747,8 @@ pub enum InteractiveExit {
     Suspend,
     /// Temporarily restore the terminal and run the configured external editor.
     ExternalEditor,
+    /// The outer terminal owner must switch between regular and fullscreen mode.
+    ScreenModeChange,
 }
 
 /// Options for constructing an [`InteractiveRuntime`].
@@ -716,14 +770,23 @@ pub struct InteractiveRuntimeOptions {
     pub quiet: bool,
     /// Show hardware cursor (debug / accessibility).
     pub hardware_cursor: bool,
-    /// Override spinner indicator frames for reduced-motion (TUI-T11).
+    /// Override spinner indicator frames for reduced-motion (TUI-T1).
     /// `None` uses the default 10-frame braille animation; `Some` with a
     /// single frame renders a static indicator. No env/setting gate —
     /// callers supply this programmatically per TUI-G1 decision (option b).
     pub indicator_frames: Option<Vec<String>>,
+    /// Requested product screen mode. Pipes and machine-readable modes never
+    /// construct these options.
+    pub screen_mode: ScreenMode,
+    /// Output policy when fullscreen exits.
+    pub fullscreen_exit_output: FullscreenExitOutput,
+    /// Scrollbar policy for the fullscreen viewport.
+    pub fullscreen_scrollbar: FullscreenScrollbar,
+    /// Whether selecting fullscreen text copies it to the host clipboard.
+    pub fullscreen_copy_on_select: bool,
+    /// Initial pending UI events to reinject after startup.
     pending_ui_events: Vec<UiEvent>,
 }
-
 /// Outcome of dispatching one [`ViewAction`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionOutcome {
@@ -746,6 +809,20 @@ fn parse_slash_command(text: &str) -> Option<(&str, &str)> {
     match rest.split_once(char::is_whitespace) {
         Some((name, args)) => Some((name, args.trim_start())),
         None => Some((rest, "")),
+    }
+}
+/// Parse a thinking-level wire value, accepting the case-insensitive command
+/// spelling used by `/thinking`.
+fn parse_thinking_level(value: &str) -> Option<pi_ai::ModelThinkingLevel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(pi_ai::ModelThinkingLevel::Off),
+        "minimal" => Some(pi_ai::ModelThinkingLevel::Minimal),
+        "low" => Some(pi_ai::ModelThinkingLevel::Low),
+        "medium" => Some(pi_ai::ModelThinkingLevel::Medium),
+        "high" => Some(pi_ai::ModelThinkingLevel::High),
+        "xhigh" => Some(pi_ai::ModelThinkingLevel::Xhigh),
+        "max" => Some(pi_ai::ModelThinkingLevel::Max),
+        _ => None,
     }
 }
 
@@ -819,11 +896,14 @@ impl Default for InteractiveRuntimeOptions {
             quiet: false,
             hardware_cursor: false,
             indicator_frames: None,
+            screen_mode: ScreenMode::Regular,
+            fullscreen_exit_output: FullscreenExitOutput::Transcript,
+            fullscreen_scrollbar: FullscreenScrollbar::Auto,
+            fullscreen_copy_on_select: true,
             pending_ui_events: Vec::new(),
         }
     }
 }
-
 impl InteractiveRuntimeOptions {
     /// Build production startup options from environment capabilities.
     ///
@@ -918,6 +998,19 @@ impl InteractiveRoot {
                     component: tail,
                 },
             );
+        }
+        // A working indicator is embedded in the live editor border; keeping
+        // the same loader in the regular status band would duplicate it.
+        if view.streaming
+            && view.working_visible
+            && view
+                .status
+                .as_ref()
+                .is_some_and(|status| status.kind == StatusKind::Working)
+        {
+            composed
+                .sections
+                .retain(|section| section.label != "status");
         }
         let mut sections = composed.sections;
         let editor_idx = sections
@@ -1233,6 +1326,247 @@ impl Component for InteractiveRoot {
     }
 }
 
+/// Fullscreen product composition. The viewport owns only retained transcript
+/// rows; the runtime-owned editor, selector, status, and overlays stay live
+/// components in the bottom dock.
+struct FullscreenRoot {
+    viewport: FullscreenViewport,
+    dock: Vec<Box<dyn Component>>,
+    editor: Editor,
+    selector: Option<Box<dyn Component>>,
+    overlay: Option<Box<dyn Component>>,
+    overlay_spec: Option<pi_tui::layout::OverlaySpec>,
+    dialog_title: Option<Box<dyn Component>>,
+    search: Option<TranscriptSearch>,
+    focus: FocusArea,
+    transcript_area: Rect,
+    dock_areas: Vec<Rect>,
+    render_error: Option<pi_tui::component::RowSourceError>,
+    pending_evictions: Vec<pi_tui::image::ImageCacheEviction>,
+}
+
+impl FullscreenRoot {
+    fn prepare(&mut self, area: Rect) -> Result<(), pi_tui::component::RowSourceError> {
+        let width = area.width;
+        let mut heights = [0_u16; 6];
+        for (height, component) in heights[..3].iter_mut().zip(self.dock.iter_mut()) {
+            *height = component.measure(width);
+        }
+        heights[3] = if let Some(selector) = self.selector.as_mut() {
+            selector.measure(width)
+        } else {
+            self.editor.measure(InteractiveRoot::editor_width(width))
+        };
+        if let Some(title) = self.dialog_title.as_mut() {
+            heights[3] = heights[3].saturating_add(title.measure(width));
+        }
+        for (height, component) in heights[4..].iter_mut().zip(self.dock.iter_mut().skip(3)) {
+            *height = component.measure(width);
+        }
+
+        let dock_height = heights
+            .iter()
+            .copied()
+            .fold(0_u16, u16::saturating_add)
+            .min(area.height);
+        let transcript_height = area.height.saturating_sub(dock_height);
+        self.transcript_area = Rect::new(area.x, area.y, width, transcript_height);
+        self.dock_areas.clear();
+        self.dock_areas.resize(heights.len(), Rect::default());
+        let mut y = area.bottom();
+        for index in (0..heights.len()).rev() {
+            let height = heights[index].min(y.saturating_sub(area.y));
+            y = y.saturating_sub(height);
+            self.dock_areas[index] = Rect::new(area.x, y, width, height);
+        }
+
+        self.viewport.prepare(self.transcript_area)?;
+        if let Some(search) = self.search.as_mut() {
+            search.set_result(
+                self.viewport.selected_search_index(),
+                self.viewport.search_matches().len(),
+            );
+        }
+        Ok(())
+    }
+
+    fn take_render_error(&mut self) -> Option<pi_tui::component::RowSourceError> {
+        self.render_error.take()
+    }
+
+    fn render_editor_with_marker(&mut self, area: Rect, buf: &mut Buffer) {
+        if area.width >= 2 && area.height >= 2 {
+            let text = self.editor.get_text();
+            let (glyph, color) = super::view::editor_prompt_marker(&text);
+            let colored = super::theme::current().fg(color, glyph);
+            pi_tui::components::util::paint_line(area.x, area.y.saturating_add(1), 2, buf, &colored);
+            let shifted = Rect::new(
+                area.x.saturating_add(2),
+                area.y,
+                area.width.saturating_sub(2),
+                area.height,
+            );
+            self.editor.render(shifted, buf);
+        } else {
+            self.editor.render(area, buf);
+        }
+    }
+}
+
+impl Component for FullscreenRoot {
+    fn measure(&mut self, width: u16) -> u16 {
+        if width < VIEWPORT_WIDTH_FLOOR {
+            0
+        } else {
+            self.dock_areas
+                .iter()
+                .fold(self.transcript_area.height, |height, area| {
+                    height.saturating_add(area.height)
+                })
+        }
+    }
+
+    fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        for eviction in self.pending_evictions.drain(..) {
+            pi_tui::frame::push_raw_region(pi_tui::frame::RawRegion {
+                area: Rect::new(0, 0, 0, 0),
+                bytes: eviction.deletion,
+                kitty_id: None,
+            });
+        }
+        if area.height == 0 || area.width < VIEWPORT_WIDTH_FLOOR {
+            return;
+        }
+        if let Err(error) = self.viewport.render(self.transcript_area, buf) {
+            self.render_error = Some(error);
+        }
+
+        for (component, rect) in self.dock.iter_mut().zip(self.dock_areas[..3].iter().copied()) {
+            if rect.height > 0 {
+                component.render(rect, buf);
+            }
+        }
+
+        if let Some(rect) = self.dock_areas.get(3).copied()
+            && rect.height > 0
+        {
+            let title_height = self
+                .dialog_title
+                .as_mut()
+                .map_or(0, |title| title.measure(rect.width).min(rect.height));
+            if title_height > 0
+                && let Some(title) = self.dialog_title.as_mut()
+            {
+                title.render(Rect::new(rect.x, rect.y, rect.width, title_height), buf);
+            }
+            let body = Rect::new(
+                rect.x,
+                rect.y.saturating_add(title_height),
+                rect.width,
+                rect.height.saturating_sub(title_height),
+            );
+            if body.height > 0 {
+                if self.focus == FocusArea::Selector {
+                    if let Some(selector) = self.selector.as_mut() {
+                        selector.render(body, buf);
+                    }
+                } else {
+                    self.render_editor_with_marker(body, buf);
+                }
+            }
+        }
+
+        for (component, rect) in self
+            .dock
+            .iter_mut()
+            .skip(3)
+            .zip(self.dock_areas[4..].iter().copied())
+        {
+            if rect.height > 0 {
+                component.render(rect, buf);
+            }
+        }
+
+        if let Some(overlay) = self.overlay.as_mut() {
+            let measured = overlay.measure(area.width);
+            let rect = overlay_rect(self.overlay_spec.as_ref(), measured, area);
+            if rect.height > 0 {
+                overlay.render(rect, buf);
+            }
+        }
+        if let Some(search) = self.search.as_mut() {
+            let rect = transcript_search_rect(self.transcript_area);
+            if rect.height > 0 {
+                search.render_into(rect, buf);
+            }
+        }
+    }
+
+    fn handle_event(&mut self, event: &UiEvent) -> EventResult {
+        match self.focus {
+            FocusArea::Editor => self.editor.handle_event(event),
+            FocusArea::Selector => self
+                .selector
+                .as_mut()
+                .map_or(EventResult::Ignored, |selector| selector.handle_event(event)),
+            FocusArea::Overlay => self
+                .overlay
+                .as_mut()
+                .map_or(EventResult::Ignored, |overlay| overlay.handle_event(event)),
+            FocusArea::Widget => EventResult::Ignored,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        for component in &mut self.dock {
+            component.invalidate();
+        }
+        self.editor.invalidate();
+        if let Some(selector) = self.selector.as_mut() {
+            selector.invalidate();
+        }
+        if let Some(title) = self.dialog_title.as_mut() {
+            title.invalidate();
+        }
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.invalidate();
+        }
+        if let Some(search) = self.search.as_mut() {
+            search.invalidate();
+        }
+    }
+}
+
+/// A frame that only retires cached Kitty images before a fullscreen mode
+/// transition. Keeping the viewport out of this frame is intentional: a
+/// normal viewport render would immediately prepare visible images again.
+struct FullscreenEvictionRoot {
+    height: u16,
+    evictions: Vec<pi_tui::image::ImageCacheEviction>,
+}
+
+impl Component for FullscreenEvictionRoot {
+    fn measure(&mut self, _width: u16) -> u16 {
+        self.height
+    }
+    fn render(&mut self, area: Rect, _buf: &mut Buffer) {
+        pi_tui::frame::claim_opaque_span(area);
+        for eviction in self.evictions.drain(..) {
+            pi_tui::frame::push_raw_region(pi_tui::frame::RawRegion {
+                area: Rect::new(0, 0, 0, 0),
+                bytes: eviction.deletion,
+                kitty_id: None,
+            });
+        }
+    }
+
+    fn handle_event(&mut self, _event: &UiEvent) -> EventResult {
+        EventResult::Ignored
+    }
+
+    fn invalidate(&mut self) {}
+}
+
 // ---------------------------------------------------------------------------
 // InteractiveRuntime
 // ---------------------------------------------------------------------------
@@ -1350,6 +1684,7 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     pending_reanchor: Option<ReanchorCause>,
     pending_settle: Option<Vec<SettledBlock>>,
     shutdown: Arc<Notify>,
+    lifecycle_cancel: CancellationToken,
     exited: bool,
     exit_kind: InteractiveExit,
     last_error: Option<String>,
@@ -1384,7 +1719,21 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     chat_prefix_len: usize,
     chat_tail_cache: Option<Box<dyn Component>>,
     chat_dirty: bool,
-    /// Live selector component (replaces the editor while focused).
+    fullscreen_viewport: FullscreenViewport,
+    fullscreen_message_ids: Vec<Option<DocumentBlockId>>,
+    fullscreen_chrome_ids: [Option<DocumentBlockId>; 3],
+    fullscreen_empty_id: Option<DocumentBlockId>,
+    fullscreen_empty_present: bool,
+    fullscreen_document_dirty: bool,
+    fullscreen_search: Option<TranscriptSearch>,
+    fullscreen_dock: Vec<Box<dyn Component>>,
+    fullscreen_exit_output: FullscreenExitOutput,
+    fullscreen_scrollbar: FullscreenScrollbar,
+    fullscreen_copy_on_select: bool,
+    fullscreen_transcript_area: Rect,
+    screen_mode: ScreenMode,
+    requested_screen_mode: Option<ScreenMode>,
+    pending_fullscreen_evictions: Vec<pi_tui::image::ImageCacheEviction>,
     active_selector: Option<Box<dyn Component>>,
     /// Kind of the active selector for confirm/cancel routing.
     active_selector_kind: Option<super::state::SelectorKind>,
@@ -1398,6 +1747,14 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     /// Pending selector cancels.
     cancel_rx: mpsc::UnboundedReceiver<()>,
     cancel_tx: mpsc::UnboundedSender<()>,
+    /// Pending save-as-default values from the model selector's save chord
+    /// (`app.models.save`, value is `provider/model`).
+    model_save_rx: mpsc::UnboundedReceiver<String>,
+    model_save_tx: mpsc::UnboundedSender<String>,
+    /// Pending save-as-default values from the thinking selector's save chord
+    /// (`app.thinking.save`, value is the thinking-level wire string).
+    thinking_save_rx: mpsc::UnboundedReceiver<String>,
+    thinking_save_tx: mpsc::UnboundedSender<String>,
     /// Active tree-selector filter mode (toggled by `app.tree.filter.*`).
     tree_filter: super::selectors::TreeFilterMode,
     /// Pending session-delete confirmations (paths to remove).
@@ -1907,6 +2264,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let (settings_change_tx, settings_change_rx) =
             mpsc::unbounded_channel::<(String, String)>();
         let (theme_preview_tx, theme_preview_rx) = mpsc::unbounded_channel::<String>();
+        let (model_save_tx, model_save_rx) = mpsc::unbounded_channel::<String>();
+        let (thinking_save_tx, thinking_save_rx) = mpsc::unbounded_channel::<String>();
         let (extension_select_tx, extension_select_rx) = mpsc::unbounded_channel::<String>();
         let (extension_action_tx, extension_action_rx) = mpsc::unbounded_channel();
         let (session_rebind_tx, session_rebind_rx) = mpsc::unbounded_channel();
@@ -1914,6 +2273,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
         let editor = build_initial_editor(options, submit_tx.clone());
         let agent_dir = crate::core::config::get_agent_dir();
+        let fullscreen_viewport = FullscreenViewport::new(
+            FullscreenOptions {
+                scrollbar: options.fullscreen_scrollbar.to_scrollbar_mode(),
+                copy_on_select: options.fullscreen_copy_on_select,
+                ..FullscreenOptions::default()
+            },
+            options.theme.fullscreen_style(),
+        );
+        let fullscreen_chrome_ids = std::array::from_fn(|_| DocumentBlockId::new().ok());
+        let fullscreen_empty_id = DocumentBlockId::new().ok();
         // Process-global table for TUI components + mapper snapshot for app.* ids.
         let keybindings = crate::core::keybindings::install_app_keybindings(&agent_dir);
 
@@ -1944,6 +2313,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             spinner_kind: None,
             pending_settle: None,
             shutdown: Arc::new(Notify::new()),
+            lifecycle_cancel: CancellationToken::new(),
             exited: false,
             exit_kind: InteractiveExit::Clean,
             last_error: None,
@@ -1972,14 +2342,33 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             chat_prefix_len: usize::MAX,
             chat_tail_cache: None,
             chat_dirty: true,
+            fullscreen_viewport,
+            fullscreen_message_ids: Vec::new(),
+            fullscreen_chrome_ids,
+            fullscreen_empty_id,
+            fullscreen_empty_present: false,
+            fullscreen_document_dirty: true,
+            fullscreen_dock: Vec::new(),
+            fullscreen_search: None,
+            fullscreen_transcript_area: Rect::default(),
+            fullscreen_exit_output: options.fullscreen_exit_output,
+            fullscreen_scrollbar: options.fullscreen_scrollbar,
+            fullscreen_copy_on_select: options.fullscreen_copy_on_select,
+            screen_mode: options.screen_mode,
             active_selector: None,
             active_selector_kind: None,
             submit_rx,
             submit_tx,
+            requested_screen_mode: None,
+            pending_fullscreen_evictions: Vec::new(),
             select_rx,
             select_tx,
             cancel_rx,
             cancel_tx,
+            model_save_rx,
+            model_save_tx,
+            thinking_save_rx,
+            thinking_save_tx,
             tree_filter: super::selectors::TreeFilterMode::default(),
             session_delete_rx,
             session_delete_tx,
@@ -2030,6 +2419,39 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         view.indicator_frames.clone_from(&options.indicator_frames);
         view.resize(options.size.0, options.size.1);
         view
+    }
+    /// Take a requested product screen-mode transition, if one was queued by
+    /// a persisted settings change.
+    pub fn take_requested_screen_mode(&mut self) -> Option<ScreenMode> {
+        self.requested_screen_mode.take()
+    }
+
+    /// Apply the writer geometry after the outer terminal session has switched
+    /// the live guard/input to the requested mode.
+    ///
+    /// # Errors
+    ///
+    /// Propagates writer geometry failures.
+    pub fn apply_screen_mode(&mut self, mode: ScreenMode, size: (u16, u16)) -> io::Result<()> {
+        self.tui.set_screen_mode(mode)?;
+        self.tui.note_resize(size.0, size.1);
+        self.screen_mode = mode;
+        self.view.resize(size.0, size.1);
+        self.fullscreen_viewport.clear_interaction();
+        self.fullscreen_viewport.close_search();
+        self.fullscreen_search = None;
+        if self.view.overlay.as_ref().is_some_and(|overlay| {
+            overlay.kind == OverlayKind::TranscriptSearch
+        }) {
+            self.view.overlay = None;
+            if self.view.focus == FocusArea::Overlay {
+                self.view.focus = FocusArea::Editor;
+            }
+        }
+        self.fullscreen_document_dirty = true;
+        self.pending_reanchor = Some(ReanchorCause::Resize);
+        self.ensure_editor_on_submit();
+        Ok(())
     }
     // ----- Public accessors (driver seam) -----
 
@@ -2108,6 +2530,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     /// Signal the runtime to exit at the next loop turn (signal handler hook).
     pub fn request_shutdown(&self) {
+        self.lifecycle_cancel.cancel();
         self.shutdown_flag
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.shutdown.notify_one();
@@ -2225,7 +2648,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
             let coalesce_wait = self.coalesce_wait(Instant::now());
             let (spinner_active, spinner_deadline) = self.arm_spinner_deadline();
-
+            let viewport_deadline_active =
+                self.screen_mode == ScreenMode::Fullscreen && self.fullscreen_viewport.next_deadline().is_some();
             tokio::select! {
                 biased;
 
@@ -2281,10 +2705,15 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                         self.extension_requests = None;
                     }
                 }
-                () = wait_extension_deadline(
+                () = wait_runtime_deadline(
                     self.pending_extension_dialog.as_ref().and_then(|dialog| dialog.deadline),
                 ), if self.pending_extension_dialog.as_ref().and_then(|dialog| dialog.deadline).is_some() => {
                     self.cancel_extension_dialog(DialogEnd::TimedOut).await;
+                }
+                () = wait_runtime_deadline(self.fullscreen_viewport.next_deadline()), if viewport_deadline_active => {
+                    if self.fullscreen_viewport.tick(Instant::now()).needs_render() {
+                        self.arm_coalescer();
+                    }
                 }
                 changed = self.partial.changed(), if !self.session_events_closed_for_rebind => {
                     if changed.is_ok() {
@@ -2481,7 +2910,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         // not leave a pending task holding a stale session after exit.
         self.abort_provider_refresh();
 
-        // Final paint so the last view-state mutation is visible.
+        // Final paint so the last view-state mutation is visible. The outer
+        // terminal-session teardown retires fullscreen image data after this
+        // paint and before changing modes.
         if matches!(
             self.exit_kind,
             InteractiveExit::Clean | InteractiveExit::SessionEnded
@@ -2494,6 +2925,184 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     // -----------------------------------------------------------------------
     // Event handlers
     // -----------------------------------------------------------------------
+
+    async fn handle_fullscreen_effect(&mut self, effect: FullscreenEffect) -> io::Result<()> {
+        match effect {
+            FullscreenEffect::CopySelection(text) => {
+                let cancel = self.lifecycle_cancel.clone();
+                match crate::core::platform::clipboard::copy_to_clipboard_with(
+                    &text,
+                    crate::core::platform::clipboard::ClipboardPlatform::host(),
+                    &crate::core::platform::clipboard::HostEnv,
+                    &cancel,
+                )
+                .await
+                {
+                    Ok(crate::core::platform::clipboard::ClipboardCopyResult::Command) => {
+                        self.fullscreen_viewport.flash(
+                            "Copied selection".to_owned(),
+                            Instant::now(),
+                            Duration::from_millis(1200),
+                        );
+                    }
+                    Ok(crate::core::platform::clipboard::ClipboardCopyResult::Osc52(sequence)) => {
+                        let write_result = self
+                            .tui
+                            .outer_mut()
+                            .write_all(sequence.as_bytes())
+                            .and_then(|()| self.tui.outer_mut().flush());
+                        if let Err(error) = write_result {
+                            return Err(io::Error::other(format!(
+                                "clipboard write failed: {error}"
+                            )));
+                        }
+                        self.fullscreen_viewport.flash(
+                            "Copied selection".to_owned(),
+                            Instant::now(),
+                            Duration::from_millis(1200),
+                        );
+                    }
+                    Err(error) => self.last_error = Some(error.to_string()),
+                }
+            }
+            FullscreenEffect::OpenLink(url) => {
+                crate::core::platform::open_browser::open_browser(&url);
+                self.fullscreen_viewport.flash(
+                    "Opening link".to_owned(),
+                    Instant::now(),
+                    Duration::from_millis(1200),
+                );
+            }
+            FullscreenEffect::PasteClipboard => {
+                let cancel = self.lifecycle_cancel.clone();
+                match crate::core::platform::clipboard::read_clipboard_text(&cancel).await {
+                    crate::core::platform::clipboard::ClipboardReadResult::Value(text) => {
+                        let _ = self.paste_text(&text);
+                    }
+                    crate::core::platform::clipboard::ClipboardReadResult::Empty
+                    | crate::core::platform::clipboard::ClipboardReadResult::Unavailable => {
+                        self.last_error = Some("Clipboard has no text".to_owned());
+                    }
+                    crate::core::platform::clipboard::ClipboardReadResult::Failed(error) => {
+                        self.last_error = Some(error.to_string());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn fullscreen_search_mouse(
+        &mut self,
+        mouse: &crossterm::event::MouseEvent,
+    ) -> bool {
+        let Some(search) = self.fullscreen_search.as_mut() else {
+            return false;
+        };
+        let rect = transcript_search_rect(self.fullscreen_transcript_area);
+        let inside = mouse.column >= rect.x
+            && mouse.column.saturating_sub(rect.x) < rect.width
+            && mouse.row >= rect.y
+            && mouse.row.saturating_sub(rect.y) < rect.height;
+        if !inside {
+            return false;
+        }
+        let row = mouse.row.saturating_sub(rect.y);
+        let column = mouse.column.saturating_sub(rect.x);
+        if matches!(
+            mouse.kind,
+            crossterm::event::MouseEventKind::Down(_)
+                | crossterm::event::MouseEventKind::Up(_)
+        ) && let Some(direction) = search.navigation_direction_at(row, column)
+        {
+            let _ = search.set_hovered_navigation_direction(Some(direction));
+            if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_)) {
+                let _ = self.fullscreen_viewport.navigate_search(direction);
+            }
+            return true;
+        }
+        if mouse.kind == crossterm::event::MouseEventKind::Moved {
+            let direction = search.navigation_direction_at(row, column);
+            let _ = search.set_hovered_navigation_direction(direction);
+        }
+        true
+    }
+
+    async fn handle_fullscreen_event(&mut self, event: &UiEvent) -> io::Result<bool> {
+        if self.screen_mode != ScreenMode::Fullscreen {
+            return Ok(false);
+        }
+        if self.pending_extension_dialog.is_some()
+            || self.active_selector.is_some()
+            || self.view.overlay.as_ref().is_some_and(|overlay| {
+                overlay.kind != OverlayKind::TranscriptSearch
+            })
+        {
+            return Ok(false);
+        }
+        if let UiEvent::Mouse(mouse) = event
+            && self.fullscreen_search_mouse(mouse)
+        {
+            self.paint_frame()?;
+            return Ok(true);
+        }
+
+        let was_search_open = self.fullscreen_viewport.search_open();
+        let result = self
+            .fullscreen_viewport
+            .handle_event(event, self.mapper.keybindings(), Instant::now());
+        let has_effect = result.effect.is_some();
+        if let Some(effect) = result.effect {
+            self.handle_fullscreen_effect(effect).await?;
+        }
+
+        let search_open = self.fullscreen_viewport.search_open();
+        if search_open && self.fullscreen_search.is_none() {
+            let mut search = TranscriptSearch::new();
+            search.set_focused(true);
+            search.set_navigation_hints(
+                self.mapper
+                    .keybindings()
+                    .key_text("tui.altScreen.searchPrevious"),
+                self.mapper
+                    .keybindings()
+                    .key_text("tui.altScreen.searchNext"),
+            );
+            self.fullscreen_search = Some(search);
+            self.view.overlay = Some(Overlay {
+                kind: OverlayKind::TranscriptSearch,
+                lines: Vec::new(),
+                height: 3,
+            });
+            self.view.focus = FocusArea::Overlay;
+        } else if !search_open && self.fullscreen_search.is_some() {
+            self.fullscreen_search = None;
+            if self.view.overlay.as_ref().is_some_and(|overlay| {
+                overlay.kind == OverlayKind::TranscriptSearch
+            }) {
+                self.view.overlay = None;
+                self.view.focus = FocusArea::Editor;
+            }
+        }
+
+        let mut handled = result.event_result.is_handled();
+        let mut needs_render = result.event_result.needs_render() || has_effect;
+        if search_open && was_search_open {
+            if let Some(search) = self.fullscreen_search.as_mut() {
+                let before = search.query().to_owned();
+                let search_result = search.handle_event(event);
+                if search.query() != before {
+                    self.fullscreen_viewport.set_search_query(search.query());
+                }
+                handled = true;
+                needs_render |= search_result.needs_render() || search.query() != before;
+            }
+        }
+        if needs_render {
+            self.paint_frame()?;
+        }
+        Ok(handled)
+    }
 
     #[expect(
         clippy::too_many_lines,
@@ -2516,6 +3125,17 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             return Ok(());
         }
         if self.route_extension_input(&event) {
+            return Ok(());
+        }
+        // Extension routing declined the event. Default consumers (root,
+        // editor, selector) never act on Release; terminal interception and
+        // extension routes above already had their chance to observe it.
+        if let UiEvent::Key(key) = &event
+            && !should_dispatch_key_event(key, false)
+        {
+            return Ok(());
+        }
+        if self.handle_fullscreen_event(&event).await? {
             return Ok(());
         }
         // Swap the editor (and active selector) into a throwaway-built
@@ -2549,6 +3169,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
         while let Ok((selector, value)) = self.select_rx.try_recv() {
             actions.push(ViewAction::SelectConfirmed { selector, value });
+        }
+        let mut model_saved = false;
+        while let Ok(value) = self.model_save_rx.try_recv() {
+            self.save_model_default(&value).await;
+            model_saved = true;
+        }
+        let mut thinking_saved = false;
+        while let Ok(value) = self.thinking_save_rx.try_recv() {
+            self.save_thinking_default(&value).await;
+            thinking_saved = true;
         }
         while let Ok(value) = self.extension_select_rx.try_recv() {
             self.finish_extension_selection(value).await;
@@ -2674,7 +3304,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let mut needs_immediate_repaint = editor_result.needs_render()
             || settings_mutated
             || session_mutated
-            || tree_filter_handled;
+            || tree_filter_handled
+            || model_saved
+            || thinking_saved;
 
         for action in actions {
             let outcome = self.dispatch_action(action).await;
@@ -2695,6 +3327,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             }
         }
 
+        if self
+            .requested_screen_mode
+            .is_some_and(|mode| mode != self.screen_mode)
+        {
+            needs_immediate_repaint = true;
+            self.exited = true;
+            self.exit_kind = InteractiveExit::ScreenModeChange;
+        }
         if needs_immediate_repaint {
             // Input-driven paints BYPASS the coalescer (per master plan D9).
             self.paint_frame()?;
@@ -2716,6 +3356,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.chat_prefix_len = usize::MAX;
             self.chat_dirty = true;
         }
+        self.fullscreen_document_dirty = true;
         self.arm_coalescer();
     }
 
@@ -2745,6 +3386,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.display.hide_thinking,
             );
             self.chat_dirty = true;
+            self.fullscreen_document_dirty = true;
             self.arm_coalescer();
         } else {
             // Stream ended; the next MessageEnd event will finalize the tail.
@@ -2781,6 +3423,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.display.hide_thinking,
         );
         self.chat_dirty = true;
+        self.fullscreen_document_dirty = true;
         ActionOutcome::Repaint
     }
     #[allow(clippy::too_many_lines)]
@@ -2968,6 +3611,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     self.push_notice("reload", message);
                 }
             }
+
             Err(error) => self.last_error = Some(error),
         }
         self.rebind_extension_channels().await;
@@ -2979,6 +3623,60 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.push_theme_to_host().await;
         let keybindings = crate::core::keybindings::reload_app_keybindings(&self.debug_dump_dir);
         self.mapper.set_keybindings(keybindings);
+        ActionOutcome::Repaint
+    }
+    /// `/thinking [level]`: open the thinking selector without an argument,
+    /// or apply one available level to the active session without changing the
+    /// global default.
+    async fn handle_thinking_command(&mut self, args: &str) -> ActionOutcome {
+        let available = self.session.available_thinking_levels();
+        let argument = args.trim();
+        if argument.is_empty() {
+            return self
+                .open_selector(super::state::SelectorKind::Thinking)
+                .await;
+        }
+
+        let normalized = argument.to_ascii_lowercase();
+        let level = available
+            .iter()
+            .copied()
+            .find(|candidate| {
+                crate::core::agent_session::model::level_str(*candidate) == normalized.as_str()
+            });
+        let Some(level) = level else {
+            let available = available
+                .iter()
+                .map(|level| crate::core::agent_session::model::level_str(*level))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let error = format!(
+                "Unknown thinking level \"{argument}\". Available levels: {available}."
+            );
+            self.last_error = Some(error.clone());
+            self.push_notice("thinking", error);
+            return ActionOutcome::Repaint;
+        };
+
+        match self.session.set_thinking_level(level).await {
+            Ok(()) => {
+                self.refresh_footer().await;
+                self.push_notice(
+                    "thinking",
+                    format!(
+                        "Thinking level: {}",
+                        crate::core::agent_session::model::level_str(level)
+                    ),
+                );
+            }
+            Err(error) => {
+                self.last_error = Some(error.clone());
+                self.push_notice(
+                    "thinking",
+                    format!("Failed to set thinking level {argument}: {error}"),
+                );
+            }
+        }
         ActionOutcome::Repaint
     }
 
@@ -2994,6 +3692,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             "theme" => self.open_selector(SelectorKind::Theme).await,
             "settings" => self.open_selector(SelectorKind::Settings).await,
             "model" => self.open_selector(SelectorKind::Model).await,
+            "thinking" => self.handle_thinking_command(args).await,
             "scoped-models" => self.open_selector(SelectorKind::ScopedModels).await,
             "export" => self.handle_export_command(args).await,
             "import" => self.handle_import_command(args),
@@ -3074,6 +3773,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             }
         }
         self.chat_dirty = true;
+        self.fullscreen_document_dirty = true;
     }
 
     /// `/logout`: list stored credentials and open the removal selector, or
@@ -3399,6 +4099,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 session.refresh_models(crate::core::model_runtime::ModelsRefreshOptions {
                     allow_network: None,
                     providers: Some(vec![refresh_provider_id]),
+                    signal: None,
                 }),
             )
             .await
@@ -3760,7 +4461,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.confirm_saved_placeholder = Some(self.view.editor.placeholder.clone());
         }
         prompt.clone_into(&mut self.view.editor.placeholder);
-        self.active_selector = Some(self.build_select_list(kind, items));
+        self.active_selector = Some(self.build_select_list(kind, items, None));
         self.active_selector_kind = Some(kind);
         self.view.focus = FocusArea::Selector;
         self.view.overlay = None;
@@ -3866,6 +4567,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 text,
             }));
         self.chat_dirty = true;
+        self.fullscreen_document_dirty = true;
     }
 
     async fn submit_slash_command(&mut self, name: String, args: String) -> ActionOutcome {
@@ -3979,31 +4681,83 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     async fn copy_last_assistant(&mut self) -> ActionOutcome {
+        if self.screen_mode == ScreenMode::Fullscreen
+            && let Some(text) = self.fullscreen_viewport.take_selection()
+        {
+            let cancel = self.lifecycle_cancel.clone();
+            match crate::core::platform::clipboard::copy_to_clipboard_with(
+                &text,
+                crate::core::platform::clipboard::ClipboardPlatform::host(),
+                &crate::core::platform::clipboard::HostEnv,
+                &cancel,
+            )
+            .await
+            {
+                Ok(crate::core::platform::clipboard::ClipboardCopyResult::Command) => {
+                    self.fullscreen_viewport.flash(
+                        "Copied selection".to_owned(),
+                        Instant::now(),
+                        Duration::from_millis(1200),
+                    );
+                }
+                Ok(crate::core::platform::clipboard::ClipboardCopyResult::Osc52(sequence)) => {
+                    if let Err(error) = self
+                        .tui
+                        .outer_mut()
+                        .write_all(sequence.as_bytes())
+                        .and_then(|()| self.tui.outer_mut().flush())
+                    {
+                        self.last_error = Some(format!("clipboard write failed: {error}"));
+                    } else {
+                        self.fullscreen_viewport.flash(
+                            "Copied selection".to_owned(),
+                            Instant::now(),
+                            Duration::from_millis(1200),
+                        );
+                    }
+                }
+                Err(error) => self.last_error = Some(error.to_string()),
+            }
+            return ActionOutcome::Repaint;
+        }
+
         match self.session.last_assistant_text().await {
             Ok(Some(text)) if !text.is_empty() => {
-                if crate::core::platform::clipboard::copy_to_clipboard_with(
+                let cancel = self.lifecycle_cancel.clone();
+                match crate::core::platform::clipboard::copy_to_clipboard_with(
                     &text,
                     crate::core::platform::clipboard::ClipboardPlatform::host(),
                     &crate::core::platform::clipboard::HostEnv,
-                    &mut |sequence| {
-                        // OSC 52 must travel through the runtime's sole stdout
-                        // handle: a second `io::stdout()` LineWriter would hold
-                        // sub-kilobyte payloads until the next newline, and the
-                        // flush below is what delivers them.
-                        let _ = self.tui.outer_mut().write_all(sequence.as_bytes());
-                        let _ = self.tui.outer_mut().flush();
-                    },
+                    &cancel,
                 )
-                .is_ok()
+                .await
                 {
-                    self.set_status(SessionStatus {
-                        kind: StatusKind::Working,
-                        frame: 0,
-                        elapsed_secs: 0,
-                        message: "Copied last assistant message".to_owned(),
-                    });
-                } else {
-                    self.last_error = Some("Failed to copy to clipboard".to_owned());
+                    Ok(crate::core::platform::clipboard::ClipboardCopyResult::Command) => {
+                        self.set_status(SessionStatus {
+                            kind: StatusKind::Working,
+                            frame: 0,
+                            elapsed_secs: 0,
+                            message: "Copied last assistant message".to_owned(),
+                        });
+                    }
+                    Ok(crate::core::platform::clipboard::ClipboardCopyResult::Osc52(sequence)) => {
+                        if let Err(error) = self
+                            .tui
+                            .outer_mut()
+                            .write_all(sequence.as_bytes())
+                            .and_then(|()| self.tui.outer_mut().flush())
+                        {
+                            self.last_error = Some(format!("clipboard write failed: {error}"));
+                        } else {
+                            self.set_status(SessionStatus {
+                                kind: StatusKind::Working,
+                                frame: 0,
+                                elapsed_secs: 0,
+                                message: "Copied last assistant message".to_owned(),
+                            });
+                        }
+                    }
+                    Err(error) => self.last_error = Some(error.to_string()),
                 }
             }
             Ok(_) => self.set_status(SessionStatus {
@@ -4292,8 +5046,49 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         value: String,
     ) -> ActionOutcome {
         match selector {
-            super::state::SelectorKind::Model
-            | super::state::SelectorKind::Tree
+            super::state::SelectorKind::Model => {
+                self.close_selector();
+                let outcome = match value.split_once('/') {
+                    Some((provider, model)) => self.session.set_model(provider, model, false).await,
+                    None => Err(format!("Invalid model entry: {value}")),
+                };
+                match outcome {
+                    Ok(()) => {
+                        self.refresh_footer().await;
+                        self.push_notice("model", format!("Selected model {value}"));
+                    }
+                    Err(error) => {
+                        self.last_error = Some(error.clone());
+                        self.push_notice(
+                            "model",
+                            format!("Failed to select model {value}: {error}"),
+                        );
+                    }
+                }
+                ActionOutcome::Repaint
+            }
+            super::state::SelectorKind::Thinking => {
+                self.close_selector();
+                let outcome = match parse_thinking_level(&value) {
+                    Some(level) => self.session.set_thinking_level(level).await,
+                    None => Err(format!("Unknown thinking level: {value}")),
+                };
+                match outcome {
+                    Ok(()) => {
+                        self.refresh_footer().await;
+                        self.push_notice("thinking", format!("Thinking level: {value}"));
+                    }
+                    Err(error) => {
+                        self.last_error = Some(error.clone());
+                        self.push_notice(
+                            "thinking",
+                            format!("Failed to select thinking level {value}: {error}"),
+                        );
+                    }
+                }
+                ActionOutcome::Repaint
+            }
+            super::state::SelectorKind::Tree
             | super::state::SelectorKind::Trust
             | super::state::SelectorKind::Settings
             | super::state::SelectorKind::Config
@@ -4410,6 +5205,63 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
     }
 
+    /// `app.models.save` on the model selector: apply the selected
+    /// `provider/model` row and persist it as the default model (ports
+    /// `selectModel(model, persist: true)`). The selector closes before the
+    /// save attempt (the reference disposes first); failures surface through
+    /// `last_error` plus a transcript notice. Normal confirm is unchanged —
+    /// it closes the selector without touching persistence.
+    async fn save_model_default(&mut self, value: &str) {
+        self.close_selector();
+        let outcome = match value.split_once('/') {
+            Some((provider, model)) => self.session.set_model(provider, model, true).await,
+            None => Err(format!("Invalid model entry: {value}")),
+        };
+        match outcome {
+            Ok(()) => {
+                self.refresh_footer().await;
+                self.push_notice("model", format!("Saved default model {value}"));
+            }
+            Err(error) => {
+                self.last_error = Some(error.clone());
+                self.push_notice(
+                    "model",
+                    format!("Failed to save default model {value}: {error}"),
+                );
+            }
+        }
+    }
+
+    /// `app.thinking.save` on the thinking selector: apply the selected
+    /// level and persist it as the global default. The selector closes before
+    /// the save attempt; failures surface through `last_error` plus a
+    /// transcript notice.
+    async fn save_thinking_default(&mut self, value: &str) {
+        self.close_selector();
+        let Some(level) = parse_thinking_level(value) else {
+            let error = format!("Unknown thinking level: {value}");
+            self.last_error = Some(error.clone());
+            self.push_notice("thinking", error);
+            return;
+        };
+        match self.session.persist_thinking_level(level).await {
+            Ok(()) => {
+                self.refresh_footer().await;
+                self.push_notice(
+                    "thinking",
+                    format!("Default thinking level: {value}"),
+                );
+            }
+            Err(error) => {
+                self.last_error = Some(error.clone());
+                self.push_notice(
+                    "thinking",
+                    format!("Failed to save default thinking level {value}: {error}"),
+                );
+            }
+        }
+    }
+
     fn close_selector(&mut self) {
         // Real selector-close boundary: an auth-kind selector reset its own
         // selection state here, so a cancelled or superseded `/login` cannot
@@ -4519,6 +5371,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     fn handle_resize(&mut self, width: u16, height: u16) -> ActionOutcome {
         self.tui.note_resize(width, height);
         self.view.resize(width, height);
+        self.fullscreen_document_dirty = true;
 
         // Drain queued events. Only Resize events coalesce; everything else
         // is preserved in `pending_ui_reinject` for the next loop iteration
@@ -4598,7 +5451,37 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                             .with_description(entry.description.unwrap_or_default())
                     })
                     .collect();
-                Ok(self.build_select_list(kind, items))
+                Ok(self.build_select_list(kind, items, Some("app.models.save")));
+            }
+            super::state::SelectorKind::Thinking => {
+                let current = self.session.current_thinking_level();
+                let available = self.session.available_thinking_levels();
+                let default_level = self.session.default_thinking_level().or(Some(
+                    crate::core::agent_session_services::DEFAULT_THINKING_LEVEL,
+                ));
+                let select_tx = self.select_tx.clone();
+                let cancel_tx = self.cancel_tx.clone();
+                let save_tx = self.thinking_save_tx.clone();
+                let component = super::selectors::ThinkingSelectorComponent::new(
+                    current,
+                    available,
+                    Box::new(move |level| {
+                        let _ = select_tx.send((
+                            super::state::SelectorKind::Thinking,
+                            crate::core::agent_session::model::level_str(level).to_owned(),
+                        ));
+                    }),
+                    Box::new(move || {
+                        let _ = cancel_tx.send(());
+                    }),
+                    Some(Box::new(move |level| {
+                        let _ = save_tx.send(
+                            crate::core::agent_session::model::level_str(level).to_owned(),
+                        );
+                    })),
+                    default_level,
+                );
+                Ok(Box::new(component))
             }
             super::state::SelectorKind::Session => {
                 let entries = self.session.get_session_entries().await?;
@@ -4686,7 +5569,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                             .with_description(entry.description.unwrap_or_default())
                     })
                     .collect();
-                Ok(self.build_select_list(kind, items))
+                Ok(self.build_select_list(kind, items, None));
             }
             super::state::SelectorKind::Trust => {
                 let rows = self.session.get_trust_entries().await?;
@@ -4743,6 +5626,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         &self,
         kind: super::state::SelectorKind,
         items: Vec<pi_tui::components::SelectItem>,
+        save_binding: Option<&'static str>,
     ) -> Box<dyn Component> {
         let mut list = super::selectors::apply_select_list_copy(
             pi_tui::components::SelectList::new(
@@ -4752,6 +5636,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             ),
             super::selectors::selector_empty_copy(kind),
         );
+        if let Some(binding) = save_binding {
+            // Reference model-selector footer names the configurable save key.
+            list = list.with_hint(super::selectors::selector_save_hint(binding));
+        }
         list.set_selected_index(0);
         let select_tx = self.select_tx.clone();
         list.on_select = Some(Box::new(move |item| {
@@ -4761,7 +5649,18 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         list.on_cancel = Some(Box::new(move || {
             let _ = cancel_tx.send(());
         }));
-        Box::new(list)
+        let Some(save_binding) = save_binding else {
+            return Box::new(list);
+        };
+        // Save chord (ports the reference selector handleInput save branch):
+        // intercept ahead of the list and carry the selected row to the
+        // runtime's persist path.
+        let mut wrapped = super::selectors::SaveableSelectList::new(list, save_binding);
+        let save_tx = self.model_save_tx.clone();
+        wrapped.on_save_as_default = Some(Box::new(move |value| {
+            let _ = save_tx.send(value);
+        }));
+        Box::new(wrapped)
     }
 
     fn build_tree_select_list(
@@ -4776,7 +5675,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 pi_tui::components::SelectItem::new(entry.value, label)
             })
             .collect();
-        self.build_select_list(kind, items)
+        self.build_select_list(kind, items, None)
     }
 
     /// Build the session selector with inline delete confirmation, wiring its
@@ -5032,6 +5931,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 self.handle_extension_ui_control(control).await;
             }
         }
+        self.fullscreen_document_dirty = true;
         self.arm_coalescer();
     }
 
@@ -5124,6 +6024,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 let _ = self.reapply_display_preferences();
             }
         }
+        self.fullscreen_document_dirty = true;
         self.push_ui_state_to_host().await;
     }
 
@@ -5161,7 +6062,6 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
     /// Install `resolved` as the live theme: thread-local current, view theme,
     /// generation bump, and memoized chat-line cache invalidation. No-op when
-    /// the theme is unchanged. The event loop flushes the pending host push.
     fn apply_theme(&mut self, resolved: Arc<ResolvedTheme>) {
         if *resolved == *self.view.theme {
             return;
@@ -5175,6 +6075,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.chat_prefix_len = usize::MAX;
         self.chat_tail_cache = None;
         self.chat_dirty = true;
+        self.fullscreen_document_dirty = true;
         self.arm_coalescer();
     }
 
@@ -5231,6 +6132,24 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// A rejected change refreshes nothing: the input action and any armed
     /// taps survive until persistence succeeds.
     async fn handle_settings_change(&mut self, id: &str, value: &str) {
+        let requested_mode = if id == "tuiMode" {
+            let mode = match value.parse::<ScreenMode>() {
+                Ok(mode) => mode,
+                Err(_) => {
+                    self.last_error = Some(format!("unknown TUI mode: {value}"));
+                    return;
+                }
+            };
+            if self.view.overlay.is_some() {
+                self.last_error = Some(
+                    "cannot change TUI mode while a modal overlay is open".to_owned(),
+                );
+                return;
+            }
+            Some(mode)
+        } else {
+            None
+        };
         if let Err(error) = self.session.apply_settings_change(id, value) {
             self.last_error = Some(error);
             return;
@@ -5242,7 +6161,42 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
         if matches!(id, "theme" | "themeMode") {
             self.apply_theme_from_settings();
+            self.fullscreen_viewport
+                .set_style(self.view.theme.fullscreen_style());
+            self.fullscreen_document_dirty = true;
             self.push_theme_to_host().await;
+        }
+        if let Some(mode) = requested_mode {
+            self.requested_screen_mode = (mode != self.screen_mode).then_some(mode);
+        }
+        match id {
+            "fullscreenExitOutput" => {
+                if let Some(output) = FullscreenExitOutput::parse(value) {
+                    self.fullscreen_exit_output = output;
+                }
+            }
+            "fullscreenScrollbar" => {
+                if let Some(scrollbar) = FullscreenScrollbar::parse(value) {
+                    self.fullscreen_scrollbar = scrollbar;
+                    self.fullscreen_viewport
+                        .set_scrollbar(scrollbar.to_scrollbar_mode());
+                }
+            }
+            "fullscreenCopyOnSelect" => {
+                self.fullscreen_copy_on_select = value == "on";
+                self.fullscreen_viewport
+                    .set_copy_on_select(self.fullscreen_copy_on_select);
+            }
+            _ => {}
+        }
+        if matches!(
+            id,
+            "tuiMode"
+                | "fullscreenExitOutput"
+                | "fullscreenScrollbar"
+                | "fullscreenCopyOnSelect"
+        ) {
+            self.fullscreen_document_dirty = true;
         }
         self.arm_coalescer();
     }
@@ -5698,10 +6652,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             && self.extension_slot_owns_focus(&key, slot)
             && let Some(runner) = self.extension_runner.as_ref()
         {
+            let Some(event_wire) = ui_event_wire(event) else {
+                return false;
+            };
             let request = UiEventRequest {
                 key,
                 generation: slot.generation,
-                event: ui_event_wire(event),
+                event: event_wire,
                 data: encode_terminal_input(event),
             };
             let runner = Arc::clone(runner);
@@ -5759,12 +6716,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         };
         match runner.terminal_input(&data).await {
             Ok(result) if result.consume => None,
-            Ok(result) => result
-                .data
-                .filter(|rewritten| rewritten != &data)
-                .map_or(Some(event), |rewritten| {
+            Ok(result) => {
+                let Some(rewritten) = result.data.filter(|rewritten| rewritten != &data) else {
+                    return Some(event);
+                };
+                if matches!(&event, UiEvent::Mouse(_)) && is_sgr_mouse_sequence(&rewritten) {
+                    decode_sgr_mouse(&rewritten)
+                } else {
                     Some(decode_terminal_input(rewritten))
-                }),
+                }
+            }
             Err(_) => Some(event),
         }
     }
@@ -5811,6 +6772,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.chat_tail_cache = None;
         self.chat_dirty = true;
         self.rebind_extension_channels().await;
+        self.fullscreen_document_dirty = true;
+        self.fullscreen_viewport.clear_interaction();
+        self.fullscreen_viewport.close_search();
+        self.fullscreen_search = None;
     }
 
     /// Re-apply the semantic border painter to the live editor.
@@ -5822,6 +6787,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let snapshot = self.session.footer_snapshot().await;
         project_footer(&mut self.view, &snapshot);
         self.sync_editor_border();
+        self.fullscreen_document_dirty = true;
     }
 
     /// Clear selector focus before process suspension.
@@ -5830,14 +6796,69 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.exited = false;
     }
 
+    /// Mirror the ordinary working loader in the editor's top border.
+    ///
+    /// The editor has no animation clock of its own: the runtime owns the
+    /// spinner frame and refreshes this activity payload immediately before
+    /// each paint. Retry, compaction, branch-summary, and idle notices stay in
+    /// the status dock only, matching the product's embedded-working policy.
+    fn sync_editor_border_activity(&mut self) {
+        let activity = self
+            .view
+            .status
+            .as_ref()
+            .filter(|status| {
+                self.view.streaming
+                    && self.view.working_visible
+                    && status.kind == StatusKind::Working
+            })
+            .map(|status| {
+                let frame = match self.view.indicator_frames.as_deref() {
+                    Some(frames) if !frames.is_empty() => frames
+                        .get(status.frame % frames.len())
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    Some(_) => "",
+                    None => pi_tui::components::DEFAULT_LOADER_FRAMES
+                        .get(status.frame % pi_tui::components::DEFAULT_LOADER_FRAMES.len())
+                        .copied()
+                        .unwrap_or(""),
+                };
+                let border_color = editor_border_color(self.view.editor.border);
+                let glyph = if frame.is_empty() {
+                    String::new()
+                } else {
+                    border_color(frame)
+                };
+                let elapsed = if status.elapsed_secs == 0 {
+                    String::new()
+                } else {
+                    format!(" {}s", status.elapsed_secs)
+                };
+                let message = format!(
+                    "{}{elapsed} · {} to cancel",
+                    status.message,
+                    pi_tui::keybindings::key_text("app.interrupt")
+                );
+                let message = border_color(&message);
+                let label = if glyph.is_empty() {
+                    message
+                } else {
+                    format!("{glyph} {message}")
+                };
+                BorderActivity { label, glyph }
+            });
+        self.editor.set_border_activity(activity);
+    }
+
     fn set_status(&mut self, status: SessionStatus) {
-        // Only assign here. The spinner clock restart on a kind change lives
         // in `reconcile_spinner_clock` — the single reset point every status
         // transition funnels through, including direct `view.status`
         // replacements that bypass this method (reached via
         // `arm_spinner_deadline` in the loop and `tick_status_indicator` for
         // direct callers).
         self.view.status = Some(status);
+        self.fullscreen_document_dirty = true;
     }
 
     /// Advance the status spinner one frame and refresh its elapsed-seconds
@@ -5868,6 +6889,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
         status.frame = self.spinner_frame;
         status.elapsed_secs = elapsed_secs;
+        self.fullscreen_document_dirty = true;
         true
     }
 
@@ -5909,6 +6931,254 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.view.messages = all;
             self.chat_dirty = false;
         }
+    }
+    fn fullscreen_message_component(&self, message: &MessageView) -> Box<dyn Component> {
+        let md_theme = super::theme::markdown_theme();
+        let renderers = super::tool_renderers::builtin_tool_renderers();
+        let components = super::theme::with_theme(self.view.theme.clone(), || {
+            super::theme::with_hyperlinks(self.view.hyperlinks, || {
+                super::view::build_message(message, &renderers, &md_theme, &self.view.theme)
+            })
+        });
+        let mut stack = super::messages::ColumnStack::new();
+        for component in components {
+            stack.push(component);
+        }
+        Box::new(stack)
+    }
+
+    fn take_composed_component(
+        sections: &mut Vec<ComposedSection>,
+        label: &'static str,
+    ) -> Box<dyn Component> {
+        sections
+            .iter()
+            .position(|section| section.label == label)
+            .map(|index| sections.remove(index).component)
+            .unwrap_or_else(|| Box::new(pi_tui::components::Spacer::new(0)))
+    }
+
+    fn refresh_fullscreen_document(&mut self) {
+        if !self.fullscreen_document_dirty {
+            return;
+        }
+        let mut composed = compose(&self.view);
+        let header = Self::take_composed_component(&mut composed.sections, "header");
+        let resources = Self::take_composed_component(&mut composed.sections, "resources");
+        let diagnostics = Self::take_composed_component(&mut composed.sections, "diagnostics");
+        let pending = Self::take_composed_component(&mut composed.sections, "pending");
+        let status = if self.view.streaming
+            && self.view.working_visible
+            && self
+                .view
+                .status
+                .as_ref()
+                .is_some_and(|status| status.kind == StatusKind::Working)
+        {
+            Box::new(pi_tui::components::Spacer::new(0)) as Box<dyn Component>
+        } else {
+            Self::take_composed_component(&mut composed.sections, "status")
+        };
+        let widgets_above =
+            Self::take_composed_component(&mut composed.sections, "widgets-above");
+        let widgets_below =
+            Self::take_composed_component(&mut composed.sections, "widgets-below");
+        let footer = Self::take_composed_component(&mut composed.sections, "footer");
+
+        let empty = self.view.messages.is_empty() && !self.view.streaming;
+        let shape_changed = self.fullscreen_message_ids.len() != self.view.messages.len()
+            || self.fullscreen_empty_present != empty;
+        if shape_changed {
+            self.fullscreen_viewport.document_mut().clear();
+            self.fullscreen_message_ids = (0..self.view.messages.len())
+                .map(|_| DocumentBlockId::new().ok())
+                .collect();
+            self.fullscreen_empty_present = empty;
+        }
+
+        let mut blocks =
+            Vec::with_capacity(3 + self.view.messages.len() + usize::from(empty));
+        for (id, component) in self
+            .fullscreen_chrome_ids
+            .iter()
+            .copied()
+            .zip([header, resources, diagnostics])
+        {
+            if let Some(id) = id {
+                blocks.push(DocumentBlock {
+                    id,
+                    zone: None,
+                    component,
+                });
+            }
+        }
+        for (message, id) in self
+            .view
+            .messages
+            .iter()
+            .zip(self.fullscreen_message_ids.iter().copied())
+        {
+            let Some(id) = id else {
+                continue;
+            };
+            let zone = match message {
+                MessageView::User(_) => Some(pi_tui::alt_screen::PromptZone::Prompt),
+                MessageView::Assistant(assistant)
+                    if assistant
+                        .message
+                        .content
+                        .iter()
+                        .any(|content| match content {
+                            AssistantContent::Text(text) => !text.text.trim().is_empty(),
+                            AssistantContent::Thinking(thinking) => {
+                                !thinking.thinking.trim().is_empty()
+                            }
+                            AssistantContent::ToolCall(_) => false,
+                        }) =>
+                {
+                    Some(pi_tui::alt_screen::PromptZone::AssistantOutput)
+                }
+                MessageView::Assistant(_)
+                | MessageView::Tool(_)
+                | MessageView::Bash(_)
+                | MessageView::Custom(_)
+                | MessageView::Compaction(_)
+                | MessageView::Branch(_)
+                | MessageView::Skill(_) => None,
+            };
+            blocks.push(DocumentBlock {
+                id,
+                zone,
+                component: self.fullscreen_message_component(message),
+            });
+        }
+        if empty
+            && let Some(id) = self.fullscreen_empty_id
+        {
+            let mut empty_stack = super::messages::ColumnStack::new();
+            empty_stack.push(Box::new(pi_tui::components::Text::with_padding(
+                self.view.theme.fg(
+                    super::theme::ThemeColor::Dim,
+                    "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.",
+                ),
+                super::messages::CONTENT_INDENT,
+                0,
+            )));
+            empty_stack.push(Box::new(pi_tui::components::Text::with_padding(
+                self.view.theme.fg(
+                    super::theme::ThemeColor::Dim,
+                    &format!(
+                        "/hotkeys shortcuts · {} expand tools · {} thinking",
+                        pi_tui::keybindings::key_text("app.tools.expand"),
+                        pi_tui::keybindings::key_text("app.thinking.cycle")
+                    ),
+                ),
+                super::messages::CONTENT_INDENT,
+                0,
+            )));
+            blocks.push(DocumentBlock {
+                id,
+                zone: None,
+                component: Box::new(empty_stack),
+            });
+        }
+        let document = self.fullscreen_viewport.document_mut();
+        for block in blocks {
+            document.upsert(block);
+        }
+        self.fullscreen_viewport
+            .set_style(self.view.theme.fullscreen_style());
+        self.fullscreen_viewport
+            .set_scrollbar(self.fullscreen_scrollbar.to_scrollbar_mode());
+        self.fullscreen_viewport
+            .set_copy_on_select(self.fullscreen_copy_on_select);
+        self.fullscreen_document_dirty = false;
+
+        self.fullscreen_dock = vec![
+            pending,
+            status,
+            widgets_above,
+            widgets_below,
+            footer,
+        ];
+    }
+
+    fn build_fullscreen_root(
+        &mut self,
+        editor: Editor,
+        selector: Option<Box<dyn Component>>,
+    ) -> FullscreenRoot {
+        self.refresh_fullscreen_document();
+        let mut composed = compose(&self.view);
+        let overlay = composed.overlay.take();
+        let overlay_spec = composed.overlay_spec.take();
+        let dialog_title = self.pending_extension_dialog.as_ref().map(|dialog| {
+            Box::new(pi_tui::components::Text::with_padding(
+                super::theme::bold(&self.view.theme.fg(
+                    super::theme::ThemeColor::Accent,
+                    &extension_dialog_title(&dialog.request),
+                )),
+                1,
+                0,
+            )) as Box<dyn Component>
+        });
+        FullscreenRoot {
+            viewport: std::mem::replace(
+                &mut self.fullscreen_viewport,
+                FullscreenViewport::default(),
+            ),
+            dock: std::mem::take(&mut self.fullscreen_dock),
+            editor,
+            selector,
+            overlay,
+            overlay_spec,
+            dialog_title,
+            search: self.fullscreen_search.take(),
+            focus: self.view.focus,
+            transcript_area: Rect::default(),
+            dock_areas: Vec::new(),
+            render_error: None,
+            pending_evictions: std::mem::take(&mut self.pending_fullscreen_evictions),
+        }
+    }
+
+    fn recover_fullscreen_root(&mut self, root: FullscreenRoot) {
+        self.fullscreen_viewport = root.viewport;
+        self.fullscreen_search = root.search;
+        self.fullscreen_dock = root.dock;
+        self.editor = root.editor;
+        self.active_selector = root.selector;
+        self.pending_fullscreen_evictions = root.pending_evictions;
+        if let Some(error) = root.render_error {
+            self.last_error = Some(format!("fullscreen document render failed: {error}"));
+        }
+    }
+
+
+    fn paint_fullscreen_frame(&mut self) -> io::Result<()> {
+        let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
+        let saved_selector = self.active_selector.take();
+        let mut root = self.build_fullscreen_root(saved_editor, saved_selector);
+        let size = self.tui.size();
+        let area = Rect::new(0, 0, size.width, size.height);
+        if let Err(error) = root.prepare(area) {
+            self.fullscreen_transcript_area = root.transcript_area;
+            self.recover_fullscreen_root(root);
+            self.last_error = Some(format!("fullscreen document prepare failed: {error}"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
+        }
+        self.fullscreen_transcript_area = root.transcript_area;
+        let txn = self.pending_reanchor.take()
+            .map_or(Txn::Frame, Txn::Reanchor);
+        let result = self.tui.commit(txn, &mut root);
+        let render_error = root.take_render_error();
+        self.recover_fullscreen_root(root);
+        self.ensure_editor_on_submit();
+        if let Some(error) = render_error {
+            self.last_error = Some(format!("fullscreen document render failed: {error}"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
+        }
+        result
     }
 
     fn build_root(
@@ -5959,6 +7229,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     }
 
     fn paint_frame(&mut self) -> io::Result<()> {
+        self.sync_editor_border_activity();
+        if self.screen_mode == ScreenMode::Fullscreen {
+            return self.paint_fullscreen_frame();
+        }
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
         let saved_selector = self.active_selector.take();
         let mut root = self.build_root(saved_editor, saved_selector);
@@ -5971,22 +7245,43 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.ensure_editor_on_submit();
         result
     }
-
     fn commit_settle(&mut self, blocks: Vec<SettledBlock>) -> io::Result<()> {
+        if self.screen_mode == ScreenMode::Fullscreen {
+            let _ = blocks;
+            return self.paint_frame();
+        }
+        self.sync_editor_border_activity();
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
         let saved_selector = self.active_selector.take();
         let mut root = self.build_root(saved_editor, saved_selector);
         let result = self.tui.commit(Txn::Settle(blocks), &mut root);
+
         self.recover_root(root);
         self.ensure_editor_on_submit();
         result
     }
+    fn flush_fullscreen_image_cache(&mut self) -> io::Result<()> {
+        if self.screen_mode != ScreenMode::Fullscreen {
+            return Ok(());
+        }
+        self.pending_fullscreen_evictions
+            .extend(self.fullscreen_viewport.clear_image_cache());
+        let mut root = FullscreenEvictionRoot {
+            height: self.tui.size().height,
+            evictions: std::mem::take(&mut self.pending_fullscreen_evictions),
+        };
+        self.tui.commit(Txn::Frame, &mut root)
+    }
 
     fn commit_reanchor(&mut self) -> io::Result<()> {
+        if self.screen_mode == ScreenMode::Fullscreen {
+            self.pending_reanchor = None;
+            return self.paint_frame();
+        }
+        self.sync_editor_border_activity();
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
         let saved_selector = self.active_selector.take();
         let mut root = self.build_root(saved_editor, saved_selector);
-        // A resize reanchor already repaints full rows, so a queued overlay-open
         // reanchor is subsumed — drop it or the next normal frame does an extra,
         // unrelated full-row reanchor (CodeRabbit review body).
         self.pending_reanchor = None;
@@ -6109,7 +7404,6 @@ fn project_snapshot(
         }),
         SessionActivity::Idle => None,
     };
-
     view.pending.steering = snapshot
         .steering
         .iter()
@@ -6118,8 +7412,7 @@ fn project_snapshot(
             text: t.clone(),
         })
         .collect();
-    view.pending.follow_up = snapshot
-        .follow_up
+    view.pending.follow_up = snapshot.follow_up
         .iter()
         .map(|t| PendingMessage {
             kind: PendingKind::FollowUp,
@@ -6313,6 +7606,7 @@ fn project_assistant_message(
     let pi_ai::Message::Assistant(assistant_message) = boxed.as_ref() else {
         return;
     };
+    let assistant_message = assistant_message.as_ref();
 
     for message in &mut view.messages {
         if let MessageView::Assistant(assistant) = message
@@ -6326,16 +7620,15 @@ fn project_assistant_message(
 
     if finished {
         view.messages
-            .push(MessageView::Assistant(Box::new(AssistantMessageView {
-                message: (**assistant_message).clone(),
+            .push(MessageView::Assistant(AssistantMessageView {
+                message: assistant_message.clone(),
                 hide_thinking: false,
                 hidden_thinking_label: String::new(),
                 streaming: false,
-            })));
+            }));
     } else {
-        view.messages.push(MessageView::streaming_assistant(
-            (**assistant_message).clone(),
-        ));
+        view.messages
+            .push(MessageView::streaming_assistant(assistant_message.clone()));
     }
 }
 
@@ -6694,14 +7987,14 @@ fn message_view_from_agent(message: &pi_agent::AgentMessage) -> Option<MessageVi
                     text: user_message_text(user),
                 }))
             }
-            pi_ai::Message::Assistant(am) => Some(MessageView::Assistant(Box::new(
+            pi_ai::Message::Assistant(am) => Some(MessageView::Assistant(
                 super::messages::AssistantMessageView {
-                    message: (**am).clone(),
+                    message: am.as_ref().clone(),
                     hide_thinking: false,
                     hidden_thinking_label: String::new(),
                     streaming: false,
                 },
-            ))),
+            )),
             pi_ai::Message::ToolResult(_) => None,
         },
         pi_agent::AgentMessage::Custom(custom) => Some(message_view_from_custom(custom)),
@@ -7216,6 +8509,34 @@ impl SessionHost for AgentSessionHost {
         })
     }
 
+    fn set_thinking_level(
+        &self,
+        level: pi_ai::ModelThinkingLevel,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        let session = self.read_session();
+        Box::pin(async move {
+            if session.set_thinking_level(level).await {
+                Ok(())
+            } else {
+                Err("thinking level change was not committed".to_owned())
+            }
+        })
+    }
+
+    fn persist_thinking_level(
+        &self,
+        level: pi_ai::ModelThinkingLevel,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        let session = self.read_session();
+        Box::pin(async move {
+            if session.set_thinking_level_persisted(level).await {
+                Ok(())
+            } else {
+                Err("thinking level change was not committed".to_owned())
+            }
+        })
+    }
+
     fn cycle_model(&self, forward: bool) -> BoxFuture<'_, Result<(), String>> {
         let session = self.read_session();
         Box::pin(async move {
@@ -7312,6 +8633,27 @@ impl SessionHost for AgentSessionHost {
                 };
                 settings.set_theme_mode(mode);
             }
+            "tuiMode" => {
+                let mode = value
+                    .parse::<ScreenMode>()
+                    .map_err(|_| format!("unknown TUI mode: {value}"))?;
+                settings.set_tui_mode(mode);
+            }
+            "fullscreenExitOutput" => {
+                let output = FullscreenExitOutput::parse(value)
+                    .ok_or_else(|| format!("unknown fullscreen exit output: {value}"))?;
+                settings.set_fullscreen_exit_output(output);
+            }
+            "fullscreenScrollbar" => {
+                let scrollbar = FullscreenScrollbar::parse(value)
+                    .ok_or_else(|| format!("unknown fullscreen scrollbar: {value}"))?;
+                settings.set_fullscreen_scrollbar(scrollbar);
+            }
+            "fullscreenCopyOnSelect" => match value {
+                "on" => settings.set_fullscreen_copy_on_select(true),
+                "off" => settings.set_fullscreen_copy_on_select(false),
+                other => return Err(format!("unknown fullscreen copy-on-select value: {other}")),
+            },
             "compaction.enabled" => settings.set_compaction_enabled(value == "on"),
             "retry.enabled" => settings.set_retry_enabled(value == "on"),
             "doubleEscapeAction" => {
@@ -7372,6 +8714,28 @@ impl SessionHost for AgentSessionHost {
             // silently disable the active-session delete guard.
             let guard = manager.lock().await;
             guard.get_session_file().map(str::to_owned)
+        })
+    }
+    fn resume_command(&self) -> BoxFuture<'_, Option<String>> {
+        let session = self.read_session();
+        Box::pin(async move {
+            let manager = session.session_manager();
+            let guard = manager.lock().await;
+            if !guard.is_persisted() {
+                return None;
+            }
+            let session_file = guard.get_session_file()?;
+            if !std::path::Path::new(session_file).is_file() {
+                return None;
+            }
+            let mut command = String::from(crate::core::config::APP_NAME);
+            if !guard.uses_default_session_dir() {
+                command.push_str(" --session-dir ");
+                command.push_str(&quote_resume_arg(guard.get_session_dir()));
+            }
+            command.push_str(" --session ");
+            command.push_str(&quote_resume_arg(guard.get_session_id()));
+            Some(command)
         })
     }
 
@@ -7603,6 +8967,42 @@ impl SessionHost for AgentSessionHost {
                         "dark".to_owned(),
                         "light".to_owned(),
                     ]),
+                },
+                super::state::SettingsRow {
+                    id: "tuiMode".to_owned(),
+                    label: "TUI mode".to_owned(),
+                    description: Some("Regular or fullscreen transcript".to_owned()),
+                    current_value: settings.get_tui_mode().as_str().to_owned(),
+                    values: Some(vec!["regular".to_owned(), "fullscreen".to_owned()]),
+                },
+                super::state::SettingsRow {
+                    id: "fullscreenExitOutput".to_owned(),
+                    label: "Fullscreen exit output".to_owned(),
+                    description: Some("Transcript or resume hint".to_owned()),
+                    current_value: settings.get_fullscreen_exit_output().as_str().to_owned(),
+                    values: Some(vec!["transcript".to_owned(), "resume-hint".to_owned()]),
+                },
+                super::state::SettingsRow {
+                    id: "fullscreenScrollbar".to_owned(),
+                    label: "Fullscreen scrollbar".to_owned(),
+                    description: Some("Auto, always, or hidden".to_owned()),
+                    current_value: settings.get_fullscreen_scrollbar().as_str().to_owned(),
+                    values: Some(vec![
+                        "auto".to_owned(),
+                        "always".to_owned(),
+                        "hidden".to_owned(),
+                    ]),
+                },
+                super::state::SettingsRow {
+                    id: "fullscreenCopyOnSelect".to_owned(),
+                    label: "Copy on select".to_owned(),
+                    description: Some("Copy fullscreen selections to the clipboard".to_owned()),
+                    current_value: if settings.get_fullscreen_copy_on_select() {
+                        "on".to_owned()
+                    } else {
+                        "off".to_owned()
+                    },
+                    values: Some(vec!["on".to_owned(), "off".to_owned()]),
                 },
                 super::state::SettingsRow {
                     id: "compaction.enabled".to_owned(),
@@ -7874,12 +9274,25 @@ impl SessionHost for AgentSessionHost {
         let session = self.read_session();
         session.model()
     }
+    fn current_thinking_level(&self) -> pi_ai::ModelThinkingLevel {
+        self.read_session().thinking_level()
+    }
+
+    fn available_thinking_levels(&self) -> Vec<pi_ai::ModelThinkingLevel> {
+        self.read_session().available_thinking_levels()
+    }
+
+    fn default_thinking_level(&self) -> Option<pi_ai::ModelThinkingLevel> {
+        self.read_session()
+            .lock_settings()
+            .get_default_thinking_level()
+    }
 
     fn set_model(
         &self,
         provider_id: &str,
         model_id: &str,
-        _persist: bool,
+        persist: bool,
     ) -> BoxFuture<'_, Result<(), String>> {
         let session = self.read_session();
         let provider_id = provider_id.to_owned();
@@ -7891,7 +9304,12 @@ impl SessionHost for AgentSessionHost {
             let model = runtime
                 .get_model(&provider_id, &model_id)
                 .ok_or_else(|| format!("Model not found: {provider_id}/{model_id}"))?;
-            session.set_model(model).await.map_err(|e| e.to_string())
+            let result = if persist {
+                session.set_model_persisted(model).await
+            } else {
+                session.set_model(model).await
+            };
+            result.map_err(|e| e.to_string())
         })
     }
 
@@ -8296,6 +9714,13 @@ pub async fn run_interactive_mode(
     set_kitty_protocol_active(rt.tui.capabilities().kitty_keyboard());
     rt.queue_pending_events(pending_events);
     session.start_input(rt.input_mut());
+    if options.screen_mode == ScreenMode::Fullscreen {
+        let size = session
+            .switch_screen_mode(&rt.input, ScreenMode::Fullscreen)
+            .await?;
+        rt.apply_screen_mode(ScreenMode::Fullscreen, (size.width, size.height))
+            .map_err(|error| format!("fullscreen writer setup failed: {error}"))?;
+    }
 
     // 5. First frame: run the startup sequence (theme push + first paint)
     //    with the final capabilities, after stdin ownership returned to the
@@ -8321,24 +9746,24 @@ pub async fn run_interactive_mode(
             InteractiveExit::Suspend => {
                 // Drop active selector focus so resume returns to the editor.
                 rt.close_selector_for_suspend();
+                if rt.screen_mode == ScreenMode::Fullscreen {
+                    rt.flush_fullscreen_image_cache()
+                        .map_err(|e| format!("fullscreen image cleanup failed: {e}"))?;
+                }
                 // Restore modes, suspend the process, then re-activate using
                 // the terminal dimensions observed after SIGCONT.
                 session
                     .suspend()
                     .map_err(|e| format!("terminal suspend failed: {e}"))?;
-                let size = initial_terminal_size();
-                session
-                    .guard_mut()
-                    .set_viewport_bottom_row(size.1.saturating_sub(1));
-                session
+                let size = session
                     .resume()
                     .map_err(|e| format!("terminal resume failed: {e}"))?;
                 // Reanchor without a clear and retain the runtime's clamped
                 // view row as the source for the next normal restore.
                 let _ = rt
                     .step_ui(UiEvent::Resize {
-                        width: size.0,
-                        height: size.1,
+                        width: size.width,
+                        height: size.height,
                     })
                     .await;
                 session
@@ -8352,25 +9777,104 @@ pub async fn run_interactive_mode(
             InteractiveExit::ExternalEditor => {
                 run_external_editor_handoff(&mut rt, &mut session).await?;
             }
+            InteractiveExit::ScreenModeChange => {
+                let mode = rt
+                    .take_requested_screen_mode()
+                    .ok_or_else(|| "screen-mode change was not requested".to_owned())?;
+                if rt.screen_mode == ScreenMode::Fullscreen && mode == ScreenMode::Regular {
+                    rt.flush_fullscreen_image_cache()
+                        .map_err(|e| format!("fullscreen image cleanup failed: {e}"))?;
+                }
+                let size = session.switch_screen_mode(&rt.input, mode).await?;
+                rt.apply_screen_mode(mode, (size.width, size.height))
+                    .map_err(|error| format!("screen-mode writer setup failed: {error}"))?;
+                rt.paint_frame()
+                    .map_err(|error| format!("screen-mode repaint failed: {error}"))?;
+                session
+                    .guard_mut()
+                    .set_viewport_bottom_row(rt.viewport_bottom_row());
+                rt.exited = false;
+                continue;
+            }
             other => break other,
         }
     };
 
-    // 7. Drop runtime first so any final paint commits before guard restore.
+    let normal_exit = matches!(
+        exit,
+        InteractiveExit::Clean | InteractiveExit::SessionEnded
+    );
+    let fullscreen_mode = rt.screen_mode == ScreenMode::Fullscreen;
+    let fullscreen_exit = fullscreen_mode && normal_exit;
+    let resume_hint = if fullscreen_exit
+        && rt.fullscreen_exit_output == FullscreenExitOutput::ResumeHint
+    {
+        rt.session.resume_command().await
+    } else {
+        None
+    };
+    if fullscreen_mode {
+        rt.flush_fullscreen_image_cache()
+            .map_err(|e| format!("fullscreen image cleanup failed: {e}"))?;
+    }
+    if fullscreen_exit && rt.fullscreen_exit_output == FullscreenExitOutput::Transcript {
+        // Match the native stop path: modal state cannot survive the renderer
+        // handoff, and the regular renderer writes the retained transcript to
+        // the primary screen before the guard is finally restored.
+        rt.close_selector();
+        rt.view.overlay = None;
+        rt.view.extension_overlay_slot = None;
+        rt.fullscreen_search = None;
+        rt.fullscreen_viewport.close_search();
+        let size = session.switch_screen_mode(&rt.input, ScreenMode::Regular).await?;
+        rt.apply_screen_mode(ScreenMode::Regular, (size.width, size.height))
+            .map_err(|error| format!("regular exit writer setup failed: {error}"))?;
+        rt.paint_frame()
+            .map_err(|error| format!("regular exit repaint failed: {error}"))?;
+    }
+    // Quiesce the input reader so the EventStream worker is joined before we
+    // drop the runtime and let the terminal guard restore its modes.
+    rt.lifecycle_cancel.cancel();
+    rt.input
+        .pause()
+        .await
+        .map_err(|e| format!("pause terminal input for shutdown: {e}"))?;
+    if fullscreen_exit
+        && rt.fullscreen_exit_output == FullscreenExitOutput::ResumeHint
+    {
+        // Preserve the primary screen: restoring the guard while the
+        // alternate screen is still active discards that screen, after which
+        // the hint is written through the runtime's sole output handle.
+        session.guard_mut().restore();
+    }
+    if fullscreen_exit
+        && rt.fullscreen_exit_output == FullscreenExitOutput::ResumeHint
+        && let Some(hint) = resume_hint
+    {
+        let output = format!("\r\nResume with: {hint}\r\n");
+        rt.tui
+            .outer_mut()
+            .write_all(output.as_bytes())
+            .map_err(|error| format!("write fullscreen resume hint: {error}"))?;
+        rt.tui
+            .outer_mut()
+            .flush()
+            .map_err(|error| format!("flush fullscreen resume hint: {error}"))?;
+    }
     drop(rt);
     runtime.set_rebind_session(None);
     runtime.set_before_session_invalidate(None);
     runtime.set_before_session_replacement(None);
-    // 8. Session restores terminal modes. Convert exit kind to a process
-    //    exit code.
+    // Session restores terminal modes after the runtime and its input handle
+    // have been dropped. Convert the final exit kind to a process exit code.
     let code = match exit {
         InteractiveExit::Clean
         | InteractiveExit::SessionEnded
         | InteractiveExit::Suspend
-        | InteractiveExit::ExternalEditor => 0u8,
+        | InteractiveExit::ExternalEditor
+        | InteractiveExit::ScreenModeChange => 0u8,
         InteractiveExit::IoFailure | InteractiveExit::DrawDeadlock => 1u8,
     };
-
     session.shutdown();
     Ok(code)
 }
@@ -8388,6 +9892,10 @@ where
 {
     let initial = rt.editor.get_expanded_text();
     let editor_command = rt.session.external_editor_command();
+    if rt.screen_mode == ScreenMode::Fullscreen {
+        rt.flush_fullscreen_image_cache()
+            .map_err(|e| format!("fullscreen image cleanup failed: {e}"))?;
+    }
     session.suspend_for_editor(&rt.input).await?;
 
     let cancel = CancellationToken::new();
@@ -8402,7 +9910,7 @@ where
         .map_err(|error| error.to_string());
     watcher.abort();
 
-    session.resume_from_editor(&rt.input).await?;
+    let size = session.resume_from_editor(&rt.input).await?;
     rt.exited = false;
     rt.exit_kind = InteractiveExit::Clean;
     match edited {
@@ -8413,14 +9921,10 @@ where
         Ok(EditOutcome::Unchanged | EditOutcome::Aborted) => {}
         Err(error) => rt.last_error = Some(error),
     }
-    let size = initial_terminal_size();
-    session
-        .guard_mut()
-        .set_viewport_bottom_row(size.1.saturating_sub(1));
     let _ = rt
         .step_ui(UiEvent::Resize {
-            width: size.0,
-            height: size.1,
+            width: size.width,
+            height: size.height,
         })
         .await;
     session
@@ -8482,7 +9986,7 @@ async fn wait_extension_registry_change(receiver: &mut Option<watch::Receiver<u6
     }
 }
 
-async fn wait_extension_deadline(deadline: Option<Instant>) {
+async fn wait_runtime_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
         None => std::future::pending().await,
@@ -8609,53 +10113,168 @@ fn shortcut_hints(shortcuts: &[EffectiveExtensionShortcut]) -> Vec<super::state:
         .collect()
 }
 
-fn ui_event_wire(event: &UiEvent) -> UiEventWire {
-    match event {
-        UiEvent::Key(key) => {
-            let (code, modifiers) = pi_tui::keys::normalize_event(key)
-                .unwrap_or_else(|| (format!("{:?}", key.code), key.modifiers));
-            UiEventWire::Key {
-                code,
-                modifiers: KeyModifiersWire {
-                    shift: modifiers
-                        .contains(crossterm::event::KeyModifiers::SHIFT)
-                        .then_some(true),
-                    alt: modifiers
-                        .contains(crossterm::event::KeyModifiers::ALT)
-                        .then_some(true),
-                    ctrl: modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL)
-                        .then_some(true),
-                    super_key: modifiers
-                        .contains(crossterm::event::KeyModifiers::SUPER)
-                        .then_some(true),
-                },
-                kind: match key.kind {
-                    crossterm::event::KeyEventKind::Press => KeyEventKindWire::Press,
-                    crossterm::event::KeyEventKind::Repeat => KeyEventKindWire::Repeat,
-                    crossterm::event::KeyEventKind::Release => KeyEventKindWire::Release,
-                },
-            }
-        }
-        UiEvent::Paste(text) => UiEventWire::Paste { text: text.clone() },
-        UiEvent::FocusGained => UiEventWire::FocusGained,
-        UiEvent::FocusLost => UiEventWire::FocusLost,
-        UiEvent::Resize { width, height } => UiEventWire::Resize {
-            width: *width,
-            height: *height,
-        },
-    }
+fn ui_event_wire(event: &UiEvent) -> Option<UiEventWire> {
+    pi_ext::adapters::map_ui_event(event)
 }
 
 fn encode_terminal_input(event: &UiEvent) -> Option<String> {
     match event {
         UiEvent::Paste(text) => Some(text.clone()),
         UiEvent::Key(key) => encode_key_event(key),
+        UiEvent::Mouse(mouse) => encode_sgr_mouse(mouse),
         UiEvent::FocusGained | UiEvent::FocusLost | UiEvent::Resize { .. } => None,
     }
 }
 
+
+fn quote_resume_arg(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_-./~:@".contains(character))
+    {
+        return value.to_owned();
+    }
+    let mut quoted = String::with_capacity(value.len().saturating_add(2));
+    quoted.push('\'');
+    for character in value.chars() {
+        if character == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn encode_sgr_mouse(mouse: &crossterm::event::MouseEvent) -> Option<String> {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let button_code = |button: MouseButton| match button {
+        MouseButton::Left => 0_u16,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    let (code, suffix) = match mouse.kind {
+        MouseEventKind::ScrollUp => (64_u16, 'M'),
+        MouseEventKind::ScrollDown => (65_u16, 'M'),
+        MouseEventKind::ScrollLeft => (66_u16, 'M'),
+        MouseEventKind::ScrollRight => (67_u16, 'M'),
+        MouseEventKind::Moved => (35, 'M'),
+        MouseEventKind::Drag(button) => (button_code(button) | 32, 'M'),
+        MouseEventKind::Up(button) => (button_code(button), 'm'),
+        MouseEventKind::Down(button) => (button_code(button), 'M'),
+    };
+    let modifiers = mouse.modifiers;
+    let modifier_bits = u16::from(modifiers.contains(crossterm::event::KeyModifiers::SHIFT)) * 4
+        + u16::from(modifiers.contains(crossterm::event::KeyModifiers::ALT)) * 8
+        + u16::from(modifiers.contains(crossterm::event::KeyModifiers::CONTROL)) * 16;
+    let code = code + modifier_bits;
+    Some(format!(
+        "\x1b[<{code};{};{}{}",
+        mouse.column.saturating_add(1),
+        mouse.row.saturating_add(1),
+        suffix
+    ))
+}
+
+
+fn is_sgr_mouse_sequence(data: &str) -> bool {
+    let Some(payload) = data.strip_prefix("\x1b[<") else {
+        return false;
+    };
+    let Some(fields) = payload
+        .strip_suffix('M')
+        .or_else(|| payload.strip_suffix('m'))
+    else {
+        return false;
+    };
+    let mut values = fields.split(';');
+    let Some(code) = values.next() else {
+        return false;
+    };
+    let Some(column) = values.next() else {
+        return false;
+    };
+    let Some(row) = values.next() else {
+        return false;
+    };
+    values.next().is_none()
+        && [code, column, row].into_iter().all(|value| {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn decode_sgr_mouse(data: &str) -> Option<UiEvent> {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    let payload = data.strip_prefix("\x1b[<")?;
+    let (fields, suffix) = if let Some(fields) = payload.strip_suffix('M') {
+        (fields, b'M')
+    } else if let Some(fields) = payload.strip_suffix('m') {
+        (fields, b'm')
+    } else {
+        return None;
+    };
+    let mut values = fields.split(';');
+    let code = values.next()?.parse::<u8>().ok()?;
+    let column = values.next()?.parse::<u16>().ok()?.checked_sub(1)?;
+    let row = values.next()?.parse::<u16>().ok()?.checked_sub(1)?;
+    if values.next().is_some() {
+        return None;
+    }
+
+    let button_number = (code & 0b0000_0011) | ((code & 0b1100_0000) >> 4);
+    let dragging = code & 0b0010_0000 == 0b0010_0000;
+    let kind = match (button_number, dragging) {
+        (0, false) => MouseEventKind::Down(MouseButton::Left),
+        (1, false) => MouseEventKind::Down(MouseButton::Middle),
+        (2, false) => MouseEventKind::Down(MouseButton::Right),
+        (0, true) => MouseEventKind::Drag(MouseButton::Left),
+        (1, true) => MouseEventKind::Drag(MouseButton::Middle),
+        (2, true) => MouseEventKind::Drag(MouseButton::Right),
+        (3, false) => MouseEventKind::Up(MouseButton::Left),
+        (3, true) | (4, true) | (5, true) => MouseEventKind::Moved,
+        (4, false) => MouseEventKind::ScrollUp,
+        (5, false) => MouseEventKind::ScrollDown,
+        (6, false) => MouseEventKind::ScrollLeft,
+        (7, false) => MouseEventKind::ScrollRight,
+        _ => return None,
+    };
+
+    let mut modifiers = KeyModifiers::empty();
+    if code & 0b0000_0100 == 0b0000_0100 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if code & 0b0000_1000 == 0b0000_1000 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if code & 0b0001_0000 == 0b0001_0000 {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+
+    let kind = if suffix == b'm' {
+        match kind {
+            MouseEventKind::Down(button) => MouseEventKind::Up(button),
+            other => other,
+        }
+    } else {
+        kind
+    };
+
+    Some(UiEvent::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers,
+    }))
+}
+
 fn decode_terminal_input(data: String) -> UiEvent {
+    if let Some(mouse) = decode_sgr_mouse(&data) {
+        return mouse;
+    }
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let key = match data.as_str() {
         "\r" | "\n" => Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -8778,6 +10397,7 @@ mod tests {
         login_results: std::sync::Mutex<std::collections::HashMap<String, Result<(), LoginError>>>,
         set_model_calls: std::sync::Mutex<Vec<(String, String, bool)>>,
         set_model_error: std::sync::Mutex<Option<String>>,
+        persisted_thinking_levels: std::sync::Mutex<Vec<pi_ai::ModelThinkingLevel>>,
         refresh_models_result: std::sync::Mutex<
             Option<Result<crate::core::model_runtime::ModelsRefreshResult, String>>,
         >,
@@ -9354,6 +10974,80 @@ mod tests {
                 {
                     return Err(err);
                 }
+                Ok(())
+            })
+        }
+
+        fn current_thinking_level(&self) -> pi_ai::ModelThinkingLevel {
+            let label = self
+                .snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .thinking_level_label
+                .clone();
+            match label.as_str() {
+                "minimal" => pi_ai::ModelThinkingLevel::Minimal,
+                "low" => pi_ai::ModelThinkingLevel::Low,
+                "medium" => pi_ai::ModelThinkingLevel::Medium,
+                "high" => pi_ai::ModelThinkingLevel::High,
+                "xhigh" => pi_ai::ModelThinkingLevel::Xhigh,
+                "max" => pi_ai::ModelThinkingLevel::Max,
+                _ => pi_ai::ModelThinkingLevel::Off,
+            }
+        }
+
+        fn available_thinking_levels(&self) -> Vec<pi_ai::ModelThinkingLevel> {
+            vec![
+                pi_ai::ModelThinkingLevel::Off,
+                pi_ai::ModelThinkingLevel::Minimal,
+                pi_ai::ModelThinkingLevel::Low,
+                pi_ai::ModelThinkingLevel::Medium,
+                pi_ai::ModelThinkingLevel::High,
+                pi_ai::ModelThinkingLevel::Xhigh,
+                pi_ai::ModelThinkingLevel::Max,
+            ]
+        }
+
+        fn default_thinking_level(&self) -> Option<pi_ai::ModelThinkingLevel> {
+            self.log
+                .persisted_thinking_levels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                .copied()
+        }
+
+        fn set_thinking_level(
+            &self,
+            level: pi_ai::ModelThinkingLevel,
+        ) -> BoxFuture<'_, Result<(), String>> {
+            let snapshot = Arc::clone(&self.snapshot);
+            Box::pin(async move {
+                snapshot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .thinking_level_label =
+                    crate::core::agent_session::model::level_str(level).to_owned();
+                Ok(())
+            })
+        }
+
+        fn persist_thinking_level(
+            &self,
+            level: pi_ai::ModelThinkingLevel,
+        ) -> BoxFuture<'_, Result<(), String>> {
+            let log = Arc::clone(&self.log);
+            let snapshot = Arc::clone(&self.snapshot);
+            Box::pin(async move {
+                snapshot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .thinking_level_label =
+                    crate::core::agent_session::model::level_str(level).to_owned();
+                log.persisted_thinking_levels
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(level);
                 Ok(())
             })
         }
@@ -11027,7 +12721,7 @@ mod tests {
         let (mut rt, _log) = make_runtime();
         rt.view
             .messages
-            .push(MessageView::Assistant(Box::new(AssistantMessageView {
+            .push(MessageView::Assistant(AssistantMessageView {
                 message: AssistantMessage::new(
                     "test-api",
                     "test-provider",
@@ -11037,7 +12731,7 @@ mod tests {
                 hide_thinking: false,
                 hidden_thinking_label: "Thinking hidden".to_owned(),
                 streaming: false,
-            })));
+            }));
         project_event(
             &mut rt.view,
             &AgentSessionEvent::ToolExecutionStart {
@@ -11275,19 +12969,160 @@ mod tests {
         ));
         assert_eq!(
             ui_event_wire(&event),
-            UiEventWire::Key {
+            Some(UiEventWire::Key {
                 code: "enter".to_owned(),
                 modifiers: KeyModifiersWire {
                     alt: Some(true),
                     ..KeyModifiersWire::default()
                 },
                 kind: KeyEventKindWire::Repeat,
-            }
+            })
         );
         assert_eq!(
             encode_terminal_input(&event).as_deref(),
             Some("\u{1b}[13;3:2u")
         );
+    }
+
+    /// Scene for the Release-routing preservation proof: registers the
+    /// focusable slot `key` in the already-bound runtime set (uiEvent
+    /// delivery routes by set slot ownership, so an unregistered slot would
+    /// short-circuit with `delivered: false`), waits for the registration,
+    /// then builds a runtime whose host owns `set` — construction replays
+    /// the registered slots, so the focused-slot route owns input before
+    /// the default editor sees any event.
+    async fn focused_release_route_runtime(
+        set: Arc<ExtensionRuntimeSet>,
+        ext_host: &crate::core::extension_runtime_set::tests::FakeHost,
+        key: &str,
+    ) -> Result<InteractiveRuntime<SharedWriter, FakeHost>, String> {
+        ext_host
+            .emit(crate::core::extension_runtime_set::tests::slot_frame(
+                key, "focused", true,
+            ))
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if set
+                    .current_slots()
+                    .iter()
+                    .any(|slot| slot.key == key && slot.focusable)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| format!("runtime set did not register the focused slot {key:?}"))?;
+
+        let (mut host, log) = FakeHost::new();
+        host.extension_runner = Some(set);
+        try_make_runtime_with(host, log, &TerminalCapabilities::default()).map(|(rt, _log)| rt)
+    }
+
+    /// Preservation proof (A4): a Release sent through real
+    /// `handle_ui_event` routing must reach terminal interception first and
+    /// the focused extension slot second — both before any default-consumer
+    /// Release rejection is allowed to run — while the default editor stays
+    /// unchanged. The slot must be registered in the runtime set (uiEvent
+    /// delivery routes by set slot ownership; an unregistered slot would
+    /// short-circuit with `delivered: false` and never reach the endpoint).
+    #[tokio::test]
+    async fn release_reaches_terminal_input_then_focused_slot_editor_unchanged() -> TestResult {
+        let (runner, ext_host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "tools": [],
+                "commands": [],
+                "shortcuts": [],
+                "renderers": [],
+                "handlers": ["terminalInput"],
+                "terminalInput": true,
+            }))
+            .await
+            .map_err(|error| error.to_string())?;
+        // Passthrough interception (consume, no rewrite) plus delivery
+        // acknowledgement for the focused slot.
+        ext_host.set_response("terminalInput", serde_json::json!({ "consume": false }));
+        ext_host.set_response("uiEvent", serde_json::json!({ "delivered": true }));
+        let set = ExtensionRuntimeSet::bind(vec![(
+            crate::core::extension_runtime_set::EndpointKind::Native,
+            runner,
+        )]);
+        let mut rt = focused_release_route_runtime(set.clone(), &ext_host, "release.check").await?;
+        assert_eq!(
+            rt.focused_extension_slot.as_deref(),
+            Some("release.check"),
+            "focused slot must own input before the release is sent"
+        );
+        assert_eq!(rt.view.focus, FocusArea::Widget);
+
+        // One Release of 'p' — the kind default consumers must reject —
+        // through real step_ui routing.
+        rt.step_ui(UiEvent::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Release,
+        )))
+        .await
+        .map_err(|error| format!("release routing failed: {error}"))?;
+
+        ext_host
+            .wait_for_request("terminalInput")
+            .await
+            .map_err(|error| error.to_string())?;
+        ext_host
+            .wait_for_request("uiEvent")
+            .await
+            .map_err(|error| error.to_string())?;
+        let observed = ext_host.observed_methods();
+        let terminal_input_index = observed
+            .iter()
+            .position(|method| method == "terminalInput")
+            .ok_or("terminalInput request missing")?;
+        let ui_event_index = observed
+            .iter()
+            .position(|method| method == "uiEvent")
+            .ok_or("uiEvent request missing")?;
+        assert!(
+            terminal_input_index < ui_event_index,
+            "terminal interception must observe the release before the focused slot: {observed:?}"
+        );
+
+        let release_encoding = "\u{1b}[112;1:3u";
+        assert_eq!(
+            ext_host.first_payload("terminalInput").as_ref(),
+            Some(&serde_json::json!({ "data": release_encoding })),
+            "terminalInput must receive the release encoding unchanged"
+        );
+        assert_eq!(
+            ext_host.first_payload("uiEvent").as_ref(),
+            Some(&serde_json::json!({
+                "key": "release.check",
+                "generation": 1,
+                "event": {
+                    "type": "key",
+                    "code": "p",
+                    "modifiers": {},
+                    "kind": "release"
+                },
+                "data": release_encoding
+            })),
+            "focused slot must receive the typed Release payload"
+        );
+        assert_eq!(
+            ext_host.request_count("uiEvent"),
+            1,
+            "release must be delivered once, not re-dispatched as an edit"
+        );
+        assert!(
+            rt.editor.get_text().is_empty(),
+            "default editor must not act on a Release: {:?}",
+            rt.editor.get_text()
+        );
+
+        set.shutdown_once().await;
+        Ok(())
     }
 
     #[test]
@@ -11857,7 +13692,7 @@ mod tests {
 
     /// The wire collapses every non-`Answered` outcome to identical default
     /// bytes, so the typed distinction between a fired deadline
-    /// (`TimedOut`, run-loop arm at the `wait_extension_deadline` select
+    /// (`TimedOut`, run-loop arm at the `wait_runtime_deadline` select
     /// branch) and a user/system cancel (`Cancelled`, `cancel_rx` and teardown
     /// paths) must survive to the capture seam. Both paths share one helper;
     /// this pins that the dialog end they pass is the only difference.
@@ -12140,6 +13975,107 @@ mod tests {
                 .ok_or_else(|| format!("unsupported event: {event:?}"))?;
             assert_eq!(decode_terminal_input(encoded), event);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn decode_sgr_mouse_matches_crossterm_sgr_semantics() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let cases = [
+            (
+                "\x1b[<3;8;5m",
+                MouseEventKind::Up(MouseButton::Left),
+                KeyModifiers::NONE,
+            ),
+            (
+                "\x1b[<3;8;5M",
+                MouseEventKind::Up(MouseButton::Left),
+                KeyModifiers::NONE,
+            ),
+            (
+                "\x1b[<35;8;5m",
+                MouseEventKind::Moved,
+                KeyModifiers::NONE,
+            ),
+            (
+                "\x1b[<7;8;5m",
+                MouseEventKind::Up(MouseButton::Left),
+                KeyModifiers::SHIFT,
+            ),
+        ];
+
+        for (data, kind, modifiers) in cases {
+            assert_eq!(
+                decode_sgr_mouse(data),
+                Some(UiEvent::Mouse(MouseEvent {
+                    kind,
+                    column: 7,
+                    row: 4,
+                    modifiers,
+                }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_input_mouse_rewrite_uses_sgr_semantics_and_suppresses_rejected_sequence()
+        -> TestResult
+    {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (runner, ext_host) =
+            crate::core::extension_runtime_set::tests::make_runner(serde_json::json!({
+                "handlers": ["terminalInput"],
+                "terminalInput": true,
+            }))
+            .await
+            .map_err(|error| error.to_string())?;
+        ext_host.set_response(
+            "terminalInput",
+            serde_json::json!({
+                "consume": false,
+                "data": "\x1b[<3;8;5m",
+            }),
+        );
+        let set = ExtensionRuntimeSet::bind(vec![(
+            crate::core::extension_runtime_set::EndpointKind::Native,
+            runner,
+        )]);
+        let (mut host, log) = FakeHost::new();
+        host.extension_runner = Some(Arc::clone(&set));
+        let (mut rt, _log) =
+            try_make_runtime_with(host, log, &TerminalCapabilities::default())?;
+        let original = || {
+            UiEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 7,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        let decoded = rt.intercept_terminal_input(original()).await;
+        assert_eq!(
+            decoded,
+            Some(UiEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 7,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            }))
+        );
+        assert_ne!(decoded, Some(original()));
+
+        ext_host.set_response(
+            "terminalInput",
+            serde_json::json!({
+                "consume": false,
+                "data": "\x1b[<128;8;5m",
+            }),
+        );
+        assert_eq!(rt.intercept_terminal_input(original()).await, None);
+        set.shutdown_once().await;
         Ok(())
     }
 
@@ -12675,12 +14611,12 @@ mod tests {
             .push(AssistantContent::Text(TextContent::new("hi")));
         rt.view
             .messages
-            .push(MessageView::Assistant(Box::new(AssistantMessageView {
+            .push(MessageView::Assistant(AssistantMessageView {
                 message,
                 hide_thinking: true,
                 hidden_thinking_label: "Custom label".to_owned(),
                 streaming: false,
-            })));
+            }));
 
         let outcome = rt.dispatch_action(ViewAction::Reload).await;
 

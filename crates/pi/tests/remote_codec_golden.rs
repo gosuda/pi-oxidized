@@ -1,9 +1,18 @@
 //! Golden roundtrip tests for the remote codec (PAR-CODEC, issue #31).
 //!
-//! Decodes every row of the PAR-WIRE golden corpus byte-exactly and verifies
-//! encode→decode roundtrips produce identical bytes.
+//! Every generated v8 corpus row is decoded, checked against its message kind,
+//! and re-encoded byte-for-byte. The corpus itself is generator-owned; this
+//! test deliberately does not synthesize or rewrite fixture rows.
 
 #![cfg(test)]
+#![expect(
+    clippy::expect_used,
+    reason = "golden tests use expect for irrecoverable fixture and codec assertions"
+)]
+#![expect(
+    clippy::panic,
+    reason = "golden tests panic on committed fixture or protocol drift"
+)]
 
 use std::fs;
 
@@ -15,9 +24,12 @@ use pi::remote::codec::{
     encode_client_message, encode_server_message, is_supported_protocol_version,
 };
 use pi::remote::framing::{FrameDecoder, FrameError, assert_complete_frame, encode_frame};
-use pi::remote::schemas::{ClientMessage, PROTOCOL_VERSION, ProtocolErrorCode, ServerMessage};
+use pi::remote::schemas::{
+    ClientMessage, PROTOCOL_VERSION, RpcTarget, ServerMessage,
+};
+use pi_agent::service::value::JsonValue;
 
-/// One row of the golden corpus JSONL.
+/// One row of the generator-owned golden corpus JSONL.
 #[derive(Debug, Deserialize)]
 struct CorpusRow {
     kind: String,
@@ -44,8 +56,8 @@ fn load_corpus() -> Vec<CorpusRow> {
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read corpus at {}: {e}", path.display()));
     text.lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| serde_json::from_str(l).expect("corpus row"))
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("corpus row"))
         .collect()
 }
 
@@ -56,169 +68,168 @@ fn load_corpus() -> Vec<CorpusRow> {
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("valid hex"))
         .collect()
 }
 
+fn assert_v8_kinds_present(corpus: &[CorpusRow]) {
+    let expected = [
+        "client_hello",
+        "request",
+        "cancel",
+        "server_hello",
+        "server_hello_error",
+        "response_ok",
+        "response_null",
+        "response_absent",
+        "response_error",
+        "service_update",
+        "attachment_null",
+        "attachment_session",
+        "over_limit_rejection",
+    ];
+    for kind in expected {
+        assert!(
+            corpus.iter().any(|row| row.kind == kind),
+            "generator corpus is missing v8 row kind {kind}"
+        );
+    }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "test assertion: a row with an unknown kind is corpus drift"
+)]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions: golden decode/encode must succeed"
+)]
+fn decode_and_reencode(row: &CorpusRow) -> Vec<u8> {
+    let frame = hex_to_bytes(&row.frame_hex);
+    match row.kind.as_str() {
+        "client_hello" => {
+            let message = decode_client_message(&frame, None).expect("decode client hello");
+            assert!(matches!(
+                &message,
+                ClientMessage::Hello { version } if *version == PROTOCOL_VERSION
+            ));
+            encode_client_message(&message, None).expect("re-encode client hello")
+        }
+        "request" => {
+            let message = decode_client_message(&frame, None).expect("decode request");
+            assert!(matches!(
+                &message,
+                ClientMessage::Request {
+                    target: RpcTarget::Session(_),
+                    ..
+                }
+            ));
+            encode_client_message(&message, None).expect("re-encode request")
+        }
+        "cancel" => {
+            let message = decode_client_message(&frame, None).expect("decode cancel");
+            assert!(matches!(
+                &message,
+                ClientMessage::Cancel {
+                    target: RpcTarget::Server(_),
+                    ..
+                }
+            ));
+            encode_client_message(&message, None).expect("re-encode cancel")
+        }
+        "server_hello" => {
+            let message = decode_server_message(&frame, None).expect("decode server hello");
+            assert!(matches!(
+                &message,
+                ServerMessage::Hello { version, .. } if *version == PROTOCOL_VERSION
+            ));
+            encode_server_message(&message, None).expect("re-encode server hello")
+        }
+        "server_hello_error" => {
+            let message = decode_server_message(&frame, None).expect("decode server hello error");
+            assert!(matches!(&message, ServerMessage::HelloError { .. }));
+            encode_server_message(&message, None).expect("re-encode server hello error")
+        }
+        "response_ok" => {
+            let message = decode_server_message(&frame, None).expect("decode response ok");
+            assert!(matches!(
+                &message,
+                ServerMessage::Response {
+                    result: Some(result),
+                    ..
+                } if !result.is_null()
+            ));
+            encode_server_message(&message, None).expect("re-encode response ok")
+        }
+        "response_null" => {
+            let message =
+                decode_server_message(&frame, None).expect("decode explicit null response");
+            assert!(matches!(
+                &message,
+                ServerMessage::Response {
+                    result: Some(result),
+                    ..
+                } if result.is_null()
+            ));
+            encode_server_message(&message, None).expect("re-encode explicit null response")
+        }
+        "response_absent" => {
+            let message = decode_server_message(&frame, None).expect("decode absent response");
+            assert!(matches!(
+                &message,
+                ServerMessage::Response { result: None, .. }
+            ));
+            encode_server_message(&message, None).expect("re-encode absent response")
+        }
+        "response_error" => {
+            let message = decode_server_message(&frame, None).expect("decode response error");
+            assert!(matches!(&message, ServerMessage::ResponseError { .. }));
+            encode_server_message(&message, None).expect("re-encode response error")
+        }
+        "service_update" => {
+            let message = decode_server_message(&frame, None).expect("decode service update");
+            assert!(matches!(&message, ServerMessage::ServiceUpdate { .. }));
+            encode_server_message(&message, None).expect("re-encode service update")
+        }
+        "attachment_null" => {
+            let message = decode_server_message(&frame, None).expect("decode detached attachment");
+            assert!(matches!(
+                &message,
+                ServerMessage::Attachment { attachment: None }
+            ));
+            encode_server_message(&message, None).expect("re-encode detached attachment")
+        }
+        "attachment_session" => {
+            let message = decode_server_message(&frame, None).expect("decode session attachment");
+            assert!(matches!(
+                &message,
+                ServerMessage::Attachment {
+                    attachment: Some(_)
+                }
+            ));
+            encode_server_message(&message, None).expect("re-encode session attachment")
+        }
+        "over_limit_rejection" => panic!("over-limit row has no message to decode"),
+        other => panic!("unknown v8 corpus row kind {other}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Byte-exact decode of every golden frame
+// Byte-exact decode and encode of every generated v8 frame
 // ---------------------------------------------------------------------------
 
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
 #[test]
-fn golden_client_hello_decodes_byte_exact() {
-    let row = load_corpus()
-        .into_iter()
-        .find(|r| r.kind == "client_hello")
-        .expect("client_hello row");
-    let frame = hex_to_bytes(&row.frame_hex);
-    let msg = decode_client_message(&frame, None).expect("decode client hello");
-    match msg {
-        ClientMessage::Hello { version } => {
-            assert_eq!(version, PROTOCOL_VERSION);
-        }
-        other @ ClientMessage::Request { .. } => panic!("expected Hello, got {other:?}"),
-    }
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
-#[test]
-fn golden_server_hello_decodes_byte_exact() {
-    let row = load_corpus()
-        .into_iter()
-        .find(|r| r.kind == "server_hello")
-        .expect("server_hello row");
-    let frame = hex_to_bytes(&row.frame_hex);
-    let msg = decode_server_message(&frame, None).expect("decode server hello");
-    match msg {
-        ServerMessage::Hello {
-            version,
-            connection_id,
-            snapshot,
-        } => {
-            assert_eq!(version, PROTOCOL_VERSION);
-            assert_eq!(connection_id, "connection-1");
-            assert_eq!(snapshot.server_id, "server-1");
-            assert_eq!(snapshot.protocol_version, PROTOCOL_VERSION);
-            assert_eq!(snapshot.revision, 0);
-            assert!(snapshot.sessions.is_empty());
-            assert!(snapshot.models.is_empty());
-        }
-        other => panic!("expected Hello, got {other:?}"),
-    }
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
-#[test]
-fn golden_server_hello_error_decodes_byte_exact() {
-    let row = load_corpus()
-        .into_iter()
-        .find(|r| r.kind == "server_hello_error")
-        .expect("server_hello_error row");
-    let frame = hex_to_bytes(&row.frame_hex);
-    let msg = decode_server_message(&frame, None).expect("decode server hello error");
-    match msg {
-        ServerMessage::HelloError { error } => {
-            assert_eq!(error.code, ProtocolErrorCode::Version);
-            assert_eq!(error.message, "unsupported protocol version");
-        }
-        other => panic!("expected HelloError, got {other:?}"),
-    }
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
-#[test]
-fn golden_response_ok_decodes_byte_exact() {
-    let row = load_corpus()
-        .into_iter()
-        .find(|r| r.kind == "response_ok")
-        .expect("response_ok row");
-    let frame = hex_to_bytes(&row.frame_hex);
-    let msg = decode_server_message(&frame, None).expect("decode response ok");
-    match msg {
-        ServerMessage::Response {
-            id,
-            ok,
-            result,
-            error,
-        } => {
-            assert_eq!(id, "req-1");
-            assert!(ok);
-            assert!(result.is_some());
-            assert!(error.is_none());
-        }
-        other => panic!("expected Response, got {other:?}"),
-    }
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
-#[test]
-fn golden_response_error_decodes_byte_exact() {
-    let row = load_corpus()
-        .into_iter()
-        .find(|r| r.kind == "response_error")
-        .expect("response_error row");
-    let frame = hex_to_bytes(&row.frame_hex);
-    let msg = decode_server_message(&frame, None).expect("decode response error");
-    match msg {
-        ServerMessage::Response {
-            id,
-            ok,
-            result,
-            error,
-        } => {
-            assert_eq!(id, "req-2");
-            assert!(!ok);
-            assert!(result.is_none());
-            let err = error.expect("error field");
-            assert_eq!(err.code, ProtocolErrorCode::SessionLocked);
-            assert_eq!(err.message, "session is locked");
-        }
-        other => panic!("expected Response, got {other:?}"),
-    }
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
-#[test]
-fn golden_event_envelope_decodes_byte_exact() {
-    let row = load_corpus()
-        .into_iter()
-        .find(|r| r.kind == "event_envelope")
-        .expect("event_envelope row");
-    let frame = hex_to_bytes(&row.frame_hex);
-    let msg = decode_server_message(&frame, None).expect("decode event envelope");
-    match msg {
-        ServerMessage::Event { event } => match event {
-            pi::remote::schemas::ServerEvent::SessionRemoved { session_id } => {
-                assert_eq!(session_id, "session-1");
-            }
-            other => panic!("expected SessionRemoved, got {other:?}"),
-        },
-        other => panic!("expected Event, got {other:?}"),
+fn golden_v8_corpus_decodes_and_reencodes_byte_exact() {
+    let corpus = load_corpus();
+    assert_v8_kinds_present(&corpus);
+    for row in corpus.iter().filter(|row| row.kind != "over_limit_rejection") {
+        let frame = hex_to_bytes(&row.frame_hex);
+        assert_eq!(
+            decode_and_reencode(row),
+            frame,
+            "v8 corpus frame changed for row kind {}",
+            row.kind
+        );
     }
 }
 
@@ -226,144 +237,21 @@ fn golden_event_envelope_decodes_byte_exact() {
 // Over-limit rejection
 // ---------------------------------------------------------------------------
 
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
 #[test]
 fn golden_over_limit_rejection() {
     let row = load_corpus()
         .into_iter()
-        .find(|r| r.kind == "over_limit_rejection")
-        .expect("over_limit row");
+        .find(|row| row.kind == "over_limit_rejection")
+        .expect("over_limit_rejection row");
     let frame = hex_to_bytes(&row.frame_hex);
-    // The frame is just a 4-byte prefix declaring > 16 MiB.
-    let mut dec = FrameDecoder::default();
-    let err = dec.push(&frame).expect_err("expected error");
+    let mut decoder = FrameDecoder::default();
+    let error = decoder.push(&frame).expect_err("expected over-limit error");
     assert_eq!(
-        err,
+        error,
         FrameError::Oversized {
             declared: 16 * 1024 * 1024 + 1,
-            limit: 16 * 1024 * 1024
+            limit: 16 * 1024 * 1024,
         }
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Encode → decode roundtrip produces identical bytes
-// ---------------------------------------------------------------------------
-
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[test]
-fn roundtrip_client_hello_byte_exact() {
-    let row = load_corpus()
-        .into_iter()
-        .find(|r| r.kind == "client_hello")
-        .expect("client_hello row");
-    let original = hex_to_bytes(&row.frame_hex);
-    let msg = decode_client_message(&original, None).expect("decode");
-    let reencoded = encode_client_message(&msg, None).expect("encode");
-    assert_eq!(
-        reencoded, original,
-        "client hello roundtrip must be byte-exact"
-    );
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[test]
-fn roundtrip_server_hello_byte_exact() {
-    let row = load_corpus()
-        .into_iter()
-        .find(|r| r.kind == "server_hello")
-        .expect("server_hello row");
-    let original = hex_to_bytes(&row.frame_hex);
-    let msg = decode_server_message(&original, None).expect("decode");
-    let reencoded = encode_server_message(&msg, None).expect("encode");
-    assert_eq!(
-        reencoded, original,
-        "server hello roundtrip must be byte-exact"
-    );
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[test]
-fn roundtrip_server_hello_error_byte_exact() {
-    let row = load_corpus()
-        .into_iter()
-        .find(|r| r.kind == "server_hello_error")
-        .expect("server_hello_error row");
-    let original = hex_to_bytes(&row.frame_hex);
-    let msg = decode_server_message(&original, None).expect("decode");
-    let reencoded = encode_server_message(&msg, None).expect("encode");
-    assert_eq!(
-        reencoded, original,
-        "server hello error roundtrip must be byte-exact"
-    );
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[test]
-fn roundtrip_response_ok_byte_exact() {
-    let row = load_corpus()
-        .into_iter()
-        .find(|r| r.kind == "response_ok")
-        .expect("response_ok row");
-    let original = hex_to_bytes(&row.frame_hex);
-    let msg = decode_server_message(&original, None).expect("decode");
-    let reencoded = encode_server_message(&msg, None).expect("encode");
-    assert_eq!(
-        reencoded, original,
-        "response ok roundtrip must be byte-exact"
-    );
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[test]
-fn roundtrip_response_error_byte_exact() {
-    let row = load_corpus()
-        .into_iter()
-        .find(|r| r.kind == "response_error")
-        .expect("response_error row");
-    let original = hex_to_bytes(&row.frame_hex);
-    let msg = decode_server_message(&original, None).expect("decode");
-    let reencoded = encode_server_message(&msg, None).expect("encode");
-    assert_eq!(
-        reencoded, original,
-        "response error roundtrip must be byte-exact"
-    );
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[test]
-fn roundtrip_event_envelope_byte_exact() {
-    let row = load_corpus()
-        .into_iter()
-        .find(|r| r.kind == "event_envelope")
-        .expect("event_envelope row");
-    let original = hex_to_bytes(&row.frame_hex);
-    let msg = decode_server_message(&original, None).expect("decode");
-    let reencoded = encode_server_message(&msg, None).expect("encode");
-    assert_eq!(
-        reencoded, original,
-        "event envelope roundtrip must be byte-exact"
     );
 }
 
@@ -371,93 +259,75 @@ fn roundtrip_event_envelope_byte_exact() {
 // Incremental decoder
 // ---------------------------------------------------------------------------
 
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
-#[expect(clippy::panic, reason = "test assertion: unexpected message variant")]
 #[test]
 fn incremental_client_decoder_byte_by_byte() {
     let row = load_corpus()
         .into_iter()
-        .find(|r| r.kind == "client_hello")
+        .find(|row| row.kind == "client_hello")
         .expect("client_hello row");
     let frame = hex_to_bytes(&row.frame_hex);
-    let mut dec = create_client_message_decoder(None).expect("create decoder");
-    let mut msgs = Vec::new();
+    let mut decoder = create_client_message_decoder(None).expect("create decoder");
+    let mut messages = Vec::new();
     for byte in &frame {
-        msgs.extend(dec.push(std::slice::from_ref(byte)).expect("push"));
+        messages.extend(decoder.push(std::slice::from_ref(byte)).expect("push"));
     }
-    dec.end().expect("end");
-    assert_eq!(msgs.len(), 1);
-    match &msgs[0] {
-        ClientMessage::Hello { version } => assert_eq!(*version, PROTOCOL_VERSION),
-        other @ ClientMessage::Request { .. } => panic!("expected Hello, got {other:?}"),
-    }
+    decoder.end().expect("end");
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(
+        &messages[0],
+        ClientMessage::Hello { version } if *version == PROTOCOL_VERSION
+    ));
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
 #[test]
-fn incremental_server_decoder_multiple_frames() {
+fn incremental_server_decoder_multiple_v8_frames() {
     let corpus = load_corpus();
     let server_kinds = [
         "server_hello",
         "server_hello_error",
         "response_ok",
+        "response_null",
+        "response_absent",
         "response_error",
-        "event_envelope",
+        "service_update",
+        "attachment_null",
+        "attachment_session",
     ];
     let mut combined = Vec::new();
     for kind in &server_kinds {
-        let row = corpus.iter().find(|r| &r.kind == kind).expect("server row");
+        let row = corpus
+            .iter()
+            .find(|row| row.kind == *kind)
+            .expect("server row");
         combined.extend_from_slice(&hex_to_bytes(&row.frame_hex));
     }
-    let mut dec = create_server_message_decoder(None).expect("create decoder");
-    let msgs = dec.push(&combined).expect("push");
-    dec.end().expect("end");
-    assert_eq!(
-        msgs.len(),
-        server_kinds.len(),
-        "should decode all 5 server messages"
-    );
+    let mut decoder = create_server_message_decoder(None).expect("create decoder");
+    let messages = decoder.push(&combined).expect("push");
+    decoder.end().expect("end");
+    assert_eq!(messages.len(), server_kinds.len());
 }
 
 // ---------------------------------------------------------------------------
 // Typed error conditions
 // ---------------------------------------------------------------------------
 
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
 #[test]
 fn truncated_frame_errors() {
     let row = load_corpus()
         .into_iter()
-        .find(|r| r.kind == "client_hello")
+        .find(|row| row.kind == "client_hello")
         .expect("client_hello row");
     let frame = hex_to_bytes(&row.frame_hex);
-    // Truncate payload by one byte.
-    let truncated = &frame[..frame.len() - 1];
-    let err = decode_client_message(truncated, None).expect_err("expected error");
-    assert!(
-        matches!(err, CodecError::Frame(FrameError::NotOneCompletePayload)),
-        "got {err:?}"
-    );
+    let error = decode_client_message(&frame[..frame.len() - 1], None).expect_err("expected error");
+    assert!(matches!(
+        error,
+        CodecError::Frame(FrameError::NotOneCompletePayload)
+    ));
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
 #[test]
 fn unknown_discriminant_errors() {
-    // Construct a frame with an unknown `type` discriminant.
-    // CBOR: {"type": "bogus", "version": 1}
-    // Hand-crafted CBOR: map(2) { "type" → "bogus", "version" → 1 }
+    // CBOR: {"type": "bogus", "version": 1}.
     let cbor: &[u8] = &[
         0xa2, // map(2)
         0x64, b't', b'y', b'p', b'e', // "type"
@@ -465,66 +335,43 @@ fn unknown_discriminant_errors() {
         0x67, b'v', b'e', b'r', b's', b'i', b'o', b'n', // "version"
         0x01, // 1
     ];
-    let mut frame = Vec::new();
-    frame.extend_from_slice(&u32::try_from(cbor.len()).unwrap_or(0).to_be_bytes());
-    frame.extend_from_slice(cbor);
-    let err = decode_client_message(&frame, None).expect_err("expected error");
-    assert!(
-        matches!(err, CodecError::UnknownDiscriminant(_)),
-        "got {err:?}"
-    );
+    let error = decode_client_message(&encode_frame(cbor), None).expect_err("expected error");
+    assert!(matches!(error, CodecError::UnknownDiscriminant(_)));
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "test assertions: golden decode/encode must succeed"
-)]
 #[test]
-fn version_mismatch_errors() {
-    // Client hello with version 99.
-    use pi::remote::schemas::ClientMessage;
-    let msg = ClientMessage::Hello { version: 99 };
-    let frame = encode_client_message(&msg, None).expect("encode");
-    let err = decode_client_message(&frame, None).expect_err("expected error");
-    assert!(
-        matches!(
-            err,
-            CodecError::VersionMismatch {
-                expected: 1,
-                got: 99
-            }
-        ),
-        "got {err:?}"
-    );
+fn server_hello_version_mismatch_errors() {
+    let message = ServerMessage::Hello {
+        version: PROTOCOL_VERSION + 1,
+        server_id: pi::remote::schemas::ServerId::new(
+            "00000000-0000-4000-8000-000000000001",
+        )
+        .expect("canonical server id"),
+    };
+    let error = encode_server_message(&message, None).expect_err("expected version mismatch");
+    assert!(matches!(
+        error,
+        CodecError::VersionMismatch {
+            expected: PROTOCOL_VERSION,
+            got: 9,
+        }
+    ));
 }
 
 #[test]
 fn is_supported_protocol_version_works() {
-    assert!(is_supported_protocol_version(1));
-    assert!(!is_supported_protocol_version(0));
-    assert!(!is_supported_protocol_version(2));
+    assert!(is_supported_protocol_version(PROTOCOL_VERSION));
+    assert!(!is_supported_protocol_version(PROTOCOL_VERSION - 1));
+    assert!(!is_supported_protocol_version(PROTOCOL_VERSION + 1));
 }
 
 // ---------------------------------------------------------------------------
-// Absence witness: no ByteTransport / EndpointSpec / client-taxonomy symbols
+// Absence witness: no R3/R4 symbols are part of the codec surface
 // ---------------------------------------------------------------------------
 
 #[test]
 fn absence_witness_no_r3_r4_symbols() {
-    // This test asserts that the R1–R2 codec layer does not define or import
-    // any R3/R4 symbols (ByteTransport, factory, EndpointSpec, client-taxonomy).
-    // The mere fact that this compiles is the witness: those types do not
-    // exist in the `remote` module's public surface.
-    //
-    // If someone adds `pub struct ByteTransport` to codec/framing/schemas,
-    // this test should be updated to fail — but for now, the absence is
-    // proven by the module's public API containing only:
-    //   codec::{encode_*, decode_*, *Decoder, is_supported_protocol_version, CodecError}
-    //   framing::{encode_frame, assert_complete_frame, FrameDecoder, FrameError, ...}
-    //   schemas::{* message types *}
-    //
-    // We verify by checking that the module compiles with only these re-exports.
-    let _ = PROTOCOL_VERSION; // schemas accessible
+    let _ = PROTOCOL_VERSION;
     let _: fn(&[u8], Option<pi::remote::framing::FrameDecoderOptions>) -> Result<(), FrameError> =
         assert_complete_frame;
     let _: fn(&[u8]) -> Vec<u8> = encode_frame;

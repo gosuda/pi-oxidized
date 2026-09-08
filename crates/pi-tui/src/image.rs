@@ -4,9 +4,14 @@
 //! iTerm2 inline graphics. No stdin picker, no terminal writes — callers emit
 //! the returned bytes through frame annotations.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::terminal::caps::CellDimensions;
+use ratatui::layout::Rect;
+
+use crate::frame::RawRegion;
+use crate::terminal::caps::{CellDimensions, ImageProtocol};
 
 /// Image pixel dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +29,632 @@ pub struct ImageCellSize {
     pub columns: u16,
     /// Rows (character cells).
     pub rows: u16,
+}
+
+/// How a retained image should be emitted to the terminal.
+///
+/// `Upload` carries the complete image transmission. `Placement` references a
+/// Kitty image that the terminal already has in its image store and carries
+/// only a placement command. iTerm2 has no placement-only equivalent, so it
+/// always uses `Upload`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageEmission {
+    /// Upload image data and place it.
+    Upload,
+    /// Place an image that was uploaded previously.
+    Placement,
+}
+
+/// Errors raised while turning a native image or retained image line into a
+/// document image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageError {
+    /// The image payload is not valid standard base64.
+    InvalidEncoding,
+    /// The protocol controls are malformed or incomplete.
+    InvalidProtocol,
+    /// The image dimensions or cell placement are not positive.
+    InvalidDimensions,
+    /// The protocol sequence does not have a complete terminator.
+    InvalidTermination,
+    /// Kitty placement metadata was not sufficient to identify the image.
+    MissingMetadata,
+    /// The image's dimensions or memory accounting overflowed.
+    Overflow,
+}
+
+/// Metadata retained for a Kitty image upload.
+///
+/// This is the native equivalent of the metadata table used by the upstream
+/// terminal-image module. It lets retained raw lines recover pixel dimensions
+/// for checked viewport cropping without copying the image into a text row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KittyImageMetadata {
+    /// Kitty image identity.
+    pub image_id: u32,
+    /// Placement width in terminal columns.
+    pub columns: u16,
+    /// Placement height in terminal rows.
+    pub rows: u16,
+    /// Source image width in pixels.
+    pub width_px: u32,
+    /// Source image height in pixels.
+    pub height_px: u32,
+    /// Monotonic transmission generation.
+    pub transmission_generation: u64,
+}
+
+/// Options used by native image components when preparing a retained image.
+///
+/// This type is deliberately about validated native image preparation. There
+/// is no public constructor taking arbitrary encoded bytes; retained raw lines
+/// must go through [`DocumentImage::try_from_line`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DocumentImageOptions {
+    /// Maximum placement width in cells.
+    pub max_width_cells: Option<u16>,
+    /// Maximum placement height in cells.
+    pub max_height_cells: Option<u16>,
+    /// Optional filename for an image fallback.
+    pub filename: Option<String>,
+    /// Optional stable Kitty image id.
+    pub image_id: Option<u32>,
+    /// Native terminal image protocol selected for this preparation.
+    pub protocol: Option<ImageProtocol>,
+    /// Pixel dimensions of one terminal cell.
+    pub cell_dimensions: CellDimensions,
+}
+
+/// One validated, retained terminal image.
+///
+/// The payload, protocol sequence, placement metadata, and fallback are
+/// private by design. Consumers can borrow dimensions and ask this type for a
+/// checked [`RawRegion`], but cannot manufacture a region from arbitrary bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentImage {
+    protocol: Option<ImageProtocol>,
+    dimensions: ImageDimensions,
+    columns: u16,
+    rows: u16,
+    image_id: Option<u32>,
+    sequence: Arc<[u8]>,
+    fallback: Option<Arc<str>>,
+    transmission_generation: u64,
+    transmission_bytes: usize,
+    estimated_decoded_bytes: usize,
+}
+
+impl DocumentImage {
+    /// Prepare a document image from native component data.
+    ///
+    /// This is crate-visible rather than public: image components are the
+    /// authority allowed to introduce a payload into a retained document.
+    pub(crate) fn from_native(
+        base64_data: &str,
+        mime_type: &str,
+        dimensions: ImageDimensions,
+        options: &DocumentImageOptions,
+    ) -> Result<Self, ImageError> {
+        if options.protocol.is_some()
+            && (base64_data.is_empty() || decode_b64(base64_data).is_none())
+        {
+            return Err(ImageError::InvalidEncoding);
+        }
+        if mime_type.is_empty() || dimensions.width_px == 0 || dimensions.height_px == 0 {
+            return Err(ImageError::InvalidDimensions);
+        }
+        let cell = options.cell_dimensions;
+        let max_width = options.max_width_cells.unwrap_or(60).max(1);
+        let default_max_height = u32::from(max_width)
+            .checked_mul(u32::from(cell.width.max(1)))
+            .ok_or(ImageError::Overflow)?
+            .div_ceil(u32::from(cell.height.max(1)));
+        let default_max_height = u16::try_from(default_max_height.max(1))
+            .unwrap_or(u16::MAX)
+            .max(1);
+        let max_height = options.max_height_cells.unwrap_or(default_max_height).max(1);
+        let size = calculate_image_cell_size(
+            dimensions,
+            max_width,
+            Some(max_height),
+            cell,
+        );
+        let decoded_bytes = usize::try_from(
+            u128::from(dimensions.width_px)
+                .checked_mul(u128::from(dimensions.height_px))
+                .and_then(|v| v.checked_mul(4))
+                .ok_or(ImageError::Overflow)?,
+        )
+        .map_err(|_| ImageError::Overflow)?;
+        let transmission_generation = next_transmission_generation();
+        let (protocol, image_id, sequence) = match options.protocol {
+            Some(ImageProtocol::Kitty) => {
+                let image_id = options.image_id.unwrap_or_else(allocate_image_id);
+                validate_image_id(image_id)?;
+                let sequence = encode_kitty(
+                    base64_data,
+                    KittyEncodeOptions {
+                        columns: Some(size.columns),
+                        rows: Some(size.rows),
+                        image_id: Some(image_id),
+                        move_cursor: Some(false),
+                    },
+                );
+                register_kitty_image_metadata(KittyImageMetadata {
+                    image_id,
+                    columns: size.columns,
+                    rows: size.rows,
+                    width_px: dimensions.width_px,
+                    height_px: dimensions.height_px,
+                    transmission_generation,
+                });
+                (Some(ImageProtocol::Kitty), Some(image_id), sequence)
+            }
+            Some(ImageProtocol::ITerm2) => {
+                let sequence = encode_iterm2(
+                    base64_data,
+                    ITerm2EncodeOptions {
+                        width: Some(size.columns.to_string()),
+                        height: Some("auto".to_owned()),
+                        name: options.filename.clone(),
+                        preserve_aspect_ratio: None,
+                        inline: Some(true),
+                    },
+                );
+                (Some(ImageProtocol::ITerm2), None, sequence)
+            }
+            None => (None, None, String::new()),
+        };
+        let fallback = if protocol.is_none() {
+            Some(Arc::<str>::from(image_fallback(
+                mime_type,
+                Some(dimensions),
+                options.filename.as_deref(),
+            )))
+        } else {
+            None
+        };
+        Ok(Self {
+            protocol,
+            dimensions,
+            columns: size.columns,
+            rows: if protocol.is_none() { 1 } else { size.rows.max(1) },
+            image_id,
+            sequence: Arc::<[u8]>::from(sequence.into_bytes()),
+            fallback,
+            transmission_generation,
+            transmission_bytes: 0,
+            estimated_decoded_bytes: decoded_bytes,
+        }
+        .with_transmission_length())
+    }
+
+    /// Parse a complete retained image line using default cell dimensions.
+    pub(crate) fn try_from_line(line: &str) -> Result<Option<Self>, ImageError> {
+        Self::try_from_line_with_cell(line, CellDimensions::default())
+    }
+
+    /// Parse a complete retained image line with the measured cell size.
+    /// A non-image line returns `Ok(None)`. A line that starts or contains an
+    /// image introducer but fails protocol, payload, termination, or registered
+    /// Kitty metadata validation returns an error instead of becoming
+    /// searchable text.
+    pub(crate) fn try_from_line_with_cell(
+        line: &str,
+        cell: CellDimensions,
+    ) -> Result<Option<Self>, ImageError> {
+        if let Some(start) = line.find(KITTY_PREFIX) {
+            return parse_kitty_document_image(line, start).map(Some);
+        }
+        if let Some(start) = line.find(ITERM2_PREFIX) {
+            return parse_iterm2_document_image(line, start, cell).map(Some);
+        }
+        Ok(None)
+    }
+
+    /// Image protocol, or `None` for a validated text fallback.
+    #[must_use]
+    pub const fn protocol(&self) -> Option<ImageProtocol> {
+        self.protocol
+    }
+
+    /// Whether this image is rendered through its text fallback.
+    #[must_use]
+    pub const fn is_fallback(&self) -> bool {
+        self.protocol.is_none()
+    }
+
+    /// Borrow the validated fallback text, if this image has one.
+    #[must_use]
+    pub fn fallback_text(&self) -> Option<&str> {
+        self.fallback.as_deref()
+    }
+
+    /// Pixel dimensions of the source image.
+    #[must_use]
+    pub const fn dimensions(&self) -> ImageDimensions {
+        self.dimensions
+    }
+
+    /// Placement width in terminal columns.
+    #[must_use]
+    pub const fn columns(&self) -> u16 {
+        self.columns
+    }
+
+    /// Placement height in terminal rows.
+    #[must_use]
+    pub const fn rows(&self) -> u16 {
+        self.rows
+    }
+
+    /// Kitty image id, when this image has one.
+    #[must_use]
+    pub const fn image_id(&self) -> Option<u32> {
+        self.image_id
+    }
+
+    /// Native transmission generation used for cache identity.
+    #[must_use]
+    pub const fn transmission_generation(&self) -> u64 {
+        self.transmission_generation
+    }
+
+    /// Encoded transmission size used by the offscreen cache.
+    #[must_use]
+    pub const fn transmission_bytes(&self) -> usize {
+        self.transmission_bytes
+    }
+
+    /// Estimated decoded RGBA memory used by the offscreen cache.
+    #[must_use]
+    pub const fn estimated_decoded_bytes(&self) -> usize {
+        self.estimated_decoded_bytes
+    }
+
+    /// Build a frame annotation for a visible image slice.
+    ///
+    /// `hidden_rows` is the number of logical image rows above the viewport.
+    /// The source pixel rectangle uses checked floor/ceil mapping and the
+    /// placement controls are replaced atomically, never duplicated.
+    #[must_use]
+    pub fn raw_region(
+        &self,
+        area: Rect,
+        hidden_rows: usize,
+        visible_rows: usize,
+        emission: ImageEmission,
+    ) -> Option<RawRegion> {
+        if area.width == 0
+            || area.height == 0
+            || self.protocol.is_none()
+            || visible_rows == 0
+            || hidden_rows >= usize::from(self.rows)
+        {
+            return None;
+        }
+        let visible_rows = visible_rows.min(usize::from(self.rows) - hidden_rows);
+        let bytes = self.sequence_for_rows(hidden_rows, visible_rows, emission)?;
+        Some(RawRegion {
+            area,
+            bytes,
+            kitty_id: (self.protocol == Some(ImageProtocol::Kitty))
+                .then_some(self.image_id)
+                .flatten(),
+        })
+    }
+
+    /// Return a checked Kitty sequence for a logical image slice.
+    #[must_use]
+    pub(crate) fn sequence_for_rows(
+        &self,
+        hidden_rows: usize,
+        visible_rows: usize,
+        emission: ImageEmission,
+    ) -> Option<Vec<u8>> {
+        let protocol = self.protocol?;
+        if visible_rows == 0 || hidden_rows >= usize::from(self.rows) {
+            return None;
+        }
+        let visible_rows = visible_rows.min(usize::from(self.rows) - hidden_rows);
+        match protocol {
+            ImageProtocol::Kitty => {
+                let full = std::str::from_utf8(&self.sequence).ok()?;
+                let cropped = crop_kitty_image_line(full, hidden_rows, visible_rows);
+                if emission == ImageEmission::Upload {
+                    Some(cropped.into_bytes())
+                } else {
+                    Some(kitty_placement_from_line(
+                        &cropped,
+                        self.image_id?,
+                    )?
+                    .into_bytes())
+                }
+            }
+            ImageProtocol::ITerm2 => Some(self.sequence.to_vec()),
+        }
+    }
+
+    fn with_transmission_length(mut self) -> Self {
+        self.transmission_bytes = self.sequence.len();
+        self
+    }
+}
+
+/// An explicit deletion produced when a cached offscreen image is evicted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageCacheEviction {
+    /// Kitty image id to release.
+    pub image_id: u32,
+    /// Protocol bytes consumed by the writer's existing output stage.
+    pub deletion: Vec<u8>,
+    /// Transmission generation that was evicted.
+    pub transmission_generation: u64,
+}
+
+/// An upload required when a visible image generation is not cached.
+///
+/// The visible [`DocumentImage`] remains the single owner of its immutable
+/// sequence. The caller emits that sequence through `raw_region(Upload)`,
+/// which applies viewport cropping; this record only carries cache identity
+/// and admission bookkeeping, avoiding a second full-sequence allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageCacheUpload {
+    /// Kitty image id being uploaded.
+    pub image_id: u32,
+    /// Transmission generation represented by the upload.
+    pub transmission_generation: u64,
+    /// Encoded transmission length used for admission accounting.
+    pub transmission_bytes: usize,
+    /// Whether the image was admitted to the bounded cache.
+    pub cached: bool,
+}
+
+/// Output from one image-cache operation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImageCacheOutput {
+    /// Upload identities required by the current frame. Emit the corresponding
+    /// bytes once through [`DocumentImage::raw_region`] with `Upload`.
+    pub uploads: Vec<ImageCacheUpload>,
+    /// Deletions that must be staged before replacement/current-frame image
+    /// regions so an evicted id cannot delete a newly uploaded generation.
+    pub evictions: Vec<ImageCacheEviction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedKittyImage {
+    image_id: u32,
+    transmission_generation: u64,
+    transmission_bytes: usize,
+    estimated_decoded_bytes: usize,
+}
+
+/// Bounded cache for Kitty image uploads that are no longer visible.
+///
+/// The cache deliberately stores metadata only. The immutable upload remains
+/// owned by `DocumentImage`; the frame caller emits it through the checked
+/// [`DocumentImage::raw_region`] path.
+#[derive(Debug, Clone, Default)]
+pub struct KittyImageCache {
+    entries: VecDeque<CachedKittyImage>,
+    transmission_bytes: usize,
+    decoded_bytes: usize,
+}
+
+/// Maximum number of cached offscreen Kitty images.
+pub const MAX_CACHED_OFFSCREEN_KITTY_IMAGES: usize = 16;
+/// Maximum total encoded transmission bytes for cached offscreen images.
+pub const MAX_CACHED_OFFSCREEN_KITTY_TRANSMISSION_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum total estimated decoded bytes for cached offscreen images.
+pub const MAX_CACHED_OFFSCREEN_KITTY_DECODED_BYTES: usize = 64 * 1024 * 1024;
+
+impl KittyImageCache {
+    /// Create an empty bounded cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of image generations retained for upload/placement decisions.
+    ///
+    /// Visible entries remain tracked while they are on screen. The bounded
+    /// limits apply to entries that become offscreen, matching the upstream
+    /// cache rather than imposing a limit on one visible frame.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no image generation is retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Current encoded-byte total for retained offscreen entries.
+    #[must_use]
+    pub const fn transmission_bytes(&self) -> usize {
+        self.transmission_bytes
+    }
+
+    /// Current estimated decoded-byte total for retained offscreen entries.
+    #[must_use]
+    pub const fn decoded_bytes(&self) -> usize {
+        self.decoded_bytes
+    }
+
+    /// Prepare visible Kitty images and evict old offscreen entries.
+    ///
+    /// The iterator is the complete set of images visible in the next frame.
+    /// Existing uploads become placement-only at the caller's paint step;
+    /// unseen generations produce an upload. Entries are touched in iterator
+    /// order. Only entries that are not visible count toward the C-compatible
+    /// bounds and are eligible for eviction.
+    #[must_use]
+    pub fn prepare_frame<'a, I>(&mut self, visible: I) -> ImageCacheOutput
+    where
+        I: IntoIterator<Item = &'a DocumentImage>,
+    {
+        let visible: Vec<&DocumentImage> = visible
+            .into_iter()
+            .filter(|image| image.protocol == Some(ImageProtocol::Kitty))
+            .collect();
+        let visible_ids: Vec<u32> = visible.iter().filter_map(|image| image.image_id).collect();
+        let mut output = ImageCacheOutput::default();
+        let mut seen_ids = Vec::with_capacity(visible_ids.len());
+        for image in visible {
+            let Some(image_id) = image.image_id else {
+                continue;
+            };
+            if seen_ids.contains(&image_id) {
+                continue;
+            }
+            seen_ids.push(image_id);
+            let index = self.entries.iter().position(|entry| entry.image_id == image_id);
+            let current = index.and_then(|index| self.entries.get(index).copied());
+            if current.is_some_and(|entry| {
+                entry.transmission_generation == image.transmission_generation
+            }) {
+                if let Some(index) = index
+                    && let Some(entry) = self.entries.remove(index)
+                {
+                    self.entries.push_back(entry);
+                }
+                continue;
+            }
+            if let Some(index) = index
+                && let Some(old) = self.entries.remove(index)
+            {
+                output.evictions.push(cache_eviction(old));
+            }
+            let transmission_bytes = image.transmission_bytes;
+            let decoded_bytes = image.estimated_decoded_bytes;
+            let admissible = transmission_bytes <= MAX_CACHED_OFFSCREEN_KITTY_TRANSMISSION_BYTES
+                && decoded_bytes <= MAX_CACHED_OFFSCREEN_KITTY_DECODED_BYTES;
+            output.uploads.push(ImageCacheUpload {
+                image_id,
+                transmission_generation: image.transmission_generation,
+                transmission_bytes,
+                cached: admissible,
+            });
+            if admissible {
+                self.entries.push_back(CachedKittyImage {
+                    image_id,
+                    transmission_generation: image.transmission_generation,
+                    transmission_bytes,
+                    estimated_decoded_bytes: decoded_bytes,
+                });
+            }
+        }
+        self.evict_offscreen(&visible_ids, &mut output.evictions);
+        output
+    }
+
+    /// Prepare one visible image.
+    #[must_use]
+    pub fn prepare_image(&mut self, image: &DocumentImage) -> ImageCacheOutput {
+        self.prepare_frame(std::iter::once(image))
+    }
+
+    /// Whether this exact image generation is currently uploaded/cached.
+    #[must_use]
+    pub fn is_uploaded(&self, image: &DocumentImage) -> bool {
+        image.protocol == Some(ImageProtocol::Kitty)
+            && image.image_id.is_some_and(|image_id| {
+                self.entries.iter().any(|entry| {
+                    entry.image_id == image_id
+                        && entry.transmission_generation == image.transmission_generation
+                })
+            })
+    }
+
+    /// Select upload versus placement for an image after [`Self::prepare_frame`].
+    ///
+    /// A visible image included in this output must use `Upload` even though
+    /// it is now retained in cache metadata; only a prior generation may use
+    /// a placement-only command.
+    #[must_use]
+    pub fn emission_for(
+        &self,
+        image: &DocumentImage,
+        output: &ImageCacheOutput,
+    ) -> ImageEmission {
+        if image.protocol != Some(ImageProtocol::Kitty)
+            || output.uploads.iter().any(|upload| {
+                Some(upload.image_id) == image.image_id
+                    && upload.transmission_generation == image.transmission_generation
+            })
+            || !self.is_uploaded(image)
+        {
+            ImageEmission::Upload
+        } else {
+            ImageEmission::Placement
+        }
+    }
+
+    /// Release all cached image ids for a mode/session transition.
+    #[must_use]
+    pub fn clear(&mut self) -> Vec<ImageCacheEviction> {
+        let evictions = self.entries.iter().copied().map(cache_eviction).collect();
+        self.entries.clear();
+        self.transmission_bytes = 0;
+        self.decoded_bytes = 0;
+        evictions
+    }
+
+    fn evict_offscreen(
+        &mut self,
+        visible_ids: &[u32],
+        evictions: &mut Vec<ImageCacheEviction>,
+    ) {
+        loop {
+            let mut offscreen_count: usize = 0;
+            let mut transmission_bytes: usize = 0;
+            let mut decoded_bytes: usize = 0;
+            for entry in &self.entries {
+                if visible_ids.contains(&entry.image_id) {
+                    continue;
+                }
+                offscreen_count = offscreen_count.saturating_add(1);
+                transmission_bytes = transmission_bytes.saturating_add(entry.transmission_bytes);
+                decoded_bytes = decoded_bytes.saturating_add(entry.estimated_decoded_bytes);
+            }
+            self.transmission_bytes = transmission_bytes;
+            self.decoded_bytes = decoded_bytes;
+            if offscreen_count <= MAX_CACHED_OFFSCREEN_KITTY_IMAGES
+                && transmission_bytes <= MAX_CACHED_OFFSCREEN_KITTY_TRANSMISSION_BYTES
+                && decoded_bytes <= MAX_CACHED_OFFSCREEN_KITTY_DECODED_BYTES
+            {
+                break;
+            }
+            let Some(index) = self
+                .entries
+                .iter()
+                .position(|entry| !visible_ids.contains(&entry.image_id))
+            else {
+                break;
+            };
+            if let Some(old) = self.entries.remove(index) {
+                evictions.push(cache_eviction(old));
+            }
+        }
+    }
+}
+
+fn cache_eviction(entry: CachedKittyImage) -> ImageCacheEviction {
+    ImageCacheEviction {
+        image_id: entry.image_id,
+        deletion: delete_kitty_image(entry.image_id).into_bytes(),
+        transmission_generation: entry.transmission_generation,
+    }
+}
+
+fn validate_image_id(image_id: u32) -> Result<(), ImageError> {
+    if (1..=MAX_IMAGE_ID).contains(&image_id) {
+        Ok(())
+    } else {
+        Err(ImageError::InvalidProtocol)
+    }
 }
 
 /// Options for [`encode_kitty`].
@@ -135,6 +766,12 @@ pub fn delete_kitty_image(image_id: u32) -> String {
 #[must_use]
 pub fn delete_all_kitty_images() -> String {
     "\u{1b}_Ga=d,d=A,q=2\u{1b}\\".to_owned()
+}
+
+/// Delete all visible Kitty placements while retaining uploaded image data.
+#[must_use]
+pub fn delete_all_kitty_placements() -> String {
+    "\u{1b}_Ga=d,d=a,q=2\u{1b}\\".to_owned()
 }
 
 /// Encode a base64 payload as an iTerm2 inline file transfer (`OSC 1337`).
@@ -434,7 +1071,448 @@ fn decode_b64(data: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(data).ok()
 }
 
+const KITTY_PREFIX: &str = "\u{1b}_G";
+const ITERM2_PREFIX: &str = "\u{1b}]1337;File=";
+const ST: &str = "\u{1b}\\";
+const BEL: char = '\u{7}';
+
+static KITTY_METADATA: LazyLock<Mutex<Vec<KittyImageMetadata>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static NEXT_TRANSMISSION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn metadata_table() -> &'static Mutex<Vec<KittyImageMetadata>> {
+    &KITTY_METADATA
+}
+
+fn next_transmission_generation() -> u64 {
+    NEXT_TRANSMISSION_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Register metadata for a native Kitty upload.
+///
+/// The table is bounded and process-local. It exists only so a retained line
+/// can recover the source pixel dimensions needed by viewport cropping.
+pub(crate) fn register_kitty_image_metadata(metadata: KittyImageMetadata) {
+    if validate_image_id(metadata.image_id).is_err()
+        || metadata.columns == 0
+        || metadata.rows == 0
+        || metadata.width_px == 0
+        || metadata.height_px == 0
+    {
+        return;
+    }
+    let Ok(mut table) = metadata_table().lock() else {
+        return;
+    };
+    table.retain(|entry| entry.image_id != metadata.image_id);
+    table.push(metadata);
+    if table.len() > 1024 {
+        let excess = table.len().saturating_sub(1024);
+        table.drain(..excess);
+    }
+}
+
+fn kitty_metadata(image_id: u32) -> Option<KittyImageMetadata> {
+    metadata_table()
+        .lock()
+        .ok()
+        .and_then(|table| table.iter().rev().find(|entry| entry.image_id == image_id).copied())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KittyHeader {
+    controls_start: usize,
+    controls_end: usize,
+    sequence_end: usize,
+    columns: u16,
+    rows: u16,
+    image_id: u32,
+    dimensions: ImageDimensions,
+    transmission_generation: u64,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Kitty header validation keeps chunk and metadata invariants together"
+)]
+fn parse_kitty_header(line: &str, start: usize) -> Result<KittyHeader, ImageError> {
+    if !line
+        .get(start..)
+        .is_some_and(|tail| tail.starts_with(KITTY_PREFIX))
+    {
+        return Err(ImageError::InvalidProtocol);
+    }
+    let controls_start = start
+        .checked_add(KITTY_PREFIX.len())
+        .ok_or(ImageError::Overflow)?;
+    let controls_end = line
+        .get(controls_start..)
+        .and_then(|rest| rest.find(';'))
+        .and_then(|offset| controls_start.checked_add(offset))
+        .ok_or(ImageError::InvalidTermination)?;
+    let controls = line
+        .get(controls_start..controls_end)
+        .ok_or(ImageError::InvalidProtocol)?;
+    let parsed = parse_controls(controls)?;
+    if !parsed
+        .iter()
+        .any(|(key, value)| *key == "a" && *value == "T")
+    {
+        return Err(ImageError::InvalidProtocol);
+    }
+    let _line_columns = parse_positive_u16(find_control(&parsed, "c"))?;
+    let _line_rows = parse_positive_u16(find_control(&parsed, "r"))?;
+    let image_id = parse_positive_u32(find_control(&parsed, "i"))?;
+    if let Some(marker) = find_control(&parsed, "m")
+        && marker != "0"
+        && marker != "1"
+    {
+        return Err(ImageError::InvalidProtocol);
+    }
+    let metadata = kitty_metadata(image_id).ok_or(ImageError::MissingMetadata)?;
+    let columns = metadata.columns;
+    let rows = metadata.rows;
+
+    let mut sequence_end = controls_end
+        .checked_add(1)
+        .ok_or(ImageError::Overflow)?;
+    let mut current_controls = controls;
+    loop {
+        let terminator_offset = line
+            .get(sequence_end..)
+            .and_then(|rest| rest.find(ST))
+            .ok_or(ImageError::InvalidTermination)?;
+        let terminator = sequence_end
+            .checked_add(terminator_offset)
+            .ok_or(ImageError::Overflow)?;
+        let payload = line
+            .get(sequence_end..terminator)
+            .ok_or(ImageError::InvalidProtocol)?;
+        if payload.is_empty() || decode_b64(payload).is_none() {
+            return Err(ImageError::InvalidEncoding);
+        }
+        sequence_end = terminator
+            .checked_add(ST.len())
+            .ok_or(ImageError::Overflow)?;
+        if find_control_in_str(current_controls, "m") != Some("1") {
+            break;
+        }
+        if !line
+            .get(sequence_end..)
+            .is_some_and(|tail| tail.starts_with(KITTY_PREFIX))
+        {
+            return Err(ImageError::InvalidTermination);
+        }
+        let continuation_controls_start = sequence_end
+            .checked_add(KITTY_PREFIX.len())
+            .ok_or(ImageError::Overflow)?;
+        let continuation_controls_end = line
+            .get(continuation_controls_start..)
+            .and_then(|rest| rest.find(';'))
+            .and_then(|offset| continuation_controls_start.checked_add(offset))
+            .ok_or(ImageError::InvalidTermination)?;
+        current_controls = line
+            .get(continuation_controls_start..continuation_controls_end)
+            .ok_or(ImageError::InvalidProtocol)?;
+        let continuation = parse_controls(current_controls)?;
+        let marker = find_control(&continuation, "m").ok_or(ImageError::InvalidProtocol)?;
+        if marker != "0" && marker != "1" {
+            return Err(ImageError::InvalidProtocol);
+        }
+        sequence_end = continuation_controls_end
+            .checked_add(1)
+            .ok_or(ImageError::Overflow)?;
+    }
+    let dimensions = ImageDimensions {
+        width_px: metadata.width_px,
+        height_px: metadata.height_px,
+    };
+    if dimensions.width_px == 0 || dimensions.height_px == 0 {
+        return Err(ImageError::InvalidDimensions);
+    }
+    Ok(KittyHeader {
+        controls_start,
+        controls_end,
+        sequence_end,
+        columns,
+        rows,
+        image_id,
+        dimensions,
+        transmission_generation: metadata.transmission_generation,
+    })
+}
+
+fn parse_kitty_document_image(line: &str, start: usize) -> Result<DocumentImage, ImageError> {
+    let header = parse_kitty_header(line, start)?;
+    let sequence = line
+        .get(start..header.sequence_end)
+        .ok_or(ImageError::InvalidProtocol)?;
+    let decoded_bytes = usize::try_from(
+        u128::from(header.dimensions.width_px)
+            .checked_mul(u128::from(header.dimensions.height_px))
+            .and_then(|v| v.checked_mul(4))
+            .ok_or(ImageError::Overflow)?,
+    )
+    .map_err(|_| ImageError::Overflow)?;
+    Ok(DocumentImage {
+        protocol: Some(ImageProtocol::Kitty),
+        dimensions: header.dimensions,
+        columns: header.columns,
+        rows: header.rows,
+        image_id: Some(header.image_id),
+        sequence: Arc::<[u8]>::from(sequence.as_bytes()),
+        fallback: None,
+        transmission_generation: header.transmission_generation,
+        transmission_bytes: sequence.len(),
+        estimated_decoded_bytes: decoded_bytes,
+    })
+}
+
+fn parse_iterm2_document_image(
+    line: &str,
+    start: usize,
+    cell: CellDimensions,
+) -> Result<DocumentImage, ImageError> {
+    let payload_start = start
+        .checked_add(ITERM2_PREFIX.len())
+        .ok_or(ImageError::Overflow)?;
+    let controls_end = line
+        .get(payload_start..)
+        .and_then(|rest| rest.find(':'))
+        .and_then(|offset| payload_start.checked_add(offset))
+        .ok_or(ImageError::InvalidProtocol)?;
+    let terminator = line
+        .get(controls_end.checked_add(1).ok_or(ImageError::Overflow)?..)
+        .and_then(|rest| {
+            let bel = rest.find(BEL);
+            let st = rest.find(ST);
+            match (bel, st) {
+                (Some(bel), Some(st)) => Some(bel.min(st)),
+                (Some(bel), None) => Some(bel),
+                (None, Some(st)) => Some(st),
+                (None, None) => None,
+            }
+        })
+        .and_then(|offset| controls_end.checked_add(1 + offset))
+        .ok_or(ImageError::InvalidTermination)?;
+    let controls = line
+        .get(payload_start..controls_end)
+        .ok_or(ImageError::InvalidProtocol)?;
+    let payload = line
+        .get(controls_end.checked_add(1).ok_or(ImageError::Overflow)?..terminator)
+        .ok_or(ImageError::InvalidProtocol)?;
+    if payload.is_empty() || decode_b64(payload).is_none() {
+        return Err(ImageError::InvalidEncoding);
+    }
+    let parsed = parse_iterm_controls(controls)?;
+    let width_cells = parse_cell_control(find_control(&parsed, "width"))?.unwrap_or(1);
+    let height_cells = parse_cell_control(find_control(&parsed, "height"))?.unwrap_or(1);
+    let dimensions = ImageDimensions {
+        width_px: width_cells
+            .checked_mul(u32::from(cell.width.max(1)))
+            .ok_or(ImageError::Overflow)?,
+        height_px: height_cells
+            .checked_mul(u32::from(cell.height.max(1)))
+            .ok_or(ImageError::Overflow)?,
+    };
+    let filename = match find_control(&parsed, "name") {
+        Some(name) => {
+            let filename = String::from_utf8(
+                decode_b64(name).ok_or(ImageError::InvalidEncoding)?,
+            )
+            .map_err(|_| ImageError::InvalidEncoding)?;
+            if filename.chars().any(char::is_control) {
+                return Err(ImageError::InvalidProtocol);
+            }
+            Some(filename)
+        }
+        None => None,
+    };
+    let fallback = image_fallback(
+        "image/unknown",
+        Some(dimensions),
+        filename.as_deref(),
+    );
+    let decoded_bytes = usize::try_from(
+        u128::from(dimensions.width_px)
+            .checked_mul(u128::from(dimensions.height_px))
+            .and_then(|v| v.checked_mul(4))
+            .ok_or(ImageError::Overflow)?,
+    )
+    .map_err(|_| ImageError::Overflow)?;
+    // Fullscreen deliberately disables iTerm2 images. Keep the actual native
+    // fallback as a retained image instead of classifying the sequence as text.
+    Ok(DocumentImage {
+        protocol: None,
+        dimensions,
+        columns: u16::try_from(width_cells).unwrap_or(u16::MAX).max(1),
+        rows: 1,
+        image_id: None,
+        sequence: Arc::<[u8]>::from([]),
+        fallback: Some(Arc::<str>::from(fallback)),
+        transmission_generation: next_transmission_generation(),
+        transmission_bytes: 0,
+        estimated_decoded_bytes: decoded_bytes,
+    })
+}
+
+fn parse_controls(controls: &str) -> Result<Vec<(&str, &str)>, ImageError> {
+    if controls.is_empty() {
+        return Err(ImageError::InvalidProtocol);
+    }
+    controls
+        .split(',')
+        .map(|control| {
+            let (key, value) = control.split_once('=').ok_or(ImageError::InvalidProtocol)?;
+            if key.is_empty() || value.is_empty() {
+                return Err(ImageError::InvalidProtocol);
+            }
+            Ok((key, value))
+        })
+        .collect()
+}
+
+fn parse_iterm_controls(controls: &str) -> Result<Vec<(&str, &str)>, ImageError> {
+    if controls.is_empty() {
+        return Err(ImageError::InvalidProtocol);
+    }
+    controls
+        .split(';')
+        .map(|control| {
+            let (key, value) = control.split_once('=').ok_or(ImageError::InvalidProtocol)?;
+            if key.is_empty() || value.is_empty() {
+                return Err(ImageError::InvalidProtocol);
+            }
+            Ok((key, value))
+        })
+        .collect()
+}
+
+fn find_control<'a>(controls: &'a [(&'a str, &'a str)], key: &str) -> Option<&'a str> {
+    controls
+        .iter()
+        .find_map(|(candidate, value)| (*candidate == key).then_some(*value))
+}
+
+fn find_control_in_str<'a>(controls: &'a str, key: &str) -> Option<&'a str> {
+    controls.split(',').find_map(|control| {
+        let (candidate, value) = control.split_once('=')?;
+        (candidate == key).then_some(value)
+    })
+}
+
+fn parse_positive_u16(value: Option<&str>) -> Result<u16, ImageError> {
+    let value = value.ok_or(ImageError::MissingMetadata)?;
+    let parsed = value.parse::<u16>().map_err(|_| ImageError::InvalidDimensions)?;
+    (parsed > 0).then_some(parsed).ok_or(ImageError::InvalidDimensions)
+}
+
+fn parse_positive_u32(value: Option<&str>) -> Result<u32, ImageError> {
+    let value = value.ok_or(ImageError::MissingMetadata)?;
+    let parsed = value.parse::<u32>().map_err(|_| ImageError::InvalidProtocol)?;
+    validate_image_id(parsed)?;
+    Ok(parsed)
+}
+
+fn parse_cell_control(value: Option<&str>) -> Result<Option<u32>, ImageError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value == "auto" {
+        return Ok(None);
+    }
+    let parsed = value.parse::<u32>().map_err(|_| ImageError::InvalidDimensions)?;
+    (parsed > 0)
+        .then_some(Some(parsed))
+        .ok_or(ImageError::InvalidDimensions)
+}
+
+///
+/// The returned line is unchanged when it is not a complete Kitty upload, the
+/// requested rows are already fully visible, or the slice is outside the
+/// image. This mirrors the upstream helper while using checked `u128`
+/// arithmetic for floor/ceil source-pixel mapping.
+#[must_use]
+pub fn crop_kitty_image_line(line: &str, hidden_rows: usize, visible_rows: usize) -> String {
+    let Some(start) = line.find(KITTY_PREFIX) else {
+        return line.to_owned();
+    };
+    let Ok(header) = parse_kitty_header(line, start) else {
+        return line.to_owned();
+    };
+    let image_rows = usize::from(header.rows);
+    if hidden_rows >= image_rows || visible_rows == 0 {
+        return line.to_owned();
+    }
+    let cropped_rows = visible_rows.min(image_rows - hidden_rows);
+    if hidden_rows == 0 && cropped_rows == image_rows {
+        return line.to_owned();
+    }
+    let image_height = u128::from(header.dimensions.height_px);
+    let hidden = u128::try_from(hidden_rows).unwrap_or(u128::MAX);
+    let rows = u128::from(header.rows);
+    let Some(source_y) = image_height
+        .checked_mul(hidden)
+        .map(|numerator| numerator / rows)
+    else {
+        return line.to_owned();
+    };
+    let visible_end = hidden_rows.saturating_add(cropped_rows);
+    let visible_end = u128::try_from(visible_end).unwrap_or(u128::MAX);
+    let Some(source_end) = image_height
+        .checked_mul(visible_end)
+        .map(|numerator| numerator.div_ceil(rows))
+    else {
+        return line.to_owned();
+    };
+    let source_y = source_y.min(image_height);
+    let source_end = source_end.min(image_height);
+    let source_height = source_end.saturating_sub(source_y).max(1);
+    let Some(controls) = line.get(header.controls_start..header.controls_end) else {
+        return line.to_owned();
+    };
+    let mut replaced: Vec<String> = controls
+        .split(',')
+        .filter(|control| {
+            let key = control.split_once('=').map_or(*control, |(key, _)| key);
+            !matches!(key, "y" | "h" | "r")
+        })
+        .map(str::to_owned)
+        .collect();
+    replaced.push(format!("y={source_y}"));
+    replaced.push(format!("h={source_height}"));
+    replaced.push(format!("r={cropped_rows}"));
+    let replacement = replaced.join(",");
+    let mut output = String::with_capacity(line.len() + replacement.len());
+    output.push_str(&line[..header.controls_start]);
+    output.push_str(&replacement);
+    output.push_str(&line[header.controls_end..]);
+    output
+}
+
+fn kitty_placement_from_line(line: &str, image_id: u32) -> Option<String> {
+    let start = line.find(KITTY_PREFIX)?;
+    let controls_start = start.checked_add(KITTY_PREFIX.len())?;
+    let controls_end = line.get(controls_start..)?.find(';')?.checked_add(controls_start)?;
+    let controls = line.get(controls_start..controls_end)?;
+    let mut placement = vec!["a=p".to_owned(), "q=2".to_owned()];
+    for control in controls.split(',') {
+        let key = control.split_once('=').map_or(control, |(key, _)| key);
+        if matches!(
+            key,
+            "i" | "p" | "x" | "y" | "w" | "h" | "X" | "Y" | "c" | "r" | "C" | "U" | "z"
+                | "P" | "Q" | "H" | "V"
+        ) {
+            placement.push(control.to_owned());
+        }
+    }
+    if !placement.iter().any(|control| control.starts_with("i=")) {
+        placement.push(format!("i={image_id}"));
+    }
+    Some(format!("{KITTY_PREFIX}{}\u{1b}\\", placement.join(",")))
+}
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "unit tests use contextual failure messages")]
 mod tests {
     use super::*;
     use base64::Engine as _;
@@ -525,6 +1603,10 @@ mod tests {
     fn delete_kitty_goldens() {
         assert_eq!(delete_kitty_image(42), "\u{1b}_Ga=d,d=I,i=42,q=2\u{1b}\\");
         assert_eq!(delete_all_kitty_images(), "\u{1b}_Ga=d,d=A,q=2\u{1b}\\");
+        assert_eq!(
+            delete_all_kitty_placements(),
+            "\u{1b}_Ga=d,d=a,q=2\u{1b}\\"
+        );
     }
 
     #[test]
@@ -720,5 +1802,137 @@ mod tests {
             })
         );
         assert!(get_image_dimensions(&b64, "image/unknown").is_none());
+    }
+
+    #[test]
+    fn kitty_crop_replaces_source_controls() {
+        let image_id = 0x1020;
+        register_kitty_image_metadata(KittyImageMetadata {
+            image_id,
+            columns: 4,
+            rows: 4,
+            width_px: 80,
+            height_px: 100,
+            transmission_generation: 1,
+        });
+        let line = encode_kitty(
+            "AAAA",
+            KittyEncodeOptions {
+                columns: Some(4),
+                rows: Some(4),
+                image_id: Some(image_id),
+                ..KittyEncodeOptions::default()
+            },
+        );
+        let cropped = crop_kitty_image_line(&line, 1, 2);
+        assert!(cropped.contains("y=25"));
+        assert!(cropped.contains("h=50"));
+        assert!(cropped.contains("r=2"));
+        assert_eq!(cropped.matches(",r=").count(), 1);
+        assert_eq!(cropped.matches(",h=").count(), 1);
+        let parsed = DocumentImage::try_from_line(&cropped)
+            .expect("cropped Kitty line remains valid")
+            .expect("cropped image line");
+        assert_eq!(parsed.rows(), 4);
+    }
+
+    #[test]
+    fn kitty_cache_emits_bounded_evictions() {
+        let mut cache = KittyImageCache::new();
+        let images: Vec<DocumentImage> = (1..=17)
+            .map(|image_id| {
+                DocumentImage::from_native(
+                    "AAAA",
+                    "image/png",
+                    ImageDimensions {
+                        width_px: 8,
+                        height_px: 8,
+                    },
+                    &DocumentImageOptions {
+                        max_width_cells: Some(2),
+                        max_height_cells: Some(1),
+                        image_id: Some(image_id),
+                        protocol: Some(ImageProtocol::Kitty),
+                        ..DocumentImageOptions::default()
+                    },
+                )
+                .expect("valid native image")
+            })
+            .collect();
+        let first = cache.prepare_frame(images.iter());
+        assert_eq!(first.uploads.len(), images.len());
+        assert!(first.evictions.is_empty());
+        assert_eq!(cache.transmission_bytes(), 0);
+        let second = cache.prepare_frame(images.iter());
+        assert!(second.uploads.is_empty());
+        assert_eq!(
+            cache.emission_for(&images[0], &second),
+            ImageEmission::Placement
+        );
+        let evictions = cache
+            .prepare_frame(std::iter::empty::<&DocumentImage>())
+            .evictions;
+        assert_eq!(cache.len(), MAX_CACHED_OFFSCREEN_KITTY_IMAGES);
+        assert_eq!(evictions[0].deletion, delete_kitty_image(1).into_bytes());
+    }
+
+    #[test]
+    fn retained_iterm2_line_becomes_validated_fallback() {
+        let line = encode_iterm2(
+            "AAAA",
+            ITerm2EncodeOptions {
+                width: Some("2".to_owned()),
+                height: Some("auto".to_owned()),
+                name: Some("pic.png".to_owned()),
+                ..ITerm2EncodeOptions::default()
+            },
+        );
+        let image = DocumentImage::try_from_line(&line)
+            .expect("valid iTerm2 line")
+            .expect("image line");
+        assert!(image.is_fallback());
+        assert_eq!(image.protocol(), None);
+        assert_eq!(image.rows(), 1);
+        assert_eq!(image.transmission_bytes(), 0);
+        assert!(
+            image
+                .fallback_text()
+                .is_some_and(|text| text.contains("pic.png"))
+        );
+    }
+
+    #[test]
+    fn retained_image_line_requires_protocol_metadata_and_termination() {
+        register_kitty_image_metadata(KittyImageMetadata {
+            image_id: 0x2222,
+            columns: 2,
+            rows: 3,
+            width_px: 18,
+            height_px: 54,
+            transmission_generation: 7,
+        });
+        let line = encode_kitty(
+            "AAAA",
+            KittyEncodeOptions {
+                columns: Some(2),
+                rows: Some(3),
+                image_id: Some(0x2222),
+                ..KittyEncodeOptions::default()
+            },
+        );
+        let image = DocumentImage::try_from_line(&line)
+            .expect("valid Kitty line")
+            .expect("image line");
+        assert_eq!(image.columns(), 2);
+        assert_eq!(image.rows(), 3);
+        assert_eq!(image.image_id(), Some(0x2222));
+        assert!(DocumentImage::try_from_line("plain text")
+            .expect("plain text classification")
+            .is_none());
+        let malformed = line.trim_end_matches("\u{1b}\\");
+        assert_eq!(
+            DocumentImage::try_from_line(malformed),
+            Err(ImageError::InvalidTermination)
+        );
     }
 }

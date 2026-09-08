@@ -5,13 +5,13 @@
 //! `bash-execution.ts`, `custom-message.ts`, `compaction-summary-message.ts`,
 //! `branch-summary-message.ts`, and `skill-invocation-message.ts` into pure
 //! view-models that build pi-tui components for composition.
-
 use std::collections::BTreeMap;
 
 use pi_ai::{AssistantContent, AssistantMessage, StopReason};
-use pi_tui::component::Component;
+use pi_tui::component::{
+    Component, DisplayRowSpan, EventResult, RowSourceError, UiEvent,
+};
 use pi_tui::components::{Markdown, Rail, Spacer, Text};
-
 use super::theme::{self, MarkdownTheme, ResolvedTheme, ThemeColor, user_markdown_options};
 use super::tool_renderer::{ToolPhase, ToolState};
 /// Shared left-edge indent for unrailed content (column 2; D3).
@@ -41,7 +41,7 @@ pub enum MessageView {
     /// User-authored message.
     User(UserMessageView),
     /// Assistant message (text + thinking + stop-reason errors).
-    Assistant(Box<AssistantMessageView>),
+    Assistant(AssistantMessageView),
     /// Tool execution block.
     Tool(ToolMessageView),
     /// Bash execution (`!`/`!!`) block.
@@ -144,12 +144,12 @@ impl MessageView {
     /// Build a streaming assistant tail view-model.
     #[must_use]
     pub fn streaming_assistant(message: AssistantMessage) -> Self {
-        Self::Assistant(Box::new(AssistantMessageView {
+        Self::Assistant(AssistantMessageView {
             message,
             hide_thinking: false,
             hidden_thinking_label: "Thinking…".to_owned(),
             streaming: true,
-        }))
+        })
     }
 }
 
@@ -582,9 +582,16 @@ fn custom_text_style() -> pi_tui::components::DefaultTextStyle {
 // ---------------------------------------------------------------------------
 
 /// Vertical stack of components; measure = sum of child heights, render stacks
-/// top-to-bottom. Used to assemble multi-block message bodies.
+/// top-to-bottom. Used to assemble multi-block message bodies and as a
+/// retained row source for the fullscreen transcript.
 pub struct ColumnStack {
     children: Vec<Box<dyn Component>>,
+    prepared: Option<PreparedRows>,
+}
+
+struct PreparedRows {
+    prefixes: Vec<usize>,
+    width: u16,
 }
 
 impl ColumnStack {
@@ -593,12 +600,14 @@ impl ColumnStack {
     pub fn new() -> Self {
         Self {
             children: Vec::new(),
+            prepared: None,
         }
     }
 
     /// Push a child.
     pub fn push(&mut self, child: Box<dyn Component>) {
         self.children.push(child);
+        self.prepared = None;
     }
 
     /// Whether the stack has no children.
@@ -636,30 +645,91 @@ impl Component for ColumnStack {
                 x: area.x,
                 y,
                 width: area.width,
-                height: h,
+                height: h.min(area.bottom().saturating_sub(y)),
             };
+            if row.height == 0 {
+                break;
+            }
             child.render(row, buf);
-            y = y.saturating_add(h);
-            if y >= area.y.saturating_add(area.height) {
+            y = y.saturating_add(row.height);
+            if y >= area.bottom() {
                 break;
             }
         }
     }
 
-    fn handle_event(
-        &mut self,
-        event: &pi_tui::component::UiEvent,
-    ) -> pi_tui::component::EventResult {
+    fn handle_event(&mut self, event: &UiEvent) -> EventResult {
         let _ = event;
-        pi_tui::component::EventResult::Ignored
+        EventResult::Ignored
     }
 
     fn invalidate(&mut self) {
-        for c in &mut self.children {
-            c.invalidate();
+        self.prepared = None;
+        for child in &mut self.children {
+            child.invalidate();
         }
     }
+
+    fn prepare_rows(&mut self, width: u16) -> Result<usize, RowSourceError> {
+        if width == 0 {
+            self.prepared = Some(PreparedRows {
+                prefixes: vec![0; self.children.len()],
+                width,
+            });
+            return Ok(0);
+        }
+
+        let mut prefixes = Vec::with_capacity(self.children.len());
+        let mut total = 0usize;
+        for child in &mut self.children {
+            let rows = match child.prepare_rows(width) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    self.prepared = None;
+                    for child in &mut self.children {
+                        child.invalidate();
+                    }
+                    return Err(error);
+                }
+            };
+            total = total
+                .checked_add(rows)
+                .ok_or(RowSourceError::RowCountOverflow)?;
+            prefixes.push(total);
+        }
+        self.prepared = Some(PreparedRows { prefixes, width });
+        Ok(total)
+    }
+
+    fn visit_row(
+        &self,
+        row: usize,
+        emit: &mut dyn FnMut(DisplayRowSpan<'_>),
+    ) -> Result<(), RowSourceError> {
+        let prepared = self.prepared.as_ref().ok_or(RowSourceError::NotPrepared)?;
+        if prepared.width == 0 {
+            return Err(RowSourceError::RowOutOfBounds { row, rows: 0 });
+        }
+        let rows = prepared.prefixes.last().copied().unwrap_or(0);
+        if row >= rows {
+            return Err(RowSourceError::RowOutOfBounds { row, rows });
+        }
+        let child_index = prepared.prefixes.partition_point(|end| *end <= row);
+        let child_start = child_index
+            .checked_sub(1)
+            .and_then(|index| prepared.prefixes.get(index).copied())
+            .unwrap_or(0);
+        let child_row = row
+            .checked_sub(child_start)
+            .ok_or(RowSourceError::RowCountOverflow)?;
+        let child = self
+            .children
+            .get(child_index)
+            .ok_or(RowSourceError::RowOutOfBounds { row, rows })?;
+        child.visit_row(child_row, emit)
+    }
 }
+
 
 #[cfg(test)]
 mod tests {

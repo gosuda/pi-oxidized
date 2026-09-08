@@ -3,8 +3,9 @@
  * PAR-WIRE fixture corpus generator (issue #30).
  *
  * Derives the golden remote-session wire corpus from the pinned upstream
- * `.references/pi-2.0` protocol package at 853a80d2. Offline-deterministic: the
- * upstream encoder is invoked over fixed messages; outputs are hex records.
+ * `.references/pi-2.0/packages/protocol/src` at the canonical identity.
+ * Offline-deterministic: the upstream encoder is invoked over fixed messages;
+ * outputs are hex records.
  *
  * Corpus shape (packages/pi-remote-protocol/tests/fixtures/par-wire-corpus.jsonl):
  *   { kind, message?, frameHex, note }
@@ -16,6 +17,7 @@ import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-identity.ts";
+import type { ClientMessage, ServerMessage } from "../../.references/pi-2.0/packages/protocol/src/protocol.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const upstreamRoot = join(canonicalReferenceRoot(), "packages/protocol/src");
@@ -25,43 +27,99 @@ const upstreamRoot = join(canonicalReferenceRoot(), "packages/protocol/src");
 assertCanonicalReference();
 const { FrameDecoder, DEFAULT_MAX_FRAME_LENGTH } = await import(join(upstreamRoot, "framing.ts"));
 const { encodeClientMessage, encodeServerMessage } = await import(join(upstreamRoot, "codec.ts"));
-const { PROTOCOL_VERSION } = await import(join(upstreamRoot, "schemas.ts"));
+const { PROTOCOL_VERSION } = await import(join(upstreamRoot, "protocol.ts"));
 
-const emptyServerSnapshot = {
-	serverId: "server-1",
-	protocolVersion: PROTOCOL_VERSION,
-	revision: 0,
-	sessions: [],
-	models: [],
+// --- Client message witnesses (v8 ClientMessage union) ---
+
+const clientHello = { type: "hello" as const, version: PROTOCOL_VERSION };
+
+/** RequestEnvelope with a session (session-fenced) target. */
+const requestEnvelope = {
+	type: "request" as const,
+	id: "req-1",
+	target: {
+		serverId: "00000000-0000-4000-8000-000000000001",
+		sessionId: "session-1",
+		attachmentId: "attach-1",
+	},
+	call: { command: "list" },
 };
 
-const clientHello = { type: "hello", version: PROTOCOL_VERSION };
+/** CancelEnvelope with a serverId (server-wide) target. */
+const cancelEnvelope = {
+	type: "cancel" as const,
+	id: "req-2",
+	target: { serverId: "00000000-0000-4000-8000-000000000001" },
+};
+
+// --- Server message witnesses (v8 ServerMessage union) ---
+
 const serverHello = {
-	type: "hello",
+	type: "hello" as const,
 	version: PROTOCOL_VERSION,
-	connectionId: "connection-1",
-	snapshot: emptyServerSnapshot,
+	serverId: "00000000-0000-4000-8000-000000000001",
 };
+
 const serverHelloError = {
-	type: "hello_error",
+	type: "hello_error" as const,
 	error: { code: "version", message: "unsupported protocol version" },
 };
+
+/** ok=true with result present. */
 const responseOk = {
-	type: "response",
+	type: "response" as const,
 	id: "req-1",
-	ok: true,
+	ok: true as const,
 	result: { command: "list", sessions: [] },
 };
-const responseErr = {
-	type: "response",
+
+/** ok=true with result explicit null. */
+const responseNull = {
+	type: "response" as const,
+	id: "req-4",
+	ok: true as const,
+	result: null,
+};
+
+/** ok=true with result absent (field omitted, not null). */
+const responseAbsent = {
+	type: "response" as const,
 	id: "req-2",
-	ok: false,
+	ok: true as const,
+};
+
+/** ok=false with error present. */
+const responseErr = {
+	type: "response" as const,
+	id: "req-3",
+	ok: false as const,
 	error: { code: "session_locked", message: "session is locked" },
 };
-const eventEnvelope = {
-	type: "event",
-	event: { type: "session_removed", sessionId: "session-1" },
+
+/** ServiceEventEnvelope: type is "service_update", not "event". */
+const serviceUpdateEnvelope = {
+	type: "service_update" as const,
+	subscriptionId: "sub-1",
+	update: { command: "list" },
 };
+
+/** AttachmentEnvelope with attachment: null (no active route). */
+const attachmentEnvelopeNull = {
+	type: "attachment" as const,
+	attachment: null,
+};
+
+/** AttachmentEnvelope with a live session target. */
+const attachmentEnvelopeSession = {
+	type: "attachment" as const,
+	attachment: {
+		serverId: "00000000-0000-4000-8000-000000000001",
+		sessionId: "session-1",
+		attachmentId: "attach-1",
+	},
+};
+
+// --- Row contract shared with codec test owner ---
 
 interface Row {
 	kind: string;
@@ -70,29 +128,43 @@ interface Row {
 	note: string;
 }
 
-function row(kind: string, message: unknown, encode: (value: never) => Uint8Array, note: string): Row {
-	// Upstream encode*Message already returns the framed form (4-byte BE
-	// prefix + CBOR payload); a second encodeFrame wrap would double-frame.
-	const frame = encode(message as never);
+/** Encodes and records a client message row. */
+function clientRow(
+	kind: string,
+	message: ClientMessage,
+	note: string,
+): Row {
+	const frame = encodeClientMessage(message);
+	return { kind, message, frameHex: Buffer.from(frame).toString("hex"), note };
+}
+
+/** Encodes and records a server message row. */
+function serverRow(
+	kind: string,
+	message: ServerMessage,
+	note: string,
+): Row {
+	const frame = encodeServerMessage(message);
 	return { kind, message, frameHex: Buffer.from(frame).toString("hex"), note };
 }
 
 const rows: Row[] = [
-	row("client_hello", clientHello, encodeClientMessage, "ClientMessage hello, protocol v1"),
-	row("server_hello", serverHello, encodeServerMessage, "ServerMessage hello with empty snapshot"),
-	row("server_hello_error", serverHelloError, encodeServerMessage, "hello_error with version code"),
-	row("response_ok", responseOk, encodeServerMessage, "response envelope ok=true list result"),
-	row("response_error", responseErr, encodeServerMessage, "response envelope ok=false session_locked"),
-	row(
-		"event_envelope",
-		eventEnvelope,
-		encodeServerMessage,
-		"event envelope session_removed",
-	),
+	clientRow("client_hello", clientHello, "ClientMessage hello, protocol v8"),
+	clientRow("request", requestEnvelope, "RequestEnvelope session target, list call"),
+	clientRow("cancel", cancelEnvelope, "CancelEnvelope serverId target"),
+	serverRow("server_hello", serverHello, "ServerMessage hello, serverId, no snapshot"),
+	serverRow("server_hello_error", serverHelloError, "hello_error with version code"),
+	serverRow("response_ok", responseOk, "response ok=true with result"),
+	serverRow("response_null", responseNull, "response ok=true, result null"),
+	serverRow("response_absent", responseAbsent, "response ok=true, result absent"),
+	serverRow("response_error", responseErr, "response ok=false, session_locked"),
+	serverRow("service_update", serviceUpdateEnvelope, "service_update envelope"),
+	serverRow("attachment_null", attachmentEnvelopeNull, "attachment envelope, route null"),
+	serverRow("attachment_session", attachmentEnvelopeSession, "attachment envelope, live session route"),
 ];
 
-// Over-limit rejection witness: a frame whose declared prefix exceeds the
-// configured max must fail FrameDecoder, proving the 16 MiB bound is live.
+// --- Frame-bound rejection witness: declared length exceeds 16 MiB limit ---
+
 {
 	const huge = 16 * 1024 * 1024 + 1;
 	const prefix = Buffer.alloc(4);
@@ -118,4 +190,4 @@ const rows: Row[] = [
 const target = join(here, "../../packages/pi-remote-protocol/tests/fixtures/par-wire-corpus.jsonl");
 const body = rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
 writeFileSync(target, body);
-console.log(`PAR_WIRE_CORPUS_OK rows=${rows.length}`);
+process.stdout.write(`PAR_WIRE_CORPUS_OK rows=${rows.length}\n`);

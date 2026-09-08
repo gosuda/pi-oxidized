@@ -1604,6 +1604,73 @@ describe("host: replacementReady write failure is contained", () => {
 		await teardown(connected);
 	});
 });
+describe("host: constrained sampling registry", () => {
+	test("snapshot preserves false/config and omits an absent value", async () => {
+		const factory: ExtensionFactory = (pi) => {
+			pi.registerTool({
+				name: "sampling-disabled",
+				label: "Sampling disabled",
+				description: "Explicitly disables constrained sampling",
+				parameters: { type: "object" },
+				constrainedSampling: false,
+				async execute() {
+					return { content: [] };
+				},
+			});
+			pi.registerTool({
+				name: "sampling-configured",
+				label: "Sampling configured",
+				description: "Requests strict constrained sampling",
+				parameters: { type: "object" },
+				constrainedSampling: { type: "json_schema", strict: "prefer" },
+				async execute() {
+					return { content: [] };
+				},
+			});
+			pi.registerTool({
+				name: "sampling-absent",
+				label: "Sampling absent",
+				description: "Leaves constrained sampling to the provider",
+				parameters: { type: "object" },
+				async execute() {
+					return { content: [] };
+				},
+			});
+		};
+		const connected = await connectHost([factory]);
+		try {
+			push(connected.stdin, {
+				id: 230,
+				kind: "req",
+				method: "extensions.load",
+				payload: { extensionPaths: [], cwd: process.cwd() },
+			});
+			const response = payloadOf(
+				await connected.collector.awaitFrame(
+					(frame) => frame.id === 230 && frame.kind === "res",
+					"constrained sampling registry",
+				),
+			);
+			const tools = response["tools"] as Array<Record<string, unknown>>;
+			expect(tools.map((tool) => tool["name"])).toEqual([
+				"sampling-disabled",
+				"sampling-configured",
+				"sampling-absent",
+			]);
+			const byName = new Map(tools.map((tool) => [tool["name"], tool]));
+
+			expect(byName.get("sampling-disabled")?.["constrainedSampling"]).toBe(false);
+			expect(byName.get("sampling-configured")?.["constrainedSampling"]).toEqual({
+				type: "json_schema",
+				strict: "prefer",
+			});
+			expect(Object.hasOwn(byName.get("sampling-absent") ?? {}, "constrainedSampling")).toBe(false);
+		} finally {
+			await teardown(connected);
+		}
+	});
+});
+
 describe("host: protocol extension order", () => {
 	test("initial protocol paths precede builtins and later loads append", async () => {
 		const dir = await mkdtemp(join(tmpdir(), "pr10-precedence-"));

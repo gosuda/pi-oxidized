@@ -11,7 +11,7 @@ use std::sync::Arc;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use pi_agent::{AgentTool, AgentToolResult, ToolError, ToolUpdates};
-use pi_ai::ToolResultContent;
+use pi_ai::{ConstrainedSampling, ConstrainedSamplingConfig, StrictMode, ToolResultContent};
 use pi_ai::types::TextContent;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -171,6 +171,14 @@ impl AgentTool for EditTool {
 
     fn parameters(&self) -> &Value {
         &self.parameters
+    }
+
+    fn constrained_sampling(&self) -> Option<ConstrainedSampling> {
+        Some(ConstrainedSampling::Config(
+            ConstrainedSamplingConfig::JsonSchema {
+                strict: StrictMode::Prefer,
+            },
+        ))
     }
 
     fn prepare_arguments(&self, raw: &Map<String, Value>) -> Result<Map<String, Value>, ToolError> {

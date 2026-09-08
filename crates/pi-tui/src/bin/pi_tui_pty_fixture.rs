@@ -23,9 +23,10 @@ use pi_tui::keys::{
     KeyId, MODIFY_OTHER_KEYS_OMISSION, key_matches, key_press, set_kitty_protocol_active,
     should_dispatch_key_event,
 };
+use pi_tui::terminal::probe::{ProbeCollector, probe_write_batch};
 use pi_tui::terminal::{
-    ProbeSession, ReanchorCause, SettledBlock, TerminalCapabilities, TerminalGuard, TerminalInput,
-    Tui, Txn, install_panic_emergency_hook, probe_query_batch, write_emergency_restore_bytes,
+    ReanchorCause, SettledBlock, TerminalCapabilities, TerminalGuard, TerminalInput, Tui, Txn,
+    install_panic_emergency_hook, write_emergency_restore_bytes,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect, Size};
@@ -36,6 +37,12 @@ const DRAW_DEADLINE: Duration = Duration::from_secs(8);
 const HARD_TIMEOUT: Duration = Duration::from_secs(20);
 const VIEWPORT_HEIGHT: u16 = 6;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServeMode {
+    Scripted,
+    Live,
+    ResizeBatch,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExitMode {
     Success,
@@ -180,6 +187,9 @@ impl Component for FixtureRoot {
                 self.generation = self.generation.saturating_add(1);
                 EventResult::Render
             }
+            UiEvent::Key(key) if !pi_tui::keys::should_dispatch_key_event(key, false) => {
+                EventResult::Ignored
+            }
             UiEvent::Key(key) => {
                 // Same release filter as the product runtime: ConPTY and kitty
                 // both report key-up records, which are not input.
@@ -210,12 +220,16 @@ impl Component for FixtureRoot {
                 let _ = MODIFY_OTHER_KEYS_OMISSION;
                 EventResult::Ignored
             }
+            // Native pointer events have no extension wire representation and
+            // focus transitions are inert here: decline them so the live
+            // Resize/Paste/Cursor accounting and the one-shot Resize+Ctrl+D
+            // batch handshake stay untouched.
+            UiEvent::Mouse(_) | UiEvent::FocusGained | UiEvent::FocusLost => EventResult::Ignored,
             UiEvent::Resize { .. } => {
                 self.resize_count = self.resize_count.saturating_add(1);
                 self.generation = self.generation.saturating_add(1);
                 EventResult::Render
             }
-            UiEvent::FocusGained | UiEvent::FocusLost => EventResult::Ignored,
         }
     }
 
@@ -230,48 +244,6 @@ fn fit(text: &str, width: usize) -> String {
         out.push(' ');
     }
     out
-}
-
-/// Non-blocking stdin read for probe replies. Returns `None` when no data is ready.
-#[cfg_attr(
-    not(unix),
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "Unix arm can return real poll/read I/O errors; callers need one shared io::Result contract across platforms"
-    )
-)]
-fn read_stdin_nonblocking() -> io::Result<Option<Vec<u8>>> {
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        use std::os::fd::AsFd;
-
-        let stdin = io::stdin();
-        let fd = stdin.as_fd();
-        let mut fds = [nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN)];
-        let n = nix::poll::poll(&mut fds, 0u8)
-            .map_err(|err| io::Error::other(format!("poll stdin: {err}")))?;
-        if n == 0 {
-            return Ok(None);
-        }
-        let mut buf = [0u8; 512];
-        // Use libc-level read through std after confirming readability.
-        // Temporary nonblocking would race other threads; POLLIN + short read is enough.
-        let mut handle = stdin.lock();
-        // There is no safe nonblocking Read on StdinLock without O_NONBLOCK.
-        // Fall back to reading only when poll said data is ready; a blocking read
-        // here is bounded by the harness writing probe replies immediately.
-        match handle.read(&mut buf) {
-            Ok(0) => Ok(Some(Vec::new())),
-            Ok(n) => Ok(Some(buf[..n].to_vec())),
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(None)
-    }
 }
 
 fn sanitize_visible(text: &str) -> String {
@@ -294,7 +266,7 @@ fn run() -> io::Result<ExitCode> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut exit_mode = ExitMode::Success;
     let mut sync_output = true;
-    let mut serve = false;
+    let mut serve = ServeMode::Scripted;
     for arg in &args {
         if let Some(mode) = arg.strip_prefix("--exit=") {
             exit_mode = ExitMode::parse(mode).ok_or_else(|| {
@@ -305,12 +277,22 @@ fn run() -> io::Result<ExitCode> {
             })?;
         } else if arg == "--no-sync" {
             sync_output = false;
-        } else if arg == "--serve" {
-            serve = true;
+        } else if arg == "--serve" || arg == "--resize-batch" {
+            if serve != ServeMode::Scripted {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "select only one serving mode",
+                ));
+            }
+            serve = if arg == "--serve" {
+                ServeMode::Live
+            } else {
+                ServeMode::ResizeBatch
+            };
         } else if arg == "--help" {
             writeln!(
                 io::stdout(),
-                "pi_tui_pty_fixture [--exit=success|abort|provider-error|panic|sigint] [--no-sync] [--serve]"
+                "pi_tui_pty_fixture [--exit=success|abort|provider-error|panic|sigint] [--no-sync] [--serve|--resize-batch]"
             )?;
             return Ok(ExitCode::SUCCESS);
         } else {
@@ -338,7 +320,7 @@ fn run() -> io::Result<ExitCode> {
 async fn run_fixture(
     exit_mode: ExitMode,
     sync_output: bool,
-    serve: bool,
+    serve: ServeMode,
     started: Instant,
 ) -> io::Result<ExitCode> {
     // Do not hold `stdout.lock()` across the lifetime of the fixture: `Tui`
@@ -364,27 +346,31 @@ async fn run_fixture(
     crossterm::terminal::enable_raw_mode()?;
 
     // Stage-1 probes must leave the synchronized-output wrapper.
-    let probe_bytes = probe_query_batch(true);
-    guard.writer_mut().write_all(&probe_bytes)?;
-    guard.writer_mut().flush()?;
-
-    // Read probe replies from the real PTY stdin before EventStream ownership.
-    let mut probe = ProbeSession::new();
-    let probe_deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < probe_deadline && !probe.is_complete() {
-        if let Some(bytes) = read_stdin_nonblocking()? {
-            if bytes.is_empty() {
+    //
+    // Startup probe over the ONE shared reader: record issued queries before
+    // the write (undone on write failure), then collect typed replies via the
+    // crossterm poll API. Ordinary keys stay queued in the shared reader.
+    let mut probe = ProbeCollector::default();
+    if probe_write_batch(guard.writer_mut())?.is_some() {
+        let probe_deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if probe.is_complete() {
                 break;
             }
-            let _ = probe.feed(&bytes);
-            continue;
+            let Some(remaining) = probe_deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            match crossterm::event::reply::poll_reply(Some(remaining)) {
+                Ok(Some(reply)) => probe.record(reply),
+                // Timeout, wake, or reader error all end the collection
+                // window; replies already collected stay applied.
+                Ok(None) | Err(_) => break,
+            }
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     // Deterministic seed only if the harness never answered.
     if !probe.is_complete() {
-        let _ =
-            probe.feed(b"\x1b[?0u\x1b[?1;2c\x1b[6;10;20t\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R");
+        probe.seed_defaults();
     }
 
     let mut caps = tokio::task::spawn_blocking(TerminalCapabilities::detect)
@@ -473,111 +459,47 @@ async fn run_fixture(
         commit_with_deadline(&mut tui, Txn::Frame, &mut root, started)?;
     }
 
-    // Drive TerminalInput for paste + cursor movement + resizes.
+    // Scripted synthetic resize/paste/cursor traffic. The resize-batch mode
+    // skips it entirely: its resizes, paste fallback, and cursor keys would
+    // pollute the exactly-one post-ready reanchor count and the final
+    // geometry evidence with scripted (non-OS) events.
     let mut input = TerminalInput::spawn();
-    let (inject_tx, inject_rx) = mpsc::unbounded_channel();
-    let mut mock_input = TerminalInput::mock(inject_rx);
+    if serve != ServeMode::ResizeBatch {
+        let (inject_tx, inject_rx) = mpsc::unbounded_channel();
+        let mut mock_input = TerminalInput::mock(inject_rx);
 
-    let resize_plan: [(u16, u16); 24] = [
-        (80, 24),
-        (40, 12),
-        (20, 8),
-        (12, 6),
-        (10, 5),
-        (8, 4),
-        (16, 10),
-        (32, 14),
-        (64, 20),
-        (100, 30),
-        (120, 40),
-        (200, 50),
-        (24, 8),
-        (18, 7),
-        (14, 6),
-        (11, 5),
-        (9, 4),
-        (28, 12),
-        (48, 16),
-        (72, 22),
-        (96, 28),
-        (160, 36),
-        (60, 18),
-        (80, 24),
-    ];
+        let resize_plan: [(u16, u16); 24] = [
+            (80, 24),
+            (40, 12),
+            (20, 8),
+            (12, 6),
+            (10, 5),
+            (8, 4),
+            (16, 10),
+            (32, 14),
+            (64, 20),
+            (100, 30),
+            (120, 40),
+            (200, 50),
+            (24, 8),
+            (18, 7),
+            (14, 6),
+            (11, 5),
+            (9, 4),
+            (28, 12),
+            (48, 16),
+            (72, 22),
+            (96, 28),
+            (160, 36),
+            (60, 18),
+            (80, 24),
+        ];
 
-    for (width, height) in resize_plan {
-        while let Some(event) = input.try_recv() {
-            handle_ui_event(&mut tui, &mut root, &event, started)?;
-        }
-        let event = UiEvent::Resize { width, height };
-        inject_tx
-            .send(event.clone())
-            .map_err(|_| io::Error::other("inject channel closed"))?;
-        if let Some(ev) = mock_input.try_recv() {
-            handle_ui_event(&mut tui, &mut root, &ev, started)?;
-        } else {
-            handle_ui_event(&mut tui, &mut root, &event, started)?;
-        }
-        if started.elapsed() > HARD_TIMEOUT {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "hard fixture timeout",
-            ));
-        }
-    }
-
-    // Prefer live EventStream paste/cursor if the harness injected them; always
-    // fall back to synthetic inject so the fixture remains deterministic.
-    let paste_deadline = Instant::now() + Duration::from_millis(150);
-    let mut saw_live_paste = false;
-    let mut saw_live_cursor = false;
-    while Instant::now() < paste_deadline {
-        while let Some(event) = input.try_recv() {
-            match &event {
-                UiEvent::Paste(_) => saw_live_paste = true,
-                UiEvent::Key(key)
-                    if matches!(
-                        key.code,
-                        KeyCode::Left
-                            | KeyCode::Right
-                            | KeyCode::Up
-                            | KeyCode::Down
-                            | KeyCode::Home
-                            | KeyCode::End
-                    ) =>
-                {
-                    saw_live_cursor = true;
-                }
-                _ => {}
+        for (width, height) in resize_plan {
+            while let Some(event) = input.try_recv() {
+                handle_ui_event(&mut tui, &mut root, &event, started)?;
             }
-            handle_ui_event(&mut tui, &mut root, &event, started)?;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-
-    if !saw_live_paste {
-        let paste = UiEvent::Paste("PASTED-BLOCK-line1\nline2".into());
-        inject_tx
-            .send(paste.clone())
-            .map_err(|_| io::Error::other("inject channel closed"))?;
-        if let Some(ev) = mock_input.try_recv() {
-            handle_ui_event(&mut tui, &mut root, &ev, started)?;
-        } else {
-            handle_ui_event(&mut tui, &mut root, &paste, started)?;
-        }
-    }
-
-    if !saw_live_cursor {
-        for key in [
-            key_press(KeyCode::Left, KeyModifiers::empty()),
-            key_press(KeyCode::Right, KeyModifiers::empty()),
-            key_press(KeyCode::Up, KeyModifiers::empty()),
-            key_press(KeyCode::Down, KeyModifiers::empty()),
-            key_press(KeyCode::Home, KeyModifiers::empty()),
-            key_press(KeyCode::End, KeyModifiers::empty()),
-            key_press(KeyCode::Char('x'), KeyModifiers::empty()),
-        ] {
-            let event = UiEvent::Key(key);
+            let event = UiEvent::Resize { width, height };
             inject_tx
                 .send(event.clone())
                 .map_err(|_| io::Error::other("inject channel closed"))?;
@@ -585,6 +507,75 @@ async fn run_fixture(
                 handle_ui_event(&mut tui, &mut root, &ev, started)?;
             } else {
                 handle_ui_event(&mut tui, &mut root, &event, started)?;
+            }
+            if started.elapsed() > HARD_TIMEOUT {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "hard fixture timeout",
+                ));
+            }
+        }
+
+        // Prefer live EventStream paste/cursor if the harness injected them; always
+        // fall back to synthetic inject so the fixture remains deterministic.
+        let paste_deadline = Instant::now() + Duration::from_millis(150);
+        let mut saw_live_paste = false;
+        let mut saw_live_cursor = false;
+        while Instant::now() < paste_deadline {
+            while let Some(event) = input.try_recv() {
+                match &event {
+                    UiEvent::Paste(_) => saw_live_paste = true,
+                    UiEvent::Key(key)
+                        if matches!(
+                            key.code,
+                            KeyCode::Left
+                                | KeyCode::Right
+                                | KeyCode::Up
+                                | KeyCode::Down
+                                | KeyCode::Home
+                                | KeyCode::End
+                        ) =>
+                    {
+                        saw_live_cursor = true;
+                    }
+                    _ => {}
+                }
+                handle_ui_event(&mut tui, &mut root, &event, started)?;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        if !saw_live_paste {
+            let paste = UiEvent::Paste("PASTED-BLOCK-line1\nline2".into());
+            inject_tx
+                .send(paste.clone())
+                .map_err(|_| io::Error::other("inject channel closed"))?;
+            if let Some(ev) = mock_input.try_recv() {
+                handle_ui_event(&mut tui, &mut root, &ev, started)?;
+            } else {
+                handle_ui_event(&mut tui, &mut root, &paste, started)?;
+            }
+        }
+
+        if !saw_live_cursor {
+            for key in [
+                key_press(KeyCode::Left, KeyModifiers::empty()),
+                key_press(KeyCode::Right, KeyModifiers::empty()),
+                key_press(KeyCode::Up, KeyModifiers::empty()),
+                key_press(KeyCode::Down, KeyModifiers::empty()),
+                key_press(KeyCode::Home, KeyModifiers::empty()),
+                key_press(KeyCode::End, KeyModifiers::empty()),
+                key_press(KeyCode::Char('x'), KeyModifiers::empty()),
+            ] {
+                let event = UiEvent::Key(key);
+                inject_tx
+                    .send(event.clone())
+                    .map_err(|_| io::Error::other("inject channel closed"))?;
+                if let Some(ev) = mock_input.try_recv() {
+                    handle_ui_event(&mut tui, &mut root, &ev, started)?;
+                } else {
+                    handle_ui_event(&mut tui, &mut root, &event, started)?;
+                }
             }
         }
     }
@@ -603,7 +594,7 @@ async fn run_fixture(
     commit_with_deadline(&mut tui, Txn::Frame, &mut root, started)?;
 
     let mut live = None;
-    if serve {
+    if serve != ServeMode::Scripted {
         root.status = "serving".into();
         root.plugin = "SERVE-READY".into();
         commit_with_deadline(&mut tui, Txn::Frame, &mut root, started)?;
@@ -618,7 +609,29 @@ async fn run_fixture(
             out.write_all(b"\x1b]999;PI_TUI_INPUT_READY=1\x07")?;
             out.flush()?;
         }
-        serve_live_events(&mut input, &mut tui, &mut root, started).await?;
+        if serve == ServeMode::ResizeBatch {
+            let (resize_event, (width, height)) = completed_resize_batch(
+                &mut input,
+                started + HARD_TIMEOUT,
+                crossterm::terminal::size,
+            )
+            .await?;
+            // The kernel-queried size is the render authority; clamp only
+            // against degenerate zero dimensions like handle_ui_event does.
+            root.status = format!("batch-complete {width}x{height}");
+            tui.note_resize(width.max(1), height.max(1));
+            // Reuse the notification consumed at the batch boundary. This
+            // keeps the accounting tied to genuine TerminalInput input.
+            let _ = root.handle_event(&resize_event);
+            commit_with_deadline(
+                &mut tui,
+                Txn::Reanchor(ReanchorCause::Resize),
+                &mut root,
+                started,
+            )?;
+        } else {
+            serve_live_events(&mut input, &mut tui, &mut root, started).await?;
+        }
         live = Some((
             root.paste_count
                 .checked_sub(paste_baseline)
@@ -735,6 +748,56 @@ async fn run_fixture(
             }
         }
     }
+}
+// A Ctrl+D producer fence and at least one genuine Resize event complete the
+// batch. Return the consumed notification so the caller handles it once after
+// querying the kernel geometry.
+async fn completed_resize_batch(
+    input: &mut TerminalInput,
+    deadline: Instant,
+    terminal_size: impl FnOnce() -> io::Result<(u16, u16)>,
+) -> io::Result<(UiEvent, (u16, u16))> {
+    let mut resize_event = None;
+    let mut completed = false;
+    let wait = async {
+        while resize_event.is_none() || !completed {
+            match input.recv().await {
+                Some(event @ UiEvent::Resize { .. }) => {
+                    resize_event = Some(event);
+                }
+                Some(UiEvent::Key(key))
+                    if key.code == KeyCode::Char('d')
+                        && key.modifiers == KeyModifiers::CONTROL
+                        && key.kind == crossterm::event::KeyEventKind::Press =>
+                {
+                    completed = true;
+                }
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unexpected input in resize batch",
+                    ));
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "incomplete resize batch",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    };
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), wait)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "hard fixture timeout"))??;
+    let resize_event = resize_event.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "completed resize batch lost its resize event",
+        )
+    })?;
+    Ok((resize_event, terminal_size()?))
 }
 
 async fn serve_live_events(
@@ -886,5 +949,48 @@ impl Write for StdoutOwner {
         self.out.write_all(&payload)?;
         self.out.write_all(end.as_bytes())?;
         self.out.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    use pi_tui::component::{Component, EventResult, UiEvent};
+    use pi_tui::keys::key_press;
+
+    use super::FixtureRoot;
+
+    #[test]
+    fn key_actions_ignore_release_but_keep_repeat() {
+        let mut root = FixtureRoot::new();
+        for (kind, expected) in [
+            (KeyEventKind::Press, EventResult::Render),
+            (KeyEventKind::Release, EventResult::Ignored),
+            (KeyEventKind::Repeat, EventResult::Render),
+        ] {
+            let mut key = key_press(KeyCode::Left, KeyModifiers::NONE);
+            key.kind = kind;
+            assert_eq!(root.handle_event(&UiEvent::Key(key)), expected);
+        }
+        assert_eq!(root.cursor_moves, 2);
+    }
+
+    #[test]
+    fn native_mouse_is_ignored_without_touching_live_counters() {
+        let mut root = FixtureRoot::new();
+        assert_eq!(
+            root.handle_event(&UiEvent::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 5,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            })),
+            EventResult::Ignored
+        );
+        assert_eq!(
+            (root.paste_count, root.cursor_moves, root.resize_count, root.generation),
+            (0, 0, 0, 0),
+            "a declined pointer event must not advance any live counter"
+        );
     }
 }

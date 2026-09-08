@@ -39,9 +39,10 @@ use pi_tui::components::util::paint_lines;
 use pi_tui::components::{DefaultTextStyle, Input, Markdown, MarkdownOptions, MarkdownTheme, Rail};
 use pi_tui::keys::set_kitty_protocol_active;
 use pi_tui::overlay::write_overlay_cells;
+use pi_tui::terminal::probe::{ProbeCollector, probe_write_batch};
 use pi_tui::terminal::{
-    ProbeSession, TerminalCapabilities, TerminalGuard, TerminalInput, Tui, Txn,
-    install_panic_emergency_hook, probe_query_batch, write_emergency_restore_bytes,
+    TerminalCapabilities, TerminalGuard, TerminalInput, Tui, Txn, install_panic_emergency_hook,
+    write_emergency_restore_bytes,
 };
 use pi_tui::text::{normalize_terminal_output, visible_width};
 use ratatui::buffer::Buffer;
@@ -481,43 +482,6 @@ fn put_line(line: &str, buf: &mut Buffer, row: &mut u16, width: usize, bottom: u
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Non-blocking stdin read for probe replies. Returns `None` when no data is ready.
-#[cfg_attr(
-    not(unix),
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "Unix arm can return real poll/read I/O errors; callers need one shared io::Result contract across platforms"
-    )
-)]
-fn read_stdin_nonblocking() -> io::Result<Option<Vec<u8>>> {
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        use std::os::fd::AsFd;
-
-        let stdin = io::stdin();
-        let fd = stdin.as_fd();
-        let mut fds = [nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN)];
-        let n = nix::poll::poll(&mut fds, 0u8)
-            .map_err(|err| io::Error::other(format!("poll stdin: {err}")))?;
-        if n == 0 {
-            return Ok(None);
-        }
-        let mut buf = [0u8; 512];
-        let mut handle = stdin.lock();
-        match handle.read(&mut buf) {
-            Ok(0) => Ok(Some(Vec::new())),
-            Ok(n) => Ok(Some(buf[..n].to_vec())),
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(None)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -625,25 +589,29 @@ async fn run_gauntlet(started: Instant) -> io::Result<ExitCode> {
 
     crossterm::terminal::enable_raw_mode()?;
 
-    let probe_bytes = probe_query_batch(true);
-    guard.writer_mut().write_all(&probe_bytes)?;
-    guard.writer_mut().flush()?;
-
-    let mut probe = ProbeSession::new();
-    let probe_deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < probe_deadline && !probe.is_complete() {
-        if let Some(bytes) = read_stdin_nonblocking()? {
-            if bytes.is_empty() {
+    // Startup probe over the ONE shared reader: record issued queries before
+    // the write (undone on write failure), then collect typed replies via the
+    // crossterm poll API. Ordinary keys stay queued in the shared reader.
+    let mut probe = ProbeCollector::default();
+    if probe_write_batch(guard.writer_mut())?.is_some() {
+        let probe_deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if probe.is_complete() {
                 break;
             }
-            let _ = probe.feed(&bytes);
-            continue;
+            let Some(remaining) = probe_deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            match crossterm::event::reply::poll_reply(Some(remaining)) {
+                Ok(Some(reply)) => probe.record(reply),
+                // Timeout, wake, or reader error all end the collection
+                // window; replies already collected stay applied.
+                Ok(None) | Err(_) => break,
+            }
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     if !probe.is_complete() {
-        let _ =
-            probe.feed(b"\x1b[?0u\x1b[?1;2c\x1b[6;10;20t\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R");
+        probe.seed_defaults();
     }
 
     let mut caps = tokio::task::spawn_blocking(TerminalCapabilities::detect)

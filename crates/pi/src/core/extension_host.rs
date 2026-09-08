@@ -22,11 +22,11 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use pi_agent::{AfterToolCallResult, AgentMessage, AgentTool, BeforeToolCallResult};
-use pi_ai::{AssistantMessage, AssistantMessageEvent, ToolResultContent};
+use pi_ai::{AssistantMessage, AssistantMessageEvent, ConstrainedSampling, ToolResultContent};
 use pi_ext::adapters::{
     self, CommandRegistration, CommandSourceInfo, ExtensionAgentTool, ExtensionProvider,
-    FlagRegistration, ProviderRegistration, Registry, RendererRegistration, ShortcutRegistration,
-    ToolRegistration,
+    FlagRegistration, ProviderCapabilities, ProviderRegistration, Registry, RendererRegistration,
+    ShortcutRegistration, ToolRegistration,
 };
 use pi_ext::client::{
     HostClient, HostClientError, HostNotification, HostSessionControlEvent, HostSessionRequest,
@@ -524,6 +524,8 @@ struct ToolWire {
     parameters: Value,
     #[serde(default)]
     execution_mode: Option<pi_agent::ToolExecutionMode>,
+    #[serde(default)]
+    constrained_sampling: Option<ConstrainedSampling>,
 }
 
 /// Wire form of [`CommandRegistration`].
@@ -595,9 +597,7 @@ struct RendererWire {
 /// Wire form of a host-registered custom provider.
 ///
 /// Matches the host's `buildRegistrySnapshot` camelCase payload: full
-/// `ProviderConfig` fields plus a boolean `streamSimple` flag (the function
-/// itself never crosses the wire; the host keeps it and Rust proxies via
-/// [`ExtensionProvider`] when the flag is true).
+/// `ProviderConfig` fields plus the callback capabilities held by the host.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderWire {
@@ -617,9 +617,15 @@ struct ProviderWire {
     auth_header: Option<bool>,
     #[serde(default)]
     models: Option<Vec<ProviderModelDefinition>>,
-    /// `true` when the host holds a live `streamSimple` function for this provider.
+    /// `true` when the host holds a live `streamSimple` function.
     #[serde(default)]
     stream_simple: bool,
+    /// `true` when the host holds a live `fetchDeferred` function.
+    #[serde(default)]
+    fetch_deferred: bool,
+    /// `true` when the host holds a live `cancelDeferred` function.
+    #[serde(default)]
+    cancel_deferred: bool,
     /// Optional extension path used in diagnostic messages when present.
     #[serde(default)]
     extension_path: Option<String>,
@@ -707,8 +713,8 @@ struct RegistrySnapshot {
     flag_values: HashMap<String, Value>,
     /// Provider config inputs keyed by provider id (for `ModelRuntime` registration).
     provider_configs: HashMap<String, ProviderConfigInput>,
-    /// Provider ids that expose a host-side `streamSimple` handler.
-    stream_provider_ids: HashSet<String>,
+    /// Host callback capabilities keyed by provider id.
+    provider_capabilities: HashMap<String, ProviderCapabilities>,
     /// Optional extension path per provider (diagnostics).
     provider_extension_paths: HashMap<String, String>,
     /// Host-reported per-path load errors.
@@ -728,6 +734,7 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
             description: tool.description,
             parameters: tool.parameters,
             execution_mode: tool.execution_mode,
+            constrained_sampling: tool.constrained_sampling,
         };
         // First registration wins (host already dedups; this is the Rust-side
         // trust boundary for a duplicated name).
@@ -796,18 +803,22 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
 
     for provider in wire.providers {
         let name = provider.name.clone();
-        let stream_simple = provider.stream_simple;
         let extension_path = provider.extension_path.clone();
         let config = provider.to_config_input();
+        let capabilities = ProviderCapabilities {
+            stream_simple: provider.stream_simple,
+            fetch_deferred: provider.fetch_deferred,
+            cancel_deferred: provider.cancel_deferred,
+        };
         if snapshot.registry.register_provider(ProviderRegistration {
             name: name.clone(),
             base_url: config.base_url.clone(),
             api: config.api.clone(),
         }) {
             snapshot.provider_configs.insert(name.clone(), config);
-            if stream_simple {
-                snapshot.stream_provider_ids.insert(name.clone());
-            }
+            snapshot
+                .provider_capabilities
+                .insert(name.clone(), capabilities);
             if let Some(path) = extension_path {
                 snapshot.provider_extension_paths.insert(name, path);
             }
@@ -1379,13 +1390,13 @@ impl HostExtensionRunner {
             .unwrap_or_default()
     }
 
-    /// Provider ids that expose a host-side `streamSimple` handler.
+    /// Host callback capabilities keyed by provider id.
     #[must_use]
-    pub fn stream_provider_ids(&self) -> HashSet<String> {
+    pub fn provider_capabilities(&self) -> HashMap<String, ProviderCapabilities> {
         self.inner
             .snapshot
             .read()
-            .map(|guard| guard.stream_provider_ids.clone())
+            .map(|guard| guard.provider_capabilities.clone())
             .unwrap_or_default()
     }
 
@@ -1415,11 +1426,18 @@ impl HostExtensionRunner {
         let snap = &mut *guard;
         // Clear and rebuild from the update.
         snap.provider_configs.clear();
-        snap.stream_provider_ids.clear();
+        snap.provider_capabilities.clear();
         snap.registry.clear_providers();
         snap.provider_extension_paths.clear();
         for entry in &update.providers {
             let name = entry.name.clone();
+            if !snap.registry.register_provider(ProviderRegistration {
+                name: name.clone(),
+                base_url: entry.base_url.clone(),
+                api: entry.api.clone(),
+            }) {
+                continue;
+            }
             let config = ProviderConfigInput {
                 name: Some(entry.name.clone()),
                 base_url: entry.base_url.clone(),
@@ -1439,19 +1457,18 @@ impl HostExtensionRunner {
                 oauth: None,
             };
             snap.provider_configs.insert(name.clone(), config);
-            if entry.stream_simple {
-                snap.stream_provider_ids.insert(name.clone());
-            }
+            snap.provider_capabilities.insert(
+                name.clone(),
+                ProviderCapabilities {
+                    stream_simple: entry.stream_simple,
+                    fetch_deferred: entry.fetch_deferred,
+                    cancel_deferred: entry.cancel_deferred,
+                },
+            );
             if let Some(path) = &entry.extension_path {
                 snap.provider_extension_paths
                     .insert(name.clone(), path.clone());
             }
-            // Register in the registry.
-            let _ = snap.registry.register_provider(ProviderRegistration {
-                name: name.clone(),
-                base_url: entry.base_url.clone(),
-                api: entry.api.clone(),
-            });
         }
     }
 
@@ -1485,9 +1502,8 @@ impl HostExtensionRunner {
     /// bound to the live host client (callers register them with the model
     /// runtime). Rebuilt per call since [`ExtensionProvider`] is not `Clone`.
     ///
-    /// Includes every host-registered provider. Custom-stream selection still
-    /// requires `streamSimple: true` at registration time
-    /// ([`Self::register_providers_on`]); baseURL-only providers stay native.
+    /// Includes every host-registered provider. Callback capabilities are
+    /// materialized on each adapter from the current endpoint snapshot.
     #[must_use]
     pub fn providers(&self) -> HashMap<String, ExtensionProvider> {
         let client = Arc::clone(&self.inner.client);
@@ -1500,9 +1516,15 @@ impl HostExtensionRunner {
                     .providers()
                     .iter()
                     .map(|provider| {
+                        let capabilities = guard
+                            .provider_capabilities
+                            .get(&provider.name)
+                            .copied()
+                            .unwrap_or_default();
                         (
                             provider.name.clone(),
-                            ExtensionProvider::new(provider.name.clone(), Arc::clone(&client)),
+                            ExtensionProvider::new(provider.name.clone(), Arc::clone(&client))
+                                .with_capabilities(capabilities),
                         )
                     })
                     .collect()
@@ -1510,25 +1532,40 @@ impl HostExtensionRunner {
             .unwrap_or_default()
     }
 
-    /// Register this host's provider configs + stream adapters on `runtime`.
+    /// Register this host's provider configs and callback adapters on `runtime`.
     ///
     /// Each provider failure becomes a diagnostic string; siblings continue.
-    /// Stream handlers are registered only when `streamSimple` was true.
+    /// A provider with `streamSimple` is registered for ordinary streaming;
+    /// deferred-only providers are registered for fetch/cancel without
+    /// becoming ordinary stream handlers.
     #[must_use]
     pub fn register_providers_on(
         &self,
         runtime: &ModelRuntime,
     ) -> Vec<(String, Result<(), ModelRuntimeError>)> {
         let configs = self.provider_configs();
-        let stream_ids = self.stream_provider_ids();
+        let capabilities = self.provider_capabilities();
         let paths = self.provider_extension_paths();
         let mut results = Vec::with_capacity(configs.len());
         for (name, config) in configs {
             let path = paths.get(&name).cloned().unwrap_or_else(|| name.clone());
             let outcome = runtime.register_provider(&name, config);
-            if outcome.is_ok() && stream_ids.contains(&name) {
-                let adapter = ExtensionProvider::new(name.clone(), Arc::clone(self.client()));
-                runtime.register_extension_stream_provider(name.clone(), Arc::new(adapter));
+            let provider_capabilities = capabilities.get(&name).copied().unwrap_or_default();
+            if outcome.is_ok()
+                && (provider_capabilities.stream_simple
+                    || provider_capabilities.fetch_deferred
+                    || provider_capabilities.cancel_deferred)
+            {
+                let adapter = ExtensionProvider::new(name.clone(), Arc::clone(self.client()))
+                    .with_capabilities(provider_capabilities);
+                if provider_capabilities.stream_simple {
+                    runtime.register_extension_stream_provider(name.clone(), Arc::new(adapter));
+                } else {
+                    runtime.register_extension_deferred_provider(
+                        name.clone(),
+                        Arc::new(adapter),
+                    );
+                }
             }
             results.push((path, outcome));
         }

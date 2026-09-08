@@ -11,7 +11,9 @@
 //!   the first scoped model when the current model is not in the scoped set.
 //! - Available cycling uses the model-runtime auth-configured snapshot.
 //! - Both call `set_thinking_level`, which clamps to the new model's supported
-//!   set and only persists/emits when the effective level actually changes.
+//!   set and emits only when the effective level actually changes. Explicit
+//!   `*_persisted` operations update the global default after the session
+//!   mutation succeeds.
 //! - Auth checks are skipped when no model runtime is attached (tests /
 //!   pre-runtime builds).
 //!
@@ -59,6 +61,15 @@ pub enum ModelError {
     /// Session persistence failed while appending the model-change entry.
     #[error(transparent)]
     Session(#[from] SessionError),
+}
+
+/// Whether a model or thinking mutation updates the global default.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationPersistence {
+    /// Update only the active session.
+    Session,
+    /// Update the active session and the global default.
+    Default,
 }
 
 /// Canonical thinking-level ordering used by `clampThinkingLevel`
@@ -171,11 +182,11 @@ impl AgentSession {
         self.model_runtime_handle()
     }
 
-    /// Set the current model.
+    /// Set the current model for this session without changing the global default.
     ///
     /// Validates auth via the attached runtime (when present), updates agent
-    /// state, appends a `model_change` session entry, mutates settings, and
-    /// re-clamps the thinking level to the new model's capabilities.
+    /// state, appends a `model_change` session entry, and re-clamps the
+    /// thinking level to the new model's capabilities.
     ///
     /// # Errors
     ///
@@ -183,6 +194,29 @@ impl AgentSession {
     /// credential for the model's provider, or [`ModelError::Session`] when
     /// persistence fails (live agent state is left unchanged in that case).
     pub async fn set_model(&self, model: Model) -> Result<(), ModelError> {
+        self.set_model_with_persistence(model, MutationPersistence::Session)
+            .await
+    }
+
+    /// Set the current model and update the global default.
+    ///
+    /// This is the explicit persistence operation used by the model selector's
+    /// save chord. Normal model selection and cycling use [`Self::set_model`]
+    /// so they do not mutate settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::set_model`].
+    pub async fn set_model_persisted(&self, model: Model) -> Result<(), ModelError> {
+        self.set_model_with_persistence(model, MutationPersistence::Default)
+            .await
+    }
+
+    async fn set_model_with_persistence(
+        &self,
+        model: Model,
+        persistence: MutationPersistence,
+    ) -> Result<(), ModelError> {
         if let Some(runtime) = self.model_runtime()
             && runtime.check_auth(&model.provider).await.is_none()
         {
@@ -197,8 +231,10 @@ impl AgentSession {
             manager.append_model_change(&model.provider, &model.id)?;
         }
         self.agent.set_model(model.clone());
-        self.lock_settings()
-            .set_default_model_and_provider(&model.provider, &model.id);
+        if persistence == MutationPersistence::Default {
+            self.lock_settings()
+                .set_default_model_and_provider(&model.provider, &model.id);
+        }
         // Model-switch path: the thinking append may fail independently; the
         // live level (reported by callers via `thinking_level()`) stays honest.
         let _committed = self.set_thinking_level(thinking).await;
@@ -249,8 +285,6 @@ impl AgentSession {
             }
         }
         self.agent.set_model(next.model.clone());
-        self.lock_settings()
-            .set_default_model_and_provider(&next.model.provider, &next.model.id);
         // Cycle result reports the actual live level below; bind-and-ignore.
         let _committed = self.set_thinking_level(thinking).await;
         self.emit_model_select(&next.model, Some(&current), ModelSelectSource::Cycle)
@@ -291,8 +325,6 @@ impl AgentSession {
             }
         }
         self.agent.set_model(next_model.clone());
-        self.lock_settings()
-            .set_default_model_and_provider(&next_model.provider, &next_model.id);
         // Cycle result reports the actual live level below; bind-and-ignore.
         let _committed = self.set_thinking_level(thinking).await;
         self.emit_model_select(&next_model, Some(&current), ModelSelectSource::Cycle)
@@ -319,13 +351,14 @@ impl AgentSession {
         keep
     }
 
-    /// Set the thinking level.
+    /// Set the thinking level for the active session without changing the
+    /// global default.
     ///
-    /// Clamps to the current model's supported levels. Only persists / emits
-    /// when the effective level actually changes. The reference is synchronous
-    /// because JavaScript is single-threaded; this Rust port is `async` so it
-    /// can append to the session manager (held under a `tokio::Mutex`) and
-    /// await extension emits without spawning.
+    /// Clamps to the current model's supported levels. Only emits when the
+    /// effective level actually changes. The reference is synchronous because
+    /// JavaScript is single-threaded; this Rust port is `async` so it can
+    /// append to the session manager (held under a `tokio::Mutex`) and await
+    /// extension emits without spawning.
     ///
     /// Returns whether the live level now equals the requested effective
     /// level: `true` on commit or when no change was needed, `false` when the
@@ -342,8 +375,8 @@ impl AgentSession {
         if effective == previous {
             return true;
         }
-        // Durable append first: live level, settings, and events publish only
-        // changes the session file actually holds.
+        // Durable append first: live level and events publish only changes the
+        // session file actually holds.
         {
             let mut manager = self.session_manager.lock().await;
             if manager
@@ -354,12 +387,6 @@ impl AgentSession {
             }
         }
         self.agent.set_thinking_level(effective);
-        // Persist as the default only when the model supports reasoning, or the
-        // new level is not "off" (TypeScript `supportsThinking() ||
-        // effectiveLevel !== "off"`).
-        if self.supports_thinking() || effective != ModelThinkingLevel::Off {
-            self.lock_settings().set_default_thinking_level(effective);
-        }
         self.emit_public(super::events::AgentSessionEvent::ThinkingLevelChanged {
             level: effective,
         });
@@ -368,6 +395,21 @@ impl AgentSession {
             .emit(super::events::AgentSessionEvent::ThinkingLevelChanged { level: effective })
             .await;
         true
+    }
+
+    /// Set the thinking level for the active session and update the global
+    /// default to the requested level.
+    ///
+    /// This is the explicit persistence operation used by the thinking
+    /// selector's save chord. Normal selection and cycling use
+    /// [`Self::set_thinking_level`] so they do not mutate settings.
+    #[must_use = "a false return means the level change was not durably committed"]
+    pub async fn set_thinking_level_persisted(&self, level: ModelThinkingLevel) -> bool {
+        let committed = self.set_thinking_level(level).await;
+        if committed {
+            self.lock_settings().set_default_thinking_level(level);
+        }
+        committed
     }
 
     /// Cycle to the next supported thinking level.

@@ -1,4 +1,4 @@
-//! Selector view-models (model / session / tree / settings / config / auth / scoped).
+//! Selector view-models (model / thinking / session / tree / settings / config / auth / scoped).
 //!
 //! Ports the `*SelectorComponent` family from
 //! `.references/pi-2.0/packages/coding-agent/src/modes/interactive/components/`.
@@ -10,8 +10,11 @@
 
 use std::collections::BTreeMap;
 
+use pi_ai::ModelThinkingLevel;
 use pi_tui::component::{Component, EventResult, UiEvent};
-use pi_tui::components::{SelectItem, SelectList, SettingItem, SettingsList, SettingsListOptions};
+use pi_tui::components::{
+    Input, SelectItem, SelectList, SettingItem, SettingsList, SettingsListOptions, Text,
+};
 use pi_tui::keybindings::get_keybindings;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -139,6 +142,7 @@ pub fn selector_empty_copy(kind: SelectorKind) -> SelectorEmptyCopy {
     };
     match kind {
         SelectorKind::Model | SelectorKind::ScopedModels => both("  No matching models"),
+        SelectorKind::Thinking => both("  No matching thinking levels"),
         SelectorKind::Theme => both("  No matching themes"),
         SelectorKind::Session => both("  No sessions found"),
         SelectorKind::Tree => both("  No entries found"),
@@ -178,7 +182,7 @@ pub(super) fn apply_settings_list_copy(
 }
 
 // ---------------------------------------------------------------------------
-// Select-list selectors (model / session / tree / auth / scoped)
+// Select-list selectors (model / thinking / session / tree / auth / scoped)
 // ---------------------------------------------------------------------------
 
 /// Build the model selector. Reads the thread-local current theme.
@@ -439,6 +443,288 @@ pub fn build_session_selector_component(
     SessionSelector::new(list, current_session_path)
 }
 
+// Save-chord select-list wrappers (model and thinking selectors)
+// ---------------------------------------------------------------------------
+
+type SaveDefaultCallback = Box<dyn FnMut(String) + Send>;
+
+/// Select-list wrapper that intercepts one app-level save chord before the
+/// inner list sees it (ports the reference selector `handleInput` save branch,
+/// `app.models.save` on the model selector). Navigation, filter,
+/// confirm, and cancel keys fall through to the wrapped [`SelectList`]
+/// unchanged, so a user rebind of the save id — or a physical-key collision
+/// with another `app.*` id — resolves through the shared keybindings manager,
+/// never a hardcoded key.
+pub struct SaveableSelectList {
+    list: SelectList,
+    save_binding: &'static str,
+    /// Called with the selected row's value when the save chord fires.
+    pub on_save_as_default: Option<SaveDefaultCallback>,
+}
+
+impl SaveableSelectList {
+    /// Wrap `list` so `save_binding` triggers [`Self::on_save_as_default`].
+    #[must_use]
+    pub fn new(list: SelectList, save_binding: &'static str) -> Self {
+        Self {
+            list,
+            save_binding,
+            on_save_as_default: None,
+        }
+    }
+
+    /// Replace rows and retain the selected value when it remains available.
+    pub fn replace_items(
+        &mut self,
+        items: Vec<SelectItem>,
+        selected_value: Option<&str>,
+    ) {
+        let selected_index = selected_value
+            .and_then(|value| items.iter().position(|item| item.value == value))
+            .unwrap_or(0);
+        self.list.set_items(items);
+        self.list.set_selected_index(selected_index);
+    }
+
+    /// Return the currently selected row.
+    #[must_use]
+    pub fn selected_item(&self) -> Option<&SelectItem> {
+        self.list.selected_item()
+    }
+
+    fn handle_key(&mut self, key: &KeyEvent) -> EventResult {
+        if self.on_save_as_default.is_some()
+            && get_keybindings().matches(key, self.save_binding)
+        {
+            // Consumed even with no selected row, mirroring the reference.
+            if let Some(item) = self.list.selected_item().cloned()
+                && let Some(cb) = self.on_save_as_default.as_mut()
+            {
+                cb(item.value);
+            }
+            return EventResult::Consumed;
+        }
+        self.list.handle_event(&UiEvent::Key(*key))
+    }
+}
+
+impl Component for SaveableSelectList {
+    fn measure(&mut self, width: u16) -> u16 {
+        self.list.measure(width)
+    }
+
+    fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        self.list.render(area, buf);
+    }
+
+    fn handle_event(&mut self, event: &UiEvent) -> EventResult {
+        match event {
+            UiEvent::Key(key) => self.handle_key(key),
+            other => self.list.handle_event(other),
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.list.invalidate();
+    }
+}
+
+/// Thinking-level selector with search, session-only selection, and a
+/// configurable save-as-default chord.
+///
+/// The selected row callback changes only the active session. The optional
+/// save callback is invoked by `app.thinking.save` and is the only callback
+/// that asks the runtime to update the global default.
+pub struct ThinkingSelectorComponent {
+    title: Text,
+    cycle_hint: Text,
+    search_input: Input,
+    select_list: SaveableSelectList,
+    footer: Text,
+    all_items: Vec<SelectItem>,
+}
+
+impl ThinkingSelectorComponent {
+    /// Build a selector around the available levels and session callbacks.
+    #[must_use]
+    pub fn new(
+        current_level: ModelThinkingLevel,
+        available_levels: Vec<ModelThinkingLevel>,
+        on_select: Box<dyn FnMut(ModelThinkingLevel) + Send>,
+        on_cancel: Box<dyn FnMut() + Send>,
+        on_select_as_default: Option<Box<dyn FnMut(ModelThinkingLevel) + Send>>,
+        default_level: Option<ModelThinkingLevel>,
+    ) -> Self {
+        let all_items = available_levels
+            .into_iter()
+            .map(|level| {
+                let marker = if level == current_level { "✓ " } else { "  " };
+                let description = thinking_level_description(level);
+                let description = if default_level == Some(level) {
+                    format!("{description} · default")
+                } else {
+                    description.to_owned()
+                };
+                SelectItem::new(
+                    crate::core::agent_session::model::level_str(level),
+                    format!("{marker}{}", crate::core::agent_session::model::level_str(level)),
+                )
+                .with_description(description)
+            })
+            .collect::<Vec<_>>();
+        let selected_index = all_items
+            .iter()
+            .position(|item| {
+                item.value == crate::core::agent_session::model::level_str(current_level)
+            })
+            .unwrap_or(0);
+
+        let copy = selector_empty_copy(SelectorKind::Thinking);
+        let mut select_list = SelectList::new(
+            all_items.clone(),
+            SELECTOR_MAX_VISIBLE,
+            theme::select_list_theme(),
+        )
+        .with_empty_text(copy.empty)
+        .with_no_match_text(copy.no_match);
+        select_list.set_selected_index(selected_index);
+        select_list.on_select = Some(Box::new(move |item| {
+            if let Some(level) = parse_thinking_level(item.value.as_str()) {
+                on_select(level);
+            }
+        }));
+        select_list.on_cancel = Some(on_cancel);
+
+        let mut select_list = SaveableSelectList::new(select_list, "app.thinking.save");
+        if let Some(mut callback) = on_select_as_default {
+            select_list.on_save_as_default = Some(Box::new(move |value| {
+                if let Some(level) = parse_thinking_level(value.as_str()) {
+                    callback(level);
+                }
+            }));
+        }
+
+        let mut search_input = Input::new();
+        search_input.set_focused(true);
+        Self {
+            title: Text::with_padding("Thinking Level", 0, 0),
+            cycle_hint: Text::with_padding(
+                format!(
+                    "{} cycles thinking levels in-session",
+                    pi_tui::keybindings::key_display_text("app.thinking.cycle")
+                ),
+                0,
+                0,
+            ),
+            search_input,
+            select_list,
+            footer: Text::with_padding(selector_save_hint("app.thinking.save"), 0, 0),
+            all_items,
+        }
+    }
+
+    fn apply_filter(&mut self) {
+        let query = self.search_input.value().to_owned();
+        let selected_value = self
+            .select_list
+            .selected_item()
+            .map(|item| item.value.clone());
+        let filtered = pi_tui::fuzzy::fuzzy_filter(&self.all_items, &query, |item| {
+            item.value.as_str()
+        });
+        self.select_list
+            .replace_items(filtered, selected_value.as_deref());
+    }
+}
+
+impl Component for ThinkingSelectorComponent {
+    fn measure(&mut self, width: u16) -> u16 {
+        self.title
+            .measure(width)
+            .saturating_add(self.cycle_hint.measure(width))
+            .saturating_add(self.search_input.measure(width))
+            .saturating_add(self.select_list.measure(width))
+            .saturating_add(self.footer.measure(width))
+    }
+
+    fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        let mut y = area.y;
+        let bottom = area.bottom();
+        let mut render_child = |child: &mut dyn Component| {
+            if y >= bottom {
+                return;
+            }
+            let height = child.measure(area.width).min(bottom - y);
+            if height == 0 {
+                return;
+            }
+            child.render(Rect::new(area.x, y, area.width, height), buf);
+            y = y.saturating_add(height);
+        };
+        render_child(&mut self.title);
+        render_child(&mut self.cycle_hint);
+        render_child(&mut self.search_input);
+        render_child(&mut self.select_list);
+        render_child(&mut self.footer);
+    }
+
+    fn handle_event(&mut self, event: &UiEvent) -> EventResult {
+        let list_result = self.select_list.handle_event(event);
+        if !matches!(list_result, EventResult::Ignored) {
+            return list_result;
+        }
+
+        let input_result = self.search_input.handle_event(event);
+        if !matches!(input_result, EventResult::Ignored) {
+            self.apply_filter();
+        }
+        input_result
+    }
+
+    fn invalidate(&mut self) {
+        self.title.invalidate();
+        self.cycle_hint.invalidate();
+        self.search_input.invalidate();
+        self.select_list.invalidate();
+        self.footer.invalidate();
+    }
+}
+
+fn thinking_level_description(level: ModelThinkingLevel) -> &'static str {
+    match level {
+        ModelThinkingLevel::Off => "No reasoning",
+        ModelThinkingLevel::Minimal => "Very brief reasoning (~1k tokens)",
+        ModelThinkingLevel::Low => "Light reasoning (~2k tokens)",
+        ModelThinkingLevel::Medium => "Moderate reasoning (~8k tokens)",
+        ModelThinkingLevel::High => "Deep reasoning (~16k tokens)",
+        ModelThinkingLevel::Xhigh => "Extra-high reasoning (~32k tokens)",
+        ModelThinkingLevel::Max => "Maximum reasoning",
+    }
+}
+
+fn parse_thinking_level(value: &str) -> Option<ModelThinkingLevel> {
+    match value {
+        "off" => Some(ModelThinkingLevel::Off),
+        "minimal" => Some(ModelThinkingLevel::Minimal),
+        "low" => Some(ModelThinkingLevel::Low),
+        "medium" => Some(ModelThinkingLevel::Medium),
+        "high" => Some(ModelThinkingLevel::High),
+        "xhigh" => Some(ModelThinkingLevel::Xhigh),
+        "max" => Some(ModelThinkingLevel::Max),
+        _ => None,
+    }
+}
+
+/// Footer hint naming the configurable save chord (reference selector footer:
+/// "⏎ to select · `<key>` to set as default · esc to cancel").
+#[must_use]
+pub fn selector_save_hint(save_binding: &str) -> String {
+    format!(
+        "  ⏎ to select · {} to set as default · esc to cancel",
+        pi_tui::keybindings::key_display_text(save_binding)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Settings-list selectors (settings / config)
 // ---------------------------------------------------------------------------
@@ -503,6 +789,7 @@ mod tests {
 
     const ALL_KINDS: &[SelectorKind] = &[
         SelectorKind::Model,
+        SelectorKind::Thinking,
         SelectorKind::Session,
         SelectorKind::Tree,
         SelectorKind::Fork,
@@ -530,6 +817,13 @@ mod tests {
                 SelectorEmptyCopy {
                     empty: "  No matching models",
                     no_match: "  No matching models",
+                },
+                HelperBoundary::Select,
+            ),
+            SelectorKind::Thinking => (
+                SelectorEmptyCopy {
+                    empty: "  No matching thinking levels",
+                    no_match: "  No matching thinking levels",
                 },
                 HelperBoundary::Select,
             ),
@@ -611,10 +905,9 @@ mod tests {
         snapshot_buffer_plain(&buf, 80, buf.area().height).join("\n")
     }
 
-    #[test]
     fn selector_kind_mapping_is_exhaustive_at_helper_boundary() {
         assert_eq!(
-            14,
+            15,
             ALL_KINDS.len(),
             "update ALL_KINDS when SelectorKind grows"
         );

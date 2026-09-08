@@ -241,6 +241,102 @@ export interface ProviderEvent {
 	data?: unknown;
 }
 
+/** Full opaque handle for a provider-owned deferred response. */
+export interface ProviderDeferredHandle {
+	provider: string;
+	modelId: string;
+	api: string;
+	id: string;
+	expiresAt?: number;
+	pollAfterMs?: number;
+	data?: unknown;
+}
+
+/** Prepared options forwarded to a deferred provider operation. */
+export interface ProviderDeferredOptions {
+	/** Deferred fetch is always a single non-waiting poll (`0`). */
+	wait?: number;
+	apiKey?: string;
+	env?: Record<string, string>;
+	headers?: Record<string, string | null>;
+	timeoutMs?: number;
+	maxRetries?: number;
+	maxRetryDelayMs?: number;
+	[key: string]: unknown;
+}
+
+/** Native callbacks requested for one provider operation. */
+export interface ProviderCallbackFlags {
+	beforePayload: boolean;
+	onResponse: boolean;
+}
+
+/** HTTP response metadata passed to the native response callback. */
+export interface ProviderResponseWire {
+	status: number;
+	headers: Record<string, string>;
+}
+
+/** Correlated deferred fetch request (Rust → extension host). */
+export interface ProviderFetchDeferredRequest {
+	providerId: string;
+	model: unknown;
+	handle: ProviderDeferredHandle;
+	options: ProviderDeferredOptions;
+	callbacks: ProviderCallbackFlags;
+}
+
+/** Correlated deferred cancellation request (Rust → extension host). */
+export interface ProviderCancelDeferredRequest {
+	providerId: string;
+	model: unknown;
+	handle: ProviderDeferredHandle;
+	options: ProviderDeferredOptions;
+	callbacks: ProviderCallbackFlags;
+}
+
+/** Native payload callback request (extension host → Rust). */
+export interface ProviderBeforePayloadRequest {
+	callId: string;
+	payload: unknown;
+}
+
+/** Native payload callback response (Rust → extension host). */
+export interface ProviderBeforePayloadResponse {
+	payload: unknown;
+}
+
+/** Native response callback request (extension host → Rust). */
+export interface ProviderOnResponseRequest {
+	callId: string;
+	response: ProviderResponseWire;
+}
+
+/** Native response callback acknowledgment (Rust → extension host). */
+export type ProviderOnResponseResponse = Record<string, never>;
+
+/** Independent provider capability snapshot used by product/proxy code. */
+export interface ProviderCapabilities {
+	stream_simple: boolean;
+	fetch_deferred: boolean;
+	cancel_deferred: boolean;
+}
+
+/** Provider entry in a providers.update / registry snapshot. */
+export interface ProviderUpdateEntry {
+	name: string;
+	baseUrl?: string;
+	api?: string;
+	apiKey?: string;
+	headers?: Record<string, string>;
+	authHeader?: boolean;
+	models?: unknown[];
+	streamSimple?: boolean;
+	fetchDeferred?: boolean;
+	cancelDeferred?: boolean;
+	extensionPath?: string;
+}
+
 /** Key modifiers on the wire. */
 export interface KeyModifiersWire {
 	shift?: boolean;
