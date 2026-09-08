@@ -28,7 +28,7 @@ pub fn from_serde_json(value: SerdeValue) -> JsonValue {
             match input {
                 SerdeValue::Null => attach_from(&mut stack, &mut root, JsonValue::Null),
                 SerdeValue::Bool(value) => {
-                    attach_from(&mut stack, &mut root, JsonValue::Bool(value))
+                    attach_from(&mut stack, &mut root, JsonValue::Bool(value));
                 }
                 SerdeValue::Number(value) => {
                     attach_from(

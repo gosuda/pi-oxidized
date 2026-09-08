@@ -1089,7 +1089,7 @@ impl HookRegistry {
                 Ok(None) => {}
                 Err(error) => {
                     self.report(HookName::BeforeRun, &event, &context, &error)
-                        .await
+                        .await;
                 }
             }
         }
@@ -1140,7 +1140,7 @@ impl HookRegistry {
                 Ok(None) => {}
                 Err(error) => {
                     self.report(HookName::BeforeRunEnd, &event, &context, &error)
-                        .await
+                        .await;
                 }
             }
         }
@@ -1179,7 +1179,7 @@ impl HookRegistry {
                 Ok(None) => {}
                 Err(error) => {
                     self.report(HookName::TransformContext, &event, &context, &error)
-                        .await
+                        .await;
                 }
             }
         }
@@ -1220,7 +1220,7 @@ impl HookRegistry {
                 Ok(None) => {}
                 Err(error) => {
                     self.report(HookName::BeforeRequest, &event, &context, &error)
-                        .await
+                        .await;
                 }
             }
         }
@@ -1251,7 +1251,7 @@ impl HookRegistry {
                 Ok(None) => {}
                 Err(error) => {
                     self.report(HookName::BeforePayload, &event, &context, &error)
-                        .await
+                        .await;
                 }
             }
         }
@@ -1285,7 +1285,7 @@ impl HookRegistry {
                 Ok(None) => {}
                 Err(error) => {
                     self.report(HookName::AfterResponse, &event, &context, &error)
-                        .await
+                        .await;
                 }
             }
         }
@@ -1424,7 +1424,7 @@ impl HookRegistry {
                 Ok(None) => {}
                 Err(error) => {
                     self.report(HookName::AfterTool, &event, &context, &error)
-                        .await
+                        .await;
                 }
             }
         }
@@ -1459,7 +1459,7 @@ impl HookRegistry {
                 Ok(None) => {}
                 Err(error) => {
                     self.report(HookName::BeforeCompaction, &event, &context, &error)
-                        .await
+                        .await;
                 }
             }
         }
@@ -1494,7 +1494,7 @@ impl HookRegistry {
                 Ok(None) => {}
                 Err(error) => {
                     self.report(HookName::BeforeNavigation, &event, &context, &error)
-                        .await
+                        .await;
                 }
             }
         }

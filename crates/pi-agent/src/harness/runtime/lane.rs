@@ -1019,7 +1019,7 @@ pub(crate) async fn read_queue_snapshot(
                     entry_id: item.entry_id,
                     kind: item.kind,
                     message: payload,
-                })
+                });
             }
             crate::session::PendingEntry::Custom {
                 custom_type,

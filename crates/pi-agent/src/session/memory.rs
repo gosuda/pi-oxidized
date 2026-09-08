@@ -973,7 +973,7 @@ async fn dropping_pending_custom_id_fork_releases_reservation() -> Result<(), Se
 
     match repo.fork(&source_metadata, options.clone(), &cx).await {
         Err(SessionError::Invariant(message)) => {
-            assert_eq!(message, "session already exists: retry-fork")
+            assert_eq!(message, "session already exists: retry-fork");
         }
         Err(_) | Ok(_) => {
             return Err(SessionError::Invariant(

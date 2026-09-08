@@ -2396,6 +2396,7 @@ async fn finish_parallel_tools(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_tool(
     lane: &LaneRuntime,
     operation: &Operation,

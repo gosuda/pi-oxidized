@@ -22,6 +22,7 @@ pub(crate) struct RestoredLane {
 }
 
 /// Read every lane and operation without mutating session storage.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn restore_session(
     session: &Arc<dyn Session>,
     cx: &Context,

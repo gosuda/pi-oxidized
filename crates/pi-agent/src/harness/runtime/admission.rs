@@ -723,6 +723,7 @@ pub(crate) async fn cancel_queued(
 }
 
 /// Durably mark an operation for cancellation and drain steering/follow-up.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn request_abort(
     lane: &LaneRuntime,
     operation_id: &OperationId,

@@ -74,6 +74,7 @@ struct ForkFixture {
     pending_value: RawAddress,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn seed_fork_fixture(repo: &MemorySessionRepo, cx: &Context) -> ForkFixture {
     let session = create_session(repo, "source", cx).await;
     let metadata = session.metadata().clone();
@@ -272,7 +273,7 @@ async fn open_rejects_double_open_and_delete_while_open() {
 
     match repo.open(&metadata, &cx).await {
         Err(SessionError::Invariant(message)) => {
-            assert_eq!(message, "session is already open: lifecycle")
+            assert_eq!(message, "session is already open: lifecycle");
         }
         other => panic!(
             "expected double-open rejection, got {}",
@@ -376,6 +377,7 @@ async fn branch_fork_rejects_an_unconfigured_lane() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn branch_forks_at_root_before_and_at_preserve_the_expected_ancestry() {
     let repo = MemorySessionRepo::new();
     let cx = Context::background();
