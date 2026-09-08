@@ -53,6 +53,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
 import { AssistantDeltaReducer } from "./assistant-delta.ts";
+import { isRecord, isStructuredAbortError } from "./wire-validators.ts";
 
 /** Minimal event bus for extension-to-extension communication. */
 export function createEventBus() {
@@ -174,19 +175,6 @@ function isSlotComponent(value: unknown): value is SlotComponent {
 	return value !== null
 		&& typeof value === "object"
 		&& typeof (value as SlotComponent).render === "function";
-}
-
-/**
- * Structured cancellation only: a real Error (or DOMException, which is
- * not Error-derived in every runtime) named AbortError. Message text is
- * deliberately never consulted — an extension failure that merely says
- * "cancelled" must stay an extension_error.
- */
-function isStructuredAbortError(error: unknown): boolean {
-	if (error instanceof Error && error.name === "AbortError") return true;
-	return typeof DOMException === "function"
-		&& error instanceof DOMException
-		&& error.name === "AbortError";
 }
 
 /** Pending load options captured during the hello handshake. */
@@ -2528,10 +2516,19 @@ export class ExtensionHost {
 			return;
 		}
 
+		const rawOptions = p["options"];
+		if (rawOptions !== undefined && !isRecord(rawOptions)) {
+			await this.client.respondError(id, "provider.stream" as Method, {
+				code: "invalid_arguments",
+				message: "provider.stream options must be an object",
+				retryable: false,
+			});
+			return;
+		}
 		const controller = new AbortController();
 		this.inFlightProviders.set(id, controller);
 		const options = {
-			...((p["options"] as Record<string, unknown> | undefined) ?? {}),
+			...(rawOptions ?? {}),
 			signal: controller.signal,
 		};
 		try {
@@ -3182,10 +3179,6 @@ export class ExtensionHost {
 	get extensionCount(): number { return this.extensions.length; }
 	getExtensions(): Extension[] { return [...this.extensions]; }
 	getRunner(): ExtensionRunner | undefined { return this.runner; }
-}
-
-function isRecord<T extends Record<string, unknown>>(value: unknown): value is T {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Compare JSON-serializable values ignoring object-key insertion order. */

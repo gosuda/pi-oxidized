@@ -252,16 +252,39 @@ export interface ProviderDeferredHandle {
 	data?: unknown;
 }
 
-/** Prepared options forwarded to a deferred provider operation. */
+/** Prepared options forwarded to a deferred provider operation.
+ *
+ * Mirrors the Rust `ProviderDeferredOptions` envelope (crates/pi-ext/src/protocol.rs):
+ * every explicitly typed option is optional, camelCase on the wire, and
+ * omitted when `None`. Unknown provider-specific extras survive unreshaped
+ * through the index signature, mirroring the Rust `#[serde(flatten)] extra`.
+ */
 export interface ProviderDeferredOptions {
-	/** Deferred fetch is always a single non-waiting poll (`0`). */
+	/** One-shot polling wait. Deferred fetch always sends `0`. */
 	wait?: number;
 	apiKey?: string;
 	env?: Record<string, string>;
 	headers?: Record<string, string | null>;
+	/** Request timeout in milliseconds. */
 	timeoutMs?: number;
+	/** Maximum retry attempts. */
 	maxRetries?: number;
+	/** Maximum retry delay in milliseconds. */
 	maxRetryDelayMs?: number;
+	/** Sampling temperature. */
+	temperature?: number;
+	/** Maximum output tokens. */
+	maxTokens?: number;
+	/** Provider transport tag. */
+	transport?: string;
+	/** Prompt-cache retention tag. */
+	cacheRetention?: string;
+	/** Optional session identifier. */
+	sessionId?: string;
+	/** WebSocket connect timeout in milliseconds. */
+	websocketConnectTimeoutMs?: number;
+	/** Optional request metadata. */
+	metadata?: Record<string, unknown>;
 	[key: string]: unknown;
 }
 
@@ -315,11 +338,19 @@ export interface ProviderOnResponseRequest {
 /** Native response callback acknowledgment (Rust → extension host). */
 export type ProviderOnResponseResponse = Record<string, never>;
 
-/** Independent provider capability snapshot used by product/proxy code. */
+/** Independent provider capability snapshot used by product/proxy code.
+ *
+ * Mirrors the Rust `ProviderCapabilitiesWire` representation (crates/pi-ext/src/protocol.rs):
+ * camelCase on the wire, and each field is omitted when `false`, so older
+ * hosts keep the compact snapshot shape. Absence means the capability is off.
+ */
 export interface ProviderCapabilities {
-	stream_simple: boolean;
-	fetch_deferred: boolean;
-	cancel_deferred: boolean;
+	/** Whether the endpoint exposes ordinary `streamSimple`. */
+	streamSimple?: boolean;
+	/** Whether the endpoint exposes `fetchDeferred`. */
+	fetchDeferred?: boolean;
+	/** Whether the endpoint exposes `cancelDeferred`. */
+	cancelDeferred?: boolean;
 }
 
 /** Provider entry in a providers.update / registry snapshot. */

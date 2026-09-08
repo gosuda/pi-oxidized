@@ -1287,6 +1287,27 @@ describe("lean: commands, flags, shortcuts, providers", () => {
 		await link.finish();
 	});
 
+	test("provider.stream rejects present-but-non-object options before streaming", async () => {
+		const link = await loadedLink();
+		for (const [id, bad] of [[40, [1, 2]], [41, "nope"], [42, 42]] as const) {
+			link.request(id, "provider.stream", {
+				providerId: "lean-provider",
+				model: { id: "m1" },
+				context: {},
+				options: bad,
+			});
+			const err = payload(await link.error(id, "provider.stream"));
+			expect(err["code"]).toBe("invalid_arguments");
+			expect(err["message"]).toBe("provider.stream options must be an object");
+			expect(link.allFrames().some((f) => f.id === id && f.kind === "event")).toBe(false);
+		}
+		// Absent options still defaults to {} and streams normally.
+		link.request(43, "provider.stream", { providerId: "lean-provider", model: { id: "m1" }, context: {} });
+		const res = payload(await link.response(43, "provider.stream"));
+		expect(res).toEqual({});
+		await link.finish();
+	});
+
 	test("provider.stream fails fast when the lifecycle signal is absent", async () => {
 		// Dynamic import: exercises the real .mjs plugin-loading boundary.
 		const fixture = (await import(ECHO_ENTRY)) as { default: LeanExtension };
@@ -2770,6 +2791,7 @@ describe("lean: structural graph proofs", () => {
 			"lean-api.ts",
 			"lean-runner.ts",
 			"protocol.ts",
+			"wire-validators.ts",
 		]);
 		for (const specifier of bare) {
 			const allowed = specifier === "@earendil-works/pi-tui-protocol"

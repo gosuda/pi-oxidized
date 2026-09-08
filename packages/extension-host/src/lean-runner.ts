@@ -53,6 +53,7 @@ import {
 	parseLeanExtension,
 } from "./lean-api.ts";
 import { AssistantDeltaReducer } from "./assistant-delta.ts";
+import { isRecord, isStructuredAbortError } from "./wire-validators.ts";
 
 /** Host lifecycle state. */
 const RunnerState = {
@@ -94,11 +95,6 @@ interface RegisteredHook {
 	handler: (event: never, ctx: LeanContext) => unknown;
 	extensionPath: string;
 }
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 
 /**
  * Import specifiers that mark a lean entry as accidentally built for
@@ -870,17 +866,6 @@ async function findModuleLoadViolationInGraph(entry: string): Promise<ModuleLoad
 }
 
 /**
- * Structured cancellation only: a real Error (or DOMException, which is
- * not Error-derived in every runtime) named AbortError. Message text is
- * deliberately never consulted — an extension failure that merely says
- * "cancelled" must stay an extension_error.
- */
-function isStructuredAbortError(error: unknown): boolean {
-	if (error instanceof Error && error.name === "AbortError") return true;
-	return typeof DOMException === "function" && error instanceof DOMException && error.name === "AbortError";
-}
-
-/**
  * Lean Mode-2 endpoint process. Owns the declarative registry and bridges
  * it to Rust over a single JSONL byte transport, mirroring the Mode-1
  * host's four-state machine (hello → loading → ready → disposed).
@@ -1449,10 +1434,19 @@ export class LeanRunner {
 			return;
 		}
 
+		const rawOptions = p["options"];
+		if (rawOptions !== undefined && !isRecord(rawOptions)) {
+			await this.client.respondError(id, "provider.stream" as Method, {
+				code: "invalid_arguments",
+				message: "provider.stream options must be an object",
+				retryable: false,
+			});
+			return;
+		}
 		const controller = new AbortController();
 		this.inFlightProviders.set(id, controller);
 		const options = {
-			...(isRecord(p["options"]) ? p["options"] : {}),
+			...(rawOptions ?? {}),
 			signal: controller.signal,
 		};
 		try {
