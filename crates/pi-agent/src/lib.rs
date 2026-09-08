@@ -6,13 +6,17 @@
 pub mod agent;
 pub mod bus;
 pub mod config;
+pub mod context;
 pub mod drain;
 pub mod error;
 pub mod event;
+pub mod harness;
 pub mod message;
 pub mod queue;
 pub mod run;
 pub mod schedule;
+pub mod service;
+pub mod session;
 pub mod state;
 pub mod telemetry;
 pub mod tool;
