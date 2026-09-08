@@ -265,13 +265,13 @@ async fn input_task_with_factory<S, F>(
             }
             InputWake::Event(Some(Err(error))) => {
                 if crossterm::event::reply::is_protocol_error(&error) {
-                    // Recognized malformed or oversized reply framing: stop
-                    // decoding and park until a control message. A later
-                    // resume recovers the parser (defined session recovery);
-                    // keys are never replayed and nothing is discarded
-                    // silently (the tty is simply not read while parked).
-                    stream = None;
-                    paused = true;
+                    // Recognized malformed or oversized reply framing: drop the
+                    // current stream, clear the latch, and recreate the stream
+                    // in-task so decoding resumes immediately. The defined
+                    // Pause/Resume path remains available for probes.
+                    drop(stream.take());
+                    crossterm::event::reply::recover_protocol_error();
+                    stream = Some(make_stream());
                 }
                 // Transient read errors are ignored; EOF ends the task.
             }
@@ -364,10 +364,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_error_parks_stream_and_resume_recovers() -> io::Result<()> {
-        // A latched reply protocol error stops decoding and parks the task;
-        // a resume recovers the parser and a fresh stream stays live. Keys
-        // are never replayed and nothing is silently discarded.
+    async fn protocol_error_recovers_in_task_and_keeps_stream_live() -> io::Result<()> {
+        // A latched reply protocol error is recovered in-task: the current
+        // stream is dropped, the parser latch is cleared, and a fresh stream
+        // starts immediately. Later events are delivered without a Resume
+        // control, and the defined Pause/Resume path still works.
         let protocol_message =
             "crossterm reply protocol error: malformed OSC 11 reply framing (test)";
         let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -375,12 +376,23 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let factory_calls = std::sync::Arc::clone(&calls);
         tokio::spawn(input_task_with_factory(events_tx, control_rx, move || {
-            factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(futures::stream::iter(vec![Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                protocol_message,
-            ))]))
-                as std::pin::Pin<Box<dyn futures::Stream<Item = io::Result<Event>> + Send>>
+            let n = factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let stream: std::pin::Pin<Box<dyn futures::Stream<Item = io::Result<Event>> + Send>> =
+                match n {
+                    0 => Box::pin(futures::stream::iter(vec![Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        protocol_message,
+                    ))])),
+                    1 => Box::pin(
+                        futures::stream::iter(vec![
+                            Ok(Event::FocusGained),
+                            Ok(Event::Resize(80, 24)),
+                        ])
+                        .chain(futures::stream::pending()),
+                    ),
+                    _ => Box::pin(futures::stream::pending::<io::Result<Event>>()),
+                };
+            stream
         }));
         let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
         let mut input = TerminalInput {
@@ -390,20 +402,24 @@ mod tests {
             control_rx: None,
         };
 
-        // Give the task a tick to hit the error and park.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(
-            input.try_recv().is_none(),
-            "the protocol error must not surface as a key event"
+        // The task recovers in-task and delivers the next events without a
+        // Resume control.
+        assert_eq!(input.recv().await, Some(UiEvent::FocusGained));
+        assert_eq!(
+            input.recv().await,
+            Some(UiEvent::Resize {
+                width: 80,
+                height: 24,
+            })
         );
 
-        // Pause still works while parked, and resume recovers.
+        // The defined Pause/Resume path still works after in-task recovery.
         input.pause().await?;
-        input.resume(Vec::new()).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        input.resume(vec![UiEvent::FocusGained]).await?;
+        assert_eq!(input.recv().await, Some(UiEvent::FocusGained));
         assert!(
-            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-            "resume must recreate the stream after recovery"
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "error, recovery, and resume must each recreate the stream"
         );
         input.shutdown();
         Ok(())

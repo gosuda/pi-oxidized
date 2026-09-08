@@ -250,7 +250,9 @@ impl<W: Write> TerminalGuard<W> {
             return Ok(());
         }
         let result = self.restore_fullscreen_modes();
-        self.screen_mode = ScreenMode::Regular;
+        if result.is_ok() {
+            self.screen_mode = ScreenMode::Regular;
+        }
         result
     }
 
@@ -289,7 +291,13 @@ impl<W: Write> TerminalGuard<W> {
             return Ok(());
         }
         let mut first_error = None;
-        while let Some(step) = self.fullscreen_applied.pop() {
+        // Walk the activation stack in reverse (last activated first), removing
+        // only the steps that successfully restore. Failed steps stay on the
+        // applied list so the caller can retry.
+        let mut i = self.fullscreen_applied.len();
+        while i > 0 {
+            i -= 1;
+            let step = self.fullscreen_applied[i];
             let result = match step {
                 FullscreenStep::AlternateScreen => queue!(self.writer, LeaveAlternateScreen),
                 FullscreenStep::AutowrapDisabled => queue!(self.writer, EnableLineWrap),
@@ -298,11 +306,13 @@ impl<W: Write> TerminalGuard<W> {
                 FullscreenStep::MouseAll => self.writer.write_all(b"\x1b[?1003l"),
                 FullscreenStep::MouseSgr => self.writer.write_all(b"\x1b[?1006l"),
             };
-            if let Err(error) = result
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+            if let Err(error) = result {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
             }
+            self.fullscreen_applied.remove(i);
         }
         // Show after leaving 1049 so a hot switch never emits inline cursor
         // parking or a scroll while the alternate screen is still active.
@@ -798,6 +808,54 @@ mod tests {
         // A failed switch must not latch the fullscreen bookkeeping.
         assert_eq!(guard.screen_mode(), ScreenMode::Regular);
         Ok(())
+    }
+
+    #[test]
+    fn leave_fullscreen_retains_failed_steps_and_stays_fullscreen() {
+        // Activation order: alternate screen, then autowrap, then SGR mouse.
+        // Budget 15 lets the first two restore writes (SGR 7, autowrap 5)
+        // succeed, then fails the alternate-screen restore (8) and Show. The
+        // failed step stays recorded and the screen mode stays Fullscreen.
+        let mut guard = TerminalGuard::new(LatchingFailureWriter {
+            bytes: Vec::new(),
+            attempted: Vec::new(),
+            budget: 15,
+        });
+        guard.applied.push(RestoreStep::RawMode);
+        guard.fullscreen_applied = vec![
+            FullscreenStep::AlternateScreen,
+            FullscreenStep::AutowrapDisabled,
+            FullscreenStep::MouseSgr,
+        ];
+        guard.screen_mode = ScreenMode::Fullscreen;
+
+        let result = guard.leave_fullscreen();
+        assert!(
+            result.is_err(),
+            "leave_fullscreen must report the failed restore"
+        );
+        assert_eq!(
+            guard.screen_mode(),
+            ScreenMode::Fullscreen,
+            "screen mode must not advance on a failed restore"
+        );
+        assert_eq!(
+            guard.fullscreen_applied,
+            [FullscreenStep::AlternateScreen],
+            "only successfully restored steps should be removed"
+        );
+
+        // Increase the budget and retry; the remaining step, Show, and flush
+        // now all succeed, so the mode finally becomes Regular.
+        guard.writer_mut().budget = 100;
+        let result = guard.leave_fullscreen();
+        assert!(result.is_ok(), "retry should succeed with a healthy writer");
+        assert_eq!(
+            guard.screen_mode(),
+            ScreenMode::Regular,
+            "mode advances only after full success"
+        );
+        assert!(guard.fullscreen_applied.is_empty(), "all steps restored");
     }
 
     // MUTATION RECIPE — reverting `enter_fullscreen` to the pre-fix shape

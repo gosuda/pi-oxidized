@@ -78,7 +78,7 @@ pub struct TerminalCapabilities {
     /// Truecolor (24-bit) support.
     pub true_color: bool,
     /// DEC synchronized output (`CSI ? 2026`); granted only for terminals
-    /// known to support it. Unknown terminals (ConPTY fallback among them)
+    /// known to support it. Unknown terminals (`ConPTY` fallback among them)
     /// keep unwrapped frames; `PI_TUI_NO_SYNC` forces it off everywhere.
     pub sync_output: bool,
     /// Active keyboard protocol.
@@ -120,7 +120,12 @@ impl TerminalCapabilities {
     /// Detect capabilities, then apply explicit overrides over the environment.
     #[must_use]
     pub fn detect_with_overrides(overrides: TerminalCapabilityOverrides) -> Self {
-        resolve_with(|key| env::var(key).ok(), probe_tmux_hyperlinks, overrides)
+        resolve_with(
+            |key| env::var(key).ok(),
+            probe_tmux_hyperlinks,
+            probe_tmux_sync,
+            overrides,
+        )
     }
 
     /// Apply a Kitty keyboard probe result.
@@ -157,28 +162,36 @@ impl TerminalCapabilities {
 ///
 /// The environment seam (`env`) maps a variable name to its value, allowing
 /// tests to exercise every authority row without mutating the process
-/// environment. The `tmux_forwards_hyperlink` probe is only consulted in
-/// the tmux row.
-fn detect_with<E, P>(env: E, tmux_forwards_hyperlink: P) -> TerminalCapabilities
+/// environment. The `tmux_forwards_hyperlink` and `tmux_supports_sync`
+/// probes are only consulted in the tmux row.
+fn detect_with<E, P, S>(
+    env: E,
+    tmux_forwards_hyperlink: P,
+    tmux_supports_sync: S,
+) -> TerminalCapabilities
 where
     E: Fn(&str) -> Option<String>,
     P: Fn() -> bool,
+    S: Fn() -> bool,
 {
     resolve_with(
         env,
         tmux_forwards_hyperlink,
+        tmux_supports_sync,
         TerminalCapabilityOverrides::default(),
     )
 }
 
-fn resolve_with<E, P>(
+fn resolve_with<E, P, S>(
     env: E,
     tmux_forwards_hyperlink: P,
+    tmux_supports_sync: S,
     explicit: TerminalCapabilityOverrides,
 ) -> TerminalCapabilities
 where
     E: Fn(&str) -> Option<String>,
     P: Fn() -> bool,
+    S: Fn() -> bool,
 {
     let environment = TerminalCapabilityOverrides {
         images: env("PI_IMAGE_PROTOCOL").and_then(|value| {
@@ -197,11 +210,15 @@ where
         hyperlinks: explicit.hyperlinks.or(environment.hyperlinks),
         true_color: explicit.true_color.or(environment.true_color),
     };
-    let mut capabilities = detect_rows(&env, || {
-        effective
-            .hyperlinks
-            .unwrap_or_else(&tmux_forwards_hyperlink)
-    });
+    let mut capabilities = detect_rows(
+        &env,
+        || {
+            effective
+                .hyperlinks
+                .unwrap_or_else(&tmux_forwards_hyperlink)
+        },
+        tmux_supports_sync,
+    );
 
     if let Some(images) = effective.images {
         capabilities.images = match images {
@@ -228,10 +245,45 @@ fn parse_boolean_capability_override(value: Option<&str>) -> Option<bool> {
     }
 }
 
-fn detect_rows<E, P>(env: E, tmux_forwards_hyperlink: P) -> TerminalCapabilities
+/// Kitty-protocol row: Kitty image protocol, truecolor, hyperlinks, and
+/// synchronized output unless the escape hatch disables it. Kitty, Ghostty,
+/// `WezTerm`, and Warp share this exact grant.
+fn grant_kitty_row(caps: &mut TerminalCapabilities, sync_disabled: bool) {
+    caps.images = Some(ImageProtocol::Kitty);
+    caps.true_color = true;
+    caps.hyperlinks = true;
+    caps.sync_output = !sync_disabled;
+}
+
+/// tmux row: images off (unreliable under multiplexer), hyperlinks only
+/// when the tmux client forwards them. tmux implements DEC 2026 (3.2+),
+/// so synchronized output is granted only after a version probe shows
+/// the attached client is 3.2 or newer.
+fn detect_tmux_row<P, S>(
+    caps: &mut TerminalCapabilities,
+    has_true_color_hint: bool,
+    sync_disabled: bool,
+    tmux_forwards_hyperlink: P,
+    tmux_supports_sync: S,
+) where
+    P: Fn() -> bool,
+    S: Fn() -> bool,
+{
+    caps.images = None;
+    caps.true_color = has_true_color_hint;
+    caps.hyperlinks = tmux_forwards_hyperlink();
+    caps.sync_output = !sync_disabled && tmux_supports_sync();
+}
+
+fn detect_rows<E, P, S>(
+    env: E,
+    tmux_forwards_hyperlink: P,
+    tmux_supports_sync: S,
+) -> TerminalCapabilities
 where
     E: Fn(&str) -> Option<String>,
     P: Fn() -> bool,
+    S: Fn() -> bool,
 {
     let mut caps = TerminalCapabilities::default();
     // `PI_TUI_NO_SYNC` escape hatch: synchronized output stays off even in a
@@ -252,13 +304,15 @@ where
 
     // Authority order — first match wins (matches TS `detectCapabilities`).
 
-    // 1. tmux: images off (unreliable under multiplexer), hyperlinks only
-    //    when the tmux client forwards them. tmux implements DEC 2026 (3.2+).
+    // 1. tmux row (see `detect_tmux_row`).
     if has_marker(&env, "TMUX") || term.as_deref().is_some_and(|t| t.starts_with("tmux")) {
-        caps.images = None;
-        caps.true_color = has_true_color_hint;
-        caps.hyperlinks = tmux_forwards_hyperlink();
-        caps.sync_output = !sync_disabled;
+        detect_tmux_row(
+            &mut caps,
+            has_true_color_hint,
+            sync_disabled,
+            tmux_forwards_hyperlink,
+            tmux_supports_sync,
+        );
         return caps;
     }
 
@@ -272,10 +326,7 @@ where
 
     // 3. Kitty.
     if has_marker(&env, "KITTY_WINDOW_ID") || term_program.as_deref() == Some("kitty") {
-        caps.images = Some(ImageProtocol::Kitty);
-        caps.true_color = true;
-        caps.hyperlinks = true;
-        caps.sync_output = !sync_disabled;
+        grant_kitty_row(&mut caps, sync_disabled);
         return caps;
     }
 
@@ -284,19 +335,13 @@ where
         || term.as_deref().is_some_and(|t| t.contains("ghostty"))
         || has_marker(&env, "GHOSTTY_RESOURCES_DIR")
     {
-        caps.images = Some(ImageProtocol::Kitty);
-        caps.true_color = true;
-        caps.hyperlinks = true;
-        caps.sync_output = !sync_disabled;
+        grant_kitty_row(&mut caps, sync_disabled);
         return caps;
     }
 
     // 5. WezTerm.
     if has_marker(&env, "WEZTERM_PANE") || term_program.as_deref() == Some("wezterm") {
-        caps.images = Some(ImageProtocol::Kitty);
-        caps.true_color = true;
-        caps.hyperlinks = true;
-        caps.sync_output = !sync_disabled;
+        grant_kitty_row(&mut caps, sync_disabled);
         return caps;
     }
 
@@ -305,10 +350,7 @@ where
         || has_marker(&env, "WARP_SESSION_ID")
         || has_marker(&env, "WARP_TERMINAL_SESSION_UUID")
     {
-        caps.images = Some(ImageProtocol::Kitty);
-        caps.true_color = true;
-        caps.hyperlinks = true;
-        caps.sync_output = !sync_disabled;
+        grant_kitty_row(&mut caps, sync_disabled);
         return caps;
     }
 
@@ -384,7 +426,7 @@ where
 }
 
 const TMUX_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-const TMUX_FEATURES_MAX_BYTES: u64 = 4096;
+const TMUX_PROBE_MAX_BYTES: u64 = 4096;
 static NEXT_TMUX_PROBE_OUTPUT: AtomicU64 = AtomicU64::new(0);
 
 fn create_tmux_probe_output() -> io::Result<(PathBuf, File)> {
@@ -406,25 +448,22 @@ fn create_tmux_probe_output() -> io::Result<(PathBuf, File)> {
     ))
 }
 
-/// Probe whether the attached tmux client forwards OSC 8 hyperlinks.
-///
-/// tmux only re-emits them when its `client_termfeatures` lists `hyperlinks`.
-/// Any spawn, exit-status, timeout, oversized output, or UTF-8 failure is
-/// conservative and returns `false`. The output file prevents a descendant
-/// retaining stdout from extending the probe past its deadline.
-fn probe_tmux_hyperlinks() -> bool {
+/// Run a `tmux display-message` probe with the supplied arguments and
+/// return the trimmed, validated output. Any spawn, exit-status, timeout,
+/// oversized output, or UTF-8 failure is conservative and returns `None`.
+fn probe_tmux_output(args: &[&str]) -> Option<String> {
     let Ok((output_path, output_file)) = create_tmux_probe_output() else {
-        return false;
+        return None;
     };
     let Ok(mut child) = Command::new("tmux")
-        .args(["display-message", "-p", "#{client_termfeatures}"])
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_file))
         .stderr(Stdio::null())
         .spawn()
     else {
         let _ = fs::remove_file(output_path);
-        return false;
+        return None;
     };
 
     let deadline = Instant::now() + TMUX_PROBE_TIMEOUT;
@@ -451,24 +490,85 @@ fn probe_tmux_hyperlinks() -> bool {
     let result = match status {
         Some(status) if status.success() => {
             let mut output = Vec::new();
-            File::open(&output_path)
-                .and_then(|file| {
-                    file.take(TMUX_FEATURES_MAX_BYTES + 1)
-                        .read_to_end(&mut output)
-                })
-                .is_ok()
-                && u64::try_from(output.len()).is_ok_and(|len| len <= TMUX_FEATURES_MAX_BYTES)
-                && String::from_utf8(output).is_ok_and(|features| {
-                    features
-                        .split(',')
-                        .map(str::trim)
-                        .any(|feature| feature == "hyperlinks")
-                })
+            let read_ok = File::open(&output_path)
+                .and_then(|file| file.take(TMUX_PROBE_MAX_BYTES + 1).read_to_end(&mut output))
+                .is_ok();
+            let within_limit =
+                u64::try_from(output.len()).is_ok_and(|len| len <= TMUX_PROBE_MAX_BYTES);
+            if read_ok && within_limit {
+                String::from_utf8(output).ok().map(|s| s.trim().to_string())
+            } else {
+                None
+            }
         }
-        _ => false,
+        _ => None,
     };
     let _ = fs::remove_file(output_path);
     result
+}
+
+/// Parse a tmux version string and decide whether DEC 2026 synchronized
+/// output is supported (tmux 3.2+). Any format that cannot be reliably
+/// parsed is treated as unsupported, matching the conservative default.
+fn tmux_version_sync(version: &str) -> bool {
+    let mut digits = version
+        .trim()
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .peekable();
+    let Some(major) = parse_decimal(&mut digits) else {
+        return false;
+    };
+    if digits.next() != Some('.') {
+        return false;
+    }
+    let Some(minor) = parse_decimal(&mut digits) else {
+        return false;
+    };
+    major > 3 || (major == 3 && minor >= 2)
+}
+
+fn parse_decimal<I: Iterator<Item = char>>(digits: &mut std::iter::Peekable<I>) -> Option<u32> {
+    let mut value = 0u32;
+    let mut seen = false;
+    while let Some(&c) = digits.peek() {
+        if c.is_ascii_digit() {
+            let digit = c as u32 - '0' as u32;
+            value = value.checked_mul(10)?.checked_add(digit)?;
+            digits.next();
+            seen = true;
+        } else {
+            break;
+        }
+    }
+    seen.then_some(value)
+}
+
+/// Probe whether the attached tmux client forwards OSC 8 hyperlinks.
+///
+/// tmux only re-emits them when its `client_termfeatures` lists `hyperlinks`.
+/// Any spawn, exit-status, timeout, oversized output, or UTF-8 failure is
+/// conservative and returns `false`. The output file prevents a descendant
+/// retaining stdout from extending the probe past its deadline.
+fn probe_tmux_hyperlinks() -> bool {
+    probe_tmux_output(&["display-message", "-p", "#{client_termfeatures}"]).is_some_and(
+        |features| {
+            features
+                .split(',')
+                .map(str::trim)
+                .any(|feature| feature == "hyperlinks")
+        },
+    )
+}
+
+/// Probe whether the attached tmux client is version 3.2 or newer, which
+/// is required for DEC 2026 synchronized output.
+///
+/// Any spawn, exit-status, timeout, oversized output, UTF-8 failure, or
+/// unparseable version is conservative and returns `false`.
+fn probe_tmux_sync() -> bool {
+    probe_tmux_output(&["display-message", "-p", "#{version}"])
+        .is_some_and(|version| tmux_version_sync(&version))
 }
 
 /// Encode a Kitty image deletion by id (`ESC _Ga=d,d=I,i=N ST`).
@@ -488,7 +588,7 @@ mod tests {
     use super::{
         CellDimensions, ImageProtocol, ImageProtocolOverride, KeyboardProtocol,
         TerminalCapabilities, TerminalCapabilityOverrides, detect_with, kitty_delete_all,
-        kitty_delete_id, resolve_with,
+        kitty_delete_id, resolve_with, tmux_version_sync,
     };
     use std::collections::HashMap;
 
@@ -515,7 +615,7 @@ mod tests {
 
     #[test]
     fn unknown_terminal_defaults_conservative() {
-        let caps = detect_with(env_from(&[]), || false);
+        let caps = detect_with(env_from(&[]), || false, || false);
         assert_eq!(caps.images, None);
         assert!(!caps.hyperlinks);
         assert!(!caps.true_color);
@@ -524,7 +624,7 @@ mod tests {
 
     #[test]
     fn unknown_with_colorterm_truecolor_hint() {
-        let caps = detect_with(env_from(&[("COLORTERM", "truecolor")]), || false);
+        let caps = detect_with(env_from(&[("COLORTERM", "truecolor")]), || false, || false);
         assert!(caps.true_color);
         assert!(!caps.hyperlinks);
         assert_eq!(caps.images, None);
@@ -532,13 +632,13 @@ mod tests {
 
     #[test]
     fn unknown_with_colorterm_24bit_hint() {
-        let caps = detect_with(env_from(&[("COLORTERM", "24bit")]), || false);
+        let caps = detect_with(env_from(&[("COLORTERM", "24bit")]), || false, || false);
         assert!(caps.true_color);
     }
 
     #[test]
     fn unknown_256color_term_does_not_grant_truecolor() {
-        let caps = detect_with(env_from(&[("TERM", "xterm-256color")]), || false);
+        let caps = detect_with(env_from(&[("TERM", "xterm-256color")]), || false, || false);
         assert!(!caps.true_color);
         assert!(!caps.hyperlinks);
         assert_eq!(caps.images, None);
@@ -549,7 +649,7 @@ mod tests {
     fn bare_xterm_256color_conpty_fallback_disables_sync_output() {
         // rel-r3 witness row: bare TERM=xterm-256color with no terminal markers
         // must not emit DEC 2026 wrappers (ConhostVtDec2026Fallback, section 3.6).
-        let caps = detect_with(env_from(&[("TERM", "xterm-256color")]), || false);
+        let caps = detect_with(env_from(&[("TERM", "xterm-256color")]), || false, || false);
         assert!(!caps.sync_output);
     }
 
@@ -561,6 +661,7 @@ mod tests {
                 ("PI_IMAGE_PROTOCOL", "kitty"),
                 ("PI_TRUE_COLOR", "1"),
             ]),
+            || false,
             || false,
         );
 
@@ -578,6 +679,7 @@ mod tests {
                 ("PI_TRUE_COLOR", "0"),
             ]),
             || false,
+            || false,
         );
 
         assert!(!caps.hyperlinks);
@@ -594,6 +696,7 @@ mod tests {
                 ("PI_IMAGE_PROTOCOL", "auto"),
                 ("PI_TRUE_COLOR", "invalid"),
             ]),
+            || false,
             || false,
         );
 
@@ -614,6 +717,7 @@ mod tests {
                 probed.set(true);
                 false
             },
+            || false,
         );
 
         assert!(!probed.get());
@@ -635,6 +739,7 @@ mod tests {
                 probed.set(true);
                 false
             },
+            || false,
             TerminalCapabilityOverrides {
                 images: Some(ImageProtocolOverride::ITerm2),
                 hyperlinks: Some(true),
@@ -654,21 +759,29 @@ mod tests {
 
     #[test]
     fn vte_only_does_not_grant_hyperlinks() {
-        let caps = detect_with(env_from(&[("VTE_VERSION", "6800")]), || false);
+        let caps = detect_with(env_from(&[("VTE_VERSION", "6800")]), || false, || false);
         assert!(!caps.hyperlinks);
         assert_eq!(caps.images, None);
     }
 
     #[test]
     fn apple_terminal_stays_unknown() {
-        let caps = detect_with(env_from(&[("TERM_PROGRAM", "Apple_Terminal")]), || false);
+        let caps = detect_with(
+            env_from(&[("TERM_PROGRAM", "Apple_Terminal")]),
+            || false,
+            || false,
+        );
         assert!(!caps.hyperlinks);
         assert_eq!(caps.images, None);
     }
 
     #[test]
     fn cmux_alone_stays_unknown() {
-        let caps = detect_with(env_from(&[("CMUX_WORKSPACE_ID", "workspace")]), || false);
+        let caps = detect_with(
+            env_from(&[("CMUX_WORKSPACE_ID", "workspace")]),
+            || false,
+            || false,
+        );
         assert!(!caps.hyperlinks);
         assert_eq!(caps.images, None);
     }
@@ -682,6 +795,7 @@ mod tests {
                 ("TMUX", "/tmp/tmux-1000/default,1234,0"),
                 ("TERM_PROGRAM", "ghostty"),
             ]),
+            || true,
             || true,
         );
         assert!(caps.hyperlinks);
@@ -697,6 +811,7 @@ mod tests {
                 ("TERM_PROGRAM", "ghostty"),
             ]),
             || false,
+            || true,
         );
         assert!(!caps.hyperlinks);
         assert_eq!(caps.images, None);
@@ -706,11 +821,11 @@ mod tests {
     #[test]
     fn tmux_via_term_prefix_checks_probe() {
         let env = env_from(&[("TERM", "tmux-256color"), ("TERM_PROGRAM", "iterm.app")]);
-        let caps_true = detect_with(&env, || true);
+        let caps_true = detect_with(&env, || true, || true);
         assert!(caps_true.hyperlinks);
         assert_eq!(caps_true.images, None);
         assert!(caps_true.sync_output);
-        let caps_false = detect_with(&env, || false);
+        let caps_false = detect_with(&env, || false, || true);
         assert!(!caps_false.hyperlinks);
         assert!(caps_false.sync_output);
     }
@@ -723,6 +838,7 @@ mod tests {
                 ("TMUX", "/tmp/tmux-1000/default,1234,0"),
                 ("TERM", "tmux-256color"),
             ]),
+            || false,
             || false,
         );
         assert!(!caps.true_color);
@@ -739,6 +855,7 @@ mod tests {
                 ("TERM", "tmux-256color"),
             ]),
             || false,
+            || false,
         );
         assert!(caps.true_color);
         assert!(!caps.hyperlinks);
@@ -754,16 +871,75 @@ mod tests {
                 ("TERM", "tmux-256color"),
             ]),
             || true,
+            || false,
         );
         assert_eq!(caps.images, None);
         assert!(caps.hyperlinks);
+    }
+
+    #[test]
+    fn tmux_version_sync_mapping() {
+        // New / supported (3.2+)
+        assert!(tmux_version_sync("3.2"));
+        assert!(tmux_version_sync("3.2a"));
+        assert!(tmux_version_sync("3.4"));
+        assert!(tmux_version_sync("3.10"));
+        assert!(tmux_version_sync("4.0"));
+        assert!(tmux_version_sync("next-3.3"));
+
+        // Old / unsupported
+        assert!(!tmux_version_sync("3.1"));
+        assert!(!tmux_version_sync("3.1b"));
+        assert!(!tmux_version_sync("3.0"));
+        assert!(!tmux_version_sync("2.9"));
+        assert!(!tmux_version_sync("next-3.1"));
+
+        // Unknown / unparseable
+        assert!(!tmux_version_sync(""));
+        assert!(!tmux_version_sync("invalid"));
+        assert!(!tmux_version_sync("master"));
+        assert!(!tmux_version_sync("3"));
+        assert!(!tmux_version_sync("3."));
+    }
+
+    #[test]
+    fn tmux_new_version_enables_sync_output() {
+        let caps = detect_with(
+            env_from(&[("TMUX", "/tmp/tmux-1000/default,1234,0")]),
+            || false,
+            || true,
+        );
+        assert!(caps.sync_output);
+    }
+
+    #[test]
+    fn tmux_old_or_unknown_version_disables_sync_output() {
+        let caps = detect_with(
+            env_from(&[("TMUX", "/tmp/tmux-1000/default,1234,0")]),
+            || false,
+            || false,
+        );
+        assert!(!caps.sync_output);
+    }
+
+    #[test]
+    fn tmux_no_sync_overrides_version_probe() {
+        let caps = detect_with(
+            env_from(&[
+                ("TMUX", "/tmp/tmux-1000/default,1234,0"),
+                ("PI_TUI_NO_SYNC", "1"),
+            ]),
+            || false,
+            || true,
+        );
+        assert!(!caps.sync_output);
     }
 
     // -- Authority row 2: screen --
 
     #[test]
     fn screen_forces_hyperlinks_false() {
-        let caps = detect_with(env_from(&[("TERM", "screen-256color")]), || false);
+        let caps = detect_with(env_from(&[("TERM", "screen-256color")]), || false, || false);
         assert!(!caps.hyperlinks);
         assert_eq!(caps.images, None);
     }
@@ -772,6 +948,7 @@ mod tests {
     fn screen_truecolor_from_hint() {
         let caps = detect_with(
             env_from(&[("TERM", "screen-256color"), ("COLORTERM", "truecolor")]),
+            || false,
             || false,
         );
         assert!(caps.true_color);
@@ -782,7 +959,7 @@ mod tests {
 
     #[test]
     fn kitty_via_window_id() {
-        let caps = detect_with(env_from(&[("KITTY_WINDOW_ID", "1")]), || false);
+        let caps = detect_with(env_from(&[("KITTY_WINDOW_ID", "1")]), || false, || false);
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
         assert!(caps.sync_output);
@@ -790,7 +967,7 @@ mod tests {
 
     #[test]
     fn kitty_via_term_program() {
-        let caps = detect_with(env_from(&[("TERM_PROGRAM", "kitty")]), || false);
+        let caps = detect_with(env_from(&[("TERM_PROGRAM", "kitty")]), || false, || false);
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
     }
@@ -799,7 +976,7 @@ mod tests {
 
     #[test]
     fn ghostty_via_term_program() {
-        let caps = detect_with(env_from(&[("TERM_PROGRAM", "ghostty")]), || false);
+        let caps = detect_with(env_from(&[("TERM_PROGRAM", "ghostty")]), || false, || false);
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
         assert!(caps.true_color);
@@ -811,6 +988,7 @@ mod tests {
         let caps = detect_with(
             env_from(&[("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty")]),
             || false,
+            || false,
         );
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
@@ -818,7 +996,7 @@ mod tests {
 
     #[test]
     fn ghostty_via_term_contains() {
-        let caps = detect_with(env_from(&[("TERM", "xterm-ghostty")]), || false);
+        let caps = detect_with(env_from(&[("TERM", "xterm-ghostty")]), || false, || false);
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
     }
@@ -831,6 +1009,7 @@ mod tests {
                 ("CMUX_WORKSPACE_ID", "workspace"),
             ]),
             || false,
+            || false,
         );
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
@@ -840,7 +1019,7 @@ mod tests {
 
     #[test]
     fn wezterm_via_pane() {
-        let caps = detect_with(env_from(&[("WEZTERM_PANE", "0")]), || false);
+        let caps = detect_with(env_from(&[("WEZTERM_PANE", "0")]), || false, || false);
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
         assert!(caps.sync_output);
@@ -848,7 +1027,7 @@ mod tests {
 
     #[test]
     fn wezterm_via_term_program() {
-        let caps = detect_with(env_from(&[("TERM_PROGRAM", "wezterm")]), || false);
+        let caps = detect_with(env_from(&[("TERM_PROGRAM", "wezterm")]), || false, || false);
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
     }
@@ -857,7 +1036,11 @@ mod tests {
 
     #[test]
     fn warp_via_term_program() {
-        let caps = detect_with(env_from(&[("TERM_PROGRAM", "WarpTerminal")]), || false);
+        let caps = detect_with(
+            env_from(&[("TERM_PROGRAM", "WarpTerminal")]),
+            || false,
+            || false,
+        );
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.true_color);
         assert!(caps.hyperlinks);
@@ -866,9 +1049,11 @@ mod tests {
 
     #[test]
     fn warp_via_session_id() {
-        let caps = detect_with(env_from(&[("WARP_SESSION_ID", "some-session-id")]), || {
-            false
-        });
+        let caps = detect_with(
+            env_from(&[("WARP_SESSION_ID", "some-session-id")]),
+            || false,
+            || false,
+        );
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
     }
@@ -881,6 +1066,7 @@ mod tests {
                 "d0e1a2e5-7ca7-44cd-9037-ac7222011161",
             )]),
             || false,
+            || false,
         );
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
         assert!(caps.hyperlinks);
@@ -890,7 +1076,11 @@ mod tests {
 
     #[test]
     fn iterm2_via_session_id() {
-        let caps = detect_with(env_from(&[("ITERM_SESSION_ID", "w0t0p1:12345")]), || false);
+        let caps = detect_with(
+            env_from(&[("ITERM_SESSION_ID", "w0t0p1:12345")]),
+            || false,
+            || false,
+        );
         assert_eq!(caps.images, Some(ImageProtocol::ITerm2));
         assert!(caps.hyperlinks);
         assert!(caps.true_color);
@@ -899,7 +1089,11 @@ mod tests {
 
     #[test]
     fn iterm2_via_term_program() {
-        let caps = detect_with(env_from(&[("TERM_PROGRAM", "iterm.app")]), || false);
+        let caps = detect_with(
+            env_from(&[("TERM_PROGRAM", "iterm.app")]),
+            || false,
+            || false,
+        );
         assert_eq!(caps.images, Some(ImageProtocol::ITerm2));
         assert!(caps.hyperlinks);
     }
@@ -910,6 +1104,7 @@ mod tests {
     fn windows_terminal_truecolor_and_hyperlinks() {
         let caps = detect_with(
             env_from(&[("WT_SESSION", "session"), ("TERM", "xterm-256color")]),
+            || false,
             || false,
         );
         assert!(caps.true_color);
@@ -922,7 +1117,7 @@ mod tests {
 
     #[test]
     fn vscode_enables_hyperlinks() {
-        let caps = detect_with(env_from(&[("TERM_PROGRAM", "vscode")]), || false);
+        let caps = detect_with(env_from(&[("TERM_PROGRAM", "vscode")]), || false, || false);
         assert!(caps.hyperlinks);
         assert!(caps.true_color);
         assert_eq!(caps.images, None);
@@ -933,7 +1128,11 @@ mod tests {
 
     #[test]
     fn alacritty_enables_hyperlinks() {
-        let caps = detect_with(env_from(&[("TERM_PROGRAM", "alacritty")]), || false);
+        let caps = detect_with(
+            env_from(&[("TERM_PROGRAM", "alacritty")]),
+            || false,
+            || false,
+        );
         assert!(caps.hyperlinks);
         assert!(caps.true_color);
         assert_eq!(caps.images, None);
@@ -944,7 +1143,7 @@ mod tests {
 
     #[test]
     fn zed_enables_hyperlinks() {
-        let caps = detect_with(env_from(&[("TERM_PROGRAM", "zed")]), || false);
+        let caps = detect_with(env_from(&[("TERM_PROGRAM", "zed")]), || false, || false);
         assert!(caps.hyperlinks);
         assert!(caps.true_color);
         assert_eq!(caps.images, None);
@@ -954,6 +1153,7 @@ mod tests {
     fn pi_image_protocol_overrides_zed_default() {
         let caps = detect_with(
             env_from(&[("TERM_PROGRAM", "zed"), ("PI_IMAGE_PROTOCOL", "kitty")]),
+            || false,
             || false,
         );
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
@@ -970,6 +1170,7 @@ mod tests {
                 ("TERMINAL_EMULATOR", "JetBrains-JediTerm"),
                 ("TERM", "xterm-256color"),
             ]),
+            || false,
             || false,
         );
         assert!(caps.true_color);
@@ -988,6 +1189,7 @@ mod tests {
                 ("KITTY_WINDOW_ID", "1"),
             ]),
             || false,
+            || false,
         );
         assert_eq!(caps.images, None);
         assert!(!caps.hyperlinks);
@@ -997,6 +1199,7 @@ mod tests {
     fn screen_takes_precedence_over_kitty() {
         let caps = detect_with(
             env_from(&[("TERM", "screen-256color"), ("KITTY_WINDOW_ID", "1")]),
+            || false,
             || false,
         );
         assert_eq!(caps.images, None);
@@ -1008,6 +1211,7 @@ mod tests {
         let caps = detect_with(
             env_from(&[("KITTY_WINDOW_ID", "1"), ("TERM_PROGRAM", "iterm.app")]),
             || false,
+            || false,
         );
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
     }
@@ -1016,6 +1220,7 @@ mod tests {
     fn kitty_takes_precedence_over_zed() {
         let caps = detect_with(
             env_from(&[("KITTY_WINDOW_ID", "1"), ("TERM_PROGRAM", "zed")]),
+            || false,
             || false,
         );
         assert_eq!(caps.images, Some(ImageProtocol::Kitty));
@@ -1031,7 +1236,7 @@ mod tests {
 
     #[test]
     fn pi_tui_no_sync_disables_sync_output() {
-        let caps = detect_with(env_from(&[("PI_TUI_NO_SYNC", "1")]), || false);
+        let caps = detect_with(env_from(&[("PI_TUI_NO_SYNC", "1")]), || false, || false);
         assert!(!caps.sync_output);
     }
 
@@ -1040,6 +1245,7 @@ mod tests {
         let caps = detect_with(
             env_from(&[("KITTY_WINDOW_ID", "1"), ("PI_TUI_NO_SYNC", "1")]),
             || false,
+            || false,
         );
         assert!(!caps.sync_output);
     }
@@ -1047,10 +1253,14 @@ mod tests {
     #[test]
     fn empty_terminal_markers_do_not_grant_or_mask_capabilities() {
         let probed = std::cell::Cell::new(false);
-        let kitty = detect_with(env_from(&[("TMUX", ""), ("KITTY_WINDOW_ID", "1")]), || {
-            probed.set(true);
-            false
-        });
+        let kitty = detect_with(
+            env_from(&[("TMUX", ""), ("KITTY_WINDOW_ID", "1")]),
+            || {
+                probed.set(true);
+                false
+            },
+            || false,
+        );
         assert!(!probed.get());
         assert_eq!(kitty.images, Some(ImageProtocol::Kitty));
 
@@ -1065,7 +1275,7 @@ mod tests {
             "WT_SESSION",
         ] {
             assert_eq!(
-                detect_with(env_from(&[(marker, "")]), || false),
+                detect_with(env_from(&[(marker, "")]), || false, || false),
                 TerminalCapabilities::default(),
                 "empty {marker} must be falsey"
             );

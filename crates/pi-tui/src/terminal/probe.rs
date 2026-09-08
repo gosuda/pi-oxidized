@@ -291,9 +291,9 @@ pub(crate) fn probe_collect_replies_with_yield(
 /// kitty flags) and the cursor reported; OSC 11 and cell size are best-effort
 /// refinements that must not extend the wait alone.
 fn all_outstanding_answered(answered: &IssuedQueries) -> bool {
-    !answered.is_outstanding(QueryKind::DeviceAttributes)
-        && !answered.is_outstanding(QueryKind::KittyFlags)
-        && !answered.is_outstanding(QueryKind::CursorPosition)
+    let class_answered = !answered.is_outstanding(QueryKind::DeviceAttributes)
+        || !answered.is_outstanding(QueryKind::KittyFlags);
+    class_answered && !answered.is_outstanding(QueryKind::CursorPosition)
 }
 
 fn record_answer(answered: &mut IssuedQueries, reply: &TerminalReply) {
@@ -642,5 +642,48 @@ mod tests {
     fn issued_osc11_record_matches_requery() {
         let issued = IssuedQueries::osc11();
         assert_eq!(issued.kinds(), &[QueryKind::Osc11]);
+    }
+
+    #[test]
+    fn outstanding_answered_requires_class_and_cursor() {
+        // Startup always issues both class queries; completion needs at least
+        // one class answer plus cursor. Unissued class/cursor kinds stay
+        // non-blocking.
+        let mut answered = IssuedQueries::startup(true);
+        assert!(!all_outstanding_answered(&answered));
+
+        answered.answer(QueryKind::DeviceAttributes);
+        assert!(
+            !all_outstanding_answered(&answered),
+            "cursor is still outstanding"
+        );
+
+        answered.answer(QueryKind::CursorPosition);
+        assert!(
+            all_outstanding_answered(&answered),
+            "DA1 + cursor completes even when kitty is unanswered"
+        );
+
+        let mut answered = IssuedQueries::startup(true);
+        answered.answer(QueryKind::KittyFlags);
+        answered.answer(QueryKind::CursorPosition);
+        assert!(
+            all_outstanding_answered(&answered),
+            "kitty + cursor completes even when DA1 is unanswered"
+        );
+
+        let mut answered = IssuedQueries::startup(true);
+        answered.answer(QueryKind::CursorPosition);
+        assert!(
+            !all_outstanding_answered(&answered),
+            "class must answer too"
+        );
+
+        let mut answered = IssuedQueries::osc11();
+        answered.answer(QueryKind::Osc11);
+        assert!(
+            all_outstanding_answered(&answered),
+            "non-class/cursor queries do not block completion"
+        );
     }
 }
