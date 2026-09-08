@@ -22,12 +22,9 @@ use tokio_util::sync::CancellationToken;
 use crate::context::Context;
 use crate::message::AgentMessage;
 use crate::session::{
-    CompactionSettings, DurableStructuralPreparation, Entry, EntryBase, EntryId,
-    HarnessRetryPolicy,
+    CompactionSettings, DurableStructuralPreparation, Entry, EntryBase, EntryId, HarnessRetryPolicy,
 };
 
-use crate::harness::api::HarnessModels;
-use crate::harness::hooks::CompactResult;
 use super::utils::{
     FileLists, FileOperations, assistant_content_text, compute_file_lists,
     estimate_custom_content_chars, estimate_text_and_image_content_chars,
@@ -41,6 +38,8 @@ use super::{
         summary_user_message,
     },
 };
+use crate::harness::api::HarnessModels;
+use crate::harness::hooks::CompactResult;
 
 /// Request boundary used by compaction and branch-summary algorithms.
 ///
@@ -58,11 +57,13 @@ pub type SummaryRequest = Arc<
 >;
 
 /// Retry callback invoked when a retry is scheduled.
-pub type RetryScheduledCallback = Arc<dyn Fn(u64, u64, u64, String) -> BoxFuture<'static, ()> + Send + Sync>;
+pub type RetryScheduledCallback =
+    Arc<dyn Fn(u64, u64, u64, String) -> BoxFuture<'static, ()> + Send + Sync>;
 /// Retry callback invoked immediately before a retry attempt.
 pub type RetryAttemptCallback = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 /// Retry callback invoked when the retry loop finishes.
-pub type RetryFinishedCallback = Arc<dyn Fn(bool, u64, Option<String>) -> BoxFuture<'static, ()> + Send + Sync>;
+pub type RetryFinishedCallback =
+    Arc<dyn Fn(bool, u64, Option<String>) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Async retry lifecycle callbacks.
 #[derive(Clone, Default)]
@@ -172,7 +173,10 @@ fn get_assistant_usage(message: &AgentMessage) -> Option<Usage> {
     let Message::Assistant(assistant) = message.as_ref() else {
         return None;
     };
-    if matches!(assistant.stop_reason, StopReason::Aborted | StopReason::Error) {
+    if matches!(
+        assistant.stop_reason,
+        StopReason::Aborted | StopReason::Error
+    ) {
         return None;
     }
     (calculate_context_tokens(&assistant.usage) > 0).then(|| assistant.usage.clone())
@@ -185,8 +189,16 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
         AgentMessage::Llm(message) => estimate_llm_message_tokens(message.as_ref()),
         AgentMessage::Custom(custom) => match custom.role.as_str() {
             "bashExecution" => {
-                let command = custom.payload.get("command").and_then(Value::as_str).unwrap_or("");
-                let output = custom.payload.get("output").and_then(Value::as_str).unwrap_or("");
+                let command = custom
+                    .payload
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let output = custom
+                    .payload
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 js_string_len(command)
                     .saturating_add(js_string_len(output))
                     .div_ceil(4)
@@ -217,10 +229,9 @@ fn estimate_llm_message_tokens(message: &Message) -> u64 {
             .map(|block| match block {
                 AssistantContent::Text(text) => js_string_len(&text.text),
                 AssistantContent::Thinking(thinking) => js_string_len(&thinking.thinking),
-                AssistantContent::ToolCall(call) => js_string_len(&call.name)
-                    .saturating_add(js_string_len(&safe_json_stringify(&Value::Object(
-                        call.arguments.clone(),
-                    )))),
+                AssistantContent::ToolCall(call) => js_string_len(&call.name).saturating_add(
+                    js_string_len(&safe_json_stringify(&Value::Object(call.arguments.clone()))),
+                ),
             })
             .sum(),
     };
@@ -270,7 +281,11 @@ pub fn should_compact(
 
 /// Finds entries that can start a retained context boundary.
 #[must_use]
-pub fn find_valid_cut_points(entries: &[Entry], start_index: usize, end_index: usize) -> Vec<usize> {
+pub fn find_valid_cut_points(
+    entries: &[Entry],
+    start_index: usize,
+    end_index: usize,
+) -> Vec<usize> {
     let end_index = end_index.min(entries.len());
     let start_index = start_index.min(end_index);
     let mut cut_points = Vec::new();
@@ -353,7 +368,11 @@ pub fn find_cut_point(
         };
         accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(message));
         if accumulated_tokens >= keep_recent_tokens {
-            if let Some(candidate) = cut_points.iter().copied().find(|candidate| *candidate >= index) {
+            if let Some(candidate) = cut_points
+                .iter()
+                .copied()
+                .find(|candidate| *candidate >= index)
+            {
                 cut_index = candidate;
             }
             break;
@@ -392,9 +411,7 @@ pub fn prepare_compaction(
     path_entries: &[Entry],
     settings: &CompactionSettings,
 ) -> Result<Option<CompactionPreparation>, CompactionError> {
-    if path_entries.is_empty()
-        || matches!(path_entries.last(), Some(Entry::Compaction { .. }))
-    {
+    if path_entries.is_empty() || matches!(path_entries.last(), Some(Entry::Compaction { .. })) {
         return Ok(None);
     }
 
@@ -479,8 +496,11 @@ pub fn prepare_compaction(
         .filter_map(get_message_from_entry_for_compaction)
         .collect::<Vec<_>>();
 
-    let mut file_ops =
-        extract_file_operations(path_entries, previous_compaction_index, &messages_to_summarize);
+    let mut file_ops = extract_file_operations(
+        path_entries,
+        previous_compaction_index,
+        &messages_to_summarize,
+    );
     for message in &turn_prefix_messages {
         extract_file_ops_from_message(message, &mut file_ops);
     }
@@ -504,7 +524,10 @@ fn extract_file_operations(
 ) -> FileOperations {
     let mut file_ops = FileOperations::default();
     if let Some(index) = previous_compaction_index
-        && let Entry::Compaction { details: Some(details), .. } = &entries[index]
+        && let Entry::Compaction {
+            details: Some(details),
+            ..
+        } = &entries[index]
         && let Some(object) = details.as_object()
     {
         if let Some(paths) = object.get("readFiles").and_then(Value::as_array) {
@@ -719,9 +742,11 @@ pub async fn generate_summary(
     callbacks: Option<&SummaryRetryCallbacks>,
     cx: &Context,
 ) -> Result<String, CompactionError> {
-    Ok(generate_summary_with_usage(current_messages, models, options, retry, callbacks, cx)
-        .await?
-        .text)
+    Ok(
+        generate_summary_with_usage(current_messages, models, options, retry, callbacks, cx)
+            .await?
+            .text,
+    )
 }
 
 /// Generates summary text and usage using the configured provider stream.
@@ -814,10 +839,46 @@ pub async fn compact_with_request(
     request: &SummaryRequest,
     cx: &Context,
 ) -> Result<CompactResult, CompactionError> {
-    let (summary, usage) = if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
-        let mut history_text = "No prior history.".to_owned();
-        let mut history_usage = None;
-        if !preparation.messages_to_summarize.is_empty() {
+    let (summary, usage) =
+        if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
+            let mut history_text = "No prior history.".to_owned();
+            let mut history_usage = None;
+            if !preparation.messages_to_summarize.is_empty() {
+                let result = generate_summary_with_request(
+                    &preparation.messages_to_summarize,
+                    &SummaryGenerationOptions {
+                        model: options.model.clone(),
+                        reserve_tokens: preparation.settings.reserve_tokens,
+                        custom_instructions: options.custom_instructions.clone(),
+                        previous_summary: preparation.previous_summary.clone(),
+                        thinking_level: options.thinking_level,
+                    },
+                    request,
+                    cx,
+                )
+                .await?;
+                history_text = result.text;
+                history_usage = Some(result.usage);
+            }
+            let prefix = generate_turn_prefix_summary(
+                &preparation.turn_prefix_messages,
+                &options.model,
+                preparation.settings.reserve_tokens,
+                options.thinking_level,
+                request,
+                cx,
+            )
+            .await?;
+            (
+                format!(
+                    "{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{}",
+                    prefix.text
+                ),
+                history_usage.map_or(prefix.usage.clone(), |history| {
+                    add_usage(&history, &prefix.usage)
+                }),
+            )
+        } else {
             let result = generate_summary_with_request(
                 &preparation.messages_to_summarize,
                 &SummaryGenerationOptions {
@@ -831,41 +892,8 @@ pub async fn compact_with_request(
                 cx,
             )
             .await?;
-            history_text = result.text;
-            history_usage = Some(result.usage);
-        }
-        let prefix = generate_turn_prefix_summary(
-            &preparation.turn_prefix_messages,
-            &options.model,
-            preparation.settings.reserve_tokens,
-            options.thinking_level,
-            request,
-            cx,
-        )
-        .await?;
-        (
-            format!(
-                "{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{}",
-                prefix.text
-            ),
-            history_usage.map_or(prefix.usage.clone(), |history| add_usage(&history, &prefix.usage)),
-        )
-    } else {
-        let result = generate_summary_with_request(
-            &preparation.messages_to_summarize,
-            &SummaryGenerationOptions {
-                model: options.model.clone(),
-                reserve_tokens: preparation.settings.reserve_tokens,
-                custom_instructions: options.custom_instructions.clone(),
-                previous_summary: preparation.previous_summary.clone(),
-                thinking_level: options.thinking_level,
-            },
-            request,
-            cx,
-        )
-        .await?;
-        (result.text, result.usage)
-    };
+            (result.text, result.usage)
+        };
     let FileLists {
         read_files,
         modified_files,
@@ -1103,7 +1131,10 @@ pub fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
     if NON_RETRYABLE.iter().any(|pattern| lower.contains(pattern)) {
         return false;
     }
-    if RETRYABLE.iter().any(|pattern| wildcard_pattern_matches(&lower, pattern)) {
+    if RETRYABLE
+        .iter()
+        .any(|pattern| wildcard_pattern_matches(&lower, pattern))
+    {
         return true;
     }
     [429_u16, 500, 502, 503, 504, 524]
@@ -1133,12 +1164,7 @@ fn wildcard_pattern_matches(text: &str, pattern: &str) -> bool {
     (0..=text.len()).any(|start| wildcard_match_at(text, pattern, start, 0))
 }
 
-fn wildcard_match_at(
-    text: &[u8],
-    pattern: &[u8],
-    text_index: usize,
-    pattern_index: usize,
-) -> bool {
+fn wildcard_match_at(text: &[u8], pattern: &[u8], text_index: usize, pattern_index: usize) -> bool {
     if pattern_index == pattern.len() {
         return true;
     }
@@ -1348,8 +1374,23 @@ mod tests {
         };
         assert!(!should_compact(90, 100, &settings));
         assert!(should_compact(91, 100, &settings));
-        assert!(!should_compact(100, 100, &CompactionSettings { enabled: false, ..settings }));
-        assert_eq!(estimate_tokens(&AgentMessage::Custom(crate::message::CustomAgentMessage::new("branchSummary", Map::from_iter([(String::from("summary"), Value::from("1234"))])))), 1);
+        assert!(!should_compact(
+            100,
+            100,
+            &CompactionSettings {
+                enabled: false,
+                ..settings
+            }
+        ));
+        assert_eq!(
+            estimate_tokens(&AgentMessage::Custom(
+                crate::message::CustomAgentMessage::new(
+                    "branchSummary",
+                    Map::from_iter([(String::from("summary"), Value::from("1234"))])
+                )
+            )),
+            1
+        );
     }
 
     #[test]
@@ -1358,7 +1399,11 @@ mod tests {
             total_tokens: 20,
             ..Usage::default()
         };
-        let messages = vec![assistant("old", StopReason::Stop, Usage::default()), assistant("anchor", StopReason::Stop, usage), assistant("tail", StopReason::Stop, Usage::default())];
+        let messages = vec![
+            assistant("old", StopReason::Stop, Usage::default()),
+            assistant("anchor", StopReason::Stop, usage),
+            assistant("tail", StopReason::Stop, Usage::default()),
+        ];
         let result = estimate_context_tokens(&messages);
         assert_eq!(result.usage_tokens, 20);
         assert_eq!(result.last_usage_index, Some(1));
@@ -1367,12 +1412,35 @@ mod tests {
 
     #[test]
     fn cut_point_skips_tool_results_and_keeps_turn_integrity() {
-        let user = AgentMessage::Llm(Box::new(Message::User(pi_ai::UserMessage::new(pi_ai::UserMessageContent::Text("u".to_owned()), 1))));
-        let tool = AgentMessage::Llm(Box::new(Message::ToolResult(pi_ai::ToolResultMessage::new("c", "x", vec![pi_ai::ToolResultContent::Text(TextContent::new("r"))], false, 1))));
+        let user = AgentMessage::Llm(Box::new(Message::User(pi_ai::UserMessage::new(
+            pi_ai::UserMessageContent::Text("u".to_owned()),
+            1,
+        ))));
+        let tool = AgentMessage::Llm(Box::new(Message::ToolResult(
+            pi_ai::ToolResultMessage::new(
+                "c",
+                "x",
+                vec![pi_ai::ToolResultContent::Text(TextContent::new("r"))],
+                false,
+                1,
+            ),
+        )));
         let entries = vec![
-            Entry::Message { base: base("u"), message: user, terminate: false },
-            Entry::Message { base: base("t"), message: tool, terminate: false },
-            Entry::Message { base: base("a"), message: assistant("a", StopReason::Stop, Usage::default()), terminate: false },
+            Entry::Message {
+                base: base("u"),
+                message: user,
+                terminate: false,
+            },
+            Entry::Message {
+                base: base("t"),
+                message: tool,
+                terminate: false,
+            },
+            Entry::Message {
+                base: base("a"),
+                message: assistant("a", StopReason::Stop, Usage::default()),
+                terminate: false,
+            },
         ];
         let points = find_valid_cut_points(&entries, 0, entries.len());
         assert_eq!(points, vec![0, 2]);
@@ -1380,7 +1448,10 @@ mod tests {
         assert_eq!(cut.first_kept_entry_index, 2);
     }
 
-    #[expect(clippy::expect_used, reason = "test fixture asserts round-trip variant via expect")]
+    #[expect(
+        clippy::expect_used,
+        reason = "test fixture asserts round-trip variant via expect"
+    )]
     #[test]
     fn durable_compaction_round_trip() {
         let preparation = CompactionPreparation {

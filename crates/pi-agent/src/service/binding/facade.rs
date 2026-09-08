@@ -2,17 +2,19 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use futures::future::{ready, BoxFuture, FutureExt};
+use futures::future::{BoxFuture, FutureExt, ready};
 
 use crate::context::Context;
 
-use super::lifecycle::{await_with_lifetime, ErrorReporter, Lifecycle};
 use super::super::delta::DeltaOp;
 use super::super::error::{RemoteServiceErrorCode, ServiceError};
 use super::super::replicated::{ReplicatedState, ReplicatedStateListener};
 use super::super::transport::RemoteServiceTransport;
-use super::super::value::{is_json_value, JsInteger, JsString, JsonValue};
-use super::super::wire::{ServiceCall, ServiceInstanceAddress, ServiceInstanceSnapshot, ServiceMemberSnapshot};
+use super::super::value::{JsInteger, JsString, JsonValue, is_json_value};
+use super::super::wire::{
+    ServiceCall, ServiceInstanceAddress, ServiceInstanceSnapshot, ServiceMemberSnapshot,
+};
+use super::lifecycle::{ErrorReporter, Lifecycle, await_with_lifetime};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MemberKind {
@@ -59,7 +61,10 @@ impl FacadeInner {
         if !self.is_active() {
             return Err(ServiceError::remote(
                 RemoteServiceErrorCode::ServiceStaleInstance,
-                format!("Remote service {} binding is closed", display_js(&self.service_id)),
+                format!(
+                    "Remote service {} binding is closed",
+                    display_js(&self.service_id)
+                ),
             ));
         }
         Ok(())
@@ -102,7 +107,10 @@ impl RemoteServiceFacade {
     ///
     /// # Errors
     /// Returns an error if access is denied or if the member's known kind conflicts with its previous use.
-    pub fn member(&self, name: impl Into<JsString>) -> Result<Arc<RemoteServiceMember>, ServiceError> {
+    pub fn member(
+        &self,
+        name: impl Into<JsString>,
+    ) -> Result<Arc<RemoteServiceMember>, ServiceError> {
         self.inner.lifecycle.assert_access()?;
         let name = name.into();
         let mut members = lock(&self.inner.members);
@@ -153,7 +161,9 @@ impl RemoteServiceFacade {
         context: &Context,
     ) -> Result<(), ServiceError> {
         if !same_address(snapshot.instance.as_ref(), self.inner.address.as_ref()) {
-            return Err(ServiceError::local("Remote service snapshot has the wrong address"));
+            return Err(ServiceError::local(
+                "Remote service snapshot has the wrong address",
+            ));
         }
         let members = validate_members(&snapshot.members)?;
         let existing: Vec<(JsString, Arc<RemoteServiceMember>)> = {
@@ -201,7 +211,9 @@ impl RemoteServiceFacade {
                     slots.insert(name.clone(), Arc::clone(&member));
                     Some(member)
                 })
-                .ok_or_else(|| ServiceError::internal("Remote service member slot was not created"))?;
+                .ok_or_else(|| {
+                    ServiceError::internal("Remote service member slot was not created")
+                })?;
             slot.set_description(kind)?;
             if let ServiceMemberSnapshot::State { sequence, ops, .. } = snapshot_member {
                 slot.hydrate(*sequence, ops, context)?;
@@ -229,7 +241,8 @@ impl RemoteServiceFacade {
     }
 
     pub(crate) fn clear(&self) {
-        let members: Vec<Arc<RemoteServiceMember>> = lock(&self.inner.members).values().cloned().collect();
+        let members: Vec<Arc<RemoteServiceMember>> =
+            lock(&self.inner.members).values().cloned().collect();
         for member in members {
             member.clear();
         }
@@ -239,8 +252,6 @@ impl RemoteServiceFacade {
         self.inner.active.store(false, Ordering::Release);
         self.clear();
     }
-
-
 }
 
 /// One explicitly addressed remote member. The same handle is reused by a stable facade.
@@ -340,7 +351,10 @@ impl RemoteServiceMember {
     /// # Errors
     /// Returns an error if the facade is gone, access is denied, this member is not a state member,
     /// or state subscription/hydration fails.
-    pub fn subscribe_state(&self, listener: ReplicatedStateListener) -> Result<Arc<dyn Fn() + Send + Sync>, ServiceError> {
+    pub fn subscribe_state(
+        &self,
+        listener: ReplicatedStateListener,
+    ) -> Result<Arc<dyn Fn() + Send + Sync>, ServiceError> {
         let Some(facade) = self.facade.upgrade() else {
             return Err(ServiceError::disposed("Remote service facade is gone"));
         };
@@ -351,18 +365,24 @@ impl RemoteServiceMember {
 
     pub(crate) fn set_description(&self, kind: MemberKind) -> Result<(), ServiceError> {
         let mut state = lock(&self.kind);
-        if let Some(actual) = state.actual && actual != kind {
+        if let Some(actual) = state.actual
+            && actual != kind
+        {
             return Err(ServiceError::local(format!(
                 "Remote service member {} changed kind",
                 display_js(&self.name),
             )));
         }
-        if let Some(expected) = state.expected && expected != kind {
+        if let Some(expected) = state.expected
+            && expected != kind
+        {
             return Err(ServiceError::remote(
                 RemoteServiceErrorCode::ServiceMemberMismatch,
                 format!(
                     "Remote service member {} is {:?}, not {:?}",
-                    display_js(&self.name), kind, expected
+                    display_js(&self.name),
+                    kind,
+                    expected
                 ),
             ));
         }
@@ -396,7 +416,9 @@ impl RemoteServiceMember {
 
     fn expect(&self, expected: MemberKind) -> Result<(), ServiceError> {
         let mut state = lock(&self.kind);
-        if let Some(previous) = state.expected && previous != expected {
+        if let Some(previous) = state.expected
+            && previous != expected
+        {
             return Err(ServiceError::remote(
                 RemoteServiceErrorCode::ServiceMemberMismatch,
                 format!(
@@ -406,12 +428,16 @@ impl RemoteServiceMember {
             ));
         }
         state.expected = Some(expected);
-        if let Some(actual) = state.actual && actual != expected {
+        if let Some(actual) = state.actual
+            && actual != expected
+        {
             return Err(ServiceError::remote(
                 RemoteServiceErrorCode::ServiceMemberMismatch,
                 format!(
                     "Remote service member {} is {:?}, not {:?}",
-                    display_js(&self.name), actual, expected
+                    display_js(&self.name),
+                    actual,
+                    expected
                 ),
             ));
         }
@@ -430,17 +456,24 @@ where
     let mut result = Vec::with_capacity(members.len());
     for member in members {
         let name = match member {
-            ServiceMemberSnapshot::Method { name } | ServiceMemberSnapshot::State { name, .. } => name,
+            ServiceMemberSnapshot::Method { name } | ServiceMemberSnapshot::State { name, .. } => {
+                name
+            }
         };
         if name.as_utf16().is_empty() || result.iter().any(|(known, _, _)| known == name) {
-            return Err(ServiceError::local("Remote service has invalid member descriptions"));
+            return Err(ServiceError::local(
+                "Remote service has invalid member descriptions",
+            ));
         }
         result.push((name.clone(), MemberKind::from_snapshot(member), member));
     }
     Ok(result)
 }
 
-fn same_address(left: Option<&ServiceInstanceAddress>, right: Option<&ServiceInstanceAddress>) -> bool {
+fn same_address(
+    left: Option<&ServiceInstanceAddress>,
+    right: Option<&ServiceInstanceAddress>,
+) -> bool {
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => left == right,

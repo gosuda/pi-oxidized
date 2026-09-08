@@ -14,8 +14,7 @@ use crate::session::EntryId;
 
 /// Marker prepended to compaction summary text when it is re-injected as a
 /// user message.
-pub const COMPACTION_SUMMARY_PREFIX: &str =
-    "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+pub const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 /// Marker appended to compaction summary text.
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 /// Marker prepended to branch summary text when it is re-injected as a user
@@ -51,7 +50,10 @@ pub fn bash_execution_to_text(message: &CustomAgentMessage) -> String {
         let _ = write!(text, "\n\nCommand exited with code {code}");
     }
     if truncated && !full_output_path.is_empty() {
-        let _ = write!(text, "\n\n[Output truncated. Full output: {full_output_path}]");
+        let _ = write!(
+            text,
+            "\n\n[Output truncated. Full output: {full_output_path}]"
+        );
     }
     text
 }
@@ -125,7 +127,9 @@ fn convert_custom_to_llm(custom: &CustomAgentMessage) -> Option<Message> {
                 Some(Value::Array(blocks)) => UserMessageContent::Blocks(
                     blocks
                         .iter()
-                        .filter_map(|block| serde_json::from_value::<UserContent>(block.clone()).ok())
+                        .filter_map(|block| {
+                            serde_json::from_value::<UserContent>(block.clone()).ok()
+                        })
                         .collect(),
                 ),
                 _ => UserMessageContent::Blocks(Vec::new()),
@@ -199,7 +203,10 @@ fn payload_bool(message: &CustomAgentMessage, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[expect(clippy::panic, reason = "test assertions use let-else panic for irrecoverable fixture mismatch")]
+#[expect(
+    clippy::panic,
+    reason = "test assertions use let-else panic for irrecoverable fixture mismatch"
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,15 +252,12 @@ mod tests {
         let mut payload = Map::new();
         payload.insert("summary".to_owned(), Value::from("did things"));
         payload.insert("timestamp".to_owned(), Value::from(5));
-        let messages = vec![
-            custom("branchSummary", payload.clone()),
-            {
-                let mut p = Map::new();
-                p.insert("summary".to_owned(), Value::from("older"));
-                p.insert("timestamp".to_owned(), Value::from(3));
-                custom("compactionSummary", p)
-            },
-        ];
+        let messages = vec![custom("branchSummary", payload.clone()), {
+            let mut p = Map::new();
+            p.insert("summary".to_owned(), Value::from("older"));
+            p.insert("timestamp".to_owned(), Value::from(3));
+            custom("compactionSummary", p)
+        }];
         let llm = convert_to_llm(&messages);
         assert_eq!(llm.len(), 2);
         let Message::User(first) = &llm[0] else {

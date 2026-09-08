@@ -12,7 +12,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use super::value::{js_number_to_string, JsInteger, JsObject, JsString, JsonValue};
+use super::value::{JsInteger, JsObject, JsString, JsonValue, js_number_to_string};
 
 const DEFAULT_MAX_OVERLAP_SCAN: usize = 65_536;
 const OVERLAP_PROBE: usize = 64;
@@ -281,9 +281,9 @@ pub const RESERVED_SEGMENTS: [&str; 3] = ["__proto__", "constructor", "prototype
 /// non-ASCII code unit can equal an ASCII byte widened to `u16`.
 #[must_use]
 pub fn is_reserved_segment(segment: &[u16]) -> bool {
-    RESERVED_SEGMENTS
-        .iter()
-        .any(|name| name.len() == segment.len() && name.bytes().map(u16::from).eq(segment.iter().copied()))
+    RESERVED_SEGMENTS.iter().any(|name| {
+        name.len() == segment.len() && name.bytes().map(u16::from).eq(segment.iter().copied())
+    })
 }
 
 /// Validates a path against the cross-language path grammar.
@@ -383,7 +383,12 @@ impl DeltaOp {
 
     /// Constructs an array splice operation.
     #[must_use]
-    pub fn splice(path: StatePath, index: JsInteger, delete_count: JsInteger, values: Vec<JsonValue>) -> Self {
+    pub fn splice(
+        path: StatePath,
+        index: JsInteger,
+        delete_count: JsInteger,
+        values: Vec<JsonValue>,
+    ) -> Self {
         Self::Splice(path, index, delete_count, values)
     }
 
@@ -417,11 +422,15 @@ impl DeltaOp {
     pub fn into_json(self) -> JsonValue {
         match self {
             Self::Replace(value) => JsonValue::Array(vec![verb_value("r"), value]),
-            Self::Set(path, value) => JsonValue::Array(vec![verb_value("s"), path_value(path), value]),
-            Self::Delete(path) => JsonValue::Array(vec![verb_value("d"), path_value(path)]),
-            Self::Append(path, value) => {
-                JsonValue::Array(vec![verb_value("a"), path_value(path), JsonValue::String(value)])
+            Self::Set(path, value) => {
+                JsonValue::Array(vec![verb_value("s"), path_value(path), value])
             }
+            Self::Delete(path) => JsonValue::Array(vec![verb_value("d"), path_value(path)]),
+            Self::Append(path, value) => JsonValue::Array(vec![
+                verb_value("a"),
+                path_value(path),
+                JsonValue::String(value),
+            ]),
             Self::Truncate(path, count) => {
                 JsonValue::Array(vec![verb_value("t"), path_value(path), number_value(count)])
             }
@@ -539,18 +548,28 @@ impl WireOp {
     pub fn into_json(self) -> JsonValue {
         match self {
             Self::Replace(value) => JsonValue::Array(vec![verb_value("r"), value]),
-            Self::Set(path, value) => JsonValue::Array(vec![verb_value("s"), path_ref_value(path), value]),
+            Self::Set(path, value) => {
+                JsonValue::Array(vec![verb_value("s"), path_ref_value(path), value])
+            }
             Self::SetShort(value) => JsonValue::Array(vec![verb_value("s"), value]),
             Self::Delete(path) => JsonValue::Array(vec![verb_value("d"), path_ref_value(path)]),
             Self::DeleteShort => JsonValue::Array(vec![verb_value("d")]),
-            Self::Append(path, value) => {
-                JsonValue::Array(vec![verb_value("a"), path_ref_value(path), JsonValue::String(value)])
+            Self::Append(path, value) => JsonValue::Array(vec![
+                verb_value("a"),
+                path_ref_value(path),
+                JsonValue::String(value),
+            ]),
+            Self::AppendShort(value) => {
+                JsonValue::Array(vec![verb_value("a"), JsonValue::String(value)])
             }
-            Self::AppendShort(value) => JsonValue::Array(vec![verb_value("a"), JsonValue::String(value)]),
-            Self::Truncate(path, count) => {
-                JsonValue::Array(vec![verb_value("t"), path_ref_value(path), number_value(count)])
+            Self::Truncate(path, count) => JsonValue::Array(vec![
+                verb_value("t"),
+                path_ref_value(path),
+                number_value(count),
+            ]),
+            Self::TruncateShort(count) => {
+                JsonValue::Array(vec![verb_value("t"), number_value(count)])
             }
-            Self::TruncateShort(count) => JsonValue::Array(vec![verb_value("t"), number_value(count)]),
             Self::Splice(path, index, delete_count, values) => JsonValue::Array(vec![
                 verb_value("p"),
                 path_ref_value(path),
@@ -564,7 +583,9 @@ impl WireOp {
                 number_value(delete_count),
                 JsonValue::Array(values),
             ]),
-            Self::Define(id, path) => JsonValue::Array(vec![verb_value("#"), number_value(id), path_value(path)]),
+            Self::Define(id, path) => {
+                JsonValue::Array(vec![verb_value("#"), number_value(id), path_value(path)])
+            }
         }
     }
 }
@@ -798,7 +819,11 @@ impl DeltaTracker {
     /// # Errors
     /// Returns `DeltaError` when the path is empty, a key segment is reserved,
     /// the target is not a string, or the path is unresolvable.
-    pub fn append_string(&mut self, path: &StatePath, value: impl Into<JsString>) -> Result<(), DeltaError> {
+    pub fn append_string(
+        &mut self,
+        path: &StatePath,
+        value: impl Into<JsString>,
+    ) -> Result<(), DeltaError> {
         validate_non_empty(path)?;
         append_string_path(&mut self.root, path, &value.into())?;
         self.dirty = true;
@@ -810,7 +835,11 @@ impl DeltaTracker {
     /// # Errors
     /// Returns `DeltaError` when the path is empty, a key segment is reserved,
     /// the target is not a string, or the path is unresolvable.
-    pub fn truncate_string(&mut self, path: &StatePath, count: JsInteger) -> Result<(), DeltaError> {
+    pub fn truncate_string(
+        &mut self,
+        path: &StatePath,
+        count: JsInteger,
+    ) -> Result<(), DeltaError> {
         validate_non_empty(path)?;
         truncate_string_path(&mut self.root, path, count)?;
         self.dirty = true;
@@ -828,7 +857,13 @@ impl DeltaTracker {
             JsonValue::Array(items) => items.len(),
             _ => return Err(DeltaError::NotArray { path: path.clone() }),
         };
-        splice_path(&mut self.root, path, count(length), JsInteger::zero(), values)?;
+        splice_path(
+            &mut self.root,
+            path,
+            count(length),
+            JsInteger::zero(),
+            values,
+        )?;
         self.dirty = true;
         Ok(())
     }
@@ -897,7 +932,10 @@ pub fn apply(target: Option<JsonValue>, ops: &[DeltaOp]) -> Result<Option<JsonVa
 /// # Errors
 /// Returns `DeltaError` when an operation is invalid or a path cannot be
 /// resolved against the current value.
-pub fn apply_immutable(target: Option<&JsonValue>, ops: &[DeltaOp]) -> Result<Option<JsonValue>, DeltaError> {
+pub fn apply_immutable(
+    target: Option<&JsonValue>,
+    ops: &[DeltaOp],
+) -> Result<Option<JsonValue>, DeltaError> {
     let mut root = target.cloned();
     for op in ops {
         op.validate()?;
@@ -994,7 +1032,12 @@ impl DeltaEncoder {
                 DeltaOp::Append(_, value) => output.push(WireOp::Append(path_ref, value.clone())),
                 DeltaOp::Truncate(_, count) => output.push(WireOp::Truncate(path_ref, *count)),
                 DeltaOp::Splice(_, index, delete_count, values) => {
-                    output.push(WireOp::Splice(path_ref, *index, *delete_count, values.clone()));
+                    output.push(WireOp::Splice(
+                        path_ref,
+                        *index,
+                        *delete_count,
+                        values.clone(),
+                    ));
                 }
                 DeltaOp::Replace(_) => continue,
             }
@@ -1161,7 +1204,10 @@ fn validate_path_ref(path_ref: &PathRef) -> Result<(), DeltaError> {
     }
 }
 
-fn resolve_path_ref(paths: &HashMap<JsInteger, StatePath>, path_ref: &PathRef) -> Result<StatePath, DeltaError> {
+fn resolve_path_ref(
+    paths: &HashMap<JsInteger, StatePath>,
+    path_ref: &PathRef,
+) -> Result<StatePath, DeltaError> {
     match path_ref {
         PathRef::Inline(path) => Ok(path.clone()),
         PathRef::Id(id) => paths.get(id).cloned().ok_or(DeltaError::PathId(*id)),
@@ -1184,7 +1230,10 @@ fn parse_delta_op(raw: &[JsonValue]) -> Result<DeltaOp, DeltaError> {
             if raw.len() != 3 {
                 return Err(invalid_tuple("op", "s arity"));
             }
-            Ok(DeltaOp::Set(parse_path_value(&raw[1], "op")?, raw[2].clone()))
+            Ok(DeltaOp::Set(
+                parse_path_value(&raw[1], "op")?,
+                raw[2].clone(),
+            ))
         }
         Some(b'd') => {
             if raw.len() != 2 {
@@ -1239,7 +1288,10 @@ fn parse_wire_op(raw: &[JsonValue]) -> Result<WireOp, DeltaError> {
         }
         Some(b's') => match raw.len() {
             2 => Ok(WireOp::SetShort(raw[1].clone())),
-            3 => Ok(WireOp::Set(parse_path_ref(&raw[1], "wire")?, raw[2].clone())),
+            3 => Ok(WireOp::Set(
+                parse_path_ref(&raw[1], "wire")?,
+                raw[2].clone(),
+            )),
             _ => Err(invalid_tuple("wire", "s arity")),
         },
         Some(b'd') => match raw.len() {
@@ -1248,7 +1300,9 @@ fn parse_wire_op(raw: &[JsonValue]) -> Result<WireOp, DeltaError> {
             _ => Err(invalid_tuple("wire", "d arity")),
         },
         Some(b'a') => match raw.len() {
-            2 => Ok(WireOp::AppendShort(parse_string_value(&raw[1], "wire", "a value")?)),
+            2 => Ok(WireOp::AppendShort(parse_string_value(
+                &raw[1], "wire", "a value",
+            )?)),
             3 => Ok(WireOp::Append(
                 parse_path_ref(&raw[1], "wire")?,
                 parse_string_value(&raw[2], "wire", "a value")?,
@@ -1256,7 +1310,9 @@ fn parse_wire_op(raw: &[JsonValue]) -> Result<WireOp, DeltaError> {
             _ => Err(invalid_tuple("wire", "a arity")),
         },
         Some(b't') => match raw.len() {
-            2 => Ok(WireOp::TruncateShort(parse_nonnegative_integer(&raw[1], "wire", "t count")?)),
+            2 => Ok(WireOp::TruncateShort(parse_nonnegative_integer(
+                &raw[1], "wire", "t count",
+            )?)),
             3 => Ok(WireOp::Truncate(
                 parse_path_ref(&raw[1], "wire")?,
                 parse_nonnegative_integer(&raw[2], "wire", "t count")?,
@@ -1306,7 +1362,11 @@ fn parse_path_ref(value: &JsonValue, kind: &'static str) -> Result<PathRef, Delt
     if value.as_array().is_some() {
         Ok(PathRef::Inline(parse_path_value(value, kind)?))
     } else {
-        Ok(PathRef::Id(parse_nonnegative_integer(value, kind, "bad path id")?))
+        Ok(PathRef::Id(parse_nonnegative_integer(
+            value,
+            kind,
+            "bad path id",
+        )?))
     }
 }
 
@@ -1314,18 +1374,36 @@ fn parse_path_segment(value: &JsonValue, kind: &'static str) -> Result<PathSegme
     if let Some(key) = value.as_str() {
         return Ok(PathSegment::Key(key.clone()));
     }
-    Ok(PathSegment::Index(parse_nonnegative_integer(value, kind, "path segment")?))
+    Ok(PathSegment::Index(parse_nonnegative_integer(
+        value,
+        kind,
+        "path segment",
+    )?))
 }
 
-fn parse_string_value(value: &JsonValue, kind: &'static str, reason: &'static str) -> Result<JsString, DeltaError> {
-    value.as_str().cloned().ok_or_else(|| invalid_tuple(kind, reason))
+fn parse_string_value(
+    value: &JsonValue,
+    kind: &'static str,
+    reason: &'static str,
+) -> Result<JsString, DeltaError> {
+    value
+        .as_str()
+        .cloned()
+        .ok_or_else(|| invalid_tuple(kind, reason))
 }
 
 fn parse_items(value: &JsonValue, kind: &'static str) -> Result<Vec<JsonValue>, DeltaError> {
-    value.as_array().cloned().ok_or_else(|| invalid_tuple(kind, "p items"))
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| invalid_tuple(kind, "p items"))
 }
 
-fn parse_nonnegative_integer(value: &JsonValue, kind: &'static str, reason: &'static str) -> Result<JsInteger, DeltaError> {
+fn parse_nonnegative_integer(
+    value: &JsonValue,
+    kind: &'static str,
+    reason: &'static str,
+) -> Result<JsInteger, DeltaError> {
     let Some(number) = value.as_f64() else {
         return Err(invalid_tuple(kind, reason));
     };
@@ -1348,7 +1426,10 @@ fn verb_code(verb: &JsString) -> Option<u8> {
 fn unknown_verb(verb: &JsString) -> String {
     // Diagnostic only: a verb holding unpaired surrogates renders with
     // replacement characters because a Rust `String` cannot hold them.
-    format!("unknown op verb: {}", String::from_utf16_lossy(verb.as_utf16()))
+    format!(
+        "unknown op verb: {}",
+        String::from_utf16_lossy(verb.as_utf16())
+    )
 }
 
 fn invalid_tuple(kind: &'static str, reason: &str) -> DeltaError {
@@ -1416,12 +1497,22 @@ fn diff_value(
     Ok(())
 }
 
-fn diff_string(before: &[u16], after: &[u16], path: &StatePath, scan: usize, output: &mut Vec<DeltaOp>) {
+fn diff_string(
+    before: &[u16],
+    after: &[u16],
+    path: &StatePath,
+    scan: usize,
+    output: &mut Vec<DeltaOp>,
+) {
     if before == after {
         return;
     }
     if path.is_empty() {
-        emit_set(path, JsonValue::String(JsString::from_utf16(after.to_vec())), output);
+        emit_set(
+            path,
+            JsonValue::String(JsString::from_utf16(after.to_vec())),
+            output,
+        );
         return;
     }
     if after.len() > before.len() && after.starts_with(before) {
@@ -1433,10 +1524,17 @@ fn diff_string(before: &[u16], after: &[u16], path: &StatePath, scan: usize, out
     }
     let shared = overlap(before, after, scan);
     if shared == 0 {
-        emit_set(path, JsonValue::String(JsString::from_utf16(after.to_vec())), output);
+        emit_set(
+            path,
+            JsonValue::String(JsString::from_utf16(after.to_vec())),
+            output,
+        );
         return;
     }
-    output.push(DeltaOp::Truncate(path.clone(), count(before.len() - shared)));
+    output.push(DeltaOp::Truncate(
+        path.clone(),
+        count(before.len() - shared),
+    ));
     if after.len() > shared {
         // The append may begin inside what was a surrogate pair in `before`;
         // UTF-16 code units keep that split lossless.
@@ -1447,7 +1545,13 @@ fn diff_string(before: &[u16], after: &[u16], path: &StatePath, scan: usize, out
     }
 }
 
-fn diff_object(before: &JsObject, after: &JsObject, path: &StatePath, scan: usize, output: &mut Vec<DeltaOp>) -> Result<(), DeltaError> {
+fn diff_object(
+    before: &JsObject,
+    after: &JsObject,
+    path: &StatePath,
+    scan: usize,
+    output: &mut Vec<DeltaOp>,
+) -> Result<(), DeltaError> {
     if before
         .keys()
         .chain(after.keys())
@@ -1458,7 +1562,13 @@ fn diff_object(before: &JsObject, after: &JsObject, path: &StatePath, scan: usiz
     }
     for (key, value) in after {
         let child_path = path.joined(PathSegment::Key(key.clone()));
-        diff_value(before.get(key.as_utf16()), Some(value), &child_path, scan, output)?;
+        diff_value(
+            before.get(key.as_utf16()),
+            Some(value),
+            &child_path,
+            scan,
+            output,
+        )?;
     }
     for key in before.keys() {
         if !after.contains_key(key.as_utf16()) {
@@ -1469,7 +1579,13 @@ fn diff_object(before: &JsObject, after: &JsObject, path: &StatePath, scan: usiz
     Ok(())
 }
 
-fn diff_array(before: &[JsonValue], after: &[JsonValue], path: &StatePath, scan: usize, output: &mut Vec<DeltaOp>) -> Result<(), DeltaError> {
+fn diff_array(
+    before: &[JsonValue],
+    after: &[JsonValue],
+    path: &StatePath,
+    scan: usize,
+    output: &mut Vec<DeltaOp>,
+) -> Result<(), DeltaError> {
     if before.len() == after.len() {
         for (index, (left, right)) in before.iter().zip(after).enumerate() {
             diff_value(
@@ -1500,7 +1616,12 @@ fn diff_array(before: &[JsonValue], after: &[JsonValue], path: &StatePath, scan:
         if prefix == 0 && remove == before.len() {
             emit_set(path, JsonValue::Array(after.to_vec()), output);
         } else {
-            output.push(DeltaOp::Splice(path.clone(), count(prefix), count(remove), items));
+            output.push(DeltaOp::Splice(
+                path.clone(),
+                count(prefix),
+                count(remove),
+                items,
+            ));
         }
         return Ok(());
     }
@@ -1558,23 +1679,33 @@ fn apply_one(root: &mut Option<JsonValue>, op: &DeltaOp) -> Result<(), DeltaErro
             Ok(())
         }
         DeltaOp::Set(path, value) => {
-            let target = root.as_mut().ok_or_else(|| DeltaError::Path { path: path.clone() })?;
+            let target = root
+                .as_mut()
+                .ok_or_else(|| DeltaError::Path { path: path.clone() })?;
             set_path(target, path, value.clone())
         }
         DeltaOp::Delete(path) => {
-            let target = root.as_mut().ok_or_else(|| DeltaError::Path { path: path.clone() })?;
+            let target = root
+                .as_mut()
+                .ok_or_else(|| DeltaError::Path { path: path.clone() })?;
             delete_path(target, path)
         }
         DeltaOp::Append(path, value) => {
-            let target = root.as_mut().ok_or_else(|| DeltaError::Path { path: path.clone() })?;
+            let target = root
+                .as_mut()
+                .ok_or_else(|| DeltaError::Path { path: path.clone() })?;
             append_string_path(target, path, value)
         }
         DeltaOp::Truncate(path, count) => {
-            let target = root.as_mut().ok_or_else(|| DeltaError::Path { path: path.clone() })?;
+            let target = root
+                .as_mut()
+                .ok_or_else(|| DeltaError::Path { path: path.clone() })?;
             truncate_string_path(target, path, *count)
         }
         DeltaOp::Splice(path, index, delete_count, values) => {
-            let target = root.as_mut().ok_or_else(|| DeltaError::Path { path: path.clone() })?;
+            let target = root
+                .as_mut()
+                .ok_or_else(|| DeltaError::Path { path: path.clone() })?;
             splice_path(target, path, *index, *delete_count, values.clone())
         }
     }
@@ -1584,7 +1715,9 @@ fn resolve_value<'a>(root: &'a JsonValue, path: &StatePath) -> Result<&'a JsonVa
     let mut current = root;
     for segment in path.as_slice() {
         current = match current {
-            JsonValue::Object(map) => object_get(map, segment).ok_or_else(|| DeltaError::Path { path: path.clone() })?,
+            JsonValue::Object(map) => {
+                object_get(map, segment).ok_or_else(|| DeltaError::Path { path: path.clone() })?
+            }
             JsonValue::Array(items) => {
                 let Some(index) = segment.as_index() else {
                     return Err(DeltaError::UnsafePath {
@@ -1592,7 +1725,9 @@ fn resolve_value<'a>(root: &'a JsonValue, path: &StatePath) -> Result<&'a JsonVa
                     });
                 };
                 let index = existing_index(index, items.len(), path)?;
-                items.get(index).ok_or_else(|| DeltaError::Path { path: path.clone() })?
+                items
+                    .get(index)
+                    .ok_or_else(|| DeltaError::Path { path: path.clone() })?
             }
             _ => return Err(DeltaError::Path { path: path.clone() }),
         };
@@ -1600,16 +1735,18 @@ fn resolve_value<'a>(root: &'a JsonValue, path: &StatePath) -> Result<&'a JsonVa
     Ok(current)
 }
 
-fn resolve_parent_mut<'a>(root: &'a mut JsonValue, path: &StatePath) -> Result<(&'a mut JsonValue, PathSegment), DeltaError> {
+fn resolve_parent_mut<'a>(
+    root: &'a mut JsonValue,
+    path: &StatePath,
+) -> Result<(&'a mut JsonValue, PathSegment), DeltaError> {
     let Some((last, parents)) = path.as_slice().split_last() else {
         return Err(DeltaError::Path { path: path.clone() });
     };
     let mut current = root;
     for segment in parents {
         current = match current {
-            JsonValue::Object(map) => {
-                object_get_mut(map, segment).ok_or_else(|| DeltaError::Path { path: path.clone() })?
-            }
+            JsonValue::Object(map) => object_get_mut(map, segment)
+                .ok_or_else(|| DeltaError::Path { path: path.clone() })?,
             JsonValue::Array(items) => {
                 let Some(index) = segment.as_index() else {
                     return Err(DeltaError::UnsafePath {
@@ -1617,7 +1754,9 @@ fn resolve_parent_mut<'a>(root: &'a mut JsonValue, path: &StatePath) -> Result<(
                     });
                 };
                 let index = existing_index(index, items.len(), path)?;
-                items.get_mut(index).ok_or_else(|| DeltaError::Path { path: path.clone() })?
+                items
+                    .get_mut(index)
+                    .ok_or_else(|| DeltaError::Path { path: path.clone() })?
             }
             _ => return Err(DeltaError::Path { path: path.clone() }),
         };
@@ -1675,7 +1814,11 @@ fn delete_path(root: &mut JsonValue, path: &StatePath) -> Result<(), DeltaError>
     }
 }
 
-fn normalize_splice(length: usize, start: i64, delete_count: Option<i64>) -> (JsInteger, JsInteger) {
+fn normalize_splice(
+    length: usize,
+    start: i64,
+    delete_count: Option<i64>,
+) -> (JsInteger, JsInteger) {
     let length = u64::try_from(length).unwrap_or(u64::MAX);
     let index = if start < 0 {
         length.saturating_sub(start.unsigned_abs())
@@ -1715,7 +1858,11 @@ fn splice_path(
     Ok(())
 }
 
-fn append_string_path(root: &mut JsonValue, path: &StatePath, value: &JsString) -> Result<(), DeltaError> {
+fn append_string_path(
+    root: &mut JsonValue,
+    path: &StatePath,
+    value: &JsString,
+) -> Result<(), DeltaError> {
     let target = resolve_value_mut(root, path)?;
     let JsonValue::String(current) = target else {
         return Err(DeltaError::NotString { path: path.clone() });
@@ -1729,7 +1876,11 @@ fn append_string_path(root: &mut JsonValue, path: &StatePath, value: &JsString) 
     Ok(())
 }
 
-fn truncate_string_path(root: &mut JsonValue, path: &StatePath, count: JsInteger) -> Result<(), DeltaError> {
+fn truncate_string_path(
+    root: &mut JsonValue,
+    path: &StatePath,
+    count: JsInteger,
+) -> Result<(), DeltaError> {
     let target = resolve_value_mut(root, path)?;
     let JsonValue::String(current) = target else {
         return Err(DeltaError::NotString { path: path.clone() });
@@ -1743,13 +1894,15 @@ fn truncate_string_path(root: &mut JsonValue, path: &StatePath, count: JsInteger
     Ok(())
 }
 
-fn resolve_value_mut<'a>(root: &'a mut JsonValue, path: &StatePath) -> Result<&'a mut JsonValue, DeltaError> {
+fn resolve_value_mut<'a>(
+    root: &'a mut JsonValue,
+    path: &StatePath,
+) -> Result<&'a mut JsonValue, DeltaError> {
     let mut current = root;
     for segment in path.as_slice() {
         current = match current {
-            JsonValue::Object(map) => {
-                object_get_mut(map, segment).ok_or_else(|| DeltaError::Path { path: path.clone() })?
-            }
+            JsonValue::Object(map) => object_get_mut(map, segment)
+                .ok_or_else(|| DeltaError::Path { path: path.clone() })?,
             JsonValue::Array(items) => {
                 let Some(index) = segment.as_index() else {
                     return Err(DeltaError::UnsafePath {
@@ -1757,7 +1910,9 @@ fn resolve_value_mut<'a>(root: &'a mut JsonValue, path: &StatePath) -> Result<&'
                     });
                 };
                 let index = existing_index(index, items.len(), path)?;
-                items.get_mut(index).ok_or_else(|| DeltaError::Path { path: path.clone() })?
+                items
+                    .get_mut(index)
+                    .ok_or_else(|| DeltaError::Path { path: path.clone() })?
             }
             _ => return Err(DeltaError::Path { path: path.clone() }),
         };
@@ -1812,7 +1967,10 @@ fn appendable_index(index: JsInteger, length: usize) -> Result<usize, DeltaError
 /// the nearest binary64, which stays finite, nonnegative, and integral, so
 /// the checked constructor cannot fail here.
 fn count(value: usize) -> JsInteger {
-    #[expect(clippy::cast_precision_loss, reason = "binary64 rounding is the canonical integer coercion")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "binary64 rounding is the canonical integer coercion"
+    )]
     let value = value as f64;
     JsInteger::new(value).unwrap_or_else(|_| JsInteger::zero())
 }
@@ -1820,7 +1978,10 @@ fn count(value: usize) -> JsInteger {
 /// Converts a `u64` into the binary64 integer domain, with the same rounding
 /// guarantee as [`count`].
 fn integer(value: u64) -> JsInteger {
-    #[expect(clippy::cast_precision_loss, reason = "binary64 rounding is the canonical integer coercion")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "binary64 rounding is the canonical integer coercion"
+    )]
     let value = value as f64;
     JsInteger::new(value).unwrap_or_else(|_| JsInteger::zero())
 }
@@ -1884,7 +2045,10 @@ mod tests {
         let first = encoder.encode(&ops)?;
         assert_eq!(wire_json(&first), json(r#"[["a",["a","deep"],"1"]]"#)?);
         let second = encoder.encode(&[DeltaOp::Append(p.clone(), js("2"))])?;
-        assert_eq!(wire_json(&second), json(r##"[["#",0,["a","deep"]],["a",0,"2"]]"##)?);
+        assert_eq!(
+            wire_json(&second),
+            json(r##"[["#",0,["a","deep"]],["a",0,"2"]]"##)?
+        );
         let mut decoder = DeltaDecoder::new();
         assert_eq!(decoder.decode(&first)?, ops);
         assert_eq!(decoder.decode(&second)?, vec![DeltaOp::Append(p, js("2"))]);
@@ -1929,16 +2093,25 @@ mod tests {
             &[DeltaOp::Truncate(p.clone(), int(1.0)?)],
         )?
         .ok_or("root")?;
-        assert_eq!(string_member(&result, "text")?.as_utf16(), [0xDE00].as_slice());
+        assert_eq!(
+            string_member(&result, "text")?.as_utf16(),
+            [0xDE00].as_slice()
+        );
 
         // Appending a lone high surrogate keeps the units verbatim —
         // JavaScript concatenates code units without combining them.
         let result = apply(
             Some(result),
-            &[DeltaOp::Append(p.clone(), JsString::from_utf16(vec![0xD800]))],
+            &[DeltaOp::Append(
+                p.clone(),
+                JsString::from_utf16(vec![0xD800]),
+            )],
         )?
         .ok_or("root")?;
-        assert_eq!(string_member(&result, "text")?.as_utf16(), [0xDE00, 0xD800].as_slice());
+        assert_eq!(
+            string_member(&result, "text")?.as_utf16(),
+            [0xDE00, 0xD800].as_slice()
+        );
 
         // A lone-surrogate append survives the tuple round trip: the writer
         // keeps it as a \udXXX escape and the parser restores the same units.
@@ -1963,11 +2136,16 @@ mod tests {
         // splits the pair, which the canonical string represents losslessly.
         assert_eq!(
             ops,
-            vec![DeltaOp::Truncate(path(vec![PathSegment::key("text")])?, int(2.0)?)]
+            vec![DeltaOp::Truncate(
+                path(vec![PathSegment::key("text")])?,
+                int(2.0)?
+            )]
         );
-        let applied = apply(Some(json(r#"{"text":"a😀"}"#)?), &ops)?
-            .ok_or("root")?;
-        assert_eq!(string_member(&applied, "text")?.as_utf16(), [0xDE00].as_slice());
+        let applied = apply(Some(json(r#"{"text":"a😀"}"#)?), &ops)?.ok_or("root")?;
+        assert_eq!(
+            string_member(&applied, "text")?.as_utf16(),
+            [0xDE00].as_slice()
+        );
         Ok(())
     }
 
@@ -1983,19 +2161,15 @@ mod tests {
                 json("1")?
             )
         );
-        let result = apply(Some(json(r#"{"a":0}"#)?), &[op])?
-            .ok_or("root")?;
+        let result = apply(Some(json(r#"{"a":0}"#)?), &[op])?.ok_or("root")?;
         let expected = json("1")?;
         let JsonValue::Object(map) = &result else {
             return Err("expected object".into());
         };
         assert_eq!(map.get(key.as_utf16()), Some(&expected));
         // And the operation serializes back to the same escape.
-        let encoded = DeltaOp::Set(
-            StatePath::from(vec![PathSegment::Key(key)]),
-            json("1")?,
-        )
-        .into_json();
+        let encoded =
+            DeltaOp::Set(StatePath::from(vec![PathSegment::Key(key)]), json("1")?).into_json();
         assert_eq!(stringify_json(&encoded), r#"["s",["\ud800"],1]"#);
         Ok(())
     }
@@ -2014,23 +2188,23 @@ mod tests {
         // as String.slice and Array.prototype.splice do.
         let t = DeltaOp::from_json(&json(r#"["t",["s"],1e30]"#)?)?;
         let s = DeltaOp::from_json(&json(r#"["p",["xs"],0,1e9,[]]"#)?)?;
-        let result = apply(Some(json(r#"{"s":"abc","xs":[1,2]}"#)?), &[t, s])?
-            .ok_or("root")?;
+        let result = apply(Some(json(r#"{"s":"abc","xs":[1,2]}"#)?), &[t, s])?.ok_or("root")?;
         assert_eq!(result, json(r#"{"s":"","xs":[]}"#)?);
 
         // A splice index beyond the end clamps to an append.
         let splice = DeltaOp::from_json(&json(r#"["p",["xs"],1e30,0,[2]]"#)?)?;
-        let result = apply(Some(json(r#"{"xs":[1]}"#)?), &[splice])?
-            .ok_or("root")?;
+        let result = apply(Some(json(r#"{"xs":[1]}"#)?), &[splice])?.ok_or("root")?;
         assert_eq!(result, json(r#"{"xs":[1,2]}"#)?);
 
         // A set index beyond one-past-the-end is still a sparse-write
         // rejection at application.
-        assert!(apply(
-            Some(json(r#"{"xs":[1]}"#)?),
-            &[DeltaOp::from_json(&json(r#"["s",["xs",1e30],9]"#)?)?],
-        )
-        .is_err());
+        assert!(
+            apply(
+                Some(json(r#"{"xs":[1]}"#)?),
+                &[DeltaOp::from_json(&json(r#"["s",["xs",1e30],9]"#)?)?],
+            )
+            .is_err()
+        );
 
         // Negative, fractional, and non-numeric counts stay rejected at parse.
         assert!(DeltaOp::from_json(&json(r#"["t",["s"],-1]"#)?).is_err());
@@ -2149,8 +2323,7 @@ mod tests {
     #[test]
     fn splice_at_the_root_path_replaces_array_contents() -> TestResult {
         let splice = DeltaOp::from_json(&json(r#"["p",[],1,1,[9]]"#)?)?;
-        let result = apply(Some(json("[1,2,3]")?), &[splice])?
-            .ok_or("root")?;
+        let result = apply(Some(json("[1,2,3]")?), &[splice])?.ok_or("root")?;
         assert_eq!(result, json("[1,9,3]")?);
         Ok(())
     }
@@ -2172,12 +2345,7 @@ mod tests {
             ops,
             vec![
                 DeltaOp::Append(text_path, js("abcd")),
-                DeltaOp::Splice(
-                    xs_path,
-                    int(1.0)?,
-                    int(0.0)?,
-                    vec![json("2")?, json("3")?],
-                ),
+                DeltaOp::Splice(xs_path, int(1.0)?, int(0.0)?, vec![json("2")?, json("3")?],),
             ]
         );
         assert!(!tracker.dirty());
@@ -2211,14 +2379,8 @@ mod tests {
             ],
         )?
         .ok_or("root")?;
-        assert_eq!(
-            previous,
-            json(r#"{"nested":{"value":1},"untouched":[1]}"#)?
-        );
-        assert_eq!(
-            replacement,
-            json(r#"{"nested":{"value":2}}"#)?
-        );
+        assert_eq!(previous, json(r#"{"nested":{"value":1},"untouched":[1]}"#)?);
+        assert_eq!(replacement, json(r#"{"nested":{"value":2}}"#)?);
         assert_eq!(next, json(r#"{"nested":{"value":3}}"#)?);
         Ok(())
     }

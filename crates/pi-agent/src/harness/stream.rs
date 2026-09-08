@@ -34,7 +34,10 @@ pub struct HarnessRequestContext {
 
 /// Optional context transformation performed before provider-message mapping.
 pub type TransformRequestContext = Arc<
-    dyn Fn(HarnessRequestContext, Context) -> BoxFuture<'static, Result<HarnessRequestContext, GateRejection>>
+    dyn Fn(
+            HarnessRequestContext,
+            Context,
+        ) -> BoxFuture<'static, Result<HarnessRequestContext, GateRejection>>
         + Send
         + Sync,
 >;
@@ -106,10 +109,12 @@ pub(crate) struct HarnessDeferredStreamConfig {
     pub observer: Arc<dyn AssistantStreamObserver>,
 }
 
-
 /// Convert owned transcript messages to provider messages.
 pub type ToProviderMessages = Arc<
-    dyn Fn(Vec<AgentMessage>, Context) -> BoxFuture<'static, Result<Vec<pi_ai::Message>, HarnessError>>
+    dyn Fn(
+            Vec<AgentMessage>,
+            Context,
+        ) -> BoxFuture<'static, Result<Vec<pi_ai::Message>, HarnessError>>
         + Send
         + Sync,
 >;
@@ -261,9 +266,8 @@ pub(crate) async fn stream_harness_deferred(
             config.on_payload.clone(),
             on_response,
         );
-        native_options.insert_extra_if_absent_with(pi_ai::StreamOptionKey::WAIT, || {
-            Value::from(0_u64)
-        });
+        native_options
+            .insert_extra_if_absent_with(pi_ai::StreamOptionKey::WAIT, || Value::from(0_u64));
         let stream = config
             .models
             .fetch_deferred(&config.model, handle, native_options);
@@ -279,7 +283,6 @@ pub(crate) async fn stream_harness_deferred(
     )
     .await
 }
-
 
 /// Consume provider events and run the terminal lifecycle in order.
 async fn consume_stream(
@@ -311,7 +314,8 @@ async fn consume_stream(
                     .into());
                 }
                 started = true;
-                gate.admit(|| observer.start(partial.as_ref(), &event, cx))?.await?;
+                gate.admit(|| observer.start(partial.as_ref(), &event, cx))?
+                    .await?;
             }
             AssistantMessageEvent::Done { message, .. } => {
                 if !started {
@@ -476,7 +480,6 @@ fn response_callback(
     })
 }
 
-
 fn metadata_snapshot(metadata: &ResponseMetadataCell) -> AssistantResponseMetadata {
     metadata
         .lock()
@@ -631,10 +634,7 @@ fn apply_map_patch<V: Clone>(slot: &mut Option<BTreeMap<String, V>>, patch: &Map
         MapPatch::Unchanged => {}
         MapPatch::Clear => *slot = None,
         MapPatch::Merge(changes) => {
-            if slot.is_none()
-                && !changes.is_empty()
-                && !changes.values().any(Option::is_some)
-            {
+            if slot.is_none() && !changes.is_empty() && !changes.values().any(Option::is_some) {
                 return;
             }
             let map = slot.get_or_insert_with(BTreeMap::new);
@@ -717,7 +717,8 @@ mod tests {
     }
 
     #[test]
-    fn frame_reduction_preserves_pending_without_inventing_terminal_state() -> Result<(), SessionError> {
+    fn frame_reduction_preserves_pending_without_inventing_terminal_state()
+    -> Result<(), SessionError> {
         let mut partial = AssistantMessage::new("api", "provider", "model", 1);
         partial.stop_reason = pi_ai::StopReason::Pending;
         let frames = [pi_ai::AssistantMessageFrame::Start {
@@ -786,7 +787,10 @@ mod tests {
             deferred: Some(DeferredRequest::Flag(false)),
             ..HarnessStreamOptions::default()
         };
-        assert_eq!(apply_stream_options_patch(&before, &create_stream_options_patch(&before, &after)), after);
+        assert_eq!(
+            apply_stream_options_patch(&before, &create_stream_options_patch(&before, &after)),
+            after
+        );
 
         let object = HarnessStreamOptions {
             deferred: Some(DeferredRequest::Options { window: None }),

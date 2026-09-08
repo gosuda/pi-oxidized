@@ -3,8 +3,11 @@ use std::marker::PhantomData;
 
 use serde::{Deserialize, Serialize};
 
-use super::{EntryId, LaneConfiguration, LaneName, OperationId, OperationResultRecord, OperationMeta, OperationState, PendingEntry, ScanOrder};
 use super::DurableStructuralPreparation;
+use super::{
+    EntryId, LaneConfiguration, LaneName, OperationId, OperationMeta, OperationResultRecord,
+    OperationState, PendingEntry, ScanOrder,
+};
 use crate::tool::AgentToolResult;
 
 /// Which durable sub-space an address names: a single value or an append-only list.
@@ -50,13 +53,21 @@ pub struct ValueList<T> {
 
 impl<T> Clone for Value<T> {
     fn clone(&self) -> Self {
-        Self { namespace: self.namespace, key: self.key.clone(), _marker: self._marker }
+        Self {
+            namespace: self.namespace,
+            key: self.key.clone(),
+            _marker: self._marker,
+        }
     }
 }
 
 impl<T> Clone for ValueList<T> {
     fn clone(&self) -> Self {
-        Self { namespace: self.namespace, key: self.key.clone(), _marker: self._marker }
+        Self {
+            namespace: self.namespace,
+            key: self.key.clone(),
+            _marker: self._marker,
+        }
     }
 }
 
@@ -77,22 +88,41 @@ impl<T> Value<T> {
     /// Returns [`InvalidAddress`] when `namespace` is empty or when either
     /// component contains a NUL, both of which would break a backend that keys
     /// on `(namespace, key)`.
-    pub fn new(namespace: &'static str, key: impl Into<Cow<'static, str>>) -> Result<Self, InvalidAddress> {
+    pub fn new(
+        namespace: &'static str,
+        key: impl Into<Cow<'static, str>>,
+    ) -> Result<Self, InvalidAddress> {
         let key = key.into();
         validate(namespace, &key)?;
-        Ok(Self { namespace, key, _marker: PhantomData })
+        Ok(Self {
+            namespace,
+            key,
+            _marker: PhantomData,
+        })
     }
     /// Returns the namespace as a borrowed slice, for comparisons and display.
-    #[must_use] pub fn namespace(&self) -> &str { self.namespace }
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        self.namespace
+    }
     /// Returns the namespace as its frozen `&'static str`.
     ///
     /// Typed scans rebuild each hit's address from the scanned prefix's
     /// namespace, which needs the static lifetime to survive past the borrow.
-    #[must_use] pub fn static_namespace(&self) -> &'static str { self.namespace }
+    #[must_use]
+    pub fn static_namespace(&self) -> &'static str {
+        self.namespace
+    }
     /// Returns the key.
-    #[must_use] pub fn key(&self) -> &str { self.key.as_ref() }
+    #[must_use]
+    pub fn key(&self) -> &str {
+        self.key.as_ref()
+    }
     /// Drops the `T` phantom, producing the address a backend trait method takes.
-    #[must_use] pub fn erase(&self) -> RawAddress { RawAddress::value(self.namespace, self.key()) }
+    #[must_use]
+    pub fn erase(&self) -> RawAddress {
+        RawAddress::value(self.namespace, self.key())
+    }
 }
 
 impl<T> ValueList<T> {
@@ -102,21 +132,41 @@ impl<T> ValueList<T> {
     ///
     /// Returns [`InvalidAddress`] when `namespace` is empty or when either
     /// component contains a NUL.
-    pub fn new(namespace: &'static str, key: impl Into<Cow<'static, str>>) -> Result<Self, InvalidAddress> {
+    pub fn new(
+        namespace: &'static str,
+        key: impl Into<Cow<'static, str>>,
+    ) -> Result<Self, InvalidAddress> {
         let key = key.into();
         validate(namespace, &key)?;
-        Ok(Self { namespace, key, _marker: PhantomData })
+        Ok(Self {
+            namespace,
+            key,
+            _marker: PhantomData,
+        })
     }
     /// Returns the namespace as a borrowed slice.
-    #[must_use] pub fn namespace(&self) -> &str { self.namespace }
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        self.namespace
+    }
     /// Returns the key.
-    #[must_use] pub fn key(&self) -> &str { self.key.as_ref() }
+    #[must_use]
+    pub fn key(&self) -> &str {
+        self.key.as_ref()
+    }
     /// Drops the `T` phantom, producing the address a backend trait method takes.
-    #[must_use] pub fn erase(&self) -> RawAddress { RawAddress::list(self.namespace, self.key()) }
+    #[must_use]
+    pub fn erase(&self) -> RawAddress {
+        RawAddress::list(self.namespace, self.key())
+    }
 }
 
 fn validate(namespace: &str, key: &str) -> Result<(), InvalidAddress> {
-    if namespace.is_empty() || namespace.contains('\0') || key.contains('\0') { Err(InvalidAddress) } else { Ok(()) }
+    if namespace.is_empty() || namespace.contains('\0') || key.contains('\0') {
+        Err(InvalidAddress)
+    } else {
+        Ok(())
+    }
 }
 
 /// Address as a backend sees it: all components owned, no phantom.
@@ -136,12 +186,22 @@ pub struct RawAddress {
 
 impl RawAddress {
     /// Builds a value-sub-space address from borrowed components.
-    #[must_use] pub fn value(namespace: &str, key: &str) -> Self {
-        Self { namespace: namespace.to_owned(), key: key.to_owned(), kind: AddressKind::Value }
+    #[must_use]
+    pub fn value(namespace: &str, key: &str) -> Self {
+        Self {
+            namespace: namespace.to_owned(),
+            key: key.to_owned(),
+            kind: AddressKind::Value,
+        }
     }
     /// Builds a list-sub-space address from borrowed components.
-    #[must_use] pub fn list(namespace: &str, key: &str) -> Self {
-        Self { namespace: namespace.to_owned(), key: key.to_owned(), kind: AddressKind::List }
+    #[must_use]
+    pub fn list(namespace: &str, key: &str) -> Self {
+        Self {
+            namespace: namespace.to_owned(),
+            key: key.to_owned(),
+            kind: AddressKind::List,
+        }
     }
 }
 
@@ -210,18 +270,34 @@ pub const LIST_READ_MAX_LIMIT: u32 = 10_000;
 /// Returns [`InvalidAddress`] when an explicit `limit` is zero; an absent limit
 /// becomes [`LIST_READ_DEFAULT_LIMIT`] and a larger one is clamped to
 /// [`LIST_READ_MAX_LIMIT`].
-pub fn resolve_list_read_options(options: Option<ListReadOptions>) -> Result<ResolvedListReadOptions, InvalidAddress> {
+pub fn resolve_list_read_options(
+    options: Option<ListReadOptions>,
+) -> Result<ResolvedListReadOptions, InvalidAddress> {
     let options = options.unwrap_or_default();
     let limit = options.limit.unwrap_or(LIST_READ_DEFAULT_LIMIT);
-    if limit == 0 { return Err(InvalidAddress); }
-    Ok(ResolvedListReadOptions { cursor: options.cursor, order: options.order.unwrap_or(ScanOrder::Asc), limit: limit.min(LIST_READ_MAX_LIMIT) })
+    if limit == 0 {
+        return Err(InvalidAddress);
+    }
+    Ok(ResolvedListReadOptions {
+        cursor: options.cursor,
+        order: options.order.unwrap_or(ScanOrder::Asc),
+        limit: limit.min(LIST_READ_MAX_LIMIT),
+    })
 }
 
 fn address<T>(namespace: &'static str, key: impl Into<Cow<'static, str>>) -> Value<T> {
-    Value { namespace, key: key.into(), _marker: PhantomData }
+    Value {
+        namespace,
+        key: key.into(),
+        _marker: PhantomData,
+    }
 }
 fn list_address<T>(namespace: &'static str, key: impl Into<Cow<'static, str>>) -> ValueList<T> {
-    ValueList { namespace, key: key.into(), _marker: PhantomData }
+    ValueList {
+        namespace,
+        key: key.into(),
+        _marker: PhantomData,
+    }
 }
 
 /// The frozen `pi.*` address helpers below name one durable slot each, so no
@@ -231,59 +307,120 @@ fn list_address<T>(namespace: &'static str, key: impl Into<Cow<'static, str>>) -
 /// identifier strings, so construction cannot fail and these helpers unwrap.
 /// Current tip entry of one branch lane, or `None` when the lane is empty.
 #[must_use]
-pub fn branch_tip(branch: &str) -> Value<Option<EntryId>> { address("pi.branch.tip", branch.to_owned()) }
+pub fn branch_tip(branch: &str) -> Value<Option<EntryId>> {
+    address("pi.branch.tip", branch.to_owned())
+}
 /// Empty-key prefix over `pi.branch.tip`, for scanning which branch lanes exist.
 #[must_use]
-pub fn branch_tip_inventory_prefix() -> Value<Option<EntryId>> { address("pi.branch.tip", "") }
+pub fn branch_tip_inventory_prefix() -> Value<Option<EntryId>> {
+    address("pi.branch.tip", "")
+}
 /// Persisted model, thinking level, and active tools of one lane.
 #[must_use]
-pub fn lane_config(lane: &LaneName) -> Value<LaneConfiguration> { address("pi.lane.config", lane.as_str().to_owned()) }
+pub fn lane_config(lane: &LaneName) -> Value<LaneConfiguration> {
+    address("pi.lane.config", lane.as_str().to_owned())
+}
 /// Persisted current/last operation ids and inbox of one lane.
 #[must_use]
-pub fn lane_state(lane: &LaneName) -> Value<super::LaneState> { address("pi.lane.state", lane.as_str().to_owned()) }
+pub fn lane_state(lane: &LaneName) -> Value<super::LaneState> {
+    address("pi.lane.state", lane.as_str().to_owned())
+}
 /// Recorded outcome of a completed operation, replayed instead of re-run.
 #[must_use]
-pub fn operation_result(op: &OperationId) -> Value<OperationResultRecord> { address("pi.result", op.as_str().to_owned()) }
+pub fn operation_result(op: &OperationId) -> Value<OperationResultRecord> {
+    address("pi.result", op.as_str().to_owned())
+}
 /// Operation identity and request metadata.
 #[must_use]
-pub fn operation_meta(op: &OperationId) -> Value<OperationMeta> { address("pi.op.meta", op.as_str().to_owned()) }
+pub fn operation_meta(op: &OperationId) -> Value<OperationMeta> {
+    address("pi.op.meta", op.as_str().to_owned())
+}
 /// Normalized state-machine record of one operation.
 #[must_use]
-pub fn operation_state(op: &OperationId) -> Value<OperationState> { address("pi.op.state", op.as_str().to_owned()) }
+pub fn operation_state(op: &OperationId) -> Value<OperationState> {
+    address("pi.op.state", op.as_str().to_owned())
+}
 /// Resolved arguments of one tool call, keyed by operation, step, and source index.
 #[must_use]
-pub fn operation_tool_args(op: &OperationId, step: &str, source_index: u32) -> Value<serde_json::Map<String, serde_json::Value>> { address("pi.op.tool_args", format!("{op}:{step}:{source_index}")) }
+pub fn operation_tool_args(
+    op: &OperationId,
+    step: &str,
+    source_index: u32,
+) -> Value<serde_json::Map<String, serde_json::Value>> {
+    address("pi.op.tool_args", format!("{op}:{step}:{source_index}"))
+}
 /// Memoized tool output of one invocation, keyed by operation, invocation entry, and tool name.
 #[must_use]
-pub fn operation_tool_memo(op: &OperationId, inv: &EntryId, name: &str) -> Value<serde_json::Value> { address("pi.op.tool_memo", format!("{op}:{inv}:{name}")) }
+pub fn operation_tool_memo(
+    op: &OperationId,
+    inv: &EntryId,
+    name: &str,
+) -> Value<serde_json::Value> {
+    address("pi.op.tool_memo", format!("{op}:{inv}:{name}"))
+}
 /// Structural preparation captured for one named task of an operation.
 #[must_use]
-pub fn operation_preparation(op: &OperationId, task: &str) -> Value<DurableStructuralPreparation> { address("pi.op.preparation", format!("{op}:{task}")) }
+pub fn operation_preparation(op: &OperationId, task: &str) -> Value<DurableStructuralPreparation> {
+    address("pi.op.preparation", format!("{op}:{task}"))
+}
 /// Prefix over [`operation_tool_args`], narrowed to one step when given.
 #[must_use]
-pub fn operation_tool_args_prefix(op: &OperationId, step: Option<&str>) -> Value<serde_json::Map<String, serde_json::Value>> { address("pi.op.tool_args", step.map_or_else(|| format!("{op}:"), |s| format!("{op}:{s}:"))) }
+pub fn operation_tool_args_prefix(
+    op: &OperationId,
+    step: Option<&str>,
+) -> Value<serde_json::Map<String, serde_json::Value>> {
+    address(
+        "pi.op.tool_args",
+        step.map_or_else(|| format!("{op}:"), |s| format!("{op}:{s}:")),
+    )
+}
 /// Prefix over [`operation_tool_memo`], narrowed to one invocation when given.
 #[must_use]
-pub fn operation_tool_memo_prefix(op: &OperationId, inv: Option<&EntryId>) -> Value<serde_json::Value> { address("pi.op.tool_memo", inv.map_or_else(|| format!("{op}:"), |i| format!("{op}:{i}:"))) }
+pub fn operation_tool_memo_prefix(
+    op: &OperationId,
+    inv: Option<&EntryId>,
+) -> Value<serde_json::Value> {
+    address(
+        "pi.op.tool_memo",
+        inv.map_or_else(|| format!("{op}:"), |i| format!("{op}:{i}:")),
+    )
+}
 /// Prefix over [`operation_preparation`] for one operation.
 #[must_use]
-pub fn operation_preparation_prefix(op: &OperationId) -> Value<DurableStructuralPreparation> { address("pi.op.preparation", format!("{op}:")) }
+pub fn operation_preparation_prefix(op: &OperationId) -> Value<DurableStructuralPreparation> {
+    address("pi.op.preparation", format!("{op}:"))
+}
 /// Entry body staged under one entry id before it is committed.
 #[must_use]
-pub fn pending_entry(entry: &EntryId) -> Value<PendingEntry> { address("pi.pending.entry", entry.as_str().to_owned()) }
+pub fn pending_entry(entry: &EntryId) -> Value<PendingEntry> {
+    address("pi.pending.entry", entry.as_str().to_owned())
+}
 /// Tool output staged for one invocation before its entry commits.
 #[must_use]
-pub fn pending_tool_output(op: &OperationId, inv: &EntryId) -> Value<AgentToolResult> { address("pi.pending.tool_output", format!("{op}:{inv}")) }
+pub fn pending_tool_output(op: &OperationId, inv: &EntryId) -> Value<AgentToolResult> {
+    address("pi.pending.tool_output", format!("{op}:{inv}"))
+}
 /// Prefix over [`pending_tool_output`] for one operation.
 #[must_use]
-pub fn pending_tool_output_prefix(op: &OperationId) -> Value<AgentToolResult> { address("pi.pending.tool_output", format!("{op}:")) }
+pub fn pending_tool_output_prefix(op: &OperationId) -> Value<AgentToolResult> {
+    address("pi.pending.tool_output", format!("{op}:"))
+}
 /// Assistant reply frames staged for one response, so a resumed run can continue
 /// mid-stream instead of re-requesting it.
 #[must_use]
-pub fn pending_assistant_frames(op: &OperationId, response: &EntryId) -> ValueList<pi_ai::AssistantMessageFrame> { list_address("pi.pending.assistant_frame", format!("{op}:{response}")) }
+pub fn pending_assistant_frames(
+    op: &OperationId,
+    response: &EntryId,
+) -> ValueList<pi_ai::AssistantMessageFrame> {
+    list_address("pi.pending.assistant_frame", format!("{op}:{response}"))
+}
 /// Human-visible session name; the singleton key is empty.
 #[must_use]
-pub fn session_name() -> Value<String> { address("pi.session.name", "") }
+pub fn session_name() -> Value<String> {
+    address("pi.session.name", "")
+}
 /// Human-visible label attached to one entry.
 #[must_use]
-pub fn entry_label(entry: &EntryId) -> Value<String> { address("pi.entry.label", entry.as_str().to_owned()) }
+pub fn entry_label(entry: &EntryId) -> Value<String> {
+    address("pi.entry.label", entry.as_str().to_owned())
+}

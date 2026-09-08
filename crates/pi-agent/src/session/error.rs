@@ -55,7 +55,9 @@ impl std::fmt::Display for StorageFailure {
 
 impl Error for StorageFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source.as_ref().map(|source| source.as_ref() as &(dyn Error + 'static))
+        self.source
+            .as_ref()
+            .map(|source| source.as_ref() as &(dyn Error + 'static))
     }
 }
 
@@ -63,7 +65,11 @@ impl StorageFailure {
     /// Builds a failure with no underlying cause.
     #[must_use]
     pub fn new(code: StorageErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), source: None }
+        Self {
+            code,
+            message: message.into(),
+            source: None,
+        }
     }
 }
 
@@ -84,12 +90,20 @@ pub enum StorageErrorCode {
     /// `"closed"` — the session or repository was already closed.
     Closed,
     /// `"aborted"` — the operation's cancellation token fired mid-call.
-    Aborted
+    Aborted,
 }
 
 impl std::fmt::Display for StorageErrorCode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self { Self::NotFound => "not_found", Self::InvalidHeader => "invalid_header", Self::VersionMismatch => "version_mismatch", Self::Corrupt => "corrupt", Self::Io => "io", Self::Closed => "closed", Self::Aborted => "aborted" };
+        let name = match self {
+            Self::NotFound => "not_found",
+            Self::InvalidHeader => "invalid_header",
+            Self::VersionMismatch => "version_mismatch",
+            Self::Corrupt => "corrupt",
+            Self::Io => "io",
+            Self::Closed => "closed",
+            Self::Aborted => "aborted",
+        };
         formatter.write_str(name)
     }
 }

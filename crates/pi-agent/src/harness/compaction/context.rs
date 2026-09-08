@@ -101,7 +101,10 @@ pub fn session_entry_to_context_messages(entry: &Entry) -> Vec<AgentMessage> {
     }
 }
 
-#[expect(clippy::panic, reason = "test assertions use let-else panic for irrecoverable fixture mismatch")]
+#[expect(
+    clippy::panic,
+    reason = "test assertions use let-else panic for irrecoverable fixture mismatch"
+)]
 #[cfg(test)]
 mod tests {
     use super::*;

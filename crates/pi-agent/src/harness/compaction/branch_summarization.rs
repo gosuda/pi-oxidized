@@ -11,21 +11,23 @@ use serde_json::Value;
 use crate::context::Context;
 use crate::message::AgentMessage;
 use crate::session::{
-    Branch, BranchScan, DurableStructuralPreparation, Entry, EntryId, HarnessRetryPolicy, ScanOrder,
-    Session, SessionError,
+    Branch, BranchScan, DurableStructuralPreparation, Entry, EntryId, HarnessRetryPolicy,
+    ScanOrder, Session, SessionError,
 };
 
-use crate::harness::api::HarnessModels;
-use crate::harness::hooks::BranchSummaryResult;
-use super::messages::{create_branch_summary_message, create_compaction_summary_message, summary_user_message};
+use super::messages::{
+    create_branch_summary_message, create_compaction_summary_message, summary_user_message,
+};
 use super::utils::{
     FileLists, FileOperations, compute_file_lists, extract_file_ops_from_message,
     format_file_operations, serialize_conversation,
 };
 use super::{
-    SummaryRequest, SummaryRetryCallbacks, SUMMARIZATION_SYSTEM_PROMPT,
+    SUMMARIZATION_SYSTEM_PROMPT, SummaryRequest, SummaryRetryCallbacks,
     complete_simple_with_retries, create_summary_request_options, estimate_tokens,
 };
+use crate::harness::api::HarnessModels;
+use crate::harness::hooks::BranchSummaryResult;
 
 /// Stable branch-summary error categories.
 #[derive(Debug, thiserror::Error)]
@@ -192,10 +194,9 @@ pub async fn collect_entries_for_branch_summary(
         if common_ancestor_id.as_ref() == Some(&id) {
             break;
         }
-        let entry = session
-            .get_entry(&id, cx)
-            .await?
-            .ok_or_else(|| SessionError::Invariant(format!("Corrupt session: entry {id} not found")))?;
+        let entry = session.get_entry(&id, cx).await?.ok_or_else(|| {
+            SessionError::Invariant(format!("Corrupt session: entry {id} not found"))
+        })?;
         current = entry.parent_id().cloned();
         entries.push(entry);
     }
@@ -242,8 +243,10 @@ pub fn prepare_branch_entries(entries: &[Entry], token_budget: u64) -> BranchPre
         extract_file_ops_from_message(&message, &mut file_ops);
         let tokens = estimate_tokens(&message);
         if token_budget > 0 && total_tokens.saturating_add(tokens) > token_budget {
-            if matches!(entry, Entry::Compaction { .. } | Entry::BranchSummary { .. })
-                && total_tokens.saturating_mul(10) < token_budget.saturating_mul(9)
+            if matches!(
+                entry,
+                Entry::Compaction { .. } | Entry::BranchSummary { .. }
+            ) && total_tokens.saturating_mul(10) < token_budget.saturating_mul(9)
             {
                 selected_reverse.push(message);
                 total_tokens = total_tokens.saturating_add(tokens);
@@ -309,7 +312,8 @@ pub async fn generate_branch_summary(
     let reserve_tokens = options
         .reserve_tokens
         .unwrap_or(DEFAULT_BRANCH_RESERVE_TOKENS);
-    let preparation = prepare_branch_entries(entries, context_window.saturating_sub(reserve_tokens));
+    let preparation =
+        prepare_branch_entries(entries, context_window.saturating_sub(reserve_tokens));
     let models = Arc::clone(&options.models);
     let model = options.model.clone();
     let retry = options.retry;
@@ -366,20 +370,20 @@ pub async fn generate_branch_summary_with_request(
             modified_files: Vec::new(),
         });
     }
-    let conversation_text = serialize_conversation(&super::messages::convert_to_llm(
-        &preparation.messages,
-    ));
+    let conversation_text =
+        serialize_conversation(&super::messages::convert_to_llm(&preparation.messages));
     let instructions = match (
         options.replace_instructions,
-        options.custom_instructions.as_deref().filter(|custom| !custom.is_empty()),
+        options
+            .custom_instructions
+            .as_deref()
+            .filter(|custom| !custom.is_empty()),
     ) {
         (true, Some(custom)) => custom.to_owned(),
         (_, Some(custom)) => format!("{BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: {custom}"),
         _ => BRANCH_SUMMARY_PROMPT.to_owned(),
     };
-    let prompt = format!(
-        "<conversation>\n{conversation_text}\n</conversation>\n\n{instructions}"
-    );
+    let prompt = format!("<conversation>\n{conversation_text}\n</conversation>\n\n{instructions}");
     let response = request(
         AiContext {
             system_prompt: Some(SUMMARIZATION_SYSTEM_PROMPT.to_owned()),

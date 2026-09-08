@@ -1666,7 +1666,12 @@ mod tests {
                 Map::from_iter([("path".into(), Value::String("x".into()))]),
             )),
         ];
-        assert!(estimate_tokens(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(asst))))) > 0);
+        assert!(
+            estimate_tokens(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                asst
+            )))))
+                > 0
+        );
 
         assert!(estimate_tokens(&tool_result_msg("result text")) > 0);
         assert!(estimate_tokens(&custom_msg("custom body")) > 0);

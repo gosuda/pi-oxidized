@@ -174,8 +174,9 @@ impl ToolUpdateSink {
 }
 
 /// Source for a turn-scoped typed tool context.
-pub type ToolContextSource =
-    Arc<dyn Fn(Context) -> BoxFuture<'static, Result<ToolContextValue, HarnessError>> + Send + Sync>;
+pub type ToolContextSource = Arc<
+    dyn Fn(Context) -> BoxFuture<'static, Result<ToolContextValue, HarnessError>> + Send + Sync,
+>;
 
 /// Erased, shareable tool context value.
 pub type ToolContextValue = Arc<dyn Any + Send + Sync>;

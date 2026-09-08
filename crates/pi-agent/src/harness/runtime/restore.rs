@@ -12,8 +12,8 @@ use crate::session::operation::{Control, Operation, OperationState};
 use crate::session::traits::{Session, SessionReaderExt};
 use crate::session::{LaneName, SessionError};
 
-use crate::harness::result::OpenOperation;
 use super::support::LaneData;
+use crate::harness::result::OpenOperation;
 
 /// A restored lane plus its durable state.
 pub(crate) struct RestoredLane {
@@ -76,14 +76,18 @@ pub(crate) async fn restore_session(
                 .get_value(&operation_meta(operation_id), cx)
                 .await?
                 .ok_or_else(|| {
-                    SessionError::Invariant(format!("lane {name} references missing operation metadata"))
+                    SessionError::Invariant(format!(
+                        "lane {name} references missing operation metadata"
+                    ))
                 })?
                 .value;
             let operation_state = session
                 .get_value(&operation_state(operation_id), cx)
                 .await?
                 .ok_or_else(|| {
-                    SessionError::Invariant(format!("lane {name} references missing operation state"))
+                    SessionError::Invariant(format!(
+                        "lane {name} references missing operation state"
+                    ))
                 })?
                 .value;
             if meta.operation_id != *operation_id || meta.lane != name {
@@ -116,7 +120,10 @@ pub(crate) async fn restore_session(
                 operation_id: operation.meta.operation_id.clone(),
                 kind: operation_kind(&operation.meta.intent),
                 started_at: operation.meta.started_at,
-                aborting: matches!(operation.state.scope().control, Control::CancelRequested { .. }),
+                aborting: matches!(
+                    operation.state.scope().control,
+                    Control::CancelRequested { .. }
+                ),
             });
         }
         lanes.push(RestoredLane { name, data });
@@ -127,8 +134,12 @@ pub(crate) async fn restore_session(
 fn operation_kind(intent: &crate::session::OperationIntent) -> crate::session::OperationKind {
     match intent {
         crate::session::OperationIntent::Run { .. } => crate::session::OperationKind::Run,
-        crate::session::OperationIntent::Compaction { .. } => crate::session::OperationKind::Compaction,
-        crate::session::OperationIntent::Navigation { .. } => crate::session::OperationKind::Navigation,
+        crate::session::OperationIntent::Compaction { .. } => {
+            crate::session::OperationKind::Compaction
+        }
+        crate::session::OperationIntent::Navigation { .. } => {
+            crate::session::OperationKind::Navigation
+        }
     }
 }
 

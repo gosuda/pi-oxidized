@@ -128,7 +128,10 @@ impl ServiceInstanceAddress {
     pub fn into_json(self) -> JsonValue {
         JsonValue::Object(JsObject::from([
             (key("key"), JsonValue::String(self.key)),
-            (key("generation"), JsonValue::Number(self.generation.as_f64())),
+            (
+                key("generation"),
+                JsonValue::Number(self.generation.as_f64()),
+            ),
         ]))
     }
 }
@@ -161,7 +164,11 @@ impl<Op: ServiceOp> ServiceMemberSnapshot<Op> {
                 (key("name"), JsonValue::String(name)),
                 (key("kind"), string("method")),
             ])),
-            Self::State { name, sequence, ops } => JsonValue::Object(JsObject::from([
+            Self::State {
+                name,
+                sequence,
+                ops,
+            } => JsonValue::Object(JsObject::from([
                 (key("name"), JsonValue::String(name)),
                 (key("kind"), string("state")),
                 (key("sequence"), JsonValue::Number(sequence.as_f64())),
@@ -191,7 +198,12 @@ impl<Op: ServiceOp> ServiceInstanceSnapshot<Op> {
         }
         object.insert(
             key("members"),
-            JsonValue::Array(self.members.into_iter().map(ServiceMemberSnapshot::into_json).collect()),
+            JsonValue::Array(
+                self.members
+                    .into_iter()
+                    .map(ServiceMemberSnapshot::into_json)
+                    .collect(),
+            ),
         );
         JsonValue::Object(object)
     }
@@ -217,7 +229,12 @@ impl<Op: ServiceOp> ServiceSubscriptionSnapshot<Op> {
             (key("mode"), string(self.mode.as_str())),
             (
                 key("instances"),
-                JsonValue::Array(self.instances.into_iter().map(ServiceInstanceSnapshot::into_json).collect()),
+                JsonValue::Array(
+                    self.instances
+                        .into_iter()
+                        .map(ServiceInstanceSnapshot::into_json)
+                        .collect(),
+                ),
             ),
         ]))
     }
@@ -279,7 +296,9 @@ impl<Op: ServiceOp> ServiceProviderUpdate<Op> {
                 }
                 JsonValue::Object(object)
             }
-            Self::Unavailable => JsonValue::Object(JsObject::from([(key("type"), string("unavailable"))])),
+            Self::Unavailable => {
+                JsonValue::Object(JsObject::from([(key("type"), string("unavailable"))]))
+            }
             Self::Replaced { snapshot } => JsonValue::Object(JsObject::from([
                 (key("type"), string("replaced")),
                 (key("snapshot"), snapshot.into_json()),
@@ -467,7 +486,12 @@ pub fn decode_service_control_call(call: &ServiceCall) -> Option<ServiceControlC
 pub fn parse_service_call(value: &JsonValue) -> Result<ServiceCall, WireError> {
     const DESCRIPTION: &str = "service call";
     let call = record(value, DESCRIPTION)?;
-    assert_keys(call, &["serviceId", "member", "args"], &["instance"], DESCRIPTION)?;
+    assert_keys(
+        call,
+        &["serviceId", "member", "args"],
+        &["instance"],
+        DESCRIPTION,
+    )?;
     let (Some(service_id), Some(member), Some(args)) = (
         id_field(call, "serviceId"),
         id_field(call, "member"),
@@ -538,7 +562,9 @@ pub fn parse_service_subscription_snapshot(
 ///
 /// Returns `WireError::Invalid` for a malformed snapshot envelope or
 /// `WireError::Delta` if an operation batch is rejected.
-pub fn parse_wire_service_subscription_snapshot(value: &JsonValue) -> Result<WireServiceSubscriptionSnapshot, WireError> {
+pub fn parse_wire_service_subscription_snapshot(
+    value: &JsonValue,
+) -> Result<WireServiceSubscriptionSnapshot, WireError> {
     parse_subscription_snapshot::<WireOp>(value)
 }
 
@@ -549,7 +575,9 @@ pub fn parse_wire_service_subscription_snapshot(value: &JsonValue) -> Result<Wir
 ///
 /// Returns `WireError::Invalid` for a malformed update or `WireError::Delta`
 /// if an operation batch is rejected.
-pub fn parse_service_provider_update(value: &JsonValue) -> Result<ServiceProviderUpdate<DeltaOp>, WireError> {
+pub fn parse_service_provider_update(
+    value: &JsonValue,
+) -> Result<ServiceProviderUpdate<DeltaOp>, WireError> {
     parse_provider_update::<DeltaOp>(value)
 }
 
@@ -559,7 +587,9 @@ pub fn parse_service_provider_update(value: &JsonValue) -> Result<ServiceProvide
 ///
 /// Returns `WireError::Invalid` for a malformed update or `WireError::Delta`
 /// if an operation batch is rejected.
-pub fn parse_wire_service_provider_update(value: &JsonValue) -> Result<WireServiceProviderUpdate, WireError> {
+pub fn parse_wire_service_provider_update(
+    value: &JsonValue,
+) -> Result<WireServiceProviderUpdate, WireError> {
     parse_provider_update::<WireOp>(value)
 }
 
@@ -568,7 +598,12 @@ fn parse_subscription_snapshot<Op: ServiceOp>(
 ) -> Result<ServiceSubscriptionSnapshot<Op>, WireError> {
     const DESCRIPTION: &str = "service subscription snapshot";
     let snapshot = record(value, DESCRIPTION)?;
-    assert_keys(snapshot, &["serviceId", "mode", "instances"], &[], DESCRIPTION)?;
+    assert_keys(
+        snapshot,
+        &["serviceId", "mode", "instances"],
+        &[],
+        DESCRIPTION,
+    )?;
     let Some(service_id) = id_field(snapshot, "serviceId") else {
         return Err(invalid(DESCRIPTION));
     };
@@ -589,13 +624,20 @@ fn parse_subscription_snapshot<Op: ServiceOp>(
     })
 }
 
-fn parse_provider_update<Op: ServiceOp>(value: &JsonValue) -> Result<ServiceProviderUpdate<Op>, WireError> {
+fn parse_provider_update<Op: ServiceOp>(
+    value: &JsonValue,
+) -> Result<ServiceProviderUpdate<Op>, WireError> {
     let update = record(value, "service provider update")?;
     let Some(JsonValue::String(kind)) = field(update, "type") else {
         return Err(invalid("service provider update"));
     };
     if same_text(kind, "state") {
-        assert_keys(update, &["type", "member", "sequence", "ops"], &["instance"], "state update")?;
+        assert_keys(
+            update,
+            &["type", "member", "sequence", "ops"],
+            &["instance"],
+            "state update",
+        )?;
         let Some(member) = id_field(update, "member") else {
             return Err(invalid("service state update"));
         };
@@ -637,7 +679,9 @@ fn parse_provider_update<Op: ServiceOp>(value: &JsonValue) -> Result<ServiceProv
     }
 }
 
-fn parse_instance<Op: ServiceOp>(value: &JsonValue) -> Result<ServiceInstanceSnapshot<Op>, WireError> {
+fn parse_instance<Op: ServiceOp>(
+    value: &JsonValue,
+) -> Result<ServiceInstanceSnapshot<Op>, WireError> {
     const DESCRIPTION: &str = "service instance snapshot";
     let instance = record(value, DESCRIPTION)?;
     assert_keys(instance, &["members"], &["instance"], DESCRIPTION)?;
@@ -669,7 +713,12 @@ fn parse_member<Op: ServiceOp>(value: &JsonValue) -> Result<ServiceMemberSnapsho
         Ok(ServiceMemberSnapshot::Method { name: name.clone() })
     } else if same_text(kind, "state") {
         const DESCRIPTION: &str = "service state snapshot";
-        assert_keys(member, &["name", "kind", "sequence", "ops"], &[], DESCRIPTION)?;
+        assert_keys(
+            member,
+            &["name", "kind", "sequence", "ops"],
+            &[],
+            DESCRIPTION,
+        )?;
         let Some(name) = id_field(member, "name") else {
             return Err(invalid(DESCRIPTION));
         };
@@ -755,7 +804,11 @@ fn field<'a>(map: &'a JsObject, key: &str) -> Option<&'a JsonValue> {
         .find_map(|(name, value)| same_text(name, key).then_some(value))
 }
 
-fn required_field<'a>(map: &'a JsObject, key: &str, description: &'static str) -> Result<&'a JsonValue, WireError> {
+fn required_field<'a>(
+    map: &'a JsObject,
+    key: &str,
+    description: &'static str,
+) -> Result<&'a JsonValue, WireError> {
     field(map, key).ok_or_else(|| invalid(description))
 }
 
@@ -799,7 +852,11 @@ fn optional_address(map: &JsObject) -> Result<Option<ServiceInstanceAddress>, Wi
 /// admitted, including values beyond `2^53` or `u64::MAX`.  There is no
 /// magnitude cap at this boundary; the remote transport applies its own
 /// stricter limit before bytes cross the wire.
-fn integer_value(value: &JsonValue, minimum: f64, description: &'static str) -> Result<JsInteger, WireError> {
+fn integer_value(
+    value: &JsonValue,
+    minimum: f64,
+    description: &'static str,
+) -> Result<JsInteger, WireError> {
     let JsonValue::Number(number) = value else {
         return Err(invalid(description));
     };
@@ -809,7 +866,12 @@ fn integer_value(value: &JsonValue, minimum: f64, description: &'static str) -> 
     JsInteger::new(*number).map_err(|_| invalid(description))
 }
 
-fn integer_field(map: &JsObject, key: &str, minimum: f64, description: &'static str) -> Result<JsInteger, WireError> {
+fn integer_field(
+    map: &JsObject,
+    key: &str,
+    minimum: f64,
+    description: &'static str,
+) -> Result<JsInteger, WireError> {
     match field(map, key) {
         Some(value) => integer_value(value, minimum, description),
         None => Err(invalid(description)),
@@ -864,10 +926,15 @@ mod tests {
         let subscribe = create_service_subscribe_call("sub-1", "chat", ServiceMode::Keyed);
         assert_eq!(
             subscribe.clone().into_json(),
-            json(r#"{"serviceId":"$chord.service","member":"subscribe","args":["sub-1","chat","keyed"]}"#),
+            json(
+                r#"{"serviceId":"$chord.service","member":"subscribe","args":["sub-1","chat","keyed"]}"#
+            ),
         );
         // `instance` is absent, never null.
-        assert_eq!(object_field(&subscribe.clone().into_json(), "instance"), None);
+        assert_eq!(
+            object_field(&subscribe.clone().into_json(), "instance"),
+            None
+        );
         assert_eq!(
             decode_service_control_call(&subscribe),
             Some(ServiceControlCall::Subscribe {
@@ -887,7 +954,9 @@ mod tests {
             })
         );
 
-        let control = |instance: Option<ServiceInstanceAddress>, member: &str, args: Vec<JsonValue>| ServiceCall {
+        let control = |instance: Option<ServiceInstanceAddress>,
+                       member: &str,
+                       args: Vec<JsonValue>| ServiceCall {
             service_id: JsString::from_utf8(SERVICE_CONTROL_ID),
             instance,
             member: JsString::from_utf8(member),
@@ -898,7 +967,11 @@ mod tests {
             generation: integer(1.0),
         });
         assert_eq!(
-            decode_service_control_call(&control(addressed.clone(), SERVICE_CATALOGUE_MEMBER, vec![])),
+            decode_service_control_call(&control(
+                addressed.clone(),
+                SERVICE_CATALOGUE_MEMBER,
+                vec![]
+            )),
             None
         );
         assert_eq!(
@@ -956,10 +1029,13 @@ mod tests {
         // The parsed call re-encodes to the identical tree, address included.
         assert_eq!(
             call.clone().into_json(),
-            json(r#"{"serviceId":"chat","member":"post","instance":{"key":"room","generation":2},"args":[{"text":"hi"}]}"#),
+            json(
+                r#"{"serviceId":"chat","member":"post","instance":{"key":"room","generation":2},"args":[{"text":"hi"}]}"#
+            ),
         );
 
-        let bare = parse_service_call(&json(r#"{"serviceId":"chat","member":"post","args":[]}"#)).expect("bare call");
+        let bare = parse_service_call(&json(r#"{"serviceId":"chat","member":"post","args":[]}"#))
+            .expect("bare call");
         assert_eq!(bare.instance, None);
         // Absence round-trips as absence: no `instance` key is emitted.
         assert_eq!(
@@ -967,7 +1043,8 @@ mod tests {
             json(r#"{"serviceId":"chat","member":"post","args":[]}"#),
         );
 
-        let null_instance = json(r#"{"serviceId":"chat","member":"post","args":[],"instance":null}"#);
+        let null_instance =
+            json(r#"{"serviceId":"chat","member":"post","args":[],"instance":null}"#);
         assert_eq!(
             parse_service_call(&null_instance).expect_err("null instance is not omission"),
             WireError::Invalid {
@@ -1074,8 +1151,9 @@ mod tests {
                 },
             ]
         );
-        let duplicate =
-            json(r#"[{"serviceId":"chat","mode":"singleton"},{"serviceId":"chat","mode":"keyed"}]"#);
+        let duplicate = json(
+            r#"[{"serviceId":"chat","mode":"singleton"},{"serviceId":"chat","mode":"keyed"}]"#,
+        );
         assert_eq!(
             parse_service_catalogue(&duplicate).expect_err("duplicate id"),
             WireError::Invalid {
@@ -1103,11 +1181,14 @@ mod tests {
         let wire_only = json(
             r##"{"serviceId":"chat","mode":"singleton","instances":[{"members":[{"kind":"state","name":"text","sequence":1,"ops":[["#",0,["a"]],["a",0,"x"]]}]}]}"##,
         );
-        let wire_snapshot = parse_wire_service_subscription_snapshot(&wire_only).expect("wire domain");
+        let wire_snapshot =
+            parse_wire_service_subscription_snapshot(&wire_only).expect("wire domain");
         // The wire member re-encodes to the identical tree.
         assert_eq!(
             wire_snapshot.instances[0].members[0].clone().into_json(),
-            json(r##"{"kind":"state","name":"text","sequence":1,"ops":[["#",0,["a"]],["a",0,"x"]]}"##),
+            json(
+                r##"{"kind":"state","name":"text","sequence":1,"ops":[["#",0,["a"]],["a",0,"x"]]}"##
+            ),
         );
         assert!(parse_service_subscription_snapshot(&wire_only).is_err());
 
@@ -1158,11 +1239,14 @@ mod tests {
         // The parsed update re-encodes to the identical tree.
         assert_eq!(
             state.clone().into_json(),
-            json(r#"{"type":"state","instance":{"key":"room","generation":1},"member":"counter","sequence":4,"ops":[["s",["count"],7]]}"#),
+            json(
+                r#"{"type":"state","instance":{"key":"room","generation":1},"member":"counter","sequence":4,"ops":[["s",["count"],7]]}"#
+            ),
         );
 
         assert_eq!(
-            parse_wire_service_provider_update(&json(r#"{"type":"unavailable"}"#)).expect("unavailable"),
+            parse_wire_service_provider_update(&json(r#"{"type":"unavailable"}"#))
+                .expect("unavailable"),
             WireServiceProviderUpdate::Unavailable
         );
         let replaced = parse_wire_service_provider_update(&json(
@@ -1184,8 +1268,10 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_wire_service_provider_update(&json(r#"{"type":"spawned","instance":{"members":[]}}"#))
-                .expect("spawned"),
+            parse_wire_service_provider_update(&json(
+                r#"{"type":"spawned","instance":{"members":[]}}"#
+            ))
+            .expect("spawned"),
             WireServiceProviderUpdate::Spawned {
                 instance: ServiceInstanceSnapshot {
                     instance: None,
@@ -1230,13 +1316,15 @@ mod tests {
         };
         assert!(parse_wire_service_provider_update(&state_update("1")).is_ok());
         assert_eq!(
-            parse_wire_service_provider_update(&state_update("0")).expect_err("update sequence starts at one"),
+            parse_wire_service_provider_update(&state_update("0"))
+                .expect_err("update sequence starts at one"),
             WireError::Invalid {
                 description: "service state update",
             }
         );
         assert_eq!(
-            parse_wire_service_provider_update(&state_update("1.5")).expect_err("fractional sequence"),
+            parse_wire_service_provider_update(&state_update("1.5"))
+                .expect_err("fractional sequence"),
             WireError::Invalid {
                 description: "service state update",
             }
@@ -1248,7 +1336,8 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_wire_service_provider_update(&state_update("\"4\"")).expect_err("string sequence"),
+            parse_wire_service_provider_update(&state_update("\"4\""))
+                .expect_err("string sequence"),
             WireError::Invalid {
                 description: "service state update",
             }
@@ -1277,7 +1366,8 @@ mod tests {
         );
         let negative_zero = parse_service_subscription_snapshot(&member_negative_zero)
             .expect("negative zero is a source-admitted member sequence");
-        let ServiceMemberSnapshot::State { sequence, .. } = &negative_zero.instances[0].members[0] else {
+        let ServiceMemberSnapshot::State { sequence, .. } = &negative_zero.instances[0].members[0]
+        else {
             panic!("state member");
         };
         assert!(sequence.as_f64().is_sign_negative());
@@ -1285,7 +1375,8 @@ mod tests {
             r#"{"serviceId":"chat","mode":"singleton","instances":[{"members":[{"kind":"state","name":"text","sequence":0.5,"ops":[]}]}]}"#,
         );
         assert_eq!(
-            parse_service_subscription_snapshot(&member_fractional).expect_err("fractional member sequence"),
+            parse_service_subscription_snapshot(&member_fractional)
+                .expect_err("fractional member sequence"),
             WireError::Invalid {
                 description: "service state snapshot",
             }
@@ -1295,7 +1386,8 @@ mod tests {
         let huge_generation = json(
             r#"{"serviceId":"chat","member":"post","args":[],"instance":{"key":"room","generation":18446744073709551616}}"#,
         );
-        let call = parse_service_call(&huge_generation).expect("2^64 generation is source-admitted");
+        let call =
+            parse_service_call(&huge_generation).expect("2^64 generation is source-admitted");
         assert_eq!(
             call.instance,
             Some(ServiceInstanceAddress {

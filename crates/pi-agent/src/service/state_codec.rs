@@ -15,16 +15,19 @@
 //! sequences are [`JsInteger`], so source-admitted UTF-16 and unbounded
 //! integral doubles behave exactly as they do for a JavaScript replica.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use thiserror::Error;
 
-use super::delta::{apply_immutable, is_base, DeltaDecoder, DeltaEncoder, DeltaError, DeltaOp, WireOp};
-use super::value::{js_number_to_string, JsInteger, JsString, JsonValue};
+use super::delta::{
+    DeltaDecoder, DeltaEncoder, DeltaError, DeltaOp, WireOp, apply_immutable, is_base,
+};
+use super::value::{JsInteger, JsString, JsonValue, js_number_to_string};
 use super::wire::{
     ServiceInstanceAddress, ServiceInstanceSnapshot, ServiceMemberSnapshot, ServiceProviderUpdate,
-    ServiceSubscriptionSnapshot, WireServiceInstanceSnapshot, WireServiceProviderUpdate, WireServiceSubscriptionSnapshot,
+    ServiceSubscriptionSnapshot, WireServiceInstanceSnapshot, WireServiceProviderUpdate,
+    WireServiceSubscriptionSnapshot,
 };
 
 /// A stateful operation encoder for every replicated state in one service
@@ -90,13 +93,19 @@ impl<C: Default> StateCodecRegistry<C> {
     ) -> Result<&mut C, ServiceCodecError> {
         let key = (instance.cloned(), member.clone());
         match self.entries.entry(key) {
-            Entry::Occupied(_) => Err(ServiceCodecError::DuplicateServiceState(describe_state(instance, member))),
+            Entry::Occupied(_) => Err(ServiceCodecError::DuplicateServiceState(describe_state(
+                instance, member,
+            ))),
             Entry::Vacant(entry) => Ok(entry.insert(C::default())),
         }
     }
 
     /// Returns the registered codec for one (instance, member) pair.
-    fn get(&mut self, instance: Option<&ServiceInstanceAddress>, member: &JsString) -> Result<&mut C, ServiceCodecError> {
+    fn get(
+        &mut self,
+        instance: Option<&ServiceInstanceAddress>,
+        member: &JsString,
+    ) -> Result<&mut C, ServiceCodecError> {
         let key = (instance.cloned(), member.clone());
         self.entries
             .get_mut(&key)
@@ -294,8 +303,14 @@ fn encode_instance(
     let mut members = Vec::with_capacity(instance.members.len());
     for member in &instance.members {
         members.push(match member {
-            ServiceMemberSnapshot::Method { name } => ServiceMemberSnapshot::Method { name: name.clone() },
-            ServiceMemberSnapshot::State { name, sequence, ops } => ServiceMemberSnapshot::State {
+            ServiceMemberSnapshot::Method { name } => {
+                ServiceMemberSnapshot::Method { name: name.clone() }
+            }
+            ServiceMemberSnapshot::State {
+                name,
+                sequence,
+                ops,
+            } => ServiceMemberSnapshot::State {
                 name: name.clone(),
                 sequence: *sequence,
                 ops: codecs.add(instance.instance.as_ref(), name)?.encode(ops)?,
@@ -315,8 +330,14 @@ fn decode_instance(
     let mut members = Vec::with_capacity(instance.members.len());
     for member in &instance.members {
         members.push(match member {
-            ServiceMemberSnapshot::Method { name } => ServiceMemberSnapshot::Method { name: name.clone() },
-            ServiceMemberSnapshot::State { name, sequence, ops } => ServiceMemberSnapshot::State {
+            ServiceMemberSnapshot::Method { name } => {
+                ServiceMemberSnapshot::Method { name: name.clone() }
+            }
+            ServiceMemberSnapshot::State {
+                name,
+                sequence,
+                ops,
+            } => ServiceMemberSnapshot::State {
                 name: name.clone(),
                 sequence: *sequence,
                 ops: codecs.add(instance.instance.as_ref(), name)?.decode(ops)?,
@@ -383,7 +404,11 @@ impl ReplicatedStateReplica {
     /// Returns `ServiceStateError::NotBaseBatch` if the operation batch does
     /// not begin with a complete replacement, or `ServiceStateError::Delta`
     /// if the applier rejects the batch.
-    pub fn hydrate(&mut self, sequence: JsInteger, ops: &[DeltaOp]) -> Result<(), ServiceStateError> {
+    pub fn hydrate(
+        &mut self,
+        sequence: JsInteger,
+        ops: &[DeltaOp],
+    ) -> Result<(), ServiceStateError> {
         if !is_base(ops) {
             return Err(ServiceStateError::NotBaseBatch);
         }
@@ -400,7 +425,11 @@ impl ReplicatedStateReplica {
     /// not been hydrated, `ServiceStateError::SequenceGap` if the incoming
     /// sequence is not the previous sequence plus one, or
     /// `ServiceStateError::Delta` if the applier rejects the batch.
-    pub fn update(&mut self, sequence: JsInteger, ops: &[DeltaOp]) -> Result<(), ServiceStateError> {
+    pub fn update(
+        &mut self,
+        sequence: JsInteger,
+        ops: &[DeltaOp],
+    ) -> Result<(), ServiceStateError> {
         let (Some(previous), Some(_)) = (self.sequence, self.value.as_ref()) else {
             return Err(ServiceStateError::UpdateBeforeHydration);
         };
@@ -431,8 +460,8 @@ mod tests {
     use crate::service::delta::{PathRef, PathSegment, StatePath};
     use crate::service::value::parse_json;
     use crate::service::wire::{
-        parse_wire_service_provider_update, parse_wire_service_subscription_snapshot, ServiceMode,
-        WireServiceMemberSnapshot,
+        ServiceMode, WireServiceMemberSnapshot, parse_wire_service_provider_update,
+        parse_wire_service_subscription_snapshot,
     };
 
     fn json(text: &str) -> JsonValue {
@@ -498,7 +527,11 @@ mod tests {
         }
     }
 
-    fn counter_instance(key: &str, generation: f64, sequence: f64) -> ServiceInstanceSnapshot<DeltaOp> {
+    fn counter_instance(
+        key: &str,
+        generation: f64,
+        sequence: f64,
+    ) -> ServiceInstanceSnapshot<DeltaOp> {
         ServiceInstanceSnapshot {
             instance: Some(address(key, generation)),
             members: vec![ServiceMemberSnapshot::State {
@@ -512,7 +545,9 @@ mod tests {
     #[test]
     fn snapshot_round_trips_through_the_wire_grammar() {
         let mut encoder = ServiceStateEncoder::new();
-        let wire = encoder.encode_snapshot(&counter_snapshot()).expect("encode snapshot");
+        let wire = encoder
+            .encode_snapshot(&counter_snapshot())
+            .expect("encode snapshot");
         // First use of a path stays inline; the dictionary only interns on
         // the second use.
         assert_eq!(
@@ -521,7 +556,8 @@ mod tests {
                 r#"{"serviceId":"chat","mode":"singleton","instances":[{"instance":{"key":"room","generation":1},"members":[{"kind":"method","name":"post"},{"kind":"state","name":"counter","sequence":3,"ops":[["s",["count"],5]]}]}]}"#,
             ),
         );
-        let parsed = parse_wire_service_subscription_snapshot(&wire.into_json()).expect("parse wire snapshot");
+        let parsed = parse_wire_service_subscription_snapshot(&wire.into_json())
+            .expect("parse wire snapshot");
         let mut decoder = ServiceStateDecoder::new();
         let round_tripped = decoder.decode_snapshot(&parsed).expect("decode snapshot");
         assert_eq!(round_tripped, counter_snapshot());
@@ -566,9 +602,12 @@ mod tests {
         let mut encoder = ServiceStateEncoder::new();
         encoder.encode_snapshot(&snapshot).expect("snapshot");
         let first = encoder
-            .encode_update(&state_update(Some(address("room", 1.0)), "counter", 4.0, vec![
-                delta_op(r#"["s",["count"],6]"#),
-            ]))
+            .encode_update(&state_update(
+                Some(address("room", 1.0)),
+                "counter",
+                4.0,
+                vec![delta_op(r#"["s",["count"],6]"#)],
+            ))
             .expect("first update");
         // The second use of the "count" path interns it as dictionary id 0.
         assert_eq!(
@@ -577,9 +616,12 @@ mod tests {
         );
         // A different member owns a separate codec, so its path stays inline.
         let other_member = encoder
-            .encode_update(&state_update(Some(address("room", 1.0)), "label", 1.0, vec![
-                delta_op(r#"["s",["x"],1]"#),
-            ]))
+            .encode_update(&state_update(
+                Some(address("room", 1.0)),
+                "label",
+                1.0,
+                vec![delta_op(r#"["s",["x"],1]"#)],
+            ))
             .expect("other member");
         assert_eq!(
             object_field(&other_member.into_json(), "ops"),
@@ -587,9 +629,12 @@ mod tests {
         );
         // The same member name under another instance owns another codec.
         let other_instance = encoder
-            .encode_update(&state_update(Some(address("room", 2.0)), "counter", 1.0, vec![
-                delta_op(r#"["s",["count"],1]"#),
-            ]))
+            .encode_update(&state_update(
+                Some(address("room", 2.0)),
+                "counter",
+                1.0,
+                vec![delta_op(r#"["s",["count"],1]"#)],
+            ))
             .expect("other instance");
         assert_eq!(
             object_field(&other_instance.into_json(), "ops"),
@@ -613,7 +658,9 @@ mod tests {
             }],
         };
         let mut encoder = ServiceStateEncoder::new();
-        encoder.encode_snapshot(&snapshot).expect("register UTF-16 state");
+        encoder
+            .encode_snapshot(&snapshot)
+            .expect("register UTF-16 state");
         let update = ServiceProviderUpdate::State {
             instance: None,
             member,
@@ -631,7 +678,9 @@ mod tests {
     #[test]
     fn unavailable_resets_the_dictionary() {
         let mut encoder = ServiceStateEncoder::new();
-        encoder.encode_snapshot(&counter_snapshot()).expect("snapshot");
+        encoder
+            .encode_snapshot(&counter_snapshot())
+            .expect("snapshot");
         encoder
             .encode_update(&ServiceProviderUpdate::Unavailable)
             .expect("unavailable");
@@ -639,9 +688,12 @@ mod tests {
         // exactly like the source registry.
         assert_eq!(
             encoder
-                .encode_update(&state_update(Some(address("room", 1.0)), "counter", 4.0, vec![
-                    delta_op(r#"["s",["count"],6]"#),
-                ]))
+                .encode_update(&state_update(
+                    Some(address("room", 1.0)),
+                    "counter",
+                    4.0,
+                    vec![delta_op(r#"["s",["count"],6]"#),]
+                ))
                 .expect_err("reset codecs are unknown"),
             ServiceCodecError::UnknownServiceState("room@1.counter".to_owned())
         );
@@ -650,7 +702,9 @@ mod tests {
     #[test]
     fn replaced_resets_and_reregisters() {
         let mut encoder = ServiceStateEncoder::new();
-        encoder.encode_snapshot(&counter_snapshot()).expect("snapshot");
+        encoder
+            .encode_snapshot(&counter_snapshot())
+            .expect("snapshot");
         let snapshot = counter_snapshot();
         let replacement = snapshot.instances.into_iter().next().expect("instance");
         let replaced = encoder
@@ -661,12 +715,17 @@ mod tests {
         let replaced_json = replaced.into_json();
         assert_eq!(
             object_field(object_field(&replaced_json, "snapshot"), "members"),
-            &json(r#"[{"kind":"method","name":"post"},{"kind":"state","name":"counter","sequence":3,"ops":[["s",["count"],5]]}]"#),
+            &json(
+                r#"[{"kind":"method","name":"post"},{"kind":"state","name":"counter","sequence":3,"ops":[["s",["count"],5]]}]"#
+            ),
         );
         let after = encoder
-            .encode_update(&state_update(Some(address("room", 1.0)), "counter", 4.0, vec![
-                delta_op(r#"["s",["count"],6]"#),
-            ]))
+            .encode_update(&state_update(
+                Some(address("room", 1.0)),
+                "counter",
+                4.0,
+                vec![delta_op(r#"["s",["count"],6]"#)],
+            ))
             .expect("state after replaced");
         assert_eq!(
             object_field(&after.into_json(), "ops"),
@@ -677,16 +736,21 @@ mod tests {
     #[test]
     fn spawned_adds_and_closed_removes() {
         let mut encoder = ServiceStateEncoder::new();
-        encoder.encode_snapshot(&counter_snapshot()).expect("snapshot");
+        encoder
+            .encode_snapshot(&counter_snapshot())
+            .expect("snapshot");
         encoder
             .encode_update(&ServiceProviderUpdate::Spawned {
                 instance: counter_instance("lobby", 2.0, 1.0),
             })
             .expect("spawned");
         let lobby = encoder
-            .encode_update(&state_update(Some(address("lobby", 2.0)), "counter", 2.0, vec![
-                delta_op(r#"["s",["count"],2]"#),
-            ]))
+            .encode_update(&state_update(
+                Some(address("lobby", 2.0)),
+                "counter",
+                2.0,
+                vec![delta_op(r#"["s",["count"],2]"#)],
+            ))
             .expect("lobby state");
         assert_eq!(
             object_field(&lobby.into_json(), "ops"),
@@ -699,17 +763,23 @@ mod tests {
             .expect("closed");
         assert_eq!(
             encoder
-                .encode_update(&state_update(Some(address("lobby", 2.0)), "counter", 3.0, vec![
-                    delta_op(r#"["s",["count"],3]"#),
-                ]))
+                .encode_update(&state_update(
+                    Some(address("lobby", 2.0)),
+                    "counter",
+                    3.0,
+                    vec![delta_op(r#"["s",["count"],3]"#),]
+                ))
                 .expect_err("closed codec removed"),
             ServiceCodecError::UnknownServiceState("lobby@2.counter".to_owned())
         );
         // A different instance under the same key keeps its own codec.
         let room = encoder
-            .encode_update(&state_update(Some(address("room", 1.0)), "counter", 4.0, vec![
-                delta_op(r#"["s",["count"],6]"#),
-            ]))
+            .encode_update(&state_update(
+                Some(address("room", 1.0)),
+                "counter",
+                4.0,
+                vec![delta_op(r#"["s",["count"],6]"#)],
+            ))
             .expect("room state survives close");
         assert_eq!(
             object_field(&room.into_json(), "ops"),
@@ -720,7 +790,9 @@ mod tests {
     #[test]
     fn method_members_do_not_touch_the_dictionary() {
         let mut encoder = ServiceStateEncoder::new();
-        encoder.encode_snapshot(&counter_snapshot()).expect("snapshot");
+        encoder
+            .encode_snapshot(&counter_snapshot())
+            .expect("snapshot");
         encoder
             .encode_update(&ServiceProviderUpdate::Spawned {
                 instance: ServiceInstanceSnapshot {
@@ -732,9 +804,12 @@ mod tests {
         // The counter codec survived the method-only spawn untouched, so its
         // path still resolves through the dictionary.
         let after = encoder
-            .encode_update(&state_update(Some(address("room", 1.0)), "counter", 4.0, vec![
-                delta_op(r#"["s",["count"],6]"#),
-            ]))
+            .encode_update(&state_update(
+                Some(address("room", 1.0)),
+                "counter",
+                4.0,
+                vec![delta_op(r#"["s",["count"],6]"#)],
+            ))
             .expect("counter state");
         assert_eq!(
             object_field(&after.into_json(), "ops"),
@@ -765,7 +840,9 @@ mod tests {
             }],
         };
         assert_eq!(
-            encoder.encode_snapshot(&duplicated).expect_err("duplicate member"),
+            encoder
+                .encode_snapshot(&duplicated)
+                .expect_err("duplicate member"),
             ServiceCodecError::DuplicateServiceState("room@1.counter".to_owned())
         );
     }
@@ -774,22 +851,35 @@ mod tests {
     fn decoder_mirrors_dictionary_ownership() {
         let mut encoder = ServiceStateEncoder::new();
         let mut decoder = ServiceStateDecoder::new();
-        let wire_snapshot = encoder.encode_snapshot(&counter_snapshot()).expect("snapshot");
-        let decoded_snapshot = decoder.decode_snapshot(&wire_snapshot).expect("decode snapshot");
+        let wire_snapshot = encoder
+            .encode_snapshot(&counter_snapshot())
+            .expect("snapshot");
+        let decoded_snapshot = decoder
+            .decode_snapshot(&wire_snapshot)
+            .expect("decode snapshot");
         assert_eq!(decoded_snapshot, counter_snapshot());
         let wire_update = encoder
-            .encode_update(&state_update(Some(address("room", 1.0)), "counter", 4.0, vec![
-                delta_op(r#"["s",["count"],6]"#),
-            ]))
+            .encode_update(&state_update(
+                Some(address("room", 1.0)),
+                "counter",
+                4.0,
+                vec![delta_op(r#"["s",["count"],6]"#)],
+            ))
             .expect("encode update");
         let wire_value = wire_update.into_json();
-        let parsed_update = parse_wire_service_provider_update(&wire_value).expect("parse wire update");
-        let decoded_update = decoder.decode_update(&parsed_update).expect("decode update");
+        let parsed_update =
+            parse_wire_service_provider_update(&wire_value).expect("parse wire update");
+        let decoded_update = decoder
+            .decode_update(&parsed_update)
+            .expect("decode update");
         assert_eq!(
             decoded_update,
-            state_update(Some(address("room", 1.0)), "counter", 4.0, vec![
-                delta_op(r#"["s",["count"],6]"#),
-            ])
+            state_update(
+                Some(address("room", 1.0)),
+                "counter",
+                4.0,
+                vec![delta_op(r#"["s",["count"],6]"#),]
+            )
         );
         decoder
             .decode_update(&WireServiceProviderUpdate::Closed {
@@ -797,7 +887,9 @@ mod tests {
             })
             .expect("decode closed");
         assert_eq!(
-            decoder.decode_update(&parsed_update).expect_err("closed codec removed"),
+            decoder
+                .decode_update(&parsed_update)
+                .expect_err("closed codec removed"),
             ServiceCodecError::UnknownServiceState("room@1.counter".to_owned())
         );
         decoder
@@ -807,7 +899,9 @@ mod tests {
                     members: vec![WireServiceMemberSnapshot::State {
                         name: js("counter"),
                         sequence: integer(1.0),
-                        ops: vec![WireOp::from_json(&json(r#"["r",{"count":0}]"#)).expect("wire op")],
+                        ops: vec![
+                            WireOp::from_json(&json(r#"["r",{"count":0}]"#)).expect("wire op"),
+                        ],
                     }],
                 },
             })
@@ -828,9 +922,12 @@ mod tests {
             .expect("decode after spawned");
         assert_eq!(
             hydrated,
-            state_update(Some(address("room", 1.0)), "counter", 2.0, vec![
-                delta_op(r#"["s",["count"],1]"#),
-            ])
+            state_update(
+                Some(address("room", 1.0)),
+                "counter",
+                2.0,
+                vec![delta_op(r#"["s",["count"],1]"#),]
+            )
         );
     }
 

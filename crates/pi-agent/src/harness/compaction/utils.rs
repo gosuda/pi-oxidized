@@ -4,9 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use pi_ai::{
-    AssistantContent, Message, ToolResultContent, UserContent, UserMessageContent,
-};
+use pi_ai::{AssistantContent, Message, ToolResultContent, UserContent, UserMessageContent};
 use serde_json::{Map, Value};
 
 use crate::message::AgentMessage;
@@ -193,10 +191,7 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                     }
                 }
                 if !tool_calls.is_empty() {
-                    parts.push(format!(
-                        "[Assistant tool calls]: {}",
-                        tool_calls.join("; ")
-                    ));
+                    parts.push(format!("[Assistant tool calls]: {}", tool_calls.join("; ")));
                 }
             }
             Message::ToolResult(message) => {
@@ -259,10 +254,7 @@ pub fn user_content_text(content: &UserMessageContent, separator: &str) -> Strin
 
 /// Text from assistant content blocks, with a caller-selected separator.
 #[must_use]
-pub fn assistant_content_text(
-    content: &[AssistantContent],
-    separator: &str,
-) -> String {
+pub fn assistant_content_text(content: &[AssistantContent], separator: &str) -> String {
     content
         .iter()
         .filter_map(|block| match block {

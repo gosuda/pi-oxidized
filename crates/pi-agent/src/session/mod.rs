@@ -6,6 +6,8 @@
 /// Typed `(namespace, key)` addresses for durable session state, plus the
 /// frozen `pi.*` namespace helpers every backend and runtime path shares.
 pub mod address;
+/// Shared session and branch behavior over a storage backend.
+mod backed;
 pub mod configuration;
 /// Committed and not-yet-materialized session entries and their bodies.
 pub mod entry;
@@ -25,8 +27,6 @@ pub mod memory;
 pub mod operation;
 /// Scan, cursor, and raw-read shapes shared by every backend query.
 pub mod scan;
-/// Shared session and branch behavior over a storage backend.
-mod backed;
 /// The backend contract: `Storage`, read/mutation/session/branch traits, and
 /// the session repository.
 pub mod traits;
@@ -35,6 +35,7 @@ pub mod traits;
 pub mod write;
 
 pub use address::*;
+pub use backed::*;
 pub use configuration::*;
 pub use entry::*;
 pub use error::*;
@@ -44,6 +45,5 @@ pub use lane_state::*;
 pub use memory::*;
 pub use operation::*;
 pub use scan::*;
-pub use backed::*;
 pub use traits::*;
 pub use write::*;

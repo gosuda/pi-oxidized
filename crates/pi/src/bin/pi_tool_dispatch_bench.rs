@@ -425,9 +425,9 @@ fn run_block(
     let cpu_before = cpu::cpu_micros(clk_tck);
     for index in 0..calls {
         let message = tool_call_message(index, args);
-        sink.append_assistant(&AgentMessage::Llm(Box::new(Message::Assistant(
-            Box::new(message.clone()),
-        ))));
+        sink.append_assistant(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+            message.clone(),
+        )))));
         let batch = runtime
             .block_on(execute_tool_calls(context, &message, config, cancel, sink))
             .map_err(|error| format!("execute_tool_calls failed: {error}"))?;

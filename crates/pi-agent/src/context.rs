@@ -249,7 +249,9 @@ mod tests {
 
     #[test]
     fn same_type_distinct_names_are_distinct_slots() {
-        let cx = Context::background().with_value(FIRST, 1).with_value(SECOND, 2);
+        let cx = Context::background()
+            .with_value(FIRST, 1)
+            .with_value(SECOND, 2);
         assert_eq!(cx.value(FIRST).as_deref(), Some(&1));
         assert_eq!(cx.value(SECOND).as_deref(), Some(&2));
     }

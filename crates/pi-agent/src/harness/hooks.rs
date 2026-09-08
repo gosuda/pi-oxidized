@@ -11,27 +11,26 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use futures::future::BoxFuture;
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use crate::context::{with_telemetry_context, Context, telemetry_context};
-use crate::message::AgentMessage;
-use crate::telemetry::{
-    AttributeValue, SpanAttributes, SpanOptions, SpanStatus, TelemetryContext,
-    TelemetrySpan, set_attributes_contained,
-    set_status_contained, start_span_contained,
-};
-use crate::session::{
-    CompactionReason, DurableStructuralPreparation, EntryId, HarnessStreamOptions, LaneName,
-    OperationKind, SettledAssistantMessage,
-};
-use super::stream::{
-    HarnessStreamOptionsPatch, apply_stream_options_patch, create_stream_options_patch,
-};
 use super::api::HarnessResources;
 use super::event::{HandlerErrorKind, HarnessEvent, HarnessEventPayload};
 use super::gate::{Gate, GateRejection};
 use super::result::{HarnessError, HarnessFault};
+use super::stream::{
+    HarnessStreamOptionsPatch, apply_stream_options_patch, create_stream_options_patch,
+};
+use crate::context::{Context, telemetry_context, with_telemetry_context};
+use crate::message::AgentMessage;
+use crate::session::{
+    CompactionReason, DurableStructuralPreparation, EntryId, HarnessStreamOptions, LaneName,
+    OperationKind, SettledAssistantMessage,
+};
+use crate::telemetry::{
+    AttributeValue, SpanAttributes, SpanOptions, SpanStatus, TelemetryContext, TelemetrySpan,
+    set_attributes_contained, set_status_contained, start_span_contained,
+};
+use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 /// A handler failure accepted by the hook boundary.
 pub type HookError = Box<dyn Error + Send + Sync + 'static>;
@@ -60,9 +59,8 @@ pub type HookFuture<T> = BoxFuture<'static, Result<T, HookError>>;
 ///
 /// The registry never routes this callback back through itself.  This prevents
 /// a broken error listener from recursively generating more hook errors.
-pub type HookErrorReporter = Arc<dyn Fn(HarnessEvent, Context) -> BoxFuture<'static, ()> + Send + Sync>;
-
-
+pub type HookErrorReporter =
+    Arc<dyn Fn(HarnessEvent, Context) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// A local error used when a structural hook returns incompatible decisions.
 #[derive(Debug, thiserror::Error)]
@@ -871,16 +869,17 @@ impl HookRegistry {
     /// # Errors
     ///
     /// Returns [`HarnessError::Closed`] when the registry is closed.
-    pub fn on<H: Hook>(&self, handler: H::Handler, id: Option<String>) -> Result<Unsubscribe, HarnessError> {
+    pub fn on<H: Hook>(
+        &self,
+        handler: H::Handler,
+        id: Option<String>,
+    ) -> Result<Unsubscribe, HarnessError> {
         let identity = Arc::new(());
-        let erased: Arc<dyn ErasedHookHandler> = Arc::new(TypedHookHandler::<
-            H::Event,
-            H::Result,
-            H::Handler,
-        > {
-            handler,
-            _event: std::marker::PhantomData,
-        });
+        let erased: Arc<dyn ErasedHookHandler> =
+            Arc::new(TypedHookHandler::<H::Event, H::Result, H::Handler> {
+                handler,
+                _event: std::marker::PhantomData,
+            });
         let mut state = self.shared.lock_state();
         if let Some(error) = state.closed.as_ref() {
             return Err(HarnessError::Closed {
@@ -960,7 +959,10 @@ impl HookRegistry {
         E: HookEvent,
         R: Clone + Send + Sync + 'static,
     {
-        let value = registration.handler.invoke(Box::new(event), context.clone()).await?;
+        let value = registration
+            .handler
+            .invoke(Box::new(event), context.clone())
+            .await?;
         value
             .downcast::<R>()
             .map(|result| *result)
@@ -1059,7 +1061,6 @@ impl HookRegistry {
         (self.shared.reporter)(event, context.clone()).await;
     }
 
-
     async fn before_run(
         &self,
         event: BeforeRunEvent,
@@ -1086,7 +1087,10 @@ impl HookRegistry {
                     }
                 }
                 Ok(None) => {}
-                Err(error) => self.report(HookName::BeforeRun, &event, &context, &error).await,
+                Err(error) => {
+                    self.report(HookName::BeforeRun, &event, &context, &error)
+                        .await
+                }
             }
         }
         Ok((!injected.is_empty()).then_some(BeforeRunResult {
@@ -1094,14 +1098,13 @@ impl HookRegistry {
         }))
     }
 
-    async fn before_drive(
-        &self,
-        event: BeforeDriveEvent,
-        context: Context,
-    ) -> HookRunResult<()> {
+    async fn before_drive(&self, event: BeforeDriveEvent, context: Context) -> HookRunResult<()> {
         let registrations = self.registrations::<BeforeDrive>()?;
         for registration in registrations {
-            match self.invoke::<_, ()>(&registration, event.clone(), &context).await {
+            match self
+                .invoke::<_, ()>(&registration, event.clone(), &context)
+                .await
+            {
                 Ok(()) => {}
                 Err(error) => {
                     let message = error.to_string();
@@ -1135,7 +1138,10 @@ impl HookRegistry {
                     }
                 }
                 Ok(None) => {}
-                Err(error) => self.report(HookName::BeforeRunEnd, &event, &context, &error).await,
+                Err(error) => {
+                    self.report(HookName::BeforeRunEnd, &event, &context, &error)
+                        .await
+                }
             }
         }
         Ok(follow_up.map(|follow_up| BeforeRunEndResult {
@@ -1171,7 +1177,10 @@ impl HookRegistry {
                     }
                 }
                 Ok(None) => {}
-                Err(error) => self.report(HookName::TransformContext, &event, &context, &error).await,
+                Err(error) => {
+                    self.report(HookName::TransformContext, &event, &context, &error)
+                        .await
+                }
             }
         }
         Ok(Some(TransformContextResult {
@@ -1209,7 +1218,10 @@ impl HookRegistry {
                     }
                 }
                 Ok(None) => {}
-                Err(error) => self.report(HookName::BeforeRequest, &event, &context, &error).await,
+                Err(error) => {
+                    self.report(HookName::BeforeRequest, &event, &context, &error)
+                        .await
+                }
             }
         }
         Ok(changed.then_some(BeforeRequestResult {
@@ -1237,7 +1249,10 @@ impl HookRegistry {
             {
                 Ok(Some(result)) => payload = result.payload,
                 Ok(None) => {}
-                Err(error) => self.report(HookName::BeforePayload, &event, &context, &error).await,
+                Err(error) => {
+                    self.report(HookName::BeforePayload, &event, &context, &error)
+                        .await
+                }
             }
         }
         Ok(Some(BeforePayloadResult { payload }))
@@ -1268,7 +1283,10 @@ impl HookRegistry {
                     }
                 }
                 Ok(None) => {}
-                Err(error) => self.report(HookName::AfterResponse, &event, &context, &error).await,
+                Err(error) => {
+                    self.report(HookName::AfterResponse, &event, &context, &error)
+                        .await
+                }
             }
         }
         Ok(Some(AfterResponseResult {
@@ -1319,7 +1337,8 @@ impl HookRegistry {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    self.report(HookName::BeforeTool, &event, &context, &error).await;
+                    self.report(HookName::BeforeTool, &event, &context, &error)
+                        .await;
                     block = Some(ToolBlock {
                         reason: error.to_string(),
                         terminate: None,
@@ -1403,7 +1422,10 @@ impl HookRegistry {
                     }
                 }
                 Ok(None) => {}
-                Err(error) => self.report(HookName::AfterTool, &event, &context, &error).await,
+                Err(error) => {
+                    self.report(HookName::AfterTool, &event, &context, &error)
+                        .await
+                }
             }
         }
         Ok(changed.then_some(aggregate))
@@ -1423,7 +1445,8 @@ impl HookRegistry {
                 Ok(Some(result)) => {
                     if result.decline == Some(true) && result.compaction.is_some() {
                         let error: HookError = Box::new(HookMessageError(
-                            "before_compaction hook cannot return both decline and compaction".to_owned(),
+                            "before_compaction hook cannot return both decline and compaction"
+                                .to_owned(),
                         ));
                         self.report(HookName::BeforeCompaction, &event, &context, &error)
                             .await;
@@ -1434,7 +1457,10 @@ impl HookRegistry {
                     }
                 }
                 Ok(None) => {}
-                Err(error) => self.report(HookName::BeforeCompaction, &event, &context, &error).await,
+                Err(error) => {
+                    self.report(HookName::BeforeCompaction, &event, &context, &error)
+                        .await
+                }
             }
         }
         Ok(None)
@@ -1454,7 +1480,8 @@ impl HookRegistry {
                 Ok(Some(result)) => {
                     if result.decline == Some(true) && result.summary.is_some() {
                         let error: HookError = Box::new(HookMessageError(
-                            "before_navigation hook cannot return both decline and summary".to_owned(),
+                            "before_navigation hook cannot return both decline and summary"
+                                .to_owned(),
                         ));
                         self.report(HookName::BeforeNavigation, &event, &context, &error)
                             .await;
@@ -1465,7 +1492,10 @@ impl HookRegistry {
                     }
                 }
                 Ok(None) => {}
-                Err(error) => self.report(HookName::BeforeNavigation, &event, &context, &error).await,
+                Err(error) => {
+                    self.report(HookName::BeforeNavigation, &event, &context, &error)
+                        .await
+                }
             }
         }
         Ok(None)
@@ -1474,7 +1504,9 @@ impl HookRegistry {
 
 impl std::fmt::Debug for HookRegistry {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("HookRegistry").finish_non_exhaustive()
+        formatter
+            .debug_struct("HookRegistry")
+            .finish_non_exhaustive()
     }
 }
 
@@ -1524,14 +1556,12 @@ mod tests {
                 });
             registry.on::<BeforeRun>(handler, Some("first".to_owned()))
         };
-        let _first = first
-            .map_err(|error| format!("first hook registration failed: {error}"))?;
-        let failing: BeforeRunHook =
-            Arc::new(|_event: BeforeRunEvent, _context: Context| {
-                Box::pin(async {
-                    Err::<Option<BeforeRunResult>, _>(HookMessageError("hook failed".to_owned()))
-                })
-            });
+        let _first = first.map_err(|error| format!("first hook registration failed: {error}"))?;
+        let failing: BeforeRunHook = Arc::new(|_event: BeforeRunEvent, _context: Context| {
+            Box::pin(async {
+                Err::<Option<BeforeRunResult>, _>(HookMessageError("hook failed".to_owned()))
+            })
+        });
         let _failing = registry
             .on::<BeforeRun>(failing, Some("failing".to_owned()))
             .map_err(|error| format!("failing hook registration failed: {error}"))?;
@@ -1553,8 +1583,7 @@ mod tests {
                 });
             registry.on::<BeforeRun>(handler, Some("third".to_owned()))
         };
-        let _third = third
-            .map_err(|error| format!("third hook registration failed: {error}"))?;
+        let _third = third.map_err(|error| format!("third hook registration failed: {error}"))?;
 
         let (gate, _control) = super::super::gate::create_gate();
         let event = BeforeRunEvent {
@@ -1575,21 +1604,19 @@ mod tests {
             .ok_or_else(|| "before_run aggregate omitted injected messages".to_owned())?;
         assert_eq!(messages, vec![expected_first, expected_third]);
         assert_eq!(
-            seen_prompt_lengths.lock().map_or_else(|_| Vec::new(), |lengths| lengths.clone()),
+            seen_prompt_lengths
+                .lock()
+                .map_or_else(|_| Vec::new(), |lengths| lengths.clone()),
             vec![0, 1]
         );
-        assert_eq!(
-            reports.lock().map_or_else(|_| 0, |events| events.len()),
-            1
-        );
+        assert_eq!(reports.lock().map_or_else(|_| 0, |events| events.len()), 1);
         Ok(())
     }
 
     #[tokio::test]
     async fn before_drive_handler_failure_preserves_fault_and_open_gate() -> TestResult {
-        let registry = HookRegistry::new(|_event, _context| -> BoxFuture<'static, ()> {
-            Box::pin(async {})
-        });
+        let registry =
+            HookRegistry::new(|_event, _context| -> BoxFuture<'static, ()> { Box::pin(async {}) });
         let handler: BeforeDriveHook = Arc::new(|_event: BeforeDriveEvent, _context: Context| {
             Box::pin(async { Err::<(), _>(TestHandlerError) })
         });

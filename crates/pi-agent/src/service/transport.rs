@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
 use crate::context::Context;
-
+use futures::future::BoxFuture;
 
 use super::delta::DeltaOp;
 use super::error::ServiceError;

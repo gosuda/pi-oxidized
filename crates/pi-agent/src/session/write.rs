@@ -1,9 +1,9 @@
-use serde::{de::Error as _, ser::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::Error as _};
 use serde_json::Value as JsonValue;
 
-use crate::message::AgentMessage;
 use super::address::{Value, ValueList};
 use super::{Entry, EntryId, NewEntry, NewEntryBody, SessionError, UsageId};
+use crate::message::AgentMessage;
 
 /// One unit of proposed durable change.
 ///
@@ -82,14 +82,23 @@ pub enum ListWrite {
 /// [`SessionError::Invariant`] when `next` cannot be serialized to JSON.
 pub fn set_value<T: Serialize>(address: &Value<T>, next: &T) -> Result<Write, SessionError> {
     serde_json::to_value(next)
-        .map(|value| Write::Value(ValueWrite::Set { namespace: address.namespace().to_owned(), key: address.key().to_owned(), value }))
+        .map(|value| {
+            Write::Value(ValueWrite::Set {
+                namespace: address.namespace().to_owned(),
+                key: address.key().to_owned(),
+                value,
+            })
+        })
         .map_err(|error| SessionError::Invariant(format!("value serialization failed: {error}")))
 }
 
 /// Builds a value-delete write from a typed address.
 #[must_use]
 pub fn delete_value<T>(address: &Value<T>) -> Write {
-    Write::Value(ValueWrite::Delete { namespace: address.namespace().to_owned(), key: address.key().to_owned() })
+    Write::Value(ValueWrite::Delete {
+        namespace: address.namespace().to_owned(),
+        key: address.key().to_owned(),
+    })
 }
 
 /// Builds a typed list-append write.
@@ -97,16 +106,30 @@ pub fn delete_value<T>(address: &Value<T>) -> Write {
 /// # Errors
 ///
 /// [`SessionError::Invariant`] when `element` cannot be serialized to JSON.
-pub fn append_list<T: Serialize>(address: &ValueList<T>, element: &T) -> Result<Write, SessionError> {
+pub fn append_list<T: Serialize>(
+    address: &ValueList<T>,
+    element: &T,
+) -> Result<Write, SessionError> {
     serde_json::to_value(element)
-        .map(|value| Write::List(ListWrite::Append { namespace: address.namespace().to_owned(), key: address.key().to_owned(), value }))
-        .map_err(|error| SessionError::Invariant(format!("list element serialization failed: {error}")))
+        .map(|value| {
+            Write::List(ListWrite::Append {
+                namespace: address.namespace().to_owned(),
+                key: address.key().to_owned(),
+                value,
+            })
+        })
+        .map_err(|error| {
+            SessionError::Invariant(format!("list element serialization failed: {error}"))
+        })
 }
 
 /// Builds a list-delete write from a typed address.
 #[must_use]
 pub fn delete_list<T>(address: &ValueList<T>) -> Write {
-    Write::List(ListWrite::Delete { namespace: address.namespace().to_owned(), key: address.key().to_owned() })
+    Write::List(ListWrite::Delete {
+        namespace: address.namespace().to_owned(),
+        key: address.key().to_owned(),
+    })
 }
 
 /// A committed token/cost measurement.
@@ -203,16 +226,24 @@ pub trait CommittedIdView {
 /// assistant message whose stop reason is still pending. Value and list
 /// writes are always admitted.
 pub fn validate_committed_writes(
-    writes: &[Write], first_seq: u64, existing: &dyn CommittedIdView,
+    writes: &[Write],
+    first_seq: u64,
+    existing: &dyn CommittedIdView,
 ) -> Result<(), SessionError> {
     if first_seq != existing.next_seq() {
-        return Err(SessionError::Invariant(format!("commit starts at sequence {first_seq}, expected {}", existing.next_seq())));
+        return Err(SessionError::Invariant(format!(
+            "commit starts at sequence {first_seq}, expected {}",
+            existing.next_seq()
+        )));
     }
     let mut batch_ids = std::collections::HashSet::<&str>::new();
     let mut batch_entry_ids = std::collections::HashSet::<&str>::new();
     for (index, write) in writes.iter().enumerate() {
-        let index = u64::try_from(index).map_err(|_| SessionError::Invariant("sequence overflow".to_owned()))?;
-        let _seq = first_seq.checked_add(index).ok_or_else(|| SessionError::Invariant("sequence overflow".to_owned()))?;
+        let index = u64::try_from(index)
+            .map_err(|_| SessionError::Invariant("sequence overflow".to_owned()))?;
+        let _seq = first_seq
+            .checked_add(index)
+            .ok_or_else(|| SessionError::Invariant("sequence overflow".to_owned()))?;
         match write {
             Write::Entry { entry } => {
                 let id = entry.id.as_str();
@@ -227,10 +258,15 @@ pub fn validate_committed_writes(
                     && !existing.contains_entry_id(parent)
                     && !batch_entry_ids.contains(parent.as_str())
                 {
-                    return Err(SessionError::Invariant(format!("missing parent id {parent}")));
+                    return Err(SessionError::Invariant(format!(
+                        "missing parent id {parent}"
+                    )));
                 }
                 batch_entry_ids.insert(id);
-                if let NewEntryBody::Message { message: AgentMessage::Llm(llm), .. } = &entry.body
+                if let NewEntryBody::Message {
+                    message: AgentMessage::Llm(llm),
+                    ..
+                } = &entry.body
                     && let pi_ai::Message::Assistant(assistant) = llm.as_ref()
                     && matches!(assistant.stop_reason, pi_ai::StopReason::Pending)
                 {
@@ -269,10 +305,22 @@ pub enum CommittedWrite {
 impl Serialize for CommittedWrite {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let (mut value, kind) = match self {
-            Self::Entry(entry) => (serde_json::to_value(entry).map_err(S::Error::custom)?, "entry"),
-            Self::Usage(row) => (serde_json::to_value(row).map_err(S::Error::custom)?, "usage"),
-            Self::Value(write) => (serde_json::to_value(write).map_err(S::Error::custom)?, "value"),
-            Self::List(write) => (serde_json::to_value(write).map_err(S::Error::custom)?, "list"),
+            Self::Entry(entry) => (
+                serde_json::to_value(entry).map_err(S::Error::custom)?,
+                "entry",
+            ),
+            Self::Usage(row) => (
+                serde_json::to_value(row).map_err(S::Error::custom)?,
+                "usage",
+            ),
+            Self::Value(write) => (
+                serde_json::to_value(write).map_err(S::Error::custom)?,
+                "value",
+            ),
+            Self::List(write) => (
+                serde_json::to_value(write).map_err(S::Error::custom)?,
+                "list",
+            ),
         };
         let object = value
             .as_object_mut()
@@ -286,20 +334,30 @@ impl<'de> Deserialize<'de> for CommittedWrite {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let mut value = JsonValue::deserialize(deserializer)?;
         let kind = {
-            let object = value
-                .as_object_mut()
-                .ok_or_else(|| D::Error::custom("committed write must deserialize from an object"))?;
+            let object = value.as_object_mut().ok_or_else(|| {
+                D::Error::custom("committed write must deserialize from an object")
+            })?;
             object
                 .remove("kind")
                 .and_then(|kind| kind.as_str().map(str::to_owned))
                 .ok_or_else(|| D::Error::custom("committed write is missing string kind"))?
         };
         match kind.as_str() {
-            "entry" => serde_json::from_value(value).map(Self::Entry).map_err(D::Error::custom),
-            "usage" => serde_json::from_value(value).map(Self::Usage).map_err(D::Error::custom),
-            "value" => serde_json::from_value(value).map(Self::Value).map_err(D::Error::custom),
-            "list" => serde_json::from_value(value).map(Self::List).map_err(D::Error::custom),
-            other => Err(D::Error::custom(format!("unknown committed write kind {other}"))),
+            "entry" => serde_json::from_value(value)
+                .map(Self::Entry)
+                .map_err(D::Error::custom),
+            "usage" => serde_json::from_value(value)
+                .map(Self::Usage)
+                .map_err(D::Error::custom),
+            "value" => serde_json::from_value(value)
+                .map(Self::Value)
+                .map_err(D::Error::custom),
+            "list" => serde_json::from_value(value)
+                .map(Self::List)
+                .map_err(D::Error::custom),
+            other => Err(D::Error::custom(format!(
+                "unknown committed write kind {other}"
+            ))),
         }
     }
 }
@@ -363,8 +421,12 @@ impl CommittedWrite {
         match self {
             Self::Entry(entry) => entry.seq(),
             Self::Usage(row) => row.seq,
-            Self::Value(CommittedValueWrite::Set { seq, .. } | CommittedValueWrite::Delete { seq, .. })
-            | Self::List(CommittedListWrite::Append { seq, .. } | CommittedListWrite::Delete { seq, .. }) => *seq,
+            Self::Value(
+                CommittedValueWrite::Set { seq, .. } | CommittedValueWrite::Delete { seq, .. },
+            )
+            | Self::List(
+                CommittedListWrite::Append { seq, .. } | CommittedListWrite::Delete { seq, .. },
+            ) => *seq,
         }
     }
 }
@@ -383,7 +445,8 @@ pub fn commit_writes(
     let mut committed = Vec::with_capacity(writes.len());
     let mut seqs = Vec::with_capacity(writes.len());
     for (index, write) in writes.into_iter().enumerate() {
-        let index = u64::try_from(index).map_err(|_| SessionError::Invariant("sequence overflow".to_owned()))?;
+        let index = u64::try_from(index)
+            .map_err(|_| SessionError::Invariant("sequence overflow".to_owned()))?;
         let seq = first_seq
             .checked_add(index)
             .ok_or_else(|| SessionError::Invariant("sequence overflow".to_owned()))?;
@@ -398,17 +461,39 @@ pub fn commit_writes(
                 adjustment: row.adjustment,
                 details: row.details,
             }),
-            Write::Value(ValueWrite::Set { namespace, key, value }) => {
-                CommittedWrite::Value(CommittedValueWrite::Set { seq, namespace, key, value })
-            }
+            Write::Value(ValueWrite::Set {
+                namespace,
+                key,
+                value,
+            }) => CommittedWrite::Value(CommittedValueWrite::Set {
+                seq,
+                namespace,
+                key,
+                value,
+            }),
             Write::Value(ValueWrite::Delete { namespace, key }) => {
-                CommittedWrite::Value(CommittedValueWrite::Delete { seq, namespace, key })
+                CommittedWrite::Value(CommittedValueWrite::Delete {
+                    seq,
+                    namespace,
+                    key,
+                })
             }
-            Write::List(ListWrite::Append { namespace, key, value }) => {
-                CommittedWrite::List(CommittedListWrite::Append { seq, namespace, key, value })
-            }
+            Write::List(ListWrite::Append {
+                namespace,
+                key,
+                value,
+            }) => CommittedWrite::List(CommittedListWrite::Append {
+                seq,
+                namespace,
+                key,
+                value,
+            }),
             Write::List(ListWrite::Delete { namespace, key }) => {
-                CommittedWrite::List(CommittedListWrite::Delete { seq, namespace, key })
+                CommittedWrite::List(CommittedListWrite::Delete {
+                    seq,
+                    namespace,
+                    key,
+                })
             }
         };
         committed.push(committed_write);
@@ -439,7 +524,9 @@ pub fn validate_replayed_writes(
     for write in writes {
         let seq = write.seq();
         if seq <= previous_seq {
-            return Err(SessionError::Invariant(format!("non-monotonic storage sequence {seq}")));
+            return Err(SessionError::Invariant(format!(
+                "non-monotonic storage sequence {seq}"
+            )));
         }
         previous_seq = seq;
         let (id, parent) = match write {
@@ -448,13 +535,17 @@ pub fn validate_replayed_writes(
             CommittedWrite::Value(_) | CommittedWrite::List(_) => continue,
         };
         if existing.contains_id(id) || !batch_ids.insert(id) {
-            return Err(SessionError::Invariant(format!("duplicate entry or usage id {id}")));
+            return Err(SessionError::Invariant(format!(
+                "duplicate entry or usage id {id}"
+            )));
         }
         if let Some(parent) = parent
             && !existing.contains_entry_id(parent)
             && !batch_entry_ids.contains(parent.as_str())
         {
-            return Err(SessionError::Invariant(format!("missing parent entry {parent}")));
+            return Err(SessionError::Invariant(format!(
+                "missing parent entry {parent}"
+            )));
         }
         if matches!(write, CommittedWrite::Entry(_)) {
             batch_entry_ids.insert(id);
@@ -462,4 +553,3 @@ pub fn validate_replayed_writes(
     }
     Ok(())
 }
-

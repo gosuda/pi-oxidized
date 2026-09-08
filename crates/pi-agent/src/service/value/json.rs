@@ -49,15 +49,21 @@ pub enum JsonError {
 /// [`JsonError::Internal`] only if the cursor met validated text it could not
 /// follow (a bug, never an input property).
 pub fn parse_json(text: &str) -> Result<JsonValue, JsonError> {
-    let raw = serde_json::from_str::<&RawValue>(text)
-        .map_err(|error| JsonError::Syntax { message: error.to_string() })?;
+    let raw = serde_json::from_str::<&RawValue>(text).map_err(|error| JsonError::Syntax {
+        message: error.to_string(),
+    })?;
     materialize(raw.get())
 }
 
 /// One open container on the materialization stack.
 enum Frame {
-    Array { items: Vec<JsonValue> },
-    Object { map: JsObject, key: Option<JsString> },
+    Array {
+        items: Vec<JsonValue>,
+    },
+    Object {
+        map: JsObject,
+        key: Option<JsString>,
+    },
 }
 
 /// Where the materializer stands relative to the container stack.
@@ -137,7 +143,10 @@ fn step_value(
         }
         b'{' => {
             cursor.bump();
-            stack.push(Frame::Object { map: JsObject::new(), key: None });
+            stack.push(Frame::Object {
+                map: JsObject::new(),
+                key: None,
+            });
             return Ok(Phase::ObjectEntry);
         }
         _ => return Err(internal("unexpected byte in validated text")),
@@ -253,7 +262,11 @@ fn read_object_key(cursor: &mut Cursor<'_>, stack: &mut [Frame]) -> Result<(), J
 }
 
 /// Files one completed value into the innermost container, or into the root.
-fn attach(stack: &mut [Frame], root: &mut Option<JsonValue>, value: JsonValue) -> Result<(), JsonError> {
+fn attach(
+    stack: &mut [Frame],
+    root: &mut Option<JsonValue>,
+    value: JsonValue,
+) -> Result<(), JsonError> {
     match stack.last_mut() {
         None => {
             if root.is_some() {
@@ -390,7 +403,8 @@ impl Cursor<'_> {
                     // second unit stands alone exactly as written, keeping
                     // both escape readings lossless.
                     let bytes = self.text.as_bytes();
-                    if bytes.get(self.pos) == Some(&b'\\') && bytes.get(self.pos + 1) == Some(&b'u') {
+                    if bytes.get(self.pos) == Some(&b'\\') && bytes.get(self.pos + 1) == Some(&b'u')
+                    {
                         self.pos += 2;
                         units.push(self.parse_hex4()?);
                     }
@@ -557,10 +571,12 @@ fn write_string(value: &JsString, out: &mut String) {
     let mut index = 0;
     while index < units.len() {
         let unit = units[index];
-        if matches!(unit, 0xD800..=0xDBFF) && matches!(units.get(index + 1), Some(0xDC00..=0xDFFF)) {
+        if matches!(unit, 0xD800..=0xDBFF) && matches!(units.get(index + 1), Some(0xDC00..=0xDFFF))
+        {
             // A stored pair serializes as its scalar; re-parsing re-splits it.
-            let scalar =
-                0x1_0000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(units[index + 1]) - 0xDC00);
+            let scalar = 0x1_0000
+                + ((u32::from(unit) - 0xD800) << 10)
+                + (u32::from(units[index + 1]) - 0xDC00);
             if let Some(scalar) = char::from_u32(scalar) {
                 out.push(scalar);
             } else {
@@ -676,7 +692,12 @@ fn normalize_decimal(text: &str) -> (String, i32) {
     // Leading zeros shift the exponent down; trailing zeros are decimal
     // notation decoration and drop without touching the exponent.
     let leading = digits.bytes().take_while(|&byte| byte == b'0').count();
-    let end = digits.len() - digits.bytes().rev().take_while(|&byte| byte == b'0').count();
+    let end = digits.len()
+        - digits
+            .bytes()
+            .rev()
+            .take_while(|&byte| byte == b'0')
+            .count();
     if leading >= end {
         // Unreachable for nonzero magnitudes; spell a plain zero.
         return (String::from("0"), 1);
@@ -727,5 +748,7 @@ fn place_digits(digits: &str, exponent: i32, out: &mut String) {
 
 /// Builds the module-local "cannot happen" error.
 fn internal(message: &'static str) -> JsonError {
-    JsonError::Internal { message: message.to_owned() }
+    JsonError::Internal {
+        message: message.to_owned(),
+    }
 }

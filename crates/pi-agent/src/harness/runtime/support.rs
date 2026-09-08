@@ -7,16 +7,14 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::context::Context;
-use crate::message::{default_convert_to_llm, user_text, AgentMessage};
+use crate::message::{AgentMessage, default_convert_to_llm, user_text};
 use crate::queue::QueueMode;
 use crate::session::address::{
-    branch_tip, entry_label, lane_config, lane_state,
-    operation_meta as operation_meta_value, operation_preparation, operation_result, operation_state,
-    pending_assistant_frames, pending_entry,
+    branch_tip, entry_label, lane_config, lane_state, operation_meta as operation_meta_value,
+    operation_preparation, operation_result, operation_state, pending_assistant_frames,
+    pending_entry,
 };
-use crate::session::configuration::{
-    CompactionSettings, HarnessRetryPolicy, HarnessStreamOptions,
-};
+use crate::session::configuration::{CompactionSettings, HarnessRetryPolicy, HarnessStreamOptions};
 use crate::session::operation::{
     Control, NormalizedRetryPolicy, Operation, OperationIntent, OperationKind, OperationMeta,
     OperationResultRecord, OperationScope, RunSettings,
@@ -255,7 +253,10 @@ pub(crate) fn normalized_retry(
 }
 
 pub(crate) fn pending_write(entry: EntryId, kind: InboxItemKind) -> InboxItem {
-    InboxItem { entry_id: entry, kind }
+    InboxItem {
+        entry_id: entry,
+        kind,
+    }
 }
 
 pub(crate) fn pending_entry_write(
@@ -316,7 +317,6 @@ pub(crate) fn op_cleanup_writes(op: &OperationId, response: Option<&EntryId>) ->
     writes
 }
 
-
 pub(crate) async fn branch_entries(
     branch: &dyn Branch,
     cx: &Context,
@@ -335,7 +335,11 @@ pub(crate) async fn context_messages(
     for entry in crate::harness::compaction::build_context_entries(entries) {
         if let Entry::Custom { custom_type, .. } = entry {
             if let Some(projector) = entry_projectors.get(custom_type) {
-                messages.extend(projector(entry.clone(), cx.clone()).await?.unwrap_or_default());
+                messages.extend(
+                    projector(entry.clone(), cx.clone())
+                        .await?
+                        .unwrap_or_default(),
+                );
             }
         } else {
             messages.extend(crate::harness::compaction::session_entry_to_context_messages(entry));
@@ -363,9 +367,7 @@ pub(crate) async fn read_pending(
     Ok(values)
 }
 
-pub(crate) fn lane_branch_tip_address(
-    lane: &LaneName,
-) -> crate::session::Value<Option<EntryId>> {
+pub(crate) fn lane_branch_tip_address(lane: &LaneName) -> crate::session::Value<Option<EntryId>> {
     branch_tip(lane.as_str())
 }
 
@@ -383,7 +385,6 @@ pub(crate) fn ensure_lane_name(name: &LaneName) -> Result<(), HarnessError> {
     }
     Ok(())
 }
-
 
 pub(crate) fn operation_meta(
     op: &OperationId,
@@ -417,9 +418,7 @@ pub(crate) fn context_window(model: &pi_ai::Model) -> u32 {
     u32::try_from(model.context_window).unwrap_or(u32::MAX)
 }
 
-pub(crate) fn lane_config_address(
-    lane: &LaneName,
-) -> crate::session::Value<LaneConfiguration> {
+pub(crate) fn lane_config_address(lane: &LaneName) -> crate::session::Value<LaneConfiguration> {
     lane_config(lane)
 }
 
@@ -427,16 +426,13 @@ pub(crate) fn lane_state_address(lane: &LaneName) -> crate::session::Value<LaneS
     lane_state(lane)
 }
 
-pub(crate) fn result_address(
-    op: &OperationId,
-) -> crate::session::Value<OperationResultRecord> {
+pub(crate) fn result_address(op: &OperationId) -> crate::session::Value<OperationResultRecord> {
     operation_result(op)
 }
 
 pub(crate) fn label_address(entry: &EntryId) -> crate::session::Value<String> {
     entry_label(entry)
 }
-
 
 pub(crate) fn preparation_address(
     op: &OperationId,
@@ -479,8 +475,8 @@ mod tests {
     /// context, contributes its messages in source order, and its failure
     /// aborts the context build.
     #[tokio::test]
-    async fn context_messages_projects_registered_custom_entries_and_propagates_errors(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn context_messages_projects_registered_custom_entries_and_propagates_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
         let projector: EntryProjector = Arc::new(|entry: Entry, _cx: Context| {
             let id = entry.id().as_str().to_owned();
             let future: BoxFuture<'static, Result<Option<Vec<AgentMessage>>, SessionError>> =
@@ -529,9 +525,9 @@ mod tests {
 
         let failing: EntryProjector = Arc::new(|_entry: Entry, _cx: Context| {
             let future: BoxFuture<'static, Result<Option<Vec<AgentMessage>>, SessionError>> =
-                Box::pin(async move {
-                    Err(SessionError::Invariant("projector failed".to_owned()))
-                });
+                Box::pin(
+                    async move { Err(SessionError::Invariant("projector failed".to_owned())) },
+                );
             future
         });
         let mut projectors = HashMap::new();

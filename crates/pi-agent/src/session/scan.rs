@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use super::{EntryId, EntryType};
 use super::address::AddressKind;
+use super::{EntryId, EntryType};
 
 /// Direction a scan walks its sequence space.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -11,14 +11,14 @@ pub enum ScanOrder {
     #[default]
     Asc,
     /// `"desc"` — newest sequence first.
-    Desc
+    Desc,
 }
 
 /// Exclusive sequence boundary for a paginated scan.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EntryCursor {
     /// Last sequence already observed; results exclude it.
-    pub seq: u64
+    pub seq: u64,
 }
 
 /// Branch-ancestry scan as callers request it, with an optional start.
@@ -173,27 +173,50 @@ pub struct RawListElement {
     /// list and serves as the pagination cursor.
     pub seq: u64,
     /// Serialized element value.
-    pub value: serde_json::Value
+    pub value: serde_json::Value,
 }
 
 impl From<&super::Entry> for EntryStructure {
     fn from(entry: &super::Entry) -> Self {
-        Self { id: entry.id().clone(), parent_id: entry.parent_id().cloned(), seq: entry.seq(), timestamp: entry.timestamp(), entry_type: entry.entry_type(), custom_type: entry.custom_type().map(str::to_owned) }
+        Self {
+            id: entry.id().clone(),
+            parent_id: entry.parent_id().cloned(),
+            seq: entry.seq(),
+            timestamp: entry.timestamp(),
+            entry_type: entry.entry_type(),
+            custom_type: entry.custom_type().map(str::to_owned),
+        }
     }
 }
 
 mod branch_order {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use super::ScanOrder;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
     #[expect(
         clippy::ref_option,
         clippy::trivially_copy_pass_by_ref,
         reason = "Serde serialize_with passes a reference to the complete Option field"
     )]
-    pub fn serialize<S: Serializer>(order: &Option<ScanOrder>, serializer: S) -> Result<S::Ok, S::Error> {
-        order.map(|value| match value { ScanOrder::Asc => "oldestFirst", ScanOrder::Desc => "newestFirst" }).serialize(serializer)
+    pub fn serialize<S: Serializer>(
+        order: &Option<ScanOrder>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        order
+            .map(|value| match value {
+                ScanOrder::Asc => "oldestFirst",
+                ScanOrder::Desc => "newestFirst",
+            })
+            .serialize(serializer)
     }
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<ScanOrder>, D::Error> {
-        Option::<String>::deserialize(deserializer)?.map(|value| match value.as_str() { "oldestFirst" => Ok(ScanOrder::Asc), "newestFirst" => Ok(ScanOrder::Desc), _ => Err(serde::de::Error::custom("invalid branch scan order")) }).transpose()
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<ScanOrder>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| match value.as_str() {
+                "oldestFirst" => Ok(ScanOrder::Asc),
+                "newestFirst" => Ok(ScanOrder::Desc),
+                _ => Err(serde::de::Error::custom("invalid branch scan order")),
+            })
+            .transpose()
     }
 }

@@ -27,12 +27,22 @@ pub fn from_serde_json(value: SerdeValue) -> JsonValue {
         if let Some(input) = pending.take() {
             match input {
                 SerdeValue::Null => attach_from(&mut stack, &mut root, JsonValue::Null),
-                SerdeValue::Bool(value) => attach_from(&mut stack, &mut root, JsonValue::Bool(value)),
+                SerdeValue::Bool(value) => {
+                    attach_from(&mut stack, &mut root, JsonValue::Bool(value))
+                }
                 SerdeValue::Number(value) => {
-                    attach_from(&mut stack, &mut root, JsonValue::Number(number_to_f64(&value)));
+                    attach_from(
+                        &mut stack,
+                        &mut root,
+                        JsonValue::Number(number_to_f64(&value)),
+                    );
                 }
                 SerdeValue::String(value) => {
-                    attach_from(&mut stack, &mut root, JsonValue::String(JsString::from(value)));
+                    attach_from(
+                        &mut stack,
+                        &mut root,
+                        JsonValue::String(JsString::from(value)),
+                    );
                 }
                 SerdeValue::Array(mut values) => {
                     let capacity = values.len();
@@ -40,7 +50,10 @@ pub fn from_serde_json(value: SerdeValue) -> JsonValue {
                     // so the resulting array retains source order.
                     values.reverse();
                     let first = values.pop();
-                    stack.push(FromFrame::Array { built: Vec::with_capacity(capacity), rest: values });
+                    stack.push(FromFrame::Array {
+                        built: Vec::with_capacity(capacity),
+                        rest: values,
+                    });
                     pending = first;
                     continue;
                 }
@@ -52,7 +65,11 @@ pub fn from_serde_json(value: SerdeValue) -> JsonValue {
                     } else {
                         (None, None)
                     };
-                    stack.push(FromFrame::Object { built: BTreeMap::new(), key, rest: values });
+                    stack.push(FromFrame::Object {
+                        built: BTreeMap::new(),
+                        key,
+                        rest: values,
+                    });
                     pending = first;
                     continue;
                 }
@@ -139,7 +156,10 @@ pub fn try_into_serde_json(value: JsonValue) -> Result<SerdeValue, ValueError> {
                     let capacity = values.len();
                     let mut rest = std::mem::take(values).into_iter();
                     let first = rest.next();
-                    frames.push(IntoFrame::Array { built: Vec::with_capacity(capacity), rest });
+                    frames.push(IntoFrame::Array {
+                        built: Vec::with_capacity(capacity),
+                        rest,
+                    });
                     pending = first;
                 }
                 JsonValue::Object(values) => {
@@ -149,7 +169,11 @@ pub fn try_into_serde_json(value: JsonValue) -> Result<SerdeValue, ValueError> {
                     } else {
                         (None, None)
                     };
-                    frames.push(IntoFrame::Object { built: Map::new(), key, rest });
+                    frames.push(IntoFrame::Object {
+                        built: Map::new(),
+                        key,
+                        rest,
+                    });
                     pending = first;
                 }
             }

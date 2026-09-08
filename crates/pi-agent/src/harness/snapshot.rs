@@ -12,8 +12,8 @@ use serde_json::{Map, Value};
 
 use crate::message::AgentMessage;
 use crate::session::{
-    Entry, EntryId, EntryType, InboxItemKind, LaneConfiguration, LaneName,
-    OperationKind, OperationId, OperationResultRecord, SessionStats,
+    Entry, EntryId, EntryType, InboxItemKind, LaneConfiguration, LaneName, OperationId,
+    OperationKind, OperationResultRecord, SessionStats,
 };
 use crate::tool::AgentToolResult;
 
@@ -22,7 +22,11 @@ use super::result::{LaneInfo, OperationStatus};
 
 /// A queued lane item in the exact order in which it will be drained.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum LaneQueuedItem {
     /// An LLM-compatible queued message.
     Message {
@@ -53,7 +57,11 @@ pub enum LaneQueuedItem {
 
 /// A tool currently represented in a lane operation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum LaneSnapshotTool {
     /// A tool whose effect is still running.
     Running {
@@ -208,34 +216,30 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
 
     match &event.payload {
         payload @ (HarnessEventPayload::RunStart { .. }
-            | HarnessEventPayload::CompactionStart { .. }
-            | HarnessEventPayload::NavigationStart { .. }) => {
-            reduce_operation_start(snapshot, payload)
-        }
+        | HarnessEventPayload::CompactionStart { .. }
+        | HarnessEventPayload::NavigationStart { .. }) => reduce_operation_start(snapshot, payload),
         payload @ (HarnessEventPayload::OperationAbort { .. }
-            | HarnessEventPayload::RunResume { .. }
-            | HarnessEventPayload::RunSuspend { .. }
-            | HarnessEventPayload::RetryScheduled { .. }
-            | HarnessEventPayload::RetryStart { .. }
-            | HarnessEventPayload::RetryEnd { .. }) => {
-            reduce_operation_control(snapshot, payload)
-        }
+        | HarnessEventPayload::RunResume { .. }
+        | HarnessEventPayload::RunSuspend { .. }
+        | HarnessEventPayload::RetryScheduled { .. }
+        | HarnessEventPayload::RetryStart { .. }
+        | HarnessEventPayload::RetryEnd { .. }) => reduce_operation_control(snapshot, payload),
         payload @ (HarnessEventPayload::MessageStart { .. }
-            | HarnessEventPayload::MessageUpdate { .. }
-            | HarnessEventPayload::MessageEnd { .. }) => reduce_message(snapshot, payload),
+        | HarnessEventPayload::MessageUpdate { .. }
+        | HarnessEventPayload::MessageEnd { .. }) => reduce_message(snapshot, payload),
         payload @ (HarnessEventPayload::ToolStart { .. }
-            | HarnessEventPayload::ToolUpdate { .. }
-            | HarnessEventPayload::ToolEnd { .. }) => reduce_tool(snapshot, payload),
+        | HarnessEventPayload::ToolUpdate { .. }
+        | HarnessEventPayload::ToolEnd { .. }) => reduce_tool(snapshot, payload),
         payload @ (HarnessEventPayload::EntryAdded { .. }
-            | HarnessEventPayload::QueueUpdate { .. }
-            | HarnessEventPayload::Usage { .. }
-            | HarnessEventPayload::ConfigUpdate { .. }
-            | HarnessEventPayload::Fault { .. }) => {
+        | HarnessEventPayload::QueueUpdate { .. }
+        | HarnessEventPayload::Usage { .. }
+        | HarnessEventPayload::ConfigUpdate { .. }
+        | HarnessEventPayload::Fault { .. }) => {
             reduce_entry_queue_usage_config(snapshot, event, payload)
         }
         payload @ (HarnessEventPayload::RunEnd { .. }
-            | HarnessEventPayload::CompactionEnd { .. }
-            | HarnessEventPayload::NavigationEnd { .. }) => reduce_terminal(snapshot, payload),
+        | HarnessEventPayload::CompactionEnd { .. }
+        | HarnessEventPayload::NavigationEnd { .. }) => reduce_terminal(snapshot, payload),
         HarnessEventPayload::HandlerError { .. }
         | HarnessEventPayload::TurnStart { .. }
         | HarnessEventPayload::TurnEnd { .. }
@@ -277,7 +281,9 @@ fn reduce_operation_start(
             ));
             ReduceOutcome::Updated
         }
-        HarnessEventPayload::CompactionStart { run_id, started_at, .. } => {
+        HarnessEventPayload::CompactionStart {
+            run_id, started_at, ..
+        } => {
             // In-run compaction is a segment bracket and must not replace the
             // open run operation.  A standalone compaction has no operation.
             if snapshot.operation.is_some() {
@@ -291,7 +297,9 @@ fn reduce_operation_start(
             ));
             ReduceOutcome::Updated
         }
-        HarnessEventPayload::NavigationStart { run_id, started_at, .. } => {
+        HarnessEventPayload::NavigationStart {
+            run_id, started_at, ..
+        } => {
             if snapshot.operation.is_some() {
                 return ReduceOutcome::Ignored;
             }
@@ -395,7 +403,9 @@ fn reduce_message(snapshot: &mut LaneSnapshot, payload: &HarnessEventPayload) ->
             operation.streaming_message = Some(message);
             ReduceOutcome::Updated
         }
-        HarnessEventPayload::MessageUpdate { run_id, message, .. } => {
+        HarnessEventPayload::MessageUpdate {
+            run_id, message, ..
+        } => {
             let Some(message) = assistant_message(message) else {
                 return ReduceOutcome::Ignored;
             };
@@ -699,5 +709,3 @@ fn tool_result_call_id(message: &AgentMessage) -> Option<&str> {
         Message::User(_) | Message::Assistant(_) => None,
     }
 }
-
-

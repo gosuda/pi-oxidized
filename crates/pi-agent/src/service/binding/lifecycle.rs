@@ -43,11 +43,13 @@ impl Lifecycle {
     }
 
     pub(crate) fn set_bound(&self, bound: bool) {
-        self.bound.store(bound, std::sync::atomic::Ordering::Release);
+        self.bound
+            .store(bound, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn dispose(&self) {
-        self.disposed.store(true, std::sync::atomic::Ordering::Release);
+        self.disposed
+            .store(true, std::sync::atomic::Ordering::Release);
         self.set_bound(false);
         self.calls.close();
     }

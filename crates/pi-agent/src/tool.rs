@@ -432,16 +432,20 @@ mod tests {
                 "required": ["code"]
             }),
             mode: None,
-            constrained_sampling: Some(ConstrainedSampling::Config(ConstrainedSamplingConfig::JsonSchema {
-                strict: StrictMode::Prefer,
-            })),
+            constrained_sampling: Some(ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema {
+                    strict: StrictMode::Prefer,
+                },
+            )),
         };
         let pi_tool = to_pi_tool(&tool);
         assert_eq!(
             pi_tool.constrained_sampling,
-            Some(ConstrainedSampling::Config(ConstrainedSamplingConfig::JsonSchema {
-                strict: StrictMode::Prefer,
-            }))
+            Some(ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema {
+                    strict: StrictMode::Prefer,
+                }
+            ))
         );
     }
 
@@ -456,7 +460,10 @@ mod tests {
             constrained_sampling: Some(ConstrainedSampling::Disabled),
         };
         let pi_tool = to_pi_tool(&tool);
-        assert_eq!(pi_tool.constrained_sampling, Some(ConstrainedSampling::Disabled));
+        assert_eq!(
+            pi_tool.constrained_sampling,
+            Some(ConstrainedSampling::Disabled)
+        );
     }
 
     #[test]

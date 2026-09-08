@@ -20,12 +20,12 @@ use crate::tool::ToolExecutionMode;
 
 use super::bus::{HarnessEventBus, WatchHandle};
 use super::hooks::HookRegistry;
-use super::snapshot::{LaneSnapshot, SessionSnapshot};
 use super::result::{
     AbortRequestResult, AbortResult, CancelQueuedResult, CompactionResult, DriveResult,
     HarnessError, LaneExecutionInfo, LaneInfo, NavigationResult, OperationAdmissionResult,
     QueueResult, RecordUsageResult, ResumeResult, RunResult,
 };
+use super::snapshot::{LaneSnapshot, SessionSnapshot};
 use super::stream::ToProviderMessages;
 use super::tool::{HarnessTool, ToolContextSource, ToolContextValue};
 
@@ -90,8 +90,7 @@ pub trait AgentLane: Send + Sync {
         cx: &'a Context,
     ) -> BoxFuture<'a, OperationAdmissionResult>;
     /// Drives one admitted operation step.
-    fn drive<'a>(&'a self, options: DriveOptions, cx: &'a Context)
-        -> BoxFuture<'a, DriveResult>;
+    fn drive<'a>(&'a self, options: DriveOptions, cx: &'a Context) -> BoxFuture<'a, DriveResult>;
     /// Requests cancellation for one operation.
     fn request_abort<'a>(
         &'a self,
@@ -160,8 +159,7 @@ pub trait AgentLane: Send + Sync {
     ) -> BoxFuture<'a, RecordUsageResult>;
 
     /// Waits until this lane has no active operation.
-    fn wait_for_idle<'a>(&'a self, cx: &'a Context)
-        -> BoxFuture<'a, Result<(), HarnessError>>;
+    fn wait_for_idle<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<(), HarnessError>>;
     /// Runs a job after this lane becomes idle.
     fn run_when_idle<'a>(
         &'a self,
@@ -220,12 +218,13 @@ pub trait AgentHarness: Send + Sync {
         cx: &'a Context,
     ) -> BoxFuture<'a, Result<Arc<dyn AgentLane>, HarnessError>>;
     /// Lists lanes in the session.
-    fn lanes<'a>(&'a self, cx: &'a Context)
-        -> BoxFuture<'a, Result<Vec<LaneInfo>, HarnessError>>;
+    fn lanes<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<Vec<LaneInfo>, HarnessError>>;
 
     /// Reads the session name.
-    fn get_name<'a>(&'a self, cx: &'a Context)
-        -> BoxFuture<'a, Result<Option<String>, HarnessError>>;
+    fn get_name<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<String>, HarnessError>>;
     /// Changes the session name.
     fn set_name<'a>(
         &'a self,
@@ -258,8 +257,10 @@ pub trait AgentHarness: Send + Sync {
         cx: &'a Context,
     ) -> BoxFuture<'a, Result<(), HarnessError>>;
     /// Reads configured skills and prompt templates.
-    fn get_resources<'a>(&'a self, cx: &'a Context)
-        -> BoxFuture<'a, Result<HarnessResources, HarnessError>>;
+    fn get_resources<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<HarnessResources, HarnessError>>;
     /// Replaces configured skills and prompt templates.
     fn set_resources<'a>(
         &'a self,
@@ -267,8 +268,10 @@ pub trait AgentHarness: Send + Sync {
         cx: &'a Context,
     ) -> BoxFuture<'a, Result<(), HarnessError>>;
     /// Reads provider stream options for future operations.
-    fn get_stream_options<'a>(&'a self, cx: &'a Context)
-        -> BoxFuture<'a, Result<crate::session::HarnessStreamOptions, HarnessError>>;
+    fn get_stream_options<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<crate::session::HarnessStreamOptions, HarnessError>>;
     /// Replaces provider stream options for future operations.
     fn set_stream_options<'a>(
         &'a self,
@@ -276,8 +279,10 @@ pub trait AgentHarness: Send + Sync {
         cx: &'a Context,
     ) -> BoxFuture<'a, Result<(), HarnessError>>;
     /// Reads whole-request retry policy for future operations.
-    fn get_retry_policy<'a>(&'a self, cx: &'a Context)
-        -> BoxFuture<'a, Result<HarnessRetryPolicy, HarnessError>>;
+    fn get_retry_policy<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<HarnessRetryPolicy, HarnessError>>;
     /// Validates and replaces whole-request retry policy for future operations.
     fn set_retry_policy<'a>(
         &'a self,
@@ -285,8 +290,10 @@ pub trait AgentHarness: Send + Sync {
         cx: &'a Context,
     ) -> BoxFuture<'a, Result<(), HarnessError>>;
     /// Reads compaction settings for future operations.
-    fn get_compaction_settings<'a>(&'a self, cx: &'a Context)
-        -> BoxFuture<'a, Result<CompactionSettings, HarnessError>>;
+    fn get_compaction_settings<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<CompactionSettings, HarnessError>>;
     /// Replaces compaction settings for future operations.
     fn set_compaction_settings<'a>(
         &'a self,
@@ -294,8 +301,10 @@ pub trait AgentHarness: Send + Sync {
         cx: &'a Context,
     ) -> BoxFuture<'a, Result<(), HarnessError>>;
     /// Reads the steering queue mode.
-    fn get_steering_mode<'a>(&'a self, cx: &'a Context)
-        -> BoxFuture<'a, Result<QueueMode, HarnessError>>;
+    fn get_steering_mode<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<QueueMode, HarnessError>>;
     /// Replaces the steering queue mode.
     fn set_steering_mode<'a>(
         &'a self,
@@ -303,8 +312,10 @@ pub trait AgentHarness: Send + Sync {
         cx: &'a Context,
     ) -> BoxFuture<'a, Result<(), HarnessError>>;
     /// Reads the follow-up queue mode.
-    fn get_follow_up_mode<'a>(&'a self, cx: &'a Context)
-        -> BoxFuture<'a, Result<QueueMode, HarnessError>>;
+    fn get_follow_up_mode<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<QueueMode, HarnessError>>;
     /// Replaces the follow-up queue mode.
     fn set_follow_up_mode<'a>(
         &'a self,

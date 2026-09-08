@@ -1,35 +1,32 @@
 //! Admission, queue, durable cancellation, and usage operations.
 
-use futures::future::{ready, FutureExt};
+use futures::future::{FutureExt, ready};
 
 use crate::context::Context;
 use crate::message::AgentMessage;
 use crate::queue::QueueMode;
 use crate::session::address::{
-    branch_tip, lane_state, operation_meta, operation_preparation, operation_state,
-    pending_entry,
+    branch_tip, lane_state, operation_meta, operation_preparation, operation_state, pending_entry,
 };
 use crate::session::operation::{
-    Control, Operation, OperationIntent, OperationKind, OperationState, ResultBoundary,
-    SummaryTask,
+    Control, Operation, OperationIntent, OperationKind, OperationState, ResultBoundary, SummaryTask,
 };
 use crate::session::{
     BranchScan, CompactionReason, Entry, EntryId, InboxItem, InboxItemKind, LaneName, LaneState,
     NewUsageRow, OperationId, PendingEntry, ScanOrder, Write,
 };
 
+use super::lane::LaneRuntime;
+use super::support::{
+    LaneData, RuntimeConfig, custom_entry_write, entry_write, map_session_error, new_entry_id,
+    new_operation_id, new_usage_id, operation_kind, operation_scope, pending_entry_write,
+    pending_write, prompt_messages, queue_message, read_pending, sealed_rejection, set_json,
+};
 use crate::harness::api::{OperationRequest, QueueInput, RecordUsageOptions};
 use crate::harness::event::HarnessEventPayload;
-use super::lane::LaneRuntime;
 use crate::harness::result::{
-    AbortRequestOutcome, AbortRequestResult, CancelQueuedKind, CancelQueuedResult,
-    HarnessError, HarnessFault, OperationAdmission, OperationAdmissionResult, RecordUsageResult,
-    QueueResult,
-};
-use super::support::{
-    custom_entry_write, entry_write, map_session_error, new_entry_id, new_operation_id,
-    new_usage_id, operation_kind, operation_scope, pending_entry_write, pending_write,
-    prompt_messages, queue_message, read_pending, sealed_rejection, set_json, LaneData, RuntimeConfig,
+    AbortRequestOutcome, AbortRequestResult, CancelQueuedKind, CancelQueuedResult, HarnessError,
+    HarnessFault, OperationAdmission, OperationAdmissionResult, QueueResult, RecordUsageResult,
 };
 
 /// Admit one operation without invoking a provider or tool.
@@ -40,7 +37,10 @@ pub(crate) async fn accept(
 ) -> OperationAdmissionResult {
     lane.ensure_open()?;
     match request {
-        OperationRequest::Prompt { operation_id, prompt } => {
+        OperationRequest::Prompt {
+            operation_id,
+            prompt,
+        } => {
             let messages = prompt_messages(prompt).map_err(|error| with_lane(error, &lane.name))?;
             accept_run(lane, operation_id, messages, cx).await
         }
@@ -95,13 +95,14 @@ pub(crate) async fn accept(
                 })?;
             let mut text = template.content.clone();
             for (index, arg) in args.iter().enumerate() {
-                let one_based = index
-                    .checked_add(1)
-                    .ok_or_else(|| HarnessError::InvalidMessage {
-                        lane: lane.name.clone(),
-                        reason: "template_arguments".to_owned(),
-                        message: "template argument index overflow".to_owned(),
-                    })?;
+                let one_based =
+                    index
+                        .checked_add(1)
+                        .ok_or_else(|| HarnessError::InvalidMessage {
+                            lane: lane.name.clone(),
+                            reason: "template_arguments".to_owned(),
+                            message: "template argument index overflow".to_owned(),
+                        })?;
                 text = text.replace(&format!("{{{index}}}"), arg);
                 text = text.replace(&format!("{{{one_based}}}"), arg);
             }
@@ -210,8 +211,8 @@ async fn commit_admission_writes<'a, Fut>(
 ) -> Result<tokio::sync::MutexGuard<'a, LaneData>, HarnessError>
 where
     Fut: futures::future::Future<
-        Output = Result<crate::session::CommitResult, crate::session::SessionError>,
-    >,
+            Output = Result<crate::session::CommitResult, crate::session::SessionError>,
+        >,
 {
     drop(data);
     if let Err(error) = commit.await {
@@ -272,7 +273,12 @@ async fn commit_run(
             PendingEntry::Custom {
                 custom_type,
                 payload,
-            } => writes.push(custom_entry_write(id.clone(), parent.clone(), custom_type, payload)),
+            } => writes.push(custom_entry_write(
+                id.clone(),
+                parent.clone(),
+                custom_type,
+                payload,
+            )),
         }
         parent = Some(id.clone());
         writes.push(crate::session::delete_value(&pending_entry(&id)));
@@ -313,12 +319,17 @@ async fn commit_run(
             .cloned()
             .collect(),
     };
-    writes.push(set_json(&operation_meta(&admission.operation_id), &operation.meta).map_err(map_session_error)?);
-    writes.push(set_json(&operation_state(&admission.operation_id), &operation.state).map_err(map_session_error)?);
+    writes.push(
+        set_json(&operation_meta(&admission.operation_id), &operation.meta)
+            .map_err(map_session_error)?,
+    );
+    writes.push(
+        set_json(&operation_state(&admission.operation_id), &operation.state)
+            .map_err(map_session_error)?,
+    );
     writes.push(set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?);
     writes.push(set_json(&branch_tip(lane.name.as_str()), &parent).map_err(map_session_error)?);
-    let mut data =
-        commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
+    let mut data = commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
     data.tip = parent;
     data.state = next_state;
     data.operation = Some(operation);
@@ -391,12 +402,17 @@ async fn accept_compaction(
     let writes = vec![
         set_json(&operation_meta(&operation_id), &operation.meta).map_err(map_session_error)?,
         set_json(&operation_state(&operation_id), &operation.state).map_err(map_session_error)?,
-        set_json(&operation_preparation(&operation_id, &task_id), &durable).map_err(map_session_error)?,
+        set_json(&operation_preparation(&operation_id, &task_id), &durable)
+            .map_err(map_session_error)?,
         set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?,
     ];
-    let mutator = lane.owner.session.begin_mutation(cx).await.map_err(map_session_error)?;
-    let mut data =
-        commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
+    let mutator = lane
+        .owner
+        .session
+        .begin_mutation(cx)
+        .await
+        .map_err(map_session_error)?;
+    let mut data = commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
     data.state = next_state;
     data.operation = Some(operation);
     drop(data);
@@ -517,13 +533,9 @@ async fn commit_navigation(
         intent,
     );
     let preparation = if summarize {
-        let entries = navigation_branch_entries(
-            lane,
-            data.tip.as_ref(),
-            admission.target_id.as_ref(),
-            cx,
-        )
-        .await?;
+        let entries =
+            navigation_branch_entries(lane, data.tip.as_ref(), admission.target_id.as_ref(), cx)
+                .await?;
         let context_window = if config.model.context_window == 0 {
             128_000
         } else {
@@ -568,7 +580,8 @@ async fn commit_navigation(
         inbox: data.state.inbox.clone(),
     };
     let mut writes = vec![
-        set_json(&operation_meta(&admission.operation_id), &operation.meta).map_err(map_session_error)?,
+        set_json(&operation_meta(&admission.operation_id), &operation.meta)
+            .map_err(map_session_error)?,
         set_json(&operation_state(&admission.operation_id), &operation.state)
             .map_err(map_session_error)?,
         set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?,
@@ -582,9 +595,13 @@ async fn commit_navigation(
             .map_err(map_session_error)?,
         );
     }
-    let mutator = lane.owner.session.begin_mutation(cx).await.map_err(map_session_error)?;
-    let mut data =
-        commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
+    let mutator = lane
+        .owner
+        .session
+        .begin_mutation(cx)
+        .await
+        .map_err(map_session_error)?;
+    let mut data = commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
     data.state = next_state;
     data.operation = Some(operation);
     Ok(())
@@ -643,13 +660,12 @@ pub(crate) async fn enqueue(
     let id = new_entry_id(lane.owner.session.as_ref()).map_err(map_session_error)?;
     let pending = PendingEntry::Message { payload: message };
     let mut data = lane.data.lock().await;
-    let pending_value_write =
-        pending_entry_write(&id, &pending).map_err(map_session_error)?;
+    let pending_value_write = pending_entry_write(&id, &pending).map_err(map_session_error)?;
     let mut next_state = data.state.clone();
     next_state.inbox.push(pending_write(id.clone(), kind));
-    let state_write =
-        set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?;
-    lane.commit(vec![pending_value_write, state_write], cx).await?;
+    let state_write = set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?;
+    lane.commit(vec![pending_value_write, state_write], cx)
+        .await?;
     data.state = next_state;
     let queues = data.state.inbox.clone();
     drop(data);
@@ -689,8 +705,7 @@ pub(crate) async fn cancel_queued(
     };
     let mut next_state = data.state.clone();
     next_state.inbox.remove(index);
-    let state_write =
-        set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?;
+    let state_write = set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?;
     let delete_write = crate::session::delete_value(&pending_entry(entry));
     lane.commit(vec![delete_write, state_write], cx).await?;
     data.state = next_state;
@@ -715,10 +730,13 @@ pub(crate) async fn request_abort(
 ) -> AbortRequestResult {
     lane.ensure_open()?;
     let mut data = lane.data.lock().await;
-    let operation = data.operation.clone().ok_or_else(|| HarnessError::NoActiveOperation {
-        lane: lane.name.clone(),
-        message: "lane has no active operation".to_owned(),
-    })?;
+    let operation = data
+        .operation
+        .clone()
+        .ok_or_else(|| HarnessError::NoActiveOperation {
+            lane: lane.name.clone(),
+            message: "lane has no active operation".to_owned(),
+        })?;
     if operation.meta.operation_id != *operation_id {
         return Err(HarnessError::OperationMismatch {
             lane: lane.name.clone(),
@@ -728,7 +746,10 @@ pub(crate) async fn request_abort(
             message: "abort request does not name the current operation".to_owned(),
         });
     }
-    if matches!(&operation.state.scope().control, Control::CancelRequested { .. }) {
+    if matches!(
+        &operation.state.scope().control,
+        Control::CancelRequested { .. }
+    ) {
         return Ok(AbortRequestOutcome {
             operation_id: operation_id.clone(),
             newly_requested: false,
@@ -776,13 +797,23 @@ pub(crate) async fn request_abort(
             .state
             .inbox
             .iter()
-            .filter(|item| !drained_items.iter().any(|drained| drained.entry_id == item.entry_id))
+            .filter(|item| {
+                !drained_items
+                    .iter()
+                    .any(|drained| drained.entry_id == item.entry_id)
+            })
             .cloned()
             .collect(),
     };
-    writes.push(set_json(&operation_state(operation_id), &next_operation.state).map_err(map_session_error)?);
+    writes.push(
+        set_json(&operation_state(operation_id), &next_operation.state)
+            .map_err(map_session_error)?,
+    );
     writes.push(set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?);
-    mutator.commit(writes, cx).await.map_err(map_session_error)?;
+    mutator
+        .commit(writes, cx)
+        .await
+        .map_err(map_session_error)?;
     data.state = next_state;
     data.operation = Some(next_operation);
     drop(data);
@@ -897,7 +928,9 @@ fn select_inbox(
 
 fn with_lane(error: HarnessError, lane: &LaneName) -> HarnessError {
     match error {
-        HarnessError::InvalidMessage { reason, message, .. } => HarnessError::InvalidMessage {
+        HarnessError::InvalidMessage {
+            reason, message, ..
+        } => HarnessError::InvalidMessage {
             lane: lane.clone(),
             reason,
             message,

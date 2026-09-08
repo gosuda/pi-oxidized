@@ -6,8 +6,8 @@
 
 use std::error::Error;
 
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::message::AgentMessage;
 use crate::session::{
@@ -444,4 +444,3 @@ pub struct OpenOperation {
     /// Whether an abort was already requested.
     pub aborting: bool,
 }
-

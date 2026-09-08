@@ -10,17 +10,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use futures::future::BoxFuture;
-use tokio::sync::{watch, Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 
-use crate::context::Context;
-use crate::message::AgentMessage;
 use super::address::{self, ListReadOptions, RawAddress};
 use super::entry::{Entry, NewEntry, NewEntryBody};
 use super::error::{SessionError, StorageErrorCode, StorageFailure};
 use super::ids::{EntryId, LaneName};
-use super::scan::{BranchScan, EntryQuery, EntryScan, RawListElement, RawStoredValue, ScanOrder, StorageBranchScan};
-use super::traits::{Branch, IdGenerator, MutationGuard, Session, SessionMetadata, SessionMutation, SessionReader, SessionReaderExt, Storage};
+use super::scan::{
+    BranchScan, EntryQuery, EntryScan, RawListElement, RawStoredValue, ScanOrder, StorageBranchScan,
+};
+use super::traits::{
+    Branch, IdGenerator, MutationGuard, Session, SessionMetadata, SessionMutation, SessionReader,
+    SessionReaderExt, Storage,
+};
 use super::write::{self, CommitResult, ListWrite, SessionStats, ValueWrite, Write};
+use crate::context::Context;
+use crate::message::AgentMessage;
 
 type CloseResult = Result<(), SessionError>;
 type CloseCallback = Box<dyn Fn() + Send + Sync>;
@@ -37,7 +42,11 @@ impl CloseOperation {
             if let Some(outcome) = result.borrow().as_ref().cloned() {
                 return outcome;
             }
-            result.changed().await.map_err(|_| SessionError::Invariant("session close task ended before publishing result".to_owned()))?;
+            result.changed().await.map_err(|_| {
+                SessionError::Invariant(
+                    "session close task ended before publishing result".to_owned(),
+                )
+            })?;
         }
     }
 }
@@ -64,50 +73,64 @@ impl CloseState {
     }
 
     fn start(&self, cx: &Context) -> Arc<CloseOperation> {
-        self.operation.get_or_init(|| {
-            let (sender, receiver) = watch::channel::<Option<CloseResult>>(None);
-            let storage = Arc::clone(&self.storage);
-            let mutation = Arc::clone(&self.mutation);
-            let on_close = Arc::clone(&self.on_close);
-            let context = cx.clone();
-            tokio::spawn(async move {
-                let guard = mutation.lock().await;
-                let close_context = context.without_cancellation();
-                let result = storage.close(&close_context).await;
-                drop(guard);
+        self.operation
+            .get_or_init(|| {
+                let (sender, receiver) = watch::channel::<Option<CloseResult>>(None);
+                let storage = Arc::clone(&self.storage);
+                let mutation = Arc::clone(&self.mutation);
+                let on_close = Arc::clone(&self.on_close);
+                let context = cx.clone();
+                tokio::spawn(async move {
+                    let guard = mutation.lock().await;
+                    let close_context = context.without_cancellation();
+                    let result = storage.close(&close_context).await;
+                    drop(guard);
 
-                let callback = match on_close.lock() {
-                    Ok(mut on_close) => on_close.take(),
-                    Err(poisoned) => poisoned.into_inner().take(),
-                };
-                if let Some(callback) = callback {
-                    callback();
-                }
-                let _ = sender.send(Some(result));
-            });
-            Arc::new(CloseOperation { result: receiver })
-        }).clone()
+                    let callback = match on_close.lock() {
+                        Ok(mut on_close) => on_close.take(),
+                        Err(poisoned) => poisoned.into_inner().take(),
+                    };
+                    if let Some(callback) = callback {
+                        callback();
+                    }
+                    let _ = sender.send(Some(result));
+                });
+                Arc::new(CloseOperation { result: receiver })
+            })
+            .clone()
     }
 }
 
 /// The session is closed; returned by every operation admitted after
 /// [`Session::close`] begins.
 pub(super) fn closed_error() -> SessionError {
-    SessionError::Backend(StorageFailure::new(StorageErrorCode::Closed, "session storage is closed"))
+    SessionError::Backend(StorageFailure::new(
+        StorageErrorCode::Closed,
+        "session storage is closed",
+    ))
 }
 
 /// The caller's cancellation token fired before the operation touched state.
 pub(super) fn aborted_error() -> SessionError {
-    SessionError::Backend(StorageFailure::new(StorageErrorCode::Aborted, "operation cancelled"))
+    SessionError::Backend(StorageFailure::new(
+        StorageErrorCode::Aborted,
+        "operation cancelled",
+    ))
 }
 
 /// Rejects branch names a backend could not key on: empty, or containing NUL.
 pub(super) fn validate_branch_name(name: &LaneName) -> Result<(), SessionError> {
     if name.as_str().is_empty() {
-        return Err(SessionError::InvalidBranch { branch: name.clone(), reason: "branch name must not be empty".to_owned() });
+        return Err(SessionError::InvalidBranch {
+            branch: name.clone(),
+            reason: "branch name must not be empty".to_owned(),
+        });
     }
     if name.as_str().contains('\0') {
-        return Err(SessionError::InvalidBranch { branch: name.clone(), reason: "branch name must not contain \\u0000".to_owned() });
+        return Err(SessionError::InvalidBranch {
+            branch: name.clone(),
+            reason: "branch name must not contain \\u0000".to_owned(),
+        });
     }
     Ok(())
 }
@@ -149,7 +172,11 @@ impl StorageBackedSession {
         on_close: Option<Box<dyn Fn() + Send + Sync>>,
     ) -> Arc<Self> {
         let mutation = Arc::new(Mutex::new(()));
-        let close_state = Arc::new(CloseState::new(Arc::clone(&storage), Arc::clone(&mutation), on_close));
+        let close_state = Arc::new(CloseState::new(
+            Arc::clone(&storage),
+            Arc::clone(&mutation),
+            on_close,
+        ));
         Arc::new_cyclic(|this| Self {
             metadata,
             storage,
@@ -162,12 +189,22 @@ impl StorageBackedSession {
     }
 
     fn ensure_open(&self) -> Result<(), SessionError> {
-        if self.closed.load(Ordering::Acquire) { Err(closed_error()) } else { Ok(()) }
+        if self.closed.load(Ordering::Acquire) {
+            Err(closed_error())
+        } else {
+            Ok(())
+        }
     }
 
     fn branch_handle(&self, name: &LaneName) -> Result<Arc<dyn Branch>, SessionError> {
-        let session = self.this.upgrade().ok_or_else(|| SessionError::Invariant("session handle dropped".to_owned()))?;
-        Ok(Arc::new(StorageBackedBranch { session, name: name.clone() }))
+        let session = self
+            .this
+            .upgrade()
+            .ok_or_else(|| SessionError::Invariant("session handle dropped".to_owned()))?;
+        Ok(Arc::new(StorageBackedBranch {
+            session,
+            name: name.clone(),
+        }))
     }
 
     /// Appends `body` as a new entry on `name`'s tip and moves the tip in the
@@ -176,9 +213,17 @@ impl StorageBackedSession {
     /// The pending-assistant rejection runs before the id is reserved so a
     /// refused append never burns a generator id, and before the mutation slot
     /// is taken so it never waits on the line.
-    async fn append_to_branch(&self, name: &LaneName, body: NewEntryBody, cx: &Context) -> Result<EntryId, SessionError> {
+    async fn append_to_branch(
+        &self,
+        name: &LaneName,
+        body: NewEntryBody,
+        cx: &Context,
+    ) -> Result<EntryId, SessionError> {
         self.ensure_open()?;
-        if let NewEntryBody::Message { message: AgentMessage::Llm(llm), .. } = &body
+        if let NewEntryBody::Message {
+            message: AgentMessage::Llm(llm),
+            ..
+        } = &body
             && let pi_ai::Message::Assistant(assistant) = llm.as_ref()
             && matches!(assistant.stop_reason, pi_ai::StopReason::Pending)
         {
@@ -195,7 +240,13 @@ impl StorageBackedSession {
         mutation
             .commit(
                 vec![
-                    Write::Entry { entry: NewEntry { id: id.clone(), parent_id, body } },
+                    Write::Entry {
+                        entry: NewEntry {
+                            id: id.clone(),
+                            parent_id,
+                            body,
+                        },
+                    },
                     write::set_value(&tip_address, &Some(id.clone()))?,
                 ],
                 cx,
@@ -206,42 +257,66 @@ impl StorageBackedSession {
 }
 
 impl SessionReader for StorageBackedSession {
-    fn get_entries<'a>(&'a self, ids: &'a [EntryId], cx: &'a Context) -> BoxFuture<'a, Result<HashMap<EntryId, Entry>, SessionError>> {
+    fn get_entries<'a>(
+        &'a self,
+        ids: &'a [EntryId],
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<HashMap<EntryId, Entry>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             self.storage.get_entries(ids, cx).await
         })
     }
-    fn get_stats<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<SessionStats, SessionError>> {
+    fn get_stats<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<SessionStats, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             self.storage.get_stats(cx).await
         })
     }
-    fn get_value_json<'a>(&'a self, address: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<Option<RawStoredValue>, SessionError>> {
+    fn get_value_json<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<RawStoredValue>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             self.storage.get_value(address, cx).await
         })
     }
-    fn scan_values_json<'a>(&'a self, prefix: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<Vec<RawStoredValue>, SessionError>> {
+    fn scan_values_json<'a>(
+        &'a self,
+        prefix: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<RawStoredValue>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             self.storage.scan_values(prefix, cx).await
         })
     }
-    fn read_list_json<'a>(&'a self, address: &'a RawAddress, options: Option<ListReadOptions>, cx: &'a Context) -> BoxFuture<'a, Result<Vec<RawListElement>, SessionError>> {
+    fn read_list_json<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        options: Option<ListReadOptions>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<RawListElement>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             self.storage.read_list(address, options, cx).await
         })
     }
-    fn scan_branch<'a>(&'a self, query: &'a StorageBranchScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+    fn scan_branch<'a>(
+        &'a self,
+        query: &'a StorageBranchScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
@@ -257,19 +332,44 @@ impl Session for StorageBackedSession {
     fn id_generator(&self) -> &dyn IdGenerator {
         &*self.id_generator
     }
-    fn get_entry<'a>(&'a self, id: &'a EntryId, cx: &'a Context) -> BoxFuture<'a, Result<Option<Entry>, SessionError>> {
+    fn get_entry<'a>(
+        &'a self,
+        id: &'a EntryId,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<Entry>, SessionError>> {
         Box::pin(async move {
             let mut entries = self.get_entries(std::slice::from_ref(id), cx).await?;
             Ok(entries.remove(id))
         })
     }
-    fn get_name<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<Option<String>, SessionError>> {
-        Box::pin(async move { Ok(self.get_value(&address::session_name(), cx).await?.map(|stored| stored.value)) })
+    fn get_name<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<String>, SessionError>> {
+        Box::pin(async move {
+            Ok(self
+                .get_value(&address::session_name(), cx)
+                .await?
+                .map(|stored| stored.value))
+        })
     }
-    fn get_label<'a>(&'a self, target: &'a EntryId, cx: &'a Context) -> BoxFuture<'a, Result<Option<String>, SessionError>> {
-        Box::pin(async move { Ok(self.get_value(&address::entry_label(target), cx).await?.map(|stored| stored.value)) })
+    fn get_label<'a>(
+        &'a self,
+        target: &'a EntryId,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<String>, SessionError>> {
+        Box::pin(async move {
+            Ok(self
+                .get_value(&address::entry_label(target), cx)
+                .await?
+                .map(|stored| stored.value))
+        })
     }
-    fn find_entries<'a>(&'a self, query: Option<&'a EntryQuery>, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+    fn find_entries<'a>(
+        &'a self,
+        query: Option<&'a EntryQuery>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
@@ -279,27 +379,55 @@ impl Session for StorageBackedSession {
                 ScanOrder::Asc => (Some(cursor.seq.saturating_add(1)), None),
                 ScanOrder::Desc => (None, Some(cursor.seq.saturating_sub(1))),
             });
-            let scan = EntryScan { from_seq, to_seq, order: Some(order), limit: query.limit, entry_type: query.entry_type, custom_type: query.custom_type };
+            let scan = EntryScan {
+                from_seq,
+                to_seq,
+                order: Some(order),
+                limit: query.limit,
+                entry_type: query.entry_type,
+                custom_type: query.custom_type,
+            };
             self.storage.scan_entries(&scan, cx).await
         })
     }
-    fn find_entry<'a>(&'a self, query: Option<&'a EntryQuery>, cx: &'a Context) -> BoxFuture<'a, Result<Option<Entry>, SessionError>> {
+    fn find_entry<'a>(
+        &'a self,
+        query: Option<&'a EntryQuery>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<Entry>, SessionError>> {
         Box::pin(async move {
             let mut query = query.cloned().unwrap_or_default();
             query.limit = Some(query.limit.map_or(1, |limit| limit.min(1)));
-            Ok(self.find_entries(Some(&query), cx).await?.into_iter().next())
+            Ok(self
+                .find_entries(Some(&query), cx)
+                .await?
+                .into_iter()
+                .next())
         })
     }
-    fn branch<'a>(&'a self, name: &'a LaneName, cx: &'a Context) -> BoxFuture<'a, Result<Option<Arc<dyn Branch>>, SessionError>> {
+    fn branch<'a>(
+        &'a self,
+        name: &'a LaneName,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<Arc<dyn Branch>>, SessionError>> {
         Box::pin(async move {
             validate_branch_name(name)?;
-            if self.get_value(&address::branch_tip(name.as_str()), cx).await?.is_none() {
+            if self
+                .get_value(&address::branch_tip(name.as_str()), cx)
+                .await?
+                .is_none()
+            {
                 return Ok(None);
             }
             self.branch_handle(name).map(Some)
         })
     }
-    fn create_branch<'a>(&'a self, name: &'a LaneName, at: Option<&'a EntryId>, cx: &'a Context) -> BoxFuture<'a, Result<Arc<dyn Branch>, SessionError>> {
+    fn create_branch<'a>(
+        &'a self,
+        name: &'a LaneName,
+        at: Option<&'a EntryId>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Arc<dyn Branch>, SessionError>> {
         Box::pin(async move {
             self.ensure_open()?;
             validate_branch_name(name)?;
@@ -309,17 +437,25 @@ impl Session for StorageBackedSession {
                 return Err(SessionError::BranchExists(name.clone()));
             }
             if let Some(at) = at
-                && mutation.get_entries(std::slice::from_ref(at), cx).await?.is_empty()
+                && mutation
+                    .get_entries(std::slice::from_ref(at), cx)
+                    .await?
+                    .is_empty()
             {
                 return Err(SessionError::UnknownTarget(at.clone()));
             }
             // A `None` anchor persists JSON `null`: the branch exists but is
             // empty, exactly like a branch whose tip was never moved.
-            mutation.commit(vec![write::set_value(&tip_address, &at.cloned())?], cx).await?;
+            mutation
+                .commit(vec![write::set_value(&tip_address, &at.cloned())?], cx)
+                .await?;
             self.branch_handle(name)
         })
     }
-    fn begin_mutation<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<MutationGuard<'a>, SessionError>> {
+    fn begin_mutation<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<MutationGuard<'a>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
@@ -328,59 +464,121 @@ impl Session for StorageBackedSession {
             // lock; sealed waiters are rejected, never run.
             self.ensure_open()?;
             cx.check().map_err(|_| aborted_error())?;
-            Ok(Box::new(StorageBackedMutation { session: self, guard }) as MutationGuard<'a>)
+            Ok(Box::new(StorageBackedMutation {
+                session: self,
+                guard,
+            }) as MutationGuard<'a>)
         })
     }
-    fn set_value_json<'a>(&'a self, address: &'a RawAddress, next: serde_json::Value, cx: &'a Context) -> BoxFuture<'a, Result<(), SessionError>> {
+    fn set_value_json<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        next: serde_json::Value,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
             self.begin_mutation(cx)
                 .await?
-                .commit(vec![Write::Value(ValueWrite::Set { namespace: address.namespace.clone(), key: address.key.clone(), value: next })], cx)
+                .commit(
+                    vec![Write::Value(ValueWrite::Set {
+                        namespace: address.namespace.clone(),
+                        key: address.key.clone(),
+                        value: next,
+                    })],
+                    cx,
+                )
                 .await
                 .map(|_| ())
         })
     }
-    fn delete_value_json<'a>(&'a self, address: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<(), SessionError>> {
+    fn delete_value_json<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
             self.begin_mutation(cx)
                 .await?
-                .commit(vec![Write::Value(ValueWrite::Delete { namespace: address.namespace.clone(), key: address.key.clone() })], cx)
+                .commit(
+                    vec![Write::Value(ValueWrite::Delete {
+                        namespace: address.namespace.clone(),
+                        key: address.key.clone(),
+                    })],
+                    cx,
+                )
                 .await
                 .map(|_| ())
         })
     }
-    fn append_list_json<'a>(&'a self, address: &'a RawAddress, element: serde_json::Value, cx: &'a Context) -> BoxFuture<'a, Result<(), SessionError>> {
+    fn append_list_json<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        element: serde_json::Value,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
             self.begin_mutation(cx)
                 .await?
-                .commit(vec![Write::List(ListWrite::Append { namespace: address.namespace.clone(), key: address.key.clone(), value: element })], cx)
+                .commit(
+                    vec![Write::List(ListWrite::Append {
+                        namespace: address.namespace.clone(),
+                        key: address.key.clone(),
+                        value: element,
+                    })],
+                    cx,
+                )
                 .await
                 .map(|_| ())
         })
     }
-    fn delete_list_json<'a>(&'a self, address: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<(), SessionError>> {
+    fn delete_list_json<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
             self.begin_mutation(cx)
                 .await?
-                .commit(vec![Write::List(ListWrite::Delete { namespace: address.namespace.clone(), key: address.key.clone() })], cx)
+                .commit(
+                    vec![Write::List(ListWrite::Delete {
+                        namespace: address.namespace.clone(),
+                        key: address.key.clone(),
+                    })],
+                    cx,
+                )
                 .await
                 .map(|_| ())
         })
     }
-    fn set_name<'a>(&'a self, name: Option<&'a str>, cx: &'a Context) -> BoxFuture<'a, Result<(), SessionError>> {
+    fn set_name<'a>(
+        &'a self,
+        name: Option<&'a str>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
         let address = address::session_name().erase();
         Box::pin(async move {
             match name {
-                Some(name) => self.set_value_json(&address, serde_json::Value::String(name.to_owned()), cx).await,
+                Some(name) => {
+                    self.set_value_json(&address, serde_json::Value::String(name.to_owned()), cx)
+                        .await
+                }
                 None => self.delete_value_json(&address, cx).await,
             }
         })
     }
-    fn set_label<'a>(&'a self, target: &'a EntryId, label: Option<&'a str>, cx: &'a Context) -> BoxFuture<'a, Result<(), SessionError>> {
+    fn set_label<'a>(
+        &'a self,
+        target: &'a EntryId,
+        label: Option<&'a str>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
         let address = address::entry_label(target).erase();
         Box::pin(async move {
             match label {
-                Some(label) => self.set_value_json(&address, serde_json::Value::String(label.to_owned()), cx).await,
+                Some(label) => {
+                    self.set_value_json(&address, serde_json::Value::String(label.to_owned()), cx)
+                        .await
+                }
                 None => self.delete_value_json(&address, cx).await,
             }
         })
@@ -408,28 +606,56 @@ struct StorageBackedMutation<'s> {
 }
 
 impl SessionReader for StorageBackedMutation<'_> {
-    fn get_entries<'a>(&'a self, ids: &'a [EntryId], cx: &'a Context) -> BoxFuture<'a, Result<HashMap<EntryId, Entry>, SessionError>> {
+    fn get_entries<'a>(
+        &'a self,
+        ids: &'a [EntryId],
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<HashMap<EntryId, Entry>, SessionError>> {
         self.session.storage.get_entries(ids, cx)
     }
-    fn get_stats<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<SessionStats, SessionError>> {
+    fn get_stats<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<SessionStats, SessionError>> {
         self.session.storage.get_stats(cx)
     }
-    fn get_value_json<'a>(&'a self, address: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<Option<RawStoredValue>, SessionError>> {
+    fn get_value_json<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<RawStoredValue>, SessionError>> {
         self.session.storage.get_value(address, cx)
     }
-    fn scan_values_json<'a>(&'a self, prefix: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<Vec<RawStoredValue>, SessionError>> {
+    fn scan_values_json<'a>(
+        &'a self,
+        prefix: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<RawStoredValue>, SessionError>> {
         self.session.storage.scan_values(prefix, cx)
     }
-    fn read_list_json<'a>(&'a self, address: &'a RawAddress, options: Option<ListReadOptions>, cx: &'a Context) -> BoxFuture<'a, Result<Vec<RawListElement>, SessionError>> {
+    fn read_list_json<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        options: Option<ListReadOptions>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<RawListElement>, SessionError>> {
         self.session.storage.read_list(address, options, cx)
     }
-    fn scan_branch<'a>(&'a self, query: &'a StorageBranchScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+    fn scan_branch<'a>(
+        &'a self,
+        query: &'a StorageBranchScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
         self.session.storage.scan_branch(query, cx)
     }
 }
 
 impl<'s> SessionMutation<'s> for StorageBackedMutation<'s> {
-    fn commit(self: Box<Self>, writes: Vec<Write>, cx: &Context) -> BoxFuture<'s, Result<CommitResult, SessionError>> {
+    fn commit(
+        self: Box<Self>,
+        writes: Vec<Write>,
+        cx: &Context,
+    ) -> BoxFuture<'s, Result<CommitResult, SessionError>> {
         let context = cx.clone();
         Box::pin(async move {
             context.check().map_err(|_| aborted_error())?;
@@ -443,7 +669,9 @@ impl<'s> SessionMutation<'s> for StorageBackedMutation<'s> {
             });
             match task.await {
                 Ok(result) => result,
-                Err(error) => Err(SessionError::Invariant(format!("session commit task failed: {error}"))),
+                Err(error) => Err(SessionError::Invariant(format!(
+                    "session commit task failed: {error}"
+                ))),
             }
         })
     }
@@ -463,7 +691,10 @@ impl Branch for StorageBackedBranch {
     fn name(&self) -> &LaneName {
         &self.name
     }
-    fn get_tip_id<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<Option<EntryId>, SessionError>> {
+    fn get_tip_id<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<EntryId>, SessionError>> {
         Box::pin(async move {
             self.session
                 .get_value(&address::branch_tip(self.name.as_str()), cx)
@@ -472,14 +703,20 @@ impl Branch for StorageBackedBranch {
                 .ok_or_else(|| SessionError::Invariant(format!("unknown branch: {}", self.name)))
         })
     }
-    fn find_entries<'a>(&'a self, query: Option<&'a BranchScan>, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+    fn find_entries<'a>(
+        &'a self,
+        query: Option<&'a BranchScan>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
         Box::pin(async move {
             let query = query.cloned().unwrap_or_default();
             let start = match query.start {
                 Some(start) => Some(start),
                 None => self.get_tip_id(cx).await?,
             };
-            let Some(start) = start else { return Ok(Vec::new()) };
+            let Some(start) = start else {
+                return Ok(Vec::new());
+            };
             self.session
                 .scan_branch(
                     &StorageBranchScan {
@@ -497,17 +734,56 @@ impl Branch for StorageBackedBranch {
                 .await
         })
     }
-    fn find_entry<'a>(&'a self, query: Option<&'a BranchScan>, cx: &'a Context) -> BoxFuture<'a, Result<Option<Entry>, SessionError>> {
+    fn find_entry<'a>(
+        &'a self,
+        query: Option<&'a BranchScan>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<Entry>, SessionError>> {
         Box::pin(async move {
             let mut query = query.cloned().unwrap_or_default();
             query.limit = Some(query.limit.map_or(1, |limit| limit.min(1)));
-            Ok(self.find_entries(Some(&query), cx).await?.into_iter().next())
+            Ok(self
+                .find_entries(Some(&query), cx)
+                .await?
+                .into_iter()
+                .next())
         })
     }
-    fn append_message<'a>(&'a self, message: AgentMessage, cx: &'a Context) -> BoxFuture<'a, Result<EntryId, SessionError>> {
-        Box::pin(async move { self.session.append_to_branch(&self.name, NewEntryBody::Message { message, terminate: false }, cx).await })
+    fn append_message<'a>(
+        &'a self,
+        message: AgentMessage,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<EntryId, SessionError>> {
+        Box::pin(async move {
+            self.session
+                .append_to_branch(
+                    &self.name,
+                    NewEntryBody::Message {
+                        message,
+                        terminate: false,
+                    },
+                    cx,
+                )
+                .await
+        })
     }
-    fn append_custom_entry<'a>(&'a self, custom_type: &'a str, data: Option<serde_json::Value>, cx: &'a Context) -> BoxFuture<'a, Result<EntryId, SessionError>> {
-        Box::pin(async move { self.session.append_to_branch(&self.name, NewEntryBody::Custom { custom_type: custom_type.to_owned(), data }, cx).await })
+    fn append_custom_entry<'a>(
+        &'a self,
+        custom_type: &'a str,
+        data: Option<serde_json::Value>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<EntryId, SessionError>> {
+        Box::pin(async move {
+            self.session
+                .append_to_branch(
+                    &self.name,
+                    NewEntryBody::Custom {
+                        custom_type: custom_type.to_owned(),
+                        data,
+                    },
+                    cx,
+                )
+                .await
+        })
     }
 }

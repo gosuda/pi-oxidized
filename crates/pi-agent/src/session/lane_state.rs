@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::message::AgentMessage;
 use super::{EntryId, OperationId};
+use crate::message::AgentMessage;
 
 /// Model identity persisted in lane configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -68,7 +68,7 @@ pub enum InboxItemKind {
     NextRun,
     /// Serialized literal `"write"` — a custom (non-message) payload queued for
     /// durable writing rather than for model context.
-    Write
+    Write,
 }
 
 /// Entry payload staged under its reserved id before it joins a branch.
@@ -78,13 +78,13 @@ pub enum PendingEntry {
     /// Tag `"message"` — a message payload not yet appended to the branch.
     Message {
         /// Staged message.
-        payload: AgentMessage
+        payload: AgentMessage,
     },
     /// Tag `"custom"` — an application-defined payload not yet appended.
     Custom {
         /// Application discriminator the eventual custom entry will carry.
         custom_type: String,
         /// Staged payload; `None` is a marker with no data.
-        payload: Option<serde_json::Value>
+        payload: Option<serde_json::Value>,
     },
 }

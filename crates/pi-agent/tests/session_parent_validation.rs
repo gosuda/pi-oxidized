@@ -4,17 +4,20 @@
 //! in the same batch. Usage-row ids share the global duplicate-id namespace
 //! but can never parent an entry, and an entry can never parent itself.
 #![expect(clippy::panic, reason = "test failure paths panic with context")]
-#![expect(clippy::expect_used, reason = "test assertions use expect for concise failure")]
+#![expect(
+    clippy::expect_used,
+    reason = "test assertions use expect for concise failure"
+)]
 
 use std::collections::HashSet;
 
+use pi_agent::AgentMessage;
 use pi_agent::context::Context;
 use pi_agent::pi_ai;
 use pi_agent::session::{
     CommittedIdView, Entry, EntryId, MemoryStorage, NewEntry, NewEntryBody, NewUsageRow,
     SessionError, Storage, UsageId, Write, validate_committed_writes,
 };
-use pi_agent::AgentMessage;
 
 /// Minimal committed-state view: `ids` is the global identity namespace
 /// (committed entries and usage rows), `entry_ids` is entry-only membership.
@@ -26,15 +29,27 @@ struct View {
 
 impl View {
     fn empty() -> Self {
-        Self { ids: HashSet::new(), entry_ids: HashSet::new(), next_seq: 1 }
+        Self {
+            ids: HashSet::new(),
+            entry_ids: HashSet::new(),
+            next_seq: 1,
+        }
     }
 
     fn committed_entry(id: &str) -> Self {
-        Self { ids: HashSet::from([id.to_owned()]), entry_ids: HashSet::from([EntryId::from(id)]), next_seq: 1 }
+        Self {
+            ids: HashSet::from([id.to_owned()]),
+            entry_ids: HashSet::from([EntryId::from(id)]),
+            next_seq: 1,
+        }
     }
 
     fn committed_usage(id: &str) -> Self {
-        Self { ids: HashSet::from([id.to_owned()]), entry_ids: HashSet::new(), next_seq: 1 }
+        Self {
+            ids: HashSet::from([id.to_owned()]),
+            entry_ids: HashSet::new(),
+            next_seq: 1,
+        }
     }
 }
 
@@ -57,7 +72,10 @@ fn entry(id: &str, parent: Option<&str>) -> Write {
         entry: NewEntry {
             id: EntryId::from(id),
             parent_id: parent.map(EntryId::from),
-            body: NewEntryBody::Custom { custom_type: "note".to_owned(), data: None },
+            body: NewEntryBody::Custom {
+                custom_type: "note".to_owned(),
+                data: None,
+            },
         },
     }
 }
@@ -109,7 +127,11 @@ fn accepts_committed_entry_parent() {
 #[test]
 fn accepts_earlier_same_batch_entry_parent() {
     let view = View::empty();
-    let writes = [entry("a", None), entry("b", Some("a")), entry("c", Some("b"))];
+    let writes = [
+        entry("a", None),
+        entry("b", Some("a")),
+        entry("c", Some("b")),
+    ];
     assert!(validate_committed_writes(&writes, 1, &view).is_ok());
 }
 
@@ -123,13 +145,19 @@ fn accepts_mixed_batch_with_entry_chain() {
 #[test]
 fn rejects_self_parent() {
     let view = View::empty();
-    expect_missing_parent(validate_committed_writes(&[entry("a", Some("a"))], 1, &view), "a");
+    expect_missing_parent(
+        validate_committed_writes(&[entry("a", Some("a"))], 1, &view),
+        "a",
+    );
 }
 
 #[test]
 fn rejects_committed_usage_row_as_parent() {
     let view = View::committed_usage("u1");
-    expect_missing_parent(validate_committed_writes(&[entry("a", Some("u1"))], 1, &view), "u1");
+    expect_missing_parent(
+        validate_committed_writes(&[entry("a", Some("u1"))], 1, &view),
+        "u1",
+    );
 }
 
 #[test]
@@ -149,7 +177,10 @@ fn rejects_later_same_batch_entry_as_parent() {
 #[test]
 fn rejects_unknown_parent() {
     let view = View::empty();
-    expect_missing_parent(validate_committed_writes(&[entry("a", Some("ghost"))], 1, &view), "ghost");
+    expect_missing_parent(
+        validate_committed_writes(&[entry("a", Some("ghost"))], 1, &view),
+        "ghost",
+    );
 }
 
 #[test]
@@ -183,7 +214,10 @@ fn rejects_id_committed_under_other_kind() {
 fn rejects_pending_assistant_message() {
     let view = View::empty();
     let result = validate_committed_writes(&[pending_assistant_entry("a", None)], 1, &view);
-    assert!(matches!(result, Err(SessionError::PendingAssistantMessage)), "got {result:?}");
+    assert!(
+        matches!(result, Err(SessionError::PendingAssistantMessage)),
+        "got {result:?}"
+    );
 }
 
 #[test]
@@ -203,9 +237,18 @@ async fn storage_accepts_committed_and_earlier_entry_parents() {
     let storage = MemoryStorage::new();
     let cx = Context::background();
 
-    storage.commit(vec![entry("root", None)], &cx).await.expect("root commit should succeed");
+    storage
+        .commit(vec![entry("root", None)], &cx)
+        .await
+        .expect("root commit should succeed");
     let result = storage
-        .commit(vec![entry("child", Some("root")), entry("grandchild", Some("child"))], &cx)
+        .commit(
+            vec![
+                entry("child", Some("root")),
+                entry("grandchild", Some("child")),
+            ],
+            &cx,
+        )
         .await
         .expect("true entry ancestors should be accepted");
 
@@ -214,11 +257,20 @@ async fn storage_accepts_committed_and_earlier_entry_parents() {
     let child_id = EntryId::from("child");
     let grandchild_id = EntryId::from("grandchild");
     let entries = storage
-        .get_entries(&[root_id.clone(), child_id.clone(), grandchild_id.clone()], &cx)
+        .get_entries(
+            &[root_id.clone(), child_id.clone(), grandchild_id.clone()],
+            &cx,
+        )
         .await
         .expect("committed entries should be readable");
-    assert_eq!(entries.get(&child_id).and_then(Entry::parent_id), Some(&root_id));
-    assert_eq!(entries.get(&grandchild_id).and_then(Entry::parent_id), Some(&child_id));
+    assert_eq!(
+        entries.get(&child_id).and_then(Entry::parent_id),
+        Some(&root_id)
+    );
+    assert_eq!(
+        entries.get(&grandchild_id).and_then(Entry::parent_id),
+        Some(&child_id)
+    );
 }
 
 #[tokio::test]
@@ -226,7 +278,10 @@ async fn storage_rejects_usage_parent_without_partial_commit() {
     let storage = MemoryStorage::new();
     let cx = Context::background();
 
-    storage.commit(vec![usage("u1")], &cx).await.expect("usage seed should succeed");
+    storage
+        .commit(vec![usage("u1")], &cx)
+        .await
+        .expect("usage seed should succeed");
     let result = storage
         .commit(vec![entry("prefix", None), entry("child", Some("u1"))], &cx)
         .await;
@@ -238,9 +293,15 @@ async fn storage_rejects_usage_parent_without_partial_commit() {
         .get_entries(&[prefix_id.clone(), child_id], &cx)
         .await
         .expect("failed batch entries should be readable");
-    assert!(entries.is_empty(), "failed batch must not expose a committed prefix");
+    assert!(
+        entries.is_empty(),
+        "failed batch must not expose a committed prefix"
+    );
 
-    let stats = storage.get_stats(&cx).await.expect("stats should be readable");
+    let stats = storage
+        .get_stats(&cx)
+        .await
+        .expect("stats should be readable");
     assert_eq!(stats.message_count, 0);
     assert_eq!(stats.usage, pi_ai::Usage::default());
 

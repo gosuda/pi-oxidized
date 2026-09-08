@@ -27,7 +27,7 @@ mod bridge;
 mod json;
 
 pub use bridge::{from_serde_json, try_into_serde_json};
-pub use json::{js_number_to_string, parse_json, stringify_json, write_json, JsonError};
+pub use json::{JsonError, js_number_to_string, parse_json, stringify_json, write_json};
 
 /// Object storage for canonical values.
 ///
@@ -56,7 +56,9 @@ impl JsString {
     /// Encodes a valid Rust UTF-8 string into UTF-16 code units.
     #[must_use]
     pub fn from_utf8(text: &str) -> Self {
-        Self { units: text.encode_utf16().collect() }
+        Self {
+            units: text.encode_utf16().collect(),
+        }
     }
 
     /// Borrows the exact UTF-16 code units.
@@ -77,7 +79,10 @@ impl JsString {
             let unit = self.units[index];
             index += 1;
             let scalar = if (0xD800..=0xDBFF).contains(&unit)
-                && self.units.get(index).is_some_and(|next| (0xDC00..=0xDFFF).contains(next))
+                && self
+                    .units
+                    .get(index)
+                    .is_some_and(|next| (0xDC00..=0xDFFF).contains(next))
             {
                 let low = self.units[index];
                 index += 1;
@@ -206,7 +211,9 @@ impl JsInteger {
     /// matching JavaScript `Number` arithmetic.
     #[must_use]
     pub fn next(&self) -> Self {
-        Self { value: self.value + 1.0 }
+        Self {
+            value: self.value + 1.0,
+        }
     }
 
     /// Clamps this counter to `len` before the bounded integer conversion.
@@ -215,7 +222,10 @@ impl JsInteger {
         clippy::cast_possible_truncation,
         reason = "JsInteger::new rejects nonintegral values"
     )]
-    #[expect(clippy::cast_sign_loss, reason = "JsInteger::new rejects negative values")]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "JsInteger::new rejects negative values"
+    )]
     pub fn clamp_to_len(&self, len: usize) -> usize {
         // `JsInteger::new` guarantees a finite, nonnegative, integral binary64.
         // Values above `u128::MAX` saturate; values that cannot fit `usize` clamp to `len`.
@@ -245,7 +255,9 @@ impl PartialOrd for JsInteger {
 
 impl Ord for JsInteger {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.normalized().partial_cmp(&other.normalized()).unwrap_or(Ordering::Equal)
+        self.normalized()
+            .partial_cmp(&other.normalized())
+            .unwrap_or(Ordering::Equal)
     }
 }
 
@@ -315,13 +327,20 @@ impl Clone for JsonValue {
                     Self::Array(values) => {
                         let mut rest = values.iter();
                         let first = rest.next();
-                        frames.push(Frame::Array { built: Vec::with_capacity(values.len()), rest });
+                        frames.push(Frame::Array {
+                            built: Vec::with_capacity(values.len()),
+                            rest,
+                        });
                         pending = first;
                     }
                     Self::Object(values) => {
                         let mut rest = values.iter();
                         let first = rest.next();
-                        frames.push(Frame::Object { built: JsObject::new(), key: None, rest });
+                        frames.push(Frame::Object {
+                            built: JsObject::new(),
+                            key: None,
+                            rest,
+                        });
                         if let Some((key, value)) = first {
                             if let Some(Frame::Object { key: slot, .. }) = frames.last_mut() {
                                 *slot = Some(key.clone());
@@ -383,7 +402,9 @@ impl PartialEq for JsonValue {
                     if left.len() != right.len() {
                         return false;
                     }
-                    for ((left_key, left_value), (right_key, right_value)) in left.iter().zip(right.iter()) {
+                    for ((left_key, left_value), (right_key, right_value)) in
+                        left.iter().zip(right.iter())
+                    {
                         if left_key != right_key {
                             return false;
                         }
@@ -473,7 +494,10 @@ impl Drop for JsonValue {
         match self {
             Self::Array(items) => pending.append(items),
             Self::Object(map) => {
-                pending.extend(map.values_mut().map(|value| std::mem::replace(value, Self::Null)));
+                pending.extend(
+                    map.values_mut()
+                        .map(|value| std::mem::replace(value, Self::Null)),
+                );
             }
             _ => {}
         }
@@ -481,7 +505,10 @@ impl Drop for JsonValue {
             match &mut value {
                 Self::Array(items) => pending.append(items),
                 Self::Object(map) => {
-                    pending.extend(map.values_mut().map(|slot| std::mem::replace(slot, Self::Null)));
+                    pending.extend(
+                        map.values_mut()
+                            .map(|slot| std::mem::replace(slot, Self::Null)),
+                    );
                 }
                 _ => {}
             }
@@ -621,7 +648,10 @@ pub fn is_json_value(value: &JsonValue) -> bool {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "test fixtures and assertions use contextual failure messages")]
+#[expect(
+    clippy::expect_used,
+    reason = "test fixtures and assertions use contextual failure messages"
+)]
 mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
@@ -638,8 +668,12 @@ mod tests {
 
     #[test]
     fn scalar_and_container_json_round_trip() {
-        let value = parse(r#"{"null":null,"bool":true,"number":1.25,"text":"é😀","items":[false,2]}"#);
-        assert_eq!(stringify_json(&value), r#"{"bool":true,"items":[false,2],"null":null,"number":1.25,"text":"é😀"}"#);
+        let value =
+            parse(r#"{"null":null,"bool":true,"number":1.25,"text":"é😀","items":[false,2]}"#);
+        assert_eq!(
+            stringify_json(&value),
+            r#"{"bool":true,"items":[false,2],"null":null,"number":1.25,"text":"é😀"}"#
+        );
         assert_eq!(parse(&stringify_json(&value)), value);
     }
 
@@ -648,33 +682,46 @@ mod tests {
         let value = parse(r#"{"a":1,"\u0061":2}"#);
         let object = value.as_object().expect("object");
         assert_eq!(object.len(), 1);
-        assert_eq!(object.get(&JsString::from("a")).and_then(JsonValue::as_f64), Some(2.0));
+        assert_eq!(
+            object.get(&JsString::from("a")).and_then(JsonValue::as_f64),
+            Some(2.0)
+        );
     }
 
     #[test]
     fn surrogate_units_are_lossless_and_strictly_decoded() {
         let lone = parse(r#""\uDE03""#);
         assert_eq!(lone.as_str().expect("string").as_utf16(), &[0xDE03]);
-        assert_eq!(lone.as_str().expect("string").try_to_utf8(), Err(UnpairedSurrogate { index: 0 }));
+        assert_eq!(
+            lone.as_str().expect("string").try_to_utf8(),
+            Err(UnpairedSurrogate { index: 0 })
+        );
         assert_eq!(stringify_json(&lone), r#""\ude03""#);
         let reparsed = parse(&stringify_json(&lone));
         assert_eq!(reparsed.as_str().expect("string").as_utf16(), &[0xDE03]);
 
         let pair = parse(r#""\uD83D\uDE00""#);
-        assert_eq!(pair.as_str().expect("string").try_to_utf8().as_deref(), Ok("😀"));
+        assert_eq!(
+            pair.as_str().expect("string").try_to_utf8().as_deref(),
+            Ok("😀")
+        );
         assert_eq!(stringify_json(&pair), "\"😀\"");
     }
 
     #[test]
     fn negative_zero_overflow_and_json_admission_stay_separate() {
         let negative_zero = parse("-0");
-        assert!(matches!(negative_zero, JsonValue::Number(number) if number == 0.0 && number.is_sign_negative()));
+        assert!(
+            matches!(negative_zero, JsonValue::Number(number) if number == 0.0 && number.is_sign_negative())
+        );
         assert_eq!(stringify_json(&negative_zero), "0");
         let reparsed = parse(&stringify_json(&negative_zero));
         assert!(matches!(reparsed, JsonValue::Number(number) if !number.is_sign_negative()));
 
         let overflow = parse("1e9999");
-        assert!(matches!(overflow, JsonValue::Number(number) if number.is_infinite() && number.is_sign_positive()));
+        assert!(
+            matches!(overflow, JsonValue::Number(number) if number.is_infinite() && number.is_sign_positive())
+        );
         assert!(!is_json_value(&overflow));
         assert_eq!(stringify_json(&overflow), "null");
     }
@@ -760,7 +807,10 @@ mod tests {
         assert_eq!(number, Some(9_007_199_254_740_992.0));
 
         let lone = JsonValue::String(JsString::from_utf16(vec![0xD800]));
-        assert_eq!(try_into_serde_json(lone), Err(ValueError::LoneSurrogate { index: 0 }));
+        assert_eq!(
+            try_into_serde_json(lone),
+            Err(ValueError::LoneSurrogate { index: 0 })
+        );
         assert_eq!(
             try_into_serde_json(JsonValue::Number(f64::INFINITY)),
             Err(ValueError::NonFinite(f64::INFINITY))

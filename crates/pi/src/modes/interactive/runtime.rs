@@ -6333,8 +6333,9 @@ fn project_assistant_message(
                 streaming: false,
             })));
     } else {
-        view.messages
-            .push(MessageView::streaming_assistant((**assistant_message).clone()));
+        view.messages.push(MessageView::streaming_assistant(
+            (**assistant_message).clone(),
+        ));
     }
 }
 

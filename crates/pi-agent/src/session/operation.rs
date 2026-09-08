@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-use super::{EntryId, LaneConfiguration, LaneName, OperationId, UsageId};
 use super::configuration::{
     CompactionReason, CompactionSettings, HarnessRetryPolicy, HarnessStreamOptions,
     InvalidRetryPolicy,
 };
+use super::{EntryId, LaneConfiguration, LaneName, OperationId, UsageId};
 use crate::queue::QueueMode;
 use crate::tool::ToolExecutionMode;
 
@@ -20,8 +20,8 @@ pub enum Control {
     CancelRequested {
         /// When cancellation was requested, in Unix epoch milliseconds.
         #[serde(rename = "requestedAt")]
-        requested_at: i64
-    }
+        requested_at: i64,
+    },
 }
 
 /// Immutable identity of one durable operation, written once at reservation and
@@ -53,14 +53,14 @@ pub enum OperationIntent {
         /// Pre-committed prompt entries this run must consume. Empty is
         /// normal when the trigger is an inbox item instead.
         #[serde(rename = "promptEntryIds")]
-        prompt_entry_ids: Vec<EntryId>
+        prompt_entry_ids: Vec<EntryId>,
     },
     /// Tag `"compaction"` — summarize transcript history on the current branch.
     Compaction {
         /// Caller guidance appended to the summary request; `None` uses the
         /// default instruction set.
         #[serde(rename = "customInstructions")]
-        custom_instructions: Option<String>
+        custom_instructions: Option<String>,
     },
     /// Tag `"navigation"` — move the branch tip to an earlier entry.
     Navigation {
@@ -73,7 +73,7 @@ pub enum OperationIntent {
         /// Optional label recorded with the navigation; absence stores no label.
         label: Option<String>,
         /// Caller guidance for the summary request, when summarizing.
-        custom_instructions: Option<String>
+        custom_instructions: Option<String>,
     },
 }
 
@@ -86,7 +86,7 @@ pub enum OperationKind {
     /// Tag `"compaction"`.
     Compaction,
     /// Tag `"navigation"`.
-    Navigation
+    Navigation,
 }
 
 /// Terminal outcome of a driven operation.
@@ -100,7 +100,7 @@ pub enum TerminalStatus {
     /// Tag `"aborted"` — cancelled by request rather than by failure.
     Aborted,
     /// Tag `"failed"` — ended on an error recorded in the result.
-    Failed
+    Failed,
 }
 
 /// Error carried by a failed terminal result.
@@ -112,7 +112,7 @@ pub struct OperationError {
     /// Human-readable detail for transcripts and logs.
     pub message: String,
     /// Optional structured context; absence carries no additional data.
-    pub details: Option<serde_json::Value>
+    pub details: Option<serde_json::Value>,
 }
 
 /// Immutable lane-lived observation record written by one terminal transaction.
@@ -177,7 +177,6 @@ pub struct RunSettings {
     pub tool_execution: ToolExecutionMode,
 }
 
-
 /// Flat durable operation state: exactly 13 family-neutral dispatcher leaves.
 /// Tag field is `at`; every literal is frozen and dotted.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -189,7 +188,7 @@ pub enum OperationState {
     Starting {
         /// Uniform cancellation, settings, and latest-assistant scope.
         #[serde(flatten)]
-        scope: OperationScope
+        scope: OperationScope,
     },
     /// Tag `"checkpoint"` — a resumable boundary is recorded; the next step
     /// decides whether another assistant turn is needed.
@@ -200,7 +199,7 @@ pub enum OperationState {
         scope: OperationScope,
         /// Continuation decision and the entry that triggered it.
         #[serde(flatten)]
-        data: CheckpointData
+        data: CheckpointData,
     },
     /// Tag `"assistant.ready"` — a provider request may be issued for this
     /// step.
@@ -214,7 +213,7 @@ pub enum OperationState {
         generation_context: GenerationContext,
         /// One-based attempt number the next request will be.
         #[serde(rename = "nextAttempt")]
-        next_attempt: u64
+        next_attempt: u64,
     },
     /// Tag `"assistant.effect_pending"` — a response settled but its durable
     /// effects (entry and usage writes) are not yet confirmed, so recovery must
@@ -242,7 +241,7 @@ pub enum OperationState {
         intended_output_limit: u32,
         /// Model context window in tokens, captured for overflow detection.
         #[serde(rename = "contextWindow")]
-        context_window: u32
+        context_window: u32,
     },
     /// Tag `"assistant.retry_wait"` — the attempt failed and the next one is
     /// deferred until the backoff deadline.
@@ -256,7 +255,7 @@ pub enum OperationState {
         generation_context: GenerationContext,
         /// Persisted backoff deadline and failure message.
         #[serde(flatten)]
-        retry: RetryWait
+        retry: RetryWait,
     },
     /// Tag `"tools"` — tool calls from the settled assistant message are being
     /// executed and placed.
@@ -266,7 +265,7 @@ pub enum OperationState {
         #[serde(flatten)]
         scope: OperationScope,
         /// Nested per-call state machine for this assistant message.
-        batch: ToolBatch
+        batch: ToolBatch,
     },
     /// Tag `"deferred.suspended"` — the request produced a deferred handle and
     /// the operation is waiting for a later poll instead of holding a thread.
@@ -274,7 +273,7 @@ pub enum OperationState {
     DeferredSuspended {
         /// Step, source entry, poll counter, and captured request parameters.
         #[serde(flatten)]
-        deferred: DeferredScope
+        deferred: DeferredScope,
     },
     /// Tag `"deferred.effect_pending"` — a polled deferred response settled and
     /// its durable writes are not yet confirmed.
@@ -288,7 +287,7 @@ pub enum OperationState {
         response_entry_id: EntryId,
         /// Reserved usage-row id for the settled deferred response.
         #[serde(rename = "usageId")]
-        usage_id: UsageId
+        usage_id: UsageId,
     },
     /// Tag `"summary.deciding"` — a summary task is claimed and the driver is
     /// deciding what to summarize.
@@ -298,7 +297,7 @@ pub enum OperationState {
         #[serde(flatten)]
         scope: OperationScope,
         /// Summary work item, including its result boundary.
-        task: SummaryTask
+        task: SummaryTask,
     },
     /// Tag `"summary.ready"` — preparation is durable and a summary request may
     /// be issued.
@@ -312,7 +311,7 @@ pub enum OperationState {
         generation: SummaryGenerationScope,
         /// One-based attempt number the next summary request will be.
         #[serde(rename = "nextAttempt")]
-        next_attempt: u64
+        next_attempt: u64,
     },
     /// Tag `"summary.effect_pending"` — a summary response settled and its
     /// writes (entry, usage rows, preparation cleanup) are being applied.
@@ -332,7 +331,7 @@ pub enum OperationState {
         /// Usage-row ids recorded by this attempt, in the order they were
         /// written. Empty before any usage is accounted.
         #[serde(rename = "usageIds")]
-        usage_ids: Vec<UsageId>
+        usage_ids: Vec<UsageId>,
     },
     /// Tag `"summary.retry_wait"` — the summary attempt failed and its next
     /// attempt is deferred until the backoff deadline.
@@ -346,7 +345,7 @@ pub enum OperationState {
         generation: SummaryGenerationScope,
         /// Persisted backoff deadline and failure message.
         #[serde(flatten)]
-        retry: RetryWait
+        retry: RetryWait,
     },
     /// Tag `"navigation.ready_to_commit"` — everything needed for the tip move
     /// is durable; only the committing transaction remains.
@@ -359,7 +358,7 @@ pub enum OperationState {
         #[serde(rename = "targetId")]
         target_id: Option<EntryId>,
         /// Optional label recorded with the navigation; absence stores none.
-        label: Option<String>
+        label: Option<String>,
     },
 }
 
@@ -369,8 +368,20 @@ impl OperationState {
     #[must_use]
     pub fn scope(&self) -> &OperationScope {
         match self {
-            Self::Starting { scope } | Self::Checkpoint { scope, .. } | Self::AssistantReady { scope, .. } | Self::AssistantEffectPending { scope, .. } | Self::AssistantRetryWait { scope, .. } | Self::Tools { scope, .. } | Self::SummaryDeciding { scope, .. } | Self::SummaryReady { scope, .. } | Self::SummaryEffectPending { scope, .. } | Self::SummaryRetryWait { scope, .. } | Self::NavigationReadyToCommit { scope, .. } => scope,
-            Self::DeferredSuspended { deferred } | Self::DeferredEffectPending { deferred, .. } => &deferred.scope,
+            Self::Starting { scope }
+            | Self::Checkpoint { scope, .. }
+            | Self::AssistantReady { scope, .. }
+            | Self::AssistantEffectPending { scope, .. }
+            | Self::AssistantRetryWait { scope, .. }
+            | Self::Tools { scope, .. }
+            | Self::SummaryDeciding { scope, .. }
+            | Self::SummaryReady { scope, .. }
+            | Self::SummaryEffectPending { scope, .. }
+            | Self::SummaryRetryWait { scope, .. }
+            | Self::NavigationReadyToCommit { scope, .. } => scope,
+            Self::DeferredSuspended { deferred } | Self::DeferredEffectPending { deferred, .. } => {
+                &deferred.scope
+            }
         }
     }
     /// Mutably borrows the uniform scope, including through the deferred
@@ -378,15 +389,39 @@ impl OperationState {
     #[must_use]
     pub fn scope_mut(&mut self) -> &mut OperationScope {
         match self {
-            Self::Starting { scope } | Self::Checkpoint { scope, .. } | Self::AssistantReady { scope, .. } | Self::AssistantEffectPending { scope, .. } | Self::AssistantRetryWait { scope, .. } | Self::Tools { scope, .. } | Self::SummaryDeciding { scope, .. } | Self::SummaryReady { scope, .. } | Self::SummaryEffectPending { scope, .. } | Self::SummaryRetryWait { scope, .. } | Self::NavigationReadyToCommit { scope, .. } => scope,
-            Self::DeferredSuspended { deferred } | Self::DeferredEffectPending { deferred, .. } => &mut deferred.scope,
+            Self::Starting { scope }
+            | Self::Checkpoint { scope, .. }
+            | Self::AssistantReady { scope, .. }
+            | Self::AssistantEffectPending { scope, .. }
+            | Self::AssistantRetryWait { scope, .. }
+            | Self::Tools { scope, .. }
+            | Self::SummaryDeciding { scope, .. }
+            | Self::SummaryReady { scope, .. }
+            | Self::SummaryEffectPending { scope, .. }
+            | Self::SummaryRetryWait { scope, .. }
+            | Self::NavigationReadyToCommit { scope, .. } => scope,
+            Self::DeferredSuspended { deferred } | Self::DeferredEffectPending { deferred, .. } => {
+                &mut deferred.scope
+            }
         }
     }
     /// Returns the dispatcher discriminant for this leaf.
     #[must_use]
     pub fn at(&self) -> OperationAt {
         match self {
-            Self::Starting { .. } => OperationAt::Starting, Self::Checkpoint { .. } => OperationAt::Checkpoint, Self::AssistantReady { .. } => OperationAt::AssistantReady, Self::AssistantEffectPending { .. } => OperationAt::AssistantEffectPending, Self::AssistantRetryWait { .. } => OperationAt::AssistantRetryWait, Self::Tools { .. } => OperationAt::Tools, Self::DeferredSuspended { .. } => OperationAt::DeferredSuspended, Self::DeferredEffectPending { .. } => OperationAt::DeferredEffectPending, Self::SummaryDeciding { .. } => OperationAt::SummaryDeciding, Self::SummaryReady { .. } => OperationAt::SummaryReady, Self::SummaryEffectPending { .. } => OperationAt::SummaryEffectPending, Self::SummaryRetryWait { .. } => OperationAt::SummaryRetryWait, Self::NavigationReadyToCommit { .. } => OperationAt::NavigationReadyToCommit,
+            Self::Starting { .. } => OperationAt::Starting,
+            Self::Checkpoint { .. } => OperationAt::Checkpoint,
+            Self::AssistantReady { .. } => OperationAt::AssistantReady,
+            Self::AssistantEffectPending { .. } => OperationAt::AssistantEffectPending,
+            Self::AssistantRetryWait { .. } => OperationAt::AssistantRetryWait,
+            Self::Tools { .. } => OperationAt::Tools,
+            Self::DeferredSuspended { .. } => OperationAt::DeferredSuspended,
+            Self::DeferredEffectPending { .. } => OperationAt::DeferredEffectPending,
+            Self::SummaryDeciding { .. } => OperationAt::SummaryDeciding,
+            Self::SummaryReady { .. } => OperationAt::SummaryReady,
+            Self::SummaryEffectPending { .. } => OperationAt::SummaryEffectPending,
+            Self::SummaryRetryWait { .. } => OperationAt::SummaryRetryWait,
+            Self::NavigationReadyToCommit { .. } => OperationAt::NavigationReadyToCommit,
         }
     }
 }
@@ -419,7 +454,7 @@ pub enum OperationAt {
     /// Leaf `at: "summary.retry_wait"`.
     SummaryRetryWait,
     /// Leaf `at: "navigation.ready_to_commit"`.
-    NavigationReadyToCommit
+    NavigationReadyToCommit,
 }
 
 /// A reserved operation: immutable identity plus the current durable leaf.
@@ -428,7 +463,7 @@ pub struct Operation {
     /// Immutable reservation record.
     pub meta: OperationMeta,
     /// Current dispatcher leaf.
-    pub state: OperationState
+    pub state: OperationState,
 }
 
 /// Checkpoint payload; the flat leaf literal replaces the old nested phase tag.
@@ -438,7 +473,7 @@ pub struct CheckpointData {
     pub continuation: Continuation,
     /// Entry whose arrival triggered this checkpoint.
     #[serde(rename = "triggerEntryId")]
-    pub trigger_entry_id: EntryId
+    pub trigger_entry_id: EntryId,
 }
 
 /// Continuation decision recorded at a checkpoint.
@@ -450,14 +485,14 @@ pub enum Continuation {
         /// Whether the one allowed overflow-recovery attempt has already been
         /// spent, so a further overflow cannot be retried.
         #[serde(rename = "overflowRecoveryUsed")]
-        overflow_recovery_used: bool
+        overflow_recovery_used: bool,
     },
     /// Tag `"may_finish"` — the operation may end here.
     MayFinish {
         /// Whether a final assistant message is still expected before finishing.
         #[serde(rename = "includeFinalAssistant")]
-        include_final_assistant: bool
-    }
+        include_final_assistant: bool,
+    },
 }
 
 /// Everything a generation step needs that must not be re-read from live lane
@@ -481,7 +516,7 @@ pub struct GenerationContext {
     pub retry_policy: NormalizedRetryPolicy,
     /// Whether this step has already consumed its overflow-recovery attempt.
     #[serde(rename = "overflowRecoveryUsed")]
-    pub overflow_recovery_used: bool
+    pub overflow_recovery_used: bool,
 }
 
 /// Whole-request retry budget after validation and normalization, so a resumed
@@ -494,7 +529,7 @@ pub struct NormalizedRetryPolicy {
     pub max_attempts: u64,
     /// Base backoff between attempts, in milliseconds.
     #[serde(rename = "baseDelayMs")]
-    pub base_delay_ms: u64
+    pub base_delay_ms: u64,
 }
 
 /// Retry state persisted while a whole-request retry is waiting.
@@ -522,7 +557,10 @@ impl TryFrom<HarnessRetryPolicy> for NormalizedRetryPolicy {
     fn try_from(policy: HarnessRetryPolicy) -> Result<Self, Self::Error> {
         policy.validate()?;
         let max_attempts = if policy.enabled {
-            policy.max_retries.checked_add(1).ok_or(InvalidRetryPolicy)?
+            policy
+                .max_retries
+                .checked_add(1)
+                .ok_or(InvalidRetryPolicy)?
         } else {
             1
         };
@@ -547,7 +585,7 @@ pub struct ToolBatch {
     pub turn_id: String,
     /// One entry per tool call, in assistant source order. Empty is normal for
     /// a message with no calls.
-    pub calls: Vec<ToolCall>
+    pub calls: Vec<ToolCall>,
 }
 
 /// Durable state of a single tool call.
@@ -562,7 +600,7 @@ pub struct ToolCall {
     #[serde(rename = "resultEntryId")]
     pub result_entry_id: EntryId,
     /// Lifecycle stage of this call.
-    pub status: ToolCallStatus
+    pub status: ToolCallStatus,
 }
 
 /// Lifecycle stage of one tool call.
@@ -575,19 +613,19 @@ pub enum ToolCallStatus {
     /// so recovery must decide whether replaying is acceptable.
     EffectPending {
         /// Whether this call may be re-issued after a crash.
-        replay: ReplayPolicy
+        replay: ReplayPolicy,
     },
     /// Tag `"outcome_ready"` — the result exists but has not been committed.
     OutcomeReady {
         /// Whether this result ends the run instead of requesting another
         /// assistant turn.
-        terminate: bool
+        terminate: bool,
     },
     /// Tag `"completed"` — the result is committed.
     Completed {
         /// Termination flag carried into the committed result entry.
-        terminate: bool
-    }
+        terminate: bool,
+    },
 }
 
 /// Whether a tool call with an unknown outcome may be re-issued during recovery.
@@ -597,7 +635,7 @@ pub enum ReplayPolicy {
     /// Tag `"never"` — side effects may already have happened; never re-run.
     Never,
     /// Tag `"safe"` — re-running is safe, so recovery may re-issue the call.
-    Safe
+    Safe,
 }
 
 /// Where a summary task's result must land, decided when the task is created.
@@ -608,7 +646,7 @@ pub enum ResultBoundary {
     ResumeCheckpoint {
         /// Checkpoint to resume after.
         #[serde(rename = "resumeAfter")]
-        resume_after: CheckpointData
+        resume_after: CheckpointData,
     },
     /// Tag `"finish"` — the operation ends when the summary commits.
     Finish,
@@ -619,8 +657,8 @@ pub enum ResultBoundary {
         #[serde(rename = "targetId")]
         target_id: EntryId,
         /// Optional label for the navigation; absence stores none.
-        label: Option<String>
-    }
+        label: Option<String>,
+    },
 }
 
 /// Summary work item claimed by a summary leaf.
@@ -636,7 +674,7 @@ pub struct SummaryTask {
     #[serde(rename = "customInstructions")]
     pub custom_instructions: Option<String>,
     /// Where the committed summary must hand control afterwards.
-    pub boundary: ResultBoundary
+    pub boundary: ResultBoundary,
 }
 
 /// Captured parameters for one summary generation, replayed unchanged on
@@ -653,7 +691,7 @@ pub struct SummaryContext {
     pub stream_options: HarnessStreamOptions,
     /// Retry budget normalized when the summary was prepared.
     #[serde(rename = "retryPolicy")]
-    pub retry_policy: NormalizedRetryPolicy
+    pub retry_policy: NormalizedRetryPolicy,
 }
 
 /// Task and generation parameters carried together by every summary leaf.
@@ -663,7 +701,7 @@ pub struct SummaryGenerationScope {
     pub task: SummaryTask,
     /// Captured summary-generation parameters.
     #[serde(rename = "summaryContext")]
-    pub summary_context: SummaryContext
+    pub summary_context: SummaryContext,
 }
 
 /// Identifies an admitted summary request and the usage row it must settle
@@ -674,7 +712,7 @@ pub struct SummaryRequestRef {
     pub index: u32,
     /// Usage-row id reserved for this request's accounting.
     #[serde(rename = "usageId")]
-    pub usage_id: UsageId
+    pub usage_id: UsageId,
 }
 
 /// Scope carried by both deferred leaves: the uniform operation scope plus the
@@ -698,5 +736,5 @@ pub struct DeferredScope {
     pub configuration: LaneConfiguration,
     /// Stream options captured when the request was issued.
     #[serde(rename = "streamOptions")]
-    pub stream_options: HarnessStreamOptions
+    pub stream_options: HarnessStreamOptions,
 }

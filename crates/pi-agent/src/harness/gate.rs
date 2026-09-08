@@ -88,11 +88,11 @@ impl Gate {
             let state = self.shared.lock_state();
             match &*state {
                 GateState::Open => None,
-                GateState::Aborting { cancellation } => Some(GateRejection::Aborted(
-                    AbortRequested {
+                GateState::Aborting { cancellation } => {
+                    Some(GateRejection::Aborted(AbortRequested {
                         cancellation: cancellation.clone(),
-                    },
-                )),
+                    }))
+                }
                 GateState::Closed { error } => Some(GateRejection::Closed(Arc::clone(error))),
             }
         };
@@ -155,7 +155,9 @@ impl GateControl {
 
 impl std::fmt::Debug for GateControl {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("GateControl").finish_non_exhaustive()
+        formatter
+            .debug_struct("GateControl")
+            .finish_non_exhaustive()
     }
 }
 
@@ -209,10 +211,7 @@ mod tests {
         });
 
         assert!(matches!(result, Ok(7)));
-        assert!(matches!(
-            gate.admit(|| 8_u8),
-            Err(GateRejection::Closed(_))
-        ));
+        assert!(matches!(gate.admit(|| 8_u8), Err(GateRejection::Closed(_))));
     }
 
     #[test]
@@ -224,10 +223,7 @@ mod tests {
         control.begin_abort(cancellation);
 
         assert!(!gate.token().is_cancelled());
-        assert!(matches!(
-            gate.admit(|| ()),
-            Err(GateRejection::Aborted(_))
-        ));
+        assert!(matches!(gate.admit(|| ()), Err(GateRejection::Aborted(_))));
 
         control.signal_abort();
         assert!(gate.token().is_cancelled());

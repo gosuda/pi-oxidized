@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
+use pi_agent::ToolExecutionMode;
 use pi_agent::context::Context;
 use pi_agent::harness::api::{
     AcquireLaneOptions, AgentHarness, AgentHarnessBuilder, AgentHarnessOptions, AgentLane,
@@ -21,11 +22,10 @@ use pi_agent::pi_ai;
 use pi_agent::session::{
     CommitResult, Entry, EntryId, EntryScan, EntryStructure, HarnessStreamOptions, LaneName,
     ListReadOptions, MemoryStorage, OperationId, RawAddress, RawListElement, RawStoredValue,
-    SessionError, SessionMetadata, SessionReaderExt, SessionStats, Storage,
-    StorageBackedSession, StorageBranchScan, StorageErrorCode, StorageFailure, UsageRow,
-    UsageScan, UuidV7Generator, Write, address,
+    SessionError, SessionMetadata, SessionReaderExt, SessionStats, Storage, StorageBackedSession,
+    StorageBranchScan, StorageErrorCode, StorageFailure, UsageRow, UsageScan, UuidV7Generator,
+    Write, address,
 };
-use pi_agent::ToolExecutionMode;
 
 struct FailNextCommitStorage {
     inner: MemoryStorage,
@@ -52,39 +52,75 @@ impl Storage for FailNextCommitStorage {
         self.inner.commit(writes, cx)
     }
 
-    fn get_entries<'a>(&'a self, ids: &'a [EntryId], cx: &'a Context) -> BoxFuture<'a, Result<HashMap<EntryId, Entry>, SessionError>> {
+    fn get_entries<'a>(
+        &'a self,
+        ids: &'a [EntryId],
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<HashMap<EntryId, Entry>, SessionError>> {
         self.inner.get_entries(ids, cx)
     }
 
-    fn get_value<'a>(&'a self, address: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<Option<RawStoredValue>, SessionError>> {
+    fn get_value<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<RawStoredValue>, SessionError>> {
         self.inner.get_value(address, cx)
     }
 
-    fn scan_values<'a>(&'a self, prefix: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<Vec<RawStoredValue>, SessionError>> {
+    fn scan_values<'a>(
+        &'a self,
+        prefix: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<RawStoredValue>, SessionError>> {
         self.inner.scan_values(prefix, cx)
     }
 
-    fn read_list<'a>(&'a self, address: &'a RawAddress, options: Option<ListReadOptions>, cx: &'a Context) -> BoxFuture<'a, Result<Vec<RawListElement>, SessionError>> {
+    fn read_list<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        options: Option<ListReadOptions>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<RawListElement>, SessionError>> {
         self.inner.read_list(address, options, cx)
     }
 
-    fn scan_branch<'a>(&'a self, query: &'a StorageBranchScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+    fn scan_branch<'a>(
+        &'a self,
+        query: &'a StorageBranchScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
         self.inner.scan_branch(query, cx)
     }
 
-    fn scan_branch_structure<'a>(&'a self, query: &'a StorageBranchScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<EntryStructure>, SessionError>> {
+    fn scan_branch_structure<'a>(
+        &'a self,
+        query: &'a StorageBranchScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<EntryStructure>, SessionError>> {
         self.inner.scan_branch_structure(query, cx)
     }
 
-    fn scan_entries<'a>(&'a self, query: &'a EntryScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+    fn scan_entries<'a>(
+        &'a self,
+        query: &'a EntryScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
         self.inner.scan_entries(query, cx)
     }
 
-    fn scan_usage<'a>(&'a self, query: &'a UsageScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<UsageRow>, SessionError>> {
+    fn scan_usage<'a>(
+        &'a self,
+        query: &'a UsageScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<UsageRow>, SessionError>> {
         self.inner.scan_usage(query, cx)
     }
 
-    fn get_stats<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<SessionStats, SessionError>> {
+    fn get_stats<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<SessionStats, SessionError>> {
         self.inner.get_stats(cx)
     }
 
@@ -112,8 +148,7 @@ impl pi_ai::Provider for AdmissionModels {
 
 impl HarnessModels for AdmissionModels {
     fn get_model(&self, provider: &str, model_id: &str) -> Option<pi_ai::Model> {
-        (self.model.provider == provider && self.model.id == model_id)
-            .then(|| self.model.clone())
+        (self.model.provider == provider && self.model.id == model_id).then(|| self.model.clone())
     }
 }
 
@@ -199,11 +234,16 @@ async fn arm_admission_fixture(cx: &Context) -> Result<AdmissionFixture, Box<dyn
             entry_projectors: HashMap::new(),
         },
         cx,
-    ).await?;
+    )
+    .await?;
     let main_name = LaneName::from("main");
     let other_name = LaneName::from("other");
-    let main = harness.lane(&main_name, AcquireLaneOptions::default(), cx).await?;
-    let other = harness.lane(&other_name, AcquireLaneOptions::default(), cx).await?;
+    let main = harness
+        .lane(&main_name, AcquireLaneOptions::default(), cx)
+        .await?;
+    let other = harness
+        .lane(&other_name, AcquireLaneOptions::default(), cx)
+        .await?;
 
     Ok(AdmissionFixture {
         storage,
@@ -217,7 +257,8 @@ async fn arm_admission_fixture(cx: &Context) -> Result<AdmissionFixture, Box<dyn
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn admission_storage_fault_seals_all_lanes_and_preserves_one_fault() -> Result<(), Box<dyn Error>> {
+async fn admission_storage_fault_seals_all_lanes_and_preserves_one_fault()
+-> Result<(), Box<dyn Error>> {
     tokio::time::timeout(Duration::from_secs(5), async {
         let cx = Context::background();
         let fixture = arm_admission_fixture(&cx).await?;
@@ -313,41 +354,77 @@ async fn navigation_storage_fault_seals_all_lanes() -> Result<(), Box<dyn Error>
         let cx = Context::background();
         let fixture = arm_admission_fixture(&cx).await?;
         let AdmissionFixture {
-            storage, session, harness, main, other, main_name, ..
+            storage,
+            session,
+            harness,
+            main,
+            other,
+            main_name,
+            ..
         } = fixture;
         let faults = Arc::new(AtomicUsize::new(0));
         let observed = faults.clone();
-        let _listener = harness.events().on(HarnessEventType::Fault, Arc::new(move |_, _| {
-            observed.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {})
-        }))?;
+        let _listener = harness.events().on(
+            HarnessEventType::Fault,
+            Arc::new(move |_, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {})
+            }),
+        )?;
         // No target and no summary: the only storage touch is the commit.
         storage.armed.store(true, Ordering::SeqCst);
         let operation_id = OperationId::from("failed-navigation");
-        let first = main.accept(OperationRequest::Navigation {
-            operation_id: Some(operation_id.clone()),
-            target_id: None,
-            options: NavigateOptions::default(),
-        }, &cx).await;
-        let later = other.accept(OperationRequest::Prompt {
-            operation_id: Some(OperationId::from("later-admission")),
-            prompt: PromptInput::Text { text: "later".to_owned(), images: Vec::new() },
-        }, &cx).await;
-        let main_state = session.get_value(&address::lane_state(&main_name), &cx).await;
-        let operation = session.get_value(&address::operation_meta(&operation_id), &cx).await;
+        let first = main
+            .accept(
+                OperationRequest::Navigation {
+                    operation_id: Some(operation_id.clone()),
+                    target_id: None,
+                    options: NavigateOptions::default(),
+                },
+                &cx,
+            )
+            .await;
+        let later = other
+            .accept(
+                OperationRequest::Prompt {
+                    operation_id: Some(OperationId::from("later-admission")),
+                    prompt: PromptInput::Text {
+                        text: "later".to_owned(),
+                        images: Vec::new(),
+                    },
+                },
+                &cx,
+            )
+            .await;
+        let main_state = session
+            .get_value(&address::lane_state(&main_name), &cx)
+            .await;
+        let operation = session
+            .get_value(&address::operation_meta(&operation_id), &cx)
+            .await;
         let close = harness.close(&cx).await;
         assert!(first.is_err(), "failed navigation must reject");
-        assert!(later.is_err(), "storage fault must reject admission on another lane");
+        assert!(
+            later.is_err(),
+            "storage fault must reject admission on another lane"
+        );
         assert!(
             !storage.armed.load(Ordering::SeqCst),
             "navigation must reach the storage boundary"
         );
-        assert_eq!(faults.load(Ordering::SeqCst), 1, "faulted navigation admits one fault event");
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            1,
+            "faulted navigation admits one fault event"
+        );
         assert!(
             matches!(main_state?, Some(state) if state.value.current_operation_id.is_none()),
             "failed navigation must leave durable lane state idle"
         );
-        assert!(operation?.is_none(), "failed navigation must not publish operation metadata");
+        assert!(
+            operation?.is_none(),
+            "failed navigation must not publish operation metadata"
+        );
         let first_error = first.err().ok_or("missing initial rejection")?;
         let later_error = later.err().ok_or("missing subsequent rejection")?;
         let first_fault = cause_in_chain::<HarnessFault>(&first_error)
@@ -365,6 +442,7 @@ async fn navigation_storage_fault_seals_all_lanes() -> Result<(), Box<dyn Error>
         ));
         close?;
         Ok::<(), Box<dyn Error>>(())
-    }).await??;
+    })
+    .await??;
     Ok(())
 }

@@ -7,11 +7,13 @@ use std::sync::{Arc, Mutex};
 use futures::future::{BoxFuture, FutureExt};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
-use crate::context::Context;
-use crate::session::traits::Session;
-use crate::session::{
-    CompactionSettings, HarnessRetryPolicy, HarnessStreamOptions, LaneName, LaneState,
+use super::lane::LaneRuntime;
+use super::restore::{RestoredLane, restore_session};
+use super::support::{
+    RuntimeConfig, captured_configuration, default_provider_conversion, ensure_lane_name,
+    map_session_error,
 };
+use crate::context::Context;
 use crate::harness::api::{
     AcquireLaneOptions, AgentHarness, AgentHarnessBuilder, AgentHarnessOptions, HarnessResources,
 };
@@ -20,12 +22,10 @@ use crate::harness::event::{
     ConfigUpdateChange, HarnessEvent, HarnessEventPayload, ValueUpdateChange,
 };
 use crate::harness::hooks::HookRegistry;
-use super::lane::LaneRuntime;
-use super::restore::{restore_session, RestoredLane};
 use crate::harness::result::{HarnessError, HarnessFault, LaneInfo, OpenOperation};
-use super::support::{
-    captured_configuration, default_provider_conversion, ensure_lane_name, map_session_error,
-    RuntimeConfig,
+use crate::session::traits::Session;
+use crate::session::{
+    CompactionSettings, HarnessRetryPolicy, HarnessStreamOptions, LaneName, LaneState,
 };
 /// Runtime implementation attached to one durable session.
 pub(crate) struct HarnessRuntime {
@@ -45,11 +45,13 @@ impl HarnessRuntime {
         cx: &Context,
     ) -> Result<(Arc<dyn AgentHarness>, Vec<OpenOperation>), HarnessError> {
         let retry = options.retry.unwrap_or_default();
-        retry.validate().map_err(|_| HarnessError::InvalidRetryPolicy {
-            max_retries: retry.max_retries,
-            base_delay_ms: retry.base_delay_ms,
-            message: "retry policy cannot be represented safely".to_owned(),
-        })?;
+        retry
+            .validate()
+            .map_err(|_| HarnessError::InvalidRetryPolicy {
+                max_retries: retry.max_retries,
+                base_delay_ms: retry.base_delay_ms,
+                message: "retry policy cannot be represented safely".to_owned(),
+            })?;
         let compaction = options.compaction.unwrap_or_default();
         validate_tools(&options.tools)?;
         validate_active_tools(options.active_tool_names.as_deref(), &options.tools)?;
@@ -72,7 +74,9 @@ impl HarnessRuntime {
             stream_options: options.stream_options,
             retry,
             compaction,
-            steering_mode: options.steering_mode.unwrap_or(crate::queue::QueueMode::All),
+            steering_mode: options
+                .steering_mode
+                .unwrap_or(crate::queue::QueueMode::All),
             follow_up_mode: options
                 .follow_up_mode
                 .unwrap_or(crate::queue::QueueMode::All),
@@ -87,9 +91,7 @@ impl HarnessRuntime {
 
         let events = HarnessEventBus::new();
         let reporter_events = events.clone();
-        let hooks = HookRegistry::new(move |event, context| {
-            reporter_events.emit(event, &context)
-        });
+        let hooks = HookRegistry::new(move |event, context| reporter_events.emit(event, &context));
         let (restored, open) = restore_session(&options.session, cx)
             .await
             .map_err(map_session_error)?;
@@ -106,11 +108,7 @@ impl HarnessRuntime {
         {
             let mut lanes = runtime.lanes.lock().await;
             for RestoredLane { name, data } in restored {
-                let lane = LaneRuntime::new(
-                    Arc::clone(&runtime),
-                    name.clone(),
-                    data,
-                );
+                let lane = LaneRuntime::new(Arc::clone(&runtime), name.clone(), data);
                 lanes.insert(name, lane);
             }
         }
@@ -172,7 +170,6 @@ impl HarnessRuntime {
             lane.seal(Arc::clone(&fault)).await;
         }
     }
-
 }
 
 impl AgentHarnessBuilder {
@@ -238,21 +235,12 @@ impl AgentHarness for HarnessRuntime {
                 .await
                 .map_err(map_session_error)?;
             let writes = vec![
-                super::support::set_json(
-                    &super::support::lane_config_address(name),
-                    &lane_config,
-                )
-                .map_err(map_session_error)?,
-                super::support::set_json(
-                    &super::support::lane_state_address(name),
-                    &lane_state,
-                )
-                .map_err(map_session_error)?,
-                super::support::set_json(
-                    &super::support::lane_branch_tip_address(name),
-                    &tip,
-                )
-                .map_err(map_session_error)?,
+                super::support::set_json(&super::support::lane_config_address(name), &lane_config)
+                    .map_err(map_session_error)?,
+                super::support::set_json(&super::support::lane_state_address(name), &lane_state)
+                    .map_err(map_session_error)?,
+                super::support::set_json(&super::support::lane_branch_tip_address(name), &tip)
+                    .map_err(map_session_error)?,
             ];
             mutator
                 .commit(writes, cx)
@@ -270,10 +258,7 @@ impl AgentHarness for HarnessRuntime {
         })
     }
 
-    fn lanes<'a>(
-        &'a self,
-        cx: &'a Context,
-    ) -> BoxFuture<'a, Result<Vec<LaneInfo>, HarnessError>> {
+    fn lanes<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<Vec<LaneInfo>, HarnessError>> {
         Box::pin(async move {
             if self.is_closed() {
                 return Err(self.closed_error());
@@ -287,162 +272,352 @@ impl AgentHarness for HarnessRuntime {
         })
     }
 
-    fn get_name<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<Option<String>, HarnessError>> {
+    fn get_name<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<String>, HarnessError>> {
         Box::pin(async move {
-            if self.is_closed() { return Err(self.closed_error()); }
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             self.session.get_name(cx).await.map_err(map_session_error)
         })
     }
 
-    fn set_name<'a>(&'a self, name: Option<&'a str>, cx: &'a Context) -> BoxFuture<'a, Result<(), HarnessError>> {
+    fn set_name<'a>(
+        &'a self,
+        name: Option<&'a str>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
         Box::pin(async move {
-            if self.is_closed() { return Err(self.closed_error()); }
-            self.session.set_name(name, cx).await.map_err(map_session_error)?;
-            self.events.emit(HarnessEvent::global(HarnessEventPayload::ValueUpdate {
-                change: ValueUpdateChange::SessionName { name: name.map(str::to_owned) },
-            }), cx).await;
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
+            self.session
+                .set_name(name, cx)
+                .await
+                .map_err(map_session_error)?;
+            self.events
+                .emit(
+                    HarnessEvent::global(HarnessEventPayload::ValueUpdate {
+                        change: ValueUpdateChange::SessionName {
+                            name: name.map(str::to_owned),
+                        },
+                    }),
+                    cx,
+                )
+                .await;
             Ok(())
         })
     }
 
-    fn get_label<'a>(&'a self, target: &'a crate::session::EntryId, cx: &'a Context) -> BoxFuture<'a, Result<Option<String>, HarnessError>> {
+    fn get_label<'a>(
+        &'a self,
+        target: &'a crate::session::EntryId,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<String>, HarnessError>> {
         Box::pin(async move {
-            if self.is_closed() { return Err(self.closed_error()); }
-            self.session.get_label(target, cx).await.map_err(map_session_error)
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
+            self.session
+                .get_label(target, cx)
+                .await
+                .map_err(map_session_error)
         })
     }
 
-    fn set_label<'a>(&'a self, target: &'a crate::session::EntryId, label: Option<&'a str>, cx: &'a Context) -> BoxFuture<'a, Result<(), HarnessError>> {
+    fn set_label<'a>(
+        &'a self,
+        target: &'a crate::session::EntryId,
+        label: Option<&'a str>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
         Box::pin(async move {
-            if self.is_closed() { return Err(self.closed_error()); }
-            self.session.set_label(target, label, cx).await.map_err(map_session_error)?;
-            self.events.emit(HarnessEvent::global(HarnessEventPayload::ValueUpdate {
-                change: ValueUpdateChange::EntryLabel { target_id: target.clone(), label: label.map(str::to_owned) },
-            }), cx).await;
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
+            self.session
+                .set_label(target, label, cx)
+                .await
+                .map_err(map_session_error)?;
+            self.events
+                .emit(
+                    HarnessEvent::global(HarnessEventPayload::ValueUpdate {
+                        change: ValueUpdateChange::EntryLabel {
+                            target_id: target.clone(),
+                            label: label.map(str::to_owned),
+                        },
+                    }),
+                    cx,
+                )
+                .await;
             Ok(())
         })
     }
 
-    fn get_tools<'a>(&'a self, _cx: &'a Context) -> BoxFuture<'a, Result<Vec<Arc<dyn crate::harness::tool::HarnessTool>>, HarnessError>> {
+    fn get_tools<'a>(
+        &'a self,
+        _cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Arc<dyn crate::harness::tool::HarnessTool>>, HarnessError>> {
         Box::pin(async move { Ok(self.config.read().await.tools.clone()) })
     }
 
-    fn set_tools<'a>(&'a self, tools: Vec<Arc<dyn crate::harness::tool::HarnessTool>>, cx: &'a Context) -> BoxFuture<'a, Result<(), HarnessError>> {
+    fn set_tools<'a>(
+        &'a self,
+        tools: Vec<Arc<dyn crate::harness::tool::HarnessTool>>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
         Box::pin(async move {
-            if self.is_closed() { return Err(self.closed_error()); }
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             validate_tools(&tools)?;
             self.config.write().await.tools = tools;
-            self.events.emit(HarnessEvent::global(HarnessEventPayload::ConfigUpdate { change: ConfigUpdateChange::Tools }), cx).await;
+            self.events
+                .emit(
+                    HarnessEvent::global(HarnessEventPayload::ConfigUpdate {
+                        change: ConfigUpdateChange::Tools,
+                    }),
+                    cx,
+                )
+                .await;
             Ok(())
         })
     }
 
-    fn get_resources<'a>(&'a self, _cx: &'a Context) -> BoxFuture<'a, Result<HarnessResources, HarnessError>> {
+    fn get_resources<'a>(
+        &'a self,
+        _cx: &'a Context,
+    ) -> BoxFuture<'a, Result<HarnessResources, HarnessError>> {
         Box::pin(async move { Ok(self.config.read().await.resources.clone()) })
     }
 
-    fn set_resources<'a>(&'a self, resources: HarnessResources, cx: &'a Context) -> BoxFuture<'a, Result<(), HarnessError>> {
+    fn set_resources<'a>(
+        &'a self,
+        resources: HarnessResources,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
         Box::pin(async move {
-            if self.is_closed() { return Err(self.closed_error()); }
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             self.config.write().await.resources = resources;
-            self.events.emit(HarnessEvent::global(HarnessEventPayload::ConfigUpdate { change: ConfigUpdateChange::Resources }), cx).await;
+            self.events
+                .emit(
+                    HarnessEvent::global(HarnessEventPayload::ConfigUpdate {
+                        change: ConfigUpdateChange::Resources,
+                    }),
+                    cx,
+                )
+                .await;
             Ok(())
         })
     }
 
-    fn get_stream_options<'a>(&'a self, _cx: &'a Context) -> BoxFuture<'a, Result<HarnessStreamOptions, HarnessError>> {
+    fn get_stream_options<'a>(
+        &'a self,
+        _cx: &'a Context,
+    ) -> BoxFuture<'a, Result<HarnessStreamOptions, HarnessError>> {
         Box::pin(async move { Ok(self.config.read().await.stream_options.clone()) })
     }
 
-    fn set_stream_options<'a>(&'a self, options: HarnessStreamOptions, cx: &'a Context) -> BoxFuture<'a, Result<(), HarnessError>> {
+    fn set_stream_options<'a>(
+        &'a self,
+        options: HarnessStreamOptions,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
         Box::pin(async move {
-            if self.is_closed() { return Err(self.closed_error()); }
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             let mut config = self.config.write().await;
             let previous = config.stream_options.clone();
             config.stream_options = options.clone();
             drop(config);
-            self.events.emit(HarnessEvent::global(HarnessEventPayload::ConfigUpdate { change: ConfigUpdateChange::StreamOptions { value: options, previous } }), cx).await;
+            self.events
+                .emit(
+                    HarnessEvent::global(HarnessEventPayload::ConfigUpdate {
+                        change: ConfigUpdateChange::StreamOptions {
+                            value: options,
+                            previous,
+                        },
+                    }),
+                    cx,
+                )
+                .await;
             Ok(())
         })
     }
 
-    fn get_retry_policy<'a>(&'a self, _cx: &'a Context) -> BoxFuture<'a, Result<HarnessRetryPolicy, HarnessError>> {
+    fn get_retry_policy<'a>(
+        &'a self,
+        _cx: &'a Context,
+    ) -> BoxFuture<'a, Result<HarnessRetryPolicy, HarnessError>> {
         Box::pin(async move { Ok(self.config.read().await.retry) })
     }
 
-    fn set_retry_policy<'a>(&'a self, policy: HarnessRetryPolicy, cx: &'a Context) -> BoxFuture<'a, Result<(), HarnessError>> {
+    fn set_retry_policy<'a>(
+        &'a self,
+        policy: HarnessRetryPolicy,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
         Box::pin(async move {
-            policy.validate().map_err(|_| HarnessError::InvalidRetryPolicy { max_retries: policy.max_retries, base_delay_ms: policy.base_delay_ms, message: "retry policy cannot be represented safely".to_owned() })?;
+            policy
+                .validate()
+                .map_err(|_| HarnessError::InvalidRetryPolicy {
+                    max_retries: policy.max_retries,
+                    base_delay_ms: policy.base_delay_ms,
+                    message: "retry policy cannot be represented safely".to_owned(),
+                })?;
             let mut config = self.config.write().await;
             let previous = config.retry;
             config.retry = policy;
             drop(config);
-            self.events.emit(HarnessEvent::global(HarnessEventPayload::ConfigUpdate { change: ConfigUpdateChange::RetryPolicy { value: policy, previous } }), cx).await;
+            self.events
+                .emit(
+                    HarnessEvent::global(HarnessEventPayload::ConfigUpdate {
+                        change: ConfigUpdateChange::RetryPolicy {
+                            value: policy,
+                            previous,
+                        },
+                    }),
+                    cx,
+                )
+                .await;
             Ok(())
         })
     }
 
-    fn get_compaction_settings<'a>(&'a self, _cx: &'a Context) -> BoxFuture<'a, Result<CompactionSettings, HarnessError>> {
+    fn get_compaction_settings<'a>(
+        &'a self,
+        _cx: &'a Context,
+    ) -> BoxFuture<'a, Result<CompactionSettings, HarnessError>> {
         Box::pin(async move { Ok(self.config.read().await.compaction) })
     }
 
-    fn set_compaction_settings<'a>(&'a self, settings: CompactionSettings, cx: &'a Context) -> BoxFuture<'a, Result<(), HarnessError>> {
+    fn set_compaction_settings<'a>(
+        &'a self,
+        settings: CompactionSettings,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
         Box::pin(async move {
-            if self.is_closed() { return Err(self.closed_error()); }
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             let mut config = self.config.write().await;
             let previous = config.compaction;
             config.compaction = settings;
             drop(config);
-            self.events.emit(HarnessEvent::global(HarnessEventPayload::ConfigUpdate { change: ConfigUpdateChange::CompactionSettings { value: settings, previous } }), cx).await;
+            self.events
+                .emit(
+                    HarnessEvent::global(HarnessEventPayload::ConfigUpdate {
+                        change: ConfigUpdateChange::CompactionSettings {
+                            value: settings,
+                            previous,
+                        },
+                    }),
+                    cx,
+                )
+                .await;
             Ok(())
         })
     }
 
-    fn get_steering_mode<'a>(&'a self, _cx: &'a Context) -> BoxFuture<'a, Result<crate::queue::QueueMode, HarnessError>> {
+    fn get_steering_mode<'a>(
+        &'a self,
+        _cx: &'a Context,
+    ) -> BoxFuture<'a, Result<crate::queue::QueueMode, HarnessError>> {
         Box::pin(async move { Ok(self.config.read().await.steering_mode) })
     }
 
-    fn set_steering_mode<'a>(&'a self, mode: crate::queue::QueueMode, cx: &'a Context) -> BoxFuture<'a, Result<(), HarnessError>> {
+    fn set_steering_mode<'a>(
+        &'a self,
+        mode: crate::queue::QueueMode,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
         Box::pin(async move {
-            if self.is_closed() { return Err(self.closed_error()); }
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             let mut config = self.config.write().await;
             let previous = config.steering_mode;
             config.steering_mode = mode;
             drop(config);
-            self.events.emit(HarnessEvent::global(HarnessEventPayload::ConfigUpdate { change: ConfigUpdateChange::SteeringMode { value: mode, previous } }), cx).await;
+            self.events
+                .emit(
+                    HarnessEvent::global(HarnessEventPayload::ConfigUpdate {
+                        change: ConfigUpdateChange::SteeringMode {
+                            value: mode,
+                            previous,
+                        },
+                    }),
+                    cx,
+                )
+                .await;
             Ok(())
         })
     }
 
-    fn get_follow_up_mode<'a>(&'a self, _cx: &'a Context) -> BoxFuture<'a, Result<crate::queue::QueueMode, HarnessError>> {
+    fn get_follow_up_mode<'a>(
+        &'a self,
+        _cx: &'a Context,
+    ) -> BoxFuture<'a, Result<crate::queue::QueueMode, HarnessError>> {
         Box::pin(async move { Ok(self.config.read().await.follow_up_mode) })
     }
 
-    fn set_follow_up_mode<'a>(&'a self, mode: crate::queue::QueueMode, cx: &'a Context) -> BoxFuture<'a, Result<(), HarnessError>> {
+    fn set_follow_up_mode<'a>(
+        &'a self,
+        mode: crate::queue::QueueMode,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), HarnessError>> {
         Box::pin(async move {
-            if self.is_closed() { return Err(self.closed_error()); }
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             let mut config = self.config.write().await;
             let previous = config.follow_up_mode;
             config.follow_up_mode = mode;
             drop(config);
-            self.events.emit(HarnessEvent::global(HarnessEventPayload::ConfigUpdate { change: ConfigUpdateChange::FollowUpMode { value: mode, previous } }), cx).await;
+            self.events
+                .emit(
+                    HarnessEvent::global(HarnessEventPayload::ConfigUpdate {
+                        change: ConfigUpdateChange::FollowUpMode {
+                            value: mode,
+                            previous,
+                        },
+                    }),
+                    cx,
+                )
+                .await;
             Ok(())
         })
     }
 
-    fn watch_session<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<WatchHandle<crate::harness::snapshot::SessionSnapshot>, HarnessError>> {
+    fn watch_session<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<WatchHandle<crate::harness::snapshot::SessionSnapshot>, HarnessError>>
+    {
         Box::pin(async move {
             let this = Arc::new(self.clone_ref());
-            let capture: SnapshotCapture<crate::harness::snapshot::SessionSnapshot> = Arc::new(move |context| {
-                let this = Arc::clone(&this);
-                async move { this.session_snapshot(&context).await }.boxed()
-            });
-            self.events.watch_from_snapshot(capture, Arc::new(|_| true), cx).await
+            let capture: SnapshotCapture<crate::harness::snapshot::SessionSnapshot> =
+                Arc::new(move |context| {
+                    let this = Arc::clone(&this);
+                    async move { this.session_snapshot(&context).await }.boxed()
+                });
+            self.events
+                .watch_from_snapshot(capture, Arc::new(|_| true), cx)
+                .await
         })
     }
 
-    fn hooks(&self) -> &HookRegistry { &self.hooks }
-    fn events(&self) -> &HarnessEventBus { &self.events }
+    fn hooks(&self) -> &HookRegistry {
+        &self.hooks
+    }
+    fn events(&self) -> &HarnessEventBus {
+        &self.events
+    }
 
     fn close<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<(), HarnessError>> {
         Box::pin(async move {
@@ -450,11 +625,16 @@ impl AgentHarness for HarnessRuntime {
             // session open; only explicit close drains it, so the session
             // close below runs even when the runtime already shut down.
             if !self.closed.swap(true, Ordering::AcqRel) {
-                let fault = Arc::new(HarnessFault { message: "harness is closed".to_owned(), cause: Box::new(CloseReason) });
+                let fault = Arc::new(HarnessFault {
+                    message: "harness is closed".to_owned(),
+                    cause: Box::new(CloseReason),
+                });
                 self.hooks.close(Arc::clone(&fault));
                 self.events.close(Arc::clone(&fault));
                 let lanes = self.lane_snapshot().await;
-                for lane in lanes { lane.seal(Arc::clone(&fault)).await; }
+                for lane in lanes {
+                    lane.seal(Arc::clone(&fault)).await;
+                }
             }
             self.session.close(cx).await.map_err(map_session_error)
         })
@@ -475,7 +655,10 @@ impl HarnessRuntime {
         }
     }
 
-    async fn session_snapshot(&self, cx: &Context) -> Result<crate::harness::snapshot::SessionSnapshot, HarnessError> {
+    async fn session_snapshot(
+        &self,
+        cx: &Context,
+    ) -> Result<crate::harness::snapshot::SessionSnapshot, HarnessError> {
         let lanes = self.lanes(cx).await?;
         Ok(crate::harness::snapshot::SessionSnapshot {
             lanes,
@@ -488,7 +671,9 @@ impl HarnessRuntime {
 #[error("harness close requested")]
 struct CloseReason;
 
-fn validate_tools(tools: &[Arc<dyn crate::harness::tool::HarnessTool>]) -> Result<(), HarnessError> {
+fn validate_tools(
+    tools: &[Arc<dyn crate::harness::tool::HarnessTool>],
+) -> Result<(), HarnessError> {
     let mut names = std::collections::BTreeSet::new();
     for tool in tools {
         let name = tool.name();
@@ -507,9 +692,15 @@ fn validate_active_tools(
     active: Option<&[String]>,
     tools: &[Arc<dyn crate::harness::tool::HarnessTool>],
 ) -> Result<(), HarnessError> {
-    let Some(active) = active else { return Ok(()); };
-    let available: std::collections::BTreeSet<&str> = tools.iter().map(|tool| tool.name()).collect();
-    if let Some(name) = active.iter().find(|name| !available.contains(name.as_str())) {
+    let Some(active) = active else {
+        return Ok(());
+    };
+    let available: std::collections::BTreeSet<&str> =
+        tools.iter().map(|tool| tool.name()).collect();
+    if let Some(name) = active
+        .iter()
+        .find(|name| !available.contains(name.as_str()))
+    {
         return Err(HarnessError::InvalidLane {
             lane: LaneName::new(""),
             reason: "unknown_tool".to_owned(),

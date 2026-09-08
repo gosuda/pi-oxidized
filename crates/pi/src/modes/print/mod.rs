@@ -328,7 +328,9 @@ mod tests {
         msg.stop_reason = StopReason::Error;
         msg.error_message = Some("boom".into());
         let events = vec![AgentSessionEvent::AgentEnd {
-            messages: vec![AgentMessage::Llm(Box::new(Message::Assistant(Box::new(msg))))],
+            messages: vec![AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                msg,
+            ))))],
             will_retry: false,
         }];
         let options = PrintModeOptions::new(PrintOutput::Text);

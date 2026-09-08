@@ -6,17 +6,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use tokio::sync::Mutex;
 
-use crate::context::Context;
-use super::address::{AddressKind, ListReadOptions, RawAddress, resolve_list_read_options, LIST_READ_DEFAULT_LIMIT, LIST_READ_MAX_LIMIT};
+use super::address::{
+    AddressKind, LIST_READ_DEFAULT_LIMIT, LIST_READ_MAX_LIMIT, ListReadOptions, RawAddress,
+    resolve_list_read_options,
+};
+use super::backed::{StorageBackedSession, aborted_error, closed_error, validate_branch_name};
 use super::entry::Entry;
 use super::error::{SessionError, StorageErrorCode, StorageFailure};
-use super::fork::{create_fork_snapshot, fork_snapshot_writes, ForkSource, ForkSourceSnapshot};
-use super::ids::{EntryId, UuidV7Generator, UsageId};
+use super::fork::{ForkSource, ForkSourceSnapshot, create_fork_snapshot, fork_snapshot_writes};
+use super::ids::{EntryId, UsageId, UuidV7Generator};
 use super::scan::{EntryScan, EntryStructure, ScanOrder, StorageBranchScan, UsageScan};
-use super::backed::{aborted_error, closed_error, validate_branch_name, StorageBackedSession};
 use super::traits::{ForkOptions, IdGenerator, Session, SessionMetadata, SessionRepo, Storage};
-use super::write::{commit_writes, validate_committed_writes, validate_replayed_writes, CommitResult, CommittedIdView, CommittedListWrite, CommittedValueWrite, CommittedWrite, SessionStats, UsageRow, Write};
+use super::write::{
+    CommitResult, CommittedIdView, CommittedListWrite, CommittedValueWrite, CommittedWrite,
+    SessionStats, UsageRow, Write, commit_writes, validate_committed_writes,
+    validate_replayed_writes,
+};
 use super::{RawListElement, RawStoredValue};
+use crate::context::Context;
 
 /// Complete contents of the reference in-memory backend, held behind one
 /// mutex by [`MemoryStorage`].
@@ -72,12 +79,21 @@ impl InMemoryStorageState {
     ///
     /// Returns the shared commit-validation errors from
     /// [`super::validate_committed_writes`].
-    pub fn apply(&mut self, writes: &[Write], timestamp: i64) -> Result<CommitResult, SessionError> {
+    pub fn apply(
+        &mut self,
+        writes: &[Write],
+        timestamp: i64,
+    ) -> Result<CommitResult, SessionError> {
         let first_seq = self.next_seq;
         validate_committed_writes(writes, first_seq, self)?;
         let (committed, seqs) = commit_writes(writes.to_vec(), first_seq, timestamp)?;
         let stats = self.apply_committed(&committed);
-        Ok(CommitResult { first_seq, seqs, timestamp, stats })
+        Ok(CommitResult {
+            first_seq,
+            seqs,
+            timestamp,
+            stats,
+        })
     }
 
     /// Applies committed writes that have already passed validation.
@@ -98,17 +114,39 @@ impl InMemoryStorageState {
                     add_usage(&mut self.stats.usage, &row.usage);
                     self.usage.insert(row.id.clone(), row.clone());
                 }
-                CommittedWrite::Value(CommittedValueWrite::Set { seq, namespace, key, value }) => {
+                CommittedWrite::Value(CommittedValueWrite::Set {
+                    seq,
+                    namespace,
+                    key,
+                    value,
+                }) => {
                     self.values.insert(
                         (namespace.clone(), key.clone()),
-                        RawStoredValue { namespace: namespace.clone(), key: key.clone(), kind: AddressKind::Value, value: value.clone(), seq: *seq },
+                        RawStoredValue {
+                            namespace: namespace.clone(),
+                            key: key.clone(),
+                            kind: AddressKind::Value,
+                            value: value.clone(),
+                            seq: *seq,
+                        },
                     );
                 }
                 CommittedWrite::Value(CommittedValueWrite::Delete { namespace, key, .. }) => {
                     self.values.remove(&(namespace.clone(), key.clone()));
                 }
-                CommittedWrite::List(CommittedListWrite::Append { seq, namespace, key, value }) => {
-                    self.lists.entry((namespace.clone(), key.clone())).or_default().push(RawListElement { seq: *seq, value: value.clone() });
+                CommittedWrite::List(CommittedListWrite::Append {
+                    seq,
+                    namespace,
+                    key,
+                    value,
+                }) => {
+                    self.lists
+                        .entry((namespace.clone(), key.clone()))
+                        .or_default()
+                        .push(RawListElement {
+                            seq: *seq,
+                            value: value.clone(),
+                        });
                 }
                 CommittedWrite::List(CommittedListWrite::Delete { namespace, key, .. }) => {
                     self.lists.remove(&(namespace.clone(), key.clone()));
@@ -146,7 +184,9 @@ impl InMemoryStorageState {
     ///
     /// Returns the shared replay-validation error when the snapshot is
     /// inconsistent with the destination's identity and parent rules.
-    pub fn from_fork_snapshot(snapshot: &super::fork::ForkDestinationSnapshot) -> Result<Self, SessionError> {
+    pub fn from_fork_snapshot(
+        snapshot: &super::fork::ForkDestinationSnapshot,
+    ) -> Result<Self, SessionError> {
         let mut state = Self::new();
         let writes = fork_snapshot_writes(snapshot);
         state.replay(&writes)?;
@@ -165,16 +205,34 @@ impl InMemoryStorageState {
         let mut id = query.start.clone();
         let mut output = Vec::new();
         let mut seen = HashSet::new();
-        let limit = usize::try_from(query.limit.unwrap_or(LIST_READ_DEFAULT_LIMIT).min(LIST_READ_MAX_LIMIT)).unwrap_or(usize::MAX);
+        let limit = usize::try_from(
+            query
+                .limit
+                .unwrap_or(LIST_READ_DEFAULT_LIMIT)
+                .min(LIST_READ_MAX_LIMIT),
+        )
+        .unwrap_or(usize::MAX);
         while output.len() < limit {
             if !seen.insert(id.clone()) {
-                return Err(SessionError::Invariant("cycle in branch ancestry".to_owned()));
+                return Err(SessionError::Invariant(
+                    "cycle in branch ancestry".to_owned(),
+                ));
             }
-            let entry = self.entries.get(&id).ok_or_else(|| SessionError::UnknownTarget(id.clone()))?;
+            let entry = self
+                .entries
+                .get(&id)
+                .ok_or_else(|| SessionError::UnknownTarget(id.clone()))?;
             let stop = query.stop_at_id.as_ref().is_some_and(|value| value == &id)
-                || query.stop_at_type.is_some_and(|value| value == entry.entry_type());
-            if query.entry_type.is_none_or(|value| value == entry.entry_type())
-                && query.custom_type.as_deref().is_none_or(|value| entry.custom_type() == Some(value))
+                || query
+                    .stop_at_type
+                    .is_some_and(|value| value == entry.entry_type());
+            if query
+                .entry_type
+                .is_none_or(|value| value == entry.entry_type())
+                && query
+                    .custom_type
+                    .as_deref()
+                    .is_none_or(|value| entry.custom_type() == Some(value))
                 && query.cursor.is_none_or(|value| entry.seq() < value.seq)
             {
                 output.push(entry.clone());
@@ -198,7 +256,11 @@ impl InMemoryStorageState {
     pub fn snapshot_for_fork(&self) -> ForkSourceSnapshot {
         let mut entries: Vec<Entry> = self.entries.values().cloned().collect();
         entries.sort_by_key(Entry::seq);
-        ForkSourceSnapshot { entries, values: self.values.values().cloned().collect(), entries_complete: true }
+        ForkSourceSnapshot {
+            entries,
+            values: self.values.values().cloned().collect(),
+            entries_complete: true,
+        }
     }
 }
 
@@ -240,12 +302,24 @@ fn add_usage(total: &mut pi_ai::Usage, add: &pi_ai::Usage) {
 }
 
 fn now_millis() -> Result<i64, SessionError> {
-    let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| SessionError::Backend(StorageFailure { code: StorageErrorCode::Io, message: "failed to read the system clock".to_owned(), source: Some(Arc::new(error)) }))?;
-    i64::try_from(duration.as_millis()).map_err(|_| SessionError::Invariant("system clock timestamp exceeds i64 range".to_owned()))
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            SessionError::Backend(StorageFailure {
+                code: StorageErrorCode::Io,
+                message: "failed to read the system clock".to_owned(),
+                source: Some(Arc::new(error)),
+            })
+        })?;
+    i64::try_from(duration.as_millis())
+        .map_err(|_| SessionError::Invariant("system clock timestamp exceeds i64 range".to_owned()))
 }
 
 fn repo_closed_error() -> SessionError {
-    SessionError::Backend(StorageFailure::new(StorageErrorCode::Closed, "session repository is closed"))
+    SessionError::Backend(StorageFailure::new(
+        StorageErrorCode::Closed,
+        "session repository is closed",
+    ))
 }
 
 /// Reference [`Storage`] keeping the whole session in process memory.
@@ -278,7 +352,10 @@ impl MemoryStorage {
     /// Creates a fresh open handle over existing durable state.
     #[must_use]
     pub fn attach(state: Arc<Mutex<InMemoryStorageState>>) -> Self {
-        Self { state, closed: AtomicBool::new(false) }
+        Self {
+            state,
+            closed: AtomicBool::new(false),
+        }
     }
 
     /// Returns the shared durable state handle.
@@ -297,7 +374,11 @@ impl MemoryStorage {
 }
 
 impl Storage for MemoryStorage {
-    fn commit<'a>(&'a self, writes: Vec<Write>, cx: &'a Context) -> BoxFuture<'a, Result<CommitResult, SessionError>> {
+    fn commit<'a>(
+        &'a self,
+        writes: Vec<Write>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<CommitResult, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
@@ -306,40 +387,81 @@ impl Storage for MemoryStorage {
         })
     }
 
-    fn get_entries<'a>(&'a self, ids: &'a [EntryId], cx: &'a Context) -> BoxFuture<'a, Result<HashMap<EntryId, Entry>, SessionError>> {
+    fn get_entries<'a>(
+        &'a self,
+        ids: &'a [EntryId],
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<HashMap<EntryId, Entry>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             let state = self.state.lock().await;
-            Ok(ids.iter().filter_map(|id| state.entries.get(id).cloned().map(|entry| (id.clone(), entry))).collect())
+            Ok(ids
+                .iter()
+                .filter_map(|id| {
+                    state
+                        .entries
+                        .get(id)
+                        .cloned()
+                        .map(|entry| (id.clone(), entry))
+                })
+                .collect())
         })
     }
 
-    fn get_value<'a>(&'a self, address: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<Option<RawStoredValue>, SessionError>> {
+    fn get_value<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<RawStoredValue>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             let state = self.state.lock().await;
-            Ok(state.values.get(&(address.namespace.clone(), address.key.clone())).cloned())
+            Ok(state
+                .values
+                .get(&(address.namespace.clone(), address.key.clone()))
+                .cloned())
         })
     }
 
-    fn scan_values<'a>(&'a self, prefix: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<Vec<RawStoredValue>, SessionError>> {
+    fn scan_values<'a>(
+        &'a self,
+        prefix: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<RawStoredValue>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             let state = self.state.lock().await;
-            Ok(state.values.values().filter(|value| value.namespace == prefix.namespace && value.key.starts_with(&prefix.key)).cloned().collect())
+            Ok(state
+                .values
+                .values()
+                .filter(|value| {
+                    value.namespace == prefix.namespace && value.key.starts_with(&prefix.key)
+                })
+                .cloned()
+                .collect())
         })
     }
 
-    fn read_list<'a>(&'a self, address: &'a RawAddress, options: Option<ListReadOptions>, cx: &'a Context) -> BoxFuture<'a, Result<Vec<RawListElement>, SessionError>> {
+    fn read_list<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        options: Option<ListReadOptions>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<RawListElement>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
-            let options = resolve_list_read_options(options).map_err(|_| SessionError::Invariant("list limit must be positive".to_owned()))?;
+            let options = resolve_list_read_options(options)
+                .map_err(|_| SessionError::Invariant("list limit must be positive".to_owned()))?;
             let state = self.state.lock().await;
-            let mut values = state.lists.get(&(address.namespace.clone(), address.key.clone())).cloned().unwrap_or_default();
+            let mut values = state
+                .lists
+                .get(&(address.namespace.clone(), address.key.clone()))
+                .cloned()
+                .unwrap_or_default();
             if let Some(cursor) = options.cursor {
                 values.retain(|item| match options.order {
                     ScanOrder::Asc => item.seq > cursor.seq,
@@ -354,7 +476,11 @@ impl Storage for MemoryStorage {
         })
     }
 
-    fn scan_branch<'a>(&'a self, query: &'a StorageBranchScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+    fn scan_branch<'a>(
+        &'a self,
+        query: &'a StorageBranchScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
@@ -363,11 +489,23 @@ impl Storage for MemoryStorage {
         })
     }
 
-    fn scan_branch_structure<'a>(&'a self, query: &'a StorageBranchScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<EntryStructure>, SessionError>> {
-        Box::pin(async move { self.scan_branch(query, cx).await.map(|entries| entries.iter().map(EntryStructure::from).collect()) })
+    fn scan_branch_structure<'a>(
+        &'a self,
+        query: &'a StorageBranchScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<EntryStructure>, SessionError>> {
+        Box::pin(async move {
+            self.scan_branch(query, cx)
+                .await
+                .map(|entries| entries.iter().map(EntryStructure::from).collect())
+        })
     }
 
-    fn scan_entries<'a>(&'a self, query: &'a EntryScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+    fn scan_entries<'a>(
+        &'a self,
+        query: &'a EntryScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
@@ -377,20 +515,41 @@ impl Storage for MemoryStorage {
                 .values()
                 .filter(|entry| query.from_seq.is_none_or(|value| entry.seq() >= value))
                 .filter(|entry| query.to_seq.is_none_or(|value| entry.seq() <= value))
-                .filter(|entry| query.entry_type.is_none_or(|value| entry.entry_type() == value))
-                .filter(|entry| query.custom_type.as_deref().is_none_or(|value| entry.custom_type() == Some(value)))
+                .filter(|entry| {
+                    query
+                        .entry_type
+                        .is_none_or(|value| entry.entry_type() == value)
+                })
+                .filter(|entry| {
+                    query
+                        .custom_type
+                        .as_deref()
+                        .is_none_or(|value| entry.custom_type() == Some(value))
+                })
                 .cloned()
                 .collect();
             entries.sort_by_key(Entry::seq);
             if query.order == Some(ScanOrder::Desc) {
                 entries.reverse();
             }
-            entries.truncate(usize::try_from(query.limit.unwrap_or(LIST_READ_DEFAULT_LIMIT).min(LIST_READ_MAX_LIMIT)).unwrap_or(usize::MAX));
+            entries.truncate(
+                usize::try_from(
+                    query
+                        .limit
+                        .unwrap_or(LIST_READ_DEFAULT_LIMIT)
+                        .min(LIST_READ_MAX_LIMIT),
+                )
+                .unwrap_or(usize::MAX),
+            );
             Ok(entries)
         })
     }
 
-    fn scan_usage<'a>(&'a self, query: &'a UsageScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<UsageRow>, SessionError>> {
+    fn scan_usage<'a>(
+        &'a self,
+        query: &'a UsageScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<UsageRow>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
@@ -406,12 +565,23 @@ impl Storage for MemoryStorage {
             if query.order == Some(ScanOrder::Desc) {
                 rows.reverse();
             }
-            rows.truncate(usize::try_from(query.limit.unwrap_or(LIST_READ_DEFAULT_LIMIT).min(LIST_READ_MAX_LIMIT)).unwrap_or(usize::MAX));
+            rows.truncate(
+                usize::try_from(
+                    query
+                        .limit
+                        .unwrap_or(LIST_READ_DEFAULT_LIMIT)
+                        .min(LIST_READ_MAX_LIMIT),
+                )
+                .unwrap_or(usize::MAX),
+            );
             Ok(rows)
         })
     }
 
-    fn get_stats<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<SessionStats, SessionError>> {
+    fn get_stats<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<SessionStats, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
@@ -431,7 +601,10 @@ impl Storage for MemoryStorage {
 }
 
 impl ForkSource for MemoryStorage {
-    fn capture_fork_source<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<ForkSourceSnapshot, SessionError>> {
+    fn capture_fork_source<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<ForkSourceSnapshot, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
@@ -510,12 +683,20 @@ impl MemorySessionRepo {
 
     async fn reserve_id(&self, id: &str) -> Result<IdReservation, SessionError> {
         let sessions = self.sessions.lock().await;
-        let mut pending = self.pending_ids.lock().map_err(|_| SessionError::Invariant("session id registry poisoned".to_owned()))?;
+        let mut pending = self
+            .pending_ids
+            .lock()
+            .map_err(|_| SessionError::Invariant("session id registry poisoned".to_owned()))?;
         if sessions.contains_key(id) || pending.contains(id) {
-            return Err(SessionError::Invariant(format!("session already exists: {id}")));
+            return Err(SessionError::Invariant(format!(
+                "session already exists: {id}"
+            )));
         }
         pending.insert(id.to_owned());
-        Ok(IdReservation { pending_ids: Arc::clone(&self.pending_ids), id: id.to_owned() })
+        Ok(IdReservation {
+            pending_ids: Arc::clone(&self.pending_ids),
+            id: id.to_owned(),
+        })
     }
 
     fn make_session(&self, record: &Record) -> Arc<StorageBackedSession> {
@@ -560,7 +741,11 @@ impl SessionRepo for MemorySessionRepo {
     type CreateOptions = MemoryCreateOptions;
     type ListOptions = MemoryListOptions;
 
-    fn create<'a>(&'a self, options: Self::CreateOptions, cx: &'a Context) -> BoxFuture<'a, Result<Arc<dyn Session>, SessionError>> {
+    fn create<'a>(
+        &'a self,
+        options: Self::CreateOptions,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Arc<dyn Session>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
@@ -583,7 +768,12 @@ impl SessionRepo for MemorySessionRepo {
             self.ensure_open()?;
             let state = Arc::new(Mutex::new(InMemoryStorageState::new()));
             let open = Arc::new(AtomicBool::new(true));
-            let mut record = Record { metadata, state, open, session: None };
+            let mut record = Record {
+                metadata,
+                state,
+                open,
+                session: None,
+            };
             let session = self.make_session(&record);
             record.session = Some(Arc::clone(&session));
             let mut sessions = self.sessions.lock().await;
@@ -593,17 +783,27 @@ impl SessionRepo for MemorySessionRepo {
         })
     }
 
-    fn open<'a>(&'a self, metadata: &'a Self::Metadata, cx: &'a Context) -> BoxFuture<'a, Result<Arc<dyn Session>, SessionError>> {
+    fn open<'a>(
+        &'a self,
+        metadata: &'a Self::Metadata,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Arc<dyn Session>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             let mut sessions = self.sessions.lock().await;
             self.ensure_open()?;
-            let record = sessions
-                .get_mut(&metadata.id)
-                .ok_or_else(|| SessionError::Backend(StorageFailure::new(StorageErrorCode::NotFound, "session not found")))?;
+            let record = sessions.get_mut(&metadata.id).ok_or_else(|| {
+                SessionError::Backend(StorageFailure::new(
+                    StorageErrorCode::NotFound,
+                    "session not found",
+                ))
+            })?;
             if record.open.swap(true, Ordering::AcqRel) {
-                return Err(SessionError::Invariant(format!("session is already open: {}", metadata.id)));
+                return Err(SessionError::Invariant(format!(
+                    "session is already open: {}",
+                    metadata.id
+                )));
             }
             let session = self.make_session(record);
             record.session = Some(Arc::clone(&session));
@@ -611,34 +811,56 @@ impl SessionRepo for MemorySessionRepo {
         })
     }
 
-    fn list<'a>(&'a self, _options: Option<Self::ListOptions>, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Self::Metadata>, SessionError>> {
+    fn list<'a>(
+        &'a self,
+        _options: Option<Self::ListOptions>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Self::Metadata>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             let sessions = self.sessions.lock().await;
             self.ensure_open()?;
-            Ok(sessions.values().map(|record| record.metadata.clone()).collect())
+            Ok(sessions
+                .values()
+                .map(|record| record.metadata.clone())
+                .collect())
         })
     }
 
-    fn delete<'a>(&'a self, metadata: &'a Self::Metadata, cx: &'a Context) -> BoxFuture<'a, Result<(), SessionError>> {
+    fn delete<'a>(
+        &'a self,
+        metadata: &'a Self::Metadata,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             let mut sessions = self.sessions.lock().await;
             self.ensure_open()?;
-            let record = sessions
-                .get(&metadata.id)
-                .ok_or_else(|| SessionError::Backend(StorageFailure::new(StorageErrorCode::NotFound, "session not found")))?;
+            let record = sessions.get(&metadata.id).ok_or_else(|| {
+                SessionError::Backend(StorageFailure::new(
+                    StorageErrorCode::NotFound,
+                    "session not found",
+                ))
+            })?;
             if record.open.load(Ordering::Acquire) {
-                return Err(SessionError::Invariant(format!("session is open: {}", metadata.id)));
+                return Err(SessionError::Invariant(format!(
+                    "session is open: {}",
+                    metadata.id
+                )));
             }
             sessions.remove(&metadata.id);
             Ok(())
         })
     }
 
-    fn fork<'a>(&'a self, source: &'a Self::Metadata, options: ForkOptions, cx: &'a Context) -> BoxFuture<'a, Result<Arc<dyn Session>, SessionError>> {
+    fn fork<'a>(
+        &'a self,
+        source: &'a Self::Metadata,
+        options: ForkOptions,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Arc<dyn Session>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
@@ -647,15 +869,22 @@ impl SessionRepo for MemorySessionRepo {
             }
             let (source_metadata, source_state) = {
                 let sessions = self.sessions.lock().await;
-                let record = sessions
-                    .get(&source.id)
-                    .ok_or_else(|| SessionError::Backend(StorageFailure::new(StorageErrorCode::NotFound, "session not found")))?;
+                let record = sessions.get(&source.id).ok_or_else(|| {
+                    SessionError::Backend(StorageFailure::new(
+                        StorageErrorCode::NotFound,
+                        "session not found",
+                    ))
+                })?;
                 (record.metadata.clone(), Arc::clone(&record.state))
             };
             let created_at = now_millis()?;
             let id = match &options {
-                ForkOptions::Branch { id: Some(id), .. } | ForkOptions::Tree { id: Some(id) } => id.clone(),
-                ForkOptions::Branch { id: None, .. } | ForkOptions::Tree { id: None } => self.id_generator.next(Some(created_at))?,
+                ForkOptions::Branch { id: Some(id), .. } | ForkOptions::Tree { id: Some(id) } => {
+                    id.clone()
+                }
+                ForkOptions::Branch { id: None, .. } | ForkOptions::Tree { id: None } => {
+                    self.id_generator.next(Some(created_at))?
+                }
             };
             let _reservation = self.reserve_id(&id).await?;
             cx.check().map_err(|_| aborted_error())?;
@@ -663,7 +892,9 @@ impl SessionRepo for MemorySessionRepo {
             let source_storage = MemoryStorage::attach(source_state);
             let source_snapshot = source_storage.capture_fork_source(cx).await?;
             let snapshot = create_fork_snapshot(&source_snapshot, &options)?;
-            let destination_state = Arc::new(Mutex::new(InMemoryStorageState::from_fork_snapshot(&snapshot)?));
+            let destination_state = Arc::new(Mutex::new(InMemoryStorageState::from_fork_snapshot(
+                &snapshot,
+            )?));
             let metadata = SessionMetadata {
                 id: id.clone(),
                 created_at,
@@ -673,7 +904,12 @@ impl SessionRepo for MemorySessionRepo {
                 legacy_parent_session_path: None,
             };
             let open = Arc::new(AtomicBool::new(true));
-            let mut record = Record { metadata, state: destination_state, open, session: None };
+            let mut record = Record {
+                metadata,
+                state: destination_state,
+                open,
+                session: None,
+            };
             let session = self.make_session(&record);
             record.session = Some(Arc::clone(&session));
             let mut sessions = self.sessions.lock().await;
@@ -728,13 +964,17 @@ async fn dropping_pending_custom_id_fork_releases_reservation() -> Result<(), Se
     };
     let source_guard = source_state.lock().await;
 
-    let options = ForkOptions::Tree { id: Some("retry-fork".to_owned()) };
+    let options = ForkOptions::Tree {
+        id: Some("retry-fork".to_owned()),
+    };
     let mut pending = Box::pin(repo.fork(&source_metadata, options.clone(), &cx));
     let mut poll_cx = PollContext::from_waker(noop_waker_ref());
     assert!(matches!(pending.as_mut().poll(&mut poll_cx), Poll::Pending));
 
     match repo.fork(&source_metadata, options.clone(), &cx).await {
-        Err(SessionError::Invariant(message)) => assert_eq!(message, "session already exists: retry-fork"),
+        Err(SessionError::Invariant(message)) => {
+            assert_eq!(message, "session already exists: retry-fork")
+        }
         Err(_) | Ok(_) => {
             return Err(SessionError::Invariant(
                 "expected pending reservation to reject duplicate fork".to_owned(),
@@ -750,7 +990,8 @@ async fn dropping_pending_custom_id_fork_releases_reservation() -> Result<(), Se
 }
 #[cfg(test)]
 #[tokio::test]
-async fn dropping_commit_observer_retains_committed_write_after_close_reopen() -> Result<(), SessionError> {
+async fn dropping_commit_observer_retains_committed_write_after_close_reopen()
+-> Result<(), SessionError> {
     // Once `begin_mutation` admits a commit, the owned task carries the
     // mutation permit through backend I/O and settlement even if only the
     // caller's observer future is dropped: close must drain that task instead
@@ -775,7 +1016,12 @@ async fn dropping_commit_observer_retains_committed_write_after_close_reopen() -
         legacy_parent_session_path: None,
     };
     let session = repo
-        .create(MemoryCreateOptions { metadata: Some(metadata.clone()) }, &cx)
+        .create(
+            MemoryCreateOptions {
+                metadata: Some(metadata.clone()),
+            },
+            &cx,
+        )
         .await?;
 
     let state = {
@@ -800,8 +1046,14 @@ async fn dropping_commit_observer_retains_committed_write_after_close_reopen() -
                 },
             },
         },
-        super::write::set_value(&super::address::branch_tip(lane.as_str()), &Some(entry_id.clone()))?,
-        super::write::set_value(&super::address::session_name(), &"dropped-commit-observer".to_owned())?,
+        super::write::set_value(
+            &super::address::branch_tip(lane.as_str()),
+            &Some(entry_id.clone()),
+        )?,
+        super::write::set_value(
+            &super::address::session_name(),
+            &"dropped-commit-observer".to_owned(),
+        )?,
     ];
 
     let mutation = session.begin_mutation(&cx).await?;
@@ -816,26 +1068,39 @@ async fn dropping_commit_observer_retains_committed_write_after_close_reopen() -
     // mutation permit until its backend I/O settles, so close can only line
     // up behind it instead of bypassing it.
     let mut close_waiter = session.close(&cx);
-    assert!(matches!(close_waiter.as_mut().poll(&mut poll_cx), Poll::Pending));
+    assert!(matches!(
+        close_waiter.as_mut().poll(&mut poll_cx),
+        Poll::Pending
+    ));
 
     drop(state_guard);
     close_waiter.await?;
 
     let reopened = repo.open(&metadata, &cx).await?;
-    let branch = reopened
-        .branch(&lane, &cx)
-        .await?
-        .ok_or_else(|| SessionError::Invariant("committed branch should survive close and reopen".to_owned()))?;
+    let branch = reopened.branch(&lane, &cx).await?.ok_or_else(|| {
+        SessionError::Invariant("committed branch should survive close and reopen".to_owned())
+    })?;
     assert_eq!(branch.get_tip_id(&cx).await?, Some(entry_id.clone()));
-    let committed = reopened
-        .get_entry(&entry_id, &cx)
-        .await?
-        .ok_or_else(|| SessionError::Invariant("dropped-observer commit should be settled by close and visible after reopen".to_owned()))?;
+    let committed = reopened.get_entry(&entry_id, &cx).await?.ok_or_else(|| {
+        SessionError::Invariant(
+            "dropped-observer commit should be settled by close and visible after reopen"
+                .to_owned(),
+        )
+    })?;
     assert_eq!(committed.custom_type(), Some("note"));
     match committed {
-        Entry::Custom { data: Some(data), .. } => assert_eq!(data, serde_json::json!({"body": "durable"})),
-        other => return Err(SessionError::Invariant(format!("reopened entry should be the committed custom note, got {other:?}"))),
+        Entry::Custom {
+            data: Some(data), ..
+        } => assert_eq!(data, serde_json::json!({"body": "durable"})),
+        other => {
+            return Err(SessionError::Invariant(format!(
+                "reopened entry should be the committed custom note, got {other:?}"
+            )));
+        }
     }
-    assert_eq!(reopened.get_name(&cx).await?, Some("dropped-commit-observer".to_owned()));
+    assert_eq!(
+        reopened.get_name(&cx).await?,
+        Some("dropped-commit-observer".to_owned())
+    );
     Ok(())
 }

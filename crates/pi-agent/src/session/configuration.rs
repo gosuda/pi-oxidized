@@ -44,7 +44,9 @@ impl Default for HarnessRetryPolicy {
 
 /// Retry policy values that cannot be represented safely at the JS wire edge.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("retry policy values must be non-negative JavaScript-safe integers and maxRetries must leave room for one attempt")]
+#[error(
+    "retry policy values must be non-negative JavaScript-safe integers and maxRetries must leave room for one attempt"
+)]
 pub struct InvalidRetryPolicy;
 
 impl HarnessRetryPolicy {

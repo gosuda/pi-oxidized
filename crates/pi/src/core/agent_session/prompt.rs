@@ -1337,9 +1337,9 @@ mod tests {
         manager
             .append_message(&pi_agent::user_text("hi", std::iter::empty()))
             .test_context("append user")?;
-        let assistant = AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(Box::new(assistant_text(
-            "answer",
-        )))));
+        let assistant = AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(Box::new(
+            assistant_text("answer"),
+        ))));
         manager
             .append_message(&assistant)
             .test_context("append assistant")?;

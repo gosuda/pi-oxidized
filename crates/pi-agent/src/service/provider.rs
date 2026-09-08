@@ -14,7 +14,7 @@ use super::delta::DeltaOp;
 use super::error::{RemoteServiceErrorCode, ServiceError};
 use super::replicated::{MutableReplicatedState, ReplicatedSourceListener};
 use super::transport::{RemoteServiceTransport, ServiceSubscription, ServiceUpdateListener};
-use super::value::{is_json_value, JsInteger, JsString, JsonValue};
+use super::value::{JsInteger, JsString, JsonValue, is_json_value};
 use super::wire::{
     ServiceCall, ServiceCatalogueEntry, ServiceInstanceAddress, ServiceInstanceSnapshot,
     ServiceMemberSnapshot, ServiceMode, ServiceProviderUpdate, ServiceSubscriptionSnapshot,
@@ -193,7 +193,9 @@ impl RemoteServiceProvider {
                 )));
             }
             if registrations.contains_key(&definition.id) {
-                return Err(ServiceError::local("Remote service catalogue contains duplicate IDs"));
+                return Err(ServiceError::local(
+                    "Remote service catalogue contains duplicate IDs",
+                ));
             }
             catalogue.push(ServiceCatalogueEntry {
                 service_id: definition.id.clone(),
@@ -235,7 +237,11 @@ impl RemoteServiceProvider {
     /// allowlisted or not singleton, a provider is already published, the
     /// implementation has no members or holds a non-JSON state value, or the
     /// member shape does not match the published facade.
-    pub fn provide(&self, service_id: &JsString, implementation: ServiceImplementation) -> Result<(), ServiceError> {
+    pub fn provide(
+        &self,
+        service_id: &JsString,
+        implementation: ServiceImplementation,
+    ) -> Result<(), ServiceError> {
         {
             let inner = lock(&self.inner);
             assert_active(&inner)?;
@@ -244,7 +250,10 @@ impl RemoteServiceProvider {
             if registration.singleton.is_some() {
                 return Err(ServiceError::remote(
                     RemoteServiceErrorCode::ServiceModeMismatch,
-                    format!("Remote service {} already has a provider", display_js_string(service_id)),
+                    format!(
+                        "Remote service {} already has a provider",
+                        display_js_string(service_id)
+                    ),
                 ));
             }
         }
@@ -258,7 +267,10 @@ impl RemoteServiceProvider {
             if registration.singleton.is_some() {
                 return Err(ServiceError::remote(
                     RemoteServiceErrorCode::ServiceModeMismatch,
-                    format!("Remote service {} already has a provider", display_js_string(service_id)),
+                    format!(
+                        "Remote service {} already has a provider",
+                        display_js_string(service_id)
+                    ),
                 ));
             }
             assert_shape(registration, &shape)?;
@@ -272,7 +284,10 @@ impl RemoteServiceProvider {
             if registration.singleton.is_some() {
                 Err(ServiceError::remote(
                     RemoteServiceErrorCode::ServiceModeMismatch,
-                    format!("Remote service {} already has a provider", display_js_string(service_id)),
+                    format!(
+                        "Remote service {} already has a provider",
+                        display_js_string(service_id)
+                    ),
                 ))
             } else {
                 assert_shape(registration, &shape).map(|()| {
@@ -347,7 +362,11 @@ impl RemoteServiceProvider {
     ///
     /// Returns an error under the same conditions as
     /// [`Self::validate_replacement`].
-    pub fn replace(&self, service_id: &JsString, implementation: ServiceImplementation) -> Result<(), ServiceError> {
+    pub fn replace(
+        &self,
+        service_id: &JsString,
+        implementation: ServiceImplementation,
+    ) -> Result<(), ServiceError> {
         {
             let inner = lock(&self.inner);
             assert_active(&inner)?;
@@ -393,7 +412,10 @@ impl RemoteServiceProvider {
     ///
     /// Returns an error when the provider is disposed, the service is not
     /// allowlisted, or no singleton provider is published.
-    pub fn use_service(&self, service_id: &JsString) -> Result<ServiceImplementation, ServiceError> {
+    pub fn use_service(
+        &self,
+        service_id: &JsString,
+    ) -> Result<ServiceImplementation, ServiceError> {
         let inner = lock(&self.inner);
         assert_active(&inner)?;
         let registration = registration(&inner, service_id)?;
@@ -433,7 +455,9 @@ impl RemoteServiceProvider {
             assert_active(&inner)?;
             let registration = registration(&inner, service_id)?;
             if key.as_utf16().is_empty() {
-                return Err(ServiceError::local("Remote service instance key must not be empty"));
+                return Err(ServiceError::local(
+                    "Remote service instance key must not be empty",
+                ));
             }
             require_mode(registration, ServiceMode::Keyed)?;
             if registration.instances.contains_key(&key) {
@@ -577,7 +601,6 @@ impl RemoteServiceProvider {
         if let Some(payload) = panic_payload {
             std::panic::resume_unwind(payload);
         }
-
     }
     fn create_instance(
         &self,
@@ -831,7 +854,11 @@ fn emit_update_inner(
     enum Delivery {
         /// Same-thread reentrant publication, delivered immediately and never
         /// queued behind the outer drain, matching the source.
-        Immediate(Arc<ProviderSubscriber>, ServiceProviderUpdate<DeltaOp>, Context),
+        Immediate(
+            Arc<ProviderSubscriber>,
+            ServiceProviderUpdate<DeltaOp>,
+            Context,
+        ),
         /// Freshly claimed serial ownership, drained after internal locks are
         /// released so no lock is held through the listener call.
         Claim(Arc<ProviderSubscriber>),
@@ -891,9 +918,7 @@ fn emit_update_inner(
 /// Drains one subscriber's buffer in order as the sole delivery owner.  The
 /// owner is released before returning, including after a listener panic, and
 /// entries queued by other threads while draining are picked up in order.
-fn drain_subscriber(
-    subscriber: &Arc<ProviderSubscriber>,
-) -> Option<Box<dyn std::any::Any + Send>> {
+fn drain_subscriber(subscriber: &Arc<ProviderSubscriber>) -> Option<Box<dyn std::any::Any + Send>> {
     let mut panic_payload = None;
     loop {
         let entries = {
@@ -920,7 +945,9 @@ fn drain_subscriber(
     }
 }
 
-fn snapshot_registration(registration: &ServiceRegistration) -> ServiceSubscriptionSnapshot<DeltaOp> {
+fn snapshot_registration(
+    registration: &ServiceRegistration,
+) -> ServiceSubscriptionSnapshot<DeltaOp> {
     let instances = if registration.mode == ServiceMode::Singleton {
         registration
             .singleton
@@ -975,7 +1002,10 @@ fn classify_implementation(
         {
             return Err(ServiceError::remote(
                 RemoteServiceErrorCode::ServiceInvalidValue,
-                format!("Remote service {} state value must be strict JSON", display_js_string(service_id)),
+                format!(
+                    "Remote service {} state value must be strict JSON",
+                    display_js_string(service_id)
+                ),
             ));
         }
     }
@@ -1024,7 +1054,10 @@ fn resolve_instance<'a>(
         if address.is_some() {
             return Err(ServiceError::remote(
                 RemoteServiceErrorCode::ServiceModeMismatch,
-                format!("Remote service {} is singleton", display_js_string(&registration.service_id)),
+                format!(
+                    "Remote service {} is singleton",
+                    display_js_string(&registration.service_id)
+                ),
             ));
         }
         return registration
@@ -1035,7 +1068,10 @@ fn resolve_instance<'a>(
     let Some(address) = address else {
         return Err(ServiceError::remote(
             RemoteServiceErrorCode::ServiceModeMismatch,
-            format!("Remote service {} is keyed", display_js_string(&registration.service_id)),
+            format!(
+                "Remote service {} is keyed",
+                display_js_string(&registration.service_id)
+            ),
         ));
     };
     let Some(instance) = registration.instances.get(&address.key) else {
@@ -1048,7 +1084,11 @@ fn resolve_instance<'a>(
             ),
         ));
     };
-    if instance.address.as_ref().is_none_or(|current| current.generation != address.generation) {
+    if instance
+        .address
+        .as_ref()
+        .is_none_or(|current| current.generation != address.generation)
+    {
         return Err(ServiceError::remote(
             RemoteServiceErrorCode::ServiceStaleInstance,
             format!(
@@ -1065,29 +1105,36 @@ fn registration<'a>(
     inner: &'a ProviderInner,
     service_id: &JsString,
 ) -> Result<&'a ServiceRegistration, ServiceError> {
-    inner
-        .registrations
-        .get(service_id)
-        .ok_or_else(|| ServiceError::remote(
+    inner.registrations.get(service_id).ok_or_else(|| {
+        ServiceError::remote(
             RemoteServiceErrorCode::ServiceNotAllowed,
-            format!("Remote service {} is not allowlisted", display_js_string(service_id)),
-        ))
+            format!(
+                "Remote service {} is not allowlisted",
+                display_js_string(service_id)
+            ),
+        )
+    })
 }
 
 fn registration_mut<'a>(
     inner: &'a mut ProviderInner,
     service_id: &JsString,
 ) -> Result<&'a mut ServiceRegistration, ServiceError> {
-    inner
-        .registrations
-        .get_mut(service_id)
-        .ok_or_else(|| ServiceError::remote(
+    inner.registrations.get_mut(service_id).ok_or_else(|| {
+        ServiceError::remote(
             RemoteServiceErrorCode::ServiceNotAllowed,
-            format!("Remote service {} is not allowlisted", display_js_string(service_id)),
-        ))
+            format!(
+                "Remote service {} is not allowlisted",
+                display_js_string(service_id)
+            ),
+        )
+    })
 }
 
-fn require_mode(registration: &ServiceRegistration, expected: ServiceMode) -> Result<(), ServiceError> {
+fn require_mode(
+    registration: &ServiceRegistration,
+    expected: ServiceMode,
+) -> Result<(), ServiceError> {
     if registration.mode == expected {
         return Ok(());
     }
@@ -1104,7 +1151,9 @@ fn require_mode(registration: &ServiceRegistration, expected: ServiceMode) -> Re
 
 fn assert_active(inner: &ProviderInner) -> Result<(), ServiceError> {
     if inner.disposed {
-        return Err(ServiceError::disposed("Remote service provider is disposed"));
+        return Err(ServiceError::disposed(
+            "Remote service provider is disposed",
+        ));
     }
     Ok(())
 }
@@ -1112,7 +1161,10 @@ fn assert_active(inner: &ProviderInner) -> Result<(), ServiceError> {
 fn not_found(service_id: &JsString) -> ServiceError {
     ServiceError::remote(
         RemoteServiceErrorCode::ServiceNotFound,
-        format!("Remote service {} has no local provider", display_js_string(service_id)),
+        format!(
+            "Remote service {} has no local provider",
+            display_js_string(service_id)
+        ),
     )
 }
 
@@ -1159,9 +1211,9 @@ mod tests {
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
-    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -1224,10 +1276,7 @@ mod tests {
 
     fn object(count: f64) -> JsonValue {
         let mut fields = BTreeMap::new();
-        fields.insert(
-            JsString::from_utf8("count"),
-            JsonValue::Number(count),
-        );
+        fields.insert(JsString::from_utf8("count"), JsonValue::Number(count));
         JsonValue::Object(fields)
     }
 
@@ -1273,8 +1322,8 @@ mod tests {
         record: Arc<Record>,
         on_state: Arc<dyn Fn(JsInteger) + Send + Sync>,
     ) -> ServiceUpdateListener {
-        Arc::new(move |update: &ServiceProviderUpdate<DeltaOp>, _context: &Context| {
-            match update {
+        Arc::new(
+            move |update: &ServiceProviderUpdate<DeltaOp>, _context: &Context| match update {
                 ServiceProviderUpdate::State { sequence, .. } => {
                     record.push("enter", Some(*sequence));
                     on_state(*sequence);
@@ -1284,8 +1333,8 @@ mod tests {
                 ServiceProviderUpdate::Replaced { .. } => record.push("replaced", None),
                 ServiceProviderUpdate::Spawned { .. } => record.push("spawned", None),
                 ServiceProviderUpdate::Closed { .. } => record.push("closed", None),
-            }
-        })
+            },
+        )
     }
 
     /// Shared slot for a worker handle installed once by the listener hook.
@@ -1379,17 +1428,25 @@ mod tests {
         let state = MutableReplicatedState::new(object(0.0));
         let svc = JsString::from_utf8("svc");
         let provider = provider(vec![definition("svc", ServiceMode::Singleton)]);
-        provider.provide(&svc, state_members(&state)).expect("provide");
+        provider
+            .provide(&svc, state_members(&state))
+            .expect("provide");
         let record = Arc::new(Record::new());
         let listener = recording_listener(Arc::clone(&record), Arc::new(|_: JsInteger| {}));
         let subscription = provider
             .subscribe(svc, ServiceMode::Singleton, listener, Context::background())
             .await
             .expect("subscribe");
-        assert!(record.entries().is_empty(), "nothing delivers before activation");
+        assert!(
+            record.entries().is_empty(),
+            "nothing delivers before activation"
+        );
         publish(&state, 1.0);
         publish(&state, 2.0);
-        assert!(record.entries().is_empty(), "preactivation updates stay buffered");
+        assert!(
+            record.entries().is_empty(),
+            "preactivation updates stay buffered"
+        );
         subscription.activate();
         assert_eq!(
             record.entries(),
@@ -1401,7 +1458,10 @@ mod tests {
             ],
             "buffered updates deliver in publication order"
         );
-        subscription.close(Context::background()).await.expect("close");
+        subscription
+            .close(Context::background())
+            .await
+            .expect("close");
         provider.dispose();
     }
 
@@ -1410,7 +1470,9 @@ mod tests {
         let state = MutableReplicatedState::new(object(0.0));
         let svc = JsString::from_utf8("svc");
         let provider = provider(vec![definition("svc", ServiceMode::Singleton)]);
-        provider.provide(&svc, state_members(&state)).expect("provide");
+        provider
+            .provide(&svc, state_members(&state))
+            .expect("provide");
         let events = Arc::new(Mutex::new(Vec::<(String, JsonValue, JsInteger)>::new()));
         let nested = Arc::new(AtomicBool::new(false));
         let listener_a: ServiceUpdateListener = {
@@ -1421,11 +1483,7 @@ mod tests {
                 let ServiceProviderUpdate::State { sequence, .. } = update else {
                     return;
                 };
-                lock(&events).push((
-                    String::from("A"),
-                    state.value().as_ref().clone(),
-                    *sequence,
-                ));
+                lock(&events).push((String::from("A"), state.value().as_ref().clone(), *sequence));
                 if !nested.swap(true, Ordering::AcqRel) {
                     publish(&state, 2.0);
                 }
@@ -1438,11 +1496,7 @@ mod tests {
                 let ServiceProviderUpdate::State { sequence, .. } = update else {
                     return;
                 };
-                lock(&events).push((
-                    String::from("B"),
-                    state.value().as_ref().clone(),
-                    *sequence,
-                ));
+                lock(&events).push((String::from("B"), state.value().as_ref().clone(), *sequence));
             })
         };
         let subscription_a = provider
@@ -1455,7 +1509,12 @@ mod tests {
             .await
             .expect("subscribe A");
         let subscription_b = provider
-            .subscribe(svc, ServiceMode::Singleton, listener_b, Context::background())
+            .subscribe(
+                svc,
+                ServiceMode::Singleton,
+                listener_b,
+                Context::background(),
+            )
             .await
             .expect("subscribe B");
         subscription_a.activate();
@@ -1487,7 +1546,9 @@ mod tests {
         let state = MutableReplicatedState::new(object(0.0));
         let svc = JsString::from_utf8("svc");
         let provider = provider(vec![definition("svc", ServiceMode::Singleton)]);
-        provider.provide(&svc, state_members(&state)).expect("provide");
+        provider
+            .provide(&svc, state_members(&state))
+            .expect("provide");
         let record = Arc::new(Record::new());
         let spawns = Arc::new(AtomicUsize::new(0));
         let worker_slot: SharedSlot<thread::JoinHandle<()>> = Arc::new(Mutex::new(None));
@@ -1540,8 +1601,14 @@ mod tests {
             ],
             "queued other-thread update delivers in order after the outer drain"
         );
-        assert!(record.on_one_thread(), "the owner thread delivers queued updates");
-        subscription.close(Context::background()).await.expect("close");
+        assert!(
+            record.on_one_thread(),
+            "the owner thread delivers queued updates"
+        );
+        subscription
+            .close(Context::background())
+            .await
+            .expect("close");
         provider.dispose();
     }
 
@@ -1622,8 +1689,14 @@ mod tests {
             ],
             "callback joins the worker, then the owner delivers the worker-triggered update"
         );
-        assert!(record.on_one_thread(), "delivery stays on the owning thread");
-        subscription.close(Context::background()).await.expect("close");
+        assert!(
+            record.on_one_thread(),
+            "delivery stays on the owning thread"
+        );
+        subscription
+            .close(Context::background())
+            .await
+            .expect("close");
         provider.dispose();
     }
 
@@ -1637,7 +1710,12 @@ mod tests {
         let record = Arc::new(Record::new());
         let listener = recording_listener(Arc::clone(&record), Arc::new(|_: JsInteger| {}));
         let subscription = provider
-            .subscribe(room.clone(), ServiceMode::Keyed, listener, Context::background())
+            .subscribe(
+                room.clone(),
+                ServiceMode::Keyed,
+                listener,
+                Context::background(),
+            )
             .await
             .expect("subscribe");
         subscription.activate();
@@ -1703,7 +1781,10 @@ mod tests {
             labels(&["spawned", "closed", "spawned", "enter", "exit", "closed"]),
             "closed replacement publishes nothing further"
         );
-        subscription.close(Context::background()).await.expect("close");
+        subscription
+            .close(Context::background())
+            .await
+            .expect("close");
         provider.dispose();
     }
 
@@ -1719,13 +1800,20 @@ mod tests {
         let record = Arc::new(Record::new());
         let listener = recording_listener(Arc::clone(&record), Arc::new(|_: JsInteger| {}));
         let subscription = provider
-            .subscribe(svc.clone(), ServiceMode::Singleton, listener, Context::background())
+            .subscribe(
+                svc.clone(),
+                ServiceMode::Singleton,
+                listener,
+                Context::background(),
+            )
             .await
             .expect("subscribe");
         subscription.activate();
         assert!(record.entries().is_empty());
 
-        provider.replace(&svc, state_members(&state_two)).expect("replace");
+        provider
+            .replace(&svc, state_members(&state_two))
+            .expect("replace");
         assert_eq!(
             record.labels(),
             labels(&["replaced"]),
@@ -1752,7 +1840,9 @@ mod tests {
             "withdrawn instance publishes nothing"
         );
 
-        provider.provide(&svc, state_members(&state_two)).expect("re-provide");
+        provider
+            .provide(&svc, state_members(&state_two))
+            .expect("re-provide");
         publish(&state_two, 3.0);
         assert_eq!(
             record.labels(),
@@ -1775,7 +1865,10 @@ mod tests {
         );
         provider.dispose();
         assert_eq!(record.labels().len(), 7, "dispose is idempotent");
-        subscription.close(Context::background()).await.expect("close after dispose");
+        subscription
+            .close(Context::background())
+            .await
+            .expect("close after dispose");
         publish(&state_two, 4.0);
         assert_eq!(record.labels().len(), 7, "nothing delivers after disposal");
     }

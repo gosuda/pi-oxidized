@@ -1,5 +1,8 @@
 //! Behavioral regressions for the memory session repository and shared session.
-#![expect(clippy::expect_used, reason = "test assertions use expect for concise failure")]
+#![expect(
+    clippy::expect_used,
+    reason = "test assertions use expect for concise failure"
+)]
 #![expect(clippy::panic, reason = "test failure paths panic with context")]
 
 use std::sync::Arc;
@@ -9,12 +12,12 @@ use futures::task::noop_waker_ref;
 
 use pi_agent::context::Context;
 use pi_agent::session::{
-    address, append_list, set_value, Branch, EntryId, EntryQuery, ForkOptions, ForkPosition,
-    InboxItem, InboxItemKind, IdGenerator, LaneConfiguration, LaneName, LaneState,
-    ListReadOptions, MemoryCreateOptions, MemorySessionRepo, MemoryStorage, ModelIdentity,
-    NewUsageRow, OperationId, RawAddress, Session, SessionError, SessionMetadata,
-    SessionReaderExt, SessionRepo, Storage, StorageBackedSession, StorageErrorCode,
-    UuidV7Generator, UsageId, ValueList, ValueWrite, Write,
+    Branch, EntryId, EntryQuery, ForkOptions, ForkPosition, IdGenerator, InboxItem, InboxItemKind,
+    LaneConfiguration, LaneName, LaneState, ListReadOptions, MemoryCreateOptions,
+    MemorySessionRepo, MemoryStorage, ModelIdentity, NewUsageRow, OperationId, RawAddress, Session,
+    SessionError, SessionMetadata, SessionReaderExt, SessionRepo, Storage, StorageBackedSession,
+    StorageErrorCode, UsageId, UuidV7Generator, ValueList, ValueWrite, Write, address, append_list,
+    set_value,
 };
 use serde_json::json;
 
@@ -30,9 +33,14 @@ fn metadata(id: &str) -> SessionMetadata {
 }
 
 async fn create_session(repo: &MemorySessionRepo, id: &str, cx: &Context) -> Arc<dyn Session> {
-    repo.create(MemoryCreateOptions { metadata: Some(metadata(id)) }, cx)
-        .await
-        .expect("session creation should succeed")
+    repo.create(
+        MemoryCreateOptions {
+            metadata: Some(metadata(id)),
+        },
+        cx,
+    )
+    .await
+    .expect("session creation should succeed")
 }
 
 fn require_branch(handle: Option<Arc<dyn Branch>>, what: &'static str) -> Arc<dyn Branch> {
@@ -84,30 +92,44 @@ async fn seed_fork_fixture(repo: &MemorySessionRepo, cx: &Context) -> ForkFixtur
         .expect("child append should succeed");
 
     let lane_config = LaneConfiguration {
-        model: ModelIdentity { provider: "provider".to_owned(), model_id: "model".to_owned() },
+        model: ModelIdentity {
+            provider: "provider".to_owned(),
+            model_id: "model".to_owned(),
+        },
         thinking_level: pi_agent::pi_ai::ModelThinkingLevel::Off,
         active_tool_names: vec!["tool".to_owned()],
     };
     let lane_state = LaneState {
         current_operation_id: Some(OperationId::from("op-current")),
         last_operation_id: Some(OperationId::from("op-last")),
-        inbox: vec![InboxItem { entry_id: child.clone(), kind: InboxItemKind::FollowUp }],
+        inbox: vec![InboxItem {
+            entry_id: child.clone(),
+            kind: InboxItemKind::FollowUp,
+        }],
     };
 
     let ordinary_list = ValueList::<serde_json::Value>::new("app.list", "events")
         .expect("test list address should be valid")
         .erase();
-    let pending_list = ValueList::<serde_json::Value>::new("pi.pending.assistant_frame", "op-1:response")
-        .expect("test pending list address should be valid")
-        .erase();
+    let pending_list =
+        ValueList::<serde_json::Value>::new("pi.pending.assistant_frame", "op-1:response")
+            .expect("test pending list address should be valid")
+            .erase();
     let operation_value = RawAddress::value("pi.op.state", "op-1");
     let result_value = RawAddress::value("pi.result", "op-1");
     let pending_value = RawAddress::value("pi.pending.entry", "entry-1");
 
-    let usage = pi_agent::pi_ai::Usage { total_tokens: 7, ..pi_agent::pi_ai::Usage::default() };
-    let mutation = session.begin_mutation(cx).await.expect("mutation should open");
+    let usage = pi_agent::pi_ai::Usage {
+        total_tokens: 7,
+        ..pi_agent::pi_ai::Usage::default()
+    };
+    let mutation = session
+        .begin_mutation(cx)
+        .await
+        .expect("mutation should open");
     let writes = vec![
-        set_value(&address::lane_config(&lane), &lane_config).expect("lane config should serialize"),
+        set_value(&address::lane_config(&lane), &lane_config)
+            .expect("lane config should serialize"),
         set_value(&address::lane_state(&lane), &lane_state).expect("lane state should serialize"),
         append_list(
             &ValueList::<serde_json::Value>::new("app.list", "events").expect("list address"),
@@ -190,12 +212,24 @@ async fn close_then_reopen_preserves_durable_branches_and_entries() {
         .expect("entry should append");
     session.close(&cx).await.expect("close should complete");
 
-    let reopened = repo.open(&metadata, &cx).await.expect("closed session should reopen");
+    let reopened = repo
+        .open(&metadata, &cx)
+        .await
+        .expect("closed session should reopen");
     let reopened_main = require_branch(
-        reopened.branch(&main, &cx).await.expect("branch lookup should succeed"),
+        reopened
+            .branch(&main, &cx)
+            .await
+            .expect("branch lookup should succeed"),
         "durable main branch should remain visible",
     );
-    assert_eq!(reopened_main.get_tip_id(&cx).await.expect("tip should decode"), Some(child.clone()));
+    assert_eq!(
+        reopened_main
+            .get_tip_id(&cx)
+            .await
+            .expect("tip should decode"),
+        Some(child.clone())
+    );
     let entries = reopened_main
         .find_entries(
             Some(&pi_agent::session::BranchScan {
@@ -207,14 +241,26 @@ async fn close_then_reopen_preserves_durable_branches_and_entries() {
         .await
         .expect("durable ancestry should be readable");
     assert_eq!(
-        entries.iter().map(|entry| entry.id().clone()).collect::<Vec<_>>(),
+        entries
+            .iter()
+            .map(|entry| entry.id().clone())
+            .collect::<Vec<_>>(),
         vec![root, child]
     );
     let reopened_empty = require_branch(
-        reopened.branch(&empty, &cx).await.expect("empty branch lookup should succeed"),
+        reopened
+            .branch(&empty, &cx)
+            .await
+            .expect("empty branch lookup should succeed"),
         "empty branch existence should be durable",
     );
-    assert_eq!(reopened_empty.get_tip_id(&cx).await.expect("empty tip should decode"), None);
+    assert_eq!(
+        reopened_empty
+            .get_tip_id(&cx)
+            .await
+            .expect("empty tip should decode"),
+        None
+    );
 }
 
 #[tokio::test]
@@ -225,16 +271,34 @@ async fn open_rejects_double_open_and_delete_while_open() {
     let metadata = session.metadata().clone();
 
     match repo.open(&metadata, &cx).await {
-        Err(SessionError::Invariant(message)) => assert_eq!(message, "session is already open: lifecycle"),
-        other => panic!("expected double-open rejection, got {}", if other.is_ok() { "Ok" } else { "different error" }),
+        Err(SessionError::Invariant(message)) => {
+            assert_eq!(message, "session is already open: lifecycle")
+        }
+        other => panic!(
+            "expected double-open rejection, got {}",
+            if other.is_ok() {
+                "Ok"
+            } else {
+                "different error"
+            }
+        ),
     }
     match repo.delete(&metadata, &cx).await {
         Err(SessionError::Invariant(message)) => assert_eq!(message, "session is open: lifecycle"),
-        other => panic!("expected delete-while-open rejection, got {}", if other.is_ok() { "Ok" } else { "different error" }),
+        other => panic!(
+            "expected delete-while-open rejection, got {}",
+            if other.is_ok() {
+                "Ok"
+            } else {
+                "different error"
+            }
+        ),
     }
 
     session.close(&cx).await.expect("close should complete");
-    repo.delete(&metadata, &cx).await.expect("closed session should be deletable");
+    repo.delete(&metadata, &cx)
+        .await
+        .expect("closed session should be deletable");
 }
 
 #[tokio::test]
@@ -282,7 +346,10 @@ async fn branch_fork_rejects_an_unconfigured_lane() {
     let source = create_session(&repo, "unconfigured-source", &cx).await;
     let metadata = source.metadata().clone();
     let lane = LaneName::from("unconfigured");
-    source.create_branch(&lane, None, &cx).await.expect("branch should exist");
+    source
+        .create_branch(&lane, None, &cx)
+        .await
+        .expect("branch should exist");
 
     match repo
         .fork(
@@ -298,7 +365,10 @@ async fn branch_fork_rejects_an_unconfigured_lane() {
         .await
     {
         Err(SessionError::Invariant(message)) => {
-            assert_eq!(message, "source branch unconfigured is not a configured AgentLane");
+            assert_eq!(
+                message,
+                "source branch unconfigured is not a configured AgentLane"
+            );
         }
         Err(error) => panic!("expected unconfigured-lane invariant, got {error:?}"),
         Ok(_) => panic!("unconfigured branch fork unexpectedly succeeded"),
@@ -325,11 +395,26 @@ async fn branch_forks_at_root_before_and_at_preserve_the_expected_ancestry() {
         .await
         .expect("before-root fork should succeed");
     let before_branch = require_branch(
-        before.branch(&fixture.lane, &cx).await.expect("before-root branch lookup should succeed"),
+        before
+            .branch(&fixture.lane, &cx)
+            .await
+            .expect("before-root branch lookup should succeed"),
         "before-root branch should exist",
     );
-    assert_eq!(before_branch.get_tip_id(&cx).await.expect("before-root tip should decode"), None);
-    assert!(before_branch.find_entries(None, &cx).await.expect("before-root ancestry should read").is_empty());
+    assert_eq!(
+        before_branch
+            .get_tip_id(&cx)
+            .await
+            .expect("before-root tip should decode"),
+        None
+    );
+    assert!(
+        before_branch
+            .find_entries(None, &cx)
+            .await
+            .expect("before-root ancestry should read")
+            .is_empty()
+    );
     assert_eq!(
         before
             .get_value(&address::lane_config(&fixture.lane), &cx)
@@ -348,22 +433,34 @@ async fn branch_forks_at_root_before_and_at_preserve_the_expected_ancestry() {
             .value,
         LaneState::default()
     );
-    for address in [&fixture.operation_value, &fixture.result_value, &fixture.pending_value] {
-        assert!(before
-            .get_value_json(address, &cx)
-            .await
-            .expect("before-root transient value read should succeed")
-            .is_none());
+    for address in [
+        &fixture.operation_value,
+        &fixture.result_value,
+        &fixture.pending_value,
+    ] {
+        assert!(
+            before
+                .get_value_json(address, &cx)
+                .await
+                .expect("before-root transient value read should succeed")
+                .is_none()
+        );
     }
     for address in [&fixture.ordinary_list, &fixture.pending_list] {
-        assert!(before
-            .read_list_json(address, Some(ListReadOptions::default()), &cx)
-            .await
-            .expect("before-root list read should succeed")
-            .is_empty());
+        assert!(
+            before
+                .read_list_json(address, Some(ListReadOptions::default()), &cx)
+                .await
+                .expect("before-root list read should succeed")
+                .is_empty()
+        );
     }
     assert_eq!(
-        before.get_stats(&cx).await.expect("before-root stats should read").usage,
+        before
+            .get_stats(&cx)
+            .await
+            .expect("before-root stats should read")
+            .usage,
         pi_agent::pi_ai::Usage::default()
     );
 
@@ -381,16 +478,41 @@ async fn branch_forks_at_root_before_and_at_preserve_the_expected_ancestry() {
         .await
         .expect("at-root fork should succeed");
     let at_branch = require_branch(
-        at.branch(&fixture.lane, &cx).await.expect("at-root branch lookup should succeed"),
+        at.branch(&fixture.lane, &cx)
+            .await
+            .expect("at-root branch lookup should succeed"),
         "at-root branch should exist",
     );
-    assert_eq!(at_branch.get_tip_id(&cx).await.expect("at-root tip should decode"), Some(fixture.root.clone()));
+    assert_eq!(
+        at_branch
+            .get_tip_id(&cx)
+            .await
+            .expect("at-root tip should decode"),
+        Some(fixture.root.clone())
+    );
     let entries = at_branch
-        .find_entries(Some(&pi_agent::session::BranchScan { order: Some(pi_agent::session::ScanOrder::Asc), ..Default::default() }), &cx)
+        .find_entries(
+            Some(&pi_agent::session::BranchScan {
+                order: Some(pi_agent::session::ScanOrder::Asc),
+                ..Default::default()
+            }),
+            &cx,
+        )
         .await
         .expect("at-root ancestry should read");
-    assert_eq!(entries.iter().map(|entry| entry.id().clone()).collect::<Vec<_>>(), vec![fixture.root]);
-    assert!(at.get_entry(&fixture.child, &cx).await.expect("child lookup should succeed").is_none());
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.id().clone())
+            .collect::<Vec<_>>(),
+        vec![fixture.root]
+    );
+    assert!(
+        at.get_entry(&fixture.child, &cx)
+            .await
+            .expect("child lookup should succeed")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -399,20 +521,46 @@ async fn tree_fork_rebuilds_lane_state_and_excludes_transient_values_lists_and_u
     let cx = Context::background();
     let fixture = seed_fork_fixture(&repo, &cx).await;
     let tree = repo
-        .fork(&fixture.metadata, ForkOptions::Tree { id: Some("tree".to_owned()) }, &cx)
+        .fork(
+            &fixture.metadata,
+            ForkOptions::Tree {
+                id: Some("tree".to_owned()),
+            },
+            &cx,
+        )
         .await
         .expect("tree fork should succeed");
 
     let entries = tree
-        .find_entries(Some(&EntryQuery { order: Some(pi_agent::session::ScanOrder::Asc), ..Default::default() }), &cx)
+        .find_entries(
+            Some(&EntryQuery {
+                order: Some(pi_agent::session::ScanOrder::Asc),
+                ..Default::default()
+            }),
+            &cx,
+        )
         .await
         .expect("tree entries should read");
-    assert_eq!(entries.iter().map(|entry| entry.id().clone()).collect::<Vec<_>>(), vec![fixture.root.clone(), fixture.child.clone()]);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.id().clone())
+            .collect::<Vec<_>>(),
+        vec![fixture.root.clone(), fixture.child.clone()]
+    );
     let tree_branch = require_branch(
-        tree.branch(&fixture.lane, &cx).await.expect("tree branch lookup should succeed"),
+        tree.branch(&fixture.lane, &cx)
+            .await
+            .expect("tree branch lookup should succeed"),
         "tree branch should exist",
     );
-    assert_eq!(tree_branch.get_tip_id(&cx).await.expect("tree tip should decode"), Some(fixture.child));
+    assert_eq!(
+        tree_branch
+            .get_tip_id(&cx)
+            .await
+            .expect("tree tip should decode"),
+        Some(fixture.child)
+    );
     assert_eq!(
         tree.get_value(&address::lane_state(&fixture.lane), &cx)
             .await
@@ -429,15 +577,25 @@ async fn tree_fork_rebuilds_lane_state_and_excludes_transient_values_lists_and_u
             .value,
         fixture.lane_config
     );
-    for address in [&fixture.operation_value, &fixture.result_value, &fixture.pending_value] {
-        assert!(tree.get_value_json(address, &cx).await.expect("transient value read should succeed").is_none());
+    for address in [
+        &fixture.operation_value,
+        &fixture.result_value,
+        &fixture.pending_value,
+    ] {
+        assert!(
+            tree.get_value_json(address, &cx)
+                .await
+                .expect("transient value read should succeed")
+                .is_none()
+        );
     }
     for address in [&fixture.ordinary_list, &fixture.pending_list] {
-        assert!(tree
-            .read_list_json(address, Some(ListReadOptions::default()), &cx)
-            .await
-            .expect("forked list read should succeed")
-            .is_empty());
+        assert!(
+            tree.read_list_json(address, Some(ListReadOptions::default()), &cx)
+                .await
+                .expect("forked list read should succeed")
+                .is_empty()
+        );
     }
     let stats = tree.get_stats(&cx).await.expect("tree stats should read");
     assert_eq!(stats.usage, pi_agent::pi_ai::Usage::default());
@@ -449,11 +607,17 @@ async fn dropping_close_waiter_drains_admitted_mutation_and_allows_reopen() {
     let cx = Context::background();
     let session = create_session(&repo, "drop-close-waiter", &cx).await;
     let metadata = session.metadata().clone();
-    let mutation = session.begin_mutation(&cx).await.expect("mutation should be admitted");
+    let mutation = session
+        .begin_mutation(&cx)
+        .await
+        .expect("mutation should be admitted");
 
     let mut close_waiter = session.close(&cx);
     let mut poll_cx = TaskContext::from_waker(noop_waker_ref());
-    assert!(matches!(close_waiter.as_mut().poll(&mut poll_cx), Poll::Pending));
+    assert!(matches!(
+        close_waiter.as_mut().poll(&mut poll_cx),
+        Poll::Pending
+    ));
     drop(close_waiter);
 
     // Release the admitted mutation; the close worker continues without a
@@ -467,7 +631,9 @@ async fn dropping_close_waiter_drains_admitted_mutation_and_allows_reopen() {
                 reopened = Some(session);
                 break;
             }
-            Err(SessionError::Invariant(message)) if message == "session is already open: drop-close-waiter" => {
+            Err(SessionError::Invariant(message))
+                if message == "session is already open: drop-close-waiter" =>
+            {
                 tokio::task::yield_now().await;
             }
             Err(error) => panic!("unexpected reopen result: {error:?}"),

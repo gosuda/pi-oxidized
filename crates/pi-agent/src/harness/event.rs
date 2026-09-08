@@ -15,8 +15,8 @@ use serde_json::{Map, Value};
 use crate::message::AgentMessage;
 use crate::queue::QueueMode;
 use crate::session::{
-    CompactionReason, CompactionSettings, Entry, EntryId, HarnessRetryPolicy, LaneName,
-    ModelIdentity, OperationError, OperationId, TerminalStatus, UsageRow, HarnessStreamOptions,
+    CompactionReason, CompactionSettings, Entry, EntryId, HarnessRetryPolicy, HarnessStreamOptions,
+    LaneName, ModelIdentity, OperationError, OperationId, TerminalStatus, UsageRow,
 };
 use crate::tool::AgentToolResult;
 
@@ -627,7 +627,10 @@ impl HarnessEventPayload {
     /// Returns whether `recovery: true` is meaningful for this payload.
     #[must_use]
     pub const fn allows_recovery(&self) -> bool {
-        !matches!(self, Self::Fault { .. } | Self::ValueUpdate { .. } | Self::Usage { .. })
+        !matches!(
+            self,
+            Self::Fault { .. } | Self::ValueUpdate { .. } | Self::Usage { .. }
+        )
     }
 }
 
@@ -674,8 +677,7 @@ impl<'de> Deserialize<'de> for HarnessEvent {
             .transpose()
             .map_err(D::Error::custom)?
             .unwrap_or(false);
-        let payload =
-            serde_json::from_value(Value::Object(object)).map_err(D::Error::custom)?;
+        let payload = serde_json::from_value(Value::Object(object)).map_err(D::Error::custom)?;
         let event = Self {
             lane,
             recovery,
@@ -756,7 +758,12 @@ impl HarnessEvent {
             )));
         }
         if !self.payload.requires_lane()
-            && !matches!(self.payload, HarnessEventPayload::Fault { .. } | HarnessEventPayload::ValueUpdate { .. } | HarnessEventPayload::HandlerError { .. })
+            && !matches!(
+                self.payload,
+                HarnessEventPayload::Fault { .. }
+                    | HarnessEventPayload::ValueUpdate { .. }
+                    | HarnessEventPayload::HandlerError { .. }
+            )
             && self.lane.is_some()
         {
             return Err(EventEnvelopeError::new(format!(
@@ -865,8 +872,11 @@ impl MarkBoundary {
 // Keep the event module's public API independent of the bus implementation's
 // storage details while allowing downstream code to name the listener type.
 /// An asynchronously invoked, passive event listener.
-pub type EventListener =
-    Arc<dyn Fn(HarnessEvent, crate::context::Context) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+pub type EventListener = Arc<
+    dyn Fn(HarnessEvent, crate::context::Context) -> futures::future::BoxFuture<'static, ()>
+        + Send
+        + Sync,
+>;
 
 /// A filter used by a watcher to select events.
 pub type EventFilter = Arc<dyn Fn(&HarnessEvent) -> bool + Send + Sync>;

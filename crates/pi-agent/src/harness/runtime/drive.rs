@@ -22,40 +22,36 @@ use crate::session::operation::{
 };
 use crate::session::traits::SessionReaderExt;
 use crate::session::{
-    EntryId, LaneName, LaneState, NewUsageRow, OperationId, OperationResultRecord,
-    PendingEntry, SettledAssistantMessage, TerminalStatus, UsageId, Write,
+    EntryId, LaneName, LaneState, NewUsageRow, OperationId, OperationResultRecord, PendingEntry,
+    SettledAssistantMessage, TerminalStatus, UsageId, Write,
 };
 use crate::tool::{AgentToolResult, ToolExecutionMode};
 
+use super::lane::{DriveController, LaneRuntime};
+use super::support::{
+    assistant_agent_message, assistant_message, branch_entries, captured_configuration,
+    context_messages, context_window, entry_write, map_session_error, new_entry_id, new_usage_id,
+    op_cleanup_writes, response_limit, set_json,
+};
+use crate::harness::api::DriveOptions;
+use crate::harness::event::HarnessEventPayload;
+use crate::harness::gate::{Gate, GateRejection};
 use crate::harness::hooks::{
     AfterResponseEvent, BeforeDriveEvent, BeforePayloadEvent, BeforeRequestEvent,
     BeforeRequestStep, BeforeRunEndEvent, HookRunError,
 };
-use crate::session::configuration::HarnessStreamOptions;
-use crate::harness::api::DriveOptions;
-use crate::harness::tool::ToolInvocation;
-use crate::harness::event::HarnessEventPayload;
-use crate::harness::gate::{Gate, GateRejection};
-use super::lane::{DriveController, LaneRuntime};
 use crate::harness::result::{DriveOutcome, DriveResult, HarnessError, HarnessFault};
 use crate::harness::stream::{
+    AssistantStreamObserver, HarnessAfterResponse, HarnessAssistantStreamConfig,
+    HarnessDeferredStreamConfig, HarnessRequestContext, TransformRequestContext,
     apply_stream_options_patch, native_stream_options, stream_harness_assistant,
-    stream_harness_deferred, AssistantStreamObserver, HarnessAfterResponse,
-    HarnessAssistantStreamConfig, HarnessDeferredStreamConfig, HarnessRequestContext,
-    TransformRequestContext,
+    stream_harness_deferred,
 };
-use super::support::{
-    assistant_agent_message, assistant_message, branch_entries, captured_configuration,
-    context_messages, context_window, entry_write, map_session_error, new_entry_id,
-    new_usage_id, op_cleanup_writes, response_limit, set_json,
-};
+use crate::harness::tool::ToolInvocation;
+use crate::session::configuration::HarnessStreamOptions;
 
 /// Drive one operation to the next durable boundary.
-pub(crate) async fn drive(
-    lane: &LaneRuntime,
-    options: DriveOptions,
-    cx: &Context,
-) -> DriveResult {
+pub(crate) async fn drive(lane: &LaneRuntime, options: DriveOptions, cx: &Context) -> DriveResult {
     lane.ensure_open()?;
     loop {
         let existing = lane.active_drive.lock().await.clone();
@@ -210,20 +206,13 @@ async fn dispatch_state(
     cx: &Context,
 ) -> Result<DriveStep, HarnessError> {
     match &operation.state {
-        OperationState::Starting { .. } => {
-            start_run(lane, operation, controller, cx).await
-        }
-        OperationState::Checkpoint { .. } => {
-            checkpoint(lane, operation, controller, cx).await
-        }
-        OperationState::AssistantReady { .. } => {
-            generation(lane, operation, controller, cx).await
-        }
+        OperationState::Starting { .. } => start_run(lane, operation, controller, cx).await,
+        OperationState::Checkpoint { .. } => checkpoint(lane, operation, controller, cx).await,
+        OperationState::AssistantReady { .. } => generation(lane, operation, controller, cx).await,
         OperationState::AssistantEffectPending { .. } => {
             recover_assistant_effect(lane, operation, controller, cx).await
         }
-        OperationState::AssistantRetryWait { .. }
-        | OperationState::SummaryRetryWait { .. } => {
+        OperationState::AssistantRetryWait { .. } | OperationState::SummaryRetryWait { .. } => {
             retry_wait(lane, operation, controller, options.wait_for_retry, cx).await
         }
         OperationState::Tools { .. } => tools(lane, operation, controller, cx).await,
@@ -231,17 +220,14 @@ async fn dispatch_state(
             deferred_suspended(lane, operation, controller, options.poll_deferred, cx).await
         }
         OperationState::DeferredEffectPending { .. } => {
-            recover_deferred_effect(lane, operation, controller, options.poll_deferred, cx)
-                .await
+            recover_deferred_effect(lane, operation, controller, options.poll_deferred, cx).await
         }
         OperationState::SummaryDeciding { .. }
         | OperationState::SummaryReady { .. }
         | OperationState::SummaryEffectPending { .. } => {
             structural(lane, operation, controller, options.wait_for_retry, cx).await
         }
-        OperationState::NavigationReadyToCommit { .. } => {
-            navigation(lane, operation, cx).await
-        }
+        OperationState::NavigationReadyToCommit { .. } => navigation(lane, operation, cx).await,
     }
 }
 
@@ -295,7 +281,12 @@ async fn start_run(
             prompt,
             resources: lane.owner.config_snapshot().await.resources,
         };
-        match lane.owner.hooks.run_with_gate::<crate::harness::hooks::BeforeRun>(event, &controller.gate, cx).await {
+        match lane
+            .owner
+            .hooks
+            .run_with_gate::<crate::harness::hooks::BeforeRun>(event, &controller.gate, cx)
+            .await
+        {
             Ok(Some(result)) => {
                 if let Some(messages) = result.messages {
                     append_injected_messages(lane, messages, cx).await?;
@@ -354,14 +345,9 @@ async fn checkpoint(
             } else {
                 false
             };
-            if let Some(step) = maybe_start_compaction(
-                lane,
-                operation,
-                trigger.clone(),
-                force_compaction,
-                cx,
-            )
-            .await?
+            if let Some(step) =
+                maybe_start_compaction(lane, operation, trigger.clone(), force_compaction, cx)
+                    .await?
             {
                 return Ok(step);
             }
@@ -381,8 +367,7 @@ async fn checkpoint(
             if let Some(trigger) = drained.trigger {
                 return renew_assistant_ready(lane, operation, trigger, cx).await;
             }
-            finish_run_boundary(lane, operation, controller, include_final_assistant, cx)
-                .await
+            finish_run_boundary(lane, operation, controller, include_final_assistant, cx).await
         }
     }
 }
@@ -475,11 +460,7 @@ async fn finish_run_boundary(
         match lane
             .owner
             .hooks
-            .run_with_gate::<crate::harness::hooks::BeforeRunEnd>(
-                event,
-                &controller.gate,
-                cx,
-            )
+            .run_with_gate::<crate::harness::hooks::BeforeRunEnd>(event, &controller.gate, cx)
             .await
         {
             Ok(result) => result.and_then(|result| result.follow_up),
@@ -507,13 +488,7 @@ async fn finish_run_boundary(
     if lane.data.lock().await.tip.is_none() {
         return Err(invariant("completed run has no tip"));
     }
-    if include_final_assistant
-        && operation
-            .state
-            .scope()
-            .latest_assistant_entry_id
-            .is_none()
-    {
+    if include_final_assistant && operation.state.scope().latest_assistant_entry_id.is_none() {
         return Err(invariant("completed run is missing its final assistant"));
     }
     let record = settle(lane, operation, TerminalStatus::Completed, None, cx).await?;
@@ -638,22 +613,21 @@ async fn maybe_start_compaction(
     if !force && !compaction_threshold_met(&entries, &model, &settings) {
         return Ok(None);
     }
-    let preparation =
-        match crate::harness::compaction::prepare_compaction(&entries, &settings) {
-            Ok(Some(preparation)) => preparation,
-            Ok(None) => return Ok(None),
-            Err(error) => {
-                let record = settle_failure(
-                    lane,
-                    operation,
-                    error.code().to_owned(),
-                    error.to_string(),
-                    cx,
-                )
-                .await?;
-                return Ok(Some(DriveStep::Settled(record)));
-            }
-        };
+    let preparation = match crate::harness::compaction::prepare_compaction(&entries, &settings) {
+        Ok(Some(preparation)) => preparation,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            let record = settle_failure(
+                lane,
+                operation,
+                error.code().to_owned(),
+                error.to_string(),
+                cx,
+            )
+            .await?;
+            return Ok(Some(DriveStep::Settled(record)));
+        }
+    };
     let task_id = format!("{}:compaction:{}", operation.meta.operation_id, trigger);
     let reason = if force {
         crate::session::CompactionReason::Overflow
@@ -841,7 +815,12 @@ async fn assistant_stream_config(
         thinking_level: context.configuration.thinking_level,
         stream_options,
         transform_context: transform_context(current.lane, current.operation, current.controller),
-        to_provider_messages: current.lane.owner.config_snapshot().await.to_provider_messages,
+        to_provider_messages: current
+            .lane
+            .owner
+            .config_snapshot()
+            .await
+            .to_provider_messages,
         on_payload: before_payload_callback(
             current.lane,
             current.operation,
@@ -934,22 +913,22 @@ async fn generation(
         response_id.clone(),
     )
     .await;
-    let response = match stream_harness_assistant(
-        &messages,
-        &stream_config,
-        &controller.gate,
-        cx,
-    )
-    .await
+    let response = match stream_harness_assistant(&messages, &stream_config, &controller.gate, cx)
+        .await
     {
         Ok(response) => response,
-        Err(error) => return stream_failure(lane, operation, controller, context, attempt, error, cx).await,
+        Err(error) => {
+            return stream_failure(lane, operation, controller, context, attempt, error, cx).await;
+        }
     };
     let pending = lane
         .current_operation()
         .await
         .ok_or_else(|| invariant("assistant operation disappeared before publication"))?;
-    if matches!(&pending.state.scope().control, Control::CancelRequested { .. }) {
+    if matches!(
+        &pending.state.scope().control,
+        Control::CancelRequested { .. }
+    ) {
         let record = publish_interrupted(lane, operation, &response_id, cx).await?;
         return Ok(DriveStep::Settled(record));
     }
@@ -964,7 +943,9 @@ fn pending_response_id(state: &OperationState) -> Result<EntryId, HarnessError> 
         | OperationState::DeferredEffectPending {
             response_entry_id, ..
         } => Ok(response_entry_id.clone()),
-        _ => Err(invariant("response publication without response reservation")),
+        _ => Err(invariant(
+            "response publication without response reservation",
+        )),
     }
 }
 
@@ -1071,7 +1052,7 @@ async fn stream_failure(
                 Ok(DriveStep::Settled(record))
             }
         }
-}
+    }
 }
 
 async fn publish_response(
@@ -1106,8 +1087,10 @@ async fn publish_response(
     if record.status == TerminalStatus::Failed && record.error.is_some() {
         return Ok(DriveStep::Settled(record));
     }
-    if matches!(&operation.state, OperationState::AssistantEffectPending { .. })
-        && matches!(message.stop_reason, pi_ai::StopReason::Deferred)
+    if matches!(
+        &operation.state,
+        OperationState::AssistantEffectPending { .. }
+    ) && matches!(message.stop_reason, pi_ai::StopReason::Deferred)
     {
         return Ok(DriveStep::WaitingDeferred {
             deferred: message.deferred.ok_or_else(|| HarnessError::Closed {
@@ -1139,18 +1122,15 @@ fn pending_usage_id(state: &OperationState) -> Result<UsageId, HarnessError> {
     }
 }
 
-fn assistant_tool_calls(
-    message: &pi_ai::AssistantMessage,
-) -> Vec<(u32, pi_ai::ToolCall)> {
+fn assistant_tool_calls(message: &pi_ai::AssistantMessage) -> Vec<(u32, pi_ai::ToolCall)> {
     message
         .content
         .iter()
         .enumerate()
         .filter_map(|(source_index, block)| match block {
-            pi_ai::AssistantContent::ToolCall(call) => Some((
-                u32::try_from(source_index).ok()?,
-                call.clone(),
-            )),
+            pi_ai::AssistantContent::ToolCall(call) => {
+                Some((u32::try_from(source_index).ok()?, call.clone()))
+            }
             _ => None,
         })
         .collect()
@@ -1267,11 +1247,9 @@ fn length_response_state(
             response_entry_id.clone(),
             generation_context.overflow_recovery_used,
         ),
-        OperationState::DeferredEffectPending { deferred, .. } => (
-            deferred.scope.clone(),
-            response_id.clone(),
-            true,
-        ),
+        OperationState::DeferredEffectPending { deferred, .. } => {
+            (deferred.scope.clone(), response_id.clone(), true)
+        }
         _ => return Err(invariant("length response without generation context")),
     };
     if overflow_recovery_used {
@@ -1402,10 +1380,7 @@ fn tool_use_response_state(
     })
 }
 
-fn finish_response_state(
-    pending: &OperationState,
-    response_id: &EntryId,
-) -> ResponseTransition {
+fn finish_response_state(pending: &OperationState, response_id: &EntryId) -> ResponseTransition {
     let mut scope = pending.scope().clone();
     scope.latest_assistant_entry_id = Some(response_id.clone());
     ResponseTransition {
@@ -1450,10 +1425,20 @@ async fn commit_assistant(
             details: None,
         },
     };
-    let state_write = set_json(&operation_state(&operation.meta.operation_id), &next_state).map_err(map_session_error)?;
+    let state_write = set_json(&operation_state(&operation.meta.operation_id), &next_state)
+        .map_err(map_session_error)?;
     let tip = Some(response_id.clone());
     let tip_write = set_json(&branch_tip(lane.name.as_str()), &tip).map_err(map_session_error)?;
-    let writes = vec![entry, usage_row, state_write, tip_write, crate::session::delete_list(&pending_assistant_frames(&operation.meta.operation_id, &response_id))];
+    let writes = vec![
+        entry,
+        usage_row,
+        state_write,
+        tip_write,
+        crate::session::delete_list(&pending_assistant_frames(
+            &operation.meta.operation_id,
+            &response_id,
+        )),
+    ];
     lane.commit(writes, cx).await?;
     data.tip = tip;
     if matches!(
@@ -1472,9 +1457,33 @@ async fn commit_assistant(
     }
     drop(data);
     lane.state_changed.notify_waiters();
-    lane.emit(HarnessEventPayload::EntryAdded { entry: lane.owner.session.get_entry(&response_id, cx).await.map_err(map_session_error)?.ok_or_else(|| invariant("assistant entry was not committed"))? }, cx).await;
-    if status == TerminalStatus::Completed && matches!(next_state_at(&next_state), crate::session::OperationAt::Tools) {
-        lane.emit(HarnessEventPayload::TurnStart { run_id: operation.meta.operation_id.clone(), turn_id: operation.meta.operation_id.to_string() }, cx).await;
+    lane.emit(
+        HarnessEventPayload::EntryAdded {
+            entry: lane
+                .owner
+                .session
+                .get_entry(&response_id, cx)
+                .await
+                .map_err(map_session_error)?
+                .ok_or_else(|| invariant("assistant entry was not committed"))?,
+        },
+        cx,
+    )
+    .await;
+    if status == TerminalStatus::Completed
+        && matches!(
+            next_state_at(&next_state),
+            crate::session::OperationAt::Tools
+        )
+    {
+        lane.emit(
+            HarnessEventPayload::TurnStart {
+                run_id: operation.meta.operation_id.clone(),
+                turn_id: operation.meta.operation_id.to_string(),
+            },
+            cx,
+        )
+        .await;
     }
     if status == TerminalStatus::Failed
         && error.is_some()
@@ -1507,7 +1516,8 @@ async fn retry_wait(
     cx: &Context,
 ) -> Result<DriveStep, HarnessError> {
     let (OperationState::AssistantRetryWait { retry, .. }
-    | OperationState::SummaryRetryWait { retry, .. }) = &operation.state else {
+    | OperationState::SummaryRetryWait { retry, .. }) = &operation.state
+    else {
         return Err(invariant("retry wait dispatcher received another state"));
     };
     if !wait {
@@ -1579,8 +1589,7 @@ async fn deferred_suspended(
         .ok_or_else(|| HarnessError::Closed {
             message: format!(
                 "deferred model {}/{} is unavailable",
-                deferred.configuration.model.provider,
-                deferred.configuration.model.model_id
+                deferred.configuration.model.provider, deferred.configuration.model.model_id
             ),
         })?;
     let poll_attempt = deferred
@@ -1611,8 +1620,7 @@ async fn deferred_suspended(
         }
         Err(error) => return Err(hook_error(error)),
     };
-    let response_id =
-        new_entry_id(lane.owner.session.as_ref()).map_err(map_session_error)?;
+    let response_id = new_entry_id(lane.owner.session.as_ref()).map_err(map_session_error)?;
     let usage_id = new_usage_id(lane.owner.session.as_ref()).map_err(map_session_error)?;
     let next_deferred = DeferredScope {
         poll: poll_attempt,
@@ -1631,19 +1639,13 @@ async fn deferred_suspended(
         stream_options,
         response_id.clone(),
     );
-    let response = match stream_harness_deferred(
-        &config,
-        handle.clone(),
-        &controller.gate,
-        cx,
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            return deferred_stream_failure(lane, operation, controller, error, cx).await;
-        }
-    };
+    let response =
+        match stream_harness_deferred(&config, handle.clone(), &controller.gate, cx).await {
+            Ok(response) => response,
+            Err(error) => {
+                return deferred_stream_failure(lane, operation, controller, error, cx).await;
+            }
+        };
     publish_deferred_response(lane, operation, handle, response, cx).await
 }
 
@@ -1678,8 +1680,7 @@ async fn recover_deferred_effect(
         .ok_or_else(|| HarnessError::Closed {
             message: format!(
                 "deferred model {}/{} is unavailable",
-                deferred.configuration.model.provider,
-                deferred.configuration.model.model_id
+                deferred.configuration.model.provider, deferred.configuration.model.model_id
             ),
         })?;
     let current = CurrentOperation {
@@ -1704,8 +1705,7 @@ async fn recover_deferred_effect(
         }
         Err(error) => return Err(hook_error(error)),
     };
-    let response_id =
-        new_entry_id(lane.owner.session.as_ref()).map_err(map_session_error)?;
+    let response_id = new_entry_id(lane.owner.session.as_ref()).map_err(map_session_error)?;
     let usage_id = new_usage_id(lane.owner.session.as_ref()).map_err(map_session_error)?;
     let next = OperationState::DeferredEffectPending {
         deferred: deferred.clone(),
@@ -1723,26 +1723,14 @@ async fn recover_deferred_effect(
         cx,
     )
     .await?;
-    let config = deferred_stream_config(
-        current,
-        &deferred,
-        model,
-        stream_options,
-        response_id,
-    );
-    let response = match stream_harness_deferred(
-        &config,
-        handle.clone(),
-        &controller.gate,
-        cx,
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            return deferred_stream_failure(lane, operation, controller, error, cx).await;
-        }
-    };
+    let config = deferred_stream_config(current, &deferred, model, stream_options, response_id);
+    let response =
+        match stream_harness_deferred(&config, handle.clone(), &controller.gate, cx).await {
+            Ok(response) => response,
+            Err(error) => {
+                return deferred_stream_failure(lane, operation, controller, error, cx).await;
+            }
+        };
     publish_deferred_response(lane, operation, handle, response, cx).await
 }
 
@@ -1827,27 +1815,63 @@ async fn recover_assistant_effect(
     cx: &Context,
 ) -> Result<DriveStep, HarnessError> {
     let (response_id, usage_id) = match &operation.state {
-        OperationState::AssistantEffectPending { response_entry_id, usage_id, .. } => (response_entry_id.clone(), usage_id.clone()),
+        OperationState::AssistantEffectPending {
+            response_entry_id,
+            usage_id,
+            ..
+        } => (response_entry_id.clone(), usage_id.clone()),
         _ => return Err(invariant("assistant recovery received another state")),
     };
-    let frames = lane.owner.session.read_list(&pending_assistant_frames(&operation.meta.operation_id, &response_id), None, cx).await.map_err(map_session_error)?;
+    let frames = lane
+        .owner
+        .session
+        .read_list(
+            &pending_assistant_frames(&operation.meta.operation_id, &response_id),
+            None,
+            cx,
+        )
+        .await
+        .map_err(map_session_error)?;
     let partial = if frames.is_empty() {
         let config = lane.data.lock().await.config.clone();
-        let model = lane.owner.models.get_model(&config.model.provider, &config.model.model_id).ok_or_else(|| HarnessError::Closed { message: "recovery model is unavailable".to_owned() })?;
-        let mut message = pi_ai::AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), crate::message::now_millis());
+        let model = lane
+            .owner
+            .models
+            .get_model(&config.model.provider, &config.model.model_id)
+            .ok_or_else(|| HarnessError::Closed {
+                message: "recovery model is unavailable".to_owned(),
+            })?;
+        let mut message = pi_ai::AssistantMessage::new(
+            model.api.clone(),
+            model.provider.clone(),
+            model.id.clone(),
+            crate::message::now_millis(),
+        );
         message.stop_reason = pi_ai::StopReason::Aborted;
         message.error_message = Some("assistant response interrupted before completion".to_owned());
         message
     } else {
-        let frames = frames.into_iter().map(|frame| frame.value).collect::<Vec<_>>();
-        let mut message = crate::harness::stream::reduce_persisted_frames(&frames).map_err(map_session_error)?;
+        let frames = frames
+            .into_iter()
+            .map(|frame| frame.value)
+            .collect::<Vec<_>>();
+        let mut message =
+            crate::harness::stream::reduce_persisted_frames(&frames).map_err(map_session_error)?;
         message.stop_reason = pi_ai::StopReason::Aborted;
         message.error_message = Some("assistant response interrupted during recovery".to_owned());
         message.timestamp = crate::message::now_millis();
         message
     };
     let assistant = assistant_agent_message(partial)?;
-    let next = OperationState::Checkpoint { scope: operation.state.scope().clone(), data: CheckpointData { continuation: Continuation::MayFinish { include_final_assistant: true }, trigger_entry_id: response_id.clone() } };
+    let next = OperationState::Checkpoint {
+        scope: operation.state.scope().clone(),
+        data: CheckpointData {
+            continuation: Continuation::MayFinish {
+                include_final_assistant: true,
+            },
+            trigger_entry_id: response_id.clone(),
+        },
+    };
     let _record = commit_assistant(
         lane,
         operation,
@@ -1867,7 +1891,18 @@ async fn recover_assistant_effect(
         cx,
     )
     .await?;
-    let record = settle(lane, operation, TerminalStatus::Aborted, Some(OperationError { code: "interrupted".to_owned(), message: "assistant response was interrupted".to_owned(), details: None }), cx).await?;
+    let record = settle(
+        lane,
+        operation,
+        TerminalStatus::Aborted,
+        Some(OperationError {
+            code: "interrupted".to_owned(),
+            message: "assistant response was interrupted".to_owned(),
+            details: None,
+        }),
+        cx,
+    )
+    .await?;
     Ok(DriveStep::Settled(record))
 }
 
@@ -1900,8 +1935,8 @@ async fn tools(
         .ok_or_else(|| invariant("tool batch assistant entry is not assistant"))?;
     let calls = assistant_tool_calls(&assistant);
     let config = lane.owner.config_snapshot().await;
-    let all_calls_are_parallel =
-        operation.state.scope().settings.tool_execution == ToolExecutionMode::Parallel
+    let all_calls_are_parallel = operation.state.scope().settings.tool_execution
+        == ToolExecutionMode::Parallel
         && calls.iter().all(|(source, _)| {
             batch
                 .calls
@@ -1922,7 +1957,7 @@ async fn tools(
                 .tools
                 .iter()
                 .find(|tool| tool.name() == call.name)
-            .is_none_or(|tool| tool.execution_mode() == ToolExecutionMode::Parallel)
+                .is_none_or(|tool| tool.execution_mode() == ToolExecutionMode::Parallel)
         });
     if all_calls_are_parallel && calls.len() > 1 {
         return parallel_tools(current, batch, &calls).await;
@@ -1950,8 +1985,7 @@ async fn tools(
             }
         }
     }
-    let record =
-        commit_tool_results(lane, operation, &batch, tool_results, terminate, cx).await?;
+    let record = commit_tool_results(lane, operation, &batch, tool_results, terminate, cx).await?;
     if record.status == TerminalStatus::Completed {
         Ok(DriveStep::Continue)
     } else {
@@ -2021,7 +2055,10 @@ async fn run_sequential_tool(
                 &durable,
             )
             .map_err(map_session_error)?;
-            current.lane.commit(vec![pending_output], current.cx).await?;
+            current
+                .lane
+                .commit(vec![pending_output], current.cx)
+                .await?;
             let mut ready_batch = batch.clone();
             if let Some(record) = ready_batch.calls.get_mut(index) {
                 record.status = ToolCallStatus::OutcomeReady {
@@ -2045,9 +2082,7 @@ async fn run_sequential_tool(
             replay: ReplayPolicy::Never,
         }
         | ToolCallStatus::OutcomeReady { .. }
-        | ToolCallStatus::Completed { .. } => {
-            recover_sequential_tool(current, record, call).await
-        }
+        | ToolCallStatus::Completed { .. } => recover_sequential_tool(current, record, call).await,
     }
 }
 
@@ -2145,11 +2180,7 @@ async fn prepare_parallel_tools(
         };
         writes.push(
             set_json(
-                &operation_tool_args(
-                    &current.operation.meta.operation_id,
-                    &turn_id,
-                    *source,
-                ),
+                &operation_tool_args(&current.operation.meta.operation_id, &turn_id, *source),
                 &call.arguments,
             )
             .map_err(map_session_error)?,
@@ -2251,11 +2282,13 @@ async fn execute_parallel_tools(
             .await?,
         ));
     }
-    Ok(ParallelToolExecution::Completed(Box::new(ParallelToolResults {
-        operation: current_operation,
-        results,
-        terminate,
-    })))
+    Ok(ParallelToolExecution::Completed(Box::new(
+        ParallelToolResults {
+            operation: current_operation,
+            results,
+            terminate,
+        },
+    )))
 }
 
 enum ParallelToolResult {
@@ -2296,7 +2329,10 @@ async fn commit_parallel_tool_result(
         &durable,
     )
     .map_err(map_session_error)?;
-    current.lane.commit(vec![pending_output], current.cx).await?;
+    current
+        .lane
+        .commit(vec![pending_output], current.cx)
+        .await?;
     let current_operation = current
         .lane
         .current_operation()
@@ -2371,17 +2407,41 @@ async fn execute_tool(
 ) -> Result<(pi_ai::ToolResultMessage, bool, AgentToolResult), HarnessError> {
     let config = lane.owner.config_snapshot().await;
     let tool = config.tools.iter().find(|tool| tool.name() == call.name);
-    let invocation = Invocation { lane, operation_id: operation.meta.operation_id.clone(), turn_id: batch.turn_id.clone(), entry_id: record.result_entry_id.clone() };
+    let invocation = Invocation {
+        lane,
+        operation_id: operation.meta.operation_id.clone(),
+        turn_id: batch.turn_id.clone(),
+        entry_id: record.result_entry_id.clone(),
+    };
     let updates = Arc::new(Mutex::new(Vec::<AgentToolResult>::new()));
     let updates_sink = crate::harness::tool::ToolUpdateSink::new({
         let updates = Arc::clone(&updates);
         move |result, _checkpoint| {
-            if let Ok(mut values) = updates.lock() { values.push(result); }
+            if let Ok(mut values) = updates.lock() {
+                values.push(result);
+            }
         }
     });
-    lane.emit(HarnessEventPayload::ToolStart { run_id: operation.meta.operation_id.clone(), turn_id: batch.turn_id.clone(), tool_call_id: call.id.clone(), tool_name: call.name.clone(), args: call.arguments.clone() }, cx).await;
-    let (result, is_error) = if matches!(&operation.state.scope().control, Control::CancelRequested { .. }) || controller.gate.token().is_cancelled() {
-        (crate::tool::error_tool_result("tool execution aborted"), true)
+    lane.emit(
+        HarnessEventPayload::ToolStart {
+            run_id: operation.meta.operation_id.clone(),
+            turn_id: batch.turn_id.clone(),
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            args: call.arguments.clone(),
+        },
+        cx,
+    )
+    .await;
+    let (result, is_error) = if matches!(
+        &operation.state.scope().control,
+        Control::CancelRequested { .. }
+    ) || controller.gate.token().is_cancelled()
+    {
+        (
+            crate::tool::error_tool_result("tool execution aborted"),
+            true,
+        )
     } else if let Some(tool) = tool {
         let admitted_context = cx.with_cancellation(controller.gate.token().clone());
         let context = match &config.tool_context {
@@ -2401,12 +2461,16 @@ async fn execute_tool(
         {
             Ok(Ok(result)) => (result, false),
             Ok(Err(error)) => (crate::tool::error_tool_result(error.message()), true),
-            Err(crate::context::Cancelled) => {
-                (crate::tool::error_tool_result("tool execution aborted"), true)
-            }
+            Err(crate::context::Cancelled) => (
+                crate::tool::error_tool_result("tool execution aborted"),
+                true,
+            ),
         }
     } else {
-        (crate::tool::error_tool_result(format!("tool {} is not registered", call.name)), true)
+        (
+            crate::tool::error_tool_result(format!("tool {} is not registered", call.name)),
+            true,
+        )
     };
     updates_sink.stop_accepting();
     let partials = updates
@@ -2414,7 +2478,17 @@ async fn execute_tool(
         .map(|values| values.clone())
         .unwrap_or_default();
     for partial in partials {
-        lane.emit(HarnessEventPayload::ToolUpdate { run_id: operation.meta.operation_id.clone(), turn_id: batch.turn_id.clone(), tool_call_id: call.id.clone(), tool_name: call.name.clone(), partial_result: partial }, cx).await;
+        lane.emit(
+            HarnessEventPayload::ToolUpdate {
+                run_id: operation.meta.operation_id.clone(),
+                turn_id: batch.turn_id.clone(),
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                partial_result: partial,
+            },
+            cx,
+        )
+        .await;
     }
     let terminate = result.terminate.unwrap_or(false);
     let durable = AgentToolResult {
@@ -2454,10 +2528,7 @@ async fn staged_tool_result(
 ) -> Result<Option<AgentToolResult>, HarnessError> {
     lane.owner
         .session
-        .get_value(
-            &pending_tool_output(operation_id, result_entry_id),
-            cx,
-        )
+        .get_value(&pending_tool_output(operation_id, result_entry_id), cx)
         .await
         .map_err(map_session_error)
         .map(|stored| stored.map(|value| value.value))
@@ -2476,7 +2547,9 @@ fn native_tool_result(
         crate::message::now_millis(),
     );
     message.details = Some(result.details.clone());
-    message.added_tool_names.clone_from(&result.added_tool_names);
+    message
+        .added_tool_names
+        .clone_from(&result.added_tool_names);
     message.is_error = false;
     let _ = terminate;
     message
@@ -2534,9 +2607,7 @@ async fn commit_tool_results(
         set_json(&operation_state(&operation.meta.operation_id), &next)
             .map_err(map_session_error)?,
     );
-    writes.push(
-        set_json(&branch_tip(lane.name.as_str()), &parent).map_err(map_session_error)?,
-    );
+    writes.push(set_json(&branch_tip(lane.name.as_str()), &parent).map_err(map_session_error)?);
     lane.commit(writes, cx).await?;
     data.tip.clone_from(&parent);
     data.operation = Some(Operation {
@@ -2553,7 +2624,8 @@ async fn commit_tool_results(
             .await
             .map_err(map_session_error)?
             .ok_or_else(|| invariant("tool result entry was not committed"))?;
-        lane.emit(HarnessEventPayload::EntryAdded { entry }, cx).await;
+        lane.emit(HarnessEventPayload::EntryAdded { entry }, cx)
+            .await;
     }
     Ok(OperationResultRecord {
         operation_id: operation.meta.operation_id.clone(),
@@ -2579,26 +2651,68 @@ async fn navigation(
     cx: &Context,
 ) -> Result<DriveStep, HarnessError> {
     let (target, label) = match &operation.state {
-        OperationState::NavigationReadyToCommit { target_id, label, .. } => (target_id.clone(), label.clone()),
+        OperationState::NavigationReadyToCommit {
+            target_id, label, ..
+        } => (target_id.clone(), label.clone()),
         _ => return Err(invariant("navigation dispatcher received another state")),
     };
     if let Some(target) = target.as_ref()
-        && lane.owner.session.get_entry(target, cx).await.map_err(map_session_error)?.is_none()
+        && lane
+            .owner
+            .session
+            .get_entry(target, cx)
+            .await
+            .map_err(map_session_error)?
+            .is_none()
     {
-        return Err(HarnessError::UnknownTarget { target_id: target.clone(), message: "navigation target disappeared".to_owned() });
+        return Err(HarnessError::UnknownTarget {
+            target_id: target.clone(),
+            message: "navigation target disappeared".to_owned(),
+        });
     }
     let mut data = lane.data.lock().await;
     let from = data.tip.clone();
-    let mut writes = vec![set_json(&branch_tip(lane.name.as_str()), &target).map_err(map_session_error)?];
+    let mut writes =
+        vec![set_json(&branch_tip(lane.name.as_str()), &target).map_err(map_session_error)?];
     if let Some(label) = label.as_ref() {
-        writes.push(set_json(&super::support::label_address(target.as_ref().ok_or_else(|| HarnessError::InvalidNavigation { lane: lane.name.clone(), reason: "root_label".to_owned(), message: "a root navigation cannot carry a label".to_owned() })?), label).map_err(map_session_error)?);
+        writes.push(
+            set_json(
+                &super::support::label_address(target.as_ref().ok_or_else(|| {
+                    HarnessError::InvalidNavigation {
+                        lane: lane.name.clone(),
+                        reason: "root_label".to_owned(),
+                        message: "a root navigation cannot carry a label".to_owned(),
+                    }
+                })?),
+                label,
+            )
+            .map_err(map_session_error)?,
+        );
     }
-    let record = OperationResultRecord { operation_id: operation.meta.operation_id.clone(), kind: OperationKind::Navigation, status: TerminalStatus::Completed, error: None, from_tip_id: from, tip_id: target.clone(), started_at: operation.meta.started_at, ended_at: crate::message::now_millis() };
+    let record = OperationResultRecord {
+        operation_id: operation.meta.operation_id.clone(),
+        kind: OperationKind::Navigation,
+        status: TerminalStatus::Completed,
+        error: None,
+        from_tip_id: from,
+        tip_id: target.clone(),
+        started_at: operation.meta.started_at,
+        ended_at: crate::message::now_millis(),
+    };
     let mut state = data.state.clone();
     state.current_operation_id = None;
     state.last_operation_id = Some(operation.meta.operation_id.clone());
-    writes.push(set_json(&super::support::lane_state_address(&lane.name), &state).map_err(map_session_error)?);
-    writes.push(set_json(&super::support::result_address(&operation.meta.operation_id), &record).map_err(map_session_error)?);
+    writes.push(
+        set_json(&super::support::lane_state_address(&lane.name), &state)
+            .map_err(map_session_error)?,
+    );
+    writes.push(
+        set_json(
+            &super::support::result_address(&operation.meta.operation_id),
+            &record,
+        )
+        .map_err(map_session_error)?,
+    );
     writes.extend(op_cleanup_writes(&operation.meta.operation_id, None));
     lane.commit(writes, cx).await?;
     data.tip.clone_from(&target);
@@ -2606,7 +2720,18 @@ async fn navigation(
     data.operation = None;
     data.last_result = Some(record.clone());
     drop(data);
-    lane.emit(HarnessEventPayload::NavigationEnd { run_id: operation.meta.operation_id.clone(), status: TerminalStatus::Completed, from_tip_id: record.from_tip_id.clone(), tip_id: record.tip_id.clone(), error: None, ended_at: record.ended_at }, cx).await;
+    lane.emit(
+        HarnessEventPayload::NavigationEnd {
+            run_id: operation.meta.operation_id.clone(),
+            status: TerminalStatus::Completed,
+            from_tip_id: record.from_tip_id.clone(),
+            tip_id: record.tip_id.clone(),
+            error: None,
+            ended_at: record.ended_at,
+        },
+        cx,
+    )
+    .await;
     lane.state_changed.notify_waiters();
     Ok(DriveStep::Settled(record))
 }
@@ -2639,17 +2764,14 @@ async fn structural(
             ..
         } => (generation.clone(), *next_attempt),
         OperationState::SummaryEffectPending {
-            generation, attempt, ..
+            generation,
+            attempt,
+            ..
         } => (generation.clone(), *attempt),
         _ => return Err(invariant("structural dispatcher received another state")),
     };
-    let durable = load_structural_preparation(
-        lane,
-        operation,
-        &generation.task.task_id,
-        cx,
-    )
-    .await?;
+    let durable =
+        load_structural_preparation(lane, operation, &generation.task.task_id, cx).await?;
     let request_ref = ensure_summary_request(current, &generation, attempt).await?;
     let model = summary_model(lane, &generation)?;
     let summary_step = match &durable {
@@ -2689,13 +2811,9 @@ async fn start_summary_generation(
     current: CurrentOperation<'_>,
     task: &crate::session::SummaryTask,
 ) -> Result<DriveStep, HarnessError> {
-    let durable = load_structural_preparation(
-        current.lane,
-        current.operation,
-        &task.task_id,
-        current.cx,
-    )
-    .await?;
+    let durable =
+        load_structural_preparation(current.lane, current.operation, &task.task_id, current.cx)
+            .await?;
     let navigation = matches!(
         &current.operation.meta.intent,
         OperationIntent::Navigation {
@@ -2704,15 +2822,13 @@ async fn start_summary_generation(
         }
     );
     match (&durable, navigation) {
-        (
-            crate::session::DurableStructuralPreparation::BranchSummary { .. },
-            true,
-        )
-        | (
-            crate::session::DurableStructuralPreparation::Compaction { .. },
-            false,
-        ) => {}
-        _ => return Err(invariant("summary preparation does not match operation intent")),
+        (crate::session::DurableStructuralPreparation::BranchSummary { .. }, true)
+        | (crate::session::DurableStructuralPreparation::Compaction { .. }, false) => {}
+        _ => {
+            return Err(invariant(
+                "summary preparation does not match operation intent",
+            ));
+        }
     }
     let config = current.lane.owner.config_snapshot().await;
     let Some(_model) = current
@@ -2770,8 +2886,7 @@ async fn ensure_summary_request(
     {
         return Ok(request.clone());
     }
-    let usage_id =
-        new_usage_id(current.lane.owner.session.as_ref()).map_err(map_session_error)?;
+    let usage_id = new_usage_id(current.lane.owner.session.as_ref()).map_err(map_session_error)?;
     let index = u32::try_from(attempt.saturating_sub(1)).map_err(|_| HarnessError::Closed {
         message: "summary request index overflow".to_owned(),
     })?;
@@ -2838,21 +2953,22 @@ async fn execute_summary(
             .map_err(|error| (error.code().to_owned(), error.to_string())))
         }
         crate::session::DurableStructuralPreparation::BranchSummary { .. } => {
-            let preparation =
-                crate::harness::compaction::BranchPreparation::from_durable(durable)
-                    .ok_or_else(|| invariant("branch preparation changed during drive"))?;
-            Ok(crate::harness::compaction::generate_branch_summary_with_request(
-                &preparation,
-                &crate::harness::compaction::PreparedBranchSummaryOptions {
-                    custom_instructions: generation.task.custom_instructions.clone(),
-                    replace_instructions: false,
-                },
-                request,
-                cx,
+            let preparation = crate::harness::compaction::BranchPreparation::from_durable(durable)
+                .ok_or_else(|| invariant("branch preparation changed during drive"))?;
+            Ok(
+                crate::harness::compaction::generate_branch_summary_with_request(
+                    &preparation,
+                    &crate::harness::compaction::PreparedBranchSummaryOptions {
+                        custom_instructions: generation.task.custom_instructions.clone(),
+                        replace_instructions: false,
+                    },
+                    request,
+                    cx,
+                )
+                .await
+                .map(StructuralSummary::Branch)
+                .map_err(|error| (error.code().to_owned(), error.to_string())),
             )
-            .await
-            .map(StructuralSummary::Branch)
-            .map_err(|error| (error.code().to_owned(), error.to_string())))
         }
     }
 }
@@ -2887,10 +3003,8 @@ async fn summary_failure(
             scope: current.operation.state.scope().clone(),
             generation,
             retry: RetryWait {
-                next_attempt: attempt.checked_add(1).ok_or_else(|| {
-                    HarnessError::Closed {
-                        message: "summary retry attempt overflow".to_owned(),
-                    }
+                next_attempt: attempt.checked_add(1).ok_or_else(|| HarnessError::Closed {
+                    message: "summary retry attempt overflow".to_owned(),
                 })?,
                 not_before,
                 error_message: message,
@@ -2914,15 +3028,13 @@ async fn summary_failure(
     Ok(DriveStep::Settled(record))
 }
 
-
 async fn load_structural_preparation(
     lane: &LaneRuntime,
     operation: &Operation,
     task_id: &str,
     cx: &Context,
 ) -> Result<crate::session::DurableStructuralPreparation, HarnessError> {
-    lane
-        .owner
+    lane.owner
         .session
         .get_value(
             &super::support::preparation_address(&operation.meta.operation_id, task_id),
@@ -2950,8 +3062,7 @@ fn summary_request(
     let gate = controller.gate.clone();
     let model = model.clone();
     let mut base_options = stream_options.clone();
-    base_options.deferred =
-        Some(crate::session::configuration::DeferredRequest::Flag(false));
+    base_options.deferred = Some(crate::session::configuration::DeferredRequest::Flag(false));
     Arc::new(move |context, mut options, request_cx| {
         let models = Arc::clone(&models);
         let hooks = hooks.clone();
@@ -2969,7 +3080,10 @@ fn summary_request(
                 attempt,
                 stream_options: base_options.clone(),
             };
-            let effective = match hooks.run_with_gate::<crate::harness::hooks::BeforeRequest>(event, &gate, &request_cx).await {
+            let effective = match hooks
+                .run_with_gate::<crate::harness::hooks::BeforeRequest>(event, &gate, &request_cx)
+                .await
+            {
                 Ok(Some(result)) => match result.stream_options {
                     Some(patch) => apply_stream_options_patch(&base_options, &patch),
                     None => base_options,
@@ -3003,13 +3117,8 @@ fn summary_request(
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect()
             });
-            options.on_payload = before_payload_callback_owned(
-                hooks,
-                lane_name,
-                run_id,
-                gate,
-                request_cx.clone(),
-            );
+            options.on_payload =
+                before_payload_callback_owned(hooks, lane_name, run_id, gate, request_cx.clone());
             crate::harness::compaction::complete_simple_with_retries(
                 &models,
                 &model,
@@ -3060,7 +3169,8 @@ async fn commit_compaction(
         .await
         .map_err(map_session_error)?
         .ok_or_else(|| invariant("compaction entry was not committed"))?;
-    lane.emit(HarnessEventPayload::EntryAdded { entry }, cx).await;
+    lane.emit(HarnessEventPayload::EntryAdded { entry }, cx)
+        .await;
     if matches!(
         &generation.task.boundary,
         crate::session::ResultBoundary::ResumeCheckpoint { .. }
@@ -3172,16 +3282,18 @@ async fn commit_branch_summary(
     };
     let old_tip = lane.data.lock().await.tip.clone();
     let from_id = match (old_tip.as_ref(), target_id.as_ref()) {
-        (Some(old_tip), Some(target_id)) => crate::harness::compaction::collect_entries_for_branch_summary(
-            lane.branch(cx).await?.as_ref(),
-            lane.owner.session.as_ref(),
-            Some(old_tip),
-            target_id,
-            cx,
-        )
-        .await
-        .map_err(map_session_error)?
-        .common_ancestor_id,
+        (Some(old_tip), Some(target_id)) => {
+            crate::harness::compaction::collect_entries_for_branch_summary(
+                lane.branch(cx).await?.as_ref(),
+                lane.owner.session.as_ref(),
+                Some(old_tip),
+                target_id,
+                cx,
+            )
+            .await
+            .map_err(map_session_error)?
+            .common_ancestor_id
+        }
         _ => None,
     };
     let summary_id = generation.summary_context.result_entry_id.clone();
@@ -3242,7 +3354,8 @@ async fn commit_branch_summary(
         .await
         .map_err(map_session_error)?
         .ok_or_else(|| invariant("branch summary entry was not committed"))?;
-    lane.emit(HarnessEventPayload::EntryAdded { entry }, cx).await;
+    lane.emit(HarnessEventPayload::EntryAdded { entry }, cx)
+        .await;
     Ok(DriveStep::Continue)
 }
 
@@ -3253,17 +3366,19 @@ async fn cancel_deferred_best_effort(
     cx: &Context,
 ) -> Result<(), HarnessError> {
     let handle = deferred_handle(lane, deferred, cx).await?;
-    let Some(model) = lane
-        .owner
-        .models
-        .get_model(&deferred.configuration.model.provider, &deferred.configuration.model.model_id)
-    else {
+    let Some(model) = lane.owner.models.get_model(
+        &deferred.configuration.model.provider,
+        &deferred.configuration.model.model_id,
+    ) else {
         return Ok(());
     };
-    let session_id = format!("{}:{}", lane.owner.session.metadata().id, lane.name.as_str());
-    let on_response: pi_ai::provider::OnResponseFn = Arc::new(|_response, _model| {
-        Box::pin(std::future::ready(Ok(())))
-    });
+    let session_id = format!(
+        "{}:{}",
+        lane.owner.session.metadata().id,
+        lane.name.as_str()
+    );
+    let on_response: pi_ai::provider::OnResponseFn =
+        Arc::new(|_response, _model| Box::pin(std::future::ready(Ok(()))));
     let options = native_stream_options(
         &deferred.stream_options,
         deferred.configuration.thinking_level,
@@ -3279,7 +3394,6 @@ async fn cancel_deferred_best_effort(
         .await;
     Ok(())
 }
-
 
 async fn reconcile_abort(
     lane: &LaneRuntime,
@@ -3326,9 +3440,25 @@ async fn publish_interrupted(
     response_id: &EntryId,
     cx: &Context,
 ) -> Result<OperationResultRecord, HarnessError> {
-    let message = lane.owner.session.get_entry(response_id, cx).await.map_err(map_session_error)?;
+    let message = lane
+        .owner
+        .session
+        .get_entry(response_id, cx)
+        .await
+        .map_err(map_session_error)?;
     let _ = message;
-    settle(lane, operation, TerminalStatus::Aborted, Some(OperationError { code: "aborted".to_owned(), message: "assistant request aborted".to_owned(), details: None }), cx).await
+    settle(
+        lane,
+        operation,
+        TerminalStatus::Aborted,
+        Some(OperationError {
+            code: "aborted".to_owned(),
+            message: "assistant request aborted".to_owned(),
+            details: None,
+        }),
+        cx,
+    )
+    .await
 }
 
 async fn operation_cleanup_writes(
@@ -3393,13 +3523,9 @@ async fn settle(
     cx: &Context,
 ) -> Result<OperationResultRecord, HarnessError> {
     let response_id = response_id_of(&operation.state);
-    let cleanup = operation_cleanup_writes(
-        lane,
-        &operation.meta.operation_id,
-        response_id.as_ref(),
-        cx,
-    )
-    .await?;
+    let cleanup =
+        operation_cleanup_writes(lane, &operation.meta.operation_id, response_id.as_ref(), cx)
+            .await?;
     let mut data = lane.data.lock().await;
     let record = OperationResultRecord {
         operation_id: operation.meta.operation_id.clone(),
@@ -3428,7 +3554,14 @@ async fn settle(
     data.operation = None;
     data.last_result = Some(record.clone());
     let payload = match record.kind {
-        OperationKind::Run => HarnessEventPayload::RunEnd { run_id: record.operation_id.clone(), status: record.status, from_tip_id: record.from_tip_id.clone(), tip_id: record.tip_id.clone(), ended_at: record.ended_at, error: record.error.clone() },
+        OperationKind::Run => HarnessEventPayload::RunEnd {
+            run_id: record.operation_id.clone(),
+            status: record.status,
+            from_tip_id: record.from_tip_id.clone(),
+            tip_id: record.tip_id.clone(),
+            ended_at: record.ended_at,
+            error: record.error.clone(),
+        },
         OperationKind::Compaction => {
             let (reason, entry_id) = match &operation.state {
                 OperationState::SummaryEffectPending { generation, .. }
@@ -3442,9 +3575,23 @@ async fn settle(
                 ),
                 _ => (crate::session::CompactionReason::Manual, None),
             };
-            HarnessEventPayload::CompactionEnd { run_id: record.operation_id.clone(), reason, status: record.status, entry_id, error: record.error.clone(), ended_at: record.ended_at }
+            HarnessEventPayload::CompactionEnd {
+                run_id: record.operation_id.clone(),
+                reason,
+                status: record.status,
+                entry_id,
+                error: record.error.clone(),
+                ended_at: record.ended_at,
+            }
         }
-        OperationKind::Navigation => HarnessEventPayload::NavigationEnd { run_id: record.operation_id.clone(), status: record.status, from_tip_id: record.from_tip_id.clone(), tip_id: record.tip_id.clone(), error: record.error.clone(), ended_at: record.ended_at },
+        OperationKind::Navigation => HarnessEventPayload::NavigationEnd {
+            run_id: record.operation_id.clone(),
+            status: record.status,
+            from_tip_id: record.from_tip_id.clone(),
+            tip_id: record.tip_id.clone(),
+            error: record.error.clone(),
+            ended_at: record.ended_at,
+        },
     };
     lane.emit(payload, cx).await;
     lane.state_changed.notify_waiters();
@@ -3454,7 +3601,12 @@ async fn settle(
 
 fn response_id_of(state: &OperationState) -> Option<EntryId> {
     match state {
-        OperationState::AssistantEffectPending { response_entry_id, .. } | OperationState::DeferredEffectPending { response_entry_id, .. } => Some(response_entry_id.clone()),
+        OperationState::AssistantEffectPending {
+            response_entry_id, ..
+        }
+        | OperationState::DeferredEffectPending {
+            response_entry_id, ..
+        } => Some(response_entry_id.clone()),
         _ => None,
     }
 }
@@ -3466,11 +3618,26 @@ async fn transition(
     cx: &Context,
 ) -> Result<(), HarnessError> {
     let mut data = lane.data.lock().await;
-    let current = data.operation.as_ref().ok_or_else(|| invariant("operation disappeared during transition"))?;
-    if current.meta.operation_id != operation.meta.operation_id { return Err(HarnessError::OperationMismatch { lane: lane.name.clone(), expected_operation_id: operation.meta.operation_id.clone(), current_operation_id: Some(current.meta.operation_id.clone()), last_operation_id: data.state.last_operation_id.clone(), message: "operation changed during transition".to_owned() }); }
-    let write = set_json(&operation_state(&operation.meta.operation_id), &state).map_err(map_session_error)?;
+    let current = data
+        .operation
+        .as_ref()
+        .ok_or_else(|| invariant("operation disappeared during transition"))?;
+    if current.meta.operation_id != operation.meta.operation_id {
+        return Err(HarnessError::OperationMismatch {
+            lane: lane.name.clone(),
+            expected_operation_id: operation.meta.operation_id.clone(),
+            current_operation_id: Some(current.meta.operation_id.clone()),
+            last_operation_id: data.state.last_operation_id.clone(),
+            message: "operation changed during transition".to_owned(),
+        });
+    }
+    let write = set_json(&operation_state(&operation.meta.operation_id), &state)
+        .map_err(map_session_error)?;
     lane.commit(vec![write], cx).await?;
-    data.operation = Some(Operation { meta: operation.meta.clone(), state });
+    data.operation = Some(Operation {
+        meta: operation.meta.clone(),
+        state,
+    });
     drop(data);
     lane.state_changed.notify_waiters();
     Ok(())
@@ -3562,28 +3729,98 @@ struct InboxDrain {
     committed: bool,
 }
 
-async fn drain_inbox(lane: &LaneRuntime, operation: &Operation, cx: &Context) -> Result<InboxDrain, HarnessError> {
+async fn drain_inbox(
+    lane: &LaneRuntime,
+    operation: &Operation,
+    cx: &Context,
+) -> Result<InboxDrain, HarnessError> {
     let mut data = lane.data.lock().await;
-    let selected = select_inbox(&data.state.inbox, operation.state.scope().settings.steering_mode, operation.state.scope().settings.follow_up_mode);
-    if selected.is_empty() { return Ok(InboxDrain { messages: Vec::new(), trigger: None, committed: false }); }
+    let selected = select_inbox(
+        &data.state.inbox,
+        operation.state.scope().settings.steering_mode,
+        operation.state.scope().settings.follow_up_mode,
+    );
+    if selected.is_empty() {
+        return Ok(InboxDrain {
+            messages: Vec::new(),
+            trigger: None,
+            committed: false,
+        });
+    }
     let entry_projectors = lane.owner.config_snapshot().await.entry_projectors;
-    let mutator = lane.owner.session.begin_mutation(cx).await.map_err(map_session_error)?;
-    let pending = super::support::read_pending(&*mutator, &selected, cx).await.map_err(map_session_error)?;
+    let mutator = lane
+        .owner
+        .session
+        .begin_mutation(cx)
+        .await
+        .map_err(map_session_error)?;
+    let pending = super::support::read_pending(&*mutator, &selected, cx)
+        .await
+        .map_err(map_session_error)?;
     let mut parent = data.tip.clone();
-    let mut drain = InboxDrain { messages: Vec::new(), trigger: None, committed: true };
+    let mut drain = InboxDrain {
+        messages: Vec::new(),
+        trigger: None,
+        committed: true,
+    };
     let mut writes = Vec::new();
     for (item, value) in pending {
-        match value { PendingEntry::Message { payload } => { drain.trigger = Some(item.entry_id.clone()); drain.messages.push(payload.clone()); writes.push(entry_write(item.entry_id.clone(), parent.clone(), payload, false)); }, PendingEntry::Custom { custom_type, payload } => { if entry_projectors.contains_key(&custom_type) { drain.trigger = Some(item.entry_id.clone()); } writes.push(super::support::custom_entry_write(item.entry_id.clone(), parent.clone(), custom_type, payload)); } }
+        match value {
+            PendingEntry::Message { payload } => {
+                drain.trigger = Some(item.entry_id.clone());
+                drain.messages.push(payload.clone());
+                writes.push(entry_write(
+                    item.entry_id.clone(),
+                    parent.clone(),
+                    payload,
+                    false,
+                ));
+            }
+            PendingEntry::Custom {
+                custom_type,
+                payload,
+            } => {
+                if entry_projectors.contains_key(&custom_type) {
+                    drain.trigger = Some(item.entry_id.clone());
+                }
+                writes.push(super::support::custom_entry_write(
+                    item.entry_id.clone(),
+                    parent.clone(),
+                    custom_type,
+                    payload,
+                ));
+            }
+        }
         parent = Some(item.entry_id.clone());
-        writes.push(crate::session::delete_value(&crate::session::address::pending_entry(
-            &item.entry_id,
-        )));
+        writes.push(crate::session::delete_value(
+            &crate::session::address::pending_entry(&item.entry_id),
+        ));
     }
-    let next_inbox = data.state.inbox.iter().filter(|item| !selected.iter().any(|chosen| chosen.entry_id == item.entry_id)).cloned().collect::<Vec<_>>();
-    let next_state = LaneState { current_operation_id: Some(operation.meta.operation_id.clone()), last_operation_id: data.state.last_operation_id.clone(), inbox: next_inbox };
-    writes.push(set_json(&super::support::lane_state_address(&lane.name), &next_state).map_err(map_session_error)?);
+    let next_inbox = data
+        .state
+        .inbox
+        .iter()
+        .filter(|item| {
+            !selected
+                .iter()
+                .any(|chosen| chosen.entry_id == item.entry_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_state = LaneState {
+        current_operation_id: Some(operation.meta.operation_id.clone()),
+        last_operation_id: data.state.last_operation_id.clone(),
+        inbox: next_inbox,
+    };
+    writes.push(
+        set_json(&super::support::lane_state_address(&lane.name), &next_state)
+            .map_err(map_session_error)?,
+    );
     writes.push(set_json(&branch_tip(lane.name.as_str()), &parent).map_err(map_session_error)?);
-    mutator.commit(writes, cx).await.map_err(map_session_error)?;
+    mutator
+        .commit(writes, cx)
+        .await
+        .map_err(map_session_error)?;
     data.tip = parent;
     data.state = next_state;
     drop(data);
@@ -3591,12 +3828,24 @@ async fn drain_inbox(lane: &LaneRuntime, operation: &Operation, cx: &Context) ->
     Ok(drain)
 }
 
-fn select_inbox(inbox: &[crate::session::InboxItem], steering: crate::queue::QueueMode, follow_up: crate::queue::QueueMode) -> Vec<crate::session::InboxItem> {
+fn select_inbox(
+    inbox: &[crate::session::InboxItem],
+    steering: crate::queue::QueueMode,
+    follow_up: crate::queue::QueueMode,
+) -> Vec<crate::session::InboxItem> {
     let mut selected = Vec::new();
     let mut steer = false;
     let mut follow = false;
     for item in inbox {
-        let allowed = match item.kind { crate::session::InboxItemKind::Write | crate::session::InboxItemKind::NextRun => true, crate::session::InboxItemKind::Steer => steering == crate::queue::QueueMode::All || !steer, crate::session::InboxItemKind::FollowUp => follow_up == crate::queue::QueueMode::All || !follow };
+        let allowed = match item.kind {
+            crate::session::InboxItemKind::Write | crate::session::InboxItemKind::NextRun => true,
+            crate::session::InboxItemKind::Steer => {
+                steering == crate::queue::QueueMode::All || !steer
+            }
+            crate::session::InboxItemKind::FollowUp => {
+                follow_up == crate::queue::QueueMode::All || !follow
+            }
+        };
         if allowed {
             match item.kind {
                 crate::session::InboxItemKind::Steer => steer = true,
@@ -3609,8 +3858,17 @@ fn select_inbox(inbox: &[crate::session::InboxItem], steering: crate::queue::Que
     selected
 }
 
-async fn read_entries_by_id(lane: &LaneRuntime, ids: &[EntryId], cx: &Context) -> Result<Vec<AgentMessage>, HarnessError> {
-    let entries = lane.owner.session.get_entries(ids, cx).await.map_err(map_session_error)?;
+async fn read_entries_by_id(
+    lane: &LaneRuntime,
+    ids: &[EntryId],
+    cx: &Context,
+) -> Result<Vec<AgentMessage>, HarnessError> {
+    let entries = lane
+        .owner
+        .session
+        .get_entries(ids, cx)
+        .await
+        .map_err(map_session_error)?;
     Ok(ids
         .iter()
         .filter_map(|id| entries.get(id).and_then(|entry| entry.message().cloned()))
@@ -3637,21 +3895,54 @@ async fn append_injected_messages(
     Ok(())
 }
 
-async fn configured_tools(lane: &LaneRuntime, names: &[String]) -> Result<Vec<pi_ai::Tool>, HarnessError> {
+async fn configured_tools(
+    lane: &LaneRuntime,
+    names: &[String],
+) -> Result<Vec<pi_ai::Tool>, HarnessError> {
     let config = lane.owner.config_snapshot().await;
     let mut tools = Vec::new();
     for name in names {
-        let tool = config.tools.iter().find(|tool| tool.name() == name).ok_or_else(|| HarnessError::Closed { message: format!("configured tool {name} is unavailable") })?;
+        let tool = config
+            .tools
+            .iter()
+            .find(|tool| tool.name() == name)
+            .ok_or_else(|| HarnessError::Closed {
+                message: format!("configured tool {name} is unavailable"),
+            })?;
         tools.push(crate::harness::tool::to_provider_tool(tool.as_ref()));
     }
     Ok(tools)
 }
 
-async fn resolve_system_prompt(lane: &LaneRuntime, controller: &DriveController, cx: &Context) -> Result<String, HarnessError> {
+async fn resolve_system_prompt(
+    lane: &LaneRuntime,
+    controller: &DriveController,
+    cx: &Context,
+) -> Result<String, HarnessError> {
     let config = lane.owner.config_snapshot().await;
-    let Some(source) = config.system_prompt else { return Ok(String::new()); };
-    let context = match &config.tool_context { Some(tool_context) => Some(tool_context(cx.clone()).await?), None => None };
-    let future = controller.gate.admit(|| source(context, cx.with_cancellation(controller.gate.token().clone()))).map_err(|error| match error { GateRejection::Closed(fault) => HarnessError::Closed { message: fault.message.clone() }, GateRejection::Aborted(_) => HarnessError::Closed { message: "system prompt was aborted".to_owned() }})?;
+    let Some(source) = config.system_prompt else {
+        return Ok(String::new());
+    };
+    let context = match &config.tool_context {
+        Some(tool_context) => Some(tool_context(cx.clone()).await?),
+        None => None,
+    };
+    let future = controller
+        .gate
+        .admit(|| {
+            source(
+                context,
+                cx.with_cancellation(controller.gate.token().clone()),
+            )
+        })
+        .map_err(|error| match error {
+            GateRejection::Closed(fault) => HarnessError::Closed {
+                message: fault.message.clone(),
+            },
+            GateRejection::Aborted(_) => HarnessError::Closed {
+                message: "system prompt was aborted".to_owned(),
+            },
+        })?;
     future.await
 }
 
@@ -3733,7 +4024,10 @@ fn before_payload_callback_owned(
                 model: model.clone(),
                 payload: value,
             };
-            match hooks.run_with_gate::<crate::harness::hooks::BeforePayload>(event, &gate, &hook_context).await {
+            match hooks
+                .run_with_gate::<crate::harness::hooks::BeforePayload>(event, &gate, &hook_context)
+                .await
+            {
                 Ok(Some(result)) => {
                     *payload = result.payload;
                     Ok(())
@@ -3746,9 +4040,7 @@ fn before_payload_callback_owned(
                 Err(HookRunError::Gate(GateRejection::Closed(fault))) => {
                     Err(pi_ai::ProviderError::new(fault.message.clone()))
                 }
-                Err(HookRunError::Handler(error)) => {
-                    Err(pi_ai::ProviderError::new(error.message))
-                }
+                Err(HookRunError::Handler(error)) => Err(pi_ai::ProviderError::new(error.message)),
             }
         })
     }))
@@ -3759,7 +4051,11 @@ fn after_response_callback(
     operation: &Operation,
     controller: &DriveController,
 ) -> Option<HarnessAfterResponse> {
-    if !lane.owner.hooks.has::<crate::harness::hooks::AfterResponse>() {
+    if !lane
+        .owner
+        .hooks
+        .has::<crate::harness::hooks::AfterResponse>()
+    {
         return None;
     }
     let hooks = lane.owner.hooks.clone();
@@ -3779,43 +4075,78 @@ fn after_response_callback(
                 headers: metadata.headers,
                 message: message.clone(),
             };
-            let result = hooks.run_with_gate::<crate::harness::hooks::AfterResponse>(event, &gate, &cx).await;
+            let result = hooks
+                .run_with_gate::<crate::harness::hooks::AfterResponse>(event, &gate, &cx)
+                .await;
             match result {
                 Ok(Some(result)) => Ok(result.message.unwrap_or(message)),
                 Ok(None) => Ok(message),
                 Err(HookRunError::Gate(rejection)) => Err(rejection),
-                Err(HookRunError::Handler(error)) => {
-                    Err(GateRejection::Closed(Arc::new(error)))
-                }
+                Err(HookRunError::Handler(error)) => Err(GateRejection::Closed(Arc::new(error))),
             }
         })
     }))
 }
 
-fn transform_context(lane: &LaneRuntime, operation: &Operation, controller: &DriveController) -> Option<TransformRequestContext> {
-    if !lane.owner.hooks.has::<crate::harness::hooks::TransformContext>() { return None; }
+fn transform_context(
+    lane: &LaneRuntime,
+    operation: &Operation,
+    controller: &DriveController,
+) -> Option<TransformRequestContext> {
+    if !lane
+        .owner
+        .hooks
+        .has::<crate::harness::hooks::TransformContext>()
+    {
+        return None;
+    }
     let hooks = lane.owner.hooks.clone();
     let lane_name = lane.name.clone();
     let run_id = operation.meta.operation_id.to_string();
     let gate = controller.gate.clone();
-    Some(Arc::new(move |request: HarnessRequestContext, cx: Context| {
-        let hooks = hooks.clone();
-        let lane_name = lane_name.clone();
-        let run_id = run_id.clone();
-        let gate = gate.clone();
-        async move {
-            let event = crate::harness::hooks::TransformContextEvent { lane: lane_name, run_id, messages: request.messages.clone(), system_prompt: request.system_prompt.clone() };
-            let result = hooks.run_with_gate::<crate::harness::hooks::TransformContext>(event, &gate, &cx).await.map_err(|error| match error { crate::harness::hooks::HookRunError::Gate(rejection) => rejection, crate::harness::hooks::HookRunError::Handler(fault) => GateRejection::Closed(Arc::new(fault)) })?;
-            let Some(result) = result else { return Ok(request); };
-            Ok(HarnessRequestContext { messages: result.messages.unwrap_or(request.messages), system_prompt: result.system_prompt.unwrap_or(request.system_prompt) })
-        }.boxed()
-    }))
+    Some(Arc::new(
+        move |request: HarnessRequestContext, cx: Context| {
+            let hooks = hooks.clone();
+            let lane_name = lane_name.clone();
+            let run_id = run_id.clone();
+            let gate = gate.clone();
+            async move {
+                let event = crate::harness::hooks::TransformContextEvent {
+                    lane: lane_name,
+                    run_id,
+                    messages: request.messages.clone(),
+                    system_prompt: request.system_prompt.clone(),
+                };
+                let result = hooks
+                    .run_with_gate::<crate::harness::hooks::TransformContext>(event, &gate, &cx)
+                    .await
+                    .map_err(|error| match error {
+                        crate::harness::hooks::HookRunError::Gate(rejection) => rejection,
+                        crate::harness::hooks::HookRunError::Handler(fault) => {
+                            GateRejection::Closed(Arc::new(fault))
+                        }
+                    })?;
+                let Some(result) = result else {
+                    return Ok(request);
+                };
+                Ok(HarnessRequestContext {
+                    messages: result.messages.unwrap_or(request.messages),
+                    system_prompt: result.system_prompt.unwrap_or(request.system_prompt),
+                })
+            }
+            .boxed()
+        },
+    ))
 }
-
 
 fn retry_delay(base: u64, attempt: u64) -> Result<u64, HarnessError> {
     let shift = attempt.saturating_sub(1).min(63);
-    base.checked_shl(u32::try_from(shift).map_err(|_| HarnessError::Closed { message: "retry shift overflow".to_owned() })?).ok_or_else(|| HarnessError::Closed { message: "retry delay overflow".to_owned() })
+    base.checked_shl(u32::try_from(shift).map_err(|_| HarnessError::Closed {
+        message: "retry shift overflow".to_owned(),
+    })?)
+    .ok_or_else(|| HarnessError::Closed {
+        message: "retry delay overflow".to_owned(),
+    })
 }
 
 async fn deferred_stream_failure(
@@ -3826,9 +4157,7 @@ async fn deferred_stream_failure(
     cx: &Context,
 ) -> Result<DriveStep, HarnessError> {
     match error {
-        crate::harness::stream::HarnessStreamError::Gate(
-            GateRejection::Aborted(abort),
-        ) => {
+        crate::harness::stream::HarnessStreamError::Gate(GateRejection::Aborted(abort)) => {
             abort.wait().await;
             reconcile_abort(lane, operation, controller, cx).await
         }
@@ -3858,13 +4187,21 @@ async fn deferred_stream_failure(
     }
 }
 
-
 fn hook_error(error: crate::harness::hooks::HookRunError) -> HarnessError {
-    match error { crate::harness::hooks::HookRunError::Gate(_) => HarnessError::Closed { message: "hook was aborted".to_owned() }, crate::harness::hooks::HookRunError::Handler(error) => HarnessError::Closed { message: error.message } }
+    match error {
+        crate::harness::hooks::HookRunError::Gate(_) => HarnessError::Closed {
+            message: "hook was aborted".to_owned(),
+        },
+        crate::harness::hooks::HookRunError::Handler(error) => HarnessError::Closed {
+            message: error.message,
+        },
+    }
 }
 
 fn invariant(message: &str) -> HarnessError {
-    HarnessError::Closed { message: format!("harness invariant failed: {message}") }
+    HarnessError::Closed {
+        message: format!("harness invariant failed: {message}"),
+    }
 }
 
 struct ResponseObserver {
@@ -3876,11 +4213,7 @@ struct ResponseObserver {
 }
 
 impl ResponseObserver {
-    fn new(
-        lane: &LaneRuntime,
-        operation_id: OperationId,
-        response_id: EntryId,
-    ) -> Self {
+    fn new(lane: &LaneRuntime, operation_id: OperationId, response_id: EntryId) -> Self {
         Self {
             owner: Arc::clone(&lane.owner),
             lane: lane.name.clone(),
@@ -3904,11 +4237,7 @@ impl ResponseObserver {
         })
     }
 
-    async fn commit(
-        &self,
-        writes: Vec<Write>,
-        cx: &Context,
-    ) -> Result<(), HarnessFault> {
+    async fn commit(&self, writes: Vec<Write>, cx: &Context) -> Result<(), HarnessFault> {
         let mutator = self
             .owner
             .session
@@ -3918,10 +4247,13 @@ impl ResponseObserver {
                 message: error.to_string(),
                 cause: Box::new(RuntimeObserverError(error.to_string())),
             })?;
-        mutator.commit(writes, cx).await.map_err(|error| HarnessFault {
-            message: error.to_string(),
-            cause: Box::new(RuntimeObserverError(error.to_string())),
-        })?;
+        mutator
+            .commit(writes, cx)
+            .await
+            .map_err(|error| HarnessFault {
+                message: error.to_string(),
+                cause: Box::new(RuntimeObserverError(error.to_string())),
+            })?;
         Ok(())
     }
 
@@ -3954,12 +4286,11 @@ impl AssistantStreamObserver for ResponseObserver {
                 })?;
                 self.commit(vec![write], cx).await?;
             }
-            let message = assistant_agent_message(message.clone()).map_err(|error| {
-                HarnessFault {
+            let message =
+                assistant_agent_message(message.clone()).map_err(|error| HarnessFault {
                     message: error.to_string(),
                     cause: Box::new(RuntimeObserverError(error.to_string())),
-                }
-            })?;
+                })?;
             self.emit(
                 HarnessEventPayload::MessageStart {
                     run_id: Some(self.operation_id.clone()),
@@ -3991,12 +4322,11 @@ impl AssistantStreamObserver for ResponseObserver {
                 })?;
                 self.commit(vec![write], cx).await?;
             }
-            let message = assistant_agent_message(message.clone()).map_err(|error| {
-                HarnessFault {
+            let message =
+                assistant_agent_message(message.clone()).map_err(|error| HarnessFault {
                     message: error.to_string(),
                     cause: Box::new(RuntimeObserverError(error.to_string())),
-                }
-            })?;
+                })?;
             self.emit(
                 HarnessEventPayload::MessageUpdate {
                     run_id: self.operation_id.clone(),
@@ -4017,12 +4347,11 @@ impl AssistantStreamObserver for ResponseObserver {
         cx: &'a Context,
     ) -> BoxFuture<'a, Result<(), HarnessFault>> {
         Box::pin(async move {
-            let message = assistant_agent_message(message.get().clone()).map_err(|error| {
-                HarnessFault {
+            let message =
+                assistant_agent_message(message.get().clone()).map_err(|error| HarnessFault {
                     message: error.to_string(),
                     cause: Box::new(RuntimeObserverError(error.to_string())),
-                }
-            })?;
+                })?;
             self.emit(
                 HarnessEventPayload::MessageEnd {
                     run_id: Some(self.operation_id.clone()),
@@ -4054,23 +4383,55 @@ struct Invocation<'a> {
     entry_id: EntryId,
 }
 impl ToolInvocation for Invocation<'_> {
-    fn invocation_id(&self) -> &EntryId { &self.entry_id }
-    fn operation_id(&self) -> &OperationId { &self.operation_id }
-    fn turn_id(&self) -> &str { &self.turn_id }
-    fn get_memo<'b>(&'b self, name: &'b str, cx: &'b Context) -> BoxFuture<'b, Result<Option<Value>, crate::session::SessionError>> {
+    fn invocation_id(&self) -> &EntryId {
+        &self.entry_id
+    }
+    fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+    fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+    fn get_memo<'b>(
+        &'b self,
+        name: &'b str,
+        cx: &'b Context,
+    ) -> BoxFuture<'b, Result<Option<Value>, crate::session::SessionError>> {
         Box::pin(async move {
-            self.lane.owner.session
-                .get_value(&operation_tool_memo(&self.operation_id, &self.entry_id, name), cx)
+            self.lane
+                .owner
+                .session
+                .get_value(
+                    &operation_tool_memo(&self.operation_id, &self.entry_id, name),
+                    cx,
+                )
                 .await
                 .map(|value| value.map(|stored| stored.value))
         })
     }
-    fn set_memo<'b>(&'b self, name: &'b str, value: Option<Value>, cx: &'b Context) -> BoxFuture<'b, Result<(), crate::session::SessionError>> {
+    fn set_memo<'b>(
+        &'b self,
+        name: &'b str,
+        value: Option<Value>,
+        cx: &'b Context,
+    ) -> BoxFuture<'b, Result<(), crate::session::SessionError>> {
         Box::pin(async move {
             let address = operation_tool_memo(&self.operation_id, &self.entry_id, name);
             match value {
-                Some(value) => self.lane.owner.session.set_value_json(&address.erase(), value, cx).await,
-                None => self.lane.owner.session.delete_value_json(&address.erase(), cx).await,
+                Some(value) => {
+                    self.lane
+                        .owner
+                        .session
+                        .set_value_json(&address.erase(), value, cx)
+                        .await
+                }
+                None => {
+                    self.lane
+                        .owner
+                        .session
+                        .delete_value_json(&address.erase(), cx)
+                        .await
+                }
             }
         })
     }

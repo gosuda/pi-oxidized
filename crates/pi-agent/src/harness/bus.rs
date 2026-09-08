@@ -6,11 +6,11 @@
 //! worker drains that queue in order while each watcher owns an independent
 //! serialized worker for its listener.
 
+use futures::future::{BoxFuture, FutureExt, ready};
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use futures::future::{BoxFuture, FutureExt, ready};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 
@@ -193,32 +193,30 @@ impl HarnessEventBus {
             return ready(()).boxed();
         }
 
-        let bound = events
-            .into_iter()
-            .map(|event| {
-                let mut recipients = state
-                    .listeners
-                    .get(&event.event_type())
-                    .into_iter()
-                    .flat_map(|listeners| {
-                        listeners
-                            .iter()
-                            .map(|registration| Recipient::Listener(Arc::clone(&registration.listener)))
-                    })
-                    .collect::<Vec<_>>();
-                recipients.extend(
-                    state
-                        .watchers
-                        .iter()
-                        .map(|registration| Recipient::Watcher(Arc::clone(&registration.recipient))),
-                );
-                BoundEvent {
-                    event,
-                    context: cx.clone(),
-                    recipients,
-                }
-            })
-            .collect::<Vec<_>>();
+        let bound =
+            events
+                .into_iter()
+                .map(|event| {
+                    let mut recipients = state
+                        .listeners
+                        .get(&event.event_type())
+                        .into_iter()
+                        .flat_map(|listeners| {
+                            listeners.iter().map(|registration| {
+                                Recipient::Listener(Arc::clone(&registration.listener))
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    recipients.extend(state.watchers.iter().map(|registration| {
+                        Recipient::Watcher(Arc::clone(&registration.recipient))
+                    }));
+                    BoundEvent {
+                        event,
+                        context: cx.clone(),
+                        recipients,
+                    }
+                })
+                .collect::<Vec<_>>();
         state.queue.push_back(DeliveryItem::Batch {
             events: bound,
             done: Some(done),
@@ -314,26 +312,27 @@ impl HarnessEventBus {
         }
         let id = next_id(&mut state);
         let weak_core = Arc::downgrade(&self.core);
-        let on_error: Arc<dyn Fn(HarnessEvent, Context, String) -> BoxFuture<'static, ()> + Send + Sync> =
-            Arc::new(move |event, context, message| {
-                if event.event_type() == HarnessEventType::HandlerError {
-                    return ready(()).boxed();
-                }
-                let Some(core) = weak_core.upgrade() else {
-                    return ready(()).boxed();
-                };
-                let payload = HarnessEventPayload::HandlerError {
-                    kind: HandlerErrorKind::Event {
-                        event: event.event_type().as_str().to_owned(),
-                    },
-                    error: message,
-                    stack: None,
-                };
-                let Ok(handler_error) = HarnessEvent::new(event.lane.clone(), false, payload) else {
-                    return ready(()).boxed();
-                };
-                HarnessEventBus { core }.emit(handler_error, &context)
-            });
+        let on_error: Arc<
+            dyn Fn(HarnessEvent, Context, String) -> BoxFuture<'static, ()> + Send + Sync,
+        > = Arc::new(move |event, context, message| {
+            if event.event_type() == HarnessEventType::HandlerError {
+                return ready(()).boxed();
+            }
+            let Some(core) = weak_core.upgrade() else {
+                return ready(()).boxed();
+            };
+            let payload = HarnessEventPayload::HandlerError {
+                kind: HandlerErrorKind::Event {
+                    event: event.event_type().as_str().to_owned(),
+                },
+                error: message,
+                stack: None,
+            };
+            let Ok(handler_error) = HarnessEvent::new(event.lane.clone(), false, payload) else {
+                return ready(()).boxed();
+            };
+            HarnessEventBus { core }.emit(handler_error, &context)
+        });
         let inner = Arc::new(WatcherInner {
             filter,
             state: Mutex::new(WatcherState {
@@ -356,7 +355,9 @@ impl HarnessEventBus {
             self_ref: OnceLock::new(),
         });
         if inner.self_ref.set(Arc::downgrade(&inner)).is_err() {
-            return Err(watcher_error("watcher self-reference was initialized twice"));
+            return Err(watcher_error(
+                "watcher self-reference was initialized twice",
+            ));
         }
         let recipient: Arc<dyn WatcherRecipient> = Arc::clone(&inner) as Arc<dyn WatcherRecipient>;
         state.watchers.push(WatcherRegistration { id, recipient });
@@ -468,13 +469,8 @@ async fn deliver_bound(core: &Arc<BusCore>, bound: BoundEvent) {
                     .catch_unwind()
                     .await;
                 if let Err(panic) = result {
-                    report_handler_error(
-                        core,
-                        &bound.event,
-                        &bound.context,
-                        panic_message(&panic),
-                    )
-                    .await;
+                    report_handler_error(core, &bound.event, &bound.context, panic_message(&panic))
+                        .await;
                 }
             }
             Recipient::Watcher(watcher) => {
@@ -641,10 +637,11 @@ impl<T: Clone + Send + Sync + 'static> WatchHandle<T> {
     pub async fn resnapshot(&self, cx: &Context) -> Result<Arc<T>, HarnessError> {
         let capture = self.begin_resnapshot()?;
         let (mark_boundary, mut boundary) = self.resnapshot_boundary();
-        let capture_result = AssertUnwindSafe(async move { (capture)(cx.clone(), mark_boundary).await })
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|panic| Err(closed_from_panic(panic_message(&panic))));
+        let capture_result =
+            AssertUnwindSafe(async move { (capture)(cx.clone(), mark_boundary).await })
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|panic| Err(closed_from_panic(panic_message(&panic))));
         boundary.wait_if_marked().await;
         self.commit_resnapshot(capture_result, &boundary)
     }
@@ -660,7 +657,9 @@ impl<T: Clone + Send + Sync + 'static> WatchHandle<T> {
             return Err(watcher_error("watch handle does not support resnapshot"));
         };
         if state.resnapshot_active {
-            return Err(watcher_error("watch handle resnapshot is already in progress"));
+            return Err(watcher_error(
+                "watch handle resnapshot is already in progress",
+            ));
         }
         state.epoch = state.epoch.wrapping_add(1);
         state.phase = WatchPhase::Dropping;
@@ -1007,9 +1006,7 @@ async fn drain_watcher<T: Clone + Send + Sync + 'static>(inner: Arc<WatcherInner
                 state.worker.scheduled = false;
                 return;
             };
-            if !state.started()
-                || state.phase != WatchPhase::Accepting
-                || next.epoch != state.epoch
+            if !state.started() || state.phase != WatchPhase::Accepting || next.epoch != state.epoch
             {
                 None
             } else if let Some(listener) = state.listener.as_ref() {
@@ -1019,7 +1016,6 @@ async fn drain_watcher<T: Clone + Send + Sync + 'static>(inner: Arc<WatcherInner
             } else {
                 None
             }
-
         };
         let Some((listener, event, context)) = next else {
             continue;
@@ -1059,7 +1055,9 @@ impl MarkState {
 
         if self.marked.swap(true, Ordering::AcqRel) {
             self.duplicate.store(true, Ordering::Release);
-            return Err(watcher_error("resnapshot boundary was marked more than once"));
+            return Err(watcher_error(
+                "resnapshot boundary was marked more than once",
+            ));
         }
         let callback = lock_unpoisoned(&self.callback).take();
         if let Some(callback) = callback {
@@ -1067,7 +1065,9 @@ impl MarkState {
             Ok(())
         } else {
             self.duplicate.store(true, Ordering::Release);
-            Err(watcher_error("resnapshot boundary callback was unavailable"))
+            Err(watcher_error(
+                "resnapshot boundary callback was unavailable",
+            ))
         }
     }
 }
@@ -1095,13 +1095,17 @@ impl ResnapshotMark {
     /// Returns the boundary violation when the capture misused its mark.
     fn verdict(&self) -> Option<HarnessError> {
         if !self.marked() {
-            Some(watcher_error("resnapshot capture did not mark its boundary"))
+            Some(watcher_error(
+                "resnapshot capture did not mark its boundary",
+            ))
         } else if self
             .state
             .duplicate
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            Some(watcher_error("resnapshot boundary was marked more than once"))
+            Some(watcher_error(
+                "resnapshot boundary was marked more than once",
+            ))
         } else {
             None
         }

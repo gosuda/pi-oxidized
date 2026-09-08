@@ -18,12 +18,14 @@ pub type BindingErrorReporter = Arc<dyn Fn(ServiceError) + Send + Sync>;
 pub type BindingAccessChecker = Arc<dyn Fn() -> Result<(), ServiceError> + Send + Sync>;
 
 pub use self::facade::{RemoteServiceFacade, RemoteServiceMember};
-use self::lifecycle::{await_with_lifetime, Lifecycle};
+use self::lifecycle::{Lifecycle, await_with_lifetime};
 use super::delta::DeltaOp;
 use super::error::{RemoteServiceErrorCode, ServiceError};
 use super::transport::{RemoteServiceTransport, ServiceSubscription};
 use super::value::JsString;
-use super::wire::{ServiceInstanceAddress, ServiceInstanceSnapshot, ServiceMode, ServiceProviderUpdate};
+use super::wire::{
+    ServiceInstanceAddress, ServiceInstanceSnapshot, ServiceMode, ServiceProviderUpdate,
+};
 
 /// Asynchronous handler invoked for each live keyed instance.
 pub type KeyedObserver = Arc<
@@ -181,10 +183,14 @@ impl RemoteServiceBinding {
         let mut allowlist = BTreeSet::new();
         for id in &options.services {
             if id.as_utf16().is_empty() {
-                return Err(ServiceError::local("Remote service binding IDs must not be empty"));
+                return Err(ServiceError::local(
+                    "Remote service binding IDs must not be empty",
+                ));
             }
             if !allowlist.insert(id.clone()) {
-                return Err(ServiceError::local("Remote service binding has duplicate service IDs"));
+                return Err(ServiceError::local(
+                    "Remote service binding has duplicate service IDs",
+                ));
             }
         }
         let report_error = options.on_error.unwrap_or_else(|| Arc::new(|_| {}));
@@ -208,7 +214,10 @@ impl RemoteServiceBinding {
     ///
     /// # Errors
     /// Returns an error when the service is not allowlisted or is already used as a different mode.
-    pub fn use_service(&self, service_id: &JsString) -> Result<Arc<RemoteServiceFacade>, ServiceError> {
+    pub fn use_service(
+        &self,
+        service_id: &JsString,
+    ) -> Result<Arc<RemoteServiceFacade>, ServiceError> {
         self.assert_available(service_id, ServiceMode::Singleton)?;
         if let Some(binding) = lock(&self.inner.singletons).get(service_id).cloned() {
             return Ok(Arc::clone(&binding.facade));
@@ -285,8 +294,10 @@ impl RemoteServiceBinding {
         self.inner.lifecycle.assert_access()?;
         loop {
             let revision = self.inner.readiness_revision.load(Ordering::Acquire);
-            let singleton_starts: Vec<Arc<SingletonBinding>> = lock(&self.inner.singletons).values().cloned().collect();
-            let keyed_starts: Vec<Arc<KeyedBinding>> = lock(&self.inner.keyed).values().cloned().collect();
+            let singleton_starts: Vec<Arc<SingletonBinding>> =
+                lock(&self.inner.singletons).values().cloned().collect();
+            let keyed_starts: Vec<Arc<KeyedBinding>> =
+                lock(&self.inner.keyed).values().cloned().collect();
             for binding in singleton_starts {
                 binding.wait_start().await?;
             }
@@ -310,7 +321,8 @@ impl RemoteServiceBinding {
         let _transition = self.inner.transition.lock().await;
         self.inner.lifecycle.set_bound(bound);
         self.inner.readiness_revision.fetch_add(1, Ordering::AcqRel);
-        let singletons: Vec<Arc<SingletonBinding>> = lock(&self.inner.singletons).values().cloned().collect();
+        let singletons: Vec<Arc<SingletonBinding>> =
+            lock(&self.inner.singletons).values().cloned().collect();
         let keyed: Vec<Arc<KeyedBinding>> = lock(&self.inner.keyed).values().cloned().collect();
         for binding in &singletons {
             binding.revision.fetch_add(1, Ordering::AcqRel);
@@ -377,16 +389,25 @@ impl RemoteServiceBinding {
         Ok(())
     }
 
-    fn assert_available(&self, service_id: &JsString, mode: ServiceMode) -> Result<(), ServiceError> {
+    fn assert_available(
+        &self,
+        service_id: &JsString,
+        mode: ServiceMode,
+    ) -> Result<(), ServiceError> {
         self.inner.lifecycle.assert_access()?;
         if !self.inner.allowlist.contains(service_id) {
             return Err(ServiceError::remote(
                 RemoteServiceErrorCode::ServiceNotAllowed,
-                format!("Remote service {} is not allowlisted", display_js(service_id)),
+                format!(
+                    "Remote service {} is not allowlisted",
+                    display_js(service_id)
+                ),
             ));
         }
         let mut modes = lock(&self.inner.modes);
-        if let Some(existing) = modes.get(service_id).copied() && existing != mode {
+        if let Some(existing) = modes.get(service_id).copied()
+            && existing != mode
+        {
             return Err(ServiceError::remote(
                 RemoteServiceErrorCode::ServiceModeMismatch,
                 format!(
@@ -432,7 +453,10 @@ impl SingletonBinding {
         };
         match task.await {
             Ok(result) => result,
-            Err(error) => Err(ServiceError::internal_with_source("Remote service start task failed", error)),
+            Err(error) => Err(ServiceError::internal_with_source(
+                "Remote service start task failed",
+                error,
+            )),
         }
     }
 
@@ -451,9 +475,9 @@ impl SingletonBinding {
         Ok(())
     }
 
-
     fn update(&self, update: &ServiceProviderUpdate<DeltaOp>, context: &Context, revision: u64) {
-        if !self.active.load(Ordering::Acquire) || self.revision.load(Ordering::Acquire) != revision {
+        if !self.active.load(Ordering::Acquire) || self.revision.load(Ordering::Acquire) != revision
+        {
             return;
         }
         let result = match update {
@@ -463,7 +487,9 @@ impl SingletonBinding {
             }
             ServiceProviderUpdate::Replaced { snapshot } => {
                 if snapshot.instance.is_some() {
-                    Err(ServiceError::local("Singleton replacement has an instance address"))
+                    Err(ServiceError::local(
+                        "Singleton replacement has an instance address",
+                    ))
                 } else {
                     self.facade.install(snapshot, context)
                 }
@@ -478,9 +504,9 @@ impl SingletonBinding {
                 instance: Some(_), ..
             }
             | ServiceProviderUpdate::Spawned { .. }
-            | ServiceProviderUpdate::Closed { .. } => {
-                Err(ServiceError::local("Singleton received a keyed lifecycle update"))
-            }
+            | ServiceProviderUpdate::Closed { .. } => Err(ServiceError::local(
+                "Singleton received a keyed lifecycle update",
+            )),
         };
         if let Err(error) = result {
             self.facade.inner.lifecycle.report(error);
@@ -495,9 +521,11 @@ async fn start_singleton(
     token: CancellationToken,
 ) -> Result<(), ServiceError> {
     let listener_binding = Arc::clone(&binding);
-    let listener = Arc::new(move |update: &ServiceProviderUpdate<DeltaOp>, context: &Context| {
-        listener_binding.update(update, context, revision);
-    });
+    let listener = Arc::new(
+        move |update: &ServiceProviderUpdate<DeltaOp>, context: &Context| {
+            listener_binding.update(update, context, revision);
+        },
+    );
     let subscription = await_with_lifetime(
         &Context::background(),
         token,
@@ -538,7 +566,11 @@ async fn start_singleton(
 }
 
 impl KeyedBinding {
-    fn new(service_id: JsString, transport: Arc<dyn RemoteServiceTransport>, lifecycle: Arc<Lifecycle>) -> Self {
+    fn new(
+        service_id: JsString,
+        transport: Arc<dyn RemoteServiceTransport>,
+        lifecycle: Arc<Lifecycle>,
+    ) -> Self {
         Self {
             service_id,
             transport,
@@ -561,7 +593,9 @@ impl KeyedBinding {
 
     fn add_observer(&self, handler: KeyedObserver) -> Result<(u64, bool), ServiceError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(ServiceError::disposed("Remote keyed service binding is closed"));
+            return Err(ServiceError::disposed(
+                "Remote keyed service binding is closed",
+            ));
         }
         let id = self.next_observer.fetch_add(1, Ordering::AcqRel);
         let mut observers = lock(&self.observers);
@@ -594,7 +628,10 @@ impl KeyedBinding {
     }
 
     fn spawn_start(self: &Arc<Self>) -> Result<(), ServiceError> {
-        if self.closed.load(Ordering::Acquire) || !self.lifecycle.is_bound() || self.starting_is_set() {
+        if self.closed.load(Ordering::Acquire)
+            || !self.lifecycle.is_bound()
+            || self.starting_is_set()
+        {
             return Ok(());
         }
         let handle = tokio::runtime::Handle::try_current()
@@ -619,15 +656,24 @@ impl KeyedBinding {
         };
         match task.await {
             Ok(result) => result,
-            Err(error) => Err(ServiceError::internal_with_source("Remote keyed service start task failed", error)),
+            Err(error) => Err(ServiceError::internal_with_source(
+                "Remote keyed service start task failed",
+                error,
+            )),
         }
     }
 
-    async fn start(self: Arc<Self>, revision: u64, token: CancellationToken) -> Result<(), ServiceError> {
+    async fn start(
+        self: Arc<Self>,
+        revision: u64,
+        token: CancellationToken,
+    ) -> Result<(), ServiceError> {
         let listener_binding = Arc::clone(&self);
-        let listener = Arc::new(move |update: &ServiceProviderUpdate<DeltaOp>, context: &Context| {
-            listener_binding.update(update, context, revision);
-        });
+        let listener = Arc::new(
+            move |update: &ServiceProviderUpdate<DeltaOp>, context: &Context| {
+                listener_binding.update(update, context, revision);
+            },
+        );
         let subscription = await_with_lifetime(
             &Context::background(),
             token.clone(),
@@ -647,9 +693,7 @@ impl KeyedBinding {
             return Ok(());
         }
         let snapshot = subscription.snapshot().clone();
-        if snapshot.service_id != self.service_id
-            || snapshot.mode != ServiceMode::Keyed
-        {
+        if snapshot.service_id != self.service_id || snapshot.mode != ServiceMode::Keyed {
             subscription.close(Context::background()).await?;
             return Err(ServiceError::local(format!(
                 "Remote service {} returned the wrong keyed snapshot",
@@ -747,8 +791,11 @@ impl KeyedBinding {
         }
     }
 
-
-    fn spawn_instance(&self, snapshot: &ServiceInstanceSnapshot<DeltaOp>, context: &Context) -> Result<(), ServiceError> {
+    fn spawn_instance(
+        &self,
+        snapshot: &ServiceInstanceSnapshot<DeltaOp>,
+        context: &Context,
+    ) -> Result<(), ServiceError> {
         let address = snapshot
             .instance
             .clone()
@@ -769,7 +816,9 @@ impl KeyedBinding {
             if let Some(existing) = instances.get(&address.key)
                 && existing.address.generation == address.generation
             {
-                return Err(ServiceError::local("Keyed service repeated a live generation"));
+                return Err(ServiceError::local(
+                    "Keyed service repeated a live generation",
+                ));
             }
             instances.insert(address.key.clone(), Arc::clone(&instance))
         };
@@ -812,17 +861,21 @@ impl KeyedBinding {
     }
 
     fn update(&self, update: &ServiceProviderUpdate<DeltaOp>, context: &Context, revision: u64) {
-        if self.closed.load(Ordering::Acquire) || self.revision.load(Ordering::Acquire) != revision {
+        if self.closed.load(Ordering::Acquire) || self.revision.load(Ordering::Acquire) != revision
+        {
             return;
         }
         let result = match update {
-            ServiceProviderUpdate::Unavailable | ServiceProviderUpdate::Replaced { .. } => {
-                Err(ServiceError::local("Keyed service received a singleton lifecycle update"))
-            }
+            ServiceProviderUpdate::Unavailable | ServiceProviderUpdate::Replaced { .. } => Err(
+                ServiceError::local("Keyed service received a singleton lifecycle update"),
+            ),
             ServiceProviderUpdate::Spawned { instance } => self.spawn_instance(instance, context),
             ServiceProviderUpdate::Closed { instance } => {
                 let current = lock(&self.instances).get(&instance.key).cloned();
-                if current.as_ref().is_some_and(|value| value.address.generation == instance.generation) {
+                if current
+                    .as_ref()
+                    .is_some_and(|value| value.address.generation == instance.generation)
+                {
                     let removed = lock(&self.instances).remove(&instance.key);
                     if let Some(removed) = removed {
                         removed.facade.deactivate();
@@ -840,16 +893,17 @@ impl KeyedBinding {
                 let current = lock(&self.instances).get(&address.key).cloned();
                 match current {
                     Some(instance)
-                        if instance.address.generation == address.generation && instance.facade.inner.is_active() =>
+                        if instance.address.generation == address.generation
+                            && instance.facade.inner.is_active() =>
                     {
                         instance.facade.update(member, *sequence, ops, context)
                     }
                     _ => Ok(()),
                 }
             }
-            ServiceProviderUpdate::State { instance: None, .. } => {
-                Err(ServiceError::local("Keyed state update has no instance address"))
-            }
+            ServiceProviderUpdate::State { instance: None, .. } => Err(ServiceError::local(
+                "Keyed state update has no instance address",
+            )),
         };
         if let Err(error) = result {
             self.lifecycle.report(error);
@@ -886,7 +940,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "test assertions use expect for concise failure")]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions use expect for concise failure"
+)]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -895,7 +952,8 @@ mod tests {
 
     use super::*;
     use crate::service::provider::{
-        RemoteServiceProvider, ServiceDefinition, ServiceImplementation, ServiceMember, ServiceMethod,
+        RemoteServiceProvider, ServiceDefinition, ServiceImplementation, ServiceMember,
+        ServiceMethod,
     };
     use crate::service::replicated::ReplicatedStateDeliveryKind;
     use crate::service::value::{JsObject, JsonValue};
@@ -931,10 +989,14 @@ mod tests {
     async fn singleton_facade_replacement_preserves_identity_and_omission() {
         let service_id = JsString::from_utf8("singleton");
         let provider = Arc::new(
-            RemoteServiceProvider::new(vec![definition(&service_id, ServiceMode::Singleton)]).expect("provider"),
+            RemoteServiceProvider::new(vec![definition(&service_id, ServiceMode::Singleton)])
+                .expect("provider"),
         );
         provider
-            .provide(&service_id, implementation(ServiceMember::Method(method(None))))
+            .provide(
+                &service_id,
+                implementation(ServiceMember::Method(method(None))),
+            )
             .expect("provide");
         let binding = RemoteServiceBinding::new(BindingOptions::new(
             vec![service_id.clone()],
@@ -944,7 +1006,13 @@ mod tests {
         let facade = binding.use_service(&service_id).expect("facade");
         binding.ready(&Context::background()).await.expect("ready");
         let member = facade.member("member").expect("member");
-        assert_eq!(member.invoke(Vec::new(), Context::background()).await.expect("invoke"), None);
+        assert_eq!(
+            member
+                .invoke(Vec::new(), Context::background())
+                .await
+                .expect("invoke"),
+            None
+        );
 
         provider
             .replace(
@@ -952,13 +1020,21 @@ mod tests {
                 implementation(ServiceMember::Method(method(Some(JsonValue::Null)))),
             )
             .expect("replace");
-        let replacement = binding.use_service(&service_id).expect("replacement facade");
+        let replacement = binding
+            .use_service(&service_id)
+            .expect("replacement facade");
         assert!(Arc::ptr_eq(&facade, &replacement));
         assert_eq!(
-            member.invoke(Vec::new(), Context::background()).await.expect("invoke"),
+            member
+                .invoke(Vec::new(), Context::background())
+                .await
+                .expect("invoke"),
             Some(JsonValue::Null)
         );
-        binding.rebind(false, Context::background()).await.expect("unbind");
+        binding
+            .rebind(false, Context::background())
+            .await
+            .expect("unbind");
         let stale = member
             .invoke(Vec::new(), Context::background())
             .await
@@ -968,19 +1044,29 @@ mod tests {
             ServiceError::Remote(remote)
                 if remote.code == RemoteServiceErrorCode::ServiceStaleInstance
         ));
-        binding.rebind(true, Context::background()).await.expect("rebind");
+        binding
+            .rebind(true, Context::background())
+            .await
+            .expect("rebind");
         assert_eq!(
-            member.invoke(Vec::new(), Context::background()).await.expect("invoke"),
+            member
+                .invoke(Vec::new(), Context::background())
+                .await
+                .expect("invoke"),
             Some(JsonValue::Null)
         );
-        binding.dispose(Context::background()).await.expect("dispose");
+        binding
+            .dispose(Context::background())
+            .await
+            .expect("dispose");
     }
 
     #[tokio::test]
     async fn state_hydrates_updates_and_clears_without_mutating_previous_revisions() {
         let service_id = JsString::from_utf8("stateful");
         let provider = Arc::new(
-            RemoteServiceProvider::new(vec![definition(&service_id, ServiceMode::Singleton)]).expect("provider"),
+            RemoteServiceProvider::new(vec![definition(&service_id, ServiceMode::Singleton)])
+                .expect("provider"),
         );
         let mutable = crate::service::replicated::MutableReplicatedState::new(object(1.0));
         provider
@@ -1013,23 +1099,29 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(first.as_ref(), &object(1.0));
         assert_eq!(replica.value().as_deref(), Some(&object(2.0)));
-        assert!(deliveries
-            .lock()
-            .expect("lock")
-            .iter()
-            .any(|(kind, _, _)| *kind == ReplicatedStateDeliveryKind::Update));
+        assert!(
+            deliveries
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|(kind, _, _)| *kind == ReplicatedStateDeliveryKind::Update)
+        );
 
         provider.withdraw(&service_id).expect("withdraw");
         assert!(replica.value().is_none());
         remove();
-        binding.dispose(Context::background()).await.expect("dispose");
+        binding
+            .dispose(Context::background())
+            .await
+            .expect("dispose");
     }
 
     #[tokio::test]
     async fn keyed_replacement_rejects_stale_facades() {
         let service_id = JsString::from_utf8("keyed");
         let provider = Arc::new(
-            RemoteServiceProvider::new(vec![definition(&service_id, ServiceMode::Keyed)]).expect("provider"),
+            RemoteServiceProvider::new(vec![definition(&service_id, ServiceMode::Keyed)])
+                .expect("provider"),
         );
         let binding = RemoteServiceBinding::new(BindingOptions::new(
             vec![service_id.clone()],
@@ -1062,7 +1154,12 @@ mod tests {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-        let stale = observed.lock().expect("lock").first().cloned().expect("observed facade");
+        let stale = observed
+            .lock()
+            .expect("lock")
+            .first()
+            .cloned()
+            .expect("observed facade");
         let stale_member = stale.member("member").expect("member");
         first_handle.close();
         for _ in 0..4 {
@@ -1087,8 +1184,16 @@ mod tests {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-        let current = observed.lock().expect("lock").last().cloned().expect("replacement facade");
-        assert_ne!(stale.address().expect("stale address").generation, current.address().expect("current address").generation);
+        let current = observed
+            .lock()
+            .expect("lock")
+            .last()
+            .cloned()
+            .expect("replacement facade");
+        assert_ne!(
+            stale.address().expect("stale address").generation,
+            current.address().expect("current address").generation
+        );
         assert_eq!(
             current
                 .invoke("member", Vec::new(), Context::background())
@@ -1097,24 +1202,29 @@ mod tests {
             Some(JsonValue::Null)
         );
         second_handle.close();
-        observation.close(Context::background()).await.expect("close observation");
-        binding.dispose(Context::background()).await.expect("dispose");
+        observation
+            .close(Context::background())
+            .await
+            .expect("close observation");
+        binding
+            .dispose(Context::background())
+            .await
+            .expect("dispose");
     }
 
     #[tokio::test]
     async fn dispose_cancels_in_flight_calls() {
         let service_id = JsString::from_utf8("hanging");
         let provider = Arc::new(
-            RemoteServiceProvider::new(vec![definition(&service_id, ServiceMode::Singleton)]).expect("provider"),
+            RemoteServiceProvider::new(vec![definition(&service_id, ServiceMode::Singleton)])
+                .expect("provider"),
         );
         let started = Arc::new(AtomicUsize::new(0));
         let started_by_method = Arc::clone(&started);
         let hanging: ServiceMethod = Arc::new(move |_args, _context| {
             started_by_method.fetch_add(1, Ordering::Relaxed);
-            async move {
-                std::future::pending::<Result<Option<JsonValue>, ServiceError>>().await
-            }
-            .boxed()
+            async move { std::future::pending::<Result<Option<JsonValue>, ServiceError>>().await }
+                .boxed()
         });
         provider
             .provide(&service_id, implementation(ServiceMember::Method(hanging)))
@@ -1134,7 +1244,13 @@ mod tests {
                 break;
             }
         }
-        binding.dispose(Context::background()).await.expect("dispose");
-        assert!(matches!(task.await.expect("call task"), Err(ServiceError::Cancelled)));
+        binding
+            .dispose(Context::background())
+            .await
+            .expect("dispose");
+        assert!(matches!(
+            task.await.expect("call task"),
+            Err(ServiceError::Cancelled)
+        ));
     }
 }
