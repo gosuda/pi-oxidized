@@ -62,6 +62,7 @@ pub(super) async fn resolve_new_session_path(
     let duplicate_suffix = format!("_{}.jsonl", encode_session_id(id));
     let id_for_error = id.to_owned();
     let path_for_error = directory.clone();
+    let path_for_worker_error = directory.clone();
     let result = tokio::task::spawn_blocking(move || {
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => Some(entries),
@@ -98,7 +99,7 @@ pub(super) async fn resolve_new_session_path(
         Ok(directory.join(file_name))
     })
     .await
-    .map_err(|source| io_failure(&path_for_error, "session path worker failed", source))?;
+    .map_err(|source| io_failure(&path_for_worker_error, "session path worker failed", source))?;
     result
 }
 
@@ -116,6 +117,7 @@ pub(super) async fn list_session_files(
     let root = root.to_path_buf();
     let target = cwd.map(session_directory_name);
     let path_for_error = root.clone();
+    let path_for_worker_error = root.clone();
     tokio::task::spawn_blocking(move || {
         let directories = if let Some(target) = target {
             vec![root.join(target)]
@@ -176,19 +178,20 @@ pub(super) async fn list_session_files(
         Ok(files)
     })
     .await
-    .map_err(|source| io_failure(&path_for_error, "session listing worker failed", source))?
+    .map_err(|source| io_failure(&path_for_worker_error, "session listing worker failed", source))?
 }
 
 /// Removes a session file. A missing file is an error.
 pub(super) async fn remove_session_file(path: &Path) -> Result<(), SessionError> {
     let path = path.to_path_buf();
     let path_for_error = path.clone();
+    let path_for_worker_error = path.clone();
     tokio::task::spawn_blocking(move || {
         fs::remove_file(&path)
             .map_err(|source| io_failure(&path_for_error, "failed to remove session", source))
     })
     .await
-    .map_err(|source| io_failure(&path_for_error, "session removal worker failed", source))?
+    .map_err(|source| io_failure(&path_for_worker_error, "session removal worker failed", source))?
 }
 
 /// Removes a session file left behind by a failed admission. A missing file is
@@ -196,6 +199,7 @@ pub(super) async fn remove_session_file(path: &Path) -> Result<(), SessionError>
 pub(super) async fn discard_session_file(path: &Path) -> Result<(), SessionError> {
     let path = path.to_path_buf();
     let path_for_error = path.clone();
+    let path_for_worker_error = path.clone();
     tokio::task::spawn_blocking(move || {
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -204,7 +208,66 @@ pub(super) async fn discard_session_file(path: &Path) -> Result<(), SessionError
         }
     })
     .await
-    .map_err(|source| io_failure(&path_for_error, "session removal worker failed", source))?
+    .map_err(|source| io_failure(&path_for_worker_error, "session removal worker failed", source))?
+}
+
+/// Verifies that `path` is the repository-owned session file for `id` below
+/// `root`'s encoded `cwd` directory.
+///
+/// `JsonlSessionMetadata.path` is caller-supplied (the record is
+/// deserializable), so both the candidate file and the expected directory are
+/// canonicalized before comparison: `..` segments and symlinks cannot smuggle
+/// a foreign file past the check. The file must sit directly inside the
+/// directory and carry the session id in its `_<id>.jsonl` name suffix — raw
+/// or percent-encoded, because legacy files embed the id unencoded. The
+/// timestamp prefix is deliberately not compared: a legacy header can
+/// normalize to a creation time that does not reproduce the original file
+/// name.
+pub(super) async fn verify_owned_session_path(
+    root: &Path,
+    cwd: &str,
+    id: &str,
+    path: &Path,
+) -> Result<(), SessionError> {
+    let directory = root.join(session_directory_name(cwd));
+    let suffixes = [
+        format!("_{}.jsonl", encode_session_id(id)),
+        format!("_{id}.jsonl"),
+    ];
+    let path = path.to_path_buf();
+    let path_for_error = path.clone();
+    let path_for_worker_error = path.clone();
+    tokio::task::spawn_blocking(move || {
+        let canonical_file = match fs::canonicalize(&path) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(SessionError::Backend(StorageFailure::new(
+                    StorageErrorCode::NotFound,
+                    format!("session file does not exist: {}", path_for_error.display()),
+                )));
+            }
+            Err(source) => {
+                return Err(io_failure(&path_for_error, "failed to resolve session path", source));
+            }
+        };
+        let owned = fs::canonicalize(&directory).ok().is_some_and(|canonical_dir| {
+            canonical_file.parent() == Some(canonical_dir.as_path())
+                && canonical_file.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    suffixes.iter().any(|suffix| name.ends_with(suffix.as_str()))
+                })
+        });
+        if owned {
+            Ok(())
+        } else {
+            Err(SessionError::Invariant(format!(
+                "Session file is not owned by this repository: {}",
+                path_for_error.display()
+            )))
+        }
+    })
+    .await
+    .map_err(|source| io_failure(&path_for_worker_error, "session path worker failed", source))?
 }
 
 /// Wraps an owned filesystem or worker error without discarding its cause.

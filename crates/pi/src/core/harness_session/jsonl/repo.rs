@@ -18,7 +18,7 @@ use super::codec::{self, JsonlStorageHeader, JSONL_FORMAT_VERSION, JSONL_STORAGE
 use super::legacy_v3;
 use super::paths::{
     discard_session_file, io_failure, list_session_files, remove_session_file,
-    resolve_new_session_path, session_directory_name,
+    resolve_new_session_path, session_directory_name, verify_owned_session_path,
 };
 use super::storage::JsonlStorage;
 
@@ -235,6 +235,7 @@ impl JsonlSessionRepo {
         if !path_exists(&metadata.path).await? {
             return Err(not_found(format!("session file does not exist: {}", metadata.path.display())));
         }
+        verify_owned_session_path(&self.root, &metadata.cwd, &metadata.id, &metadata.path).await?;
         let (header, storage) = open_storage(&metadata.path, cx).await?;
         let validation = (|| {
             cx.check().map_err(|_| aborted_error())?;
@@ -376,6 +377,7 @@ impl SessionRepo for JsonlSessionRepo {
                     )));
                 }
             }
+            let _reservation = self.reserve_id(&key, &metadata.id)?;
             let (_, storage) = self.load_storage(metadata, cx).await?;
             if let Err(error) = cx.check().map_err(|_| aborted_error()).and_then(|()| self.ensure_open()) {
                 discard_new_storage(Some(storage), None).await;
@@ -457,9 +459,11 @@ impl SessionRepo for JsonlSessionRepo {
                     )));
                 }
             }
+            let _reservation = self.reserve_id(&key, &metadata.id)?;
             if !path_exists(&metadata.path).await? {
                 return Err(not_found(format!("session file does not exist: {}", metadata.path.display())));
             }
+            verify_owned_session_path(&self.root, &metadata.cwd, &metadata.id, &metadata.path).await?;
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             remove_session_file(&metadata.path).await
@@ -645,18 +649,20 @@ async fn resolve_cwd(input: &str) -> Result<String, SessionError> {
 async fn path_exists(path: &Path) -> Result<bool, SessionError> {
     let path = path.to_path_buf();
     let path_for_error = path.clone();
+    let path_for_worker_error = path.clone();
     tokio::task::spawn_blocking(move || match fs::metadata(&path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(io_failure(&path_for_error, "failed to check session", source)),
     })
     .await
-    .map_err(|source| io_failure(&path_for_error, "session check worker failed", source))?
+    .map_err(|source| io_failure(&path_for_worker_error, "session check worker failed", source))?
 }
 
 async fn file_modified_at(path: &Path) -> Result<f64, SessionError> {
     let path = path.to_path_buf();
     let path_for_error = path.clone();
+    let path_for_worker_error = path.clone();
     tokio::task::spawn_blocking(move || {
         let modified = fs::metadata(&path)
             .map_err(|source| io_failure(&path_for_error, "failed to read session metadata", source))?
@@ -665,7 +671,7 @@ async fn file_modified_at(path: &Path) -> Result<f64, SessionError> {
         Ok(system_time_millis_f64(modified))
     })
     .await
-    .map_err(|source| io_failure(&path_for_error, "session metadata worker failed", source))?
+    .map_err(|source| io_failure(&path_for_worker_error, "session metadata worker failed", source))?
 }
 
 /// [`SystemTime`] → fractional Unix milliseconds, matching the precision and
@@ -708,4 +714,131 @@ fn repo_closed_error() -> SessionError {
 
 fn aborted_error() -> SessionError {
     SessionError::Backend(StorageFailure::new(StorageErrorCode::Aborted, "operation cancelled"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Creates then closes a session and returns its listed metadata.
+    async fn create_closed_metadata(
+        repo: &JsonlSessionRepo,
+        cwd: &str,
+        id: &str,
+    ) -> JsonlSessionMetadata {
+        let cx = Context::background();
+        let session = repo
+            .create(
+                JsonlSessionCreateOptions {
+                    cwd: cwd.to_owned(),
+                    id: Some(id.to_owned()),
+                    ..JsonlSessionCreateOptions::default()
+                },
+                &cx,
+            )
+            .await
+            .expect("create session");
+        session.close(&cx).await.expect("close session");
+        repo.list(Some(JsonlSessionListOptions { cwd: Some(cwd.to_owned()) }), &cx)
+            .await
+            .expect("list sessions")
+            .into_iter()
+            .find(|metadata| metadata.id == id)
+            .expect("created session is listed")
+    }
+
+    #[tokio::test]
+    async fn open_rejects_session_file_outside_repository() {
+        let cx = Context::background();
+        let root = tempdir().expect("root tempdir");
+        let foreign = tempdir().expect("foreign tempdir");
+        let cwd_dir = tempdir().expect("cwd tempdir");
+        let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+        // A valid session file owned by a different repository root, using the
+        // same identity so only the location check can reject it.
+        let foreign_repo = JsonlSessionRepo::new(foreign.path());
+        let foreign_metadata = create_closed_metadata(&foreign_repo, &cwd, "shared-id").await;
+
+        let repo = JsonlSessionRepo::new(root.path());
+        let mut metadata = create_closed_metadata(&repo, &cwd, "shared-id").await;
+        metadata.path = foreign_metadata.path.clone();
+        let Err(error) = repo.open(&metadata, &cx).await else {
+            panic!("open must reject a file outside this repository");
+        };
+        assert!(matches!(error, SessionError::Invariant(_)), "{error:?}");
+        assert!(foreign_metadata.path.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_session_file_outside_repository() {
+        let cx = Context::background();
+        let root = tempdir().expect("root tempdir");
+        let foreign = tempdir().expect("foreign tempdir");
+        let cwd_dir = tempdir().expect("cwd tempdir");
+        let cwd = cwd_dir.path().to_string_lossy().into_owned();
+
+        let foreign_repo = JsonlSessionRepo::new(foreign.path());
+        let foreign_metadata = create_closed_metadata(&foreign_repo, &cwd, "shared-id").await;
+
+        let repo = JsonlSessionRepo::new(root.path());
+        let mut metadata = create_closed_metadata(&repo, &cwd, "shared-id").await;
+
+        // Absolute path into another repository's file.
+        metadata.path = foreign_metadata.path.clone();
+        let error = repo
+            .delete(&metadata, &cx)
+            .await
+            .expect_err("delete must reject a file outside this repository");
+        assert!(matches!(error, SessionError::Invariant(_)), "{error:?}");
+        assert!(foreign_metadata.path.exists());
+
+        // The same target reached through `..` traversal below the root is
+        // rejected after canonicalization.
+        let relative = foreign_metadata
+            .path
+            .strip_prefix(foreign.path())
+            .expect("foreign file below foreign root");
+        metadata.path = root
+            .path()
+            .join("..")
+            .join(foreign.path().file_name().expect("foreign dir name"))
+            .join(relative);
+        let error = repo
+            .delete(&metadata, &cx)
+            .await
+            .expect_err("delete must reject a traversing path");
+        assert!(matches!(error, SessionError::Invariant(_)), "{error:?}");
+        assert!(foreign_metadata.path.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_open_and_delete_are_mutually_exclusive() {
+        let cx = Context::background();
+        let root = tempdir().expect("root tempdir");
+        let cwd_dir = tempdir().expect("cwd tempdir");
+        let cwd = cwd_dir.path().to_string_lossy().into_owned();
+        let repo = JsonlSessionRepo::new(root.path());
+        for round in 0..8 {
+            let id = format!("race-{round}");
+            let metadata = create_closed_metadata(&repo, &cwd, &id).await;
+            let (opened, deleted) =
+                tokio::join!(repo.open(&metadata, &cx), repo.delete(&metadata, &cx));
+            match (opened, deleted) {
+                (Ok(session), Err(_)) => {
+                    assert!(metadata.path.exists(), "open winner keeps the file");
+                    session.close(&cx).await.expect("close raced-open session");
+                    repo.delete(&metadata, &cx).await.expect("delete after close");
+                }
+                (Err(_), Ok(())) => {
+                    assert!(!metadata.path.exists(), "delete winner removes the file");
+                }
+                (Ok(_), Ok(())) => panic!("open and delete must not both succeed"),
+                (Err(open_error), Err(delete_error)) => {
+                    panic!("one side must win: open={open_error:?} delete={delete_error:?}")
+                }
+            }
+        }
+    }
 }
