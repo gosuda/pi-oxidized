@@ -1634,10 +1634,10 @@ impl ThemeDispatch {
         let mut state = self.lock();
         state.pending = Some(update);
         if state.active {
-            true
+            false
         } else {
             state.active = true;
-            false
+            true
         }
     }
 
