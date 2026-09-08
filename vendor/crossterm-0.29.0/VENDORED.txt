@@ -1,0 +1,192 @@
+Vendored dependency: crossterm 0.29.0 (exact)
+=============================================
+
+Upstream project : crossterm-rs/crossterm
+Upstream URL     : https://github.com/crossterm-rs/crossterm
+crates.io release: 0.29.0 (published 2025-04-05; current stable 0.29 line)
+Upstream commit  : 36d95b26a26e64b0f8c12edfe11f410a6d56a812 (tag "0.29")
+License          : MIT (LICENSE file in this directory, unmodified)
+
+Provenance
+----------
+Base tree: the crates.io-published 0.29.0 package as extracted by cargo
+(copied from ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/
+crossterm-0.29.0 on 2026-09-07). The package's .cargo_vcs_info.json pins
+git sha1 36d95b26a26e64b0f8c12edfe11f410a6d56a812, verified equal to
+refs/tags/0.29 via git ls-remote on 2026-09-07. Every file under src/ and
+the LICENSE are byte-identical to the GitHub tag archive
+(crossterm-0.29.tar.gz) modulo CRLF line terminators (the crates.io
+package preserves CRLF as stored in the publishing checkout); verified
+with a whole-tree `tr -d '\r' | diff` comparison.
+This repository's `.gitattributes` (`* text eol=lf`) forces LF
+normalization when this tree is staged or checked out, so the committed
+blobs and any fresh checkout carry the LF variant of these files; the
+checked-in bytes therefore differ from the extracted crates.io package
+only by those same line terminators.
+Upstream master as of 2026-09-07 is cdc30a9cd7f89d97a847c182feab66147eb50223
+(verified via git ls-remote on 2026-09-07); this vendor tree is pinned to
+the released 0.29.0 tag, not master.
+
+Workspace wiring
+----------------
+The workspace root Cargo.toml carries:
+
+    exclude = ["vendor/crossterm-0.29.0"]   (non-workspace vendor tree)
+
+    [patch.crates-io]
+    crossterm = { path = "vendor/crossterm-0.29.0" }
+
+so every in-workspace crossterm 0.29.0 requirement (=0.29.0, exact pin in
+crates/{pi,pi-ext,pi-tui}/Cargo.toml and ratatui 0.30.2 "crossterm_0_29")
+resolves to this directory. The version, license, and upstream identity
+are unchanged; this is a pinned-release local copy, not a fork.
+
+Intentional prune (2026-09-07)
+------------------------------
+The upstream examples/ directory (11 files: ten example programs and their
+README) and the ten [[example]] target declarations in this directory's
+active Cargo.toml are removed. Reason: the repository's DOC-D ledger
+invariant forbids any examples/ directory in the tree, and this vendored
+crate is consumed only as a library (it is excluded from the workspace and
+no build ever targets its examples). The original upstream manifest,
+including the example declarations, is retained unmodified as
+Cargo.toml.orig; every other recorded provenance property above is
+unchanged.
+
+Local modifications (persistent reply parser + typed reply collection)
+-----------------------------------------------------------------------
+All local changes are marked with the comment tag "Vendored patch" and are
+Unix byte-parser scoped; the Windows INPUT_RECORD source and all other
+crossterm behavior are untouched. Files changed against upstream 0.29.0:
+
+  src/event/source/unix/parser.rs  NEW - the ONE persistent byte parser
+                              shared by both unix event sources. Holds any
+                              `ESC`-opening candidate that could be an
+                              OSC 11 reply header under an ABSOLUTE 50 ms
+                              deadline (armed at the first ESC byte, never
+                              reset by later bytes); recognizes the
+                              `ESC ] 1 1 ;` header; carries payload/ST
+                              fragments across arbitrary idle gaps and
+                              timeouts once the header is recognized;
+                              resolves diverging or expired pre-header
+                              candidates through the existing `parse_event`
+                              key decoder exactly once; latches an explicit
+                              protocol error for recognized malformed or
+                              oversized reply framing. Includes regression
+                              tests with an injected clock.
+  src/event/reply.rs          NEW - typed bounded reply sink (capacity 16,
+                              drop-oldest) plus the ONE collection path:
+                              poll_reply() drives the same shared reader and
+                              parser every other consumer uses; drain_replies()
+                              is a raw observation helper; recover_protocol_error()
+                              and is_protocol_error() define session recovery.
+                              Ordinary input seen while collecting stays
+                              queued in the shared reader, in arrival order.
+                              Cross-platform compile; active behavior is
+                              unix-only.
+  src/event.rs                `pub mod reply;` and the unix-only
+                              `InternalEvent::ReplyConsumed` marker (a
+                              sequence consumed into the reply sink; never
+                              queued, so it never reaches filters or public
+                              events).
+  src/event/sys/unix/parse.rs cell-size reply recognition: `CSI 4 ; h ; w t`
+                              and `CSI 6 ; h ; w t` push a typed reply to
+                              the sink and return ReplyConsumed instead of
+                              being dropped as unparsable key codes.
+  src/event/source/unix/mio.rs   Uses the shared parser. try_read honors the
+                              candidate deadline inside any caller wait,
+                              surfaces the protocol error, and returns
+                              promptly when a chunk completed a reply. The
+                              ET drain is FAIRNESS-bounded, never
+                              queue-bounded: a fresh edge latches a
+                              persistent "tty readable" obligation that
+                              survives every return; the drain runs in
+                              windows of at most TTY_DRAIN_READ_BUDGET
+                              reads, each read FIONREAD-guarded (so no
+                              blocking read follows a short read on a
+                              blocking fd, a short read is not a drained
+                              proof while bytes remain queued, and
+                              FIONREAD == 0 / WouldBlock / EOF are the
+                              only drained proofs); wake/signal fds are
+                              re-probed with a zero-timeout poll at every
+                              window boundary; and the next call resumes
+                              the drain without waiting for a new edge.
+                              Source-level pipe tests include a
+                              sustained-flood wake-budget witness, a
+                              queued-tail-without-new-edge witness, and a
+                              short-read-with-pending witness (libc cfg).
+  src/event/source/unix/tty.rs   Same integration for the use-dev-tty
+                              source, with the same tests.
+  src/event/source.rs         EventSource::recover_protocol_error default
+                              method.
+  src/event/read.rs           InternalEventReader helpers for reply
+                              collection (probe_try_read, queue_event,
+                              take_queued_reply, recover_protocol_error).
+  src/event/stream.rs         EventStream worker quiescence: shutdown check
+                              before starting another poll, Err breaks the
+                              worker loop instead of spinning (a latched
+                              protocol error reaches the consumer as a
+                              stream error), and Drop drops the task sender
+                              and JOINS the wake thread, so after Drop
+                              returns no worker can read the tty.
+
+Behavior contract
+-----------------
+- One persistent parser owns every tty byte across startup probing,
+  steady state, mid-session requeries, and pause/resume. There is no raw
+  takeover, no staged-prefix transfer, and no application-side re-decoder;
+  replies, partial CSI, UTF-8, and bracketed-paste state all live in the
+  shared parser for the process lifetime.
+- Escape framing (approved 50 ms policy): a lone `ESC` is ambiguous. The
+  candidate is held under an absolute 50 ms deadline measured from the
+  first ESC byte. Diverging input resolves immediately; an expired
+  candidate resolves at the deadline into the exact ordinary key sequence
+  (`ESC` -> Esc, `ESC ]` -> Alt+']', longer pre-header prefixes decode
+  their held `1`/`;` suffix bytes as ordinary keys), each byte exactly
+  once. Once `ESC ] 1 1 ;` is recognized the deadline is removed: payload
+  and split ST fragments remain protocol across arbitrary idle gaps,
+  consumer timeouts, and handoffs.
+- Recognized, within-bound OSC 11 replies (`ESC ] 11 ; <payload> BEL|ESC \`,
+  payload <= 64 bytes) are sunk to the typed reply queue and never decode
+  as keys. The 63/64/65-byte payload boundaries behave identically at
+  startup and steady state (63 and 64 complete; the 65th payload byte
+  latches the error).
+- Recognized malformed framing (ESC inside the payload not followed by
+  `\`) or an oversized payload latches an explicit io::Error
+  (ErrorKind::InvalidData, recognized by reply::is_protocol_error).
+  Polls fail with it; NO payload byte is replayed as keys and no
+  following input is silently discarded (the tty is simply not read while
+  latched). Defined session recovery is reply::recover_protocol_error()
+  (or an application pause+resume that calls it): the latch and partial
+  framing state clear and decoding resumes fresh. The public Event enum
+  has no error variant; the error surfaces through io paths only.
+- Cell-size replies (`CSI 4 ; h ; w t`, `CSI 6 ; h ; w t`) are consumed
+  into the typed sink; cursor position, kitty keyboard enhancement flags,
+  and DA1 remain upstream InternalEvents and are additionally surfaced as
+  typed replies through poll_reply. No new public Event variants.
+- Bracketed paste is opaque to reply framing: paste content containing
+  OSC-looking text stays literal input.
+- Quiescence preconditions (NOT an all-timing guarantee): the framing
+  deadline bounds ESC-ambiguity latency only. Collection and recovery
+  APIs that drive the shared reader require the usual single-reader
+  discipline: a caller may drive poll_reply/recover only while no other
+  reader is polling — i.e. before the EventStream starts, or after the
+  stream is paused (its worker dropped and joined, which EventStream::drop
+  guarantees after its shutdown wake is honored — bounded reads (one per
+  poll iteration in the use-dev-tty source, budget windows with control
+  re-probes in the mio source) keep the worker responsive under a
+  sustained reply flood). Within
+  those windows there are no additional timing guarantees beyond the
+  50 ms framing deadline and the callers' own explicit timeouts.
+
+Why vendored
+------------
+Upstream 0.29.0 (and master as of 2026-09-07, HEAD
+cdc30a9cd7f89d97a847c182feab66147eb50223) consumes no OSC color-query
+replies and exposes no reader seam; an unknown OSC reply decodes as
+Alt+']' plus character keys, which leaked terminal query payloads into
+application input, and no upstream mechanism keeps reply framing distinct
+from keyboard input across read partitions. The fix must live inside the
+parser, so the exact released source is carried locally under the
+upstream MIT license with provenance recorded here. No remote fork,
+publication, or upstream PR is authorized or implied.
