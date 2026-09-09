@@ -188,6 +188,7 @@ struct ViewportState {
     viewport_height: u16,
     viewport_top: u16,
     live_kitty_ids: HashSet<u32>,
+    live_kitty_regions: HashSet<(u32, Rect)>,
 }
 
 impl ViewportState {
@@ -202,6 +203,7 @@ impl ViewportState {
             viewport_height,
             viewport_top,
             live_kitty_ids: HashSet::new(),
+            live_kitty_regions: HashSet::new(),
         }
     }
 
@@ -225,6 +227,13 @@ impl ViewportState {
 /// Single stdout owner implementing the three-stage transaction pipeline.
 ///
 /// Generic over the outer writer so unit tests can inject a recorder.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::struct_excessive_bools,
+        reason = "the flags represent unrelated repaint mode, cursor capability, geometry invalidation, and test fault-injection state; grouping them would invent a false state machine"
+    )
+)]
 pub struct Tui<W: Write> {
     terminal: Terminal<GuardedBackend<CrosstermBackend<FrameSink>>>,
     composition: Arc<Mutex<Vec<u8>>>,
@@ -263,6 +272,8 @@ pub struct Tui<W: Write> {
     /// inline viewport (immutable `Viewport::Inline`) still has the previous
     /// one; the next commit re-anchors before painting.
     geometry_stale: bool,
+    #[cfg(test)]
+    fail_next_rebuild: bool,
 }
 
 impl<W: Write> Tui<W> {
@@ -316,6 +327,8 @@ impl<W: Write> Tui<W> {
             prior_claims: Vec::new(),
             hardware_cursor: std::env::var_os("PI_HARDWARE_CURSOR").is_some(),
             geometry_stale: false,
+            #[cfg(test)]
+            fail_next_rebuild: false,
         })
     }
 
@@ -373,6 +386,7 @@ impl<W: Write> Tui<W> {
         self.screen_mode
     }
 
+
     /// Switch the existing terminal and frame sink between inline and
     /// fullscreen geometry.
     ///
@@ -398,20 +412,25 @@ impl<W: Write> Tui<W> {
         let previous_state = self.state.clone();
         let previous_saved = self.saved_inline_state.take();
         let previous_force = self.force_full_rows;
+        let composition_len = self.composition.lock().map_or(0, |bytes| bytes.len());
         let mut saved = previous_state.clone();
         saved.live_kitty_ids.clear();
+        saved.live_kitty_regions.clear();
         self.saved_inline_state = Some(saved);
+        self.screen_mode = ScreenMode::Fullscreen;
         self.stage_live_kitty_deletes();
         self.state.viewport_top = 0;
         self.state.viewport_height = self.state.size.height;
         self.state.cursor = Position::ORIGIN;
-        self.screen_mode = ScreenMode::Fullscreen;
         self.force_full_rows = true;
         if let Err(error) = self.rebuild_terminal() {
             self.screen_mode = ScreenMode::Regular;
             self.state = previous_state;
             self.saved_inline_state = previous_saved;
             self.force_full_rows = previous_force;
+            if let Ok(mut bytes) = self.composition.lock() {
+                bytes.truncate(composition_len);
+            }
             return Err(error);
         }
         self.invalidate_damage();
@@ -454,6 +473,7 @@ impl<W: Write> Tui<W> {
 
     fn stage_live_kitty_deletes(&mut self) {
         let ids = std::mem::take(&mut self.state.live_kitty_ids);
+        self.state.live_kitty_regions.clear();
         if ids.is_empty() {
             return;
         }
@@ -683,11 +703,15 @@ impl<W: Write> Tui<W> {
     fn append_frame_regions(&mut self, raw_regions: &[RawRegion], payload: &mut Vec<u8>) {
         let fullscreen = self.screen_mode == ScreenMode::Fullscreen;
         let mut next_ids = HashSet::new();
+        let mut next_regions = HashSet::new();
         for region in raw_regions {
             if let Some(id) = region.kitty_id
                 && (!fullscreen || (region.area.width > 0 && region.area.height > 0))
             {
                 next_ids.insert(id);
+                if fullscreen {
+                    next_regions.insert((id, region.area));
+                }
             }
         }
 
@@ -695,7 +719,8 @@ impl<W: Write> Tui<W> {
         // the frame's composition replays every visible placement below.
         let clear_placements = fullscreen
             && !self.state.live_kitty_ids.is_empty()
-            && self.state.live_kitty_ids != next_ids;
+            && (self.state.live_kitty_ids != next_ids
+                || self.state.live_kitty_regions != next_regions);
         if clear_placements {
             payload.extend_from_slice(delete_all_kitty_placements().as_bytes());
         }
@@ -722,6 +747,7 @@ impl<W: Write> Tui<W> {
             payload.extend_from_slice(b"\x1b8");
         }
         self.state.live_kitty_ids = next_ids;
+        self.state.live_kitty_regions = next_regions;
     }
 
     /// Emit the frame's cell updates, scoped to rows whose claim set changed.
@@ -989,6 +1015,10 @@ impl<W: Write> Tui<W> {
     /// viewport at origin. Any bytes already staged in the composition are
     /// preserved ahead of constructor output and the next frame.
     fn rebuild_terminal(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_rebuild) {
+            return Err(io::Error::other("injected terminal rebuild failure"));
+        }
         let pending = self.take_composition_bytes();
         let sink = FrameSink::with_shared(Arc::clone(&self.composition));
         let backend = CrosstermBackend::new(sink);
@@ -1011,6 +1041,8 @@ impl<W: Write> Tui<W> {
         let terminal = match Terminal::with_options(guarded, TerminalOptions { viewport }) {
             Ok(terminal) => terminal,
             Err(error) => {
+                // Failed initialization must not precede the restored transaction.
+                let _ = self.take_composition_bytes();
                 self.push_composition_bytes(&pending);
                 return Err(error);
             }
@@ -2036,6 +2068,183 @@ mod tests {
         let payload = tui.last_payload();
         assert!(find_subslice(payload, IMAGE_DATA_DELETE).is_some());
         assert!(find_subslice(payload, PLACEMENT_CLEAR).is_none());
+        Ok(())
+    }
+    #[derive(Clone, Copy)]
+    enum KittyMoveFrame {
+        Upload,
+        Move,
+        Stay,
+    }
+
+    struct KittyMoveRoot {
+        frame: KittyMoveFrame,
+    }
+
+    impl Component for KittyMoveRoot {
+        fn measure(&mut self, _width: u16) -> u16 {
+            1
+        }
+
+        fn render(&mut self, area: Rect, buf: &mut Buffer) {
+            if area.width == 0 || area.height == 0 {
+                return;
+            }
+            buf[(area.x, area.y)].set_char('M');
+            match self.frame {
+                KittyMoveFrame::Upload => {
+                    crate::frame::push_raw_region(crate::frame::RawRegion {
+                        area: Rect::new(0, 0, 1, 1),
+                        bytes: b"\x1b_Ga=T,f=100,q=2,i=7;u7\x1b\\".to_vec(),
+                        kitty_id: Some(7),
+                    });
+                    crate::frame::push_raw_region(crate::frame::RawRegion {
+                        area: Rect::new(0, 0, 1, 1),
+                        bytes: b"\x1b_Ga=p,q=2,i=7\x1b\\".to_vec(),
+                        kitty_id: Some(7),
+                    });
+                }
+                KittyMoveFrame::Move => {
+                    crate::frame::push_raw_region(crate::frame::RawRegion {
+                        area: Rect::new(1, 0, 1, 1),
+                        bytes: b"\x1b_Ga=p,q=2,i=7\x1b\\".to_vec(),
+                        kitty_id: Some(7),
+                    });
+                }
+                KittyMoveFrame::Stay => {
+                    crate::frame::push_raw_region(crate::frame::RawRegion {
+                        area: Rect::new(0, 0, 1, 1),
+                        bytes: b"\x1b_Ga=p,q=2,i=7\x1b\\".to_vec(),
+                        kitty_id: Some(7),
+                    });
+                }
+            }
+        }
+
+        fn handle_event(&mut self, _event: &UiEvent) -> EventResult {
+            EventResult::Ignored
+        }
+
+        fn invalidate(&mut self) {}
+    }
+
+    #[test]
+    fn fullscreen_kitty_region_move_clears_placements_and_keeps_data() -> io::Result<()> {
+        const PLACEMENT_CLEAR: &[u8] = b"\x1b_Ga=d,d=a,q=2\x1b\\";
+        const IMAGE_DATA_DELETE: &[u8] = b"\x1b_Ga=d,d=I,i=7\x1b\\";
+        const PLACEMENT: &[u8] = b"\x1b_Ga=p,q=2,i=7\x1b\\";
+        const MOVED_PLACEMENT: &[u8] = b"\x1b7\x1b[1;2H\x1b_Ga=p,q=2,i=7\x1b\\\x1b8";
+
+        let caps = TerminalCapabilities {
+            sync_output: true,
+            ..TerminalCapabilities::default()
+        };
+        let outer = Cursor::new(Vec::new());
+        let mut tui = Tui::new(outer, Size::new(20, 8), Position::ORIGIN, 3, caps)?;
+        tui.set_screen_mode(ScreenMode::Fullscreen)?;
+        let mut root = KittyMoveRoot {
+            frame: KittyMoveFrame::Upload,
+        };
+
+        tui.commit(Txn::Frame, &mut root)?;
+        root.frame = KittyMoveFrame::Move;
+        tui.commit(Txn::Frame, &mut root)?;
+        let payload = tui.last_payload().to_vec();
+
+        let clear_at = find_subslice(&payload, PLACEMENT_CLEAR)
+            .ok_or_else(|| io::Error::other("missing placement clear for moved image"))?;
+        let placement_at = find_subslice(&payload, MOVED_PLACEMENT)
+            .ok_or_else(|| io::Error::other("missing moved placement"))?;
+        assert!(
+            clear_at < placement_at,
+            "placement clear must precede replay at new coordinates"
+        );
+        assert!(
+            find_subslice(&payload, IMAGE_DATA_DELETE).is_none(),
+            "moving an image in fullscreen must not delete its data"
+        );
+        assert!(
+            find_subslice(&payload, PLACEMENT).is_some(),
+            "moved placement must be present"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fullscreen_kitty_region_unchanged_skips_placement_clear() -> io::Result<()> {
+        const PLACEMENT_CLEAR: &[u8] = b"\x1b_Ga=d,d=a,q=2\x1b\\";
+        const PLACEMENT: &[u8] = b"\x1b_Ga=p,q=2,i=7\x1b\\";
+        const STEADY_PLACEMENT: &[u8] = b"\x1b7\x1b[1;1H\x1b_Ga=p,q=2,i=7\x1b\\\x1b8";
+
+        let caps = TerminalCapabilities {
+            sync_output: true,
+            ..TerminalCapabilities::default()
+        };
+        let outer = Cursor::new(Vec::new());
+        let mut tui = Tui::new(outer, Size::new(20, 8), Position::ORIGIN, 3, caps)?;
+        tui.set_screen_mode(ScreenMode::Fullscreen)?;
+        let mut root = KittyMoveRoot {
+            frame: KittyMoveFrame::Upload,
+        };
+
+        tui.commit(Txn::Frame, &mut root)?;
+        root.frame = KittyMoveFrame::Stay;
+        tui.commit(Txn::Frame, &mut root)?;
+        let payload = tui.last_payload().to_vec();
+
+        assert!(
+            find_subslice(&payload, PLACEMENT_CLEAR).is_none(),
+            "unchanged region must not trigger a placement clear"
+        );
+        assert!(
+            find_subslice(&payload, STEADY_PLACEMENT).is_some(),
+            "steady placement must still be replayed"
+        );
+        assert!(
+            find_subslice(&payload, PLACEMENT).is_some(),
+            "placement bytes must be present"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_fullscreen_transition_does_not_delete_live_images() -> io::Result<()> {
+        const PLACEMENT_CLEAR: &[u8] = b"\x1b_Ga=d,d=a,q=2\x1b\\";
+        const IMAGE_DATA_DELETE: &[u8] = b"\x1b_Ga=d,d=I,i=7\x1b\\";
+        const PLACEMENT: &[u8] = b"\x1b_Ga=p,q=2,i=7\x1b\\";
+
+        let caps = TerminalCapabilities {
+            sync_output: true,
+            ..TerminalCapabilities::default()
+        };
+        let outer = Cursor::new(Vec::new());
+        let mut tui = Tui::new(outer, Size::new(20, 8), Position::ORIGIN, 3, caps)?;
+        let mut root = KittyMoveRoot {
+            frame: KittyMoveFrame::Upload,
+        };
+
+        tui.commit(Txn::Frame, &mut root)?;
+        tui.fail_next_rebuild = true;
+        let result = tui.set_screen_mode(ScreenMode::Fullscreen);
+        assert!(result.is_err(), "injected rebuild failure must be reported");
+        assert_eq!(tui.screen_mode(), ScreenMode::Regular);
+
+        root.frame = KittyMoveFrame::Stay;
+        tui.commit(Txn::Frame, &mut root)?;
+        let payload = tui.last_payload().to_vec();
+
+        assert!(
+            find_subslice(&payload, PLACEMENT_CLEAR).is_none(),
+            "failed fullscreen switch must not leave a stale placement clear"
+        );
+        assert!(
+            find_subslice(&payload, IMAGE_DATA_DELETE).is_none(),
+            "failed fullscreen switch must not leave a stale image data delete"
+        );
+        assert!(
+            find_subslice(&payload, PLACEMENT).is_some(),
+            "next regular frame must still paint the live image"
+        );
         Ok(())
     }
 
