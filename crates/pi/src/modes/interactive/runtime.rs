@@ -7027,7 +7027,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 continue;
             };
             let zone = match message {
-                MessageView::User(_) => Some(pi_tui::alt_screen::PromptZone::Prompt),
+                MessageView::User(_) => Some(pi_tui::alt_screen::BlockZone::Boundary),
                 MessageView::Assistant(assistant)
                     if assistant
                         .message
@@ -7041,7 +7041,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                             AssistantContent::ToolCall(_) => false,
                         }) =>
                 {
-                    Some(pi_tui::alt_screen::PromptZone::AssistantOutput)
+                    Some(pi_tui::alt_screen::BlockZone::Content)
                 }
                 MessageView::Assistant(_)
                 | MessageView::Tool(_)

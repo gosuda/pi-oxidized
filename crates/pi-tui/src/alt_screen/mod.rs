@@ -4,7 +4,7 @@ mod document;
 mod search;
 mod viewport;
 
-pub use document::{DocumentBlock, DocumentBlockId, DocumentMetrics, LineDocument, PromptZone};
+pub use document::{BlockZone, DocumentBlock, DocumentBlockId, DocumentMetrics, LineDocument};
 pub use search::{
     AltScreenSearchIndex, AltScreenSearchMatch, AltScreenSearchSegment, SearchDirection,
     SearchIndex, SearchMatch, SearchResult, SearchSegment, TranscriptSearch, find_search_matches,

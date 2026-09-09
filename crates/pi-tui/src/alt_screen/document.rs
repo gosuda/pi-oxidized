@@ -35,19 +35,19 @@ impl DocumentBlockId {
 
 /// Semantic zone attached to a retained block by product composition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptZone {
-    /// A user prompt boundary.
-    Prompt,
-    /// Visible assistant output boundary.
-    AssistantOutput,
+pub enum BlockZone {
+    /// Marks the start of a logical group of retained blocks.
+    Boundary,
+    /// Carries material inside a logical group of retained blocks.
+    Content,
 }
 
 /// One retained message/component root.
 pub struct DocumentBlock {
     /// Stable process-local identity.
     pub id: DocumentBlockId,
-    /// Optional prompt-navigation semantic zone.
-    pub zone: Option<PromptZone>,
+    /// Optional semantic zone of a retained block.
+    pub zone: Option<BlockZone>,
     /// Native component tree that owns the styled row cache.
     pub component: Box<dyn Component>,
 }
@@ -215,7 +215,7 @@ impl LineDocument {
                 && self
                     .blocks
                     .get(index)
-                    .is_some_and(|entry| entry.block.zone == Some(PromptZone::Prompt))
+                    .is_some_and(|entry| entry.block.zone == Some(BlockZone::Boundary))
             {
                 prompt_rows.push(start);
             }
