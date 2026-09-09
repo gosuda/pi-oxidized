@@ -312,7 +312,9 @@ fn record_answer(answered: &mut IssuedQueries, reply: &TerminalReply) {
 /// Call only while the sole [`crate::terminal::TerminalInput`] `EventStream`
 /// is paused so the collector and the stream share the reader serially.
 /// `None` means timeout / no-TTY / unparseable reply — the caller keeps its
-/// prior classification. Keystrokes typed during the requery stay queued in
+/// prior classification. Replies queued since the previous probe are drained
+/// before the query is written so a superseded reply cannot be adopted as
+/// this requery's answer. Keystrokes typed during the requery stay queued in
 /// the shared parser (pending CSI, UTF-8, and paste state included) and are
 /// delivered when the stream resumes.
 ///
@@ -328,6 +330,13 @@ pub fn probe_background<W: Write>(output: &mut W) -> io::Result<Option<bool>> {
         return Ok(None);
     }
 
+    // Drain replies queued since the previous probe first: a late OSC 11
+    // reply to a superseded query (startup overshoot that landed after
+    // collection ended, or a prior requery that outlived its budget) would
+    // otherwise be the first queued reply and be adopted as this requery's
+    // answer. OSC 11 replies are untagged, so the drain bounds staleness to
+    // bytes still in flight — a race the protocol itself cannot close.
+    let _ = reply::drain_replies();
     let mut issued = IssuedQueries::osc11();
     let write = output
         .write_all(osc_11_query())
