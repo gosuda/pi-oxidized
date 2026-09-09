@@ -497,15 +497,13 @@ impl SessionRepo for JsonlSessionRepo {
             }
             verify_owned_session_path(&self.root, &metadata.cwd, &metadata.id, &metadata.path)
                 .await?;
-            // A legacy raw id can share an encoded filename; the header is the
-            // authoritative identity before deletion.
-            let Some(header) = read_header(&metadata.path, cx).await? else {
-                return Err(SessionError::Invariant(format!(
-                    "Session file is not owned by this repository: {}",
-                    metadata.path.display()
-                )));
-            };
-            if header.id != metadata.id || header.cwd != metadata.cwd {
+            // A legacy raw id can share an encoded filename; a readable
+            // header is the authoritative identity check before deletion.
+            // If the header is empty or corrupt, the ownership verdict above
+            // still permits removing the stranded session file.
+            if let Some(header) = read_header(&metadata.path, cx).await?
+                && (header.id != metadata.id || header.cwd != metadata.cwd)
+            {
                 return Err(SessionError::Invariant(format!(
                     "Session identity does not match header: {}",
                     metadata.id

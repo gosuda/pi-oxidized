@@ -1290,7 +1290,7 @@ where
                             response.error_message = None;
                             return Ok(response);
                         }
-                        Err(error) => return Err(error),
+                        Err(_) => return Err(ProviderError::new("compaction aborted")),
                     }
                 }
                 () = sleep => {}
