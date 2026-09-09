@@ -187,16 +187,24 @@ async fn input_task(
     tx: mpsc::UnboundedSender<UiEvent>,
     control_rx: mpsc::UnboundedReceiver<InputControl>,
 ) {
-    input_task_with_factory(tx, control_rx, EventStream::new).await;
+    input_task_with_factory(
+        tx,
+        control_rx,
+        EventStream::new,
+        crossterm::event::reply::recover_protocol_error,
+    )
+    .await;
 }
 
-async fn input_task_with_factory<S, F>(
+async fn input_task_with_factory<S, F, R>(
     tx: mpsc::UnboundedSender<UiEvent>,
     mut control_rx: mpsc::UnboundedReceiver<InputControl>,
     mut make_stream: F,
+    mut recover_protocol_error: R,
 ) where
     S: Stream<Item = io::Result<Event>> + Unpin,
     F: FnMut() -> S,
+    R: FnMut() -> bool,
 {
     let mut paused = false;
     let mut stream = Some(make_stream());
@@ -210,7 +218,7 @@ async fn input_task_with_factory<S, F>(
                     // Defined recovery: a latched reply protocol error (from
                     // a recognized malformed or oversized reply) clears here
                     // so the recreated stream starts healthy.
-                    crossterm::event::reply::recover_protocol_error();
+                    let _ = recover_protocol_error();
                     stream = Some(make_stream());
                     for event in reinject {
                         if tx.send(event).is_err() {
@@ -270,7 +278,7 @@ async fn input_task_with_factory<S, F>(
                     // in-task so decoding resumes immediately. The defined
                     // Pause/Resume path remains available for probes.
                     drop(stream.take());
-                    crossterm::event::reply::recover_protocol_error();
+                    let _ = recover_protocol_error();
                     stream = Some(make_stream());
                 }
                 // Transient read errors are ignored; EOF ends the task.
@@ -345,9 +353,12 @@ mod tests {
     async fn pause_resume_acknowledges_and_reinjects() -> io::Result<()> {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
-        tokio::spawn(input_task_with_factory(events_tx, control_rx, || {
-            futures::stream::pending::<io::Result<Event>>()
-        }));
+        tokio::spawn(input_task_with_factory(
+            events_tx,
+            control_rx,
+            || futures::stream::pending::<io::Result<Event>>(),
+            || false,
+        ));
         let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
         let mut input = TerminalInput {
             tx: unused_tx,
@@ -365,20 +376,30 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_error_recovers_in_task_and_keeps_stream_live() -> io::Result<()> {
-        // A latched reply protocol error is recovered in-task: the current
-        // stream is dropped, the parser latch is cleared, and a fresh stream
-        // starts immediately. Later events are delivered without a Resume
-        // control, and the defined Pause/Resume path still works.
+        // Use crossterm's real latched-error message shape. The injected
+        // operation below models the parser latch and makes task recovery
+        // observable without requiring a live terminal.
         let protocol_message =
-            "crossterm reply protocol error: malformed OSC 11 reply framing (test)";
+            "crossterm reply protocol error: malformed OSC 11 reply framing (unterminated ST)";
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let factory_calls = std::sync::Arc::clone(&calls);
-        tokio::spawn(input_task_with_factory(events_tx, control_rx, move || {
-            let n = factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let stream: std::pin::Pin<Box<dyn futures::Stream<Item = io::Result<Event>> + Send>> =
-                match n {
+        let recovery_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recovery_successes =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recovery_latched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let recovery_calls_for_task = std::sync::Arc::clone(&recovery_calls);
+        let recovery_successes_for_task = std::sync::Arc::clone(&recovery_successes);
+        let recovery_latched_for_task = std::sync::Arc::clone(&recovery_latched);
+        tokio::spawn(input_task_with_factory(
+            events_tx,
+            control_rx,
+            move || {
+                let n = factory_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let stream: std::pin::Pin<
+                    Box<dyn futures::Stream<Item = io::Result<Event>> + Send>,
+                > = match n {
                     0 => Box::pin(futures::stream::iter(vec![Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         protocol_message,
@@ -392,8 +413,19 @@ mod tests {
                     ),
                     _ => Box::pin(futures::stream::pending::<io::Result<Event>>()),
                 };
-            stream
-        }));
+                stream
+            },
+            move || {
+                recovery_calls_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let recovered =
+                    recovery_latched_for_task.swap(false, std::sync::atomic::Ordering::SeqCst);
+                if recovered {
+                    recovery_successes_for_task
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                recovered
+            },
+        ));
         let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
         let mut input = TerminalInput {
             tx: unused_tx,
@@ -411,6 +443,16 @@ mod tests {
                 width: 80,
                 height: 24,
             })
+        );
+        assert_eq!(
+            recovery_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the protocol error must invoke recovery before replacement events",
+        );
+        assert_eq!(
+            recovery_successes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "recovery must report that it cleared the latched protocol error",
         );
 
         // The defined Pause/Resume path still works after in-task recovery.
