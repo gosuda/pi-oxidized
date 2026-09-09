@@ -463,6 +463,16 @@ pub fn is_wire_base(ops: &[WireOp]) -> bool {
     matches!(ops.first(), Some(WireOp::Replace(_)))
 }
 
+/// Returns whether a wire operation can mutate the decoder's path dictionary.
+///
+/// Only `Define` (which inserts a new id→path mapping) and `Replace`
+/// (which clears the dictionary) touch the persistent dictionary; every
+/// other variant reads it immutably or reuses the batch-local previous path.
+#[must_use]
+pub fn is_dictionary_mutating(op: &WireOp) -> bool {
+    matches!(op, WireOp::Define(..) | WireOp::Replace(_))
+}
+
 /// A path reference in the wire vocabulary: an inline path or a dictionary id.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum PathRef {
@@ -1079,10 +1089,19 @@ impl DeltaDecoder {
     /// Returns `DeltaError` when a dictionary id is unresolved or a resolved
     /// path is reserved or empty.
     pub fn decode(&mut self, wire: &[WireOp]) -> Result<Vec<DeltaOp>, DeltaError> {
-        let dictionary = self.paths.clone();
+        // Only `Define` (insert) and `Replace` (clear) mutate the persistent
+        // path dictionary; every other variant reads it via `resolve_path_ref`
+        // or reuses the batch-local `previous` path.  Pay for the rollback
+        // snapshot only when the batch can actually mutate the dictionary.
+        let snapshot = wire
+            .iter()
+            .any(is_dictionary_mutating)
+            .then(|| self.paths.clone());
         let result = self.decode_batch(wire);
-        if result.is_err() {
-            self.paths = dictionary;
+        if result.is_err()
+            && let Some(snapshot) = snapshot
+        {
+            self.paths = snapshot;
         }
         result
     }
