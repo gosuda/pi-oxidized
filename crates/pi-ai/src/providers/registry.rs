@@ -1,14 +1,16 @@
 //! Built-in provider metadata and native API-shape dispatch.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 
-use crate::provider::{Provider, ProviderError, StreamOptions};
-use crate::types::{
-    AssistantMessage, AssistantMessageEvent, Context, ErrorReason, Model, StopReason,
+use crate::provider::deferred::{unsupported_cancel_future, unsupported_fetch_stream};
+use crate::provider::{
+    CancelDeferredFn, DeferredCallbacks, FetchDeferredFn, Provider, ProviderError, StreamOptions,
+    error_event_stream,
 };
+use crate::types::{AssistantMessageEvent, Context, DeferredHandle, Model};
 
 /// A native provider API shape implemented by this crate.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -461,16 +463,13 @@ pub const BUILTIN_PROVIDERS: [BuiltinProviderSpec; 40] = [
 
 /// Native adapters used to dispatch every known API shape.
 pub struct ProviderRegistry {
-    openai_completions: Arc<dyn Provider>,
-    openai_responses: Arc<dyn Provider>,
-    azure_openai_responses: Arc<dyn Provider>,
-    openai_codex_responses: Arc<dyn Provider>,
-    anthropic_messages: Arc<dyn Provider>,
-    bedrock_converse_stream: Arc<dyn Provider>,
-    google_generative_ai: Arc<dyn Provider>,
-    google_vertex: Arc<dyn Provider>,
-    mistral_conversations: Arc<dyn Provider>,
-    pi_messages: Arc<dyn Provider>,
+    /// One adapter per [`KnownApi`], in [`KnownApi::ALL`] order.
+    adapters: [Arc<dyn Provider>; 10],
+    /// Aggregate deferred-callback record synthesized from the adapters at
+    /// construction. `None` when no adapter registered either callback, so
+    /// capability reflects live adapter callbacks rather than a separately
+    /// maintained flag.
+    deferred: Option<DeferredCallbacks>,
 }
 
 impl ProviderRegistry {
@@ -479,45 +478,8 @@ impl ProviderRegistry {
     /// Adapters must be supplied in [`KnownApi::ALL`] order.
     #[must_use]
     pub fn new(adapters: [Arc<dyn Provider>; 10]) -> Self {
-        let [
-            openai_completions,
-            openai_responses,
-            azure_openai_responses,
-            openai_codex_responses,
-            anthropic_messages,
-            bedrock_converse_stream,
-            google_generative_ai,
-            google_vertex,
-            mistral_conversations,
-            pi_messages,
-        ] = adapters;
-        Self {
-            openai_completions,
-            openai_responses,
-            azure_openai_responses,
-            openai_codex_responses,
-            anthropic_messages,
-            bedrock_converse_stream,
-            google_generative_ai,
-            google_vertex,
-            mistral_conversations,
-            pi_messages,
-        }
-    }
-
-    fn adapter(&self, api: KnownApi) -> &Arc<dyn Provider> {
-        match api {
-            KnownApi::OpenAiCompletions => &self.openai_completions,
-            KnownApi::OpenAiResponses => &self.openai_responses,
-            KnownApi::AzureOpenAiResponses => &self.azure_openai_responses,
-            KnownApi::OpenAiCodexResponses => &self.openai_codex_responses,
-            KnownApi::AnthropicMessages => &self.anthropic_messages,
-            KnownApi::BedrockConverseStream => &self.bedrock_converse_stream,
-            KnownApi::GoogleGenerativeAi => &self.google_generative_ai,
-            KnownApi::GoogleVertex => &self.google_vertex,
-            KnownApi::MistralConversations => &self.mistral_conversations,
-            KnownApi::PiMessages => &self.pi_messages,
-        }
+        let deferred = aggregate_deferred(&adapters);
+        Self { adapters, deferred }
     }
 
     fn builtin_spec(provider: KnownProvider) -> &'static BuiltinProviderSpec {
@@ -532,27 +494,14 @@ impl Provider for ProviderRegistry {
         context: Context,
         options: StreamOptions,
     ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
-        let Some(api) = KnownApi::from_id(&model.api) else {
-            return semantic_error_stream(
-                model,
-                format!("No API implementation for \"{}\"", model.api),
-            );
-        };
-
-        if let Some(provider) = KnownProvider::from_id(&model.provider) {
-            let spec = Self::builtin_spec(provider);
-            if !spec.apis.contains(&api) {
-                return semantic_error_stream(
-                    model,
-                    format!(
-                        "Provider {} has no API implementation for \"{}\"",
-                        model.provider, model.api
-                    ),
-                );
-            }
+        match route_adapter(&self.adapters, model) {
+            Ok(adapter) => adapter.stream(model, context, options),
+            Err(message) => error_event_stream(model, message),
         }
+    }
 
-        self.adapter(api).stream(model, context, options)
+    fn deferred(&self) -> Option<&DeferredCallbacks> {
+        self.deferred.as_ref()
     }
 }
 
@@ -560,43 +509,111 @@ const fn provider_index(provider: KnownProvider) -> usize {
     provider as usize
 }
 
-fn semantic_error_stream(
-    model: &Model,
-    message: String,
-) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
-    let mut error = AssistantMessage::new(
-        model.api.clone(),
-        model.provider.clone(),
-        model.id.clone(),
-        now_millis(),
-    );
-    error.stop_reason = StopReason::Error;
-    error.error_message = Some(message);
-    Box::pin(futures::stream::once(async move {
-        Ok(AssistantMessageEvent::Error {
-            reason: ErrorReason::Error,
-            error,
-        })
-    }))
+const fn api_index(api: KnownApi) -> usize {
+    api as usize
 }
 
-fn now_millis() -> i64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    i64::try_from(millis).unwrap_or(i64::MAX)
+/// Resolve the adapter that would serve `model`, or the routing failure
+/// message shared by every dispatch operation.
+fn route_adapter<'a>(
+    adapters: &'a [Arc<dyn Provider>; 10],
+    model: &Model,
+) -> Result<&'a Arc<dyn Provider>, String> {
+    let Some(api) = KnownApi::from_id(&model.api) else {
+        return Err(format!("No API implementation for \"{}\"", model.api));
+    };
+
+    if let Some(provider) = KnownProvider::from_id(&model.provider) {
+        let spec = ProviderRegistry::builtin_spec(provider);
+        if !spec.apis.contains(&api) {
+            return Err(format!(
+                "Provider {} has no API implementation for \"{}\"",
+                model.provider, model.api
+            ));
+        }
+    }
+
+    Ok(&adapters[api_index(api)])
+}
+
+/// Build the registry's aggregate deferred record.
+///
+/// Each callback is present iff at least one adapter registered it, matching
+/// `createProvider`'s `streams.some(...)` gate. The registered closures
+/// re-dispatch to the adapter serving `model.api`, so a routed API whose
+/// adapter lacks the callback — or an API that cannot be routed at all —
+/// yields the source's per-API unsupported error.
+fn aggregate_deferred(adapters: &[Arc<dyn Provider>; 10]) -> Option<DeferredCallbacks> {
+    let fetch = adapters
+        .iter()
+        .any(|adapter| adapter.deferred().is_some_and(|d| d.fetch.is_some()))
+        .then(|| deferred_fetch_dispatch(adapters.clone()));
+    let cancel = adapters
+        .iter()
+        .any(|adapter| adapter.deferred().is_some_and(|d| d.cancel.is_some()))
+        .then(|| deferred_cancel_dispatch(adapters.clone()));
+    if fetch.is_none() && cancel.is_none() {
+        return None;
+    }
+    Some(DeferredCallbacks { fetch, cancel })
+}
+
+fn deferred_fetch_dispatch(adapters: [Arc<dyn Provider>; 10]) -> FetchDeferredFn {
+    Arc::new(
+        move |model: &Model,
+              handle: DeferredHandle,
+              options: StreamOptions|
+              -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+            let fetch = route_adapter(&adapters, model)
+                .ok()
+                .and_then(|adapter| adapter.deferred().and_then(|d| d.fetch.clone()));
+            match fetch {
+                Some(fetch) => fetch(model, handle, options),
+                None => unsupported_fetch_stream(model, Some(model.api.as_str())),
+            }
+        },
+    )
+}
+
+fn deferred_cancel_dispatch(adapters: [Arc<dyn Provider>; 10]) -> CancelDeferredFn {
+    Arc::new(
+        move |model: &Model,
+              handle: DeferredHandle,
+              options: StreamOptions|
+              -> BoxFuture<'static, Result<(), ProviderError>> {
+            let cancel = route_adapter(&adapters, model)
+                .ok()
+                .and_then(|adapter| adapter.deferred().and_then(|d| d.cancel.clone()));
+            match cancel {
+                Some(cancel) => cancel(model, handle, options),
+                None => unsupported_cancel_future(model, Some(model.api.as_str())),
+            }
+        },
+    )
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
+#[expect(
+    clippy::panic,
+    reason = "unit tests assert on unexpected dispatch shapes"
+)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
 
     use futures::StreamExt;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::types::{ModelCost, ModelInput};
+    use crate::provider::ProviderResponse;
+    use crate::types::{
+        AssistantContent, AssistantMessage, DoneReason, ErrorReason, ModelCost, ModelInput,
+        StopReason, TextContent,
+    };
 
     #[derive(Default)]
     struct RecordingProvider {
@@ -912,5 +929,558 @@ mod tests {
             .map(|calls| calls.iter().map(|call| call.1.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
         assert_eq!(urls, vec![template, template, template]);
+    }
+
+    /// A provider carrying a registered deferred-callback record.
+    struct DeferredFixture {
+        deferred: DeferredCallbacks,
+    }
+
+    impl Provider for DeferredFixture {
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: Context,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+            futures::stream::empty().boxed()
+        }
+
+        fn deferred(&self) -> Option<&DeferredCallbacks> {
+            Some(&self.deferred)
+        }
+    }
+
+    fn deferred_handle(id: &str) -> DeferredHandle {
+        DeferredHandle {
+            provider: "custom-provider".into(),
+            model_id: "test-model".into(),
+            api: "openai-responses".into(),
+            id: id.into(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: None,
+        }
+    }
+
+    /// Registry with `provider` installed for `KnownApi::ALL[index]` and
+    /// stream-only recorders elsewhere.
+    fn deferred_registry(index: usize, provider: Arc<dyn Provider>) -> ProviderRegistry {
+        let mut adapters = recorders().map(|recorder| -> Arc<dyn Provider> { recorder });
+        adapters[index] = provider;
+        ProviderRegistry::new(adapters)
+    }
+
+    /// A fetch callback that records `"{api}:{handle.id}"` at dispatch time,
+    /// invokes `on_response` like the source's faux provider, and answers
+    /// with a terminal `Done` event stamped with the model's metadata.
+    fn recording_fetch(calls: Arc<Mutex<Vec<String>>>) -> FetchDeferredFn {
+        Arc::new(
+            move |model: &Model,
+                  handle: DeferredHandle,
+                  options: StreamOptions|
+                  -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+                if let Ok(mut calls) = calls.lock() {
+                    calls.push(format!("{}:{}", model.api, handle.id));
+                }
+                let model = model.clone();
+                futures::stream::once(async move {
+                    if let Some(on_response) = options.on_response {
+                        let metadata = ProviderResponse {
+                            status: 200,
+                            headers: BTreeMap::new(),
+                        };
+                        on_response(&metadata, &model).await?;
+                    }
+                    let mut message = AssistantMessage::new(
+                        model.api.clone(),
+                        model.provider.clone(),
+                        model.id.clone(),
+                        0,
+                    );
+                    message.stop_reason = StopReason::Stop;
+                    Ok(AssistantMessageEvent::Done {
+                        reason: DoneReason::Stop,
+                        message,
+                    })
+                })
+                .boxed()
+            },
+        )
+    }
+
+    /// What a registered cancel callback observed about one dispatch.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RecordedCancel {
+        api: String,
+        handle: String,
+        has_signal: bool,
+        timeout_ms: Option<u64>,
+        has_headers: bool,
+    }
+
+    /// A cancel callback that records API, handle, and forwarded option
+    /// presence at dispatch time.
+    fn recording_cancel(calls: Arc<Mutex<Vec<RecordedCancel>>>) -> CancelDeferredFn {
+        Arc::new(
+            move |model: &Model,
+                  handle: DeferredHandle,
+                  options: StreamOptions|
+                  -> BoxFuture<'static, Result<(), ProviderError>> {
+                let api = model.api.clone();
+                let calls = Arc::clone(&calls);
+                let has_signal = options.signal.is_some();
+                let timeout_ms = options.timeout_ms;
+                let has_headers = options.headers.is_some();
+                Box::pin(async move {
+                    if let Ok(mut calls) = calls.lock() {
+                        calls.push(RecordedCancel {
+                            api,
+                            handle: handle.id,
+                            has_signal,
+                            timeout_ms,
+                            has_headers,
+                        });
+                    }
+                    Ok(())
+                })
+            },
+        )
+    }
+
+    #[test]
+    fn api_index_matches_all_order() {
+        for (index, api) in KnownApi::ALL.into_iter().enumerate() {
+            assert_eq!(api as usize, index);
+        }
+    }
+
+    #[test]
+    fn deferred_capability_reflects_live_adapter_callbacks() {
+        // No adapter registers deferred callbacks → no record at all.
+        let registry = registry_with(&recorders());
+        assert!(registry.deferred().is_none());
+
+        // Fetch-only adapter → fetch capability only.
+        let registry = deferred_registry(
+            1,
+            Arc::new(DeferredFixture {
+                deferred: DeferredCallbacks {
+                    fetch: Some(recording_fetch(Arc::new(Mutex::new(Vec::new())))),
+                    cancel: None,
+                },
+            }),
+        );
+        let deferred = registry.deferred().expect("aggregate record");
+        assert!(deferred.supports_fetch());
+        assert!(!deferred.supports_cancel());
+
+        // Cancel-only adapter → cancel capability only.
+        let registry = deferred_registry(
+            1,
+            Arc::new(DeferredFixture {
+                deferred: DeferredCallbacks {
+                    fetch: None,
+                    cancel: Some(recording_cancel(Arc::new(Mutex::new(Vec::new())))),
+                },
+            }),
+        );
+        let deferred = registry.deferred().expect("aggregate record");
+        assert!(!deferred.supports_fetch());
+        assert!(deferred.supports_cancel());
+    }
+
+    #[tokio::test]
+    async fn fetch_deferred_dispatches_registered_callback() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = deferred_registry(
+            1,
+            Arc::new(DeferredFixture {
+                deferred: DeferredCallbacks {
+                    fetch: Some(recording_fetch(Arc::clone(&calls))),
+                    cancel: None,
+                },
+            }),
+        );
+        let test_model = model(
+            "custom-provider",
+            "openai-responses",
+            "https://example.test",
+        );
+        let events = registry
+            .fetch_deferred(
+                &test_model,
+                deferred_handle("handle-1"),
+                StreamOptions::default(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(
+            calls.lock().map(|calls| calls.clone()).unwrap_or_default(),
+            vec!["openai-responses:handle-1".to_owned()]
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(AssistantMessageEvent::Done {
+                reason: DoneReason::Stop,
+                ..
+            })]
+        ));
+    }
+
+    #[tokio::test]
+    async fn deferred_dispatch_without_api_callback_is_unsupported() {
+        let registry = deferred_registry(
+            1,
+            Arc::new(DeferredFixture {
+                deferred: DeferredCallbacks {
+                    fetch: Some(recording_fetch(Arc::new(Mutex::new(Vec::new())))),
+                    cancel: Some(recording_cancel(Arc::new(Mutex::new(Vec::new())))),
+                },
+            }),
+        );
+
+        // A routed API whose adapter registered no fetch callback, an
+        // unroutable API, and a builtin provider/API mismatch all produce the
+        // source's per-API unsupported error event.
+        for (test_model, expected) in [
+            (
+                model(
+                    "custom-provider",
+                    "openai-completions",
+                    "https://example.test",
+                ),
+                "Provider custom-provider does not support deferred responses for \"openai-completions\"",
+            ),
+            (
+                model("custom-provider", "unknown-api", "https://example.test"),
+                "Provider custom-provider does not support deferred responses for \"unknown-api\"",
+            ),
+            (
+                model("openai", "anthropic-messages", "https://example.test"),
+                "Provider openai does not support deferred responses for \"anthropic-messages\"",
+            ),
+        ] {
+            let events = registry
+                .fetch_deferred(&test_model, deferred_handle("h"), StreamOptions::default())
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(events.len(), 1);
+            match events.first() {
+                Some(Ok(AssistantMessageEvent::Error { reason, error })) => {
+                    assert_eq!(*reason, ErrorReason::Error);
+                    assert_eq!(error.stop_reason, StopReason::Error);
+                    assert_eq!(error.error_message.as_deref(), Some(expected));
+                }
+                other => panic!("expected unsupported error event, got {other:?}"),
+            }
+        }
+
+        // Cancel on an API whose adapter registered no cancel callback.
+        let error = registry
+            .cancel_deferred(
+                &model(
+                    "custom-provider",
+                    "openai-completions",
+                    "https://example.test",
+                ),
+                deferred_handle("h"),
+                StreamOptions::default(),
+            )
+            .await
+            .expect_err("absent api cancel must fail");
+        assert_eq!(
+            error.message(),
+            "Provider custom-provider cannot cancel deferred responses for \"openai-completions\""
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_deferred_dispatches_registered_callback() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = deferred_registry(
+            1,
+            Arc::new(DeferredFixture {
+                deferred: DeferredCallbacks {
+                    fetch: None,
+                    cancel: Some(recording_cancel(Arc::clone(&calls))),
+                },
+            }),
+        );
+        let signal = CancellationToken::new();
+        let mut headers = BTreeMap::new();
+        headers.insert("x-cancel".to_owned(), Some("value".to_owned()));
+        let options = StreamOptions {
+            signal: Some(signal),
+            timeout_ms: Some(43),
+            headers: Some(headers),
+            ..StreamOptions::default()
+        };
+        registry
+            .cancel_deferred(
+                &model(
+                    "custom-provider",
+                    "openai-responses",
+                    "https://example.test",
+                ),
+                deferred_handle("handle-2"),
+                options,
+            )
+            .await
+            .expect("registered cancel must succeed");
+        assert_eq!(
+            calls.lock().map(|calls| calls.clone()).unwrap_or_default(),
+            vec![RecordedCancel {
+                api: "openai-responses".to_owned(),
+                handle: "handle-2".to_owned(),
+                has_signal: true,
+                timeout_ms: Some(43),
+                has_headers: true,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_without_callbacks_drops_stale_dispatch() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = deferred_registry(
+            1,
+            Arc::new(DeferredFixture {
+                deferred: DeferredCallbacks {
+                    fetch: Some(recording_fetch(Arc::clone(&calls))),
+                    cancel: None,
+                },
+            }),
+        );
+        let test_model = model(
+            "custom-provider",
+            "openai-responses",
+            "https://example.test",
+        );
+        drop(registry.fetch_deferred(
+            &test_model,
+            deferred_handle("h-1"),
+            StreamOptions::default(),
+        ));
+        assert_eq!(calls.lock().map(|calls| calls.len()).unwrap_or_default(), 1);
+
+        // Re-registration with a stream-only adapter: the previous callback
+        // is gone and dispatch reports the provider-level unsupported error.
+        let registry = deferred_registry(1, Arc::new(RecordingProvider::default()));
+        assert!(registry.deferred().is_none());
+        let events = registry
+            .fetch_deferred(
+                &test_model,
+                deferred_handle("h-1"),
+                StreamOptions::default(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        match events.first() {
+            Some(Ok(AssistantMessageEvent::Error { error, .. })) => {
+                assert_eq!(
+                    error.error_message.as_deref(),
+                    Some("Provider custom-provider does not support deferred responses")
+                );
+            }
+            other => panic!("expected unsupported error event, got {other:?}"),
+        }
+        assert_eq!(calls.lock().map(|calls| calls.len()).unwrap_or_default(), 1);
+    }
+
+    /// Serve two loopback HTTP requests for the deferred-callback smoke: a GET
+    /// answers with the deferred body, a POST acknowledges the cancel.
+    async fn serve_deferred_loopback()
+    -> Result<(u16, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let server = tokio::spawn(async move {
+            let mut served = 0;
+            'accept: while served < 2 {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0_u8; 8192];
+                let n = loop {
+                    match socket.try_read(&mut buf) {
+                        Ok(n) => break n,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if socket.readable().await.is_err() {
+                                break 'accept;
+                            }
+                        }
+                        Err(_) => break 'accept,
+                    }
+                };
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let body = if request.starts_with("POST ") {
+                    r#"{"cancelled":true}"#
+                } else {
+                    r#"{"text":"deferred result"}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let bytes = response.as_bytes();
+                let mut written = 0;
+                while written < bytes.len() {
+                    match socket.try_write(&bytes[written..]) {
+                        Ok(0) => break,
+                        Ok(count) => written += count,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if socket.writable().await.is_err() {
+                                break 'accept;
+                            }
+                        }
+                        Err(_) => break 'accept,
+                    }
+                }
+                if written != bytes.len() {
+                    break;
+                }
+                served += 1;
+            }
+        });
+        Ok((port, server))
+    }
+
+    /// A fetch callback that performs a real GET against the model's base URL,
+    /// forwards live response metadata through `on_response`, and ends with a
+    /// terminal `Done` event carrying the polled text.
+    fn real_http_fetch_callback() -> FetchDeferredFn {
+        Arc::new(
+            |model: &Model,
+             handle: DeferredHandle,
+             options: StreamOptions|
+             -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+                let url = format!("{}/deferred/{}", model.base_url, handle.id);
+                let model = model.clone();
+                futures::stream::once(async move {
+                    let response = reqwest::get(&url).await.map_err(|error| {
+                        ProviderError::new(format!("deferred fetch failed: {error}"))
+                    })?;
+                    if let Some(on_response) = options.on_response {
+                        let metadata = ProviderResponse {
+                            status: response.status().as_u16(),
+                            headers: response
+                                .headers()
+                                .iter()
+                                .map(|(name, value)| {
+                                    (
+                                        name.as_str().to_owned(),
+                                        value.to_str().unwrap_or_default().to_owned(),
+                                    )
+                                })
+                                .collect(),
+                        };
+                        on_response(&metadata, &model).await?;
+                    }
+                    let body: serde_json::Value = response.json().await.map_err(|error| {
+                        ProviderError::new(format!("deferred fetch body failed: {error}"))
+                    })?;
+                    let text = body["text"].as_str().unwrap_or_default();
+                    let mut message = AssistantMessage::new(
+                        model.api.clone(),
+                        model.provider.clone(),
+                        model.id.clone(),
+                        0,
+                    );
+                    message
+                        .content
+                        .push(AssistantContent::Text(TextContent::new(text)));
+                    message.stop_reason = StopReason::Stop;
+                    Ok(AssistantMessageEvent::Done {
+                        reason: DoneReason::Stop,
+                        message,
+                    })
+                })
+                .boxed()
+            },
+        )
+    }
+
+    /// A cancel callback that performs a real POST to the cancel endpoint and
+    /// maps a non-2xx status to a `ProviderError`.
+    fn real_http_cancel_callback() -> CancelDeferredFn {
+        Arc::new(
+            |model: &Model,
+             handle: DeferredHandle,
+             _options: StreamOptions|
+             -> BoxFuture<'static, Result<(), ProviderError>> {
+                let url = format!("{}/deferred/{}/cancel", model.base_url, handle.id);
+                Box::pin(async move {
+                    reqwest::Client::new()
+                        .post(&url)
+                        .send()
+                        .await
+                        .map_err(|error| {
+                            ProviderError::new(format!("deferred cancel failed: {error}"))
+                        })?
+                        .error_for_status()
+                        .map_err(|error| {
+                            ProviderError::new(format!("deferred cancel failed: {error}"))
+                        })?;
+                    Ok(())
+                })
+            },
+        )
+    }
+
+    /// Real-I/O smoke: the registered fetch/cancel callbacks perform actual
+    /// loopback HTTP against a local server, dispatched through the registry.
+    #[tokio::test]
+    #[ignore = "explicit local HTTP callback smoke"]
+    async fn registered_callbacks_perform_real_http_io() -> Result<(), Box<dyn std::error::Error>> {
+        let (port, server) = serve_deferred_loopback().await?;
+        let registry = deferred_registry(
+            1,
+            Arc::new(DeferredFixture {
+                deferred: DeferredCallbacks {
+                    fetch: Some(real_http_fetch_callback()),
+                    cancel: Some(real_http_cancel_callback()),
+                },
+            }),
+        );
+        let test_model = model(
+            "custom-provider",
+            "openai-responses",
+            &format!("http://127.0.0.1:{port}"),
+        );
+
+        let events = registry
+            .fetch_deferred(
+                &test_model,
+                deferred_handle("response-1"),
+                StreamOptions::default(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        match events.as_slice() {
+            [Ok(AssistantMessageEvent::Done { reason, message })] => {
+                assert_eq!(*reason, DoneReason::Stop);
+                assert_eq!(message.provider, "custom-provider");
+                assert_eq!(message.api, "openai-responses");
+                assert!(matches!(
+                    message.content.as_slice(),
+                    [AssistantContent::Text(text)] if text.text == "deferred result"
+                ));
+            }
+            other => panic!("expected one done event, got {other:?}"),
+        }
+
+        registry
+            .cancel_deferred(
+                &test_model,
+                deferred_handle("response-1"),
+                StreamOptions::default(),
+            )
+            .await?;
+
+        server.await?;
+        Ok(())
     }
 }

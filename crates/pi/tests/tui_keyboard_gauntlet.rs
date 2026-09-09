@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use pi_tui::testkit::driver::{
-    Geometry as DriverGeometry, LaunchSpec, SettlePolicy, TerminalDriver,
+    Geometry as DriverGeometry, LaunchSpec, SettlePolicy, TerminalDriver, TerminalSnapshot,
 };
 use pi_tui::testkit::repeat::{RepeatError, run_k};
 use pi_tui::testkit::transcript::{
@@ -60,6 +60,137 @@ const BACKSPACE: &[u8] = b"\x7f";
 const STACKED_DIALOG_TITLE: &str = "Verification stacked select";
 const STACKED_OVERLAY_LINE: &str = "Verification overlay-stack state=pending";
 
+/// Scenario-local verification provider for the keyboard-streaming-interrupt
+/// gauntlet, emitted into each run's sandbox and loaded through the real
+/// `--extension` path and the real extension-host binary.
+///
+/// Invocation one emits a fixed first text delta, then parks until the
+/// host-owned `options.signal` aborts — no timer, no successful-completion
+/// branch, and no further chunk while parked. The abort listener is
+/// registered before any event is emitted and writes a deterministic
+/// witness file so the test can prove the authentic signal fired.
+/// Invocation two completes with the shared final marker. Any further
+/// invocation is a hard fixture error.
+const INTERRUPT_FIXTURE_TS: &str = r#"
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+
+const WITNESS_PATH = process.env.PI_VERIFICATION_ABORT_WITNESS;
+const FINAL_MARKER = process.env.PI_VERIFICATION_FINAL_MARKER ?? "PI_VERIFICATION_FINAL_TUI";
+const FIRST_DELTA = "verification-chunk-0001\n";
+const WITNESS_TOKEN = "verification-abort-witness";
+
+let invocation = 0;
+
+function emptyUsage() {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function assistantMessage(model, content, stopReason) {
+	return {
+		role: "assistant",
+		content,
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: emptyUsage(),
+		stopReason,
+		timestamp: 0,
+	};
+}
+
+function recordAbortWitness() {
+	if (!WITNESS_PATH) return;
+	mkdirSync(dirname(WITNESS_PATH), { recursive: true });
+	writeFileSync(WITNESS_PATH, `${WITNESS_TOKEN} invocation=1 signal=aborted\n`, "utf8");
+}
+
+async function* interruptibleStream(model, _context, options) {
+	invocation += 1;
+	const signal = options?.signal;
+	if (!signal || typeof signal.addEventListener !== "function") {
+		throw new Error("interrupt fixture: options.signal missing");
+	}
+	if (invocation === 1) {
+		let resolveAbort;
+		const aborted = new Promise((resolve) => {
+			resolveAbort = resolve;
+		});
+		const onAbort = () => {
+			recordAbortWitness();
+			resolveAbort();
+		};
+		// The listener is registered before any event is emitted; an
+		// already-aborted signal still records the witness.
+		if (signal.aborted) {
+			onAbort();
+		} else {
+			signal.addEventListener("abort", onAbort, { once: true });
+		}
+		try {
+			yield { type: "start", partial: assistantMessage(model, [], "stop") };
+			const partial = assistantMessage(model, [{ type: "text", text: "" }], "stop");
+			yield { type: "text_start", contentIndex: 0, partial };
+			partial.content[0].text += FIRST_DELTA;
+			yield { type: "text_delta", contentIndex: 0, delta: FIRST_DELTA, partial };
+			// Parked: only the authentic host AbortSignal resolves this wait.
+			await aborted;
+			const failed = assistantMessage(model, [], "aborted");
+			failed.errorMessage = "interrupt fixture observed abort";
+			yield { type: "error", reason: "aborted", error: failed };
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+		return;
+	}
+	if (invocation === 2) {
+		const text = `${FIRST_DELTA}${FINAL_MARKER}`;
+		yield { type: "start", partial: assistantMessage(model, [], "stop") };
+		const partial = assistantMessage(model, [{ type: "text", text: "" }], "stop");
+		yield { type: "text_start", contentIndex: 0, partial };
+		partial.content[0].text += FIRST_DELTA;
+		yield { type: "text_delta", contentIndex: 0, delta: FIRST_DELTA, partial };
+		partial.content[0].text += FINAL_MARKER;
+		yield { type: "text_delta", contentIndex: 0, delta: FINAL_MARKER, partial };
+		yield { type: "text_end", contentIndex: 0, content: text, partial };
+		yield { type: "done", reason: "stop", message: partial };
+		return;
+	}
+	throw new Error(`interrupt fixture: unexpected invocation ${invocation}`);
+}
+
+export default function interruptFixture(pi) {
+	pi.registerFlag("verification-profile", {
+		description: "Run-local compatibility verification profile",
+		type: "string",
+	});
+	pi.registerProvider("verification", {
+		name: "Verification",
+		baseUrl: "https://verification.invalid",
+		api: "verification",
+		models: [
+			{
+				id: "model",
+				name: "Verification Model",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1_000_000,
+				maxTokens: 100_000,
+			},
+		],
+		streamSimple: interruptibleStream,
+	});
+}
+"#;
+
 #[derive(Debug)]
 enum CorpusError {
     Prerequisite(String),
@@ -87,6 +218,7 @@ impl From<RecordingError> for CorpusError {
             RecordingError::Driver(error) => Self::Driver(error.to_string()),
             RecordingError::Transcript(error) => Self::Transcript(error.to_string()),
             RecordingError::FinishBeforeClose => Self::Driver(error.to_string()),
+            RecordingError::UnrecordedObservation(_) => Self::Transcript(error.to_string()),
         }
     }
 }
@@ -104,16 +236,38 @@ impl From<std::io::Error> for CorpusError {
 }
 
 struct Sandbox {
-    _root: TempDir,
+    root: TempDir,
     home_dir: PathBuf,
     agent_dir: PathBuf,
     session_dir: PathBuf,
     work_dir: PathBuf,
 }
 
+/// Which extension a scenario loads through the real extension host.
+///
+/// One closed choice instead of two booleans: the booleans could combine
+/// into a launch that wrote the interrupt fixture yet emitted no
+/// `--extension` tokens at all.
+#[derive(Clone, Copy)]
+enum ExtensionChoice {
+    /// No `--extension` argv tokens. The wizard keeps its setup UI
+    /// deterministic (prerequisites still prove the host and shared
+    /// extension exist); the rebind scenarios boot against product
+    /// defaults.
+    None,
+    /// The shared workspace verification extension at its absolute,
+    /// compile-time-stable path.
+    Shared,
+    /// The scenario-local parked-provider interrupt fixture, emitted into
+    /// this run's sandbox root and loaded through the stable cwd-relative
+    /// argv token (keyboard-streaming-interrupt only).
+    Interrupt,
+}
+
 /// Per-scenario launch knobs beyond the shared verification environment.
 struct LaunchOpts {
-    include_extension: bool,
+    /// Which extension the launch loads; see [`ExtensionChoice`].
+    extension: ExtensionChoice,
     wizard: bool,
     /// Deterministic streaming cadence for the interrupt scenarios.
     chunk_count: u32,
@@ -125,7 +279,7 @@ struct LaunchOpts {
 impl Default for LaunchOpts {
     fn default() -> Self {
         Self {
-            include_extension: true,
+            extension: ExtensionChoice::Shared,
             wizard: false,
             chunk_count: 3,
             chunk_delay_ms: 0,
@@ -236,7 +390,7 @@ fn create_sandbox() -> Result<Sandbox, CorpusError> {
         fs::create_dir_all(directory)?;
     }
     Ok(Sandbox {
-        _root: root,
+        root,
         home_dir,
         agent_dir,
         session_dir,
@@ -244,9 +398,48 @@ fn create_sandbox() -> Result<Sandbox, CorpusError> {
     })
 }
 
-fn common_argv(include_extension: bool) -> Result<Vec<String>, CorpusError> {
+/// File name of the scenario-local interrupt fixture inside the sandbox
+/// root; the `--extension` argv token derives from the same name so the
+/// recorded launch argv can never drift from the file actually written.
+const INTERRUPT_FIXTURE_NAME: &str = "verification-interrupt-fixture.ts";
+
+/// cwd-relative `--extension` argv token for the interrupt fixture.
+///
+/// The child runs with the sandbox work dir as its cwd while the fixture
+/// lives at the sandbox root, so `../<name>` is byte-identical on every
+/// run yet resolves to that run's own fixture. Grounded in production:
+/// pi validates a relative `--extension` against the session cwd (the
+/// child's process cwd; `resolve_resource_path` → `resolve_path_with`,
+/// joined and cleaned like Node `path.resolve`) and hands the resolved
+/// absolute path to the extension host.
+fn interrupt_fixture_arg() -> String {
+    Path::new("..")
+        .join(INTERRUPT_FIXTURE_NAME)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Path of the scenario-local interrupt fixture emitted per run.
+fn interrupt_fixture_path(sandbox: &Sandbox) -> PathBuf {
+    sandbox.root.path().join(INTERRUPT_FIXTURE_NAME)
+}
+
+/// Path the fixture's abort listener writes once the host-owned
+/// `AbortSignal` fires.
+fn interrupt_witness_path(sandbox: &Sandbox) -> PathBuf {
+    sandbox.root.path().join("verification-abort-witness.txt")
+}
+
+/// Shared verification launch argv. `extension_arg` is the literal
+/// `--extension` argv token recorded verbatim in the canonical launch
+/// event — keep it free of per-run paths (see `launch_env`); unused when
+/// `extension` is [`ExtensionChoice::None`].
+fn common_argv(
+    extension: ExtensionChoice,
+    extension_arg: &str,
+) -> Result<Vec<String>, CorpusError> {
     let mut argv = vec![pi_binary()?.to_string_lossy().into_owned()];
-    if include_extension {
+    if !matches!(extension, ExtensionChoice::None) {
         argv.extend([
             "--provider".to_owned(),
             VERIFICATION_PROVIDER.to_owned(),
@@ -255,7 +448,7 @@ fn common_argv(include_extension: bool) -> Result<Vec<String>, CorpusError> {
             "--api-key".to_owned(),
             "verification-key".to_owned(),
             "--extension".to_owned(),
-            extension_path()?.to_string_lossy().into_owned(),
+            extension_arg.to_owned(),
             format!("--{VERIFICATION_PROFILE_FLAG}"),
             VERIFICATION_PROFILE.to_owned(),
         ]);
@@ -273,6 +466,27 @@ fn common_argv(include_extension: bool) -> Result<Vec<String>, CorpusError> {
 
 fn launch_env(sandbox: &Sandbox, opts: &LaunchOpts) -> Result<LaunchEnv, CorpusError> {
     require_prerequisites()?;
+    // Resolve the `--extension` argv token before env/argv: the interrupt
+    // scenario writes its scenario-local fixture into this run's sandbox
+    // root and loads it through the real extension host.
+    //
+    // Why the argv stays run-stable while the fixture stays per-run: the
+    // token is cwd-relative (`interrupt_fixture_arg`) and the child cwd is
+    // this sandbox's work dir (`cwd` field below), so every run resolves
+    // it to its own fresh fixture with zero ephemeral path in the
+    // recorded launch event — the former seq-0 k-run divergence source.
+    // The witness env path stays absolute; env is not part of the
+    // canonical digest. The shared verification extension keeps its
+    // absolute workspace path: compile-time stable (CARGO_MANIFEST_DIR),
+    // never per-run.
+    let extension_arg = match opts.extension {
+        ExtensionChoice::Interrupt => {
+            fs::write(interrupt_fixture_path(sandbox), INTERRUPT_FIXTURE_TS)?;
+            interrupt_fixture_arg()
+        }
+        ExtensionChoice::Shared => extension_path()?.to_string_lossy().into_owned(),
+        ExtensionChoice::None => String::new(),
+    };
     let mut env = BTreeMap::new();
     env.insert(
         "HOME".to_owned(),
@@ -296,6 +510,14 @@ fn launch_env(sandbox: &Sandbox, opts: &LaunchOpts) -> Result<LaunchEnv, CorpusE
         "PI_VERIFICATION_FINAL_MARKER".to_owned(),
         FINAL_MARKER.to_owned(),
     );
+    if matches!(opts.extension, ExtensionChoice::Interrupt) {
+        env.insert(
+            "PI_VERIFICATION_ABORT_WITNESS".to_owned(),
+            interrupt_witness_path(sandbox)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
 
     if opts.wizard {
         // First-run gate requires PI_EXPERIMENTAL=1 and no PI_CODING_AGENT_DIR override.
@@ -317,23 +539,7 @@ fn launch_env(sandbox: &Sandbox, opts: &LaunchOpts) -> Result<LaunchEnv, CorpusE
         }
     }
 
-    let argv = if opts.wizard {
-        // Wizard coverage still hard-requires extension host/extension
-        // existence, but avoids loading the extension so setup UI stays
-        // deterministic.
-        let mut argv = vec![pi_binary()?.to_string_lossy().into_owned()];
-        argv.extend([
-            "--offline".to_owned(),
-            "--no-context-files".to_owned(),
-            "--no-skills".to_owned(),
-            "--no-prompt-templates".to_owned(),
-            "--no-themes".to_owned(),
-            "--approve".to_owned(),
-        ]);
-        argv
-    } else {
-        common_argv(opts.include_extension)?
-    };
+    let argv = common_argv(opts.extension, &extension_arg)?;
 
     let context = NormalizationContext {
         home: Some(sandbox.home_dir.as_os_str().as_encoded_bytes().to_vec()),
@@ -608,6 +814,32 @@ impl ProductRun {
         Ok(frame)
     }
 
+    /// Noncanonical live-viewport observation: waits until `predicate`
+    /// holds on the current screen under `policy.ceiling`, without
+    /// recording a canonical boundary or a settle-window timing entry.
+    /// Bytes drained while observing are deferred into the next recorded
+    /// output batch by `RecordingSession::observe_frame_until`.
+    fn observe_frame<F>(&mut self, mut predicate: F) -> Result<TerminalSnapshot, CorpusError>
+    where
+        F: FnMut(&TerminalSnapshot) -> bool,
+    {
+        let mut last_screen = String::new();
+        self.recording
+            .observe_frame_until(self.policy.ceiling, |snapshot| {
+                last_screen = snapshot.lines.join("\n");
+                predicate(snapshot)
+            })
+            .map_err(|error| {
+                CorpusError::Assert(format!("{error}; observed screen:\n{last_screen}"))
+            })
+    }
+
+    /// All raw output bytes recorded so far, including deferred
+    /// observation bytes folded into the last boundary.
+    fn raw_so_far(&self) -> &[u8] {
+        &self.raw_acc
+    }
+
     fn finish(mut self) -> Result<(TranscriptArtifact, Option<u32>), CorpusError> {
         let status = self.recording.close()?;
         let mut artifact = self.recording.finish()?;
@@ -730,8 +962,8 @@ fn run_keyboard_wizard(
     let launch = launch_env(
         &sandbox,
         &LaunchOpts {
+            extension: ExtensionChoice::None,
             wizard: true,
-            include_extension: false,
             ..LaunchOpts::default()
         },
     )?;
@@ -1007,8 +1239,7 @@ fn run_keyboard_streaming_interrupt(
     let launch = launch_env(
         &sandbox,
         &LaunchOpts {
-            chunk_count: 12,
-            chunk_delay_ms: 300,
+            extension: ExtensionChoice::Interrupt,
             ..LaunchOpts::default()
         },
     )?;
@@ -1016,25 +1247,70 @@ fn run_keyboard_streaming_interrupt(
     let _ = run.settle_frame(ready_predicate)?;
     let scenario = "keyboard-streaming-interrupt";
 
-    // Esc during a stream must preserve liveness. The deterministic provider
-    // does not cancel its scripted reply, so wait for its terminal frame.
+    // Turn one: the scenario-local provider emits its first delta, then
+    // parks until the host-owned AbortSignal fires — it cannot complete on
+    // its own, so the observed streaming state cannot race a completion.
     run.send_line("verification interruptible stream one")?;
-    let _ = run.settle_frame(|bytes| contains_bytes(bytes, b"verification-chunk-0001"))?;
+    run.observe_frame(|snapshot| {
+        let screen = snapshot.lines.join("\n");
+        screen.contains("verification-chunk-0001") && screen.contains("escape to cancel")
+    })?;
+
+    // Exactly one Escape through the canonical input boundary.
     run.write_input(KEY_ESCAPE)?;
+
+    // Stable post-abort checkpoint: the product cancellation disposition
+    // ("stream cancelled"), the ready composer, and no streaming/Aborting
+    // hint. A no-op Escape leaves the provider parked and fails the
+    // ceiling; a fabricated screen without signal propagation fails the
+    // witness below.
     let frame = run.settle_frame(|bytes| {
-        contains_bytes(bytes, b"Aborting")
-            || contains_bytes(bytes, b"(cancelled)")
-            || contains_bytes(bytes, FINAL_MARKER.as_bytes())
+        contains_bytes(bytes, b"stream cancelled")
+            && contains_bytes(bytes, "❯".as_bytes())
+            && !contains_bytes(bytes, b"to cancel")
+            && !contains_bytes(bytes, b"Aborting")
+    })?;
+    frame_lines_contain(scenario, &frame, "stream cancelled")?;
+
+    // The host-owned AbortSignal must have fired inside the provider. The
+    // cancel frame is fire-and-forget, so the witness can trail the render
+    // by an IPC hop — poll briefly rather than assume ordering.
+    let witness_path = interrupt_witness_path(&sandbox);
+    let witness_deadline = Instant::now() + Duration::from_secs(10);
+    let witness = loop {
+        match fs::read_to_string(&witness_path) {
+            Ok(content) => break content,
+            Err(_) if Instant::now() < witness_deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                return Err(CorpusError::Assert(format!(
+                    "{scenario}: authentic abort-signal witness missing at {}: {error}",
+                    witness_path.display()
+                )));
+            }
+        }
+    };
+    if !witness.contains("verification-abort-witness") {
+        return Err(CorpusError::Assert(format!(
+            "{scenario}: abort witness has unexpected content {witness:?}"
+        )));
+    }
+    if contains_bytes(run.raw_so_far(), FINAL_MARKER.as_bytes()) {
+        return Err(CorpusError::Assert(format!(
+            "{scenario}: {FINAL_MARKER} appeared in turn-one output; the parked provider must not complete"
+        )));
+    }
+
+    // Turn two: a real successful completion proves post-cancel liveness.
+    run.send_line("verification interruptible stream two")?;
+    let frame = run.settle_frame(|bytes| {
+        contains_bytes(bytes, FINAL_MARKER.as_bytes())
+            && contains_bytes(bytes, "❯".as_bytes())
+            && !contains_bytes(bytes, b"to cancel")
     })?;
     frame_lines_contain(scenario, &frame, FINAL_MARKER)?;
 
-    run.send_line("verification interruptible stream two")?;
-    let _ = run.settle_frame(|bytes| {
-        contains_bytes(bytes, b"verification interruptible stream two")
-            && contains_bytes(bytes, b"verification-chunk-0001")
-    })?;
-    let frame = run.settle_frame(|bytes| contains_bytes(bytes, FINAL_MARKER.as_bytes()))?;
-    frame_lines_contain(scenario, &frame, FINAL_MARKER)?;
     prove_editor_focus(&mut run, scenario, "streamfocus")?;
     quit_cleanly(&mut run)?;
     let (artifact, exit_code) = run.finish()?;
@@ -1148,7 +1424,7 @@ fn run_keyboard_rebind_hints(
     let launch = launch_env(
         &sandbox,
         &LaunchOpts {
-            include_extension: false,
+            extension: ExtensionChoice::None,
             rebind_keybindings: true,
             ..LaunchOpts::default()
         },

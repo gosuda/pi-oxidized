@@ -7,7 +7,7 @@ use futures::future::BoxFuture;
 use pi_ai::provider::{OnPayloadFn, OnResponseFn};
 use pi_ai::{
     AssistantMessage, CacheRetention, ImageContent, Model, ModelThinkingLevel, StreamOptionKey,
-    StreamOptions, TextContent, ToolCall, ToolResultMessage, Transport,
+    StreamOptions, TextContent, ToolCall, ToolChoice, ToolResultMessage, Transport,
 };
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -173,14 +173,17 @@ pub type AfterToolCall = Arc<
 
 /// Configuration for the low-level agent loop.
 ///
-/// Stream scalar fields mirror `SimpleStreamOptions`. Reasoning and thinking
-/// budgets are mapped into [`StreamOptions::extra`] by [`build_stream_options`].
+/// Stream scalar fields mirror `SimpleStreamOptions`. Reasoning, tool choice,
+/// and thinking budgets are mapped into [`StreamOptions::extra`] by
+/// [`build_stream_options`].
 #[derive(Clone)]
 pub struct AgentLoopConfig {
     /// Model used for provider requests.
     pub model: Model,
     /// Optional reasoning / thinking level.
     pub reasoning: Option<ModelThinkingLevel>,
+    /// Provider-neutral tool selection.
+    pub tool_choice: Option<ToolChoice>,
     /// Sampling temperature.
     pub temperature: Option<f64>,
     /// Maximum tokens to generate.
@@ -247,9 +250,11 @@ impl AgentLoopConfig {
     ///
     /// When `reasoning` is present and not [`ModelThinkingLevel::Off`], inserts
     /// [`StreamOptionKey::REASONING`] as the lowercase level string. When
-    /// `thinking_budgets` is present, inserts [`StreamOptionKey::THINKING_BUDGETS`].
-    /// Values already present in `stream_extra` take precedence over both
-    /// mapped values; otherwise the mapped values are inserted.
+    /// `tool_choice` is present, inserts [`StreamOptionKey::TOOL_CHOICE`] as
+    /// its wire string. When `thinking_budgets` is present, inserts
+    /// [`StreamOptionKey::THINKING_BUDGETS`].
+    /// Values already present in `stream_extra` take precedence over mapped
+    /// values; otherwise the mapped values are inserted.
     #[must_use]
     pub fn build_stream_options(
         &self,
@@ -295,6 +300,11 @@ pub fn build_stream_options(
     {
         options.insert_extra_if_absent_with(StreamOptionKey::REASONING, || {
             Value::String(thinking_level_wire(level).to_owned())
+        });
+    }
+    if let Some(choice) = config.tool_choice {
+        options.insert_extra_if_absent_with(StreamOptionKey::TOOL_CHOICE, || {
+            Value::String(choice.as_str().to_owned())
         });
     }
     if let Some(budgets) = &config.thinking_budgets {
@@ -372,6 +382,7 @@ mod tests {
     ) -> AgentLoopConfig {
         AgentLoopConfig {
             model: sample_model(),
+            tool_choice: None,
             reasoning,
             temperature: Some(0.2),
             max_tokens: Some(256),
@@ -491,5 +502,34 @@ mod tests {
             options.extra_value(StreamOptionKey::THINKING_BUDGETS),
             Some(&json!({ "low": 9 }))
         );
+    }
+
+    #[test]
+    fn build_stream_options_maps_tool_choice_and_preserves_stream_extra() {
+        let mut config = sample_config(None, None);
+        config
+            .stream_extra
+            .remove(StreamOptionKey::TOOL_CHOICE.as_str());
+        config.tool_choice = Some(ToolChoice::None);
+        let options = build_stream_options(&config, None, None);
+        assert_eq!(
+            options.extra_value(StreamOptionKey::TOOL_CHOICE),
+            Some(&json!("none"))
+        );
+
+        let mut preset = sample_config(None, None);
+        preset.tool_choice = Some(ToolChoice::None);
+        let options = build_stream_options(&preset, None, None);
+        assert_eq!(
+            options.extra_value(StreamOptionKey::TOOL_CHOICE),
+            Some(&json!("auto"))
+        );
+
+        let mut unset = sample_config(None, None);
+        unset
+            .stream_extra
+            .remove(StreamOptionKey::TOOL_CHOICE.as_str());
+        let options = build_stream_options(&unset, None, None);
+        assert!(options.extra_value(StreamOptionKey::TOOL_CHOICE).is_none());
     }
 }

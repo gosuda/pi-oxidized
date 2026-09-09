@@ -231,7 +231,7 @@ async function typecheckHost(hostDir: string, runner: CommandRunner): Promise<vo
 	if (res.exitCode !== 0) {
 		throw new HostBuildError(
 			hostDir,
-			`host typecheck failed (exit ${res.exitCode}). stderr=${res.stderr.slice(0, 1000)}`,
+			`host typecheck failed (exit ${res.exitCode}). stdout=${res.stdout.slice(0, 1000)} stderr=${res.stderr.slice(0, 1000)}`,
 		);
 	}
 }

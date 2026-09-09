@@ -28,6 +28,7 @@
 		"fixture:runtime-import": "bun run fixtures/runtime-import.ts"
 	},
 	"dependencies": {
+		"@earendil-works/chord": "0.85.1",
 		"@earendil-works/pi-tui-protocol": "file:../pi-tui-protocol",
 		"jiti": "2.7.0",
 		"typebox": "1.3.19"

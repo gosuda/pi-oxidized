@@ -45,11 +45,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::host::{HostError, HostSpec};
 use crate::protocol::{
-    COMPATIBILITY_VERSION, ConfirmRequest, ConfirmResponse, EditorRequest, EditorResponse, Frame,
-    FrameDecoder, FrameId, FrameKind, Hello, HelloAck, InputRequest, InputResponse,
-    MeasureResponse, Method, NotifyRequest, PROTOCOL_VERSION, SelectRequest, SelectResponse,
-    encode_frame, from_payload,
+    COMPATIBILITY_VERSION, ConfirmRequest, ConfirmResponse, EditorRequest, EditorResponse,
+    ErrorPayload, Frame, FrameDecoder, FrameId, FrameKind, Hello, HelloAck, InputRequest,
+    InputResponse, MeasureResponse, Method, NotifyRequest, PROTOCOL_VERSION,
+    PROVIDER_BEFORE_PAYLOAD_METHOD, PROVIDER_ON_RESPONSE_METHOD, ProviderBeforePayloadRequest,
+    ProviderBeforePayloadResponse, ProviderOnResponseRequest, ProviderOnResponseResponse,
+    SelectRequest, SelectResponse, encode_frame, from_payload,
 };
+use pi_ai::provider::{OnPayloadFn, OnResponseFn, ProviderResponse};
+use pi_ai::types::Model;
 
 /// Default bounded capacity for the outbound (client → host) frame channel.
 pub const OUTBOUND_CAPACITY: usize = 128;
@@ -94,6 +98,44 @@ thread_local! {
 /// Result type for host client operations.
 pub type HostResult<T> = Result<T, HostClientError>;
 
+/// Native callbacks scoped to one provider request.
+///
+/// The client assigns the request's numeric frame id as the callback `callId`
+/// (`id.to_string()`) and installs this record before publishing the request.
+/// It is therefore impossible for an early host callback to race registration,
+/// and the record disappears with the pending request on every terminal path.
+pub struct ProviderCallbackRegistration {
+    /// Original model captured before the request is sent. Host payloads never
+    /// get to substitute a different model for callback invocation.
+    pub model: Model,
+    /// Optional payload mutation callback.
+    pub on_payload: Option<OnPayloadFn>,
+    /// Optional response metadata callback.
+    pub on_response: Option<OnResponseFn>,
+}
+
+impl ProviderCallbackRegistration {
+    /// Whether this scope contains at least one callback.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.on_payload.is_none() && self.on_response.is_none()
+    }
+}
+
+fn callback_registration_id(id: FrameId) -> String {
+    id.to_string()
+}
+
+fn callbacks_for_model(
+    registration: &ProviderCallbackRegistration,
+) -> (Model, Option<OnPayloadFn>, Option<OnResponseFn>) {
+    (
+        registration.model.clone(),
+        registration.on_payload.clone(),
+        registration.on_response.clone(),
+    )
+}
+
 /// A terminal frame result delivered to a pending caller.
 type FrameResult = HostResult<Frame>;
 
@@ -103,6 +145,8 @@ struct PendingEntry {
     terminal: Option<oneshot::Sender<FrameResult>>,
     /// Optional streaming event channel for intermediate events.
     stream: Option<mpsc::Sender<Frame>>,
+    /// Scoped provider callbacks, if this is a callback-enabled request.
+    callback: Option<ProviderCallbackRegistration>,
     /// True once cancellation delivery owns this correlation id.
     cancelling: bool,
     /// Monotonic generation assigned by `insert_pending`. Delayed background
@@ -386,7 +430,7 @@ impl HostSessionRequest {
 /// Cross-task shared state.
 struct Shared {
     /// id → pending call. `std::sync::Mutex` because critical sections never await.
-    pending: StdMutex<HashMap<FrameId, PendingEntry>>,
+    pending: Arc<StdMutex<HashMap<FrameId, PendingEntry>>>,
     /// Runtime that owns background cancellation sends.
     runtime: tokio::runtime::Handle,
     slot_generations: StdMutex<HashMap<String, u64>>,
@@ -584,7 +628,7 @@ impl HostClient {
         let (session_requests_tx, session_requests_rx) = mpsc::channel(CORRELATED_REQUEST_CAPACITY);
         let (session_control_tx, session_control_rx) = mpsc::channel(SESSION_CONTROL_CAPACITY);
         let shared = Arc::new(Shared {
-            pending: StdMutex::new(HashMap::new()),
+            pending: Arc::new(StdMutex::new(HashMap::new())),
             runtime: tokio::runtime::Handle::current(),
             slot_generations: StdMutex::new(HashMap::new()),
             notifications: notifications_tx,
@@ -816,6 +860,27 @@ impl HostClient {
         payload: serde_json::Value,
         timeout: Duration,
     ) -> HostResult<Frame> {
+        self.request_raw_with_callbacks(method, payload, timeout, None)
+            .await
+    }
+
+    /// Send a request and install provider callbacks before publication.
+    ///
+    /// The callback registry is endpoint-local and owned by the pending route.
+    /// A host callback therefore cannot arrive in the gap between registration
+    /// and the request frame, and every terminal/cancel/drop path releases it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostClientError`] when the client is not running, when the
+    /// host answers with an error frame, or when the response times out.
+    pub async fn request_raw_with_callbacks(
+        &self,
+        method: &str,
+        payload: serde_json::Value,
+        timeout: Duration,
+        callbacks: Option<ProviderCallbackRegistration>,
+    ) -> HostResult<Frame> {
         if !self.is_running() {
             return Err(HostClientError::NotRunning);
         }
@@ -826,6 +891,7 @@ impl HostClient {
             PendingEntry {
                 terminal: Some(tx),
                 stream: None,
+                callback: callbacks.filter(|scope| !scope.is_empty()),
                 cancelling: false,
                 generation: 0,
                 cancel: CancellationToken::new(),
@@ -1201,6 +1267,29 @@ impl HostClient {
         payload: serde_json::Value,
         event_bound: usize,
     ) -> HostResult<StreamHandle> {
+        self.open_stream_raw_with_callbacks(method, payload, event_bound, None)
+            .await
+    }
+
+    /// Open a streaming call and install provider callbacks before publication.
+    ///
+    /// Callback requests use the originating stream id as `callId`; their own
+    /// frame ids remain independent and are answered by the reader task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostClientError::NotRunning`] when the client is not
+    /// running, or [`HostClientError::Closed`] when the outbound pipe is
+    /// broken. This call only publishes the request frame; the host response,
+    /// remote errors, and setup timeout surface later from
+    /// [`StreamHandle::finish`].
+    pub async fn open_stream_raw_with_callbacks(
+        &self,
+        method: &str,
+        payload: serde_json::Value,
+        event_bound: usize,
+        callbacks: Option<ProviderCallbackRegistration>,
+    ) -> HostResult<StreamHandle> {
         if !self.is_running() {
             return Err(HostClientError::NotRunning);
         }
@@ -1213,6 +1302,7 @@ impl HostClient {
             PendingEntry {
                 terminal: Some(terminal_tx),
                 stream: Some(stream_tx),
+                callback: callbacks.filter(|scope| !scope.is_empty()),
                 cancelling: false,
                 generation: 0,
                 cancel: CancellationToken::new(),
@@ -1674,6 +1764,10 @@ fn cancel_pending(
             return CancellationStart::AlreadyCancelling;
         }
         entry.cancelling = true;
+        // Cancellation owns the callback scope immediately. The pending route
+        // may remain until the control frame queues, but late callback
+        // requests must be rejected rather than invoking stale closures.
+        entry.callback = None;
         entry.cancel.cancel();
         if terminal_error.is_some() {
             entry.terminal.take()
@@ -1773,7 +1867,264 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
     true
 }
 
+/// Dispatch one host-initiated provider callback request.
+///
+/// Callback scopes are looked up by the exact decimal string of the
+/// originating provider request id. The scope is cloned for the callback
+/// task, so no mutex is held across user code or an await. A missing, late, or
+/// cancelling scope receives a correlated error and never reaches a stale
+/// callback.
+///
+/// The scope is cloned under the pending lock, but the spawned task runs
+/// later, so cancellation can win the race in between
+/// ([`cancel_pending`] marks the route cancelling and takes the callback
+/// while the cloned closure is still queued). The task therefore re-checks
+/// the pending entry under the lock immediately before the first invocation
+/// ([`callback_scope_live`]) and drops a not-yet-started invocation on a
+/// missing, cancelling, or generation-replaced scope, answering the host with
+/// a correlated error instead of running user code after cancel/timeout. A
+/// callback that passed the re-check and already began runs to completion.
+#[allow(
+    clippy::too_many_lines,
+    reason = "callback dispatch decodes, re-checks scope, and spawns per-kind tasks"
+)]
+fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
+    let is_before = frame.method == PROVIDER_BEFORE_PAYLOAD_METHOD;
+    let is_response = frame.method == PROVIDER_ON_RESPONSE_METHOD;
+    if !is_before && !is_response {
+        return None;
+    }
+
+    let call_id = if is_before {
+        let request = match from_payload::<ProviderBeforePayloadRequest>(&frame.payload) {
+            Ok(request) => request,
+            Err(error) => {
+                let message = format!("malformed provider callback request: {error}");
+                send_callback_error(shared, frame.id, &frame.method, &message);
+                return Some(true);
+            }
+        };
+        request.call_id
+    } else {
+        let request = match from_payload::<ProviderOnResponseRequest>(&frame.payload) {
+            Ok(request) => request,
+            Err(error) => {
+                let message = format!("malformed provider callback request: {error}");
+                send_callback_error(shared, frame.id, &frame.method, &message);
+                return Some(true);
+            }
+        };
+        request.call_id
+    };
+
+    let Some(origin_id) = call_id
+        .parse::<FrameId>()
+        .ok()
+        .filter(|id| callback_registration_id(*id) == call_id)
+    else {
+        send_callback_error(
+            shared,
+            frame.id,
+            &frame.method,
+            "unknown provider callback callId",
+        );
+        return Some(true);
+    };
+    let Some((model, on_payload, on_response, scope_generation)) =
+        shared.pending.lock().ok().and_then(|pending| {
+            pending
+                .get(&origin_id)
+                .filter(|entry| !entry.cancelling)
+                .and_then(|entry| {
+                    entry.callback.as_ref().map(|registration| {
+                        let (model, on_payload, on_response) = callbacks_for_model(registration);
+                        (model, on_payload, on_response, entry.generation)
+                    })
+                })
+        })
+    else {
+        send_callback_error(
+            shared,
+            frame.id,
+            &frame.method,
+            "provider callback scope is unavailable",
+        );
+        return Some(true);
+    };
+
+    let Some(outbound) = shared
+        .outbound
+        .lock()
+        .ok()
+        .and_then(|sender| sender.clone())
+    else {
+        return Some(false);
+    };
+    let pending = Arc::clone(&shared.pending);
+    let callback_frame_id = frame.id;
+    let callback_method = frame.method.clone();
+    let payload = frame.payload.clone();
+    if is_before {
+        let Some(callback) = on_payload else {
+            send_callback_error(
+                shared,
+                callback_frame_id,
+                &callback_method,
+                "provider beforePayload callback is not registered",
+            );
+            return Some(true);
+        };
+        shared.runtime.spawn(async move {
+            let mut request = match serde_json::from_value::<ProviderBeforePayloadRequest>(payload)
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    let message = format!("malformed provider callback request: {error}");
+                    let _ = outbound
+                        .send(callback_error_frame(
+                            callback_frame_id,
+                            &callback_method,
+                            &message,
+                        ))
+                        .await;
+                    return;
+                }
+            };
+            if !callback_scope_live(&pending, origin_id, scope_generation) {
+                let _ = outbound
+                    .send(callback_error_frame(
+                        callback_frame_id,
+                        &callback_method,
+                        "provider callback scope is unavailable",
+                    ))
+                    .await;
+                return;
+            }
+            let result = callback(&mut request.payload, &model).await;
+            let response = match result {
+                Ok(()) => Frame {
+                    id: callback_frame_id,
+                    kind: FrameKind::Res,
+                    method: callback_method.clone(),
+                    payload: serde_json::to_value(ProviderBeforePayloadResponse {
+                        payload: request.payload,
+                    })
+                    .unwrap_or_else(|_| crate::protocol::empty_object()),
+                },
+                Err(error) => {
+                    if let Ok(mut pending) = pending.lock()
+                        && let Some(entry) = pending.get_mut(&origin_id)
+                    {
+                        entry.callback = None;
+                    }
+                    callback_error_frame(callback_frame_id, &callback_method, &error.to_string())
+                }
+            };
+            let _ = outbound.send(response).await;
+        });
+    } else {
+        let Some(callback) = on_response else {
+            send_callback_error(
+                shared,
+                callback_frame_id,
+                &callback_method,
+                "provider onResponse callback is not registered",
+            );
+            return Some(true);
+        };
+        shared.runtime.spawn(async move {
+            let request = match serde_json::from_value::<ProviderOnResponseRequest>(payload) {
+                Ok(request) => request,
+                Err(error) => {
+                    let message = format!("malformed provider callback request: {error}");
+                    let _ = outbound
+                        .send(callback_error_frame(
+                            callback_frame_id,
+                            &callback_method,
+                            &message,
+                        ))
+                        .await;
+                    return;
+                }
+            };
+            let response = ProviderResponse {
+                status: request.response.status,
+                headers: request.response.headers,
+            };
+            if !callback_scope_live(&pending, origin_id, scope_generation) {
+                let _ = outbound
+                    .send(callback_error_frame(
+                        callback_frame_id,
+                        &callback_method,
+                        "provider callback scope is unavailable",
+                    ))
+                    .await;
+                return;
+            }
+            let result = callback(&response, &model).await;
+            let frame = match result {
+                Ok(()) => Frame {
+                    id: callback_frame_id,
+                    kind: FrameKind::Res,
+                    method: callback_method.clone(),
+                    payload: serde_json::to_value(ProviderOnResponseResponse {})
+                        .unwrap_or_else(|_| crate::protocol::empty_object()),
+                },
+                Err(error) => {
+                    if let Ok(mut pending) = pending.lock()
+                        && let Some(entry) = pending.get_mut(&origin_id)
+                    {
+                        entry.callback = None;
+                    }
+                    callback_error_frame(callback_frame_id, &callback_method, &error.to_string())
+                }
+            };
+            let _ = outbound.send(frame).await;
+        });
+    }
+    Some(true)
+}
+
+fn callback_error_frame(id: FrameId, method: &str, message: &str) -> Frame {
+    Frame {
+        id,
+        kind: FrameKind::Error,
+        method: method.to_owned(),
+        payload: serde_json::to_value(ErrorPayload::new("extension_error", message))
+            .unwrap_or_else(|_| crate::protocol::empty_object()),
+    }
+}
+
+/// Re-checks the pending callback scope under the lock immediately before a
+/// cloned callback closure is invoked.
+///
+/// [`dispatch_provider_callback`] clones the scope while holding the pending
+/// lock and releases it before the spawned task runs, so [`cancel_pending`]
+/// can win the race and take the callback in between. A missing entry, a
+/// cancelling route, a replaced generation, or a taken callback means the
+/// clone is stale: the invocation is dropped and the host receives a
+/// correlated error. A callback that passed this check and already began
+/// runs to completion.
+fn callback_scope_live(
+    pending: &StdMutex<HashMap<FrameId, PendingEntry>>,
+    origin_id: FrameId,
+    generation: u64,
+) -> bool {
+    pending.lock().is_ok_and(|guard| {
+        guard.get(&origin_id).is_some_and(|entry| {
+            !entry.cancelling && entry.generation == generation && entry.callback.is_some()
+        })
+    })
+}
+
+fn send_callback_error(shared: &Shared, id: FrameId, method: &str, message: &str) {
+    try_send_outbound(shared, callback_error_frame(id, method, message));
+}
+
 fn dispatch_request(shared: &Shared, frame: Frame) -> bool {
+    if let Some(result) = dispatch_provider_callback(shared, &frame) {
+        return result;
+    }
     match decode_session_request(&frame) {
         Decoded::Valid(request) => {
             forward_session_request(shared, request, &frame.method);
@@ -2278,7 +2629,10 @@ mod tests {
 
     type R = Result<(), Box<dyn Error>>;
 
-    use crate::test_support::make_pair;
+    use crate::test_support::{FakeHost, make_pair};
+    use futures::future::BoxFuture;
+    use pi_ai::ProviderError;
+    use pi_ai::types::ModelCost;
 
     async fn wait_for_blocked_provider_send(stream: &StreamHandle) -> R {
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -2722,6 +3076,7 @@ mod tests {
                 PendingEntry {
                     terminal: None,
                     stream: None,
+                    callback: None,
                     cancelling: false,
                     generation: new_generation,
                     cancel: CancellationToken::new(),
@@ -2870,6 +3225,7 @@ mod tests {
                 PendingEntry {
                     terminal: None,
                     stream: None,
+                    callback: None,
                     cancelling: false,
                     generation: new_generation,
                     cancel: CancellationToken::new(),
@@ -4229,6 +4585,266 @@ mod tests {
             return Err(format!("expected ReplacementAbort, got {event:?}").into());
         };
         assert_eq!(token, "abort-token");
+        Ok(())
+    }
+
+    fn callback_test_model() -> Model {
+        Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            base_url: "https://custom.example/v1".to_owned(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: Vec::new(),
+            cost: ModelCost::default(),
+            context_window: 0,
+            max_tokens: 0,
+            headers: None,
+            compat: None,
+            extra: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Installs one callback-enabled pending route as request id 9001.
+    fn insert_callback_scope(
+        client: &HostClient,
+        on_payload: Option<OnPayloadFn>,
+        on_response: Option<OnResponseFn>,
+    ) -> (FrameId, u64) {
+        let id: FrameId = 9001;
+        let generation = client.insert_pending(
+            id,
+            PendingEntry {
+                terminal: None,
+                stream: None,
+                callback: Some(ProviderCallbackRegistration {
+                    model: callback_test_model(),
+                    on_payload,
+                    on_response,
+                }),
+                cancelling: false,
+                generation: 0,
+                cancel: CancellationToken::new(),
+            },
+        );
+        (id, generation)
+    }
+
+    fn before_payload_frame(id: FrameId) -> Frame {
+        Frame {
+            id,
+            kind: FrameKind::Req,
+            method: PROVIDER_BEFORE_PAYLOAD_METHOD.to_owned(),
+            payload: serde_json::json!({ "callId": "9001", "payload": { "original": true } }),
+        }
+    }
+
+    fn on_response_frame(id: FrameId) -> Frame {
+        Frame {
+            id,
+            kind: FrameKind::Req,
+            method: PROVIDER_ON_RESPONSE_METHOD.to_owned(),
+            payload: serde_json::json!({
+                "callId": "9001",
+                "response": { "status": 200, "headers": {} }
+            }),
+        }
+    }
+
+    /// Reads the one frame the spawned callback task sends back to the host.
+    async fn callback_answer(host: &mut FakeHost) -> Result<Frame, Box<dyn Error>> {
+        let frame = tokio::time::timeout(Duration::from_secs(1), host.read_frame())
+            .await
+            .map_err(|_| "callback task never answered the host")?
+            .ok_or("host stream closed")?;
+        Ok(frame)
+    }
+
+    #[tokio::test]
+    async fn malformed_before_payload_callback_gets_correlated_error() -> R {
+        let (client, mut host) = make_pair().await;
+        let frame = Frame {
+            id: 9200,
+            kind: FrameKind::Req,
+            method: PROVIDER_BEFORE_PAYLOAD_METHOD.to_owned(),
+            payload: serde_json::json!({ "callId": "9001" }),
+        };
+
+        assert_eq!(
+            dispatch_provider_callback(&client.shared, &frame),
+            Some(true)
+        );
+
+        let error = callback_answer(&mut host).await?;
+        assert_eq!(error.kind, FrameKind::Error);
+        assert_eq!(error.id, 9200);
+        assert_eq!(error.method, PROVIDER_BEFORE_PAYLOAD_METHOD);
+        let message = error.payload["message"]
+            .as_str()
+            .ok_or("callback error message missing")?;
+        assert!(
+            message.contains("missing field `payload`"),
+            "expected serde detail in callback error, got {message:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_on_response_callback_gets_correlated_error() -> R {
+        let (client, mut host) = make_pair().await;
+        let frame = Frame {
+            id: 9201,
+            kind: FrameKind::Req,
+            method: PROVIDER_ON_RESPONSE_METHOD.to_owned(),
+            payload: serde_json::json!({ "callId": "9001" }),
+        };
+
+        assert_eq!(
+            dispatch_provider_callback(&client.shared, &frame),
+            Some(true)
+        );
+
+        let error = callback_answer(&mut host).await?;
+        assert_eq!(error.kind, FrameKind::Error);
+        assert_eq!(error.id, 9201);
+        assert_eq!(error.method, PROVIDER_ON_RESPONSE_METHOD);
+        let message = error.payload["message"]
+            .as_str()
+            .ok_or("callback error message missing")?;
+        assert!(
+            message.contains("missing field `response`"),
+            "expected serde detail in callback error, got {message:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_scope_drops_queued_before_payload_callback() -> R {
+        let (client, mut host) = make_pair().await;
+        let invoked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&invoked);
+        let on_payload: OnPayloadFn =
+            Arc::new(move |_payload: &mut serde_json::Value, _model: &Model| {
+                let flag = Arc::clone(&flag);
+                Box::pin(async move {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok::<(), ProviderError>(())
+                }) as BoxFuture<'_, Result<(), ProviderError>>
+            });
+        let (id, generation) = insert_callback_scope(&client, Some(on_payload), None);
+
+        assert_eq!(
+            dispatch_provider_callback(&client.shared, &before_payload_frame(9100)),
+            Some(true)
+        );
+
+        // Cancellation wins the race while the cloned callback is still
+        // queued on the runtime; the task must observe the dead scope and
+        // never run user code.
+        assert!(matches!(
+            cancel_pending(&client.shared, id, generation, None, None, None),
+            CancellationStart::NotRunning
+        ));
+
+        let error = callback_answer(&mut host).await?;
+        assert_eq!(error.kind, FrameKind::Error);
+        assert_eq!(error.id, 9100);
+        assert_eq!(error.method, PROVIDER_BEFORE_PAYLOAD_METHOD);
+        assert_eq!(
+            error.payload["message"],
+            "provider callback scope is unavailable"
+        );
+        assert!(!invoked.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_scope_drops_queued_on_response_callback() -> R {
+        let (client, mut host) = make_pair().await;
+        let invoked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&invoked);
+        let on_response: OnResponseFn =
+            Arc::new(move |_response: &ProviderResponse, _model: &Model| {
+                let flag = Arc::clone(&flag);
+                Box::pin(async move {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok::<(), ProviderError>(())
+                }) as BoxFuture<'_, Result<(), ProviderError>>
+            });
+        let (id, generation) = insert_callback_scope(&client, None, Some(on_response));
+
+        assert_eq!(
+            dispatch_provider_callback(&client.shared, &on_response_frame(9101)),
+            Some(true)
+        );
+        assert!(matches!(
+            cancel_pending(&client.shared, id, generation, None, None, None),
+            CancellationStart::NotRunning
+        ));
+
+        let error = callback_answer(&mut host).await?;
+        assert_eq!(error.kind, FrameKind::Error);
+        assert_eq!(error.id, 9101);
+        assert_eq!(error.method, PROVIDER_ON_RESPONSE_METHOD);
+        assert_eq!(
+            error.payload["message"],
+            "provider callback scope is unavailable"
+        );
+        assert!(!invoked.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_scope_still_invokes_before_payload_callback() -> R {
+        let (client, mut host) = make_pair().await;
+        let on_payload: OnPayloadFn = Arc::new(|payload: &mut serde_json::Value, _: &Model| {
+            Box::pin(async move {
+                *payload = serde_json::json!({ "mutated": true });
+                Ok::<(), ProviderError>(())
+            }) as BoxFuture<'_, Result<(), ProviderError>>
+        });
+        let _ = insert_callback_scope(&client, Some(on_payload), None);
+
+        assert_eq!(
+            dispatch_provider_callback(&client.shared, &before_payload_frame(9100)),
+            Some(true)
+        );
+
+        let response = callback_answer(&mut host).await?;
+        assert_eq!(response.kind, FrameKind::Res);
+        assert_eq!(response.id, 9100);
+        assert_eq!(response.method, PROVIDER_BEFORE_PAYLOAD_METHOD);
+        assert_eq!(response.payload["payload"]["mutated"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_scope_still_invokes_on_response_callback() -> R {
+        let (client, mut host) = make_pair().await;
+        let invoked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&invoked);
+        let on_response: OnResponseFn = Arc::new(move |response: &ProviderResponse, _: &Model| {
+            let flag = Arc::clone(&flag);
+            Box::pin(async move {
+                assert_eq!(response.status, 200);
+                flag.store(true, Ordering::SeqCst);
+                Ok::<(), ProviderError>(())
+            }) as BoxFuture<'_, Result<(), ProviderError>>
+        });
+        let _ = insert_callback_scope(&client, None, Some(on_response));
+
+        assert_eq!(
+            dispatch_provider_callback(&client.shared, &on_response_frame(9101)),
+            Some(true)
+        );
+
+        let response = callback_answer(&mut host).await?;
+        assert_eq!(response.kind, FrameKind::Res);
+        assert_eq!(response.id, 9101);
+        assert_eq!(response.method, PROVIDER_ON_RESPONSE_METHOD);
+        assert!(invoked.load(Ordering::SeqCst));
         Ok(())
     }
 }

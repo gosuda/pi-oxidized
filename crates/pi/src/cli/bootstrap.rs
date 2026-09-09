@@ -44,6 +44,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use futures::future::BoxFuture;
+use pi_tui::terminal::ScreenMode;
 
 use crate::cli::args::{Args, DiagnosticLevel, ListModels, Mode};
 use crate::cli::package_manager_cli::{self, DispatchPlatform, PackageHandler, PackageOutput};
@@ -348,6 +349,8 @@ pub struct Dispatched {
     pub initial_images: Vec<pi_ai::ImageContent>,
     /// Remaining CLI messages for follow-up prompts.
     pub remaining_messages: Vec<String>,
+    /// Explicit/parsed interactive screen mode, omitted for demoted modes.
+    pub tui_mode: Option<ScreenMode>,
     /// Migration result (carried into interactive mode for changelog display).
     pub migrations: MigrationResult,
 }
@@ -976,6 +979,11 @@ async fn finish_bootstrap(
         initial_message,
         initial_images,
         remaining_messages,
+        tui_mode: state
+            .app_mode
+            .is_interactive()
+            .then_some(state.parsed.tui_mode)
+            .flatten(),
         migrations: state.migrations,
     })
 }

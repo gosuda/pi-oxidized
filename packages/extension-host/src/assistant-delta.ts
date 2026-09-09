@@ -3,6 +3,8 @@
  * Both extension-host endpoints use this reducer so wire-equivalent deltas
  * produce byte-equivalent hook payloads.
  */
+import { isRecord } from "./wire-validators.ts";
+
 export class AssistantDeltaReducer {
 	private activeAssistant: Record<string, unknown> | undefined;
 	private readonly activeToolArguments = new Map<number, StreamingJsonParser>();
@@ -97,10 +99,6 @@ export class AssistantDeltaReducer {
 	getActiveAssistant(): Record<string, unknown> | undefined {
 		return this.activeAssistant;
 	}
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Tolerantly parse possibly-incomplete streamed tool-call arguments. */

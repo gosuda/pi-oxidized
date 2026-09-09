@@ -30,6 +30,9 @@ pub const CALLBACK_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// Fixed callback port used by Radius browser login.
 pub const CALLBACK_PORT: u16 = 1456;
 
+/// Default Radius gateway used by the built-in provider and dynamic catalog.
+pub const DEFAULT_RADIUS_GATEWAY: &str = "https://radius.pi.dev";
+
 /// Callback path used by Radius browser login.
 pub const CALLBACK_PATH: &str = "/oauth/callback";
 

@@ -1800,7 +1800,7 @@ mod tests {
             cost: pi_ai::UsageCost::default(),
             ..Default::default()
         };
-        AgentMessage::Llm(Box::new(Message::Assistant(msg)))
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(msg))))
     }
 
     #[test]

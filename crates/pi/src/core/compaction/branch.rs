@@ -486,7 +486,7 @@ mod tests {
         m.content = vec![AssistantContent::Text(TextContent::new(text))];
         m.usage = usage(10, 5);
         m.stop_reason = StopReason::Stop;
-        AgentMessage::Llm(Box::new(Message::Assistant(m)))
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(m))))
     }
 
     fn test_model() -> Model {
@@ -607,7 +607,7 @@ mod tests {
             "id": "m1",
             "parentId": "bs1",
             "timestamp": "2025-01-01T00:00:00.000Z",
-            "message": AgentMessage::Llm(Box::new(Message::Assistant(asst))),
+            "message": AgentMessage::Llm(Box::new(Message::Assistant(Box::new(asst)))),
         })));
 
         // Huge summary that exceeds tiny budget — should be rescued under 0.9.

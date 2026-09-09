@@ -76,3 +76,11 @@ required-features = ["bench"]
 name = "pi_tui_unicode_gauntlet_fixture"
 path = "src/bin/pi_tui_unicode_gauntlet_fixture.rs"
 
+[[bin]]
+name = "pi_tui_osc11_handoff_fixture"
+path = "src/bin/pi_tui_osc11_handoff_fixture.rs"
+
+
+
+[target.'cfg(windows)'.dev-dependencies]
+crossterm_winapi = { version = "=0.9.1", default-features = false }

@@ -836,6 +836,7 @@ impl EventConverter {
                     DoneReason::Stop => StopReason::Stop,
                     DoneReason::Length => StopReason::Length,
                     DoneReason::ToolUse => StopReason::ToolUse,
+                    DoneReason::Deferred => StopReason::Deferred,
                 };
                 self.partial.usage = usage;
                 self.partial.response_id = response_id;
@@ -1179,6 +1180,32 @@ mod tests {
         assert_eq!(message.stop_reason, StopReason::ToolUse);
         assert_eq!(message.response_id.as_deref(), Some("response-1"));
         assert_eq!(message.diagnostics.as_ref().map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn done_event_with_deferred_reason_keeps_terminal_deferred()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut converter = EventConverter::new(&model());
+        let _start = converter.apply(serde_json::from_value(json!({"type": "start"}))?)?;
+        let _text_start = converter.apply(serde_json::from_value(json!({
+            "type": "text_start", "contentIndex": 0
+        }))?)?;
+        let _delta = converter.apply(serde_json::from_value(json!({
+            "type": "text_delta", "contentIndex": 0, "delta": "queued"
+        }))?)?;
+
+        let terminal = converter.apply(serde_json::from_value(json!({
+            "type": "done",
+            "reason": "deferred",
+            "usage": empty_usage_json(),
+            "responseId": "response-9"
+        }))?)?;
+        let ConvertedEvent::Done(DoneReason::Deferred, message) = terminal else {
+            return Err("expected deferred done".into());
+        };
+        assert_eq!(message.stop_reason, StopReason::Deferred);
+        assert_eq!(serde_json::to_value(&message.content[0])?["text"], "queued");
         Ok(())
     }
 

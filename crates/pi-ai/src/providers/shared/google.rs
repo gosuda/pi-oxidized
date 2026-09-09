@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
 
+use crate::constrained_sampling::{ConstrainedSamplingError, resolve_json_schema_strict_sampling};
 use crate::provider::{StreamOptionKey, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, Context, DoneReason, ErrorReason,
@@ -85,7 +86,7 @@ pub(crate) fn build_request_body(
     context: &Context,
     options: &StreamOptions,
     thinking_config: Option<Value>,
-) -> Value {
+) -> Result<Value, GoogleFailure> {
     let mut body = Map::new();
     body.insert(
         "contents".to_owned(),
@@ -124,26 +125,32 @@ pub(crate) fn build_request_body(
     }
 
     if let Some(tools) = context.tools.as_deref().filter(|tools| !tools.is_empty()) {
-        if let Some(converted) = convert_tools(tools, false) {
-            body.insert("tools".to_owned(), converted);
-        }
-        if let Some(choice) = options
+        let supports_strict_mode = supports_google_strict_tool_sampling(&model.id);
+        let choice = options
             .extra_value(StreamOptionKey::TOOL_CHOICE)
             .and_then(Value::as_str)
             .or_else(|| {
                 options
                     .extra_value(StreamOptionKey::TOOL_CHOICE_SNAKE_CASE)
                     .and_then(Value::as_str)
-            })
+            });
+        let function_calling_mode =
+            resolve_google_function_calling_mode(tools, choice, supports_strict_mode)
+                .map_err(|error| GoogleFailure::error(error.to_string()))?;
+        if let Some(converted) = convert_tools(tools, false, supports_strict_mode)
+            .map_err(|error| GoogleFailure::error(error.to_string()))?
         {
+            body.insert("tools".to_owned(), converted);
+        }
+        if let Some(mode) = function_calling_mode {
             body.insert(
                 "toolConfig".to_owned(),
-                json!({"functionCallingConfig": {"mode": map_tool_choice(choice)}}),
+                json!({"functionCallingConfig": {"mode": mode}}),
             );
         }
     }
 
-    Value::Object(body)
+    Ok(Value::Object(body))
 }
 
 /// Convert pi conversation messages to Google `GenerateContent` contents.
@@ -162,7 +169,7 @@ pub(crate) fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
                 }
             }
             Message::Assistant(message) => {
-                if let Some(content) = convert_assistant_message(model, include_ids, message) {
+                if let Some(content) = convert_assistant_message(model, include_ids, *message) {
                     contents.push(content);
                 }
             }
@@ -373,13 +380,19 @@ fn append_tool_result(
 }
 
 /// Convert tools to Google's function-declaration wrapper.
-pub(crate) fn convert_tools(tools: &[Tool], use_parameters: bool) -> Option<Value> {
+pub(crate) fn convert_tools(
+    tools: &[Tool],
+    use_parameters: bool,
+    supports_strict_mode: bool,
+) -> Result<Option<Value>, ConstrainedSamplingError> {
     if tools.is_empty() {
-        return None;
+        return Ok(None);
     }
     let declarations = tools
         .iter()
         .map(|tool| {
+            let resolved = resolve_json_schema_strict_sampling(tool, supports_strict_mode)?;
+            let parameters = resolved.unwrap_or_else(|| tool.parameters.clone());
             let mut declaration = Map::new();
             declaration.insert("name".to_owned(), Value::String(tool.name.clone()));
             declaration.insert(
@@ -394,15 +407,36 @@ pub(crate) fn convert_tools(tools: &[Tool], use_parameters: bool) -> Option<Valu
                 }
                 .to_owned(),
                 if use_parameters {
-                    sanitize_schema_for_openapi(&tool.parameters)
+                    sanitize_schema_for_openapi(&parameters)
                 } else {
-                    tool.parameters.clone()
+                    parameters
                 },
             );
-            Value::Object(declaration)
+            Ok(Value::Object(declaration))
         })
-        .collect::<Vec<_>>();
-    Some(json!([{"functionDeclarations": declarations}]))
+        .collect::<Result<Vec<_>, ConstrainedSamplingError>>()?;
+    Ok(Some(json!([{"functionDeclarations": declarations}])))
+}
+
+fn resolve_google_function_calling_mode(
+    tools: &[Tool],
+    tool_choice: Option<&str>,
+    supports_strict_mode: bool,
+) -> Result<Option<&'static str>, ConstrainedSamplingError> {
+    let mut use_strict_mode = false;
+    for tool in tools {
+        if resolve_json_schema_strict_sampling(tool, supports_strict_mode)?.is_some() {
+            use_strict_mode = true;
+            break;
+        }
+    }
+    if matches!(tool_choice, Some("none" | "any")) {
+        return Ok(tool_choice.map(map_tool_choice));
+    }
+    if use_strict_mode {
+        return Ok(Some("VALIDATED"));
+    }
+    Ok(tool_choice.map(map_tool_choice))
 }
 
 fn sanitize_schema_for_openapi(schema: &Value) -> Value {
@@ -431,10 +465,7 @@ fn sanitize_schema_for_openapi(schema: &Value) -> Value {
     }
 }
 
-fn normalize_tool_call_id(id: &str, model: &Model) -> String {
-    if !requires_tool_call_id(&model.id) {
-        return id.to_owned();
-    }
+fn normalize_tool_call_id(id: &str, _target: &Model) -> String {
     id.chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
@@ -450,7 +481,6 @@ fn normalize_tool_call_id(id: &str, model: &Model) -> String {
 fn requires_tool_call_id(model_id: &str) -> bool {
     model_id.starts_with("claude-") || model_id.starts_with("gpt-oss-")
 }
-
 fn supports_multimodal_function_response(model_id: &str) -> bool {
     gemini_major_version(model_id).is_none_or(|version| version >= 3)
 }
@@ -465,6 +495,9 @@ fn gemini_major_version(model_id: &str) -> Option<u64> {
         return None;
     }
     suffix[..digit_count].parse().ok()
+}
+fn supports_google_strict_tool_sampling(model_id: &str) -> bool {
+    gemini_major_version(model_id).is_some_and(|version| version >= 3)
 }
 
 /// A streamed part is thinking only when Google marks `thought: true`.
@@ -645,7 +678,9 @@ pub(crate) async fn consume_response(
         StopReason::Stop => DoneReason::Stop,
         StopReason::Length => DoneReason::Length,
         StopReason::ToolUse => DoneReason::ToolUse,
-        StopReason::Error => return Err(GoogleFailure::error("An unknown error occurred")),
+        StopReason::Error | StopReason::Pending | StopReason::Deferred => {
+            return Err(GoogleFailure::error("An unknown error occurred"));
+        }
         StopReason::Aborted => return Err(GoogleFailure::aborted()),
     };
     sender
@@ -969,6 +1004,10 @@ pub(crate) async fn emit_failure(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
 mod tests {
     use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
@@ -977,7 +1016,10 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
-    use crate::types::{ImageContent, ModelCost, ToolResultMessage, UserMessage};
+    use crate::types::{
+        ConstrainedSampling, ConstrainedSamplingConfig, ImageContent, ModelCost, StrictMode,
+        ToolResultMessage, UserMessage,
+    };
 
     fn model(id: &str) -> Model {
         Model {
@@ -1068,16 +1110,17 @@ mod tests {
             name: "lookup".into(),
             description: "Lookup".into(),
             parameters: schema.clone(),
+            constrained_sampling: None,
         };
-        let full = convert_tools(std::slice::from_ref(&tool), false);
-        assert!(full.is_some(), "tool conversion should succeed");
+        let full = convert_tools(std::slice::from_ref(&tool), false, false)
+            .expect("tool conversion should succeed");
         let full = full.as_ref().unwrap_or(&Value::Null);
         assert_eq!(
             full.pointer("/0/functionDeclarations/0/parametersJsonSchema/$schema"),
             Some(&json!("https://json-schema.org/draft/2020-12/schema"))
         );
-        let openapi = convert_tools(&[tool], true);
-        assert!(openapi.is_some(), "openapi tool conversion should succeed");
+        let openapi =
+            convert_tools(&[tool], true, false).expect("openapi tool conversion should succeed");
         let openapi = openapi.as_ref().unwrap_or(&Value::Null);
         assert!(
             openapi
@@ -1097,7 +1140,108 @@ mod tests {
             schema["$schema"],
             json!("https://json-schema.org/draft/2020-12/schema")
         );
-        assert!(convert_tools(&[], false).is_none());
+        assert!(
+            convert_tools(&[], false, false)
+                .expect("empty tool conversion should succeed")
+                .is_none()
+        );
+    }
+    #[test]
+    fn strict_gemini_tools_validate_and_explicit_choice_wins() {
+        let tool = Tool {
+            name: "lookup".into(),
+            description: "Lookup".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            constrained_sampling: Some(ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema {
+                    strict: StrictMode::Prefer,
+                },
+            )),
+        };
+        let context = Context {
+            tools: Some(vec![tool]),
+            ..Context::default()
+        };
+        let strict_model = model("gemini-3-pro-preview");
+        let payload = build_request_body(&strict_model, &context, &StreamOptions::default(), None)
+            .expect("strict Google payload should succeed");
+        assert_eq!(
+            payload.pointer(
+                "/tools/0/functionDeclarations/0/parametersJsonSchema/additionalProperties"
+            ),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            payload.pointer("/toolConfig/functionCallingConfig/mode"),
+            Some(&json!("VALIDATED"))
+        );
+
+        let legacy_payload = build_request_body(
+            &model("gemini-2.5-flash"),
+            &context,
+            &StreamOptions::default(),
+            None,
+        )
+        .expect("legacy Google payload should fall back");
+        assert!(legacy_payload.get("toolConfig").is_none());
+        assert_eq!(
+            legacy_payload.pointer(
+                "/tools/0/functionDeclarations/0/parametersJsonSchema/additionalProperties"
+            ),
+            None
+        );
+
+        let mut options = StreamOptions::default();
+        options.insert_extra(StreamOptionKey::TOOL_CHOICE, Value::String("auto".into()));
+        let payload = build_request_body(&strict_model, &context, &options, None)
+            .expect("explicit Google tool choice should succeed");
+        assert_eq!(
+            payload.pointer("/toolConfig/functionCallingConfig/mode"),
+            Some(&json!("VALIDATED"))
+        );
+
+        options.insert_extra(StreamOptionKey::TOOL_CHOICE, Value::String("none".into()));
+        let payload = build_request_body(&strict_model, &context, &options, None)
+            .expect("explicit Google none choice should succeed");
+        assert_eq!(
+            payload.pointer("/toolConfig/functionCallingConfig/mode"),
+            Some(&json!("NONE"))
+        );
+    }
+
+    #[test]
+    fn require_strict_google_schema_reaches_request_error() {
+        let context = Context {
+            tools: Some(vec![Tool {
+                name: "lookup".into(),
+                description: "Lookup".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"path": {"$ref": "#/$defs/path"}}
+                }),
+                constrained_sampling: Some(ConstrainedSampling::Config(
+                    ConstrainedSamplingConfig::JsonSchema {
+                        strict: StrictMode::Require,
+                    },
+                )),
+            }]),
+            ..Context::default()
+        };
+        let error = build_request_body(
+            &model("gemini-3-pro-preview"),
+            &context,
+            &StreamOptions::default(),
+            None,
+        )
+        .expect_err("unsupported required strict schema must fail");
+        assert_eq!(
+            error.message,
+            "Tool \"lookup\" requires JSON-schema constrained sampling, but $ref schemas are unsupported."
+        );
     }
 
     #[test]
@@ -1120,7 +1264,10 @@ mod tests {
         );
         let context = Context {
             system_prompt: None,
-            messages: vec![Message::Assistant(assistant), Message::ToolResult(result)],
+            messages: vec![
+                Message::Assistant(Box::new(assistant)),
+                Message::ToolResult(result),
+            ],
             tools: None,
         };
 

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures::{StreamExt, stream::BoxStream};
+use futures::{StreamExt, stream, stream::BoxStream};
 use reqwest::{Client, Request, Response};
 use serde_json::{Value, json};
 
@@ -15,10 +15,11 @@ use super::shared::responses::{
 };
 use super::shared::truncate_error_body;
 use super::transport::{DataSseDecoder, DataSseEvent, HttpTransport, TransportError};
+use crate::constrained_sampling::grammar_tool_input_properties;
 use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
 use crate::types::{
-    AssistantContent, AssistantMessage, CacheRetention, Context, ErrorReason, Message, Model,
-    ModelThinkingLevel, Tool,
+    AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context,
+    ErrorReason, Message, Model, ModelThinkingLevel, StopReason, Tool,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -39,7 +40,6 @@ impl OpenAiResponses {
         }
     }
 }
-
 impl Provider for OpenAiResponses {
     fn stream(
         &self,
@@ -47,19 +47,52 @@ impl Provider for OpenAiResponses {
         context: Context,
         options: StreamOptions,
     ) -> BoxStream<'static, Result<crate::types::AssistantMessageEvent, ProviderError>> {
-        let (sender, stream) = super::stream_state::ProviderEventSender::channel(
-            NonZeroUsize::new(EVENT_CHANNEL_CAPACITY).unwrap_or(NonZeroUsize::MIN),
-        );
         let adapter = self.clone();
         let model = resolve_model(model, options.env.as_ref()).into_owned();
-        tokio::spawn(async move {
-            let request_tier = string_option(&options, StreamOptionKey::SERVICE_TIER);
+        stream::once(async move {
+            let grammar_properties = match grammar_tool_input_properties(
+                context.tools.as_deref(),
+                compat_bool(&model, "supportsOpenAIGrammarTools", false),
+            ) {
+                Ok(properties) => properties,
+                Err(error) => {
+                    return stream::once(async move {
+                        Ok(prestart_error(
+                            &model,
+                            ErrorReason::Error,
+                            error.to_string(),
+                        ))
+                    })
+                    .boxed();
+                }
+            };
+            let (request, grammar_properties) = match adapter
+                .prepare_request(&model, &context, &options, grammar_properties)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(failure) => {
+                    let cancelled = options
+                        .signal
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                    let (reason, message) = format_failure(&failure, cancelled);
+                    return stream::once(
+                        async move { Ok(prestart_error(&model, reason, message)) },
+                    )
+                    .boxed();
+                }
+            };
+            let (sender, stream) = super::stream_state::ProviderEventSender::channel(
+                NonZeroUsize::new(EVENT_CHANNEL_CAPACITY).unwrap_or(NonZeroUsize::MIN),
+            );
             let message = AssistantMessage::new(
                 model.api.clone(),
                 model.provider.clone(),
                 model.id.clone(),
                 unix_millis(),
             );
+            let request_tier = string_option(&options, StreamOptionKey::SERVICE_TIER);
             let mut processor = ResponsesStreamProcessor::new(
                 model.clone(),
                 message,
@@ -68,45 +101,61 @@ impl Provider for OpenAiResponses {
                     request_service_tier: request_tier,
                     apply_service_tier_pricing: true,
                     default_service_tier_uses_request: false,
+                    grammar_tool_input_properties: grammar_properties,
                 },
             );
-            if processor.start().await.is_err() {
-                return;
-            }
-            if let Err(failure) = adapter
-                .run(&model, &context, &options, &mut processor)
-                .await
-            {
-                let cancelled = options
-                    .signal
-                    .as_ref()
-                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
-                let (reason, message) = format_failure(&failure, cancelled);
-                let _terminal = processor.fail(reason, message).await;
-            }
-        });
-        stream
+            let run_adapter = adapter.clone();
+            tokio::spawn(async move {
+                if processor.start().await.is_err() {
+                    return;
+                }
+                if let Err(failure) = run_adapter
+                    .run(&model, &options, &mut processor, request)
+                    .await
+                {
+                    let cancelled = options
+                        .signal
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                    let (reason, message) = format_failure(&failure, cancelled);
+                    let _terminal = processor.fail(reason, message).await;
+                }
+            });
+            stream
+        })
+        .flatten()
+        .boxed()
     }
 }
 
 impl OpenAiResponses {
-    async fn run(
+    async fn prepare_request(
         &self,
         model: &Model,
         context: &Context,
         options: &StreamOptions,
-        processor: &mut ResponsesStreamProcessor,
-    ) -> Result<(), AdapterFailure> {
+        grammar_properties: BTreeMap<String, String>,
+    ) -> Result<(Request, BTreeMap<String, String>), AdapterFailure> {
         let cache_retention = resolve_cache_retention(options);
         let headers = build_headers(model, context, options, cache_retention);
         ensure_auth(model, options, &headers)?;
-        let mut payload = build_payload(model, context, options, cache_retention);
+        let mut payload = build_payload(model, context, options, cache_retention)?;
         if let Some(callback) = options.on_payload.as_ref() {
             callback(&mut payload, model)
                 .await
                 .map_err(|error| AdapterFailure::new(error.to_string()))?;
         }
         let request = build_request(&self.transport, model, options, headers, &payload)?;
+        Ok((request, grammar_properties))
+    }
+
+    async fn run(
+        &self,
+        model: &Model,
+        options: &StreamOptions,
+        processor: &mut ResponsesStreamProcessor,
+        request: Request,
+    ) -> Result<(), AdapterFailure> {
         let response = self
             .transport
             .execute(
@@ -120,7 +169,6 @@ impl OpenAiResponses {
         consume_response(response, options, processor).await
     }
 }
-
 async fn consume_response(
     response: Response,
     options: &StreamOptions,
@@ -283,8 +331,13 @@ fn build_payload(
     context: &Context,
     options: &StreamOptions,
     cache_retention: CacheRetention,
-) -> Value {
+) -> Result<Value, AdapterFailure> {
     let supports_tool_search = compat_bool(model, "supportsToolSearch", false);
+    let supports_strict_mode = compat_bool(model, "supportsStrictMode", true);
+    let supports_openai_grammar_tools = compat_bool(model, "supportsOpenAIGrammarTools", false);
+    let grammar_properties =
+        grammar_tool_input_properties(context.tools.as_deref(), supports_openai_grammar_tools)
+            .map_err(|error| AdapterFailure::new(error.to_string()))?;
     let (immediate_tools, deferred_tools) = split_deferred_tools(context, supports_tool_search);
     let allowed: BTreeSet<String> = ["openai", "openai-codex", "opencode"]
         .into_iter()
@@ -297,8 +350,15 @@ fn build_payload(
         &ConvertMessagesOptions {
             include_system_prompt: true,
             deferred_tools,
+            grammar_tool_input_properties: grammar_properties,
+            tool_options: ConvertToolsOptions {
+                supports_strict_mode,
+                supports_openai_grammar_tools,
+                ..ConvertToolsOptions::default()
+            },
         },
-    );
+    )
+    .map_err(|error| AdapterFailure::new(error.to_string()))?;
     let mut payload = json!({
         "model": model.id,
         "input": input,
@@ -330,16 +390,23 @@ fn build_payload(
         payload["service_tier"] = value.clone();
     }
     if !immediate_tools.is_empty() {
-        payload["tools"] = Value::Array(convert_tools(
-            &immediate_tools,
-            ConvertToolsOptions::default(),
-        ));
+        payload["tools"] = Value::Array(
+            convert_tools(
+                &immediate_tools,
+                ConvertToolsOptions {
+                    supports_strict_mode,
+                    supports_openai_grammar_tools,
+                    ..ConvertToolsOptions::default()
+                },
+            )
+            .map_err(|error| AdapterFailure::new(error.to_string()))?,
+        );
     }
     if let Some(tool_choice) = options.extra_value(StreamOptionKey::TOOL_CHOICE) {
         payload["tool_choice"] = tool_choice.clone();
     }
     apply_reasoning(model, options, &mut payload, true);
-    payload
+    Ok(payload)
 }
 
 fn apply_reasoning(
@@ -527,7 +594,26 @@ fn unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Debug)]
+fn prestart_error(
+    model: &Model,
+    reason: ErrorReason,
+    message: String,
+) -> crate::types::AssistantMessageEvent {
+    let mut error = AssistantMessage::new(
+        model.api.clone(),
+        model.provider.clone(),
+        model.id.clone(),
+        unix_millis(),
+    );
+    error.stop_reason = match reason {
+        ErrorReason::Aborted => StopReason::Aborted,
+        ErrorReason::Error => StopReason::Error,
+    };
+    error.error_message = Some(message);
+    AssistantMessageEvent::Error { reason, error }
+}
+
+#[derive(Debug)]
 struct AdapterFailure {
     message: String,
     aborted: bool,
@@ -563,6 +649,8 @@ impl AdapterFailure {
 fn format_failure(failure: &AdapterFailure, cancelled: bool) -> (ErrorReason, String) {
     if cancelled || failure.aborted {
         (ErrorReason::Aborted, failure.message.clone())
+    } else if failure.message.starts_with("Tool \"") {
+        (ErrorReason::Error, failure.message.clone())
     } else {
         (
             ErrorReason::Error,
@@ -572,6 +660,10 @@ fn format_failure(failure: &AdapterFailure, cancelled: bool) -> (ErrorReason, St
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
 mod tests {
     use super::*;
     use crate::types::{DoneReason, ModelCost, ModelInput, StopReason};
@@ -612,7 +704,8 @@ mod tests {
             Value::String("high".into()),
         );
         options.insert_extra(StreamOptionKey::SERVICE_TIER, Value::String("flex".into()));
-        let payload = build_payload(&model(), &context, &options, CacheRetention::Long);
+        let payload = build_payload(&model(), &context, &options, CacheRetention::Long)
+            .expect("default request payload conversion succeeds");
         assert_eq!(payload["store"], false);
         assert_eq!(payload["max_output_tokens"], MIN_OUTPUT_TOKENS);
         assert_eq!(payload["prompt_cache_key"].as_str().map(str::len), Some(64));
@@ -631,7 +724,8 @@ mod tests {
             &context,
             &StreamOptions::default(),
             CacheRetention::None,
-        );
+        )
+        .expect("default request payload conversion succeeds");
         assert_eq!(payload["prompt_cache_options"], json!({"mode": "explicit"}));
         // Long retention on the same model: no explicit marker.
         let payload = build_payload(
@@ -639,7 +733,8 @@ mod tests {
             &context,
             &StreamOptions::default(),
             CacheRetention::Long,
-        );
+        )
+        .expect("default request payload conversion succeeds");
         assert_eq!(payload.get("prompt_cache_options"), None);
         // Retention none without the flag: no marker either.
         let payload = build_payload(
@@ -647,7 +742,8 @@ mod tests {
             &context,
             &StreamOptions::default(),
             CacheRetention::None,
-        );
+        )
+        .expect("default request payload conversion succeeds");
         assert_eq!(payload.get("prompt_cache_options"), None);
     }
     #[test]
@@ -659,7 +755,8 @@ mod tests {
             &context,
             &StreamOptions::default(),
             CacheRetention::None,
-        );
+        )
+        .expect("default request payload conversion succeeds");
         assert_eq!(payload.get("prompt_cache_key"), None);
         assert_eq!(payload.get("prompt_cache_retention"), None);
         // Effort without summary: auto summary plus encrypted include.
@@ -668,7 +765,8 @@ mod tests {
             StreamOptionKey::REASONING_EFFORT,
             Value::String("medium".into()),
         );
-        let payload = build_payload(&model(), &context, &options, CacheRetention::None);
+        let payload = build_payload(&model(), &context, &options, CacheRetention::None)
+            .expect("default request payload conversion succeeds");
         assert_eq!(payload["reasoning"]["effort"], "medium");
         assert_eq!(payload["reasoning"]["summary"], "auto");
         assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
@@ -678,7 +776,8 @@ mod tests {
             &context,
             &StreamOptions::default(),
             CacheRetention::None,
-        );
+        )
+        .expect("default request payload conversion succeeds");
         assert_eq!(payload["reasoning"]["effort"], "none");
         // Copilot skips the implicit off; xAI always requests encrypted reasoning.
         let mut copilot = model();
@@ -688,7 +787,8 @@ mod tests {
             &context,
             &StreamOptions::default(),
             CacheRetention::None,
-        );
+        )
+        .expect("default request payload conversion succeeds");
         assert_eq!(payload.get("reasoning"), None);
         let mut xai = model();
         xai.provider = "xai".into();
@@ -697,7 +797,8 @@ mod tests {
             &context,
             &StreamOptions::default(),
             CacheRetention::None,
-        );
+        )
+        .expect("default request payload conversion succeeds");
         assert_eq!(payload["include"], json!(["reasoning.encrypted_content"]));
     }
 

@@ -267,6 +267,7 @@ fn bench_config() -> AgentLoopConfig {
     AgentLoopConfig {
         model: bench_model(),
         reasoning: None,
+        tool_choice: None,
         temperature: None,
         max_tokens: None,
         session_id: None,

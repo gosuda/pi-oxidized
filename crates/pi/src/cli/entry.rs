@@ -101,7 +101,17 @@ impl Io {
         let dispatcher = DefaultDispatcher::new()
             .with_interactive(|dispatched, runtime| {
                 Box::pin(async move {
-                    let _ = dispatched;
+                    let cli_tui_mode = dispatched.tui_mode;
+                    let (settings_tui_mode, exit_output, scrollbar, copy_on_select) = {
+                        let session = runtime.session();
+                        let settings = session.lock_settings();
+                        (
+                            settings.get_tui_mode(),
+                            settings.get_fullscreen_exit_output(),
+                            settings.get_fullscreen_scrollbar(),
+                            settings.get_fullscreen_copy_on_select(),
+                        )
+                    };
                     let overrides = {
                         let session = runtime.session();
                         let settings = session.lock_settings();
@@ -110,13 +120,17 @@ impl Io {
                     // Detection probes the terminal with blocking I/O; keep it
                     // off the runtime worker. Read settings before awaiting so
                     // no session or settings lock guard crosses the boundary.
-                    let options = tokio::task::spawn_blocking(move || {
+                    let mut options = tokio::task::spawn_blocking(move || {
                         InteractiveRuntimeOptions::detect_with_overrides(overrides)
                     })
                     .await
                     .map_err(|error| {
                         format!("interactive: capability detection join failed: {error}")
                     })?;
+                    options.screen_mode = cli_tui_mode.unwrap_or(settings_tui_mode);
+                    options.fullscreen_exit_output = exit_output;
+                    options.fullscreen_scrollbar = scrollbar;
+                    options.fullscreen_copy_on_select = copy_on_select;
                     run_interactive_mode(runtime, options)
                         .await
                         .map_err(|error| format!("interactive: {error}"))

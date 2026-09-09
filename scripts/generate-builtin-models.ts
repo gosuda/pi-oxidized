@@ -8,15 +8,35 @@
  * forbidden; runtime never needs Bun.
  *
  * Usage: bun run scripts/generate-builtin-models.ts
+ * Usage (freshness check): bun run scripts/generate-builtin-models.ts --check
+ *
+ * OFFLINE prep mode (`--offline-capture <dir>`): a second, independent input
+ * path that prepares a builtin-models catalog from an already-captured,
+ * provenance-pinned snapshot instead of the live canonical reference
+ * checkout. `<dir>` must contain `public-catalog-provenance.json` (fields:
+ * `sourceRoot`, `sourceSha`, `catalogSha256`, `providers`, `models`) and a
+ * `public-catalog-capture/models.json` catalog file. The mode re-verifies
+ * the capture's exact git source SHA via `readReferenceHead`, re-hashes the
+ * catalog bytes against the pinned `catalogSha256`, cross-checks the
+ * provenance-declared provider/model counts, and runs the parsed catalog
+ * through the same provider-set and encoding normalization as the default
+ * path. Output never touches `OUTPUT_PATH`: it lands under
+ * `target/reference-prep/<sourceSha-short>/builtin-models.prep.json` plus a
+ * `builtin-models.prep.manifest.json` sidecar. Default and `--check`
+ * behavior are unaffected by this mode's presence; it never activates
+ * unless `--offline-capture` is explicit on the command line, and it never
+ * reaches the network or a second canonical registry.
  */
 
-import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	assertCanonicalReference,
 	canonicalReferenceRoot,
+	readReferenceHead,
 } from "./reference-identity.ts";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -28,7 +48,7 @@ const REFERENCE_MODELS_PATH = join(
 const OUTPUT_PATH = join(REPO_ROOT, "crates/pi-ai/data/builtin-models.json");
 
 /** Static provider set from models.generated.ts MODELS keys (sorted). */
-const EXPECTED_PROVIDER_IDS = [
+export const EXPECTED_PROVIDER_IDS = [
 	"amazon-bedrock",
 	"ant-ling",
 	"anthropic",
@@ -69,6 +89,28 @@ const EXPECTED_PROVIDER_IDS = [
 	"zai",
 	"zai-coding-cn",
 ] as const;
+
+// ---------------------------------------------------------------------------
+// OFFLINE prep mode constants
+// ---------------------------------------------------------------------------
+
+/** Provenance sidecar filename expected inside `--offline-capture <dir>`. */
+const OFFLINE_PROVENANCE_FILENAME = "public-catalog-provenance.json";
+/** Capture subdirectory name inside `--offline-capture <dir>`. */
+const OFFLINE_CAPTURE_SUBDIR = "public-catalog-capture";
+/** Frozen catalog filename inside the capture subdirectory. */
+const OFFLINE_CATALOG_FILENAME = "models.json";
+/** Prep output root, isolated from the canonical generated artifact tree. */
+const OFFLINE_OUTPUT_ROOT = join(REPO_ROOT, "target/reference-prep");
+/** Prep artifact filename, distinct from the canonical builtin-models.json. */
+const OFFLINE_ARTIFACT_FILENAME = "builtin-models.prep.json";
+/** Prep artifact provenance sidecar filename. */
+const OFFLINE_MANIFEST_FILENAME = "builtin-models.prep.manifest.json";
+/** Recorded in the prep manifest's `generator` field. */
+const OFFLINE_GENERATOR_LABEL = "scripts/generate-builtin-models.ts --offline-capture";
+
+const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
 
 function fail(message: string): never {
 	console.error(message);
@@ -309,7 +351,6 @@ async function writeAtomically(path: string, contents: string): Promise<void> {
 		await rename(tempPath, path);
 	} catch (error) {
 		try {
-			const { unlink } = await import("node:fs/promises");
 			await unlink(tempPath);
 		} catch {
 			// best-effort temp cleanup
@@ -319,7 +360,11 @@ async function writeAtomically(path: string, contents: string): Promise<void> {
 	}
 }
 
-function summarize(catalog: Record<string, Record<string, unknown>>): string {
+function catalogTotals(catalog: Record<string, Record<string, unknown>>): {
+	providerIds: string[];
+	totalModels: number;
+	lines: string[];
+} {
 	const providerIds = Object.keys(catalog).sort();
 	let totalModels = 0;
 	const lines: string[] = [];
@@ -329,6 +374,11 @@ function summarize(catalog: Record<string, Record<string, unknown>>): string {
 		totalModels += count;
 		lines.push(`  ${providerId}: ${count}`);
 	}
+	return { providerIds, totalModels, lines };
+}
+
+function summarize(catalog: Record<string, Record<string, unknown>>): string {
+	const { providerIds, totalModels, lines } = catalogTotals(catalog);
 	return [
 		`Wrote ${OUTPUT_PATH}`,
 		`providers: ${providerIds.length}`,
@@ -338,7 +388,248 @@ function summarize(catalog: Record<string, Record<string, unknown>>): string {
 	].join("\n");
 }
 
+function summarizeOffline(
+	catalog: Record<string, Record<string, unknown>>,
+	artifactPath: string,
+	sourcePath: string,
+): string {
+	const { providerIds, totalModels, lines } = catalogTotals(catalog);
+	return [
+		`Wrote ${artifactPath}`,
+		`providers: ${providerIds.length}`,
+		`models: ${totalModels}`,
+		`source: ${sourcePath}`,
+		...lines,
+	].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// OFFLINE prep mode
+// ---------------------------------------------------------------------------
+
+interface OfflineProvenance {
+	readonly schemaVersion: number;
+	readonly sourceRoot: string;
+	readonly sourceSha: string;
+	readonly catalogSha256: string;
+	readonly providers: number;
+	readonly models: number;
+}
+
+/** Validates the subset of provenance fields this mode depends on; tolerates extra fields. */
+function parseOfflineProvenance(raw: unknown, provenancePath: string): OfflineProvenance {
+	if (!isPlainObject(raw)) {
+		fail(`missing prerequisite: offline provenance ${provenancePath} is not a JSON object`);
+	}
+	const { schemaVersion, sourceRoot, sourceSha, catalogSha256, providers, models } = raw;
+	if (typeof schemaVersion !== "number" || !Number.isInteger(schemaVersion)) {
+		fail(
+			`missing prerequisite: offline provenance ${provenancePath} field "schemaVersion" is not an integer`,
+		);
+	}
+	if (typeof sourceRoot !== "string" || sourceRoot.length === 0) {
+		fail(
+			`missing prerequisite: offline provenance ${provenancePath} field "sourceRoot" is not a non-empty string`,
+		);
+	}
+	if (typeof sourceSha !== "string" || !FULL_SHA_PATTERN.test(sourceSha)) {
+		fail(
+			`missing prerequisite: offline provenance ${provenancePath} field "sourceSha" is not a full 40-hex-character SHA`,
+		);
+	}
+	if (typeof catalogSha256 !== "string" || !SHA256_HEX_PATTERN.test(catalogSha256)) {
+		fail(
+			`missing prerequisite: offline provenance ${provenancePath} field "catalogSha256" is not a 64-hex-character SHA-256`,
+		);
+	}
+	if (typeof providers !== "number" || !Number.isInteger(providers) || providers <= 0) {
+		fail(
+			`missing prerequisite: offline provenance ${provenancePath} field "providers" is not a positive integer`,
+		);
+	}
+	if (typeof models !== "number" || !Number.isInteger(models) || models <= 0) {
+		fail(
+			`missing prerequisite: offline provenance ${provenancePath} field "models" is not a positive integer`,
+		);
+	}
+	return { schemaVersion, sourceRoot, sourceSha, catalogSha256, providers, models };
+}
+
+async function loadOfflineProvenance(provenancePath: string): Promise<OfflineProvenance> {
+	await assertPathReadable(provenancePath, "offline capture provenance");
+	const raw = await readFile(provenancePath, "utf8");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		fail(`missing prerequisite: offline provenance ${provenancePath} is not valid JSON: ${detail}`);
+	}
+	return parseOfflineProvenance(parsed, provenancePath);
+}
+
+/** Fail-closed gate: the capture's recorded source commit must equal the live checkout HEAD. */
+function assertOfflineSourceSha(provenance: OfflineProvenance, provenancePath: string): void {
+	const referenceRoot = resolve(REPO_ROOT, provenance.sourceRoot);
+	let head: string;
+	try {
+		head = readReferenceHead(referenceRoot);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		fail(
+			`offline capture source unreadable: ${provenancePath} sourceRoot "${provenance.sourceRoot}" (${referenceRoot}): ${detail}`,
+		);
+	}
+	if (head !== provenance.sourceSha) {
+		fail(
+			`offline capture source mismatch: ${provenancePath} sourceSha ${provenance.sourceSha} != live HEAD ${head} at ${referenceRoot}`,
+		);
+	}
+}
+
+async function loadFrozenCapture(
+	catalogPath: string,
+	provenance: OfflineProvenance,
+	provenancePath: string,
+): Promise<Record<string, Record<string, unknown>>> {
+	await assertPathReadable(catalogPath, "offline capture catalog");
+	const raw = await readFile(catalogPath, "utf8");
+	const actualSha256 = createHash("sha256").update(raw, "utf8").digest("hex");
+	if (actualSha256 !== provenance.catalogSha256) {
+		fail(
+			`offline capture catalog hash mismatch: ${catalogPath} sha256 ${actualSha256} != provenance ${provenancePath} catalogSha256 ${provenance.catalogSha256}`,
+		);
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		fail(`offline capture catalog ${catalogPath} is not valid JSON: ${detail}`);
+	}
+	if (!isPlainObject(parsed)) {
+		fail(`offline capture catalog ${catalogPath} root is not an object`);
+	}
+
+	const catalog = Object.create(null) as Record<string, Record<string, unknown>>;
+	let modelCount = 0;
+	for (const [providerId, providerModels] of Object.entries(parsed)) {
+		if (!isPlainObject(providerModels)) {
+			fail(`offline capture catalog ${catalogPath} provider "${providerId}" is not a model map`);
+		}
+		const providerCatalog = Object.create(null) as Record<string, unknown>;
+		for (const [modelId, model] of Object.entries(providerModels)) {
+			if (!isPlainObject(model)) {
+				fail(
+					`offline capture catalog ${catalogPath} model "${providerId}/${modelId}" is not an object`,
+				);
+			}
+			providerCatalog[modelId] = cloneJsonValue(model);
+			modelCount += 1;
+		}
+		catalog[providerId] = providerCatalog;
+	}
+
+	const providerCount = Object.keys(catalog).length;
+	if (providerCount !== provenance.providers) {
+		fail(
+			`offline capture provider count mismatch: ${catalogPath} has ${providerCount} providers != provenance ${provenancePath} providers ${provenance.providers}`,
+		);
+	}
+	if (modelCount !== provenance.models) {
+		fail(
+			`offline capture model count mismatch: ${catalogPath} has ${modelCount} models != provenance ${provenancePath} models ${provenance.models}`,
+		);
+	}
+
+	return catalog;
+}
+
+/** Deterministic prep output locations, keyed off the verified source SHA. */
+export function offlineOutputPaths(sourceSha: string): {
+	readonly dir: string;
+	readonly artifactPath: string;
+	readonly manifestPath: string;
+} {
+	const dir = join(OFFLINE_OUTPUT_ROOT, sourceSha.slice(0, 8));
+	return {
+		dir,
+		artifactPath: join(dir, OFFLINE_ARTIFACT_FILENAME),
+		manifestPath: join(dir, OFFLINE_MANIFEST_FILENAME),
+	};
+}
+
+function assertOfflineOutputIsolated(path: string): void {
+	if (resolve(path) === resolve(OUTPUT_PATH)) {
+		fail(`offline prep refuses to overwrite canonical catalog: ${path}`);
+	}
+}
+
+async function runOfflinePrep(captureRootArg: string): Promise<void> {
+	const captureRoot = resolve(REPO_ROOT, captureRootArg);
+	const provenancePath = join(captureRoot, OFFLINE_PROVENANCE_FILENAME);
+	const catalogPath = join(captureRoot, OFFLINE_CAPTURE_SUBDIR, OFFLINE_CATALOG_FILENAME);
+
+	const provenance = await loadOfflineProvenance(provenancePath);
+	assertOfflineSourceSha(provenance, provenancePath);
+	const catalog = await loadFrozenCapture(catalogPath, provenance, provenancePath);
+	validateProviderSet(catalog);
+	const sorted = buildSortedCatalog(catalog);
+	const encoded = encodeCatalog(sorted);
+	validateEncodedCatalog(encoded, sorted);
+
+	const { artifactPath, manifestPath } = offlineOutputPaths(provenance.sourceSha);
+	assertOfflineOutputIsolated(artifactPath);
+	assertOfflineOutputIsolated(manifestPath);
+
+	await writeAtomically(artifactPath, encoded);
+	const manifest = {
+		generator: OFFLINE_GENERATOR_LABEL,
+		sourceRoot: provenance.sourceRoot,
+		sourceSha: provenance.sourceSha,
+		outputSha256: createHash("sha256").update(encoded, "utf8").digest("hex"),
+	};
+	await writeAtomically(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+	process.stdout.write(`${summarizeOffline(sorted, artifactPath, catalogPath)}\n`);
+}
+
+// ---------------------------------------------------------------------------
+// CLI dispatch
+// ---------------------------------------------------------------------------
+
+type CliArgs =
+	| { readonly mode: "default" }
+	| { readonly mode: "check" }
+	| { readonly mode: "offline"; readonly offlineCaptureDir: string };
+
+function parseCliArgs(argv: readonly string[]): CliArgs {
+	const offlineIndex = argv.indexOf("--offline-capture");
+	const hasCheck = argv.includes("--check");
+	if (offlineIndex !== -1) {
+		if (hasCheck) {
+			fail("usage: --offline-capture and --check are mutually exclusive");
+		}
+		const offlineCaptureDir = argv[offlineIndex + 1];
+		if (offlineCaptureDir === undefined || offlineCaptureDir.startsWith("--")) {
+			fail("usage: --offline-capture requires a directory argument");
+		}
+		return { mode: "offline", offlineCaptureDir };
+	}
+	return { mode: hasCheck ? "check" : "default" };
+}
+
 async function main(): Promise<void> {
+	const args = parseCliArgs(process.argv);
+	if (args.mode === "offline") {
+		// Explicit non-default path: caller-owned gating via the capture's own
+		// provenance-pinned source SHA, never the canonical B assertion below.
+		assertBunRuntime();
+		await runOfflinePrep(args.offlineCaptureDir);
+		return;
+	}
+
 	// Fail closed before the reference catalog is imported or read.
 	assertCanonicalReference();
 	assertBunRuntime();
@@ -347,7 +638,7 @@ async function main(): Promise<void> {
 	const sorted = buildSortedCatalog(catalog);
 	const encoded = encodeCatalog(sorted);
 	validateEncodedCatalog(encoded, sorted);
-	if (process.argv.includes("--check")) {
+	if (args.mode === "check") {
 		const onDisk = await readFile(OUTPUT_PATH, "utf8").catch(() => null);
 		if (onDisk !== encoded) {
 			process.stderr.write(`stale builtin-models catalog: ${OUTPUT_PATH}\n`);

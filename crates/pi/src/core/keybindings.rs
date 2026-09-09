@@ -81,6 +81,11 @@ fn app_default_rows() -> Vec<AppDefault> {
             description: "Cycle thinking level",
         },
         AppDefault {
+            id: "app.thinking.save",
+            keys: &["ctrl+s"],
+            description: "Save thinking level",
+        },
+        AppDefault {
             id: "app.model.cycleForward",
             keys: &["ctrl+p"],
             description: "Cycle to next model",

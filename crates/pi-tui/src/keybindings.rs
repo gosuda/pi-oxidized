@@ -1,8 +1,8 @@
 //! Keybinding definitions, defaults, and conflict detection.
 //!
 //! Ports `.references/pi-2.0/packages/tui/src/keybindings.ts` including the exact
-//! 31 `TUI_KEYBINDINGS` defaults (lines 54–134) and `KeybindingsManager`
-//! user-claim conflict detection.
+//! 45 `TUI_KEYBINDINGS` defaults (including the fullscreen table) and
+//! `KeybindingsManager` user-claim conflict detection.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{LazyLock, Mutex};
@@ -203,9 +203,79 @@ const DEFAULT_BINDINGS: [DefaultBinding; TUI_KEYBINDING_COUNT] = [
         keys: &["escape", "ctrl+c"],
         description: "Cancel selection",
     },
+    DefaultBinding {
+        id: "tui.altScreen.pageUp",
+        keys: &["pageUp"],
+        description: "Scroll viewport up one page",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.pageDown",
+        keys: &["pageDown"],
+        description: "Scroll viewport down one page",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.halfPageUp",
+        keys: &[],
+        description: "Scroll viewport up half a page",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.halfPageDown",
+        keys: &[],
+        description: "Scroll viewport down half a page",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.lineUp",
+        keys: &[],
+        description: "Scroll viewport up one line",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.lineDown",
+        keys: &[],
+        description: "Scroll viewport down one line",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.previousPrompt",
+        keys: &["ctrl+shift+up", "ctrl+up"],
+        description: "Jump to previous semantic prompt",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.nextPrompt",
+        keys: &["ctrl+shift+down", "ctrl+down"],
+        description: "Jump to next semantic prompt",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.search",
+        keys: &["ctrl+shift+f"],
+        description: "Search the primary scroll view",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.searchNext",
+        keys: &["enter", "ctrl+g"],
+        description: "Select the next search match",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.searchPrevious",
+        keys: &["shift+enter", "ctrl+shift+g"],
+        description: "Select the previous search match",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.searchClose",
+        keys: &["escape"],
+        description: "Close transcript search",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.top",
+        keys: &["home"],
+        description: "Scroll viewport to top",
+    },
+    DefaultBinding {
+        id: "tui.altScreen.bottom",
+        keys: &["end"],
+        description: "Scroll viewport to bottom",
+    },
 ];
 
-/// Exact 31 default TUI keybindings from `keybindings.ts:54-134`.
+/// Exact 45 default TUI keybindings from `keybindings.ts:54-206`.
 #[must_use]
 pub fn tui_keybindings() -> KeybindingDefinitions {
     DEFAULT_BINDINGS
@@ -221,9 +291,9 @@ pub fn tui_keybindings() -> KeybindingDefinitions {
 }
 
 /// Number of entries in [`tui_keybindings`] / `TUI_KEYBINDINGS`.
-pub const TUI_KEYBINDING_COUNT: usize = 31;
+pub const TUI_KEYBINDING_COUNT: usize = 45;
 
-/// Stable ordered list of the 31 default action ids.
+/// Stable ordered list of the 45 default action ids.
 pub const TUI_KEYBINDING_IDS: [&str; TUI_KEYBINDING_COUNT] = [
     "tui.editor.cursorUp",
     "tui.editor.cursorDown",
@@ -256,6 +326,20 @@ pub const TUI_KEYBINDING_IDS: [&str; TUI_KEYBINDING_COUNT] = [
     "tui.select.pageDown",
     "tui.select.confirm",
     "tui.select.cancel",
+    "tui.altScreen.pageUp",
+    "tui.altScreen.pageDown",
+    "tui.altScreen.halfPageUp",
+    "tui.altScreen.halfPageDown",
+    "tui.altScreen.lineUp",
+    "tui.altScreen.lineDown",
+    "tui.altScreen.previousPrompt",
+    "tui.altScreen.nextPrompt",
+    "tui.altScreen.search",
+    "tui.altScreen.searchNext",
+    "tui.altScreen.searchPrevious",
+    "tui.altScreen.searchClose",
+    "tui.altScreen.top",
+    "tui.altScreen.bottom",
 ];
 
 fn normalize_keys(keys: impl IntoIterator<Item = KeyId>) -> Vec<KeyId> {
@@ -516,7 +600,7 @@ mod tests {
     use super::*;
     use crate::keys::{Key, key_press};
     use crossterm::event::{KeyCode, KeyModifiers};
-    const EXPECTED_DEFAULTS: [(&str, &[&str]); 31] = [
+    const EXPECTED_DEFAULTS: [(&str, &[&str]); 45] = [
         ("tui.editor.cursorUp", &["up"]),
         ("tui.editor.cursorDown", &["down"]),
         ("tui.editor.cursorLeft", &["left", "ctrl+b"]),
@@ -557,10 +641,33 @@ mod tests {
         ("tui.select.pageDown", &["pageDown"]),
         ("tui.select.confirm", &["enter"]),
         ("tui.select.cancel", &["escape", "ctrl+c"]),
+        ("tui.altScreen.pageUp", &["pageUp"]),
+        ("tui.altScreen.pageDown", &["pageDown"]),
+        ("tui.altScreen.halfPageUp", &[]),
+        ("tui.altScreen.halfPageDown", &[]),
+        ("tui.altScreen.lineUp", &[]),
+        ("tui.altScreen.lineDown", &[]),
+        (
+            "tui.altScreen.previousPrompt",
+            &["ctrl+shift+up", "ctrl+up"],
+        ),
+        (
+            "tui.altScreen.nextPrompt",
+            &["ctrl+shift+down", "ctrl+down"],
+        ),
+        ("tui.altScreen.search", &["ctrl+shift+f"]),
+        ("tui.altScreen.searchNext", &["enter", "ctrl+g"]),
+        (
+            "tui.altScreen.searchPrevious",
+            &["shift+enter", "ctrl+shift+g"],
+        ),
+        ("tui.altScreen.searchClose", &["escape"]),
+        ("tui.altScreen.top", &["home"]),
+        ("tui.altScreen.bottom", &["end"]),
     ];
 
     #[test]
-    fn exact_31_ids_and_defaults() {
+    fn exact_45_ids_and_defaults() {
         let definitions = tui_keybindings();
         let manager = KeybindingsManager::with_tui_defaults();
         assert_eq!(definitions.len(), TUI_KEYBINDING_COUNT);

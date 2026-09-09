@@ -446,25 +446,33 @@ impl FacadeChannels {
 /// Register one endpoint's provider `name` onto `runtime`.
 ///
 /// Returns the path used for diagnostics and the registration outcome. The
-/// stream-adapter rewire is best-effort: a missing config is treated as a
-/// no-op so an unregistered name does not poison the aggregate.
+/// adapter rewire is best-effort: a missing config or callback capability is
+/// treated as a no-op so an unregistered name does not poison the aggregate.
 pub(super) fn register_endpoint_provider(
     endpoint: &Endpoint,
     name: &str,
     runtime: &ModelRuntime,
 ) -> (String, Result<(), ModelRuntimeError>) {
     let configs = endpoint.runner.provider_configs();
+    let capabilities = endpoint.runner.provider_capabilities();
     let paths = endpoint.runner.provider_extension_paths();
     let path = paths.get(name).cloned().unwrap_or_else(|| name.to_owned());
     let Some(config) = configs.get(name) else {
         return (path, Ok(()));
     };
     let outcome = runtime.register_provider(name, config);
+    let provider_capabilities = capabilities.get(name).copied().unwrap_or_default();
     if outcome.is_ok()
-        && endpoint.runner.stream_provider_ids().contains(name)
+        && (provider_capabilities.stream_simple
+            || provider_capabilities.fetch_deferred
+            || provider_capabilities.cancel_deferred)
         && let Some(adapter) = endpoint.runner.providers().remove(name)
     {
-        runtime.register_extension_stream_provider(name.to_owned(), Arc::new(adapter));
+        if provider_capabilities.stream_simple {
+            runtime.register_extension_stream_provider(name.to_owned(), Arc::new(adapter));
+        } else {
+            runtime.register_extension_deferred_provider(name.to_owned(), Arc::new(adapter));
+        }
     }
     (path, outcome)
 }

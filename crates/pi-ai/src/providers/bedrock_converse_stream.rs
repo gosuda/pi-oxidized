@@ -31,6 +31,7 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde_json::{Map, Value, json};
 
+use crate::constrained_sampling::resolve_json_schema_strict_sampling;
 use crate::provider::{Provider, ProviderError, ProviderResponse, StreamOptionKey, StreamOptions};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DoneReason,
@@ -499,6 +500,15 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, Adapter
         })
 }
 
+fn compat_bool(model: &Model, key: &str, default: bool) -> bool {
+    model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.get(key))
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
+}
+
 fn build_request_payload(
     model: &Model,
     context: &Context,
@@ -529,9 +539,11 @@ fn build_request_payload(
     }
     payload.insert("inferenceConfig".to_owned(), Value::Object(inference));
 
-    if let Some(tool_config) = convert_tool_config(context, options)? {
+    let supports_strict_mode = compat_bool(model, "supportsStrictMode", false);
+    if let Some(tool_config) = convert_tool_config(context, options, supports_strict_mode)? {
         payload.insert("toolConfig".to_owned(), tool_config);
     }
+
     if let Some(additional) = build_additional_model_request_fields(model, options)? {
         payload.insert("additionalModelRequestFields".to_owned(), additional);
     }
@@ -842,6 +854,7 @@ fn normalize_model_name(value: &str) -> String {
 fn convert_tool_config(
     context: &Context,
     options: &StreamOptions,
+    supports_strict_mode: bool,
 ) -> Result<Option<Value>, String> {
     let Some(tools) = context.tools.as_ref().filter(|tools| !tools.is_empty()) else {
         return Ok(None);
@@ -854,15 +867,21 @@ fn convert_tool_config(
     let tools = tools
         .iter()
         .map(|tool| {
-            json!({
-                "toolSpec": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": { "json": tool.parameters },
-                }
-            })
+            let resolved = resolve_json_schema_strict_sampling(tool, supports_strict_mode)
+                .map_err(|error| error.to_string())?;
+            let strict = resolved.is_some();
+            let parameters = resolved.unwrap_or_else(|| tool.parameters.clone());
+            let mut tool_spec = json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": { "json": parameters },
+            });
+            if strict {
+                tool_spec["strict"] = Value::Bool(true);
+            }
+            Ok(json!({ "toolSpec": tool_spec }))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     let mut config = Map::new();
     config.insert("tools".to_owned(), Value::Array(tools));
 
@@ -1285,6 +1304,7 @@ fn parse_sdk_tools(value: &Value) -> Result<ToolConfiguration, String> {
                 .name(field_string(spec, "name")?)
                 .description(field_string(spec, "description")?)
                 .input_schema(document_schema(schema_value))
+                .set_strict(spec.get("strict").and_then(Value::as_bool))
                 .build()
                 .map_err(|error| error.to_string())?;
             Ok(AwsTool::ToolSpec(specification))
@@ -1566,7 +1586,11 @@ impl StreamAssembly {
                 };
                 let semantic = self
                     .state
-                    .start_tool_call(normalize_tool_call_id(tool.tool_use_id()), tool.name())
+                    .start_tool_call(
+                        normalize_tool_call_id(tool.tool_use_id()),
+                        tool.name(),
+                        None,
+                    )
                     .map_err(|error| AdapterFailure::Semantic(error.to_string()))?;
                 let content_index = event_content_index(&semantic)?;
                 self.blocks
@@ -1902,6 +1926,10 @@ fn map_stop_reason(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
 mod tests {
     use super::*;
     use aws_sdk_bedrockruntime::types::{
@@ -1912,8 +1940,8 @@ mod tests {
     use futures::StreamExt as _;
 
     use crate::types::{
-        AssistantContent, ModelCost, ModelInput, TextContent, ThinkingContent, Tool, ToolCall,
-        ToolResultMessage, UserMessage,
+        AssistantContent, ConstrainedSampling, ConstrainedSamplingConfig, ModelCost, ModelInput,
+        StrictMode, TextContent, ThinkingContent, Tool, ToolCall, ToolResultMessage, UserMessage,
     };
 
     fn test_model(id: &str, name: &str) -> Model {
@@ -1966,7 +1994,7 @@ mod tests {
                     UserMessageContent::Text("hello".to_owned()),
                     0,
                 )),
-                Message::Assistant(prior),
+                Message::Assistant(Box::new(prior)),
             ],
             tools: None,
         };
@@ -2007,7 +2035,7 @@ mod tests {
         prior.content.push(AssistantContent::Thinking(thinking));
         let context = Context {
             system_prompt: Some("system".to_owned()),
-            messages: vec![Message::Assistant(prior)],
+            messages: vec![Message::Assistant(Box::new(prior))],
             tools: None,
         };
         let mut options = StreamOptions::default();
@@ -2037,7 +2065,7 @@ mod tests {
         prior.content.push(AssistantContent::Thinking(thinking));
         let context = Context {
             system_prompt: None,
-            messages: vec![Message::Assistant(prior)],
+            messages: vec![Message::Assistant(Box::new(prior))],
             tools: None,
         };
         let payload = build_request_payload(&model, &context, &StreamOptions::default())
@@ -2155,7 +2183,7 @@ mod tests {
         let context = Context {
             system_prompt: None,
             messages: vec![
-                Message::Assistant(prior),
+                Message::Assistant(Box::new(prior)),
                 Message::ToolResult(result_one),
                 Message::ToolResult(result_two),
             ],
@@ -2163,6 +2191,7 @@ mod tests {
                 name: "read".to_owned(),
                 description: "read a file".to_owned(),
                 parameters: json!({ "type": "object" }),
+                constrained_sampling: None,
             }]),
         };
         let options = StreamOptions {
@@ -2187,6 +2216,67 @@ mod tests {
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(2)
+        );
+        Ok(())
+    }
+    #[test]
+    fn strict_tool_config_reaches_bedrock_sdk_and_require_errors() -> Result<(), String> {
+        let mut model = test_model("amazon.nova-pro-v1:0", "Nova Pro");
+        model.compat = Some(json!({"supportsStrictMode": true}));
+        let context = Context {
+            tools: Some(vec![Tool {
+                name: "lookup".into(),
+                description: "Lookup".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+                constrained_sampling: Some(ConstrainedSampling::Config(
+                    ConstrainedSamplingConfig::JsonSchema {
+                        strict: StrictMode::Prefer,
+                    },
+                )),
+            }]),
+            ..Context::default()
+        };
+        let payload = build_request_payload(&model, &context, &StreamOptions::default())?;
+        assert_eq!(
+            payload.pointer("/toolConfig/tools/0/toolSpec/strict"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            payload.pointer("/toolConfig/tools/0/toolSpec/inputSchema/json/additionalProperties"),
+            Some(&json!(false))
+        );
+        let sdk_config = parse_sdk_tools(&payload["toolConfig"])?;
+        let sdk_spec = sdk_config
+            .tools()
+            .first()
+            .and_then(|tool| tool.as_tool_spec().ok())
+            .ok_or_else(|| "strict Bedrock tool was not parsed".to_owned())?;
+        assert_eq!(sdk_spec.strict(), Some(true));
+
+        let required_context = Context {
+            tools: Some(vec![Tool {
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"path": {"$ref": "#/$defs/path"}}
+                }),
+                constrained_sampling: Some(ConstrainedSampling::Config(
+                    ConstrainedSamplingConfig::JsonSchema {
+                        strict: StrictMode::Require,
+                    },
+                )),
+                ..context.tools.as_ref().expect("tool exists")[0].clone()
+            }]),
+            ..Context::default()
+        };
+        let error = build_request_payload(&model, &required_context, &StreamOptions::default())
+            .expect_err("unsupported required strict schema must fail");
+        assert_eq!(
+            error,
+            "Tool \"lookup\" requires JSON-schema constrained sampling, but $ref schemas are unsupported."
         );
         Ok(())
     }

@@ -67,6 +67,11 @@ const LEDGER: &[(&str, &[(&str, &str, &str)])] = &[
             ("protocol", "UiEventWire", "outbound terminal-input framing"),
             // shortcut registration — mode-local keybinding adapter
             ("adapters", "ShortcutRegistration", "keybinding adapter"),
+            (
+                "adapters",
+                "map_ui_event",
+                "outbound terminal-input adapter",
+            ),
             // sanitize boundary — SanitizedSlot is the declared layout-adapter currency
             ("sanitize", "SanitizedSlot", "sanitize boundary"),
             ("sanitize", "contains_control_bytes", "sanitize boundary"),

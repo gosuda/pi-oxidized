@@ -3181,7 +3181,7 @@ pub(crate) mod tests {
         std::fs::write(directory.join("snapshot.json"), snapshot.to_string())?;
         Ok(())
     }
-    fn slot_frame(key: &str, text: &str) -> Frame {
+    pub(crate) fn slot_frame(key: &str, text: &str, focusable: bool) -> Frame {
         Frame {
             id: 0,
             kind: FrameKind::Event,
@@ -3192,7 +3192,7 @@ pub(crate) mod tests {
                 "placement": "aboveEditor",
                 "height": 1,
                 "runs": [[{"text": text}]],
-                "focusable": false,
+                "focusable": focusable,
             }),
         }
     }
@@ -4377,9 +4377,11 @@ pub(crate) mod tests {
             (EndpointKind::Native, second),
         ]);
 
-        first_host.emit(slot_frame("shared", "first")).await;
+        first_host.emit(slot_frame("shared", "first", false)).await;
         wait_for_slot_text(&set, "first").await?;
-        second_host.emit(slot_frame("shared", "second")).await;
+        second_host
+            .emit(slot_frame("shared", "second", false))
+            .await;
         wait_for_slot_text(&set, "second").await?;
         second_host
             .emit(Frame {
@@ -4729,7 +4731,7 @@ pub(crate) mod tests {
             make_runner_with_hook_timeout(snapshot(&["input"]), HOOK_TIMEOUT).await?;
         let mut parked = old_host.park_method("input");
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
-        old_host.emit(slot_frame("old", "old")).await;
+        old_host.emit(slot_frame("old", "old", false)).await;
         wait_for_slot_text(&set, "old").await?;
         let mut ui = set.subscribe_ui();
 
@@ -4775,7 +4777,7 @@ pub(crate) mod tests {
             make_runner_with_hook_timeout(snapshot(&["input"]), HOOK_TIMEOUT).await?;
         let mut parked = old_host.park_method("input");
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
-        old_host.emit(slot_frame("old", "old")).await;
+        old_host.emit(slot_frame("old", "old", false)).await;
         wait_for_slot_text(&set, "old").await?;
         let mut ui = set.subscribe_ui();
         let caller_set = Arc::clone(&set);
@@ -4797,7 +4799,7 @@ pub(crate) mod tests {
         let cutover = tokio::spawn(async move { cutover_set.cutover(next, pending).await });
         wait_for_dispose(&mut ui, "old").await?;
 
-        old_host.emit(slot_frame("late", "late")).await;
+        old_host.emit(slot_frame("late", "late", false)).await;
         old_host
             .emit(Frame {
                 id: request_id,
@@ -4821,7 +4823,7 @@ pub(crate) mod tests {
             make_runner_with_hook_timeout(snapshot(&["input"]), HOOK_TIMEOUT).await?;
         let mut parked = old_host.park_method("input");
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
-        old_host.emit(slot_frame("old", "old")).await;
+        old_host.emit(slot_frame("old", "old", false)).await;
         wait_for_slot_text(&set, "old").await?;
         let mut ui = set.subscribe_ui();
         let mut ui_requests = set.take_ui_requests().ok_or("ui bridge missing")?;
@@ -4908,7 +4910,7 @@ pub(crate) mod tests {
             (EndpointKind::TsCompat, old_first),
             (EndpointKind::Native, old_owner),
         ]);
-        old_host.emit(slot_frame("old-key", "old")).await;
+        old_host.emit(slot_frame("old-key", "old", false)).await;
         wait_for_slot_text(&set, "old").await?;
         let mut requests = set.take_ui_requests().ok_or("ui bridge missing")?;
         old_host
@@ -4967,7 +4969,7 @@ pub(crate) mod tests {
         let old_runner = Arc::clone(&old);
         let mut parked = old_host.park_method("input");
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
-        old_host.emit(slot_frame("old", "old")).await;
+        old_host.emit(slot_frame("old", "old", false)).await;
         wait_for_slot_text(&set, "old").await?;
         let mut ui = set.subscribe_ui();
         let caller_set = Arc::clone(&set);

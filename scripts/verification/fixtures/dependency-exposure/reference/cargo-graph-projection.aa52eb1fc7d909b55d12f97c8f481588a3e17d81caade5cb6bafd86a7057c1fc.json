@@ -12,7 +12,6 @@
 		"pi",
 		"pi-agent",
 		"pi-ai",
-		"pi-bench-alloc",
 		"pi-ext",
 		"pi-tui"
 	],
@@ -5058,6 +5057,27 @@
 			]
 		},
 		{
+			"from": "libsqlite3-sys",
+			"to": "cc",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "libsqlite3-sys",
+			"to": "pkg-config",
+			"kinds": [
+				"build"
+			]
+		},
+		{
+			"from": "libsqlite3-sys",
+			"to": "vcpkg",
+			"kinds": [
+				"build"
+			]
+		},
+		{
 			"from": "line-clipping",
 			"to": "bitflags",
 			"kinds": [
@@ -5661,6 +5681,13 @@
 		},
 		{
 			"from": "pi",
+			"to": "percent-encoding",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
 			"to": "pi-agent",
 			"kinds": [
 				"normal"
@@ -5712,6 +5739,13 @@
 		{
 			"from": "pi",
 			"to": "reqwest",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
+			"to": "rusqlite",
 			"kinds": [
 				"normal"
 			]
@@ -5803,6 +5837,13 @@
 		},
 		{
 			"from": "pi",
+			"to": "tokio-tungstenite",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi",
 			"to": "tokio-util",
 			"kinds": [
 				"normal"
@@ -5882,6 +5923,13 @@
 		{
 			"from": "pi-agent",
 			"to": "tokio-util",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-agent",
+			"to": "uuid",
 			"kinds": [
 				"normal"
 			]
@@ -6159,6 +6207,13 @@
 			"to": "crossterm",
 			"kinds": [
 				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
+			"to": "crossterm_winapi",
+			"kinds": [
+				"dev"
 			]
 		},
 		{
@@ -7580,6 +7635,41 @@
 		{
 			"from": "ring",
 			"to": "windows-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rusqlite",
+			"to": "bitflags",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rusqlite",
+			"to": "fallible-iterator",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rusqlite",
+			"to": "fallible-streaming-iterator",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rusqlite",
+			"to": "libsqlite3-sys",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "rusqlite",
+			"to": "smallvec",
 			"kinds": [
 				"normal"
 			]

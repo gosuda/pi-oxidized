@@ -96,3 +96,14 @@ The raw-literal fallback path described in `docs/PAR-MATH-latex-strategy.md` was
 | T9 Terminal interfaces | verified | PTY: sole stdout owner, transaction markers, probe emission |
 | OSC52 Clipboard | verified | Unit: correct encoding, oversized rejection |
 | T4 Math rendering | verified (re-adjudicated) | Test: `grill_t4_math_rendering_landed` — math renders to Unicode, unsupported falls back to raw |
+
+## Fullscreen pending supplement (DES-12 supersession; no new verdict)
+
+Historical regular-mode rulings above are retained unchanged as regular evidence. Per `docs/TUI-G4-supersession.md` against C `9767ba275f3e9a5ee0f5c5342249b629ab1b2282`, the following fullscreen proofs are pending implementation under DES-07/DES-09 with Main-run evidence and no pass asserted here:
+
+- Fresh fullscreen no-clear/diff proof (alternate-screen entry, origin/full-size frame, fixed dock, no CSI 2J/3J; exit restores reverse mouse/autowrap/1049/cursor with the primary screen preserved).
+- Fresh fullscreen terminal-mode restoration and single-writer proof through the existing writer ownership path.
+- Fresh fullscreen resume-size proof (next frame after suspend/resume and external-editor handoff uses re-queried dimensions without an injected Resize or self-signal).
+- Fullscreen viewport/scroll/mouse/selection/search/flash/theme/mode evidence for the approved scope.
+
+The old fixture passing results on this page are not fullscreen proof and are not reused as such.

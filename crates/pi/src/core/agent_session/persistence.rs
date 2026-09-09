@@ -91,7 +91,7 @@ impl AgentSession {
         }
 
         let assistant = match message.as_llm() {
-            Some(Message::Assistant(a)) => a.clone(),
+            Some(Message::Assistant(a)) => a.as_ref().clone(),
             _ => return Ok(()),
         };
 
@@ -163,9 +163,11 @@ impl AgentSession {
 
         // Update live agent transcript when the tail is the assistant being replaced.
         if replacement.role() == "assistant"
-            && let Some(Message::Assistant(assistant)) = replacement.as_llm().cloned()
+            && let Some(Message::Assistant(assistant)) = replacement.as_llm()
         {
-            let _ = self.agent.replace_last_assistant(assistant);
+            let _ = self
+                .agent
+                .replace_last_assistant(assistant.as_ref().clone());
         } else if matches!(replacement.role(), "user" | "toolResult" | "custom") {
             // For non-assistant replacements, rewrite the last matching role if present.
             // Agent only exposes replace_last_assistant; other roles stay on the event

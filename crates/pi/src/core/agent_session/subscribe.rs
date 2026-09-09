@@ -411,7 +411,7 @@ mod tests {
     fn assistant_message() -> pi_agent::AgentMessage {
         let mut assistant = pi_ai::AssistantMessage::new("test", "test", "model", 0);
         assistant.stop_reason = pi_ai::StopReason::Stop;
-        pi_agent::AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(assistant)))
+        pi_agent::AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(Box::new(assistant))))
     }
 
     fn update_event(index: i64) -> AgentEvent {

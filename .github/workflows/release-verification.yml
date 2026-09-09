@@ -232,6 +232,11 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --all-targets --no-fail-fast --locked
 
+          # The excluded vendor crate uses its own tracked lock. Both feature
+          # sets are required: all-features selects tty, not the mio wake path.
+          cargo test --manifest-path vendor/crossterm-0.29.0/Cargo.toml --features event-stream --locked -- --test-threads 1
+          cargo test --manifest-path vendor/crossterm-0.29.0/Cargo.toml --all-features --locked -- --test-threads 1
+
       - name: Install cargo-deny
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf  # v2.85.2

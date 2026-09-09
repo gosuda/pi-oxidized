@@ -1,6 +1,6 @@
 {
 	"generator": "scripts/verification/gen-witness.ts",
-	"totalLines": 147,
+	"totalLines": 155,
 	"methodKindPairs": [
 		[
 			"after_provider_response",
@@ -155,8 +155,40 @@
 			"res"
 		],
 		[
+			"provider.beforePayload",
+			"req"
+		],
+		[
+			"provider.beforePayload",
+			"res"
+		],
+		[
 			"provider.cancel",
 			"event"
+		],
+		[
+			"provider.cancelDeferred",
+			"req"
+		],
+		[
+			"provider.cancelDeferred",
+			"res"
+		],
+		[
+			"provider.fetchDeferred",
+			"req"
+		],
+		[
+			"provider.fetchDeferred",
+			"res"
+		],
+		[
+			"provider.onResponse",
+			"req"
+		],
+		[
+			"provider.onResponse",
+			"res"
 		],
 		[
 			"provider.stream",
@@ -558,5 +590,5 @@
 			"kind": "release"
 		}
 	],
-	"fixtureSha256": "e75b821c271c708d4d9f282298bf7f1968276bce3b0845879ff9445da78b4677"
+	"fixtureSha256": "bf28968d05201dbb270f2e2d507d7a35764dfef3fa6fc5e01f30ca5910c7f311"
 }

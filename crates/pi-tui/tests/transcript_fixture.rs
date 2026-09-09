@@ -46,7 +46,9 @@ const RESIZE_LADDER: [(u16, u16); 8] = [
     (1, 1),
 ];
 
-/// Atomic 24-size storm matching the fixture's scripted plan shape.
+/// Atomic 24-size storm. The final entry is deliberately non-initial (the
+/// fixture opens at 80x24) so the completed-batch assertion renders a real
+/// geometry transition queried from the kernel, not a no-op repaint.
 const RESIZE_STORM: [(u16, u16); 24] = [
     (80, 24),
     (40, 12),
@@ -71,7 +73,7 @@ const RESIZE_STORM: [(u16, u16); 24] = [
     (96, 28),
     (160, 36),
     (60, 18),
-    (80, 24),
+    (96, 28),
 ];
 
 #[derive(Debug)]
@@ -103,6 +105,7 @@ impl From<RecordingError> for CorpusError {
             RecordingError::FinishBeforeClose => {
                 Self::Assert("recording finish before close".to_owned())
             }
+            RecordingError::UnrecordedObservation(_) => Self::Assert(error.to_string()),
         }
     }
 }
@@ -303,6 +306,32 @@ fn count_subslice(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Reads the unsigned value the fixture published for an OSC 999 accounting
+/// marker (`PI_TUI_<NAME>=<n>`), scanning from the end so the final summary
+/// wins over any earlier occurrence in the raw stream.
+fn published_counter(raw: &[u8], name: &str) -> Option<u64> {
+    let marker = format!("PI_TUI_{name}=");
+    let start = raw
+        .windows(marker.len())
+        .rposition(|window| window == marker.as_bytes())?
+        + marker.len();
+    let digits: Vec<u8> = raw[start..]
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
 fn require_prerequisites(fixture: &str) -> Result<(), CorpusError> {
     if !cfg!(unix) {
         return Err(CorpusError::Prerequisite(
@@ -488,6 +517,43 @@ fn write_artifact(
     Ok(path)
 }
 
+/// Preserves the raw bytes of a failed settle window beside the artifact
+/// tree (same run directory as `write_artifact`). Failure-path only: never
+/// called on a successful run, and written strictly after the settle
+/// returned — no child interaction, no timing side channel.
+fn write_failure_capture(
+    row_label: &str,
+    scenario_dir: &str,
+    iteration: usize,
+    window: &[u8],
+) -> std::io::Result<PathBuf> {
+    let path = artifact_path(row_label, scenario_dir, iteration)
+        .with_file_name("storm-window-failure.bin");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, window)?;
+    Ok(path)
+}
+
+/// Builds an assertion error after preserving the failing window beside the
+/// artifact tree — same failure-path-only contract as `write_failure_capture`.
+fn captured_assert(
+    scenario: &str,
+    row_label: &str,
+    iteration: usize,
+    window: &[u8],
+    mut message: String,
+) -> CorpusError {
+    let note = match write_failure_capture(row_label, scenario, iteration, window) {
+        Ok(path) => format!("failing window bytes preserved at {}", path.display()),
+        Err(error) => format!("failing window capture failed: {error}"),
+    };
+    message.push_str("; ");
+    message.push_str(&note);
+    CorpusError::Assert(message)
+}
+
 fn standard_claims() -> Vec<ClaimClass> {
     vec![
         ClaimClass::Execution,
@@ -500,14 +566,17 @@ fn standard_claims() -> Vec<ClaimClass> {
     ]
 }
 
-fn fixture_argv(serve: bool) -> Result<Vec<String>, CorpusError> {
+/// Builds the fixture argv. `serving` selects the serving-mode flag: `None`
+/// runs the scripted exit path, `Some("--serve")` ordinary live serving, and
+/// `Some("--resize-batch")` the one-shot resize-batch mode.
+fn fixture_argv(serving: Option<&str>) -> Result<Vec<String>, CorpusError> {
     let binary = fixture_binary()?;
     let mut argv = vec![
         binary.to_string_lossy().into_owned(),
         "--exit=success".to_owned(),
     ];
-    if serve {
-        argv.push("--serve".to_owned());
+    if let Some(flag) = serving {
+        argv.push(flag.to_owned());
     }
     Ok(argv)
 }
@@ -534,7 +603,7 @@ fn run_stream_settle(
     row_label: &str,
     row: &RunnerRow,
 ) -> Result<TranscriptArtifact, CorpusError> {
-    let argv = fixture_argv(false)?;
+    let argv = fixture_argv(None)?;
     let mut run = FixtureRun::open(
         argv,
         Scenario::FixtureStreamSettle,
@@ -563,7 +632,7 @@ fn run_resize_ladder(
     row_label: &str,
     row: &RunnerRow,
 ) -> Result<TranscriptArtifact, CorpusError> {
-    let argv = fixture_argv(true)?;
+    let argv = fixture_argv(Some("--serve"))?;
     let mut run = FixtureRun::open(
         argv,
         Scenario::FixtureResizeLadder,
@@ -593,24 +662,128 @@ fn run_resize_storm(
     row_label: &str,
     row: &RunnerRow,
 ) -> Result<TranscriptArtifact, CorpusError> {
-    let argv = fixture_argv(true)?;
+    let (final_cols, final_rows) = RESIZE_STORM[RESIZE_STORM.len() - 1];
+    if (final_cols, final_rows) == (INITIAL_COLS, INITIAL_ROWS) {
+        return Err(CorpusError::Assert(
+            "resize-storm: RESIZE_STORM must end at a non-initial size so the \
+             completed-batch assertion exercises a real transition"
+                .to_owned(),
+        ));
+    }
+    let argv = fixture_argv(Some("--resize-batch"))?;
     let mut run = FixtureRun::open(
         argv,
         Scenario::FixtureResizeStorm,
         row.clone(),
         standard_claims(),
     )?;
-    let ready = run.settle_output(|bytes| contains_bytes(bytes, b"SERVE-READY"))?;
-    let txn_before = count_subslice(&ready, b"PI_TUI_TXN_BEGIN=");
+    // Arm the exactly-one accounting at INPUT_READY: every byte read from the
+    // marker onward counts, including premature output racing into the same
+    // settle window.
+    run.settle_output(|bytes| contains_bytes(bytes, b"PI_TUI_INPUT_READY=1"))?;
+    let post_ready_start =
+        find_bytes(run.raw_so_far(), b"PI_TUI_INPUT_READY=1").ok_or_else(|| {
+            CorpusError::Assert("resize-storm: INPUT_READY marker missing from raw log".to_owned())
+        })? + b"PI_TUI_INPUT_READY=1".len();
 
+    // Producer side: 24 real TIOCSWINSZ ioctls — `resize_storm` is
+    // synchronous, so it returns only after every ioctl, and the Ctrl+D
+    // written next fences producer completion. Bare VEOT (no newline, no
+    // close): the batch rejects any non-resize, non-Ctrl+D input.
     run.resize_storm(&RESIZE_STORM)?;
-    let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"STATUS"))?;
-    let txn_after = count_subslice(&frame.batch.bytes, b"PI_TUI_TXN_BEGIN=");
-    // Coalesced reanchor discipline: a single stage-3 transaction for the storm.
-    if txn_after != 1 {
-        return Err(CorpusError::Assert(format!(
-            "resize-storm: expected exactly one coalesced reanchor txn after SERVE-READY, saw {txn_after} (pre-ready txns observed in ready batch={txn_before})"
-        )));
+    run.write_input(b"\x04")?;
+
+    // The fixture commits exactly one reanchor only after BOTH the Ctrl+D
+    // completion and a genuine TerminalInput Resize notification, querying
+    // crossterm::terminal::size() for the kernel geometry. Wait for the
+    // post-commit accounting summary, then verify the batch boundary.
+    let frame = run.settle_frame(|bytes| contains_bytes(bytes, b"PI_TUI_TXN_COUNT="))?;
+    let post_ready = run.raw_so_far()[post_ready_start..].to_vec();
+    let total_txns = count_subslice(run.raw_so_far(), b"PI_TUI_TXN_BEGIN=");
+
+    let txn_count = count_subslice(&post_ready, b"PI_TUI_TXN_BEGIN=");
+    if txn_count != 1 {
+        return Err(captured_assert(
+            "resize-storm",
+            row_label,
+            iteration,
+            &post_ready,
+            format!(
+                "expected exactly one completed-batch reanchor transaction after \
+                 INPUT_READY across all post-ready bytes, saw {txn_count}"
+            ),
+        ));
+    }
+    let begin = find_bytes(&post_ready, b"PI_TUI_TXN_BEGIN=")
+        .expect("post-ready transaction begin (count checked above)");
+    let Some(end) = find_bytes(&post_ready[begin..], b"PI_TUI_TXN_END=") else {
+        return Err(captured_assert(
+            "resize-storm",
+            row_label,
+            iteration,
+            &post_ready,
+            "post-ready transaction has no TXN_END: reanchor commit is incomplete".to_owned(),
+        ));
+    };
+    let payload = &post_ready[begin..begin + end];
+    let expected_status = format!("STATUS batch-complete {final_cols}x{final_rows}");
+    if !contains_bytes(payload, expected_status.as_bytes()) {
+        return Err(captured_assert(
+            "resize-storm",
+            row_label,
+            iteration,
+            &post_ready,
+            format!(
+                "completed-batch transaction must render the kernel-queried geometry \
+                 {expected_status:?} (crossterm size() authority, not a stale event payload)"
+            ),
+        ));
+    }
+    let expected_snapshot = format!("batch-complete {final_cols}x{final_rows}");
+    if !frame
+        .snapshot
+        .lines
+        .iter()
+        .any(|line| line.contains(&expected_snapshot))
+    {
+        return Err(captured_assert(
+            "resize-storm",
+            row_label,
+            iteration,
+            &post_ready,
+            format!(
+                "settled snapshot at driver geometry {final_cols}x{final_rows} does not \
+                 show the batch-complete frame"
+            ),
+        ));
+    }
+    for (name, expected) in [("RESIZE", 1u64), ("PASTE", 0), ("CURSOR", 0)] {
+        if published_counter(&post_ready, name) != Some(expected) {
+            return Err(captured_assert(
+                "resize-storm",
+                row_label,
+                iteration,
+                &post_ready,
+                format!(
+                    "fixture accounting PI_TUI_{name} must publish {expected} for the \
+                     completed resize batch"
+                ),
+            ));
+        }
+    }
+    let published_txns = published_counter(&post_ready, "TXN_COUNT");
+    if published_txns != Some(u64::try_from(total_txns).unwrap_or(u64::MAX)) {
+        return Err(captured_assert(
+            "resize-storm",
+            row_label,
+            iteration,
+            run.raw_so_far(),
+            format!(
+                "fixture accounting PI_TUI_TXN_COUNT={} disagrees with observed \
+                 transaction count {total_txns}",
+                published_txns.map_or_else(|| "absent".to_owned(), |count| count.to_string())
+            ),
+        ));
     }
     assert_no_clear_balanced(run.raw_so_far(), "resize-storm")?;
     let artifact = run.finish()?;
@@ -623,7 +796,7 @@ fn run_paste_cursor(
     row_label: &str,
     row: &RunnerRow,
 ) -> Result<TranscriptArtifact, CorpusError> {
-    let argv = fixture_argv(true)?;
+    let argv = fixture_argv(Some("--serve"))?;
     let mut run = FixtureRun::open(
         argv,
         Scenario::FixturePasteCursor,
@@ -765,7 +938,7 @@ fn fixture_run_rejects_unsuccessful_child_exit() {
     let (_, row) = resolve_row().unwrap_or_else(|error| {
         panic!("hard-fail harness prerequisites / row config: {error}");
     });
-    let mut argv = fixture_argv(false).expect("fixture argv");
+    let mut argv = fixture_argv(None).expect("fixture argv");
     let exit = argv
         .iter_mut()
         .find(|arg| arg.as_str() == "--exit=success")

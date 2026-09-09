@@ -288,12 +288,12 @@ where
                 }
                 Message::User(user)
             }
-            Message::Assistant(assistant) => Message::Assistant(transform_assistant(
+            Message::Assistant(assistant) => Message::Assistant(Box::new(transform_assistant(
                 assistant,
                 model,
                 &mut id_map,
                 &mut normalize_tool_call_id,
-            )),
+            ))),
             Message::ToolResult(result) => {
                 let mut result = result.clone();
                 if let Some(normalized) = id_map.get(&result.tool_call_id) {
@@ -682,9 +682,9 @@ mod tests {
         orphan.stop_reason = StopReason::ToolUse;
         let transformed = transform_messages(
             &[
-                Message::Assistant(assistant),
+                Message::Assistant(Box::new(assistant)),
                 Message::ToolResult(matching),
-                Message::Assistant(orphan),
+                Message::Assistant(Box::new(orphan)),
             ],
             &model(),
             |_id, _model, _source| "normalized".into(),

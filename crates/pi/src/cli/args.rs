@@ -2,6 +2,7 @@
 
 use indexmap::IndexMap;
 use pi_ai::ModelThinkingLevel;
+use pi_tui::terminal::ScreenMode;
 use std::ops::{Deref, DerefMut};
 
 /// Output mode requested via `--mode`.
@@ -162,6 +163,8 @@ pub struct Args {
     pub thinking: Option<ModelThinkingLevel>,
     /// `--mode`.
     pub mode: Option<Mode>,
+    /// `--tui-mode` (`regular` default; explicit value overrides settings).
+    pub tui_mode: Option<ScreenMode>,
     /// `--name` / `-n`.
     pub name: Option<String>,
     /// `--session`.
@@ -298,6 +301,26 @@ fn parse_general_arg(arg: &str, args: &[String], i: &mut usize, result: &mut Arg
                 _ => {}
             }
         }
+        "--tui-mode" => match args.get(*i + 1) {
+            // A dash-prefixed or missing value is a usage error; the flag
+            // itself is consumed by the loop, the next token is not.
+            Some(value) if !value.starts_with('-') => {
+                *i += 1;
+                match value.parse::<ScreenMode>() {
+                    Ok(mode) => result.tui_mode = Some(mode),
+                    Err(_) => result.diagnostics.push(Diagnostic {
+                        level: DiagnosticLevel::Error,
+                        message: format!(
+                            "Invalid TUI mode \"{value}\". Valid values: regular, fullscreen"
+                        ),
+                    }),
+                }
+            }
+            _ => result.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "--tui-mode requires regular or fullscreen".to_owned(),
+            }),
+        },
         "--provider" if *i + 1 < args.len() => {
             *i += 1;
             result.provider = Some(args[*i].clone());
@@ -877,6 +900,84 @@ mod tests {
         let bare = parse_args(&args(&["--mode"]));
         assert_eq!(bare.mode, None);
         assert_eq!(bare.unknown_flags.get("mode"), Some(&FlagValue::Bool));
+    }
+
+    #[test]
+    fn tui_mode_parses_regular_and_fullscreen() {
+        assert_eq!(
+            parse_args(&args(&["--tui-mode", "regular"])).tui_mode,
+            Some(ScreenMode::Regular)
+        );
+        assert_eq!(
+            parse_args(&args(&["--tui-mode", "fullscreen"])).tui_mode,
+            Some(ScreenMode::Fullscreen)
+        );
+        // Unset by default; resolution against settings happens later.
+        assert_eq!(parse_args(&args(&[])).tui_mode, None);
+    }
+
+    #[test]
+    fn tui_mode_is_independent_of_output_mode() {
+        let result = parse_args(&args(&["--mode", "json", "--tui-mode", "fullscreen"]));
+        assert_eq!(result.mode, Some(Mode::Json));
+        assert_eq!(result.tui_mode, Some(ScreenMode::Fullscreen));
+        // Fullscreen selection must not rewrite the requested output mode.
+        let result = parse_args(&args(&["--tui-mode", "fullscreen", "--mode", "rpc"]));
+        assert_eq!(result.mode, Some(Mode::Rpc));
+        assert_eq!(result.tui_mode, Some(ScreenMode::Fullscreen));
+    }
+
+    #[test]
+    fn tui_mode_missing_value_is_a_usage_error() {
+        let bare = parse_args(&args(&["--tui-mode"]));
+        assert_eq!(bare.tui_mode, None);
+        assert_eq!(
+            bare.diagnostics,
+            vec![Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "--tui-mode requires regular or fullscreen".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn tui_mode_does_not_consume_a_dash_prefixed_next_token() {
+        let result = parse_args(&args(&["--tui-mode", "--print"]));
+        assert_eq!(result.tui_mode, None);
+        assert!(result.print, "the following flag must still parse");
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "--tui-mode requires regular or fullscreen".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn tui_mode_unknown_value_is_a_usage_error_and_consumed() {
+        let result = parse_args(&args(&["--tui-mode", "other", "--print"]));
+        assert_eq!(result.tui_mode, None);
+        assert!(result.print);
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "Invalid TUI mode \"other\". Valid values: regular, fullscreen".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn tui_mode_equals_form_stays_an_unknown_flag() {
+        // Mirrors the reference parser: only the space-separated form is known.
+        let result = parse_args(&args(&["--tui-mode=fullscreen"]));
+        assert_eq!(result.tui_mode, None);
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(
+            result.unknown_flags.get("tui-mode"),
+            Some(&FlagValue::Str("fullscreen".to_owned()))
+        );
     }
 
     #[test]

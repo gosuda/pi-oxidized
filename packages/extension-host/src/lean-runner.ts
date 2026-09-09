@@ -45,6 +45,7 @@ import {
 	LEAN_EVENT_TYPES,
 	type LeanCommand,
 	type LeanContext,
+	type LeanDeferredHandle,
 	type LeanExtension,
 	type LeanFlag,
 	type LeanProvider,
@@ -53,6 +54,7 @@ import {
 	parseLeanExtension,
 } from "./lean-api.ts";
 import { AssistantDeltaReducer } from "./assistant-delta.ts";
+import { isRecord, isStructuredAbortError } from "./wire-validators.ts";
 
 /** Host lifecycle state. */
 const RunnerState = {
@@ -94,11 +96,20 @@ interface RegisteredHook {
 	handler: (event: never, ctx: LeanContext) => unknown;
 	extensionPath: string;
 }
+const LEAN_PROVIDER_FETCH_DEFERRED_METHOD = "provider.fetchDeferred";
+const LEAN_PROVIDER_CANCEL_DEFERRED_METHOD = "provider.cancelDeferred";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+function isDeferredHandle(value: unknown): value is LeanDeferredHandle {
+	return isRecord(value)
+		&& typeof value["provider"] === "string"
+		&& typeof value["modelId"] === "string"
+		&& typeof value["api"] === "string"
+		&& typeof value["id"] === "string"
+		&& (value["expiresAt"] === undefined
+			|| (typeof value["expiresAt"] === "number" && Number.isFinite(value["expiresAt"])))
+		&& (value["pollAfterMs"] === undefined
+			|| (typeof value["pollAfterMs"] === "number" && Number.isFinite(value["pollAfterMs"])));
 }
-
 
 /**
  * Import specifiers that mark a lean entry as accidentally built for
@@ -870,17 +881,6 @@ async function findModuleLoadViolationInGraph(entry: string): Promise<ModuleLoad
 }
 
 /**
- * Structured cancellation only: a real Error (or DOMException, which is
- * not Error-derived in every runtime) named AbortError. Message text is
- * deliberately never consulted — an extension failure that merely says
- * "cancelled" must stay an extension_error.
- */
-function isStructuredAbortError(error: unknown): boolean {
-	if (error instanceof Error && error.name === "AbortError") return true;
-	return typeof DOMException === "function" && error instanceof DOMException && error.name === "AbortError";
-}
-
-/**
  * Lean Mode-2 endpoint process. Owns the declarative registry and bridges
  * it to Rust over a single JSONL byte transport, mirroring the Mode-1
  * host's four-state machine (hello → loading → ready → disposed).
@@ -911,7 +911,7 @@ export class LeanRunner {
 
 	/** In-flight tool.execute AbortControllers keyed by request id. */
 	private readonly inFlightTools = new Map<number, AbortController>();
-	/** In-flight provider.stream AbortControllers keyed by request id. */
+	/** In-flight provider operation AbortControllers keyed by request id. */
 	private readonly inFlightProviders = new Map<number, AbortController>();
 	/** Active shortcut handlers keyed by their resolved shortcut key. */
 	private readonly inFlightShortcuts = new Map<string, AbortController>();
@@ -1142,6 +1142,9 @@ export class LeanRunner {
 				description: tool.description,
 				parameters: tool.parameters ?? {},
 			};
+			if (tool.constrainedSampling !== undefined) {
+				entry["constrainedSampling"] = tool.constrainedSampling;
+			}
 			if (tool.executionMode !== undefined) {
 				entry["executionMode"] = tool.executionMode;
 			}
@@ -1182,6 +1185,12 @@ export class LeanRunner {
 				streamSimple: typeof provider.streamSimple === "function",
 				extensionPath,
 			};
+			if (typeof provider.fetchDeferred === "function") {
+				entry["fetchDeferred"] = true;
+			}
+			if (typeof provider.cancelDeferred === "function") {
+				entry["cancelDeferred"] = true;
+			}
 			if (provider.baseUrl !== undefined) entry["baseUrl"] = provider.baseUrl;
 			if (provider.api !== undefined) entry["api"] = provider.api;
 			if (provider.displayName !== undefined) entry["displayName"] = provider.displayName;
@@ -1236,6 +1245,12 @@ export class LeanRunner {
 				return;
 			case "provider.stream":
 				await this.handleProviderStream(id, p);
+				return;
+			case LEAN_PROVIDER_FETCH_DEFERRED_METHOD:
+				await this.handleProviderFetchDeferred(id, p);
+				return;
+			case LEAN_PROVIDER_CANCEL_DEFERRED_METHOD:
+				await this.handleProviderCancelDeferred(id, p);
 				return;
 			case "flags.set":
 				await this.handleFlagsSet(id, p);
@@ -1449,10 +1464,19 @@ export class LeanRunner {
 			return;
 		}
 
+		const rawOptions = p["options"];
+		if (rawOptions !== undefined && !isRecord(rawOptions)) {
+			await this.client.respondError(id, "provider.stream" as Method, {
+				code: "invalid_arguments",
+				message: "provider.stream options must be an object",
+				retryable: false,
+			});
+			return;
+		}
 		const controller = new AbortController();
 		this.inFlightProviders.set(id, controller);
 		const options = {
-			...(isRecord(p["options"]) ? p["options"] : {}),
+			...(rawOptions ?? {}),
 			signal: controller.signal,
 		};
 		try {
@@ -1480,6 +1504,115 @@ export class LeanRunner {
 			});
 		} finally {
 			this.inFlightProviders.delete(id);
+		}
+	}
+	private async handleProviderFetchDeferred(id: number, p: Record<string, unknown>): Promise<void> {
+		const providerId = String(p["providerId"] ?? p["name"] ?? "");
+		const registered = this.providers.get(providerId);
+		if (registered === undefined || typeof registered.provider.fetchDeferred !== "function") {
+			await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: "not_found",
+				message: `Provider not found or missing fetchDeferred: ${providerId}`,
+				retryable: false,
+			});
+			return;
+		}
+
+		const model = p["model"];
+		const rawHandle = p["handle"];
+		const rawOptions = p["options"];
+		if (
+			!isRecord(model)
+			|| !isDeferredHandle(rawHandle)
+			|| (rawOptions !== undefined && !isRecord(rawOptions))
+		) {
+			await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: "invalid_arguments",
+				message: "provider.fetchDeferred model, handle, and options must be objects",
+				retryable: false,
+			});
+			return;
+		}
+
+		const controller = new AbortController();
+		this.inFlightProviders.set(id, controller);
+		const options = {
+			...(rawOptions ?? {}),
+			wait: 0,
+			signal: controller.signal,
+		};
+		try {
+			const stream = registered.provider.fetchDeferred(model, rawHandle, options);
+			for await (const event of stream) {
+				if (controller.signal.aborted) break;
+				await this.client.send({ id, kind: "event", method: "providerEvent", payload: event });
+			}
+			if (controller.signal.aborted) {
+				await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
+					code: "cancelled",
+					message: "provider deferred fetch cancelled",
+					retryable: false,
+				});
+				return;
+			}
+			await this.client.respond(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {});
+		} catch (err) {
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
+			const message = err instanceof Error ? err.message : String(err);
+			await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: cancelled ? "cancelled" : "extension_error",
+				message: cancelled ? "provider deferred fetch cancelled" : message,
+				retryable: false,
+			});
+		} finally {
+			this.inFlightProviders.delete(id);
+		}
+	}
+
+	private async handleProviderCancelDeferred(id: number, p: Record<string, unknown>): Promise<void> {
+		const providerId = String(p["providerId"] ?? p["name"] ?? "");
+		const registered = this.providers.get(providerId);
+		if (registered === undefined || typeof registered.provider.cancelDeferred !== "function") {
+			await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: "not_found",
+				message: `Provider not found or missing cancelDeferred: ${providerId}`,
+				retryable: false,
+			});
+			return;
+		}
+
+		const model = p["model"];
+		const rawHandle = p["handle"];
+		const rawOptions = p["options"];
+		if (
+			!isRecord(model)
+			|| !isDeferredHandle(rawHandle)
+			|| (rawOptions !== undefined && !isRecord(rawOptions))
+		) {
+			await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: "invalid_arguments",
+				message: "provider.cancelDeferred model, handle, and options must be objects",
+				retryable: false,
+			});
+			return;
+		}
+
+		const controller = new AbortController();
+		const options = {
+			...(rawOptions ?? {}),
+			signal: controller.signal,
+		};
+		try {
+			await registered.provider.cancelDeferred(model, rawHandle, options);
+			await this.client.respond(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {});
+		} catch (err) {
+			const cancelled = isStructuredAbortError(err);
+			const message = err instanceof Error ? err.message : String(err);
+			await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: cancelled ? "cancelled" : "extension_error",
+				message: cancelled ? "provider deferred cancellation cancelled" : message,
+				retryable: false,
+			});
 		}
 	}
 

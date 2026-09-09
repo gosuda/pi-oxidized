@@ -290,11 +290,11 @@ mod tests {
                 UserMessageContent::Blocks(vec![UserContent::Text(TextContent::new(long.clone()))]),
                 1,
             )),
-            Message::Assistant({
+            Message::Assistant(Box::new({
                 let mut msg = pi_ai::AssistantMessage::new("anthropic", "anthropic", "test", 1);
                 msg.content = vec![AssistantContent::Text(TextContent::new(long.clone()))];
                 msg
-            }),
+            })),
         ];
         let result = serialize_conversation(&messages);
         assert!(!result.contains("truncated"));
@@ -307,7 +307,7 @@ mod tests {
     fn file_ops_read_modified_sorted() {
         let mut ops = create_file_ops();
         extract_file_ops_from_message(
-            &AgentMessage::Llm(Box::new(Message::Assistant({
+            &AgentMessage::Llm(Box::new(Message::Assistant(Box::new({
                 let mut msg = pi_ai::AssistantMessage::new("a", "p", "m", 1);
                 msg.content = vec![
                     AssistantContent::ToolCall(pi_ai::ToolCall::new(
@@ -344,7 +344,7 @@ mod tests {
                     )),
                 ];
                 msg
-            }))),
+            })))),
             &mut ops,
         );
         let (read_files, modified_files) = compute_file_lists(&ops);

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures::{StreamExt, stream::BoxStream};
+use futures::{StreamExt, stream, stream::BoxStream};
 use reqwest::{Client, Request, Response, Url};
 use serde_json::{Value, json};
 
@@ -14,9 +14,12 @@ use super::shared::responses::{
 };
 use super::shared::truncate_error_body;
 use super::transport::{DataSseDecoder, DataSseEvent, HttpTransport, TransportError};
+use crate::constrained_sampling::grammar_tool_input_properties;
 use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
-use crate::types::{AssistantMessage, Context, ErrorReason, Model, ModelThinkingLevel};
-
+use crate::types::{
+    AssistantMessage, AssistantMessageEvent, Context, ErrorReason, Model, ModelThinkingLevel,
+    StopReason,
+};
 const DEFAULT_API_VERSION: &str = "v1";
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 const MIN_OUTPUT_TOKENS: u64 = 16;
@@ -44,12 +47,54 @@ impl Provider for AzureOpenAiResponses {
         context: Context,
         options: StreamOptions,
     ) -> BoxStream<'static, Result<crate::types::AssistantMessageEvent, ProviderError>> {
-        let (sender, stream) = super::stream_state::ProviderEventSender::channel(
-            NonZeroUsize::new(EVENT_CHANNEL_CAPACITY).unwrap_or(NonZeroUsize::MIN),
-        );
         let adapter = self.clone();
         let model = model.clone();
-        tokio::spawn(async move {
+        stream::once(async move {
+            let supports_grammar = compat_bool(&model, "supportsOpenAIGrammarTools", false);
+            let grammar_properties =
+                match grammar_tool_input_properties(context.tools.as_deref(), supports_grammar) {
+                    Ok(properties) => properties,
+                    Err(error) => {
+                        return stream::once(async move {
+                            Ok(prestart_error(
+                                &model,
+                                ErrorReason::Error,
+                                error.to_string(),
+                            ))
+                        })
+                        .boxed();
+                    }
+                };
+            let (request, grammar_properties) = match adapter
+                .prepare_request(&model, &context, &options, grammar_properties)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(failure) => {
+                    let reason = if options
+                        .signal
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+                        || failure.aborted
+                    {
+                        ErrorReason::Aborted
+                    } else {
+                        ErrorReason::Error
+                    };
+                    return stream::once(async move {
+                        let message = if failure.message.starts_with("Tool \"") {
+                            failure.message
+                        } else {
+                            format!("Azure OpenAI API error: {}", failure.message)
+                        };
+                        Ok(prestart_error(&model, reason, message))
+                    })
+                    .boxed();
+                }
+            };
+            let (sender, stream) = super::stream_state::ProviderEventSender::channel(
+                NonZeroUsize::new(EVENT_CHANNEL_CAPACITY).unwrap_or(NonZeroUsize::MIN),
+            );
             let message = AssistantMessage::new(
                 "azure-openai-responses",
                 model.provider.clone(),
@@ -60,45 +105,49 @@ impl Provider for AzureOpenAiResponses {
                 model.clone(),
                 message,
                 sender,
-                ProcessOptions::default(),
+                ProcessOptions {
+                    grammar_tool_input_properties: grammar_properties,
+                    ..ProcessOptions::default()
+                },
             );
-            if processor.start().await.is_err() {
-                return;
-            }
-            if let Err(failure) = adapter
-                .run(&model, &context, &options, &mut processor)
-                .await
-            {
-                let reason = if options
-                    .signal
-                    .as_ref()
-                    .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-                    || failure.aborted
-                {
-                    ErrorReason::Aborted
-                } else {
-                    ErrorReason::Error
-                };
-                let _terminal = processor
-                    .fail(
-                        reason,
-                        format!("Azure OpenAI API error: {}", failure.message),
-                    )
-                    .await;
-            }
-        });
-        stream
+            tokio::spawn(async move {
+                if processor.start().await.is_err() {
+                    return;
+                }
+                if let Err(failure) = adapter.run(&model, &options, &mut processor, request).await {
+                    let reason = if options
+                        .signal
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+                        || failure.aborted
+                    {
+                        ErrorReason::Aborted
+                    } else {
+                        ErrorReason::Error
+                    };
+                    let _terminal = processor
+                        .fail(
+                            reason,
+                            format!("Azure OpenAI API error: {}", failure.message),
+                        )
+                        .await;
+                }
+            });
+            stream
+        })
+        .flatten()
+        .boxed()
     }
 }
 
 impl AzureOpenAiResponses {
-    async fn run(
+    async fn prepare_request(
         &self,
         model: &Model,
         context: &Context,
         options: &StreamOptions,
-        processor: &mut ResponsesStreamProcessor,
-    ) -> Result<(), AdapterFailure> {
+        grammar_properties: BTreeMap<String, String>,
+    ) -> Result<(Request, BTreeMap<String, String>), AdapterFailure> {
         let api_key = options
             .api_key
             .as_deref()
@@ -108,13 +157,23 @@ impl AzureOpenAiResponses {
             })?;
         let config = resolve_azure_config(model, options)?;
         let deployment = resolve_deployment_name(model, options);
-        let mut payload = build_payload(model, context, options, &deployment);
+        let mut payload = build_payload(model, context, options, &deployment)?;
         if let Some(callback) = options.on_payload.as_ref() {
             callback(&mut payload, model)
                 .await
                 .map_err(|error| AdapterFailure::new(error.to_string()))?;
         }
         let request = build_request(&self.transport, &config, api_key, model, options, &payload)?;
+        Ok((request, grammar_properties))
+    }
+
+    async fn run(
+        &self,
+        model: &Model,
+        options: &StreamOptions,
+        processor: &mut ResponsesStreamProcessor,
+        request: Request,
+    ) -> Result<(), AdapterFailure> {
         let response = self
             .transport
             .execute(
@@ -313,7 +372,12 @@ fn build_payload(
     context: &Context,
     options: &StreamOptions,
     deployment: &str,
-) -> Value {
+) -> Result<Value, AdapterFailure> {
+    let supports_strict_mode = compat_bool(model, "supportsStrictMode", true);
+    let supports_openai_grammar_tools = compat_bool(model, "supportsOpenAIGrammarTools", false);
+    let grammar_properties =
+        grammar_tool_input_properties(context.tools.as_deref(), supports_openai_grammar_tools)
+            .map_err(|error| AdapterFailure::new(error.to_string()))?;
     let allowed: BTreeSet<String> = [
         "openai",
         "openai-codex",
@@ -330,8 +394,15 @@ fn build_payload(
         &ConvertMessagesOptions {
             include_system_prompt: true,
             deferred_tools: BTreeMap::new(),
+            grammar_tool_input_properties: grammar_properties,
+            tool_options: ConvertToolsOptions {
+                supports_strict_mode,
+                supports_openai_grammar_tools,
+                ..ConvertToolsOptions::default()
+            },
         },
-    );
+    )
+    .map_err(|error| AdapterFailure::new(error.to_string()))?;
     let mut payload = json!({
         "model": deployment,
         "input": input,
@@ -348,10 +419,23 @@ fn build_payload(
         payload["temperature"] = Value::from(temperature);
     }
     if let Some(tools) = context.tools.as_deref().filter(|tools| !tools.is_empty()) {
-        payload["tools"] = Value::Array(convert_tools(tools, ConvertToolsOptions::default()));
+        payload["tools"] = Value::Array(
+            convert_tools(
+                tools,
+                ConvertToolsOptions {
+                    supports_strict_mode,
+                    supports_openai_grammar_tools,
+                    ..ConvertToolsOptions::default()
+                },
+            )
+            .map_err(|error| AdapterFailure::new(error.to_string()))?,
+        );
+    }
+    if let Some(tool_choice) = options.extra_value(StreamOptionKey::TOOL_CHOICE) {
+        payload["tool_choice"] = tool_choice.clone();
     }
     apply_reasoning(model, options, &mut payload);
-    payload
+    Ok(payload)
 }
 
 fn apply_reasoning(model: &Model, options: &StreamOptions, payload: &mut Value) {
@@ -399,6 +483,15 @@ fn map_thinking_level(model: &Model, value: &str) -> String {
         .unwrap_or_else(|| value.to_owned())
 }
 
+fn compat_bool(model: &Model, name: &str, default: bool) -> bool {
+    model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.get(name))
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
+}
+
 fn extra_string(options: &StreamOptions, key: StreamOptionKey) -> Option<String> {
     options
         .extra_value(key)
@@ -430,6 +523,20 @@ fn merge_option_headers(
             headers.insert(name.clone(), value.clone());
         }
     }
+}
+fn prestart_error(model: &Model, reason: ErrorReason, message: String) -> AssistantMessageEvent {
+    let mut error = AssistantMessage::new(
+        "azure-openai-responses",
+        model.provider.clone(),
+        model.id.clone(),
+        unix_millis(),
+    );
+    error.stop_reason = match reason {
+        ErrorReason::Aborted => StopReason::Aborted,
+        ErrorReason::Error => StopReason::Error,
+    };
+    error.error_message = Some(message);
+    AssistantMessageEvent::Error { reason, error }
 }
 
 fn unix_millis() -> i64 {
@@ -474,6 +581,10 @@ impl AdapterFailure {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
 mod tests {
     use super::*;
     use crate::types::{ModelCost, ModelInput};
@@ -536,7 +647,8 @@ mod tests {
         let model = model("https://x.openai.azure.com");
         let deployment = resolve_deployment_name(&model, &options);
         assert_eq!(deployment, "production");
-        let payload = build_payload(&model, &Context::default(), &options, &deployment);
+        let payload = build_payload(&model, &Context::default(), &options, &deployment)
+            .expect("default request payload conversion succeeds");
         assert_eq!(payload["model"], "production");
         assert_eq!(payload["prompt_cache_key"], "session");
         assert!(payload.get("prompt_cache_retention").is_none());
@@ -598,7 +710,8 @@ mod tests {
             StreamOptionKey::REASONING_EFFORT,
             Value::String("high".into()),
         );
-        let payload = build_payload(&reasoning, &Context::default(), &options, &deployment);
+        let payload = build_payload(&reasoning, &Context::default(), &options, &deployment)
+            .expect("default request payload conversion succeeds");
         assert_eq!(payload["max_output_tokens"], 16);
         assert_eq!(payload["reasoning"]["effort"], "high");
         assert_eq!(payload["reasoning"]["summary"], "auto");
@@ -609,7 +722,8 @@ mod tests {
             &Context::default(),
             &StreamOptions::default(),
             &deployment,
-        );
+        )
+        .expect("default request payload conversion succeeds");
         assert_eq!(payload["reasoning"]["effort"], "none");
     }
 }

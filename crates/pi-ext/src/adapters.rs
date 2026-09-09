@@ -15,11 +15,13 @@
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use futures::Stream;
+use futures::stream::{self, BoxStream};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style as RatatuiStyle};
@@ -27,21 +29,27 @@ use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::client::{HostClient, HostClientError, ProviderCallbackRegistration};
+use crate::protocol::{
+    Frame, KeyEventKindWire, KeyModifiersWire, NamedColor, ProviderCallbackFlags,
+    ProviderCancelDeferredRequest, ProviderDeferredOptions, ProviderFetchDeferredRequest,
+    SlotPlacement, ToolUpdate, UiEventWire, WireColor, from_payload,
+};
+use crate::sanitize::{SanitizedSlot, sanitize_slot};
 use pi_agent::{AgentTool, AgentToolResult, ToolError, ToolExecutionMode, ToolUpdates};
-use pi_ai::provider::{Provider, ProviderError, StreamOptions};
-use pi_ai::types::{AssistantMessageEvent, Context, Model};
+use pi_ai::ConstrainedSampling;
+use pi_ai::provider::{
+    CancelDeferredFn, DeferredCallbacks, FetchDeferredFn, Provider, ProviderError, StreamOptions,
+};
+use pi_ai::types::{
+    AssistantMessage, AssistantMessageEvent, Context, DeferredHandle, ErrorReason, Model,
+    StopReason,
+};
 use pi_tui::component::{Component, EventResult, UiEvent};
 use pi_tui::focus::{FocusId, Focusable};
 use pi_tui::frame::{RawRegion, claim_opaque_span, push_raw_region, set_cursor};
 use pi_tui::link::{format_link_close, format_link_open};
 use pi_tui::text::{slice_with_width, visible_width};
-
-use crate::client::HostClient;
-use crate::protocol::{
-    Frame, KeyEventKindWire, KeyModifiersWire, NamedColor, SlotPlacement, ToolUpdate, UiEventWire,
-    WireColor, from_payload,
-};
-use crate::sanitize::{SanitizedSlot, sanitize_slot};
 
 /// Open lifecycle method strings used by the tool bridge.
 pub mod methods {
@@ -57,10 +65,41 @@ pub mod methods {
     pub const PROVIDER_STREAM: &str = "provider.stream";
     /// Host: cancel an in-flight custom provider stream.
     pub const PROVIDER_CANCEL: &str = "provider.cancel";
+    /// Host: poll one provider-owned deferred response.
+    pub const PROVIDER_FETCH_DEFERRED: &str = "provider.fetchDeferred";
+    /// Host: cancel one provider-owned deferred response.
+    pub const PROVIDER_CANCEL_DEFERRED: &str = "provider.cancelDeferred";
 }
 
 /// Default per-call deadline for tool/provider bridges.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Independent provider operations advertised by an extension endpoint.
+///
+/// Deferred flags are materialized into callbacks by
+/// [`ExtensionProvider::with_capabilities`]; they are never a second mutable
+/// truth that can drift from the callback record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    /// Whether ordinary `streamSimple` is available.
+    pub stream_simple: bool,
+    /// Whether one-shot deferred polling is available.
+    pub fetch_deferred: bool,
+    /// Whether deferred cancellation is available.
+    pub cancel_deferred: bool,
+}
+
+impl ProviderCapabilities {
+    /// Build capability flags from the callbacks actually present.
+    #[must_use]
+    pub const fn from_callbacks(stream_simple: bool, callbacks: &DeferredCallbacks) -> Self {
+        Self {
+            stream_simple,
+            fetch_deferred: callbacks.fetch.is_some(),
+            cancel_deferred: callbacks.cancel.is_some(),
+        }
+    }
+}
 
 fn tool_error<E: std::fmt::Display>(e: E) -> ToolError {
     ToolError::new(e.to_string())
@@ -87,6 +126,8 @@ pub struct ToolRegistration {
     pub parameters: Value,
     /// Optional execution-mode override.
     pub execution_mode: Option<ToolExecutionMode>,
+    /// Optional provider-side constrained sampling request.
+    pub constrained_sampling: Option<ConstrainedSampling>,
 }
 
 /// `pi_agent::AgentTool` backed by a TypeScript extension running in the host.
@@ -144,6 +185,10 @@ impl AgentTool for ExtensionAgentTool {
 
     fn execution_mode(&self) -> Option<ToolExecutionMode> {
         self.meta.execution_mode
+    }
+
+    fn constrained_sampling(&self) -> Option<ConstrainedSampling> {
+        self.meta.constrained_sampling.clone()
     }
 
     fn prepare_arguments(&self, raw: &Map<String, Value>) -> Result<Map<String, Value>, ToolError> {
@@ -262,11 +307,15 @@ fn parse_tool_result(frame: &Frame) -> Result<AgentToolResult, ToolError> {
 ///
 /// `stream` opens a `provider.stream` call and forwards each `providerEvent`
 /// payload (deserialized as an [`AssistantMessageEvent`]) to the caller, while
-/// honoring the caller's [`CancellationToken`].
+/// honoring the caller's [`CancellationToken`]. Deferred callbacks are
+/// materialized once from [`ProviderCapabilities`] and kept with this
+/// provider instance.
 pub struct ExtensionProvider {
     provider_id: String,
     client: Arc<HostClient>,
-    timeout: Duration,
+    timeout: Arc<AtomicU64>,
+    capabilities: ProviderCapabilities,
+    deferred: Option<DeferredCallbacks>,
     /// Test-only probe notified immediately before a bounded consumer send
     /// when the channel is full (`capacity() == 0`). Absent in non-test
     /// builds so production behavior is unchanged.
@@ -276,27 +325,115 @@ pub struct ExtensionProvider {
 
 impl ExtensionProvider {
     /// Create a new proxy for `provider_id`.
+    ///
+    /// The historical constructor remains a stream-capable, deferred-disabled
+    /// proxy; callers opt into independent capabilities with
+    /// [`Self::with_capabilities`].
     #[must_use]
     pub fn new(provider_id: impl Into<String>, client: Arc<HostClient>) -> Self {
         Self {
             provider_id: provider_id.into(),
             client,
-            timeout: DEFAULT_CALL_TIMEOUT,
+            timeout: Arc::new(AtomicU64::new(timeout_millis(DEFAULT_CALL_TIMEOUT))),
+            capabilities: ProviderCapabilities {
+                stream_simple: true,
+                ..ProviderCapabilities::default()
+            },
+            deferred: None,
             #[cfg(test)]
             blocked_send_probe: None,
         }
     }
 
-    /// Override the per-call deadline.
+    /// Materialize the requested deferred callbacks from the live endpoint
+    /// capabilities. The callback record, not duplicate booleans, is the
+    /// provider's runtime source of truth.
     #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+    pub fn with_capabilities(mut self, capabilities: ProviderCapabilities) -> Self {
+        let provider_id = self.provider_id.clone();
+        let client = Arc::clone(&self.client);
+        let timeout = Arc::clone(&self.timeout);
+        let deferred = {
+            let fetch = if capabilities.fetch_deferred {
+                let client = Arc::clone(&client);
+                let provider_id = provider_id.clone();
+                let timeout = Arc::clone(&timeout);
+                let callback: FetchDeferredFn =
+                    Arc::new(
+                        move |model: &Model,
+                              handle: DeferredHandle,
+                              options: StreamOptions|
+                              -> BoxStream<
+                            'static,
+                            Result<AssistantMessageEvent, ProviderError>,
+                        > {
+                            deferred_fetch_stream(
+                                Arc::clone(&client),
+                                provider_id.clone(),
+                                current_timeout(&timeout),
+                                model,
+                                handle,
+                                options,
+                            )
+                        },
+                    );
+                Some(callback)
+            } else {
+                None
+            };
+            let cancel = if capabilities.cancel_deferred {
+                let client = Arc::clone(&client);
+                let provider_id = provider_id.clone();
+                let timeout = Arc::clone(&timeout);
+                let callback: CancelDeferredFn = Arc::new(
+                    move |model: &Model,
+                          handle: DeferredHandle,
+                          options: StreamOptions|
+                     -> futures::future::BoxFuture<'static, Result<(), ProviderError>> {
+                        deferred_cancel_future(
+                            Arc::clone(&client),
+                            provider_id.clone(),
+                            current_timeout(&timeout),
+                            model,
+                            handle,
+                            options,
+                        )
+                    },
+                );
+                Some(callback)
+            } else {
+                None
+            };
+            if fetch.is_none() && cancel.is_none() {
+                None
+            } else {
+                Some(DeferredCallbacks { fetch, cancel })
+            }
+        };
+        self.capabilities = ProviderCapabilities {
+            stream_simple: capabilities.stream_simple,
+            fetch_deferred: deferred
+                .as_ref()
+                .is_some_and(|callbacks| callbacks.fetch.is_some()),
+            cancel_deferred: deferred
+                .as_ref()
+                .is_some_and(|callbacks| callbacks.cancel.is_some()),
+        };
+        self.deferred = deferred;
         self
     }
 
-    /// Test-only builder: install a probe that is notified immediately
-    /// before a bounded consumer send when the channel is full. Absent in
-    /// non-test builds.
+    /// Override the per-call deadline.
+    #[must_use]
+    pub fn with_timeout(self, timeout: Duration) -> Self {
+        self.timeout
+            .store(timeout_millis(timeout), Ordering::Relaxed);
+        self
+    }
+
+    /// Test-only builder: install a probe that is notified immediately before
+    /// a bounded consumer send when the channel is full. Absent in non-test
+    /// builds.
     #[cfg(test)]
     #[must_use]
     fn with_blocked_send_probe(mut self, probe: Arc<tokio::sync::Notify>) -> Self {
@@ -305,17 +442,30 @@ impl ExtensionProvider {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "pre-existing adapter shape; narrowing the surface is a separate port task"
+)]
 impl Provider for ExtensionProvider {
     fn stream(
         &self,
         model: &Model,
         context: Context,
         options: StreamOptions,
-    ) -> futures::stream::BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+    ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+        if !self.capabilities.stream_simple {
+            return Box::pin(stream::once(async {
+                Err(ProviderError::new(
+                    "provider does not support ordinary streaming",
+                ))
+            }));
+        }
         let client = Arc::clone(&self.client);
         let provider_id = self.provider_id.clone();
-        let timeout = self.timeout;
+        let timeout = current_timeout(&self.timeout);
         let cancel = options.signal.clone().unwrap_or_default();
+        let callback_scope = callback_registration(model, &options);
+        let callback_flags = callback_flags(&options);
         #[cfg(test)]
         let blocked_send_probe = self.blocked_send_probe.clone();
         // Serialize model/context/options before spawning so no lock is held
@@ -328,12 +478,23 @@ impl Provider for ExtensionProvider {
         payload.insert("model".to_owned(), model_value);
         payload.insert("context".to_owned(), context_value);
         payload.insert("options".to_owned(), options_value);
+        if callback_flags.before_payload || callback_flags.on_response {
+            payload.insert(
+                "callbacks".to_owned(),
+                serde_json::to_value(callback_flags).unwrap_or(Value::Null),
+            );
+        }
 
         // Capacity-64 matches STREAM_EVENT_CAPACITY / host provider channel bound.
         let (tx, rx) = mpsc::channel::<Result<AssistantMessageEvent, ProviderError>>(64);
         tokio::spawn(async move {
             let mut handle = match client
-                .open_stream_raw(methods::PROVIDER_STREAM, Value::Object(payload), 64)
+                .open_stream_raw_with_callbacks(
+                    methods::PROVIDER_STREAM,
+                    Value::Object(payload),
+                    64,
+                    callback_scope,
+                )
                 .await
             {
                 Ok(h) => h,
@@ -412,8 +573,7 @@ impl Provider for ExtensionProvider {
                     }
                     // Race terminal-error delivery against caller
                     // cancellation so a full consumer channel does not
-                    // block cancellation teardown. When cancellation wins,
-                    // return without awaiting capacity.
+                    // block cancellation teardown.
                     tokio::select! {
                         biased;
                         () = cancel.cancelled() => {}
@@ -429,6 +589,200 @@ impl Provider for ExtensionProvider {
         });
         Box::pin(ProviderStream { rx })
     }
+
+    fn deferred(&self) -> Option<&DeferredCallbacks> {
+        self.deferred.as_ref()
+    }
+}
+
+fn timeout_millis(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn current_timeout(timeout: &AtomicU64) -> Duration {
+    Duration::from_millis(timeout.load(Ordering::Relaxed))
+}
+
+fn callback_flags(options: &StreamOptions) -> ProviderCallbackFlags {
+    ProviderCallbackFlags {
+        before_payload: options.on_payload.is_some(),
+        on_response: options.on_response.is_some(),
+    }
+}
+
+fn callback_registration(
+    model: &Model,
+    options: &StreamOptions,
+) -> Option<ProviderCallbackRegistration> {
+    let flags = callback_flags(options);
+    if !flags.before_payload && !flags.on_response {
+        return None;
+    }
+    Some(ProviderCallbackRegistration {
+        model: model.clone(),
+        on_payload: options.on_payload.clone(),
+        on_response: options.on_response.clone(),
+    })
+}
+
+fn deferred_options_wire(options: &StreamOptions, wait: Option<u64>) -> ProviderDeferredOptions {
+    let mut map = stream_options_wire(options)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    match wait {
+        Some(wait) => {
+            map.insert("wait".to_owned(), Value::from(wait));
+        }
+        None => {
+            map.remove("wait");
+        }
+    }
+    serde_json::from_value(Value::Object(map)).unwrap_or_default()
+}
+
+fn provider_error_event(model: &Model, message: String) -> AssistantMessageEvent {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let timestamp = i64::try_from(millis).unwrap_or(i64::MAX);
+    let mut error = AssistantMessage::new(
+        model.api.clone(),
+        model.provider.clone(),
+        model.id.clone(),
+        timestamp,
+    );
+    error.stop_reason = StopReason::Error;
+    error.error_message = Some(message);
+    AssistantMessageEvent::Error {
+        reason: ErrorReason::Error,
+        error,
+    }
+}
+
+fn deferred_terminal_result(
+    model: &Model,
+    error: HostClientError,
+) -> Result<AssistantMessageEvent, ProviderError> {
+    match error {
+        HostClientError::Remote { code, message } => {
+            Ok(provider_error_event(model, format!("{code}: {message}")))
+        }
+        other => Err(provider_error(other)),
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "pre-existing adapter shape; narrowing the surface is a separate port task"
+)]
+fn deferred_fetch_stream(
+    client: Arc<HostClient>,
+    provider_id: String,
+    timeout: Duration,
+    model: &Model,
+    handle: DeferredHandle,
+    options: StreamOptions,
+) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+    let cancel = options.signal.clone().unwrap_or_default();
+    let callback_scope = callback_registration(model, &options);
+    let request = ProviderFetchDeferredRequest {
+        provider_id,
+        model: serde_json::to_value(model).unwrap_or(Value::Null),
+        handle,
+        options: deferred_options_wire(&options, Some(0)),
+        callbacks: callback_flags(&options),
+    };
+    let payload = serde_json::to_value(request).unwrap_or(Value::Null);
+    let model = model.clone();
+    let (tx, rx) = mpsc::channel::<Result<AssistantMessageEvent, ProviderError>>(64);
+    tokio::spawn(async move {
+        let mut stream = match client
+            .open_stream_raw_with_callbacks(
+                methods::PROVIDER_FETCH_DEFERRED,
+                payload,
+                64,
+                callback_scope,
+            )
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = tx.send(Err(provider_error(error))).await;
+                return;
+            }
+        };
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    let _ = stream.cancel(methods::PROVIDER_CANCEL);
+                    let _ = tx.try_send(Err(ProviderError::new("provider deferred fetch cancelled")));
+                    return;
+                }
+                event = stream.next_event() => match event {
+                    Some(frame) => {
+                        if let Some(event) = decode_provider_stream_event(&frame.payload)
+                            && tx.send(Ok(event)).await.is_err()
+                        {
+                            let _ = stream.cancel(methods::PROVIDER_CANCEL);
+                            return;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+        let terminal = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                let _ = tx.try_send(Err(ProviderError::new("provider deferred fetch cancelled")));
+                return;
+            }
+            result = stream.finish(timeout) => result,
+        };
+        if let Err(error) = terminal {
+            let item = deferred_terminal_result(&model, error);
+            let _ = tx.send(item).await;
+        }
+    });
+    Box::pin(ProviderStream { rx })
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "pre-existing adapter shape; narrowing the surface is a separate port task"
+)]
+fn deferred_cancel_future(
+    client: Arc<HostClient>,
+    provider_id: String,
+    timeout: Duration,
+    model: &Model,
+    handle: DeferredHandle,
+    options: StreamOptions,
+) -> futures::future::BoxFuture<'static, Result<(), ProviderError>> {
+    let callback_scope = callback_registration(model, &options);
+    let request = ProviderCancelDeferredRequest {
+        provider_id,
+        model: serde_json::to_value(model).unwrap_or(Value::Null),
+        handle,
+        options: deferred_options_wire(&options, None),
+        callbacks: callback_flags(&options),
+    };
+    let payload = serde_json::to_value(request).unwrap_or(Value::Null);
+    Box::pin(async move {
+        client
+            .request_raw_with_callbacks(
+                methods::PROVIDER_CANCEL_DEFERRED,
+                payload,
+                timeout,
+                callback_scope,
+            )
+            .await
+            .map(|_| ())
+            .map_err(provider_error)
+    })
 }
 
 /// Encode prepared [`StreamOptions`] for the host `provider.stream` request.
@@ -597,10 +951,18 @@ impl SlotComponent {
         self.slot.placement
     }
 
-    fn forward_event(&self, event: &UiEvent) {
+    /// Map `event` and forward it to the attached router.
+    ///
+    /// Native events the protocol cannot represent (mouse) are declined
+    /// rather than claimed, so no extension input is ever manufactured.
+    fn forward_event(&self, event: &UiEvent) -> EventResult {
+        let Some(wire) = map_ui_event(event) else {
+            return EventResult::Ignored;
+        };
         if let Some(tx) = &self.event_tx {
-            let _ = tx.send(map_ui_event(event));
+            let _ = tx.send(wire);
         }
+        EventResult::Consumed
     }
 }
 
@@ -677,8 +1039,7 @@ impl Component for SlotComponent {
 
     fn handle_event(&mut self, event: &UiEvent) -> EventResult {
         if self.focused {
-            self.forward_event(event);
-            EventResult::Consumed
+            self.forward_event(event)
         } else {
             EventResult::Ignored
         }
@@ -837,21 +1198,26 @@ fn named_color_to_ratatui(name: NamedColor) -> Color {
 }
 
 /// Map a native [`UiEvent`] onto the protocol wire event type.
+///
+/// Returns `None` for native events the extension protocol cannot represent
+/// (currently [`UiEvent::Mouse`]). Callers must forward only `Some` values
+/// and never manufacture wire input for a declinable event.
 #[must_use]
-pub fn map_ui_event(event: &UiEvent) -> UiEventWire {
+pub fn map_ui_event(event: &UiEvent) -> Option<UiEventWire> {
     match event {
-        UiEvent::Key(key) => UiEventWire::Key {
+        UiEvent::Key(key) => Some(UiEventWire::Key {
             code: map_key_code(key.code),
             modifiers: map_modifiers(key.modifiers),
             kind: map_key_kind(key.kind),
-        },
-        UiEvent::Paste(text) => UiEventWire::Paste { text: text.clone() },
-        UiEvent::FocusGained => UiEventWire::FocusGained,
-        UiEvent::FocusLost => UiEventWire::FocusLost,
-        UiEvent::Resize { width, height } => UiEventWire::Resize {
+        }),
+        UiEvent::Mouse(_) => None,
+        UiEvent::Paste(text) => Some(UiEventWire::Paste { text: text.clone() }),
+        UiEvent::FocusGained => Some(UiEventWire::FocusGained),
+        UiEvent::FocusLost => Some(UiEventWire::FocusLost),
+        UiEvent::Resize { width, height } => Some(UiEventWire::Resize {
             width: *width,
             height: *height,
-        },
+        }),
     }
 }
 
@@ -1258,6 +1624,7 @@ mod tests {
             description: "d".to_owned(),
             parameters: serde_json::json!({}),
             execution_mode: None,
+            constrained_sampling: None,
         }
     }
 
@@ -1804,6 +2171,54 @@ mod tests {
         );
         Ok(())
     }
+    #[tokio::test]
+    async fn extension_provider_deferred_cancel_uses_timeout_set_after_capabilities() -> R {
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let handle = DeferredHandle {
+            provider: "custom".to_owned(),
+            model_id: "m".to_owned(),
+            api: "custom".to_owned(),
+            id: "deferred-1".to_owned(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: None,
+        };
+        let capabilities = ProviderCapabilities {
+            stream_simple: false,
+            fetch_deferred: true,
+            cancel_deferred: true,
+        };
+
+        {
+            let (client, mut host) = make_pair().await;
+            let provider = ExtensionProvider::new("custom", Arc::new(client))
+                .with_timeout(Duration::from_millis(10))
+                .with_capabilities(capabilities)
+                .with_timeout(Duration::from_millis(40));
+            let cancel =
+                tokio::spawn(provider.cancel_deferred(&model, handle, StreamOptions::default()));
+            let request = host
+                .require_frame(methods::PROVIDER_CANCEL_DEFERRED)
+                .await?;
+            assert_eq!(request.method, methods::PROVIDER_CANCEL_DEFERRED);
+            let result = tokio::time::timeout(Duration::from_secs(1), cancel).await??;
+            let Err(error) = result else {
+                return Err("deferred cancellation unexpectedly succeeded".into());
+            };
+            assert!(
+                error.to_string().contains("timed out after 40ms"),
+                "unexpected deferred cancellation timeout: {error}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn linked_styled_run_emits_balanced_safe_osc8_and_keeps_buffer_style() {
         use std::cell::RefCell;
@@ -2106,7 +2521,9 @@ mod tests {
 
     #[tokio::test]
     async fn slot_component_forwards_input_when_focused() -> R {
-        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+        };
         let slot = crate::protocol::UiSlot {
             key: "w".to_owned(),
             generation: 1,
@@ -2149,6 +2566,37 @@ mod tests {
             }
             other => return Err(format!("expected Key wire, got {other:?}").into()),
         }
+        // A native pointer event has no wire representation: it must be
+        // declined, never claimed, and never queued for the extension.
+        assert_eq!(
+            component.handle_event(&UiEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 1,
+                modifiers: KeyModifiers::empty(),
+            })),
+            EventResult::Ignored,
+            "focused slot must not claim a native mouse event it cannot forward"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no wire event may follow a declined mouse event"
+        );
+        // A genuine resize after the declined mouse still reaches the router.
+        assert_eq!(
+            component.handle_event(&UiEvent::Resize {
+                width: 120,
+                height: 40
+            }),
+            EventResult::Consumed
+        );
+        assert_eq!(
+            rx.recv().await.ok_or("resize wire not forwarded")?,
+            UiEventWire::Resize {
+                width: 120,
+                height: 40
+            }
+        );
         Ok(())
     }
 

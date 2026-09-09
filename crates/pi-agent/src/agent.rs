@@ -65,6 +65,7 @@ pub(crate) fn default_base_config(model: Model) -> AgentLoopConfig {
     AgentLoopConfig {
         model,
         reasoning: None,
+        tool_choice: None,
         temperature: None,
         max_tokens: None,
         session_id: None,
@@ -265,7 +266,7 @@ impl Agent {
             .iter()
             .rev()
             .find_map(|message| match message.as_llm() {
-                Some(Message::Assistant(assistant)) => Some(assistant.clone()),
+                Some(Message::Assistant(assistant)) => Some((**assistant).clone()),
                 _ => None,
             })
     }
@@ -281,7 +282,7 @@ impl Agent {
         let mut state = lock(&self.inner.state);
         match state.messages.last_mut() {
             Some(tail) if tail.role() == "assistant" => {
-                *tail = AgentMessage::Llm(Box::new(Message::Assistant(message)));
+                *tail = AgentMessage::Llm(Box::new(Message::Assistant(Box::new(message))));
                 true
             }
             _ => false,
@@ -665,7 +666,7 @@ fn finish_run(
             // `agent_end` and no duplicate message/turn events.
             if !terminal.load(Ordering::SeqCst) {
                 let assistant = synthesize_error_assistant(&snapshot_config(inner), cancel, &error);
-                let message = AgentMessage::Llm(Box::new(Message::Assistant(assistant)));
+                let message = AgentMessage::Llm(Box::new(Message::Assistant(Box::new(assistant))));
                 emit_message_pair(&inner.sink, message.clone());
                 inner.sink.emit(AgentEvent::TurnEnd {
                     message: message.clone(),
@@ -1495,7 +1496,7 @@ mod tests {
     }
 
     fn assistant_agent(text: &str) -> AgentMessage {
-        AgentMessage::Llm(Box::new(Message::Assistant(assistant(text))))
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(assistant(text)))))
     }
 
     #[test]

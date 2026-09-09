@@ -472,6 +472,7 @@ fn default_agent_loop_config(
     AgentLoopConfig {
         model,
         reasoning: None,
+        tool_choice: None,
         temperature: None,
         max_tokens: None,
         session_id: None,
@@ -1677,7 +1678,7 @@ mod tests {
             .replace_with
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(AgentMessage::Llm(
-            Box::new(pi_ai::Message::Assistant(replaced)),
+            Box::new(pi_ai::Message::Assistant(Box::new(replaced))),
         ));
 
         let provider = Arc::new(MockProvider(vec![

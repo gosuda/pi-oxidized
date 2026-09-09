@@ -8,7 +8,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, stream};
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue,
     USER_AGENT,
@@ -16,9 +16,11 @@ use reqwest::header::{
 use reqwest::{Client, Response};
 use serde_json::{Map, Value, json};
 use tokio::net::TcpStream;
+use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -29,11 +31,12 @@ use super::shared::responses::{
 use super::shared::truncate_error_body;
 use super::stream_state::ProviderEventSender;
 use super::transport::{DataSseDecoder, DataSseEvent, HttpTransport, TransportError};
+use crate::constrained_sampling::grammar_tool_input_properties;
 use crate::provider::{Provider, ProviderError, ProviderResponse, StreamOptionKey, StreamOptions};
 use crate::types::{
-    AssistantContent, AssistantMessage, AssistantMessageDiagnostic, DiagnosticCode,
-    DiagnosticErrorInfo, ErrorReason, Message, Model, ModelThinkingLevel, StopReason, Tool,
-    Transport,
+    AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantMessageEvent,
+    DiagnosticCode, DiagnosticErrorInfo, ErrorReason, Message, Model, ModelThinkingLevel,
+    StopReason, Tool, Transport,
 };
 
 const API: &str = "openai-codex-responses";
@@ -91,30 +94,58 @@ impl Provider for OpenAiCodexResponses {
         let Some(capacity) = NonZeroUsize::new(EVENT_CHANNEL_CAPACITY) else {
             return futures::stream::empty().boxed();
         };
-        let (sender, stream) = ProviderEventSender::channel(capacity);
         let adapter = self.clone();
         let model = model.clone();
-        let work = async move {
-            Box::pin(adapter.run(model, context, options, sender)).await;
-        };
-        tokio::spawn(work);
-        stream
+        stream::once(async move {
+            let prepared = match prepare_codex_request(&model, &context, &options).await {
+                Ok(prepared) => prepared,
+                Err(failure) => {
+                    let reason = if failure.is_cancelled()
+                        || options
+                            .signal
+                            .as_ref()
+                            .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        ErrorReason::Aborted
+                    } else {
+                        ErrorReason::Error
+                    };
+                    let message = if reason == ErrorReason::Aborted {
+                        "Request was aborted".to_owned()
+                    } else {
+                        failure.message().to_owned()
+                    };
+                    return stream::once(
+                        async move { Ok(prestart_error(&model, reason, message)) },
+                    )
+                    .boxed();
+                }
+            };
+            let (sender, stream) = ProviderEventSender::channel(capacity);
+            tokio::spawn(async move {
+                adapter.run_prepared(model, options, sender, prepared).await;
+            });
+            stream
+        })
+        .flatten()
+        .boxed()
     }
 }
 
 impl OpenAiCodexResponses {
-    async fn run(
-        self,
+    async fn run_prepared(
+        &self,
         model: Model,
-        context: crate::types::Context,
         options: StreamOptions,
         sender: ProviderEventSender,
+        prepared: PreparedCodexRequest,
     ) {
         let request_service_tier = extra_string(&options, StreamOptionKey::SERVICE_TIER);
         let process_options = ProcessOptions {
             request_service_tier,
             apply_service_tier_pricing: true,
             default_service_tier_uses_request: true,
+            grammar_tool_input_properties: prepared.grammar_tool_input_properties.clone(),
         };
         let initial =
             AssistantMessage::new(API, model.provider.clone(), model.id.clone(), unix_millis());
@@ -131,11 +162,11 @@ impl OpenAiCodexResponses {
 
         let result = Box::pin(self.run_started(
             &model,
-            &context,
             &options,
             &sender,
             &process_options,
             &mut processor,
+            &prepared,
         ))
         .await;
         if let Err(failure) = result {
@@ -169,13 +200,12 @@ impl OpenAiCodexResponses {
     async fn run_started(
         &self,
         model: &Model,
-        context: &crate::types::Context,
         options: &StreamOptions,
         sender: &ProviderEventSender,
         process_options: &ProcessOptions,
         processor: &mut ResponsesStreamProcessor,
+        prepared: &PreparedCodexRequest,
     ) -> Result<(), CodexFailure> {
-        let prepared = Box::pin(prepare_codex_request(model, context, options)).await?;
         if prepared.configured_transport != Transport::Sse && !prepared.sticky_sse {
             match Box::pin(self.attempt_websocket_with_fallback(
                 model,
@@ -183,7 +213,7 @@ impl OpenAiCodexResponses {
                 sender,
                 process_options,
                 processor,
-                &prepared,
+                prepared,
             ))
             .await?
             {
@@ -193,7 +223,7 @@ impl OpenAiCodexResponses {
         }
 
         let compressed = compress_request_body_zstd(&prepared.body_json)?;
-        let mut sse_headers = prepared.sse_headers;
+        let mut sse_headers = prepared.sse_headers.clone();
         sse_headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
         Box::pin(self.process_sse(model, options, compressed, sse_headers, processor)).await
     }
@@ -390,12 +420,9 @@ impl OpenAiCodexResponses {
             &mut semantic_events,
         )
         .await;
-
         match stream_result {
             Ok(()) => {
-                if use_cached_context {
-                    update_continuation(&mut acquired.connection, full_body, model, processor);
-                }
+                update_continuation(&mut acquired.connection, full_body, model, processor);
                 acquired.release(true).await;
                 Ok(())
             }
@@ -416,6 +443,7 @@ struct PreparedCodexRequest {
     websocket_headers: HeaderMap,
     configured_transport: Transport,
     sticky_sse: bool,
+    grammar_tool_input_properties: BTreeMap<String, String>,
 }
 
 enum WebsocketAttempt {
@@ -433,7 +461,11 @@ async fn prepare_codex_request(
         CodexFailure::semantic(format!("No API key for provider: {}", model.provider))
     })?;
     let account_id = extract_account_id(token)?;
-    let mut body = build_request_body(model, context, options);
+    let supports_grammar = compat_bool(model, "supportsOpenAIGrammarTools", false);
+    let grammar_tool_input_properties =
+        grammar_tool_input_properties(context.tools.as_deref(), supports_grammar)
+            .map_err(|error| CodexFailure::semantic(error.to_string()))?;
+    let mut body = build_request_body(model, context, options)?;
     if let Some(callback) = options.on_payload.as_ref() {
         callback(&mut body, model)
             .await
@@ -476,6 +508,7 @@ async fn prepare_codex_request(
         websocket_headers,
         configured_transport,
         sticky_sse,
+        grammar_tool_input_properties,
     })
 }
 
@@ -1034,21 +1067,32 @@ fn update_continuation(
     };
     let context = crate::types::Context {
         system_prompt: None,
-        messages: vec![Message::Assistant(message)],
+        messages: vec![Message::Assistant(Box::new(message))],
         tools: None,
     };
-    let response_items = convert_messages(
+    let Ok(response_items) = convert_messages(
         model,
         &context,
         &CODEX_TOOL_CALL_PROVIDERS,
         &ConvertMessagesOptions {
             include_system_prompt: false,
             deferred_tools: BTreeMap::new(),
+            grammar_tool_input_properties: processor.grammar_tool_input_properties().clone(),
+            ..ConvertMessagesOptions::default()
         },
-    )
-    .into_iter()
-    .filter(|item| item.get("type").and_then(Value::as_str) != Some("function_call_output"))
-    .collect();
+    ) else {
+        connection.continuation = None;
+        return;
+    };
+    let response_items = response_items
+        .into_iter()
+        .filter(|item| {
+            !matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call_output" | "custom_tool_call_output")
+            )
+        })
+        .collect();
     connection.continuation = Some(Continuation {
         request_body: request_body.clone(),
         response_id,
@@ -1071,9 +1115,14 @@ fn build_request_body(
     model: &Model,
     context: &crate::types::Context,
     options: &StreamOptions,
-) -> Value {
+) -> Result<Value, CodexFailure> {
+    let supports_strict_mode = compat_bool(model, "supportsStrictMode", true);
+    let supports_openai_grammar_tools = compat_bool(model, "supportsOpenAIGrammarTools", false);
     let (immediate_tools, deferred_tools) =
         split_deferred_tools(context, compat_bool(model, "supportsToolSearch", false));
+    let grammar_properties =
+        grammar_tool_input_properties(context.tools.as_deref(), supports_openai_grammar_tools)
+            .map_err(|error| CodexFailure::semantic(error.to_string()))?;
     let input = convert_messages(
         model,
         context,
@@ -1081,11 +1130,26 @@ fn build_request_body(
         &ConvertMessagesOptions {
             include_system_prompt: false,
             deferred_tools,
+            grammar_tool_input_properties: grammar_properties,
+            tool_options: ConvertToolsOptions {
+                strict: None,
+                supports_strict_mode,
+                supports_openai_grammar_tools,
+                ..ConvertToolsOptions::default()
+            },
         },
-    );
+    )
+    .map_err(|error| CodexFailure::semantic(error.to_string()))?;
     let mut body = codex_base_request_fields(model, context, options, input);
-    apply_codex_optional_request_fields(&mut body, model, options, &immediate_tools);
-    Value::Object(body)
+    apply_codex_optional_request_fields(
+        &mut body,
+        model,
+        options,
+        &immediate_tools,
+        supports_strict_mode,
+        supports_openai_grammar_tools,
+    )?;
+    Ok(Value::Object(body))
 }
 
 fn codex_base_request_fields(
@@ -1124,13 +1188,14 @@ fn codex_base_request_fields(
     body.insert("parallel_tool_calls".into(), Value::Bool(true));
     body
 }
-
 fn apply_codex_optional_request_fields(
     body: &mut Map<String, Value>,
     model: &Model,
     options: &StreamOptions,
     immediate_tools: &[Tool],
-) {
+    supports_strict_mode: bool,
+    supports_openai_grammar_tools: bool,
+) -> Result<(), CodexFailure> {
     if let Some(session_id) = options.session_id.as_deref() {
         body.insert(
             "prompt_cache_key".into(),
@@ -1146,13 +1211,18 @@ fn apply_codex_optional_request_fields(
     if !immediate_tools.is_empty() {
         body.insert(
             "tools".into(),
-            Value::Array(convert_tools(
-                immediate_tools,
-                ConvertToolsOptions {
-                    strict: None,
-                    defer_loading: false,
-                },
-            )),
+            Value::Array(
+                convert_tools(
+                    immediate_tools,
+                    ConvertToolsOptions {
+                        strict: None,
+                        supports_strict_mode,
+                        supports_openai_grammar_tools,
+                        ..ConvertToolsOptions::default()
+                    },
+                )
+                .map_err(|error| CodexFailure::semantic(error.to_string()))?,
+            ),
         );
     }
     if let Some(reasoning_effort) = extra_string(options, StreamOptionKey::REASONING_EFFORT) {
@@ -1166,6 +1236,7 @@ fn apply_codex_optional_request_fields(
             }),
         );
     }
+    Ok(())
 }
 
 fn split_deferred_tools(
@@ -1857,6 +1928,17 @@ const fn failure_class_name(class: FailureClass) -> &'static str {
         FailureClass::Protocol => "CodexProtocolError",
         FailureClass::Semantic => "CodexError",
     }
+}
+
+fn prestart_error(model: &Model, reason: ErrorReason, message: String) -> AssistantMessageEvent {
+    let mut error =
+        AssistantMessage::new(API, model.provider.clone(), model.id.clone(), unix_millis());
+    error.stop_reason = match reason {
+        ErrorReason::Aborted => crate::types::StopReason::Aborted,
+        ErrorReason::Error => crate::types::StopReason::Error,
+    };
+    error.error_message = Some(message);
+    AssistantMessageEvent::Error { reason, error }
 }
 
 fn unix_millis() -> i64 {

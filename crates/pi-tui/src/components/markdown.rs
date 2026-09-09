@@ -7,7 +7,10 @@ use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd}
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use crate::component::{Component, EventResult, UiEvent};
+use crate::component::{
+    Component, DisplayRowContent, DisplayRowSpan, EventResult, RowSourceError, UiEvent,
+};
+use crate::image::DocumentImage;
 use crate::link::hyperlink_capped;
 use crate::text::{
     is_image_line, render_latex, strip_trailing_partial_closing_fence, visible_width,
@@ -188,12 +191,25 @@ pub struct Markdown {
     default_style: DefaultTextStyle,
     options: MarkdownOptions,
     cache: Option<Cache>,
+    prepared: Option<PreparedRows>,
 }
 
 struct Cache {
     text: String,
     width: u16,
     lines: Vec<KeyedLine>,
+}
+#[derive(Clone, Copy)]
+struct PreparedRow {
+    line_index: usize,
+    image_index: Option<usize>,
+    row_in_image: u16,
+}
+
+struct PreparedRows {
+    width: u16,
+    rows: Vec<PreparedRow>,
+    images: Vec<DocumentImage>,
 }
 
 impl Markdown {
@@ -215,6 +231,7 @@ impl Markdown {
             default_style,
             options,
             cache: None,
+            prepared: None,
         }
     }
 
@@ -222,8 +239,8 @@ impl Markdown {
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.cache = None;
+        self.prepared = None;
     }
-
     /// Borrow source text.
     #[must_use]
     pub fn text(&self) -> &str {
@@ -234,6 +251,7 @@ impl Markdown {
     pub fn set_hyperlinks(&mut self, enabled: bool) {
         self.options.hyperlinks = enabled;
         self.cache = None;
+        self.prepared = None;
     }
 
     fn apply_default_style(&self, text: &str) -> String {
@@ -339,6 +357,7 @@ impl Markdown {
                 width,
                 lines,
             });
+            self.prepared = None;
         }
         self.cache
             .as_ref()
@@ -348,6 +367,108 @@ impl Markdown {
 }
 
 impl Component for Markdown {
+    fn prepare_rows(&mut self, width: u16) -> Result<usize, RowSourceError> {
+        self.prepared = None;
+        {
+            let _ = self.lines_for_width(width);
+        }
+        let cache = self.cache.as_ref().ok_or(RowSourceError::NotPrepared)?;
+        let mut rows = Vec::new();
+        let mut images = Vec::new();
+        let mut row_count = 0usize;
+        for (line_index, keyed) in cache.lines.iter().enumerate() {
+            if is_image_line(keyed.line()) {
+                let image = DocumentImage::try_from_line(keyed.line())
+                    .map_err(|_| RowSourceError::InvalidImage)?
+                    .ok_or(RowSourceError::InvalidImage)?;
+                let image_rows = image.rows();
+                if image_rows == 0 {
+                    return Err(RowSourceError::InvalidImage);
+                }
+                let image_index = images.len();
+                images.push(image);
+                row_count = row_count
+                    .checked_add(usize::from(image_rows))
+                    .ok_or(RowSourceError::RowCountOverflow)?;
+                for row_in_image in 0..image_rows {
+                    rows.push(PreparedRow {
+                        line_index,
+                        image_index: Some(image_index),
+                        row_in_image,
+                    });
+                }
+            } else {
+                row_count = row_count
+                    .checked_add(1)
+                    .ok_or(RowSourceError::RowCountOverflow)?;
+                rows.push(PreparedRow {
+                    line_index,
+                    image_index: None,
+                    row_in_image: 0,
+                });
+            }
+        }
+        self.prepared = Some(PreparedRows {
+            width,
+            rows,
+            images,
+        });
+        Ok(row_count)
+    }
+
+    fn visit_row(
+        &self,
+        row: usize,
+        emit: &mut dyn FnMut(DisplayRowSpan<'_>),
+    ) -> Result<(), RowSourceError> {
+        let prepared = self.prepared.as_ref().ok_or(RowSourceError::NotPrepared)?;
+        let cache = self.cache.as_ref().ok_or(RowSourceError::NotPrepared)?;
+        if prepared.width != cache.width {
+            return Err(RowSourceError::NotPrepared);
+        }
+        let prepared_row = prepared
+            .rows
+            .get(row)
+            .ok_or(RowSourceError::RowOutOfBounds {
+                row,
+                rows: prepared.rows.len(),
+            })?;
+        if let Some(image_index) = prepared_row.image_index {
+            let image = prepared
+                .images
+                .get(image_index)
+                .ok_or(RowSourceError::InvalidImage)?;
+            let width = if image.is_fallback() {
+                prepared.width
+            } else {
+                image.columns()
+            };
+            emit(DisplayRowSpan {
+                column: 0,
+                width,
+                content: DisplayRowContent::Image {
+                    image,
+                    row_in_image: prepared_row.row_in_image,
+                },
+            });
+            return Ok(());
+        }
+
+        let keyed = cache
+            .lines
+            .get(prepared_row.line_index)
+            .ok_or(RowSourceError::InvalidImage)?;
+        if is_image_line(keyed.line()) {
+            return Err(RowSourceError::InvalidImage);
+        }
+        emit(DisplayRowSpan {
+            column: 0,
+            width: cache.width,
+            content: DisplayRowContent::Text(keyed),
+        });
+        Ok(())
+    }
+
     fn measure(&mut self, width: u16) -> u16 {
         let lines = self.lines_for_width(width);
         u16::try_from(lines.len()).unwrap_or(u16::MAX)
@@ -364,6 +485,7 @@ impl Component for Markdown {
 
     fn invalidate(&mut self) {
         self.cache = None;
+        self.prepared = None;
     }
 }
 

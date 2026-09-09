@@ -8,9 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures::future::FutureExt;
+use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{self, BoxStream};
 // Config-value resolution has exactly one owner: `pi_ai::auth::config_value`
 // (one parser, one process-wide command cache). The historical
@@ -22,6 +22,9 @@ use pi_ai::auth::config_value::{
     is_config_value_configured, resolve_config_value, resolve_headers,
 };
 use pi_ai::auth::context::{DefaultAuthContext, overlay_env_auth_context};
+use pi_ai::auth::oauth::radius::{
+    DEFAULT_RADIUS_GATEWAY, RadiusOAuth, RadiusOAuthOptions, normalize_radius_gateway_url,
+};
 use pi_ai::auth::resolve::resolve_provider_auth_with_signal;
 use pi_ai::auth::{
     AMBIENT_AUTH_MARKER, AuthCheck, AuthContext, AuthInteraction, AuthResolutionOverrides,
@@ -34,18 +37,26 @@ use pi_ai::models_store::{
     FileModelsStore, InMemoryModelsStore, ModelOverrides, ModelsStore, apply_model_overrides,
     compose_provider_models, models_error_from_catalog,
 };
-use pi_ai::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
+use pi_ai::provider::{
+    CancelDeferredFn, DeferredCallbacks, FetchDeferredFn, Provider, ProviderError, StreamOptionKey,
+    StreamOptions,
+};
 use pi_ai::providers::{
     AnthropicMessages, AzureOpenAiResponses, BedrockConverseStream, DefaultBedrockClientFactory,
     GoogleGenerativeAi, GoogleVertex, MistralConversations, OpenAiCodexResponses,
     OpenAiCompletions, OpenAiResponses, PiMessages, ProviderRegistry,
 };
+use pi_ai::radius_config::{
+    RadiusCatalogError, RadiusCatalogLoader, get_radius_models, get_radius_models_from_config,
+};
 use pi_ai::types::{
-    AssistantMessageEvent, Context, Model, ModelCost, ModelInput, ModelThinkingLevel, ThinkingLevel,
+    AssistantMessageEvent, Context, DeferredHandle, Model, ModelCost, ModelInput,
+    ModelThinkingLevel, ThinkingLevel,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use super::provider_attribution::{
     merge_provider_attribution_headers, merge_provider_attribution_headers_with_telemetry,
@@ -98,8 +109,9 @@ pub struct ModelRuntimeAuthOverrides {
 /// Extension / models.json provider registration input.
 ///
 /// Mirrors the coding-agent `ProviderConfigInput` / models.json provider object
-/// fields used by registration and composition. Custom stream handlers are
-/// registered separately via [`ModelRuntime::register_extension_stream_provider`].
+/// fields used by registration and composition. Custom provider handlers are
+/// registered separately via [`ModelRuntime::register_extension_stream_provider`]
+/// or [`ModelRuntime::register_extension_deferred_provider`].
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfigInput {
@@ -301,7 +313,7 @@ pub enum ModelRuntimeError {
 /// Result of [`ModelRuntime::refresh`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelsRefreshResult {
-    /// Whether the refresh was aborted by a signal (always false for offline).
+    /// Whether the refresh was aborted by a signal.
     pub aborted: bool,
     /// Per-provider refresh errors.
     pub errors: BTreeMap<String, String>,
@@ -313,7 +325,9 @@ pub struct ModelsRefreshOptions {
     /// Whether network catalog refresh is allowed. Defaults to the runtime's
     /// construction-time policy.
     pub allow_network: Option<bool>,
-    /// listed provider ids (deduped, preserving first-seen order). Per-provider
+    /// Optional cancellation token observed by catalog I/O and refresh steps.
+    pub signal: Option<tokio_util::sync::CancellationToken>,
+    /// Listed provider ids (deduped, preserving first-seen order). Per-provider
     /// recomposition errors are recorded into [`ModelsRefreshResult::errors`]
     /// keyed by provider id. When `None`, every provider is refreshed.
     pub providers: Option<Vec<String>>,
@@ -328,8 +342,69 @@ struct RuntimeSnapshot {
     auth: HashMap<String, Option<AuthCheck>>,
 }
 
+struct RuntimeDeferredCallbacks {
+    fetch_only: DeferredCallbacks,
+    cancel_only: DeferredCallbacks,
+    both: DeferredCallbacks,
+}
+
+impl RuntimeDeferredCallbacks {
+    fn new(weak: &std::sync::Weak<ModelRuntimeInner>) -> Self {
+        let fetch: FetchDeferredFn = {
+            let weak = weak.clone();
+            Arc::new(move |model, handle, options| {
+                let Some(inner) = weak.upgrade() else {
+                    return Box::pin(stream::once(async {
+                        Err(ProviderError::new("model runtime unavailable"))
+                    }))
+                        as BoxStream<'static, Result<AssistantMessageEvent, ProviderError>>;
+                };
+                ModelRuntime { inner }.fetch_deferred(model, handle, options)
+            })
+        };
+        let cancel: CancelDeferredFn = {
+            let weak = weak.clone();
+            Arc::new(move |model, handle, options| {
+                let Some(inner) = weak.upgrade() else {
+                    return Box::pin(async {
+                        Err(ProviderError::new("model runtime unavailable"))
+                    });
+                };
+                ModelRuntime { inner }.cancel_deferred(model, handle, options)
+            })
+        };
+        Self {
+            fetch_only: DeferredCallbacks {
+                fetch: Some(fetch.clone()),
+                cancel: None,
+            },
+            cancel_only: DeferredCallbacks {
+                fetch: None,
+                cancel: Some(cancel.clone()),
+            },
+            both: DeferredCallbacks {
+                fetch: Some(fetch),
+                cancel: Some(cancel),
+            },
+        }
+    }
+}
+
+/// One live extension provider adapter and its host callback capabilities.
+///
+/// `Provider::stream` is always present at the trait boundary, so
+/// `stream_simple` records whether ordinary stream dispatch may select this
+/// adapter. Deferred dispatch uses the same adapter independently, allowing a
+/// provider that only exposes deferred callbacks to bypass ordinary streaming
+/// without losing its fetch/cancel operations.
+struct ExtensionProviderHandler {
+    provider: Arc<dyn Provider>,
+    stream_simple: bool,
+}
+
 struct ModelRuntimeInner {
     credentials: RuntimeCredentials,
+    radius_catalog_loader: RadiusCatalogLoader,
     models_store: Arc<dyn ModelsStore>,
     models_path: Option<PathBuf>,
     allow_model_network: bool,
@@ -340,15 +415,16 @@ struct ModelRuntimeInner {
     extension_providers: Mutex<HashMap<String, ProviderConfigInput>>,
     #[cfg(test)]
     provider_mutation_epoch: std::sync::atomic::AtomicUsize,
-    /// Extension stream handlers keyed by provider id.
+    /// Live extension provider adapters keyed by provider id.
     ///
-    /// Selected only when the registered config `api` exactly matches the
-    /// prepared model API (see [`ModelRuntime::stream_simple`]).
-    extension_stream_providers: Mutex<HashMap<String, Arc<dyn Provider>>>,
+    /// Stream and deferred callbacks share one replaceable record so
+    /// endpoint removal/replacement cannot leave a stale deferred adapter.
+    extension_provider_handlers: Mutex<HashMap<String, ExtensionProviderHandler>>,
     composition_errors: Mutex<HashMap<String, String>>,
     provider_models: Mutex<HashMap<String, Vec<Model>>>,
     snapshot: Mutex<RuntimeSnapshot>,
     availability_error: Mutex<Option<String>>,
+    deferred_callbacks: RuntimeDeferredCallbacks,
     /// Native 10-adapter provider registry (never replaced by extensions).
     stream_provider: Arc<dyn Provider>,
     builtins: BuiltinModels,
@@ -363,6 +439,25 @@ pub struct ModelRuntime {
 impl std::fmt::Debug for ModelRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModelRuntime").finish_non_exhaustive()
+    }
+}
+
+impl ModelRuntimeInner {
+    fn deferred_capabilities(&self) -> (bool, bool) {
+        let native = self.stream_provider.deferred();
+        let mut fetch = native.is_some_and(|callbacks| callbacks.fetch.is_some());
+        let mut cancel = native.is_some_and(|callbacks| callbacks.cancel.is_some());
+        let extensions = lock(&self.extension_provider_handlers);
+        for handler in extensions.values() {
+            if let Some(callbacks) = handler.provider.deferred() {
+                fetch |= callbacks.fetch.is_some();
+                cancel |= callbacks.cancel.is_some();
+            }
+            if fetch && cancel {
+                break;
+            }
+        }
+        (fetch, cancel)
     }
 }
 
@@ -421,6 +516,8 @@ impl ModelRuntime {
         let auth_env = options.auth_env.unwrap_or_default();
         let oauth_handlers = options.oauth_handlers.unwrap_or_default();
         let settings_manager = options.settings_manager;
+        let radius_catalog_loader = RadiusCatalogLoader::new()
+            .map_err(|error| ModelRuntimeError::HttpClient(error.to_string()))?;
         let stream_provider = Arc::new(default_provider_registry(
             options.http_proxy.as_deref(),
             options
@@ -428,28 +525,29 @@ impl ModelRuntime {
                 .unwrap_or(DEFAULT_HTTP_IDLE_TIMEOUT_MS),
         )?);
 
-        let runtime = Self {
-            inner: Arc::new(ModelRuntimeInner {
-                credentials,
-                models_store,
-                models_path,
-                allow_model_network,
-                auth_env,
-                oauth_handlers,
-                settings_manager,
-                config: Mutex::new(config),
-                extension_providers: Mutex::new(HashMap::new()),
-                #[cfg(test)]
-                provider_mutation_epoch: std::sync::atomic::AtomicUsize::new(0),
-                extension_stream_providers: Mutex::new(HashMap::new()),
-                composition_errors: Mutex::new(HashMap::new()),
-                provider_models: Mutex::new(HashMap::new()),
-                snapshot: Mutex::new(RuntimeSnapshot::default()),
-                availability_error: Mutex::new(None),
-                stream_provider,
-                builtins,
-            }),
-        };
+        let inner = Arc::new_cyclic(|weak| ModelRuntimeInner {
+            credentials,
+            radius_catalog_loader,
+            models_store,
+            models_path,
+            allow_model_network,
+            auth_env,
+            oauth_handlers,
+            settings_manager,
+            config: Mutex::new(config),
+            extension_providers: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            provider_mutation_epoch: std::sync::atomic::AtomicUsize::new(0),
+            extension_provider_handlers: Mutex::new(HashMap::new()),
+            composition_errors: Mutex::new(HashMap::new()),
+            provider_models: Mutex::new(HashMap::new()),
+            snapshot: Mutex::new(RuntimeSnapshot::default()),
+            availability_error: Mutex::new(None),
+            deferred_callbacks: RuntimeDeferredCallbacks::new(weak),
+            stream_provider,
+            builtins,
+        });
+        let runtime = Self { inner };
         runtime.rebuild_providers().await?;
         let _ = runtime
             .refresh(ModelsRefreshOptions {
@@ -685,18 +783,15 @@ impl ModelRuntime {
     /// Returns [`ModelRuntimeError::Models`] when the provider does not support
     /// the requested auth type, the login flow fails, or credential persistence
     /// fails. Returns [`ModelRuntimeError::CredentialSynchronization`] when
-    /// the credential persists but availability refresh cannot be
-    /// synchronized within the timeout.
+    /// the credential persists but availability refresh cannot be synchronized
+    /// within the timeout.
     pub async fn login(
         &self,
         provider_id: &str,
         auth_type: AuthType,
         interaction: Arc<dyn AuthInteraction>,
     ) -> Result<(), ModelRuntimeError> {
-        let provider_auth = default_provider_auth(
-            provider_id,
-            self.inner.oauth_handlers.get(provider_id).cloned(),
-        );
+        let provider_auth = self.provider_auth(provider_id);
         let credential = match auth_type {
             AuthType::Oauth => {
                 let oauth = provider_auth.oauth.ok_or_else(|| {
@@ -905,10 +1000,10 @@ impl ModelRuntime {
             .provider_mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         lock(&self.inner.extension_providers).remove(provider_id);
-        // Config and custom stream handlers are independent registrations, but
-        // dropping the provider config also drops any stream handler bound to
-        // the same id so later host reloads start from a clean map.
-        self.unregister_extension_stream_provider(provider_id);
+        // Config and custom provider handlers are independent registrations,
+        // but dropping the provider config also drops any handler bound to the
+        // same id so later host reloads start from a clean map.
+        self.unregister_extension_provider(provider_id);
         if let Err(error) = self.recompose_provider_sync(provider_id) {
             lock(&self.inner.composition_errors).insert(provider_id.to_owned(), error);
         } else {
@@ -929,9 +1024,13 @@ impl ModelRuntime {
     /// Register or replace the extension stream handler for `provider_id`.
     ///
     /// The handler is used by [`Self::stream_simple`] only when the registered
-    /// provider config `api` exactly equals the prepared model API. Config-only
-    /// registrations (baseURL/models without a stream handler) keep using the
-    /// native provider registry.
+    /// provider config `api` exactly equals the prepared model API and the
+    /// host exposed `streamSimple` for this provider. Deferred fetch/cancel
+    /// dispatch uses the same handler independently when its API matches, so
+    /// one adapter can expose either operation without masking the other.
+    ///
+    /// Replacing or removing the handler drops the old provider record, so its
+    /// deferred callback references cannot remain live.
     ///
     /// Intended for extension-host binding; available as crate API so services
     /// can install handlers without waiting on a later facade change.
@@ -940,14 +1039,40 @@ impl ModelRuntime {
         provider_id: impl Into<String>,
         provider: Arc<dyn Provider>,
     ) {
-        lock(&self.inner.extension_stream_providers).insert(provider_id.into(), provider);
+        lock(&self.inner.extension_provider_handlers).insert(
+            provider_id.into(),
+            ExtensionProviderHandler {
+                provider,
+                stream_simple: true,
+            },
+        );
     }
 
-    /// Remove the extension stream handler for `provider_id`, if any.
+    /// Register or replace a deferred-only extension handler for `provider_id`.
     ///
-    /// After unregistration, matching models fall back to the native registry.
-    pub(crate) fn unregister_extension_stream_provider(&self, provider_id: &str) {
-        lock(&self.inner.extension_stream_providers).remove(provider_id);
+    /// This handler participates in deferred fetch/cancel dispatch after the
+    /// provider/API match, but ordinary [`Self::stream_simple`] calls keep the
+    /// native provider path because the host has no `streamSimple` callback.
+    pub(crate) fn register_extension_deferred_provider(
+        &self,
+        provider_id: impl Into<String>,
+        provider: Arc<dyn Provider>,
+    ) {
+        lock(&self.inner.extension_provider_handlers).insert(
+            provider_id.into(),
+            ExtensionProviderHandler {
+                provider,
+                stream_simple: false,
+            },
+        );
+    }
+
+    /// Remove the extension stream/deferred handler for `provider_id`, if any.
+    ///
+    /// Removing the record drops both stream and deferred callback references;
+    /// matching models then use the native provider registry.
+    pub(crate) fn unregister_extension_provider(&self, provider_id: &str) {
+        lock(&self.inner.extension_provider_handlers).remove(provider_id);
     }
 
     /// Reload models.json from disk (or keep the injected snapshot path) and refresh.
@@ -998,25 +1123,92 @@ impl ModelRuntime {
         &self,
         options: ModelsRefreshOptions,
     ) -> Result<ModelsRefreshResult, ModelRuntimeError> {
-        let _allow_network = options
+        let allow_network = options
             .allow_network
             .unwrap_or(self.inner.allow_model_network);
-        // Remote catalog refresh is intentionally a no-op for this facade: the
-        // product path uses the compiled-in catalog + models-store overlays.
-        // When network catalogs land they plug in behind this gate.
+        let signal = options.signal;
+        if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Ok(ModelsRefreshResult {
+                aborted: true,
+                errors: BTreeMap::new(),
+            });
+        }
+
         if let Some(providers) = options.providers {
-            self.refresh_providers(providers).await
-        } else {
-            self.rebuild_providers().await?;
-            match self.refresh_availability().await {
-                Ok(()) => Ok(ModelsRefreshResult::default()),
-                Err(error) => {
-                    *lock(&self.inner.availability_error) = Some(error.to_string());
-                    Ok(ModelsRefreshResult {
-                        aborted: false,
-                        errors: BTreeMap::from([("availability".to_owned(), error.to_string())]),
-                    })
+            return self
+                .refresh_providers(providers, allow_network, signal.as_ref())
+                .await;
+        }
+
+        let provider_ids = self.provider_ids();
+        let mut errors = BTreeMap::new();
+        for provider_id in &provider_ids {
+            if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return Ok(ModelsRefreshResult {
+                    aborted: true,
+                    errors,
+                });
+            }
+            if let Err(error) = self.restore_radius_catalog(provider_id).await {
+                errors.insert(provider_id.clone(), error);
+            }
+        }
+
+        // Restore persisted/legacy state before any network work, matching the
+        // reference refresh ordering and keeping the last-known catalog usable
+        // when a gateway is unavailable.
+        self.rebuild_providers().await?;
+
+        if allow_network {
+            for provider_id in &provider_ids {
+                if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                    return Ok(ModelsRefreshResult {
+                        aborted: true,
+                        errors,
+                    });
                 }
+                if !self.is_radius_provider(provider_id) {
+                    continue;
+                }
+                match self
+                    .refresh_radius_catalog(provider_id, signal.as_ref())
+                    .await
+                {
+                    Ok(()) => {
+                        errors.remove(provider_id);
+                    }
+                    Err(RadiusCatalogError::Cancelled) => {
+                        return Ok(ModelsRefreshResult {
+                            aborted: true,
+                            errors,
+                        });
+                    }
+                    Err(error) => {
+                        errors.insert(provider_id.clone(), error.to_string());
+                    }
+                }
+            }
+        }
+
+        if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Ok(ModelsRefreshResult {
+                aborted: true,
+                errors,
+            });
+        }
+        match self.refresh_availability().await {
+            Ok(()) => Ok(ModelsRefreshResult {
+                aborted: false,
+                errors,
+            }),
+            Err(error) => {
+                let detail = error.to_string();
+                *lock(&self.inner.availability_error) = Some(detail.clone());
+                errors.insert("availability".to_owned(), detail);
+                Ok(ModelsRefreshResult {
+                    aborted: false,
+                    errors,
+                })
             }
         }
     }
@@ -1029,6 +1221,8 @@ impl ModelRuntime {
     async fn refresh_providers(
         &self,
         providers: Vec<String>,
+        allow_network: bool,
+        signal: Option<&CancellationToken>,
     ) -> Result<ModelsRefreshResult, ModelRuntimeError> {
         // Dedupe preserving first-seen order.
         let mut seen = BTreeSet::new();
@@ -1039,8 +1233,17 @@ impl ModelRuntime {
 
         let mut errors = BTreeMap::new();
 
-        // Recompose each target provider's model list.
+        // Restore persisted/legacy state before any network work.
         for provider_id in &target_ids {
+            if signal.is_some_and(CancellationToken::is_cancelled) {
+                return Ok(ModelsRefreshResult {
+                    aborted: true,
+                    errors,
+                });
+            }
+            if let Err(error) = self.restore_radius_catalog(provider_id).await {
+                errors.insert(provider_id.clone(), error);
+            }
             if let Err(error) = self.recompose_provider(provider_id).await {
                 errors.insert(provider_id.clone(), error.clone());
                 lock(&self.inner.composition_errors).insert(provider_id.clone(), error);
@@ -1048,11 +1251,63 @@ impl ModelRuntime {
         }
         self.update_model_snapshot_from_maps();
 
+        if allow_network {
+            for provider_id in &target_ids {
+                if signal.is_some_and(CancellationToken::is_cancelled) {
+                    return Ok(ModelsRefreshResult {
+                        aborted: true,
+                        errors,
+                    });
+                }
+                if !self.is_radius_provider(provider_id) {
+                    continue;
+                }
+                match self.refresh_radius_catalog(provider_id, signal).await {
+                    Ok(()) => {
+                        errors.remove(provider_id);
+                    }
+                    Err(RadiusCatalogError::Cancelled) => {
+                        return Ok(ModelsRefreshResult {
+                            aborted: true,
+                            errors,
+                        });
+                    }
+                    Err(error) => {
+                        errors.insert(provider_id.clone(), error.to_string());
+                    }
+                }
+            }
+        }
+
+        if signal.is_some_and(CancellationToken::is_cancelled) {
+            return Ok(ModelsRefreshResult {
+                aborted: true,
+                errors,
+            });
+        }
+
+        Ok(self
+            .refresh_provider_availability(&target_ids, signal, errors)
+            .await)
+    }
+
+    async fn refresh_provider_availability(
+        &self,
+        target_ids: &[String],
+        signal: Option<&CancellationToken>,
+        errors: BTreeMap<String, String>,
+    ) -> ModelsRefreshResult {
         // Probe availability for each target provider individually so errors
         // are recorded per-provider rather than aborting the whole refresh.
         let mut auth = HashMap::new();
         let mut configured = BTreeSet::new();
-        for provider_id in &target_ids {
+        for provider_id in target_ids {
+            if signal.is_some_and(CancellationToken::is_cancelled) {
+                return ModelsRefreshResult {
+                    aborted: true,
+                    errors,
+                };
+            }
             let check = self.probe_auth(provider_id).await;
             if check.is_some() {
                 configured.insert(provider_id.clone());
@@ -1084,14 +1339,9 @@ impl ModelRuntime {
 
         // Update the snapshot: preserve existing entries for non-target
         // providers, overlay the new results for target providers.
-        // The maps read nests inside the snapshot guard; this order is
-        // uniform (no site holds the maps guard while acquiring the
-        // snapshot guard), so unlike the config/extension pair it cannot
-        // deadlock. Keep it atomic: splitting it opens a lost-update
-        // window against concurrent register/unregister snapshot writes.
         {
             let mut snapshot = lock(&self.inner.snapshot);
-            for provider_id in &target_ids {
+            for provider_id in target_ids {
                 snapshot.auth.insert(
                     provider_id.clone(),
                     auth.get(provider_id).cloned().flatten(),
@@ -1127,10 +1377,167 @@ impl ModelRuntime {
         }
         *lock(&self.inner.availability_error) = None;
 
-        Ok(ModelsRefreshResult {
+        ModelsRefreshResult {
             aborted: false,
             errors,
-        })
+        }
+    }
+    fn provider_auth(&self, provider_id: &str) -> pi_ai::auth::ProviderAuth {
+        let handler = self
+            .inner
+            .oauth_handlers
+            .get(provider_id)
+            .cloned()
+            .or_else(|| self.radius_oauth_handler(provider_id));
+        default_provider_auth(provider_id, handler)
+    }
+
+    fn radius_oauth_handler(&self, provider_id: &str) -> Option<Arc<dyn OAuthAuth>> {
+        if !self.is_radius_provider(provider_id) {
+            return None;
+        }
+        let gateway = self.radius_gateway(provider_id)?;
+        let name = self
+            .radius_config(provider_id)
+            .and_then(|config| config.name)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| provider_id.to_owned());
+        let oauth = RadiusOAuth::new(RadiusOAuthOptions { name, gateway }).ok()?;
+        Some(Arc::new(oauth))
+    }
+
+    fn radius_config(&self, provider_id: &str) -> Option<ProviderConfigInput> {
+        let extension = lock(&self.inner.extension_providers)
+            .get(provider_id)
+            .cloned();
+        if extension
+            .as_ref()
+            .is_some_and(|config| config.oauth.as_deref() == Some("radius"))
+        {
+            return extension;
+        }
+        lock(&self.inner.config)
+            .get_provider(provider_id)
+            .cloned()
+            .filter(|config| config.oauth.as_deref() == Some("radius"))
+    }
+
+    fn is_radius_provider(&self, provider_id: &str) -> bool {
+        provider_id == "radius" || self.radius_config(provider_id).is_some()
+    }
+
+    fn radius_gateway(&self, provider_id: &str) -> Option<String> {
+        if let Some(configured) = self.radius_config(provider_id) {
+            let base_url = configured.base_url.as_deref()?.trim();
+            if base_url.is_empty() {
+                return None;
+            }
+            let gateway = base_url
+                .strip_suffix("/v1/")
+                .or_else(|| base_url.strip_suffix("/v1"))
+                .unwrap_or(base_url);
+            return Some(normalize_radius_gateway_url(gateway));
+        }
+        (provider_id == "radius").then(|| DEFAULT_RADIUS_GATEWAY.to_owned())
+    }
+
+    async fn restore_radius_catalog(&self, provider_id: &str) -> Result<(), String> {
+        if !self.is_radius_provider(provider_id) {
+            return Ok(());
+        }
+        if self
+            .inner
+            .models_store
+            .read(provider_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let credential = self
+            .inner
+            .credentials
+            .read(provider_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(Credential::Oauth(credential)) = credential else {
+            return Ok(());
+        };
+        let models = get_radius_models(provider_id, &credential);
+        if models.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .models_store
+            .write(
+                provider_id,
+                ModelsStoreEntry {
+                    models,
+                    checked_at: Some(radius_catalog_timestamp()),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn refresh_radius_catalog(
+        &self,
+        provider_id: &str,
+        signal: Option<&CancellationToken>,
+    ) -> Result<(), RadiusCatalogError> {
+        let Some(gateway) = self.radius_gateway(provider_id) else {
+            return Ok(());
+        };
+        if signal.is_some_and(CancellationToken::is_cancelled) {
+            return Err(RadiusCatalogError::Cancelled);
+        }
+        let auth = self
+            .resolve_auth(
+                provider_id,
+                None,
+                ModelRuntimeAuthOverrides::default(),
+                signal.cloned(),
+            )
+            .await
+            .map_err(|error| {
+                if signal.is_some_and(CancellationToken::is_cancelled)
+                    || matches!(
+                        &error,
+                        ModelRuntimeError::Models(models_error) if models_error.is_cancelled()
+                    )
+                {
+                    RadiusCatalogError::Cancelled
+                } else {
+                    RadiusCatalogError::Request
+                }
+            })?;
+        let Some(auth) = auth else {
+            return Ok(());
+        };
+        let config = self
+            .inner
+            .radius_catalog_loader
+            .load_config(&gateway, auth.auth.api_key.as_deref(), signal)
+            .await?;
+        if signal.is_some_and(CancellationToken::is_cancelled) {
+            return Err(RadiusCatalogError::Cancelled);
+        }
+        let models = get_radius_models_from_config(provider_id, &config);
+        self.inner
+            .models_store
+            .write(
+                provider_id,
+                ModelsStoreEntry {
+                    models,
+                    checked_at: Some(radius_catalog_timestamp()),
+                },
+            )
+            .await
+            .map_err(|_| RadiusCatalogError::Request)?;
+        self.recompose_provider(provider_id)
+            .await
+            .map_err(|_| RadiusCatalogError::Request)
     }
 
     /// Stream a simple chat completion for `model`.
@@ -1139,7 +1546,7 @@ impl ModelRuntime {
     /// After [`Self::prepare_request`], an extension stream handler is selected
     /// only when one is registered for the model provider **and** the registered
     /// config API exactly equals the prepared model API; otherwise the native
-    /// provider registry is used. The stream-provider lock is released before
+    /// provider registry is used. The handler-map lock is released before
     /// the provider `stream` call.
     #[must_use]
     pub fn stream_simple(
@@ -1170,20 +1577,50 @@ impl ModelRuntime {
         )
     }
 
-    /// Choose extension or native stream provider for a prepared model.
+    /// Choose an extension or native stream provider for a prepared model.
     ///
     /// Clones the `Arc` under the map lock and drops the guard before return so
-    /// callers never hold the lock across `stream` / await.
+    /// callers never hold the lock across the provider `stream` call. A
+    /// deferred-only handler is deliberately ignored here.
     fn select_stream_provider(
         &self,
         prepared_model: &Model,
         native: Arc<dyn Provider>,
     ) -> Arc<dyn Provider> {
-        let extensions = lock(&self.inner.extension_stream_providers);
-        let Some(extension) = extensions.get(&prepared_model.provider).cloned() else {
+        let extensions = lock(&self.inner.extension_provider_handlers);
+        let Some(handler) = extensions.get(&prepared_model.provider) else {
             return native;
         };
-        // Drop the stream map lock before reading config / returning.
+        if !handler.stream_simple {
+            return native;
+        }
+        let extension = Arc::clone(&handler.provider);
+        // Drop the handler map lock before reading config / returning.
+        drop(extensions);
+
+        let config_api = lock(&self.inner.extension_providers)
+            .get(&prepared_model.provider)
+            .and_then(|config| config.api.clone());
+        match config_api {
+            Some(api) if api == prepared_model.api => extension,
+            _ => native,
+        }
+    }
+
+    /// Choose an extension or native deferred provider for a prepared model.
+    ///
+    /// Deferred-only handlers are eligible here, while the provider/API match
+    /// remains identical to ordinary stream routing.
+    fn select_deferred_provider(
+        &self,
+        prepared_model: &Model,
+        native: Arc<dyn Provider>,
+    ) -> Arc<dyn Provider> {
+        let extensions = lock(&self.inner.extension_provider_handlers);
+        let Some(handler) = extensions.get(&prepared_model.provider) else {
+            return native;
+        };
+        let extension = Arc::clone(&handler.provider);
         drop(extensions);
 
         let config_api = lock(&self.inner.extension_providers)
@@ -1450,10 +1887,7 @@ impl ModelRuntime {
     ) -> Result<Option<AuthResult>, ModelRuntimeError> {
         // Runtime API key is exposed through RuntimeCredentials::read, so the
         // shared resolver sees it as a stored api_key credential.
-        let provider_auth = default_provider_auth(
-            provider_id,
-            self.inner.oauth_handlers.get(provider_id).cloned(),
-        );
+        let provider_auth = self.provider_auth(provider_id);
         let auth_context = self.auth_context_for(&overrides);
         let resolution_overrides = AuthResolutionOverrides {
             api_key: overrides.api_key.clone(),
@@ -1621,7 +2055,7 @@ impl ModelRuntime {
     }
 
     fn provider_ids(&self) -> BTreeSet<String> {
-        let mut ids = BTreeSet::new();
+        let mut ids = BTreeSet::from(["radius".to_owned()]);
         for provider in self.inner.builtins.keys() {
             ids.insert(provider.clone());
         }
@@ -1904,6 +2338,91 @@ impl ModelRuntime {
             });
         }
         None
+    }
+}
+
+impl Provider for ModelRuntime {
+    fn stream(
+        &self,
+        model: &Model,
+        context: Context,
+        options: StreamOptions,
+    ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+        self.stream_simple(model.clone(), context, options)
+    }
+
+    fn deferred(&self) -> Option<&DeferredCallbacks> {
+        let (fetch, cancel) = self.inner.deferred_capabilities();
+        match (fetch, cancel) {
+            (false, false) => None,
+            (true, false) => Some(&self.inner.deferred_callbacks.fetch_only),
+            (false, true) => Some(&self.inner.deferred_callbacks.cancel_only),
+            (true, true) => Some(&self.inner.deferred_callbacks.both),
+        }
+    }
+
+    fn fetch_deferred(
+        &self,
+        model: &Model,
+        handle: DeferredHandle,
+        options: StreamOptions,
+    ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+        let runtime = self.clone();
+        let native = Arc::clone(&self.inner.stream_provider);
+        let model = model.clone();
+        Box::pin(
+            async move {
+                match runtime
+                    .prepare_request(&model, options, &Context::default())
+                    .await
+                {
+                    Ok(mut prepared) => {
+                        // Deferred fetches are status polls, never a fresh
+                        // generation.  Keep the callback contract explicit.
+                        prepared
+                            .options
+                            .insert_extra(StreamOptionKey::WAIT, Value::from(0_u64));
+                        let provider = runtime.select_deferred_provider(&prepared.model, native);
+                        provider.fetch_deferred(&prepared.model, handle, prepared.options)
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        Box::pin(stream::once(
+                            async move { Err(ProviderError::new(message)) },
+                        ))
+                            as BoxStream<'static, Result<AssistantMessageEvent, ProviderError>>
+                    }
+                }
+            }
+            .flatten_stream(),
+        )
+    }
+
+    fn cancel_deferred(
+        &self,
+        model: &Model,
+        handle: DeferredHandle,
+        options: StreamOptions,
+    ) -> BoxFuture<'static, Result<(), ProviderError>> {
+        let runtime = self.clone();
+        let native = Arc::clone(&self.inner.stream_provider);
+        let model = model.clone();
+        Box::pin(async move {
+            let prepared = runtime
+                .prepare_request(&model, options, &Context::default())
+                .await
+                .map_err(|error| ProviderError::new(error.to_string()))?;
+            let provider = runtime.select_deferred_provider(&prepared.model, native);
+            provider
+                .cancel_deferred(&prepared.model, handle, prepared.options)
+                .await
+        })
+    }
+}
+
+impl pi_agent::harness::api::HarnessModels for ModelRuntime {
+    fn get_model(&self, provider: &str, model_id: &str) -> Option<pi_ai::Model> {
+        ModelRuntime::get_model(self, provider, model_id)
     }
 }
 
@@ -2316,6 +2835,14 @@ fn merge_provider_env(base: &ProviderEnv, overlay: Option<&ProviderEnv>) -> Prov
     env
 }
 
+fn radius_catalog_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -2326,11 +2853,187 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use crate::core::settings::{Settings, SettingsManagerCreateOptions};
+    use pi_agent::harness::api::HarnessModels;
+    use pi_ai::Provider;
     use pi_ai::auth::OAuthCredential;
+    use pi_ai::types::{AssistantMessage, DeferredHandle, DoneReason, StopReason};
     use serde_json::json;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
+    async fn spawn_http_fixture(
+        expected_requests: usize,
+    ) -> std::io::Result<(
+        String,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    )> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            for _ in 0..expected_requests {
+                let (mut socket, _) = listener.accept().await?;
+                let request = read_fixture_request(&mut socket).await?;
+                lock(&captured).push(request);
+                let body = r#"{"ok":true}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await?;
+            }
+            Ok(())
+        });
+        Ok((format!("http://{address}"), requests, task))
+    }
+
+    async fn read_fixture_request(socket: &mut tokio::net::TcpStream) -> std::io::Result<String> {
+        let mut request = Vec::new();
+        let mut content_length = None;
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = socket.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+            else {
+                continue;
+            };
+            if content_length.is_none() {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                content_length = headers.lines().find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .or_else(|| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                });
+            }
+            if request.len() >= header_end + content_length.unwrap_or(0) {
+                break;
+            }
+        }
+        Ok(String::from_utf8_lossy(&request).into_owned())
+    }
+
+    async fn fixture_http_request(
+        client: reqwest::Client,
+        model: &Model,
+        options: StreamOptions,
+        kind: &'static str,
+        handle_id: Option<String>,
+    ) -> Result<(), ProviderError> {
+        let wait = options.extra_value(StreamOptionKey::WAIT).cloned();
+        let has_api_key = options.api_key.is_some();
+        let mut request = client.post(&model.base_url);
+        if let Some(headers) = options.headers {
+            for (name, value) in headers {
+                if let Some(value) = value {
+                    request = request.header(name, value);
+                }
+            }
+        }
+        let response = request
+            .json(&json!({
+                "kind": kind,
+                "model": model.id,
+                "handle": handle_id,
+                "hasApiKey": has_api_key,
+                "wait": wait,
+            }))
+            .send()
+            .await
+            .map_err(|error| ProviderError::new(format!("fixture request failed: {error}")))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| ProviderError::new(format!("fixture response failed: {error}")))?;
+        if !status.is_success() || body != r#"{"ok":true}"# {
+            return Err(ProviderError::new(format!(
+                "fixture rejected request: {status} {body}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn fixture_done(model: &Model) -> AssistantMessageEvent {
+        let mut message = AssistantMessage::new(
+            model.api.clone(),
+            model.provider.clone(),
+            model.id.clone(),
+            0,
+        );
+        message.stop_reason = StopReason::Stop;
+        AssistantMessageEvent::Done {
+            reason: DoneReason::Stop,
+            message,
+        }
+    }
+
+    struct HttpExtensionProvider {
+        client: reqwest::Client,
+        deferred: DeferredCallbacks,
+    }
+
+    impl HttpExtensionProvider {
+        fn new() -> Self {
+            let client = reqwest::Client::new();
+            let fetch_client = client.clone();
+            let fetch: FetchDeferredFn = Arc::new(move |model, handle, options| {
+                let client = fetch_client.clone();
+                let model = model.clone();
+                let handle_id = handle.id;
+                Box::pin(stream::once(async move {
+                    fixture_http_request(client, &model, options, "fetch", Some(handle_id)).await?;
+                    Ok(fixture_done(&model))
+                }))
+            });
+            let cancel_client = client.clone();
+            let cancel: CancelDeferredFn = Arc::new(move |model, handle, options| {
+                let client = cancel_client.clone();
+                let model = model.clone();
+                Box::pin(async move {
+                    fixture_http_request(client, &model, options, "cancel", Some(handle.id)).await
+                })
+            });
+            Self {
+                client,
+                deferred: DeferredCallbacks {
+                    fetch: Some(fetch),
+                    cancel: Some(cancel),
+                },
+            }
+        }
+    }
+
+    impl Provider for HttpExtensionProvider {
+        fn stream(
+            &self,
+            model: &Model,
+            _context: Context,
+            options: StreamOptions,
+        ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+            let client = self.client.clone();
+            let model = model.clone();
+            Box::pin(stream::once(async move {
+                fixture_http_request(client, &model, options, "stream", None).await?;
+                Ok(fixture_done(&model))
+            }))
+        }
+
+        fn deferred(&self) -> Option<&DeferredCallbacks> {
+            Some(&self.deferred)
+        }
+    }
     fn required<T>(value: Option<T>, message: &'static str) -> Result<T, ModelRuntimeError> {
         value.ok_or_else(|| ModelRuntimeError::Registration(message.to_owned()))
     }
@@ -2350,6 +3053,283 @@ mod tests {
             headers: None,
             compat: None,
         }
+    }
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "integration test")]
+    async fn harness_models_dispatch_authenticated_http_and_clear_deferred_callbacks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (endpoint, requests, server) = spawn_http_fixture(3).await?;
+        let runtime = ModelRuntime::create_in_memory().await?;
+        runtime.register_provider(
+            "local-http",
+            &ProviderConfigInput {
+                name: Some("Local HTTP".to_owned()),
+                base_url: Some(endpoint.clone()),
+                api: Some("openai-completions".to_owned()),
+                api_key: Some("sk-local".to_owned()),
+                auth_header: Some(true),
+                headers: Some(BTreeMap::from([(
+                    "X-Provider".to_owned(),
+                    "configured".to_owned(),
+                )])),
+                models: Some(vec![ProviderModelDefinition {
+                    id: "local-model".to_owned(),
+                    name: Some("Original model name".to_owned()),
+                    api: None,
+                    base_url: None,
+                    reasoning: false,
+                    thinking_level_map: None,
+                    input: Some(vec![ModelInput::Text]),
+                    cost: Some(ModelCost::default()),
+                    context_window: Some(32_000),
+                    max_tokens: Some(4_096),
+                    headers: None,
+                    compat: None,
+                }]),
+                model_overrides: Some(BTreeMap::from([(
+                    "local-model".to_owned(),
+                    json!({"name": "Override model name"}),
+                )])),
+                ..ProviderConfigInput::default()
+            },
+        )?;
+        let extension = Arc::new(HttpExtensionProvider::new());
+        runtime.register_extension_stream_provider("local-http", extension);
+
+        let harness: &dyn HarnessModels = &runtime;
+        assert!(harness.get_model("local-http", "missing").is_none());
+        let model = required(
+            harness.get_model("local-http", "local-model"),
+            "composed local model",
+        )?;
+        assert_eq!(model.name, "Override model name");
+        assert_eq!(model.base_url, endpoint);
+        assert_eq!(model.api, "openai-completions");
+
+        let callbacks = runtime
+            .deferred()
+            .ok_or_else(|| ModelRuntimeError::Registration("deferred callbacks missing".into()))?;
+        assert!(callbacks.supports_fetch());
+        assert!(callbacks.supports_cancel());
+        let fetch = callbacks
+            .fetch
+            .clone()
+            .ok_or_else(|| ModelRuntimeError::Registration("fetch callback missing".into()))?;
+        let cancel = callbacks
+            .cancel
+            .clone()
+            .ok_or_else(|| ModelRuntimeError::Registration("cancel callback missing".into()))?;
+
+        let mut ordinary = harness.stream(&model, Context::default(), StreamOptions::default());
+        let Some(ordinary_event) = futures::StreamExt::next(&mut ordinary).await else {
+            return Err(std::io::Error::other("ordinary stream emitted no event").into());
+        };
+        assert!(matches!(
+            ordinary_event,
+            Ok(AssistantMessageEvent::Done {
+                reason: DoneReason::Stop,
+                ..
+            })
+        ));
+
+        let handle = DeferredHandle {
+            provider: model.provider.clone(),
+            model_id: model.id.clone(),
+            api: model.api.clone(),
+            id: "deferred-1".to_owned(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: None,
+        };
+        let mut deferred = fetch(&model, handle.clone(), StreamOptions::default());
+        let Some(deferred_event) = futures::StreamExt::next(&mut deferred).await else {
+            return Err(std::io::Error::other("deferred fetch emitted no event").into());
+        };
+        assert!(matches!(
+            deferred_event,
+            Ok(AssistantMessageEvent::Done {
+                reason: DoneReason::Stop,
+                ..
+            })
+        ));
+        cancel(&model, handle.clone(), StreamOptions::default()).await?;
+
+        runtime.unregister_extension_provider("local-http");
+        assert!(
+            runtime.deferred().is_none(),
+            "removing the provider record must remove its deferred capability"
+        );
+        let mut removed_fetch =
+            runtime.fetch_deferred(&model, handle.clone(), StreamOptions::default());
+        let Some(Ok(AssistantMessageEvent::Error { error, .. })) =
+            futures::StreamExt::next(&mut removed_fetch).await
+        else {
+            return Err(std::io::Error::other("removed deferred provider did not fail").into());
+        };
+        assert!(
+            error
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("does not support deferred responses")),
+            "removed provider must not fall back to ordinary streaming"
+        );
+
+        runtime.set_runtime_api_key("openai", "sk-native").await?;
+        let builtin = runtime
+            .get_models(Some("openai"))
+            .into_iter()
+            .next()
+            .ok_or_else(|| std::io::Error::other("openai builtin missing"))?;
+        let builtin_handle = DeferredHandle {
+            provider: builtin.provider.clone(),
+            model_id: builtin.id.clone(),
+            api: builtin.api.clone(),
+            id: "builtin-deferred".to_owned(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: None,
+        };
+        let mut builtin_fetch =
+            runtime.fetch_deferred(&builtin, builtin_handle, StreamOptions::default());
+        let Some(Ok(AssistantMessageEvent::Error { error, .. })) =
+            futures::StreamExt::next(&mut builtin_fetch).await
+        else {
+            return Err(std::io::Error::other("builtin deferred dispatch did not fail").into());
+        };
+        assert!(
+            error
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("does not support deferred responses")),
+            "unsupported built-in deferred dispatch must surface its real error"
+        );
+
+        runtime.unregister_provider("local-http");
+        assert!(runtime.get_model("local-http", "local-model").is_none());
+        server
+            .await
+            .map_err(|error| std::io::Error::other(format!("fixture task failed: {error}")))??;
+        let requests = lock(&requests);
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            let lower = request.to_ascii_lowercase();
+            assert!(lower.contains("authorization: bearer sk-local"));
+            assert!(lower.contains("x-provider: configured"));
+        }
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("\"kind\":\"stream\""))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("\"kind\":\"fetch\""))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("\"wait\":0"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("\"kind\":\"cancel\""))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_only_provider_does_not_hijack_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (endpoint, requests, server) = spawn_http_fixture(2).await?;
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let mut model_definition = custom_model("deferred-only", "deferred-model");
+        model_definition.api = None;
+        model_definition.base_url = None;
+        runtime.register_provider(
+            "deferred-only",
+            &ProviderConfigInput {
+                name: Some("Deferred only".to_owned()),
+                base_url: Some(endpoint),
+                api_key: Some("sk-deferred".to_owned()),
+                api: Some("unsupported-deferred-api".to_owned()),
+                models: Some(vec![model_definition]),
+                ..ProviderConfigInput::default()
+            },
+        )?;
+        runtime.register_extension_deferred_provider(
+            "deferred-only",
+            Arc::new(HttpExtensionProvider::new()),
+        );
+
+        let model = required(
+            runtime.get_model("deferred-only", "deferred-model"),
+            "deferred-only model",
+        )?;
+        let mut ordinary =
+            runtime.stream_simple(model.clone(), Context::default(), StreamOptions::default());
+        let Some(ordinary_event) = futures::StreamExt::next(&mut ordinary).await else {
+            return Err(std::io::Error::other("ordinary stream emitted no event").into());
+        };
+        assert!(
+            matches!(ordinary_event, Ok(AssistantMessageEvent::Error { .. })),
+            "deferred-only provider must keep the native stream path"
+        );
+
+        let callbacks = runtime
+            .deferred()
+            .ok_or_else(|| ModelRuntimeError::Registration("deferred callbacks missing".into()))?;
+        assert!(callbacks.supports_fetch());
+        assert!(callbacks.supports_cancel());
+        let handle = DeferredHandle {
+            provider: model.provider.clone(),
+            model_id: model.id.clone(),
+            api: model.api.clone(),
+            id: "deferred-only-handle".to_owned(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: Some(json!({"opaque": true})),
+        };
+        let mut fetch = runtime.fetch_deferred(&model, handle.clone(), StreamOptions::default());
+        let Some(fetch_event) = futures::StreamExt::next(&mut fetch).await else {
+            return Err(std::io::Error::other("deferred fetch emitted no event").into());
+        };
+        assert!(matches!(
+            fetch_event,
+            Ok(AssistantMessageEvent::Done {
+                reason: DoneReason::Stop,
+                ..
+            })
+        ));
+        runtime
+            .cancel_deferred(&model, handle, StreamOptions::default())
+            .await?;
+
+        runtime.unregister_extension_provider("deferred-only");
+        assert!(runtime.deferred().is_none());
+        server
+            .await
+            .map_err(|error| std::io::Error::other(format!("fixture task failed: {error}")))??;
+        let requests = lock(&requests);
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.contains("\"kind\":\"stream\""))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("\"kind\":\"fetch\""))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("\"kind\":\"cancel\""))
+        );
+        Ok(())
     }
 
     #[test]
@@ -2617,6 +3597,7 @@ mod tests {
             .refresh(ModelsRefreshOptions {
                 allow_network: Some(false),
                 providers: Some(vec!["acme".to_owned()]),
+                ..ModelsRefreshOptions::default()
             })
             .await?;
         assert!(result.errors.is_empty(), "{:?}", result.errors);
@@ -3113,7 +4094,7 @@ mod tests {
         )?;
         let extension = Arc::new(RecordingExtensionProvider::new());
         runtime.register_extension_stream_provider("acme", extension.clone());
-        runtime.unregister_extension_stream_provider("acme");
+        runtime.unregister_extension_provider("acme");
 
         let model = required(runtime.get_model("acme", "acme-1"), "model")?;
         let mut stream = runtime.stream_simple(model, Context::default(), StreamOptions::default());
