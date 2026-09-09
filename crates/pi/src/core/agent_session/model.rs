@@ -102,7 +102,7 @@ fn models_are_equal(a: &Model, b: &Model) -> bool {
 /// [`Model::thinking_level_map`]; an explicit `None` value marks a level
 /// unsupported, while `xhigh` and `max` are included only when explicitly
 /// mapped (mirrors the TypeScript filter exactly).
-pub(super) fn supported_thinking_levels(model: &Model) -> Vec<ModelThinkingLevel> {
+pub(crate) fn supported_thinking_levels(model: &Model) -> Vec<ModelThinkingLevel> {
     if !model.reasoning {
         return vec![ModelThinkingLevel::Off];
     }

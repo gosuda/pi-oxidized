@@ -9,10 +9,6 @@
     clippy::expect_used,
     reason = "golden tests use expect for irrecoverable fixture and codec assertions"
 )]
-#![expect(
-    clippy::panic,
-    reason = "golden tests panic on committed fixture or protocol drift"
-)]
 
 use std::fs;
 
@@ -24,10 +20,7 @@ use pi::remote::codec::{
     encode_client_message, encode_server_message, is_supported_protocol_version,
 };
 use pi::remote::framing::{FrameDecoder, FrameError, assert_complete_frame, encode_frame};
-use pi::remote::schemas::{
-    ClientMessage, PROTOCOL_VERSION, RpcTarget, ServerMessage,
-};
-use pi_agent::service::value::JsonValue;
+use pi::remote::schemas::{ClientMessage, PROTOCOL_VERSION, RpcTarget, ServerMessage};
 
 /// One row of the generator-owned golden corpus JSONL.
 #[derive(Debug, Deserialize)]
@@ -103,6 +96,10 @@ fn assert_v8_kinds_present(corpus: &[CorpusRow]) {
 #[expect(
     clippy::expect_used,
     reason = "test assertions: golden decode/encode must succeed"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one decode/encode arm per corpus row kind; splitting would scatter the golden table"
 )]
 fn decode_and_reencode(row: &CorpusRow) -> Vec<u8> {
     let frame = hex_to_bytes(&row.frame_hex);
@@ -222,7 +219,10 @@ fn decode_and_reencode(row: &CorpusRow) -> Vec<u8> {
 fn golden_v8_corpus_decodes_and_reencodes_byte_exact() {
     let corpus = load_corpus();
     assert_v8_kinds_present(&corpus);
-    for row in corpus.iter().filter(|row| row.kind != "over_limit_rejection") {
+    for row in corpus
+        .iter()
+        .filter(|row| row.kind != "over_limit_rejection")
+    {
         let frame = hex_to_bytes(&row.frame_hex);
         assert_eq!(
             decode_and_reencode(row),
@@ -343,10 +343,8 @@ fn unknown_discriminant_errors() {
 fn server_hello_version_mismatch_errors() {
     let message = ServerMessage::Hello {
         version: PROTOCOL_VERSION + 1,
-        server_id: pi::remote::schemas::ServerId::new(
-            "00000000-0000-4000-8000-000000000001",
-        )
-        .expect("canonical server id"),
+        server_id: pi::remote::schemas::ServerId::new("00000000-0000-4000-8000-000000000001")
+            .expect("canonical server id"),
     };
     let error = encode_server_message(&message, None).expect_err("expected version mismatch");
     assert!(matches!(

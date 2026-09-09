@@ -196,11 +196,9 @@ impl InputMapper {
                     out.push(ViewAction::Paste { text: text.clone() });
                 }
             }
-            UiEvent::FocusGained | UiEvent::FocusLost => {
-                // No app-level action; the runtime uses these as a heuristic
-                // to re-probe terminal light/dark on FocusGained.
-            }
-            UiEvent::Mouse(_) => {
+            UiEvent::FocusGained | UiEvent::FocusLost | UiEvent::Mouse(_) => {
+                // No app-level action; the runtime uses focus events as a
+                // heuristic to re-probe terminal light/dark on FocusGained.
                 // Native fullscreen owns pointer routing before app actions.
             }
             UiEvent::Key(key) => {

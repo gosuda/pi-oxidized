@@ -45,18 +45,18 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, poll_fn};
-use pi_ai::{AssistantContent, AssistantMessage};
 use pi_ai::auth::types::AuthSelectOption;
 use pi_ai::auth::{
     AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthType, default_provider_auth,
 };
+use pi_ai::{AssistantContent, AssistantMessage};
 use pi_tui::alt_screen::{
     DocumentBlock, DocumentBlockId, FullscreenEffect, FullscreenOptions, FullscreenViewport,
     TranscriptSearch, transcript_search_rect,
 };
 use pi_tui::component::{Component, EventResult, UiEvent};
-use pi_tui::focus::Focusable;
 use pi_tui::components::editor::{BorderActivity, Editor, EditorOptions};
+use pi_tui::focus::Focusable;
 use pi_tui::keys::{
     ParsedKeyId, encode_key_event, key_matches_parsed, parse_key_id, set_kitty_protocol_active,
     should_dispatch_key_event,
@@ -84,12 +84,12 @@ use crate::core::extension_host::{
 use crate::core::extension_runtime_set::ExtensionRuntimeSet;
 use crate::core::platform::external_editor::{EditOutcome, edit_text_in_external_editor};
 use pi_ext::client::{DialogEnd, DialogOutcome, HostUiRequest, HostUiResponse};
+#[cfg(test)]
+use pi_ext::protocol::{KeyEventKindWire, KeyModifiersWire};
 use pi_ext::protocol::{
     SlotPlacement, ThemeCatalogEntry, ThemeColorValue, ThemeUpdate, ThemeWire, UiEventRequest,
     UiEventWire,
 };
-#[cfg(test)]
-use pi_ext::protocol::{KeyEventKindWire, KeyModifiersWire};
 use pi_ext::sanitize::SanitizedSlot;
 
 use crate::core::settings::{
@@ -433,9 +433,7 @@ pub trait SessionHost: Send + Sync + 'static {
         &self,
         _level: pi_ai::ModelThinkingLevel,
     ) -> BoxFuture<'_, Result<(), String>> {
-        Box::pin(async {
-            Err("thinking level selection is unavailable".to_owned())
-        })
+        Box::pin(async { Err("thinking level selection is unavailable".to_owned()) })
     }
 
     /// Reload extensions / resources / keybindings.
@@ -1402,7 +1400,13 @@ impl FullscreenRoot {
             let text = self.editor.get_text();
             let (glyph, color) = super::view::editor_prompt_marker(&text);
             let colored = super::theme::current().fg(color, glyph);
-            pi_tui::components::util::paint_line(area.x, area.y.saturating_add(1), 2, buf, &colored);
+            pi_tui::components::util::paint_line(
+                area.x,
+                area.y.saturating_add(1),
+                2,
+                buf,
+                &colored,
+            );
             let shifted = Rect::new(
                 area.x.saturating_add(2),
                 area.y,
@@ -1444,7 +1448,11 @@ impl Component for FullscreenRoot {
             self.render_error = Some(error);
         }
 
-        for (component, rect) in self.dock.iter_mut().zip(self.dock_areas[..3].iter().copied()) {
+        for (component, rect) in self
+            .dock
+            .iter_mut()
+            .zip(self.dock_areas[..3].iter().copied())
+        {
             if rect.height > 0 {
                 component.render(rect, buf);
             }
@@ -1511,7 +1519,9 @@ impl Component for FullscreenRoot {
             FocusArea::Selector => self
                 .selector
                 .as_mut()
-                .map_or(EventResult::Ignored, |selector| selector.handle_event(event)),
+                .map_or(EventResult::Ignored, |selector| {
+                    selector.handle_event(event)
+                }),
             FocusArea::Overlay => self
                 .overlay
                 .as_mut()
@@ -2443,9 +2453,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.fullscreen_viewport.clear_interaction();
         self.fullscreen_viewport.close_search();
         self.fullscreen_search = None;
-        if self.view.overlay.as_ref().is_some_and(|overlay| {
-            overlay.kind == OverlayKind::TranscriptSearch
-        }) {
+        if self
+            .view
+            .overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.kind == OverlayKind::TranscriptSearch)
+        {
             self.view.overlay = None;
             if self.view.focus == FocusArea::Overlay {
                 self.view.focus = FocusArea::Editor;
@@ -2651,8 +2664,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
             let coalesce_wait = self.coalesce_wait(Instant::now());
             let (spinner_active, spinner_deadline) = self.arm_spinner_deadline();
-            let viewport_deadline_active =
-                self.screen_mode == ScreenMode::Fullscreen && self.fullscreen_viewport.next_deadline().is_some();
+            let viewport_deadline_active = self.screen_mode == ScreenMode::Fullscreen
+                && self.fullscreen_viewport.next_deadline().is_some();
             tokio::select! {
                 biased;
 
@@ -2995,10 +3008,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         Ok(())
     }
 
-    fn fullscreen_search_mouse(
-        &mut self,
-        mouse: &crossterm::event::MouseEvent,
-    ) -> bool {
+    fn fullscreen_search_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
         let Some(search) = self.fullscreen_search.as_mut() else {
             return false;
         };
@@ -3014,8 +3024,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let column = mouse.column.saturating_sub(rect.x);
         if matches!(
             mouse.kind,
-            crossterm::event::MouseEventKind::Down(_)
-                | crossterm::event::MouseEventKind::Up(_)
+            crossterm::event::MouseEventKind::Down(_) | crossterm::event::MouseEventKind::Up(_)
         ) && let Some(direction) = search.navigation_direction_at(row, column)
         {
             let _ = search.set_hovered_navigation_direction(Some(direction));
@@ -3037,23 +3046,25 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
         if self.pending_extension_dialog.is_some()
             || self.active_selector.is_some()
-            || self.view.overlay.as_ref().is_some_and(|overlay| {
-                overlay.kind != OverlayKind::TranscriptSearch
-            })
+            || self
+                .view
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.kind != OverlayKind::TranscriptSearch)
         {
             return Ok(false);
         }
         if let UiEvent::Mouse(mouse) = event
-            && self.fullscreen_search_mouse(mouse)
+            && self.fullscreen_search_mouse(*mouse)
         {
             self.paint_frame()?;
             return Ok(true);
         }
 
         let was_search_open = self.fullscreen_viewport.search_open();
-        let result = self
-            .fullscreen_viewport
-            .handle_event(event, self.mapper.keybindings(), Instant::now());
+        let result =
+            self.fullscreen_viewport
+                .handle_event(event, self.mapper.keybindings(), Instant::now());
         let has_effect = result.effect.is_some();
         if let Some(effect) = result.effect {
             self.handle_fullscreen_effect(effect).await?;
@@ -3080,9 +3091,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.view.focus = FocusArea::Overlay;
         } else if !search_open && self.fullscreen_search.is_some() {
             self.fullscreen_search = None;
-            if self.view.overlay.as_ref().is_some_and(|overlay| {
-                overlay.kind == OverlayKind::TranscriptSearch
-            }) {
+            if self
+                .view
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.kind == OverlayKind::TranscriptSearch)
+            {
                 self.view.overlay = None;
                 self.view.focus = FocusArea::Editor;
             }
@@ -3090,16 +3104,17 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
         let mut handled = result.event_result.is_handled();
         let mut needs_render = result.event_result.needs_render() || has_effect;
-        if search_open && was_search_open {
-            if let Some(search) = self.fullscreen_search.as_mut() {
-                let before = search.query().to_owned();
-                let search_result = search.handle_event(event);
-                if search.query() != before {
-                    self.fullscreen_viewport.set_search_query(search.query());
-                }
-                handled = true;
-                needs_render |= search_result.needs_render() || search.query() != before;
+        if search_open
+            && was_search_open
+            && let Some(search) = self.fullscreen_search.as_mut()
+        {
+            let before = search.query().to_owned();
+            let search_result = search.handle_event(event);
+            if search.query() != before {
+                self.fullscreen_viewport.set_search_query(search.query());
             }
+            handled = true;
+            needs_render |= search_result.needs_render() || search.query() != before;
         }
         if needs_render {
             self.paint_frame()?;
@@ -3641,21 +3656,17 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
 
         let normalized = argument.to_ascii_lowercase();
-        let level = available
-            .iter()
-            .copied()
-            .find(|candidate| {
-                crate::core::agent_session::model::level_str(*candidate) == normalized.as_str()
-            });
+        let level = available.iter().copied().find(|candidate| {
+            crate::core::agent_session::model::level_str(*candidate) == normalized.as_str()
+        });
         let Some(level) = level else {
             let available = available
                 .iter()
                 .map(|level| crate::core::agent_session::model::level_str(*level))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let error = format!(
-                "Unknown thinking level \"{argument}\". Available levels: {available}."
-            );
+            let error =
+                format!("Unknown thinking level \"{argument}\". Available levels: {available}.");
             self.last_error = Some(error.clone());
             self.push_notice("thinking", error);
             return ActionOutcome::Repaint;
@@ -5250,10 +5261,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         match self.session.persist_thinking_level(level).await {
             Ok(()) => {
                 self.refresh_footer().await;
-                self.push_notice(
-                    "thinking",
-                    format!("Default thinking level: {value}"),
-                );
+                self.push_notice("thinking", format!("Default thinking level: {value}"));
             }
             Err(error) => {
                 self.last_error = Some(error.clone());
@@ -5478,9 +5486,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                         let _ = cancel_tx.send(());
                     }),
                     Some(Box::new(move |level| {
-                        let _ = save_tx.send(
-                            crate::core::agent_session::model::level_str(level).to_owned(),
-                        );
+                        let _ = save_tx
+                            .send(crate::core::agent_session::model::level_str(level).to_owned());
                     })),
                     default_level,
                 );
@@ -6136,17 +6143,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     /// taps survive until persistence succeeds.
     async fn handle_settings_change(&mut self, id: &str, value: &str) {
         let requested_mode = if id == "tuiMode" {
-            let mode = match value.parse::<ScreenMode>() {
-                Ok(mode) => mode,
-                Err(_) => {
-                    self.last_error = Some(format!("unknown TUI mode: {value}"));
-                    return;
-                }
+            let Ok(mode) = value.parse::<ScreenMode>() else {
+                self.last_error = Some(format!("unknown TUI mode: {value}"));
+                return;
             };
             if self.view.overlay.is_some() {
-                self.last_error = Some(
-                    "cannot change TUI mode while a modal overlay is open".to_owned(),
-                );
+                self.last_error =
+                    Some("cannot change TUI mode while a modal overlay is open".to_owned());
                 return;
             }
             Some(mode)
@@ -6194,10 +6197,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
         if matches!(
             id,
-            "tuiMode"
-                | "fullscreenExitOutput"
-                | "fullscreenScrollbar"
-                | "fullscreenCopyOnSelect"
+            "tuiMode" | "fullscreenExitOutput" | "fullscreenScrollbar" | "fullscreenCopyOnSelect"
         ) {
             self.fullscreen_document_dirty = true;
         }
@@ -6819,8 +6819,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 let frame = match self.view.indicator_frames.as_deref() {
                     Some(frames) if !frames.is_empty() => frames
                         .get(status.frame % frames.len())
-                        .map(String::as_str)
-                        .unwrap_or(""),
+                        .map_or("", String::as_str),
                     Some(_) => "",
                     None => pi_tui::components::DEFAULT_LOADER_FRAMES
                         .get(status.frame % pi_tui::components::DEFAULT_LOADER_FRAMES.len())
@@ -6940,7 +6939,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let renderers = super::tool_renderers::builtin_tool_renderers();
         let components = super::theme::with_theme(self.view.theme.clone(), || {
             super::theme::with_hyperlinks(self.view.hyperlinks, || {
-                super::view::build_message(message, &renderers, &md_theme, &self.view.theme)
+                super::view::build_message(message, renderers, &md_theme, self.view.theme.as_ref())
             })
         });
         let mut stack = super::messages::ColumnStack::new();
@@ -6957,10 +6956,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         sections
             .iter()
             .position(|section| section.label == label)
-            .map(|index| sections.remove(index).component)
-            .unwrap_or_else(|| Box::new(pi_tui::components::Spacer::new(0)))
+            .map_or_else(
+                || Box::new(pi_tui::components::Spacer::new(0)) as Box<dyn Component>,
+                |index| sections.remove(index).component,
+            )
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Full-screen document assembly updates chrome, message blocks, and dock atomically so each paint sees one coherent snapshot"
+    )]
     fn refresh_fullscreen_document(&mut self) {
         if !self.fullscreen_document_dirty {
             return;
@@ -6982,10 +6987,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         } else {
             Self::take_composed_component(&mut composed.sections, "status")
         };
-        let widgets_above =
-            Self::take_composed_component(&mut composed.sections, "widgets-above");
-        let widgets_below =
-            Self::take_composed_component(&mut composed.sections, "widgets-below");
+        let widgets_above = Self::take_composed_component(&mut composed.sections, "widgets-above");
+        let widgets_below = Self::take_composed_component(&mut composed.sections, "widgets-below");
         let footer = Self::take_composed_component(&mut composed.sections, "footer");
 
         let empty = self.view.messages.is_empty() && !self.view.streaming;
@@ -6999,13 +7002,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.fullscreen_empty_present = empty;
         }
 
-        let mut blocks =
-            Vec::with_capacity(3 + self.view.messages.len() + usize::from(empty));
-        for (id, component) in self
-            .fullscreen_chrome_ids
-            .iter()
-            .copied()
-            .zip([header, resources, diagnostics])
+        let mut blocks = Vec::with_capacity(3 + self.view.messages.len() + usize::from(empty));
+        for (id, component) in
+            self.fullscreen_chrome_ids
+                .iter()
+                .copied()
+                .zip([header, resources, diagnostics])
         {
             if let Some(id) = id {
                 blocks.push(DocumentBlock {
@@ -7055,9 +7057,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 component: self.fullscreen_message_component(message),
             });
         }
-        if empty
-            && let Some(id) = self.fullscreen_empty_id
-        {
+        if empty && let Some(id) = self.fullscreen_empty_id {
             let mut empty_stack = super::messages::ColumnStack::new();
             empty_stack.push(Box::new(pi_tui::components::Text::with_padding(
                 self.view.theme.fg(
@@ -7097,13 +7097,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .set_copy_on_select(self.fullscreen_copy_on_select);
         self.fullscreen_document_dirty = false;
 
-        self.fullscreen_dock = vec![
-            pending,
-            status,
-            widgets_above,
-            widgets_below,
-            footer,
-        ];
+        self.fullscreen_dock = vec![pending, status, widgets_above, widgets_below, footer];
     }
 
     fn build_fullscreen_root(
@@ -7126,10 +7120,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             )) as Box<dyn Component>
         });
         FullscreenRoot {
-            viewport: std::mem::replace(
-                &mut self.fullscreen_viewport,
-                FullscreenViewport::default(),
-            ),
+            viewport: std::mem::take(&mut self.fullscreen_viewport),
             dock: std::mem::take(&mut self.fullscreen_dock),
             editor,
             selector,
@@ -7157,7 +7148,6 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         }
     }
 
-
     fn paint_fullscreen_frame(&mut self) -> io::Result<()> {
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
         let saved_selector = self.active_selector.take();
@@ -7168,10 +7158,15 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.fullscreen_transcript_area = root.transcript_area;
             self.recover_fullscreen_root(root);
             self.last_error = Some(format!("fullscreen document prepare failed: {error}"));
-            return Err(io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                error.to_string(),
+            ));
         }
         self.fullscreen_transcript_area = root.transcript_area;
-        let txn = self.pending_reanchor.take()
+        let txn = self
+            .pending_reanchor
+            .take()
             .map_or(Txn::Frame, Txn::Reanchor);
         let result = self.tui.commit(txn, &mut root);
         let render_error = root.take_render_error();
@@ -7179,7 +7174,10 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.ensure_editor_on_submit();
         if let Some(error) = render_error {
             self.last_error = Some(format!("fullscreen document render failed: {error}"));
-            return Err(io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                error.to_string(),
+            ));
         }
         result
     }
@@ -7415,7 +7413,8 @@ fn project_snapshot(
             text: t.clone(),
         })
         .collect();
-    view.pending.follow_up = snapshot.follow_up
+    view.pending.follow_up = snapshot
+        .follow_up
         .iter()
         .map(|t| PendingMessage {
             kind: PendingKind::FollowUp,
@@ -9797,25 +9796,20 @@ pub async fn run_interactive_mode(
                     .guard_mut()
                     .set_viewport_bottom_row(rt.viewport_bottom_row());
                 rt.exited = false;
-                continue;
             }
             other => break other,
         }
     };
 
-    let normal_exit = matches!(
-        exit,
-        InteractiveExit::Clean | InteractiveExit::SessionEnded
-    );
+    let normal_exit = matches!(exit, InteractiveExit::Clean | InteractiveExit::SessionEnded);
     let fullscreen_mode = rt.screen_mode == ScreenMode::Fullscreen;
     let fullscreen_exit = fullscreen_mode && normal_exit;
-    let resume_hint = if fullscreen_exit
-        && rt.fullscreen_exit_output == FullscreenExitOutput::ResumeHint
-    {
-        rt.session.resume_command().await
-    } else {
-        None
-    };
+    let resume_hint =
+        if fullscreen_exit && rt.fullscreen_exit_output == FullscreenExitOutput::ResumeHint {
+            rt.session.resume_command().await
+        } else {
+            None
+        };
     if fullscreen_mode {
         rt.flush_fullscreen_image_cache()
             .map_err(|e| format!("fullscreen image cleanup failed: {e}"))?;
@@ -9829,7 +9823,9 @@ pub async fn run_interactive_mode(
         rt.view.extension_overlay_slot = None;
         rt.fullscreen_search = None;
         rt.fullscreen_viewport.close_search();
-        let size = session.switch_screen_mode(&rt.input, ScreenMode::Regular).await?;
+        let size = session
+            .switch_screen_mode(&rt.input, ScreenMode::Regular)
+            .await?;
         rt.apply_screen_mode(ScreenMode::Regular, (size.width, size.height))
             .map_err(|error| format!("regular exit writer setup failed: {error}"))?;
         rt.paint_frame()
@@ -9842,9 +9838,7 @@ pub async fn run_interactive_mode(
         .pause()
         .await
         .map_err(|e| format!("pause terminal input for shutdown: {e}"))?;
-    if fullscreen_exit
-        && rt.fullscreen_exit_output == FullscreenExitOutput::ResumeHint
-    {
+    if fullscreen_exit && rt.fullscreen_exit_output == FullscreenExitOutput::ResumeHint {
         // Preserve the primary screen: restoring the guard while the
         // alternate screen is still active discards that screen, after which
         // the hint is written through the runtime's sole output handle.
@@ -10124,11 +10118,10 @@ fn encode_terminal_input(event: &UiEvent) -> Option<String> {
     match event {
         UiEvent::Paste(text) => Some(text.clone()),
         UiEvent::Key(key) => encode_key_event(key),
-        UiEvent::Mouse(mouse) => encode_sgr_mouse(mouse),
+        UiEvent::Mouse(mouse) => Some(encode_sgr_mouse(*mouse)),
         UiEvent::FocusGained | UiEvent::FocusLost | UiEvent::Resize { .. } => None,
     }
 }
-
 
 fn quote_resume_arg(value: &str) -> String {
     if !value.is_empty()
@@ -10151,7 +10144,7 @@ fn quote_resume_arg(value: &str) -> String {
     quoted
 }
 
-fn encode_sgr_mouse(mouse: &crossterm::event::MouseEvent) -> Option<String> {
+fn encode_sgr_mouse(mouse: crossterm::event::MouseEvent) -> String {
     use crossterm::event::{MouseButton, MouseEventKind};
 
     let button_code = |button: MouseButton| match button {
@@ -10174,14 +10167,13 @@ fn encode_sgr_mouse(mouse: &crossterm::event::MouseEvent) -> Option<String> {
         + u16::from(modifiers.contains(crossterm::event::KeyModifiers::ALT)) * 8
         + u16::from(modifiers.contains(crossterm::event::KeyModifiers::CONTROL)) * 16;
     let code = code + modifier_bits;
-    Some(format!(
+    format!(
         "\x1b[<{code};{};{}{}",
         mouse.column.saturating_add(1),
         mouse.row.saturating_add(1),
         suffix
-    ))
+    )
 }
-
 
 fn is_sgr_mouse_sequence(data: &str) -> bool {
     let Some(payload) = data.strip_prefix("\x1b[<") else {
@@ -10204,9 +10196,9 @@ fn is_sgr_mouse_sequence(data: &str) -> bool {
         return false;
     };
     values.next().is_none()
-        && [code, column, row].into_iter().all(|value| {
-            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-        })
+        && [code, column, row]
+            .into_iter()
+            .all(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn decode_sgr_mouse(data: &str) -> Option<UiEvent> {
@@ -10215,10 +10207,8 @@ fn decode_sgr_mouse(data: &str) -> Option<UiEvent> {
     let payload = data.strip_prefix("\x1b[<")?;
     let (fields, suffix) = if let Some(fields) = payload.strip_suffix('M') {
         (fields, b'M')
-    } else if let Some(fields) = payload.strip_suffix('m') {
-        (fields, b'm')
     } else {
-        return None;
+        (payload.strip_suffix('m')?, b'm')
     };
     let mut values = fields.split(';');
     let code = values.next()?.parse::<u8>().ok()?;
@@ -10238,7 +10228,7 @@ fn decode_sgr_mouse(data: &str) -> Option<UiEvent> {
         (1, true) => MouseEventKind::Drag(MouseButton::Middle),
         (2, true) => MouseEventKind::Drag(MouseButton::Right),
         (3, false) => MouseEventKind::Up(MouseButton::Left),
-        (3, true) | (4, true) | (5, true) => MouseEventKind::Moved,
+        (3..=5, true) => MouseEventKind::Moved,
         (4, false) => MouseEventKind::ScrollUp,
         (5, false) => MouseEventKind::ScrollDown,
         (6, false) => MouseEventKind::ScrollLeft,
@@ -10275,10 +10265,10 @@ fn decode_sgr_mouse(data: &str) -> Option<UiEvent> {
 }
 
 fn decode_terminal_input(data: String) -> UiEvent {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     if let Some(mouse) = decode_sgr_mouse(&data) {
         return mouse;
     }
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let key = match data.as_str() {
         "\r" | "\n" => Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         "\t" => Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
@@ -12157,23 +12147,19 @@ mod tests {
 
     #[test]
     fn installed_product_panic_hook_emits_complete_restore_sequence() -> io::Result<()> {
+        #[cfg(windows)]
+        use pi_tui::testkit::ConPtyDriver;
+        #[cfg(unix)]
+        use pi_tui::testkit::PosixPtyDriver;
         use pi_tui::testkit::{
             CapabilityProfile, DriverSession, Geometry, LaunchSpec, TerminalDriver,
         };
-        #[cfg(unix)]
-        use pi_tui::testkit::PosixPtyDriver;
-        #[cfg(windows)]
-        use pi_tui::testkit::ConPtyDriver;
 
         const CHILD_ENV: &str = "PI_TEST_PRODUCT_PANIC_HOOK_PATH";
         const CHILD_ENTERED_ENV: &str = "PI_TEST_PRODUCT_PANIC_HOOK_ENTERED";
-        const CHILD_TEST: &str =
-            "modes::interactive::runtime::tests::installed_product_panic_hook_emits_complete_restore_sequence";
+        const CHILD_TEST: &str = "modes::interactive::runtime::tests::installed_product_panic_hook_emits_complete_restore_sequence";
 
-        fn run_under_pty<D: TerminalDriver>(
-            driver: &D,
-            spec: &LaunchSpec,
-        ) -> io::Result<()> {
+        fn run_under_pty<D: TerminalDriver>(driver: &D, spec: &LaunchSpec) -> io::Result<()> {
             let session = driver
                 .open(spec)
                 .map_err(|error| io::Error::other(error.to_string()))?;
@@ -12240,10 +12226,7 @@ mod tests {
         let geometry =
             Geometry::new(80, 24).map_err(|error| io::Error::other(error.to_string()))?;
         let env = std::collections::BTreeMap::from([
-            (
-                CHILD_ENV.to_owned(),
-                fullscreen.display().to_string(),
-            ),
+            (CHILD_ENV.to_owned(), fullscreen.display().to_string()),
             (CHILD_ENTERED_ENV.to_owned(), "1".to_owned()),
         ]);
         let spec = LaunchSpec {
@@ -14070,11 +14053,7 @@ mod tests {
                 MouseEventKind::Up(MouseButton::Left),
                 KeyModifiers::NONE,
             ),
-            (
-                "\x1b[<35;8;5m",
-                MouseEventKind::Moved,
-                KeyModifiers::NONE,
-            ),
+            ("\x1b[<35;8;5m", MouseEventKind::Moved, KeyModifiers::NONE),
             (
                 "\x1b[<7;8;5m",
                 MouseEventKind::Up(MouseButton::Left),
@@ -14097,8 +14076,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_input_mouse_rewrite_uses_sgr_semantics_and_suppresses_rejected_sequence()
-        -> TestResult
-    {
+    -> TestResult {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let (runner, ext_host) =
@@ -14121,8 +14099,7 @@ mod tests {
         )]);
         let (mut host, log) = FakeHost::new();
         host.extension_runner = Some(Arc::clone(&set));
-        let (mut rt, _log) =
-            try_make_runtime_with(host, log, &TerminalCapabilities::default())?;
+        let (mut rt, _log) = try_make_runtime_with(host, log, &TerminalCapabilities::default())?;
         let original = || {
             UiEvent::Mouse(MouseEvent {
                 kind: MouseEventKind::Moved,

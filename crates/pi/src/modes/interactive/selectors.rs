@@ -474,11 +474,7 @@ impl SaveableSelectList {
     }
 
     /// Replace rows and retain the selected value when it remains available.
-    pub fn replace_items(
-        &mut self,
-        items: Vec<SelectItem>,
-        selected_value: Option<&str>,
-    ) {
+    pub fn replace_items(&mut self, items: Vec<SelectItem>, selected_value: Option<&str>) {
         let selected_index = selected_value
             .and_then(|value| items.iter().position(|item| item.value == value))
             .unwrap_or(0);
@@ -493,9 +489,7 @@ impl SaveableSelectList {
     }
 
     fn handle_key(&mut self, key: &KeyEvent) -> EventResult {
-        if self.on_save_as_default.is_some()
-            && get_keybindings().matches(key, self.save_binding)
-        {
+        if self.on_save_as_default.is_some() && get_keybindings().matches(key, self.save_binding) {
             // Consumed even with no selected row, mirroring the reference.
             if let Some(item) = self.list.selected_item().cloned()
                 && let Some(cb) = self.on_save_as_default.as_mut()
@@ -567,7 +561,10 @@ impl ThinkingSelectorComponent {
                 };
                 SelectItem::new(
                     crate::core::agent_session::model::level_str(level),
-                    format!("{marker}{}", crate::core::agent_session::model::level_str(level)),
+                    format!(
+                        "{marker}{}",
+                        crate::core::agent_session::model::level_str(level)
+                    ),
                 )
                 .with_description(description)
             })
@@ -629,9 +626,8 @@ impl ThinkingSelectorComponent {
             .select_list
             .selected_item()
             .map(|item| item.value.clone());
-        let filtered = pi_tui::fuzzy::fuzzy_filter(&self.all_items, &query, |item| {
-            item.value.as_str()
-        });
+        let filtered =
+            pi_tui::fuzzy::fuzzy_filter(&self.all_items, &query, |item| item.value.as_str());
         self.select_list
             .replace_items(filtered, selected_value.as_deref());
     }
@@ -905,6 +901,7 @@ mod tests {
         snapshot_buffer_plain(&buf, 80, buf.area().height).join("\n")
     }
 
+    #[test]
     fn selector_kind_mapping_is_exhaustive_at_helper_boundary() {
         assert_eq!(
             15,

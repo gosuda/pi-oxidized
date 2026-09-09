@@ -537,19 +537,21 @@ impl ResolvedTheme {
     /// the current match adds bold/inverse; the jump-to-end label consumes
     /// `selectedBg`/`text`. Selection and flash use inverse video rather
     /// than dedicated theme tokens.
+    #[must_use]
     pub fn fullscreen_style(&self) -> FullscreenStyle {
         let search_fg = self.fullscreen_fg_color(ThemeColor::SearchMatchText, ThemeColor::Text);
-        let search_bg = self.fullscreen_bg_color(ThemeBg::SearchMatchBg, ThemeBg::SelectedBg);
+        let search_background =
+            self.fullscreen_bg_color(ThemeBg::SearchMatchBg, ThemeBg::SelectedBg);
         FullscreenStyle {
             scrollbar_track: self.fullscreen_fg(ThemeColor::ScrollbarTrack, ThemeColor::Muted),
             scrollbar_thumb: self.fullscreen_fg(ThemeColor::ScrollbarThumb, ThemeColor::Text),
             search_match: Style::default()
                 .fg(search_fg)
-                .bg(search_bg)
+                .bg(search_background)
                 .add_modifier(Modifier::UNDERLINED),
             search_current_match: Style::default()
                 .fg(search_fg)
-                .bg(search_bg)
+                .bg(search_background)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED),
             jump_to_end: Style::default()
                 .fg(self.ratatui_color(self.fg[Self::fg_index(ThemeColor::Text)]))
@@ -2460,24 +2462,23 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_slot_rejects_invalid_color() {
+    fn fullscreen_slot_rejects_invalid_color() -> TestResult {
         let mut colors = serde_json::Map::new();
         for slot in REQUIRED_COLORS {
             colors.insert((*slot).to_owned(), serde_json::json!("#010203"));
         }
-        colors.insert(
-            "scrollbarTrack".to_owned(),
-            serde_json::json!("#zzzzzz"),
-        );
+        colors.insert("scrollbarTrack".to_owned(), serde_json::json!("#zzzzzz"));
         let error = ThemeJson::from_value(&serde_json::json!({
             "name": "test",
             "colors": colors,
         }))
-        .expect_err("bad scrollbarTrack must fail");
+        .err()
+        .ok_or_else(|| "bad scrollbarTrack must fail".to_owned())?;
         assert!(
             matches!(error, ThemeError::InvalidColor { ref slot, .. } if slot == "scrollbarTrack"),
             "unexpected error: {error:?}"
         );
+        Ok(())
     }
 
     #[test]
@@ -2526,15 +2527,12 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_style_applies_fallbacks_for_wire_built_themes() -> TestResult {
+    fn fullscreen_style_applies_fallbacks_for_wire_built_themes() {
         // Extension wire objects omit absent slots (empty = reset); the
         // resolver falls back exactly like the reference constructor.
         let theme = ResolvedTheme::from_value_slots(
             [
-                (
-                    ThemeColor::Muted,
-                    ThemeSlotValue::Rgb(Rgb(1, 2, 3)),
-                ),
+                (ThemeColor::Muted, ThemeSlotValue::Rgb(Rgb(1, 2, 3))),
                 (ThemeColor::Text, ThemeSlotValue::Rgb(Rgb(4, 5, 6))),
             ],
             [(ThemeBg::SelectedBg, ThemeSlotValue::Rgb(Rgb(7, 8, 9)))],
@@ -2557,7 +2555,6 @@ mod tests {
                 .bg(Color::Rgb(7, 8, 9))
                 .add_modifier(Modifier::UNDERLINED)
         );
-        Ok(())
     }
 
     #[test]

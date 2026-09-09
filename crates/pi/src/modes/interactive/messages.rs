@@ -7,13 +7,11 @@
 //! view-models that build pi-tui components for composition.
 use std::collections::BTreeMap;
 
-use pi_ai::{AssistantContent, AssistantMessage, StopReason};
-use pi_tui::component::{
-    Component, DisplayRowSpan, EventResult, RowSourceError, UiEvent,
-};
-use pi_tui::components::{Markdown, Rail, Spacer, Text};
 use super::theme::{self, MarkdownTheme, ResolvedTheme, ThemeColor, user_markdown_options};
 use super::tool_renderer::{ToolPhase, ToolState};
+use pi_ai::{AssistantContent, AssistantMessage, StopReason};
+use pi_tui::component::{Component, DisplayRowSpan, EventResult, RowSourceError, UiEvent};
+use pi_tui::components::{Markdown, Rail, Spacer, Text};
 /// Shared left-edge indent for unrailed content (column 2; D3).
 pub const CONTENT_INDENT: u16 = 2;
 
@@ -37,6 +35,10 @@ fn railed(
 }
 /// One chat message view-model.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "MessageView is a public view-model enum; boxing its inline variants would break construction and pattern-matching compatibility"
+)]
 pub enum MessageView {
     /// User-authored message.
     User(UserMessageView),
@@ -729,7 +731,6 @@ impl Component for ColumnStack {
         child.visit_row(child_row, emit)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
