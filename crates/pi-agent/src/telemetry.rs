@@ -1691,6 +1691,10 @@ mod tests {
     }
 
     /// Expected `(name, start_attrs, end_attrs)` for each harness span.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one literal row per registered span; splitting the pinned table hides the pin"
+    )]
     fn expected_harness_span_attributes()
     -> [(&'static str, Vec<&'static str>, Vec<&'static str>); 12] {
         [

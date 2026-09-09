@@ -721,6 +721,10 @@ struct RegistrySnapshot {
     load_errors: Vec<(String, String)>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "flat wire-to-domain projection: one field per line, no branching to extract"
+)]
 fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> RegistrySnapshot {
     let mut snapshot = RegistrySnapshot {
         terminal_input: wire.terminal_input,

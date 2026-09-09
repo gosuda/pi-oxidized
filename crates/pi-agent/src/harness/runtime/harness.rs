@@ -148,7 +148,7 @@ impl HarnessRuntime {
     pub(crate) async fn fault(&self, fault: HarnessFault, cx: &Context) {
         let fault = Arc::new(fault);
         {
-            let mut slot = self.fault.lock().unwrap_or_else(|error| error.into_inner());
+            let mut slot = self.fault.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if slot.is_some() {
                 return;
             }

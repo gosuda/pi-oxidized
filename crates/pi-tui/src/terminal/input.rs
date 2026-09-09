@@ -356,7 +356,7 @@ mod tests {
         tokio::spawn(input_task_with_factory(
             events_tx,
             control_rx,
-            || futures::stream::pending::<io::Result<Event>>(),
+            futures::stream::pending::<io::Result<Event>>,
             || false,
         ));
         let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
