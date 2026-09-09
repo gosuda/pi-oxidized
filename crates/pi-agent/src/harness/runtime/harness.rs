@@ -526,6 +526,9 @@ impl AgentHarness for HarnessRuntime {
         cx: &'a Context,
     ) -> BoxFuture<'a, Result<(), HarnessError>> {
         Box::pin(async move {
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             policy
                 .validate()
                 .map_err(|_| HarnessError::InvalidRetryPolicy {
@@ -771,4 +774,175 @@ fn validate_active_tools(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::error::Error;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use futures::future::FutureExt;
+    use futures::stream::{self, BoxStream, StreamExt};
+
+    use super::*;
+    use crate::harness::api::HarnessModels;
+    use crate::harness::event::{EventListener, HarnessEventType};
+    use crate::session::{
+        HarnessRetryPolicy, HarnessStreamOptions, MemoryStorage, SessionMetadata,
+        StorageBackedSession, UuidV7Generator,
+    };
+    use crate::tool::ToolExecutionMode;
+
+    fn fixture_model() -> pi_ai::Model {
+        pi_ai::Model {
+            id: "retry-closed-model".to_owned(),
+            name: "Retry closed fixture".to_owned(),
+            api: "retry-closed-api".to_owned(),
+            provider: "retry-closed-provider".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: Vec::new(),
+            cost: pi_ai::ModelCost::default(),
+            context_window: 8192,
+            max_tokens: 1024,
+            headers: None,
+            compat: None,
+            extra: BTreeMap::default(),
+        }
+    }
+
+    /// A model store whose provider is never invoked here; streaming returns an
+    /// empty stream so an accidental call fails closed instead of panicking.
+    struct ClosedModels {
+        model: pi_ai::Model,
+    }
+
+    impl pi_ai::Provider for ClosedModels {
+        fn stream(
+            &self,
+            _model: &pi_ai::Model,
+            _context: pi_ai::Context,
+            _options: pi_ai::StreamOptions,
+        ) -> BoxStream<'static, Result<pi_ai::AssistantMessageEvent, pi_ai::ProviderError>> {
+            stream::empty().boxed()
+        }
+    }
+
+    impl HarnessModels for ClosedModels {
+        fn get_model(&self, provider: &str, model_id: &str) -> Option<pi_ai::Model> {
+            (self.model.provider == provider && self.model.id == model_id)
+                .then(|| self.model.clone())
+        }
+    }
+
+    async fn build_harness(cx: &Context) -> Result<Arc<dyn AgentHarness>, Box<dyn Error>> {
+        let session = StorageBackedSession::new(
+            SessionMetadata {
+                id: "retry-closed".to_owned(),
+                created_at: 1,
+                storage_version: MemoryStorage::STORAGE_VERSION,
+                cwd: None,
+                parent_session_id: None,
+                legacy_parent_session_path: None,
+            },
+            Arc::new(MemoryStorage::new()),
+            Arc::new(UuidV7Generator::new()),
+            None,
+        );
+        let models = Arc::new(ClosedModels {
+            model: fixture_model(),
+        });
+        let (harness, _) = AgentHarnessBuilder::create(
+            AgentHarnessOptions {
+                session,
+                models: models.clone(),
+                model: models.model.clone(),
+                thinking_level: None,
+                active_tool_names: None,
+                tools: Vec::new(),
+                tool_context: None,
+                system_prompt: None,
+                resources: HarnessResources::default(),
+                stream_options: HarnessStreamOptions::default(),
+                retry: None,
+                compaction: None,
+                steering_mode: None,
+                follow_up_mode: None,
+                tool_execution: ToolExecutionMode::default(),
+                to_provider_messages: None,
+                entry_projectors: HashMap::new(),
+            },
+            cx,
+        )
+        .await?;
+        Ok(harness)
+    }
+
+    /// A closed harness must reject a retry-policy change with the sealed
+    /// error, leave the sealed configuration untouched, and emit no
+    /// configuration event — matching the guard every sibling setter uses.
+    #[tokio::test]
+    async fn closed_harness_rejects_retry_policy_change_and_emits_no_event(
+    ) -> Result<(), Box<dyn Error>> {
+        let cx = Context::background();
+        let harness = build_harness(&cx).await?;
+
+        let config_updates = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&config_updates);
+        let _listener = harness
+            .events()
+            .on(HarnessEventType::ConfigUpdate, {
+                Arc::new(move |_event: HarnessEvent, _cx: Context| {
+                    let observed = Arc::clone(&observed);
+                    async move {
+                        observed.fetch_add(1, Ordering::Release);
+                    }
+                    .boxed()
+                }) as EventListener
+            })?;
+
+        // A successful change before close proves the listener is wired, so
+        // the later zero is meaningful rather than a dead subscription.
+        let pre_close = HarnessRetryPolicy {
+            enabled: true,
+            max_retries: 5,
+            base_delay_ms: 1_500,
+        };
+        harness
+            .set_retry_policy(pre_close, &cx)
+            .await?;
+        assert_eq!(
+            config_updates.load(Ordering::Acquire),
+            1,
+            "open harness should emit one configuration event",
+        );
+
+        harness.close(&cx).await?;
+
+        let sealed = HarnessRetryPolicy {
+            enabled: true,
+            max_retries: 7,
+            base_delay_ms: 2_500,
+        };
+        let result = harness.set_retry_policy(sealed, &cx).await;
+        assert!(
+            matches!(result, Err(HarnessError::Closed { .. })),
+            "closed harness must reject a retry-policy change, got {result:?}",
+        );
+        assert_eq!(
+            config_updates.load(Ordering::Acquire),
+            1,
+            "closed harness must not emit a configuration event",
+        );
+
+        let after = harness.get_retry_policy(&cx).await?;
+        assert_eq!(
+            after, pre_close,
+            "closed harness must not mutate the sealed retry policy",
+        );
+        Ok(())
+    }
 }
