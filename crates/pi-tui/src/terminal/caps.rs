@@ -1,5 +1,6 @@
 //! Terminal capability detection.
 
+use std::cell::OnceCell;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -120,10 +121,15 @@ impl TerminalCapabilities {
     /// Detect capabilities, then apply explicit overrides over the environment.
     #[must_use]
     pub fn detect_with_overrides(overrides: TerminalCapabilityOverrides) -> Self {
+        let tmux_probe = OnceCell::new();
+        let tmux_forwards_hyperlink =
+            || tmux_probe.get_or_init(probe_tmux_capabilities).forwards_hyperlink;
+        let tmux_supports_sync =
+            || tmux_probe.get_or_init(probe_tmux_capabilities).supports_sync;
         resolve_with(
             |key| env::var(key).ok(),
-            probe_tmux_hyperlinks,
-            probe_tmux_sync,
+            tmux_forwards_hyperlink,
+            tmux_supports_sync,
             overrides,
         )
     }
@@ -257,8 +263,8 @@ fn grant_kitty_row(caps: &mut TerminalCapabilities, sync_disabled: bool) {
 
 /// tmux row: images off (unreliable under multiplexer), hyperlinks only
 /// when the tmux client forwards them. tmux implements DEC 2026 (3.2+),
-/// so synchronized output is granted only after a version probe shows
-/// the attached client is 3.2 or newer.
+/// so synchronized output is granted only when both the server version and
+/// attached client's `sync` feature confirm support.
 fn detect_tmux_row<P, S>(
     caps: &mut TerminalCapabilities,
     has_true_color_hint: bool,
@@ -425,9 +431,16 @@ where
     env(key).is_some_and(|value| !value.is_empty())
 }
 
+const TMUX_PROBE_FORMAT: &str = "#{client_termfeatures}\t#{version}";
 const TMUX_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const TMUX_PROBE_MAX_BYTES: u64 = 4096;
 static NEXT_TMUX_PROBE_OUTPUT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TmuxProbeCapabilities {
+    forwards_hyperlink: bool,
+    supports_sync: bool,
+}
 
 fn create_tmux_probe_output() -> io::Result<(PathBuf, File)> {
     for _ in 0..16 {
@@ -544,31 +557,34 @@ fn parse_decimal<I: Iterator<Item = char>>(digits: &mut std::iter::Peekable<I>) 
     seen.then_some(value)
 }
 
-/// Probe whether the attached tmux client forwards OSC 8 hyperlinks.
-///
-/// tmux only re-emits them when its `client_termfeatures` lists `hyperlinks`.
-/// Any spawn, exit-status, timeout, oversized output, or UTF-8 failure is
-/// conservative and returns `false`. The output file prevents a descendant
-/// retaining stdout from extending the probe past its deadline.
-fn probe_tmux_hyperlinks() -> bool {
-    probe_tmux_output(&["display-message", "-p", "#{client_termfeatures}"]).is_some_and(
-        |features| {
-            features
-                .split(',')
-                .map(str::trim)
-                .any(|feature| feature == "hyperlinks")
-        },
-    )
+fn tmux_feature_present(features: &str, wanted: &str) -> bool {
+    features
+        .split(',')
+        .map(str::trim)
+        .any(|feature| feature == wanted)
 }
 
-/// Probe whether the attached tmux client is version 3.2 or newer, which
-/// is required for DEC 2026 synchronized output.
+fn parse_tmux_capabilities(output: &str) -> Option<TmuxProbeCapabilities> {
+    let mut fields = output.split('\t');
+    let features = fields.next()?;
+    let version = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(TmuxProbeCapabilities {
+        forwards_hyperlink: tmux_feature_present(features, "hyperlinks"),
+        supports_sync: tmux_feature_present(features, "sync") && tmux_version_sync(version),
+    })
+}
+
+/// Probe the attached tmux client and server in one `display-message` call.
 ///
 /// Any spawn, exit-status, timeout, oversized output, UTF-8 failure, or
-/// unparseable version is conservative and returns `false`.
-fn probe_tmux_sync() -> bool {
-    probe_tmux_output(&["display-message", "-p", "#{version}"])
-        .is_some_and(|version| tmux_version_sync(&version))
+/// malformed combined response is conservative and returns no capabilities.
+fn probe_tmux_capabilities() -> TmuxProbeCapabilities {
+    probe_tmux_output(&["display-message", "-p", TMUX_PROBE_FORMAT])
+        .and_then(|output| parse_tmux_capabilities(&output))
+        .unwrap_or_default()
 }
 
 /// Encode a Kitty image deletion by id (`ESC _Ga=d,d=I,i=N ST`).
@@ -587,8 +603,9 @@ pub fn kitty_delete_all() -> Vec<u8> {
 mod tests {
     use super::{
         CellDimensions, ImageProtocol, ImageProtocolOverride, KeyboardProtocol,
-        TerminalCapabilities, TerminalCapabilityOverrides, detect_with, kitty_delete_all,
-        kitty_delete_id, resolve_with, tmux_version_sync,
+        TerminalCapabilities, TerminalCapabilityOverrides, TmuxProbeCapabilities, detect_with,
+        kitty_delete_all, kitty_delete_id, parse_tmux_capabilities, resolve_with,
+        tmux_version_sync,
     };
     use std::collections::HashMap;
 
@@ -900,6 +917,32 @@ mod tests {
         assert!(!tmux_version_sync("master"));
         assert!(!tmux_version_sync("3"));
         assert!(!tmux_version_sync("3."));
+    }
+
+    #[test]
+    fn tmux_sync_requires_server_version_and_client_feature() {
+        assert_eq!(
+            parse_tmux_capabilities("hyperlinks,sync\t3.2"),
+            Some(TmuxProbeCapabilities {
+                forwards_hyperlink: true,
+                supports_sync: true,
+            })
+        );
+        assert_eq!(
+            parse_tmux_capabilities("hyperlinks\t3.2"),
+            Some(TmuxProbeCapabilities {
+                forwards_hyperlink: true,
+                supports_sync: false,
+            })
+        );
+        assert_eq!(
+            parse_tmux_capabilities("sync\t3.1"),
+            Some(TmuxProbeCapabilities {
+                forwards_hyperlink: false,
+                supports_sync: false,
+            })
+        );
+        assert_eq!(parse_tmux_capabilities("hyperlinks,sync\t3.2\textra"), None);
     }
 
     #[test]
