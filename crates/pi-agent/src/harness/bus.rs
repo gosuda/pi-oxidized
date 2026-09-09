@@ -84,6 +84,12 @@ struct BusState {
     worker_scheduled: bool,
     closed: Option<Arc<HarnessFault>>,
     next_id: u64,
+    /// Count of reentrant (nested) batches occupying the front of `queue`.
+    ///
+    /// Nested admissions are inserted at this index so they stay ahead of
+    /// not-yet-delivered outer batches while preserving FIFO among themselves;
+    /// `push_front` would reverse the order of multiple nested admissions.
+    reentrant_front: usize,
 }
 
 struct ListenerRegistration {
@@ -133,6 +139,7 @@ impl HarnessEventBus {
                     worker_scheduled: false,
                     closed: None,
                     next_id: 0,
+                    reentrant_front: 0,
                 }),
                 drain_task: Mutex::new(None),
             }),
@@ -239,15 +246,19 @@ impl HarnessEventBus {
                 })
                 .collect::<Vec<_>>();
         // A listener may reenter the bus while the drain worker is suspended
-        // inside it.  Queue such nested batches at the front; the returned
-        // future delivers them inline (see `deliver_reentrant_batch`) instead
-        // of waiting for a worker that cannot run until the emitting listener
-        // returns.
+        // inside it.  Queue such nested batches ahead of not-yet-delivered
+        // outer batches; the returned future delivers them inline (see
+        // `deliver_reentrant_batch`) instead of waiting for a worker that
+        // cannot run until the emitting listener returns.  Insert at the
+        // `reentrant_front` boundary so multiple nested admissions from one
+        // listener keep FIFO order — `push_front` would reverse them.
         if reentrant_from_drain(&self.core) {
-            state.queue.push_front(DeliveryItem::Batch {
+            let boundary = state.reentrant_front;
+            state.queue.insert(boundary, DeliveryItem::Batch {
                 events: bound,
                 done: Some(done),
             });
+            state.reentrant_front = boundary + 1;
             drop(state);
             return deliver_reentrant_batch(Arc::clone(&self.core), observation).boxed();
         }
@@ -488,6 +499,9 @@ async fn drain(core: Arc<BusCore>) {
                 }
                 return;
             };
+            if state.reentrant_front > 0 {
+                state.reentrant_front -= 1;
+            }
             item
         };
         match item {
@@ -565,7 +579,9 @@ fn reentrant_from_drain(core: &BusCore) -> bool {
 /// Runs on the drain's poll chain: a listener emitted an event and awaits its
 /// delivery while the worker is suspended inside that listener.  Items are
 /// consumed from the front so the nested batch keeps queue order relative to
-/// anything an earlier abandoned nested emit left queued.  Dropping the
+/// anything an earlier abandoned nested emit left queued.  Nested admissions
+/// are inserted at the `reentrant_front` boundary, so multiple nested batches
+/// from one listener are delivered in admission (FIFO) order.  Dropping the
 /// future stays safe: the batch remains admitted and the suspended worker
 /// delivers it once the emitting listener returns.
 async fn deliver_reentrant_batch(core: Arc<BusCore>, observation: oneshot::Receiver<()>) {
@@ -579,7 +595,11 @@ async fn deliver_reentrant_batch(core: Arc<BusCore>, observation: oneshot::Recei
         }
         let item = {
             let mut state = lock_unpoisoned(&core.state);
-            state.queue.pop_front()
+            let item = state.queue.pop_front();
+            if state.reentrant_front > 0 {
+                state.reentrant_front -= 1;
+            }
+            item
         };
         let Some(item) = item else {
             return;
