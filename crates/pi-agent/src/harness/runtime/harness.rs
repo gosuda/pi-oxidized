@@ -148,7 +148,10 @@ impl HarnessRuntime {
     pub(crate) async fn fault(&self, fault: HarnessFault, cx: &Context) {
         let fault = Arc::new(fault);
         {
-            let mut slot = self.fault.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut slot = self
+                .fault
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if slot.is_some() {
                 return;
             }
@@ -432,7 +435,8 @@ impl AgentHarness for HarnessRuntime {
                     });
                 }
             }
-            config.active_tool_names
+            config
+                .active_tool_names
                 .retain(|name| offered.contains(name.as_str()));
             config.tools = tools;
             drop(config);
@@ -780,8 +784,8 @@ fn validate_active_tools(
 mod tests {
     use std::collections::HashMap;
     use std::error::Error;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures::future::FutureExt;
     use futures::stream::{self, BoxStream, StreamExt};
@@ -826,7 +830,8 @@ mod tests {
             _model: &pi_ai::Model,
             _context: pi_ai::Context,
             _options: pi_ai::StreamOptions,
-        ) -> BoxStream<'static, Result<pi_ai::AssistantMessageEvent, pi_ai::ProviderError>> {
+        ) -> BoxStream<'static, Result<pi_ai::AssistantMessageEvent, pi_ai::ProviderError>>
+        {
             stream::empty().boxed()
         }
     }
@@ -885,24 +890,22 @@ mod tests {
     /// error, leave the sealed configuration untouched, and emit no
     /// configuration event — matching the guard every sibling setter uses.
     #[tokio::test]
-    async fn closed_harness_rejects_retry_policy_change_and_emits_no_event(
-    ) -> Result<(), Box<dyn Error>> {
+    async fn closed_harness_rejects_retry_policy_change_and_emits_no_event()
+    -> Result<(), Box<dyn Error>> {
         let cx = Context::background();
         let harness = build_harness(&cx).await?;
 
         let config_updates = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&config_updates);
-        let _listener = harness
-            .events()
-            .on(HarnessEventType::ConfigUpdate, {
-                Arc::new(move |_event: HarnessEvent, _cx: Context| {
-                    let observed = Arc::clone(&observed);
-                    async move {
-                        observed.fetch_add(1, Ordering::Release);
-                    }
-                    .boxed()
-                }) as EventListener
-            })?;
+        let _listener = harness.events().on(HarnessEventType::ConfigUpdate, {
+            Arc::new(move |_event: HarnessEvent, _cx: Context| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.fetch_add(1, Ordering::Release);
+                }
+                .boxed()
+            }) as EventListener
+        })?;
 
         // A successful change before close proves the listener is wired, so
         // the later zero is meaningful rather than a dead subscription.
@@ -911,9 +914,7 @@ mod tests {
             max_retries: 5,
             base_delay_ms: 1_500,
         };
-        harness
-            .set_retry_policy(pre_close, &cx)
-            .await?;
+        harness.set_retry_policy(pre_close, &cx).await?;
         assert_eq!(
             config_updates.load(Ordering::Acquire),
             1,

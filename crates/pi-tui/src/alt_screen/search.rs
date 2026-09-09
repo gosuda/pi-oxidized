@@ -145,10 +145,9 @@ impl SearchIndex {
         let query_changed = self.normalized_query.as_deref() != Some(normalized_query.as_str());
         if source_changed || query_changed {
             self.normalized_query = Some(normalized_query.clone());
-            self.matches = self
-                .corpus
-                .as_ref()
-                .map_or_else(Vec::new, |corpus| find_corpus_matches(corpus, &normalized_query));
+            self.matches = self.corpus.as_ref().map_or_else(Vec::new, |corpus| {
+                find_corpus_matches(corpus, &normalized_query)
+            });
         }
         SearchResult {
             matches: &self.matches,
@@ -203,8 +202,8 @@ pub fn transcript_search_rect(area: Rect) -> Rect {
     }
     let margin: u16 = u16::from(area.width > 2);
     let available_width = area.width.saturating_sub(margin.saturating_mul(2));
-    let forty_percent = u16::try_from(u32::from(area.width).saturating_mul(40) / 100)
-        .unwrap_or(u16::MAX);
+    let forty_percent =
+        u16::try_from(u32::from(area.width).saturating_mul(40) / 100).unwrap_or(u16::MAX);
     let requested_width = forty_percent.max(32);
     let width = requested_width.min(available_width);
     let x = area
@@ -296,11 +295,7 @@ impl TranscriptSearch {
     }
 
     /// Set the configured navigation key hints shown in the footer row.
-    pub fn set_navigation_hints(
-        &mut self,
-        previous: impl Into<String>,
-        next: impl Into<String>,
-    ) {
+    pub fn set_navigation_hints(&mut self, previous: impl Into<String>, next: impl Into<String>) {
         self.previous_hint = previous.into();
         self.next_hint = next.into();
     }
@@ -359,9 +354,22 @@ impl TranscriptSearch {
             draw_border_row(buf, area.x, area.y, area.width, '┌', '─', '┐');
         }
         if area.height >= 2 {
-            draw_border_row(buf, area.x, area.y.saturating_add(1), area.width, '│', ' ', '│');
+            draw_border_row(
+                buf,
+                area.x,
+                area.y.saturating_add(1),
+                area.width,
+                '│',
+                ' ',
+                '│',
+            );
             if area.width > 2 {
-                let inner = Rect::new(area.x.saturating_add(1), area.y.saturating_add(1), area.width - 2, 1);
+                let inner = Rect::new(
+                    area.x.saturating_add(1),
+                    area.y.saturating_add(1),
+                    area.width - 2,
+                    1,
+                );
                 self.input.render(inner, buf);
                 self.paint_result(inner, buf);
             }
@@ -441,8 +449,8 @@ impl TranscriptSearch {
             }
             return;
         }
-        let start = usize::from(inner_start)
-            .saturating_add(available.saturating_sub(controls_width));
+        let start =
+            usize::from(inner_start).saturating_add(available.saturating_sub(controls_width));
         let start = u16::try_from(start).unwrap_or(inner_start);
         let previous_width = u16::try_from(visible_width(&previous)).unwrap_or(u16::MAX);
         self.paint_button(buf, y, start, &previous, SearchDirection::Previous);
@@ -452,7 +460,14 @@ impl TranscriptSearch {
         self.paint_button(buf, y, next_start, &next, SearchDirection::Next);
     }
 
-    fn paint_button(&mut self, buf: &mut Buffer, y: u16, start: u16, text: &str, direction: SearchDirection) {
+    fn paint_button(
+        &mut self,
+        buf: &mut Buffer,
+        y: u16,
+        start: u16,
+        text: &str,
+        direction: SearchDirection,
+    ) {
         let width = u16::try_from(visible_width(text)).unwrap_or(u16::MAX);
         match direction {
             SearchDirection::Previous => {
@@ -583,7 +598,10 @@ fn build_search_corpus(lines: &[String]) -> SearchCorpus {
                     corpus.text.push(' ');
                     pending_separator = false;
                 }
-                let folded = grapheme.chars().flat_map(char::to_lowercase).collect::<String>();
+                let folded = grapheme
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
                 let text_start = corpus.text.len();
                 corpus.text.push_str(&folded);
                 let text_end = corpus.text.len();
@@ -651,7 +669,15 @@ fn find_corpus_matches(corpus: &SearchCorpus, normalized_query: &str) -> Vec<Sea
     matches
 }
 
-fn draw_border_row(buf: &mut Buffer, x: u16, y: u16, width: u16, left: char, middle: char, right: char) {
+fn draw_border_row(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    left: char,
+    middle: char,
+    right: char,
+) {
     if width == 0 {
         return;
     }
@@ -672,7 +698,12 @@ fn draw_border_row(buf: &mut Buffer, x: u16, y: u16, width: u16, left: char, mid
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "test code")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test code"
+)]
 mod tests {
     use super::*;
 

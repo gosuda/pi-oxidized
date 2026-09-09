@@ -122,10 +122,16 @@ impl TerminalCapabilities {
     #[must_use]
     pub fn detect_with_overrides(overrides: TerminalCapabilityOverrides) -> Self {
         let tmux_probe = OnceCell::new();
-        let tmux_forwards_hyperlink =
-            || tmux_probe.get_or_init(probe_tmux_capabilities).forwards_hyperlink;
-        let tmux_supports_sync =
-            || tmux_probe.get_or_init(probe_tmux_capabilities).supports_sync;
+        let tmux_forwards_hyperlink = || {
+            tmux_probe
+                .get_or_init(probe_tmux_capabilities)
+                .forwards_hyperlink
+        };
+        let tmux_supports_sync = || {
+            tmux_probe
+                .get_or_init(probe_tmux_capabilities)
+                .supports_sync
+        };
         resolve_with(
             |key| env::var(key).ok(),
             tmux_forwards_hyperlink,

@@ -227,8 +227,7 @@ impl<W: Write> TerminalSession<W> {
             .resume(self.enable_kitty)
             .map_err(|e| format!("terminal resume after editor failed: {e}"))
             .and_then(|()| {
-                fresh_terminal_size()
-                    .map_err(|e| format!("query terminal size after editor: {e}"))
+                fresh_terminal_size().map_err(|e| format!("query terminal size after editor: {e}"))
             });
         let resumed = input
             .resume(Vec::new())
@@ -286,7 +285,6 @@ impl<W: Write> TerminalSession<W> {
         &mut self.guard
     }
 }
-
 
 fn fresh_terminal_size() -> io::Result<Size> {
     crossterm::terminal::size().map(|(width, height)| Size::new(width, height))

@@ -382,7 +382,10 @@ impl Component for ImageComponent {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "unit tests use contextual failure messages")]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
 mod tests {
     use super::*;
     use crate::components::util::{render_snapshot, strip_ansi};
@@ -558,9 +561,10 @@ mod tests {
             img.render(area, &mut buf);
         });
         let ann = annotations.into_inner();
-        assert!(ann
-            .raw_regions()
-            .iter()
-            .any(|region| region.bytes.starts_with(b"\x1b]1337;File=")));
+        assert!(
+            ann.raw_regions()
+                .iter()
+                .any(|region| region.bytes.starts_with(b"\x1b]1337;File="))
+        );
     }
 }

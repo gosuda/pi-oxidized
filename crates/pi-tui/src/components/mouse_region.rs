@@ -8,8 +8,7 @@ use crate::component::{
 use crate::focus::FocusId;
 
 /// Mouse callback used by [`MouseRegion`].
-pub type MouseRegionHandler =
-    Box<dyn FnMut(&TuiMouseEvent) -> Option<MouseResponse> + Send>;
+pub type MouseRegionHandler = Box<dyn FnMut(&TuiMouseEvent) -> Option<MouseResponse> + Send>;
 
 /// Adds mouse handling to an existing component without changing its rendering.
 pub struct MouseRegion {
@@ -69,14 +68,7 @@ impl Component for MouseRegion {
         let (rect_x, rect_width) = clipped_axis(origin_x, event.width);
         let (rect_y, rect_height) = clipped_axis(origin_y, event.height);
         let rect = Rect::new(rect_x, rect_y, rect_width, rect_height);
-        let target = MouseTarget::new(
-            self.id,
-            origin_x,
-            origin_y,
-            event.width,
-            event.height,
-            rect,
-        );
+        let target = MouseTarget::new(self.id, origin_x, origin_y, event.width, event.height, rect);
         if let Some(result) = dispatch_mouse_event(&mut *self.child, event, target) {
             return Some(MouseResponse::Forwarded(result));
         }
@@ -96,10 +88,7 @@ fn clipped_axis(origin: i32, length: u16) -> (u16, u16) {
     if visible_start > i64::from(u16::MAX) || visible_end <= visible_start {
         return (u16::MAX, 0);
     }
-    let width = u16::try_from((visible_end - visible_start).min(i64::from(u16::MAX)))
-        .unwrap_or(u16::MAX);
-    (
-        u16::try_from(visible_start).unwrap_or(u16::MAX),
-        width,
-    )
+    let width =
+        u16::try_from((visible_end - visible_start).min(i64::from(u16::MAX))).unwrap_or(u16::MAX);
+    (u16::try_from(visible_start).unwrap_or(u16::MAX), width)
 }

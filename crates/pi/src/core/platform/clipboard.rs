@@ -565,7 +565,11 @@ pub fn clipboard_read_commands(
             if env.get("WAYLAND_DISPLAY").is_some() {
                 commands.push(ReadCommand::new(
                     "wl-paste",
-                    vec!["--no-newline".to_owned(), "--type".to_owned(), "text".to_owned()],
+                    vec![
+                        "--no-newline".to_owned(),
+                        "--type".to_owned(),
+                        "text".to_owned(),
+                    ],
                 ));
             }
             if env.get("DISPLAY").is_some() {
@@ -594,7 +598,10 @@ async fn run_read_command(
     timeout: Duration,
 ) -> ProcessResult {
     let first = run_process(&cmd.program, &cmd.args, None, cancel, timeout).await;
-    if matches!(&first, ProcessResult::Success(_) | ProcessResult::Failed(ClipboardError::Cancelled)) {
+    if matches!(
+        &first,
+        ProcessResult::Success(_) | ProcessResult::Failed(ClipboardError::Cancelled)
+    ) {
         return first;
     }
     let Some((program, args)) = &cmd.fallback else {
@@ -640,7 +647,10 @@ pub async fn read_clipboard_text_with(
             ProcessResult::Failed(error) => failure = Some(error),
         }
     }
-    failure.map_or(ClipboardReadResult::Unavailable, ClipboardReadResult::Failed)
+    failure.map_or(
+        ClipboardReadResult::Unavailable,
+        ClipboardReadResult::Failed,
+    )
 }
 
 /// Returns `true` on WSL using `WSL_DISTRO_NAME`, `WSLENV`, or `/proc/version`.
@@ -1153,8 +1163,7 @@ mod tests {
     async fn osc52_fallback_returns_sequence_when_no_tool_applies() -> TestResult {
         let env = MapEnv::default();
         let cancel = CancellationToken::new();
-        let result =
-            copy_to_clipboard_with("hi", ClipboardPlatform::Unix, &env, &cancel).await?;
+        let result = copy_to_clipboard_with("hi", ClipboardPlatform::Unix, &env, &cancel).await?;
         assert_eq!(
             result,
             ClipboardCopyResult::Osc52(required(osc52_encode("hi"), "OSC 52 sequence")?)
@@ -1166,8 +1175,7 @@ mod tests {
     async fn osc52_returns_in_remote_session() -> TestResult {
         let env = MapEnv::default().set("SSH_CONNECTION", "1.2.3.4");
         let cancel = CancellationToken::new();
-        let result =
-            copy_to_clipboard_with("hi", ClipboardPlatform::Unix, &env, &cancel).await?;
+        let result = copy_to_clipboard_with("hi", ClipboardPlatform::Unix, &env, &cancel).await?;
         assert!(matches!(result, ClipboardCopyResult::Osc52(_)));
         Ok(())
     }

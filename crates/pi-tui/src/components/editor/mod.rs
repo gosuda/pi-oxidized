@@ -3146,7 +3146,10 @@ mod tests {
         let mut editor = Editor::with_defaults();
         editor.set_text("hello");
         let idle = render_rows(&mut editor, 30);
-        assert_eq!(idle.first().map(String::as_str), Some("─".repeat(30).as_str()));
+        assert_eq!(
+            idle.first().map(String::as_str),
+            Some("─".repeat(30).as_str())
+        );
 
         // An empty label paints the plain border even while attached (C
         // falls back when the status renders to zero width).

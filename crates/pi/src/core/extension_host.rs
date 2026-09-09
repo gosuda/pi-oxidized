@@ -1565,10 +1565,7 @@ impl HostExtensionRunner {
                 if provider_capabilities.stream_simple {
                     runtime.register_extension_stream_provider(name.clone(), Arc::new(adapter));
                 } else {
-                    runtime.register_extension_deferred_provider(
-                        name.clone(),
-                        Arc::new(adapter),
-                    );
+                    runtime.register_extension_deferred_provider(name.clone(), Arc::new(adapter));
                 }
             }
             results.push((path, outcome));

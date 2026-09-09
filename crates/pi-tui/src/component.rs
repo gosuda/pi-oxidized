@@ -298,9 +298,7 @@ pub fn dispatch_mouse_event(
     event: &TuiMouseEvent,
     target: MouseTarget,
 ) -> Option<MouseDispatchResult> {
-    match component
-        .handle_mouse(&retarget_mouse_event(event, &target))?
-    {
+    match component.handle_mouse(&retarget_mouse_event(event, &target))? {
         MouseResponse::Local(result) if result.is_handled() => Some(MouseDispatchResult {
             handled: result.is_handled(),
             capture: result.capture,

@@ -797,9 +797,9 @@ mod tests {
             sm.append_message(&AgentMessage::Llm(Box::new(Message::User(
                 pi_ai::UserMessage::new(pi_ai::UserMessageContent::Text("hello".into()), 0),
             ))))?;
-            sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                Box::new(assistant_with_usage("hi back", Usage::default())),
-            ))))?;
+            sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                assistant_with_usage("hi back", Usage::default()),
+            )))))?;
             sm.append_message(&AgentMessage::Llm(Box::new(Message::User(
                 pi_ai::UserMessage::new(pi_ai::UserMessageContent::Text("second".into()), 1),
             ))))?;
@@ -825,14 +825,14 @@ mod tests {
 
         session
             .agent
-            .push_message(AgentMessage::Llm(Box::new(Message::Assistant(
-                Box::new(aborted),
-            ))));
+            .push_message(AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                aborted,
+            )))));
         session
             .agent
-            .push_message(AgentMessage::Llm(Box::new(Message::Assistant(
-                Box::new(good),
-            ))));
+            .push_message(AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                good,
+            )))));
 
         let text = session.get_last_assistant_text();
         assert_eq!(text.as_deref(), Some("real text"));
@@ -846,9 +846,9 @@ mod tests {
         aborted.stop_reason = pi_ai::StopReason::Aborted;
         session
             .agent
-            .push_message(AgentMessage::Llm(Box::new(Message::Assistant(
-                Box::new(aborted),
-            ))));
+            .push_message(AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                aborted,
+            )))));
         let text = session.get_last_assistant_text();
         assert_eq!(text, None);
         Ok(())
@@ -929,9 +929,9 @@ mod tests {
         };
         {
             let mut sm = session.session_manager.lock().await;
-            sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                Box::new(assistant_with_usage("reply", Usage::default())),
-            ))))?;
+            sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                assistant_with_usage("reply", Usage::default()),
+            )))))?;
         }
         let result = session
             .navigate_tree(
@@ -988,9 +988,9 @@ mod tests {
         let session = make_session()?;
         let id = {
             let mut sm = session.session_manager.lock().await;
-            sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                Box::new(assistant_with_usage("hi", Usage::default())),
-            ))))?
+            sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                assistant_with_usage("hi", Usage::default()),
+            )))))?
         };
         session
             .navigate_tree(
@@ -1016,15 +1016,15 @@ mod tests {
         let session = make_session()?;
         let target = {
             let mut sm = session.session_manager.lock().await;
-            sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                Box::new(assistant_with_usage("first", Usage::default())),
-            ))))?
+            sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                assistant_with_usage("first", Usage::default()),
+            )))))?
         };
         {
             let mut sm = session.session_manager.lock().await;
-            sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                Box::new(assistant_with_usage("second", Usage::default())),
-            ))))?;
+            sm.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                assistant_with_usage("second", Usage::default()),
+            )))))?;
         }
         let mut empty_model = test_model();
         empty_model.id = String::new();
@@ -1052,9 +1052,9 @@ mod tests {
             let target = manager.append_message(&AgentMessage::Llm(Box::new(
                 Message::Assistant(Box::new(assistant_with_usage("first", Usage::default()))),
             )))?;
-            manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                Box::new(assistant_with_usage("second", Usage::default())),
-            ))))?;
+            manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                assistant_with_usage("second", Usage::default()),
+            )))))?;
             target
         };
         let summarizer: SummarizeStreamFn = Arc::new(move |_model, _context, options| {
@@ -1419,9 +1419,9 @@ mod tests {
             let target = manager.append_message(&AgentMessage::Llm(Box::new(
                 Message::Assistant(Box::new(assistant_with_usage("first", Usage::default()))),
             )))?;
-            manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                Box::new(assistant_with_usage("second", Usage::default())),
-            ))))?;
+            manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                assistant_with_usage("second", Usage::default()),
+            )))))?;
             target
         };
 
@@ -1564,9 +1564,9 @@ mod tests {
             let target = manager.append_message(&AgentMessage::Llm(Box::new(
                 Message::Assistant(Box::new(assistant_with_usage("first", Usage::default()))),
             )))?;
-            manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                Box::new(assistant_with_usage("second", Usage::default())),
-            ))))?;
+            manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                assistant_with_usage("second", Usage::default()),
+            )))))?;
             target
         };
 
@@ -1656,9 +1656,9 @@ mod tests {
             let target = manager.append_message(&AgentMessage::Llm(Box::new(
                 Message::Assistant(Box::new(assistant_with_usage("first", Usage::default()))),
             )))?;
-            manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(
-                Box::new(assistant_with_usage("second", Usage::default())),
-            ))))?;
+            manager.append_message(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                assistant_with_usage("second", Usage::default()),
+            )))))?;
             target
         };
 

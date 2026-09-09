@@ -49,11 +49,11 @@ use pi_ai::types::{AssistantMessageEvent, DeferredHandle, Model};
 use crate::adapters::methods;
 use crate::protocol::{
     ErrorPayload, FLAGS_SET_METHOD, FlagValueWire, FlagsSetRequest, Frame, FrameDecoder, FrameId,
-    FrameKind, Hello, HelloAck, Method, PROTOCOL_VERSION, ProviderBeforePayloadRequest,
-    ProviderBeforePayloadResponse, ProviderCallbackFlags, ProviderOnResponseRequest,
-    ProviderOnResponseResponse, ProviderResponseWire, PROVIDER_BEFORE_PAYLOAD_METHOD,
-    PROVIDER_ON_RESPONSE_METHOD, SHORTCUT_EXECUTE_METHOD, TerminalInputResult, ThemeUpdate,
-    ToolUpdate, encode_frame, from_payload, to_payload,
+    FrameKind, Hello, HelloAck, Method, PROTOCOL_VERSION, PROVIDER_BEFORE_PAYLOAD_METHOD,
+    PROVIDER_ON_RESPONSE_METHOD, ProviderBeforePayloadRequest, ProviderBeforePayloadResponse,
+    ProviderCallbackFlags, ProviderOnResponseRequest, ProviderOnResponseResponse,
+    ProviderResponseWire, SHORTCUT_EXECUTE_METHOD, TerminalInputResult, ThemeUpdate, ToolUpdate,
+    encode_frame, from_payload, to_payload,
 };
 
 /// Test-only timing instrumentation for the extension RPC dispatch bench
@@ -709,10 +709,7 @@ impl ProviderCallbackRouter {
             ));
         }
         let (id, response) = self.allocate();
-        let _route = ProviderCallbackRoute {
-            router: self,
-            id,
-        };
+        let _route = ProviderCallbackRoute { router: self, id };
         let frame = Frame {
             id,
             kind: FrameKind::Req,
@@ -1060,7 +1057,10 @@ pub trait NativeExtension: Send + Sync + 'static {
         Box::pin(async move {
             Err(ExtensionFault::new(
                 "unsupported_deferred_operation",
-                format!("provider does not support deferred fetch: {}", call.provider_id),
+                format!(
+                    "provider does not support deferred fetch: {}",
+                    call.provider_id
+                ),
             ))
         })
     }
@@ -1078,7 +1078,10 @@ pub trait NativeExtension: Send + Sync + 'static {
         Box::pin(async move {
             Err(ExtensionFault::new(
                 "unsupported_deferred_operation",
-                format!("provider does not support deferred cancel: {}", call.provider_id),
+                format!(
+                    "provider does not support deferred cancel: {}",
+                    call.provider_id
+                ),
             ))
         })
     }
@@ -2110,9 +2113,7 @@ fn dispatch_request<E: NativeExtension>(
     // Register cancellation before handoff so the next frame can find it.
     let kind = match frame.method.as_str() {
         methods::TOOL_EXECUTE => Some(InFlightKind::Tool),
-        methods::PROVIDER_STREAM | methods::PROVIDER_FETCH_DEFERRED => {
-            Some(InFlightKind::Provider)
-        }
+        methods::PROVIDER_STREAM | methods::PROVIDER_FETCH_DEFERRED => Some(InFlightKind::Provider),
         _ => None,
     };
     let token = kind.map(|kind| {
@@ -2754,8 +2755,7 @@ async fn handle_cancel_deferred<E: NativeExtension>(
         Err(message) => return error_frame(id, method, "invalid_request", &message, false),
     };
     let cancel = CancellationToken::new();
-    call.callback_context =
-        provider_callback_context(runtime, id, call.callbacks, cancel.clone());
+    call.callback_context = provider_callback_context(runtime, id, call.callbacks, cancel.clone());
     match await_callback(
         runtime.lifecycle_deadline,
         runtime.extension.cancel_deferred(context, call),
@@ -2932,7 +2932,10 @@ async fn execute_tool_request<E: NativeExtension>(
 /// Run one provider stream or deferred fetch call: forward correlated
 /// `providerEvent` frames while the operation is active, honor
 /// `provider.cancel`, then send the terminal frame.
-#[allow(clippy::too_many_lines, reason = "provider request setup decodes flags, stream, and deferred shapes inline")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "provider request setup decodes flags, stream, and deferred shapes inline"
+)]
 async fn execute_provider_request<E: NativeExtension>(
     runtime: &ServerRuntime<E>,
     id: FrameId,
@@ -2997,8 +3000,7 @@ async fn execute_provider_request<E: NativeExtension>(
     // The token was registered by the dispatcher before this task spawned,
     // so an early `provider.cancel` is never lost.
     let token = token.unwrap_or_default();
-    let callback_context =
-        provider_callback_context(runtime, id, callback_flags, token.clone());
+    let callback_context = provider_callback_context(runtime, id, callback_flags, token.clone());
     if let Some(call) = deferred_call.as_mut() {
         call.callback_context.clone_from(&callback_context);
     }
@@ -6467,8 +6469,7 @@ mod tests {
                 call.on_response(&response).await?;
                 *result
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(payload.clone());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload.clone());
                 Ok(payload)
             })
         }
@@ -6538,8 +6539,7 @@ mod tests {
         assert_eq!(on.call_id, "2");
         assert_eq!(on.response.status, 200);
         assert_ne!(
-            on_req.id,
-            before_req.id,
+            on_req.id, before_req.id,
             "each callback request has an independent id"
         );
 

@@ -1180,7 +1180,6 @@ pub struct ProviderCapabilitiesWire {
     pub cancel_deferred: bool,
 }
 
-
 /// Open method string: the host emits this event after a committed live
 /// provider mutation (register/unregister from a command or delayed callback).
 /// It is an open dotted control name, not a [`Method`] enum variant, so strict

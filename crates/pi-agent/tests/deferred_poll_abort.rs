@@ -126,7 +126,10 @@ fn recording_fetch(
     })
 }
 
-#[allow(clippy::too_many_lines, reason = "abort race scripts one full deferred run inline")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "abort race scripts one full deferred run inline"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn abort_during_deferred_poll_publishes_interrupted_not_the_response()
 -> Result<(), Box<dyn Error>> {

@@ -9,7 +9,7 @@ use ratatui::style::{Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::document::LineDocument;
-use super::search::{search_match_key, SearchDirection, SearchIndex, SearchMatch};
+use super::search::{SearchDirection, SearchIndex, SearchMatch, search_match_key};
 
 use crate::component::{
     DisplayRowContent, EventResult, TuiMouseButton, TuiMouseEvent, TuiMouseEventType, UiEvent,
@@ -18,8 +18,9 @@ use crate::components::util::{paint_keyed_line, paint_line};
 use crate::image::{DocumentImage, ImageCacheOutput, KittyImageCache};
 use crate::keybindings::KeybindingsManager;
 use crate::keys::is_key_release;
-use crate::text::{extract_ansi_code, grapheme_width, parse_osc8_hyperlink, slice_by_column, visible_width};
-
+use crate::text::{
+    extract_ansi_code, grapheme_width, parse_osc8_hyperlink, slice_by_column, visible_width,
+};
 
 const PAGE_SCROLL_OVERLAP: usize = 4;
 const ALT_WHEEL_SCROLL_MULTIPLIER: i32 = 5;
@@ -410,7 +411,10 @@ impl FullscreenViewport {
         Ok(())
     }
 
-    fn prepare_render(&mut self, area: Rect) -> Result<ImageCacheOutput, crate::component::RowSourceError> {
+    fn prepare_render(
+        &mut self,
+        area: Rect,
+    ) -> Result<ImageCacheOutput, crate::component::RowSourceError> {
         if self.area != Some(area) {
             return Err(crate::component::RowSourceError::NotPrepared);
         }
@@ -462,8 +466,14 @@ impl FullscreenViewport {
                     visible_error = Some(crate::component::RowSourceError::RowCountOverflow);
                     return;
                 }
-                if let DisplayRowContent::Image { image, row_in_image } = span.content {
-                    if !image.is_fallback() && usize::from(row_in_image) >= usize::from(image.rows()) {
+                if let DisplayRowContent::Image {
+                    image,
+                    row_in_image,
+                } = span.content
+                {
+                    if !image.is_fallback()
+                        && usize::from(row_in_image) >= usize::from(image.rows())
+                    {
                         visible_error = Some(crate::component::RowSourceError::InvalidImage);
                         return;
                     }
@@ -487,8 +497,13 @@ impl FullscreenViewport {
     ) -> Result<(), crate::component::RowSourceError> {
         let mut previous_image: Option<(Option<u32>, u16)> = None;
         for offset in 0..area.height {
-            let saw_image =
-                self.paint_document_row(area, buf, offset, image_cache_output, &mut previous_image)?;
+            let saw_image = self.paint_document_row(
+                area,
+                buf,
+                offset,
+                image_cache_output,
+                &mut previous_image,
+            )?;
             if !saw_image {
                 previous_image = None;
             }
@@ -543,7 +558,10 @@ impl FullscreenViewport {
                         painted.push((start, end));
                     }
                 }
-                DisplayRowContent::Image { image, row_in_image } => {
+                DisplayRowContent::Image {
+                    image,
+                    row_in_image,
+                } => {
                     if image.is_fallback() {
                         *previous_image = None;
                         if let Some(text) = image.fallback_text() {
@@ -599,15 +617,16 @@ impl FullscreenViewport {
             return Err(crate::component::RowSourceError::InvalidImage);
         }
         let id = image.image_id();
-        let is_continuation = context.previous_image.is_some_and(
-            |(previous_id, previous_row)| {
+        let is_continuation = context
+            .previous_image
+            .is_some_and(|(previous_id, previous_row)| {
                 previous_id == id && previous_row.saturating_add(1) == row_in_image
-            },
-        );
+            });
         if !is_continuation {
             let remaining = usize::from(image.rows()).saturating_sub(image_row);
-            let visible_rows =
-                remaining.min(usize::from(context.area.height.saturating_sub(context.offset)));
+            let visible_rows = remaining.min(usize::from(
+                context.area.height.saturating_sub(context.offset),
+            ));
             if visible_rows > 0 {
                 let visible_rows = u16::try_from(visible_rows).unwrap_or(u16::MAX);
                 let image_area = Rect::new(
@@ -616,13 +635,12 @@ impl FullscreenViewport {
                     context.span_width,
                     visible_rows,
                 );
-                let emission = context.image_cache.emission_for(image, context.image_cache_output);
-                let Some(region) = image.raw_region(
-                    image_area,
-                    image_row,
-                    usize::from(visible_rows),
-                    emission,
-                ) else {
+                let emission = context
+                    .image_cache
+                    .emission_for(image, context.image_cache_output);
+                let Some(region) =
+                    image.raw_region(image_area, image_row, usize::from(visible_rows), emission)
+                else {
                     return Err(crate::component::RowSourceError::InvalidImage);
                 };
                 mark_image_cells(buf, image_area);
@@ -667,11 +685,7 @@ impl FullscreenViewport {
         }
     }
     /// Handle an already normalized native mouse event.
-    pub fn handle_mouse(
-        &mut self,
-        event: &TuiMouseEvent,
-        now: Instant,
-    ) -> FullscreenEventResult {
+    pub fn handle_mouse(&mut self, event: &TuiMouseEvent, now: Instant) -> FullscreenEventResult {
         let Some(area) = self.area else {
             return FullscreenEventResult::ignored();
         };
@@ -688,7 +702,10 @@ impl FullscreenViewport {
         });
         if jump_hit
             && event.button == TuiMouseButton::Left
-            && matches!(event.kind, TuiMouseEventType::Press | TuiMouseEventType::Click)
+            && matches!(
+                event.kind,
+                TuiMouseEventType::Press | TuiMouseEventType::Click
+            )
         {
             let _ = self.scroll_to(ScrollTarget::Bottom, FollowPolicy::ResumeAtEnd);
             return FullscreenEventResult::render();
@@ -708,7 +725,8 @@ impl FullscreenViewport {
             let previous_following = self.follow.following_end;
             let requested = i64::from(delta);
             let remainder = self.scroll_by(requested);
-            let changed = self.top != previous_top || self.follow.following_end != previous_following;
+            let changed =
+                self.top != previous_top || self.follow.following_end != previous_following;
             let event_result = if changed || remainder != requested {
                 EventResult::Render
             } else if self.options.overscroll == Overscroll::Chain {
@@ -735,19 +753,25 @@ impl FullscreenViewport {
         y: i32,
         now: Instant,
     ) -> FullscreenEventResult {
-        let hovered = self.scrollbar_geometry_with_auto_visibility(true).is_some_and(|geometry| {
-            x == i32::from(geometry.column.saturating_sub(area.x))
-                && y >= i32::from(geometry.track_top.saturating_sub(area.y))
-                && y < i32::from(geometry.track_top.saturating_sub(area.y))
-                    + i32::from(geometry.track_height)
-        });
+        let hovered = self
+            .scrollbar_geometry_with_auto_visibility(true)
+            .is_some_and(|geometry| {
+                x == i32::from(geometry.column.saturating_sub(area.x))
+                    && y >= i32::from(geometry.track_top.saturating_sub(area.y))
+                    && y < i32::from(geometry.track_top.saturating_sub(area.y))
+                        + i32::from(geometry.track_height)
+            });
         let changed = hovered != self.scrollbar.hovered;
         self.scrollbar.hovered = hovered;
         if hovered {
             self.reveal_scrollbar(now);
         }
         FullscreenEventResult {
-            event_result: if changed { EventResult::Render } else { EventResult::Consumed },
+            event_result: if changed {
+                EventResult::Render
+            } else {
+                EventResult::Consumed
+            },
             effect: None,
         }
     }
@@ -780,7 +804,10 @@ impl FullscreenViewport {
             && usize::try_from(x).is_ok_and(|column| column < usize::from(self.content_width))
             && usize::try_from(y).is_ok_and(|row| row < usize::from(area.height));
         let captured_selection = self.selection.dragging
-            && matches!(event.kind, TuiMouseEventType::Drag | TuiMouseEventType::Release);
+            && matches!(
+                event.kind,
+                TuiMouseEventType::Drag | TuiMouseEventType::Release
+            );
         if !inside && !captured_selection {
             return FullscreenEventResult::ignored();
         }
@@ -837,7 +864,11 @@ impl FullscreenViewport {
             return rows;
         };
         let max_top = self.max_top(area.height);
-        let start = if self.follow.following_end { max_top } else { self.top.min(max_top) };
+        let start = if self.follow.following_end {
+            max_top
+        } else {
+            self.top.min(max_top)
+        };
         let (next, moved) = if rows > 0 {
             let amount = usize::try_from(rows).unwrap_or(usize::MAX);
             let next = start.saturating_add(amount).min(max_top);
@@ -877,7 +908,8 @@ impl FullscreenViewport {
         };
         let changed = self.top != next
             || self.follow.following_end != next_following
-            || self.follow.suppressed_at_end != (follow == FollowPolicy::SuppressAtEnd && next == max_top);
+            || self.follow.suppressed_at_end
+                != (follow == FollowPolicy::SuppressAtEnd && next == max_top);
         self.top = next;
         self.follow.following_end = next_following;
         self.follow.suppressed_at_end = follow == FollowPolicy::SuppressAtEnd && next == max_top;
@@ -959,7 +991,9 @@ impl FullscreenViewport {
             0
         } else {
             round_ratio(
-                u128::try_from(self.top.min(max_top)).ok()?.saturating_mul(u128::from(max_thumb)),
+                u128::try_from(self.top.min(max_top))
+                    .ok()?
+                    .saturating_mul(u128::from(max_thumb)),
                 u128::try_from(max_top).ok()?,
             )?
             .min(u128::from(max_thumb))
@@ -1024,13 +1058,15 @@ impl FullscreenViewport {
         let before = self.flashes.len();
         self.flashes.retain(|entry| entry.expires_at > now);
         changed |= before != self.flashes.len();
-        if self.scrollbar.visible_until
-            .is_some_and(|deadline| deadline <= now && !self.scrollbar.hovered && self.scrollbar.drag.is_none())
-        {
+        if self.scrollbar.visible_until.is_some_and(|deadline| {
+            deadline <= now && !self.scrollbar.hovered && self.scrollbar.drag.is_none()
+        }) {
             self.scrollbar.visible_until = None;
             changed = true;
         }
-        while self.selection.auto_scroll_deadline
+        while self
+            .selection
+            .auto_scroll_deadline
             .is_some_and(|deadline| deadline <= now)
         {
             let direction = self.selection.auto_scroll_direction;
@@ -1045,16 +1081,20 @@ impl FullscreenViewport {
             }
             if let (Some((screen_x, screen_y)), Some(area)) = (self.selection.pointer, self.area) {
                 let row = self.top.saturating_add(
-                    usize::from(screen_y.saturating_sub(area.y)).min(usize::from(area.height.saturating_sub(1))),
+                    usize::from(screen_y.saturating_sub(area.y))
+                        .min(usize::from(area.height.saturating_sub(1))),
                 );
-                let column = usize::from(screen_x.saturating_sub(area.x)).min(usize::from(self.content_width));
+                let column = usize::from(screen_x.saturating_sub(area.x))
+                    .min(usize::from(self.content_width));
                 self.update_selection_focus(SelectionPoint {
                     row,
                     col: column,
                     boundary: false,
                 });
             }
-            self.selection.auto_scroll_deadline = self.selection.auto_scroll_deadline
+            self.selection.auto_scroll_deadline = self
+                .selection
+                .auto_scroll_deadline
                 .and_then(|deadline| deadline.checked_add(SELECTION_AUTOSCROLL));
             changed = true;
         }
@@ -1225,12 +1265,13 @@ impl FullscreenViewport {
                 let previous_top = self.top;
                 let previous_following = self.follow.following_end;
                 self.scroll_by(delta);
-                let event_result =
-                    if self.top != previous_top || self.follow.following_end != previous_following {
-                        EventResult::Render
-                    } else {
-                        EventResult::Consumed
-                    };
+                let event_result = if self.top != previous_top
+                    || self.follow.following_end != previous_following
+                {
+                    EventResult::Render
+                } else {
+                    EventResult::Consumed
+                };
                 return Some(FullscreenEventResult {
                     event_result,
                     effect: None,
@@ -1298,36 +1339,36 @@ impl FullscreenViewport {
 
     fn normalize_mouse(&self, event: MouseEvent) -> TuiMouseEvent {
         let (kind, button, wheel_delta) = match event.kind {
-            MouseEventKind::Down(button) => {
-                (TuiMouseEventType::Press, mouse_button(button), None)
-            }
-            MouseEventKind::Up(button) => {
-                (TuiMouseEventType::Release, mouse_button(button), None)
-            }
-            MouseEventKind::Drag(button) => {
-                (TuiMouseEventType::Drag, mouse_button(button), None)
-            }
+            MouseEventKind::Down(button) => (TuiMouseEventType::Press, mouse_button(button), None),
+            MouseEventKind::Up(button) => (TuiMouseEventType::Release, mouse_button(button), None),
+            MouseEventKind::Drag(button) => (TuiMouseEventType::Drag, mouse_button(button), None),
             MouseEventKind::Moved => (TuiMouseEventType::Move, TuiMouseButton::None, None),
-            MouseEventKind::ScrollUp => {
-                (TuiMouseEventType::Wheel, TuiMouseButton::None, Some(-1))
-            }
-            MouseEventKind::ScrollDown => {
-                (TuiMouseEventType::Wheel, TuiMouseButton::None, Some(1))
-            }
+            MouseEventKind::ScrollUp => (TuiMouseEventType::Wheel, TuiMouseButton::None, Some(-1)),
+            MouseEventKind::ScrollDown => (TuiMouseEventType::Wheel, TuiMouseButton::None, Some(1)),
             MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
                 (TuiMouseEventType::Wheel, TuiMouseButton::None, None)
             }
         };
-        let area = self.area.unwrap_or(Rect::new(0, 0, event.column.saturating_add(1), event.row.saturating_add(1)));
+        let area = self.area.unwrap_or(Rect::new(
+            0,
+            0,
+            event.column.saturating_add(1),
+            event.row.saturating_add(1),
+        ));
         let x = i32::from(event.column).saturating_sub(i32::from(area.x));
         let y = i32::from(event.row).saturating_sub(i32::from(area.y));
         let wheel_delta = wheel_delta.map(|delta: i32| {
-            let multiplier = if event.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+            let multiplier = if event
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::ALT)
+            {
                 ALT_WHEEL_SCROLL_MULTIPLIER
             } else {
                 1
             };
-            delta.saturating_mul(multiplier).saturating_mul(i32::from(self.options.wheel_scroll_lines.max(1)))
+            delta
+                .saturating_mul(multiplier)
+                .saturating_mul(i32::from(self.options.wheel_scroll_lines.max(1)))
         });
         TuiMouseEvent {
             kind,
@@ -1366,10 +1407,11 @@ impl FullscreenViewport {
             boundary: false,
         };
         let word = self.word_selection(point);
-        let effective_count = if self
-            .last_click
-            .is_some_and(|previous| now.saturating_duration_since(previous.at) <= DOUBLE_CLICK_INTERVAL && previous.row == point.row && previous.col == point.col)
-        {
+        let effective_count = if self.last_click.is_some_and(|previous| {
+            now.saturating_duration_since(previous.at) <= DOUBLE_CLICK_INTERVAL
+                && previous.row == point.row
+                && previous.col == point.col
+        }) {
             click_count.max(2)
         } else {
             1
@@ -1378,7 +1420,13 @@ impl FullscreenViewport {
             at: now,
             row: point.row,
             col: point.col,
-            count: if effective_count >= 3 { 3 } else if effective_count == 2 { 2 } else { 1 },
+            count: if effective_count >= 3 {
+                3
+            } else if effective_count == 2 {
+                2
+            } else {
+                1
+            },
         });
         let range = match effective_count {
             2 => word,
@@ -1417,7 +1465,9 @@ impl FullscreenViewport {
             boundary: false,
         };
         self.update_selection_focus(point);
-        let same_point = self.selection.anchor
+        let same_point = self
+            .selection
+            .anchor
             .zip(self.selection.focus)
             .is_some_and(|(anchor, focus)| anchor == focus);
         if same_point {
@@ -1472,7 +1522,9 @@ impl FullscreenViewport {
                         0
                     } else {
                         round_ratio(
-                            u128::try_from(desired).unwrap_or(0).saturating_mul(u128::try_from(geometry.max_top).unwrap_or(0)),
+                            u128::try_from(desired)
+                                .unwrap_or(0)
+                                .saturating_mul(u128::try_from(geometry.max_top).unwrap_or(0)),
                             u128::from(max_offset),
                         )
                         .and_then(|value| usize::try_from(value).ok())
@@ -1490,7 +1542,8 @@ impl FullscreenViewport {
         };
         if x + i32::from(area.x) != i32::from(geometry.column)
             || y + i32::from(area.y) < i32::from(geometry.track_top)
-            || y + i32::from(area.y) >= i32::from(geometry.track_top) + i32::from(geometry.track_height)
+            || y + i32::from(area.y)
+                >= i32::from(geometry.track_top) + i32::from(geometry.track_height)
         {
             return false;
         }
@@ -1516,7 +1569,9 @@ impl FullscreenViewport {
                 0
             } else {
                 round_ratio(
-                    u128::try_from(desired).unwrap_or(0).saturating_mul(u128::try_from(geometry.max_top).unwrap_or(0)),
+                    u128::try_from(desired)
+                        .unwrap_or(0)
+                        .saturating_mul(u128::try_from(geometry.max_top).unwrap_or(0)),
                     u128::from(max_offset),
                 )
                 .and_then(|value| usize::try_from(value).ok())
@@ -1580,7 +1635,10 @@ impl FullscreenViewport {
     fn scroll_prompt(&mut self, direction: i8) {
         let rows = self.document.prompt_rows();
         let target = if direction < 0 {
-            rows.iter().copied().take_while(|row| *row < self.top).last()
+            rows.iter()
+                .copied()
+                .take_while(|row| *row < self.top)
+                .last()
         } else {
             rows.iter().copied().find(|row| *row > self.top)
         };
@@ -1596,7 +1654,9 @@ impl FullscreenViewport {
             let mut current_width = 0usize;
             self.document.visit_row(row, &mut |span| {
                 if current_width < usize::from(span.column) {
-                    line.push_str(&" ".repeat(usize::from(span.column).saturating_sub(current_width)));
+                    line.push_str(
+                        &" ".repeat(usize::from(span.column).saturating_sub(current_width)),
+                    );
                     current_width = usize::from(span.column);
                 }
                 match span.content {
@@ -1627,16 +1687,24 @@ impl FullscreenViewport {
             return EventResult::Consumed;
         }
         if self.search.query.trim().is_empty() {
-            let generation = self.prepared_generation.unwrap_or(self.document.generation());
-            let _ = self.search.index
+            let generation = self
+                .prepared_generation
+                .unwrap_or(self.document.generation());
+            let _ = self
+                .search
+                .index
                 .search_generation(generation, &self.projection, "");
             self.search.selected = None;
             self.search.selected_key = None;
             return EventResult::Consumed;
         }
-        let generation = self.prepared_generation.unwrap_or(self.document.generation());
-        let result = self.search.index
-            .search_generation(generation, &self.projection, &self.search.query);
+        let generation = self
+            .prepared_generation
+            .unwrap_or(self.document.generation());
+        let result =
+            self.search
+                .index
+                .search_generation(generation, &self.projection, &self.search.query);
         let matches = result.matches;
         if matches.is_empty() {
             self.search.selected = None;
@@ -1645,13 +1713,18 @@ impl FullscreenViewport {
         }
         let old_index = self.search.selected;
         let exact_index = self.search.selected_key.as_deref().and_then(|key| {
-            matches.iter().position(|search_match| search_match_key(search_match) == key)
+            matches
+                .iter()
+                .position(|search_match| search_match_key(search_match) == key)
         });
         let selected = match self.search.selection_mode {
             SearchSelectionMode::Query => {
-                let first = matches
-                    .iter()
-                    .position(|search_match| search_match.segments.first().is_some_and(|segment| segment.row >= self.search.anchor_row));
+                let first = matches.iter().position(|search_match| {
+                    search_match
+                        .segments
+                        .first()
+                        .is_some_and(|segment| segment.row >= self.search.anchor_row)
+                });
                 first.unwrap_or(0)
             }
             SearchSelectionMode::Next => {
@@ -1660,9 +1733,16 @@ impl FullscreenViewport {
             }
             SearchSelectionMode::Previous => {
                 let base = exact_index.or(old_index).unwrap_or(0);
-                if base == 0 { matches.len().saturating_sub(1) } else { base - 1 }
+                if base == 0 {
+                    matches.len().saturating_sub(1)
+                } else {
+                    base - 1
+                }
             }
-            SearchSelectionMode::Retain => exact_index.or(old_index).unwrap_or(0).min(matches.len().saturating_sub(1)),
+            SearchSelectionMode::Retain => exact_index
+                .or(old_index)
+                .unwrap_or(0)
+                .min(matches.len().saturating_sub(1)),
         };
         self.search.selected = Some(selected);
         self.search.selected_key = matches.get(selected).map(search_match_key);
@@ -1673,7 +1753,10 @@ impl FullscreenViewport {
         let Some(first) = search_match.segments.first() else {
             return EventResult::Consumed;
         };
-        let last_row = search_match.segments.last().map_or(first.row, |segment| segment.row);
+        let last_row = search_match
+            .segments
+            .last()
+            .map_or(first.row, |segment| segment.row);
         let height = self.area.map_or(0, |area| usize::from(area.height));
         if height == 0 {
             return EventResult::Consumed;
@@ -1693,13 +1776,21 @@ impl FullscreenViewport {
         let matches = self.search.index.matches();
         for (index, search_match) in matches.iter().enumerate() {
             for segment in &search_match.segments {
-                if segment.row < self.top || segment.row >= self.top.saturating_add(usize::from(area.height)) {
+                if segment.row < self.top
+                    || segment.row >= self.top.saturating_add(usize::from(area.height))
+                {
                     continue;
                 }
-                let row = area.y.saturating_add(u16::try_from(segment.row.saturating_sub(self.top)).unwrap_or(u16::MAX));
+                let row = area.y.saturating_add(
+                    u16::try_from(segment.row.saturating_sub(self.top)).unwrap_or(u16::MAX),
+                );
                 let start = segment.start_col.min(usize::from(self.content_width));
                 let end = segment.end_col.min(usize::from(self.content_width));
-                let style = if index == selected { self.style.search_current_match } else { self.style.search_match };
+                let style = if index == selected {
+                    self.style.search_current_match
+                } else {
+                    self.style.search_match
+                };
                 apply_style_range(buf, area.x, row, start, end, style);
                 crate::frame::claim_foreign_span(Rect::new(area.x, row, self.content_width, 1));
             }
@@ -1720,17 +1811,28 @@ impl FullscreenViewport {
             let mut start = 0usize;
             let mut end = line_width.min(usize::from(self.content_width));
             if row == selection.start.row {
-                start = grapheme_start_at_column(line, selection.start.col).unwrap_or(selection.start.col.min(line_width));
+                start = grapheme_start_at_column(line, selection.start.col)
+                    .unwrap_or(selection.start.col.min(line_width));
             }
             if row == selection.end.row {
                 end = if selection.end.boundary {
                     selection.end.col.min(line_width)
                 } else {
-                    grapheme_end_at_column(line, selection.end.col).unwrap_or(selection.end.col.saturating_add(1).min(line_width))
+                    grapheme_end_at_column(line, selection.end.col)
+                        .unwrap_or(selection.end.col.saturating_add(1).min(line_width))
                 };
             }
-            let screen_y = area.y.saturating_add(u16::try_from(row.saturating_sub(self.top)).unwrap_or(u16::MAX));
-            apply_style_range(buf, area.x, screen_y, start, end.min(usize::from(self.content_width)), Style::default().add_modifier(Modifier::REVERSED));
+            let screen_y = area
+                .y
+                .saturating_add(u16::try_from(row.saturating_sub(self.top)).unwrap_or(u16::MAX));
+            apply_style_range(
+                buf,
+                area.x,
+                screen_y,
+                start,
+                end.min(usize::from(self.content_width)),
+                Style::default().add_modifier(Modifier::REVERSED),
+            );
             crate::frame::claim_foreign_span(Rect::new(area.x, screen_y, self.content_width, 1));
         }
     }
@@ -1770,23 +1872,54 @@ impl FullscreenViewport {
         if width == 0 || width > available {
             return;
         }
-        let column = area.x.saturating_add(u16::try_from((available.saturating_sub(width)) / 2).unwrap_or(0));
+        let column = area
+            .x
+            .saturating_add(u16::try_from((available.saturating_sub(width)) / 2).unwrap_or(0));
         paint_line(column, row, width, buf, &text);
-        apply_style_range(buf, 0, row, usize::from(column), usize::from(column).saturating_add(width), self.style.jump_to_end);
-        self.jump_rect = Some(Rect::new(column, row, u16::try_from(width).unwrap_or(u16::MAX), 1));
-        crate::frame::claim_foreign_span(Rect::new(column, row, u16::try_from(width).unwrap_or(u16::MAX), 1));
+        apply_style_range(
+            buf,
+            0,
+            row,
+            usize::from(column),
+            usize::from(column).saturating_add(width),
+            self.style.jump_to_end,
+        );
+        self.jump_rect = Some(Rect::new(
+            column,
+            row,
+            u16::try_from(width).unwrap_or(u16::MAX),
+            1,
+        ));
+        crate::frame::claim_foreign_span(Rect::new(
+            column,
+            row,
+            u16::try_from(width).unwrap_or(u16::MAX),
+            1,
+        ));
     }
 
     fn paint_scrollbar(&self, area: Rect, buf: &mut Buffer) {
         let Some(geometry) = self.scrollbar_geometry() else {
             return;
         };
-        let thumb_char = if self.scrollbar.drag.is_some() { "█" } else { "┃" };
+        let thumb_char = if self.scrollbar.drag.is_some() {
+            "█"
+        } else {
+            "┃"
+        };
         for offset in 0..geometry.track_height {
             let y = geometry.track_top.saturating_add(offset);
             let thumb = offset >= geometry.thumb_top.saturating_sub(geometry.track_top)
-                && offset < geometry.thumb_top.saturating_sub(geometry.track_top).saturating_add(geometry.thumb_height);
-            let style = if thumb { self.style.scrollbar_thumb } else { self.style.scrollbar_track };
+                && offset
+                    < geometry
+                        .thumb_top
+                        .saturating_sub(geometry.track_top)
+                        .saturating_add(geometry.thumb_height);
+            let style = if thumb {
+                self.style.scrollbar_thumb
+            } else {
+                self.style.scrollbar_track
+            };
             if let Some(cell) = buf.cell_mut((geometry.column, y)) {
                 cell.set_symbol(if thumb { thumb_char } else { "│" });
                 cell.set_style(style);
@@ -1803,7 +1936,9 @@ impl FullscreenViewport {
             .rev()
             .take(usize::from(area.height))
             .collect::<Vec<_>>();
-        let start = area.height.saturating_sub(u16::try_from(visible.len()).unwrap_or(area.height));
+        let start = area
+            .height
+            .saturating_sub(u16::try_from(visible.len()).unwrap_or(area.height));
         for (index, entry) in visible.iter().rev().enumerate() {
             let row = area
                 .y
@@ -1871,9 +2006,15 @@ impl FullscreenViewport {
             return None;
         }
         if anchor.row < focus.row || (anchor.row == focus.row && anchor.col <= focus.col) {
-            Some(SelectionRange { start: anchor, end: focus })
+            Some(SelectionRange {
+                start: anchor,
+                end: focus,
+            })
         } else {
-            Some(SelectionRange { start: focus, end: anchor })
+            Some(SelectionRange {
+                start: focus,
+                end: anchor,
+            })
         }
     }
 
@@ -1886,16 +2027,20 @@ impl FullscreenViewport {
             let mut start = 0usize;
             let mut end = line_width;
             if row == selection.start.row {
-                start = grapheme_start_at_column(line, selection.start.col).unwrap_or(selection.start.col.min(line_width));
+                start = grapheme_start_at_column(line, selection.start.col)
+                    .unwrap_or(selection.start.col.min(line_width));
             }
             if row == selection.end.row {
                 end = if selection.end.boundary {
                     selection.end.col.min(line_width)
                 } else {
-                    grapheme_end_at_column(line, selection.end.col).unwrap_or(selection.end.col.saturating_add(1).min(line_width))
+                    grapheme_end_at_column(line, selection.end.col)
+                        .unwrap_or(selection.end.col.saturating_add(1).min(line_width))
                 };
             }
-            let text = slice_by_column(line, start, end.saturating_sub(start), true).trim_end().to_owned();
+            let text = slice_by_column(line, start, end.saturating_sub(start), true)
+                .trim_end()
+                .to_owned();
             lines.push(text);
         }
         let text = lines.join("\n");
@@ -1958,10 +2103,15 @@ impl FullscreenViewport {
             let width = visible_width(part);
             column = column.saturating_add(width);
             let joiner = part == "/" || part == "-";
-            let selectable = joiner || part.chars().any(|character| character.is_alphanumeric() || character == '_');
+            let selectable = joiner
+                || part
+                    .chars()
+                    .any(|character| character.is_alphanumeric() || character == '_');
             segments.push((start, column, selectable, joiner));
         }
-        let index = segments.iter().position(|(start, end, _, _)| point.col >= *start && point.col < *end)?;
+        let index = segments
+            .iter()
+            .position(|(start, end, _, _)| point.col >= *start && point.col < *end)?;
         let can_join = |left: (usize, usize, bool, bool), right: (usize, usize, bool, bool)| {
             left.2 && right.2 && (left.3 || right.3)
         };
@@ -1996,16 +2146,35 @@ impl FullscreenViewport {
             current = current.saturating_add(1);
         }
         Some(SelectionRange {
-            start: SelectionPoint { row: point.row, col: start, boundary: false },
-            end: SelectionPoint { row: point.row, col: end, boundary: true },
+            start: SelectionPoint {
+                row: point.row,
+                col: start,
+                boundary: false,
+            },
+            end: SelectionPoint {
+                row: point.row,
+                col: end,
+                boundary: true,
+            },
         })
     }
 
     fn line_selection(&self, point: SelectionPoint) -> SelectionRange {
-        let width = self.projection.get(point.row).map_or(0, |line| visible_width(line));
+        let width = self
+            .projection
+            .get(point.row)
+            .map_or(0, |line| visible_width(line));
         SelectionRange {
-            start: SelectionPoint { row: point.row, col: 0, boundary: false },
-            end: SelectionPoint { row: point.row, col: width, boundary: true },
+            start: SelectionPoint {
+                row: point.row,
+                col: 0,
+                boundary: false,
+            },
+            end: SelectionPoint {
+                row: point.row,
+                col: width,
+                boundary: true,
+            },
         }
     }
 
@@ -2027,15 +2196,24 @@ impl FullscreenViewport {
 
 impl FullscreenEventResult {
     fn ignored() -> Self {
-        Self { event_result: EventResult::Ignored, effect: None }
+        Self {
+            event_result: EventResult::Ignored,
+            effect: None,
+        }
     }
 
     fn consumed() -> Self {
-        Self { event_result: EventResult::Consumed, effect: None }
+        Self {
+            event_result: EventResult::Consumed,
+            effect: None,
+        }
     }
 
     fn render() -> Self {
-        Self { event_result: EventResult::Render, effect: None }
+        Self {
+            event_result: EventResult::Render,
+            effect: None,
+        }
     }
 }
 
@@ -2053,15 +2231,16 @@ fn round_ratio(numerator: u128, denominator: u128) -> Option<u128> {
     }
     let quotient = numerator / denominator;
     let remainder = numerator % denominator;
-    Some(quotient.saturating_add(u128::from(remainder >= denominator.saturating_sub(remainder))))
+    Some(quotient.saturating_add(u128::from(
+        remainder >= denominator.saturating_sub(remainder),
+    )))
 }
 fn mark_image_cells(buf: &mut Buffer, area: Rect) {
     for row in 0..area.height {
         for column in 0..area.width {
-            if let Some(cell) = buf.cell_mut((
-                area.x.saturating_add(column),
-                area.y.saturating_add(row),
-            )) {
+            if let Some(cell) =
+                buf.cell_mut((area.x.saturating_add(column), area.y.saturating_add(row)))
+            {
                 cell.reset();
                 cell.set_diff_option(CellDiffOption::Skip);
             }
@@ -2173,7 +2352,10 @@ fn link_at_column(line: &str, column: usize) -> Option<String> {
             index = index.saturating_add(ansi.len);
             continue;
         }
-        let Some(grapheme) = line.get(index..).and_then(|tail| tail.graphemes(true).next()) else {
+        let Some(grapheme) = line
+            .get(index..)
+            .and_then(|tail| tail.graphemes(true).next())
+        else {
             break;
         };
         let width = grapheme_width(grapheme);
@@ -2187,11 +2369,16 @@ fn link_at_column(line: &str, column: usize) -> Option<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "test code")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test code"
+)]
 mod tests {
     use super::*;
-    use crate::components::Text;
     use crate::alt_screen::document::{DocumentBlock, DocumentBlockId};
+    use crate::components::Text;
 
     fn viewport(lines: &[&str]) -> FullscreenViewport {
         let mut viewport = FullscreenViewport::default();
@@ -2229,18 +2416,34 @@ mod tests {
         viewport.prepare(Rect::new(0, 0, 20, 3)).expect("prepare");
         let geometry = viewport.scrollbar_geometry().expect("scrollbar");
         assert!(geometry.thumb_height >= 2);
-        assert!(geometry.thumb_top + geometry.thumb_height <= geometry.track_top + geometry.track_height);
+        assert!(
+            geometry.thumb_top + geometry.thumb_height
+                <= geometry.track_top + geometry.track_height
+        );
     }
 
     #[test]
     fn selection_respects_wide_grapheme_boundaries() {
         let mut viewport = viewport(&["a界b"]);
-        viewport.selection.anchor = Some(SelectionPoint { row: 0, col: 1, boundary: false });
-        viewport.selection.focus = Some(SelectionPoint { row: 0, col: 2, boundary: false });
+        viewport.selection.anchor = Some(SelectionPoint {
+            row: 0,
+            col: 1,
+            boundary: false,
+        });
+        viewport.selection.focus = Some(SelectionPoint {
+            row: 0,
+            col: 2,
+            boundary: false,
+        });
         assert_eq!(viewport.selection_text().as_deref(), Some("界"));
     }
 
-    fn pointer(kind: TuiMouseEventType, button: TuiMouseButton, screen_x: u16, screen_y: u16) -> TuiMouseEvent {
+    fn pointer(
+        kind: TuiMouseEventType,
+        button: TuiMouseButton,
+        screen_x: u16,
+        screen_y: u16,
+    ) -> TuiMouseEvent {
         TuiMouseEvent {
             kind,
             button,
@@ -2263,7 +2466,10 @@ mod tests {
         viewport.set_scrollbar(ScrollbarMode::Auto);
         assert_eq!(viewport.next_deadline(), None);
 
-        let _ = viewport.handle_mouse(&pointer(TuiMouseEventType::Move, TuiMouseButton::None, 19, 0), start);
+        let _ = viewport.handle_mouse(
+            &pointer(TuiMouseEventType::Move, TuiMouseButton::None, 19, 0),
+            start,
+        );
         let expiry = start + SCROLLBAR_REVEAL;
         // Hovering holds the reveal open, so the product must not be woken for it.
         assert_eq!(viewport.next_deadline(), None);
@@ -2286,9 +2492,15 @@ mod tests {
         let start = Instant::now();
         let mut viewport = viewport(&["a", "b", "c", "d", "e", "f"]);
         viewport.set_scrollbar(ScrollbarMode::Auto);
-        let _ = viewport.handle_mouse(&pointer(TuiMouseEventType::Move, TuiMouseButton::None, 19, 0), start);
+        let _ = viewport.handle_mouse(
+            &pointer(TuiMouseEventType::Move, TuiMouseButton::None, 19, 0),
+            start,
+        );
         let grab = start + Duration::from_millis(200);
-        let _ = viewport.handle_mouse(&pointer(TuiMouseEventType::Press, TuiMouseButton::Left, 19, 0), grab);
+        let _ = viewport.handle_mouse(
+            &pointer(TuiMouseEventType::Press, TuiMouseButton::Left, 19, 0),
+            grab,
+        );
         let expiry = grab + SCROLLBAR_REVEAL;
 
         // Pointer leaves the track while the button is still held.

@@ -483,8 +483,7 @@ impl MutableReplicatedState {
         };
         match route {
             PublicationRoute::Start(publication) => {
-                let mut panic_payload =
-                    dispatch_publication(self, &publication);
+                let mut panic_payload = dispatch_publication(self, &publication);
                 if let Some(payload) = drain_publications(self) {
                     panic_payload.get_or_insert(payload);
                 }
@@ -493,9 +492,7 @@ impl MutableReplicatedState {
                 }
             }
             PublicationRoute::Inline(publication) => {
-                if let Some(payload) =
-                    dispatch_publication(self, &publication)
-                {
+                if let Some(payload) = dispatch_publication(self, &publication) {
                     std::panic::resume_unwind(payload);
                 }
             }

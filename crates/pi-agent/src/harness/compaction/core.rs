@@ -1358,14 +1358,17 @@ fn add_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, reason = "failure-shape assertions diverge with context")]
+#[allow(
+    clippy::panic,
+    reason = "failure-shape assertions diverge with context"
+)]
 mod tests {
     use super::*;
     use futures::stream::{self, BoxStream, StreamExt};
     use pi_ai::{AssistantContent, AssistantMessage, Provider, TextContent};
     use serde_json::{Map, Value};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn user(text: &str) -> AgentMessage {
         AgentMessage::Llm(Box::new(Message::User(pi_ai::UserMessage::new(

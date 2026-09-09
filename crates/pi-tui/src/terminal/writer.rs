@@ -17,12 +17,12 @@ use std::time::{Duration, Instant};
 use crate::component::Component;
 use crate::frame::{FrameAnnotations, RawRegion, RowClaim, RowClaims, with_annotations};
 use crate::image::delete_all_kitty_placements;
+use crate::terminal::ScreenMode;
 use crate::terminal::backend::{
     GuardedBackend, audit_bytes, encode_full_row_prefix, wrap_synchronized, wrap_synchronized_into,
 };
 use crate::terminal::caps::{TerminalCapabilities, kitty_delete_id};
 use crate::terminal::sink::FrameSink;
-use crate::terminal::ScreenMode;
 
 const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
 // ── PERF-T11 paint-path probe (instrumented counter) ──────────────────────
@@ -386,7 +386,6 @@ impl<W: Write> Tui<W> {
         self.screen_mode
     }
 
-
     /// Switch the existing terminal and frame sink between inline and
     /// fullscreen geometry.
     ///
@@ -531,20 +530,18 @@ impl<W: Write> Tui<W> {
         }
         match txn {
             Txn::Frame => self.commit_frame(root, false),
-            Txn::Settle(_) if self.screen_mode == ScreenMode::Fullscreen => Err(
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "settle transaction is invalid in fullscreen mode",
-                ),
-            ),
+            Txn::Settle(_) if self.screen_mode == ScreenMode::Fullscreen => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "settle transaction is invalid in fullscreen mode",
+            )),
             Txn::Settle(blocks) => self.commit_settle(blocks, root),
             Txn::Reanchor(cause) => self.commit_reanchor(cause, root),
-            Txn::SetViewportHeight(_) if self.screen_mode == ScreenMode::Fullscreen => Err(
-                io::Error::new(
+            Txn::SetViewportHeight(_) if self.screen_mode == ScreenMode::Fullscreen => {
+                Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "viewport-height transaction is invalid in fullscreen mode",
-                ),
-            ),
+                ))
+            }
             Txn::SetViewportHeight(height) => self.commit_set_viewport_height(height, root),
         }
     }
@@ -1063,7 +1060,6 @@ impl<W: Write> Tui<W> {
             guard.extend_from_slice(bytes);
         }
     }
-
 
     fn take_composition_bytes(&mut self) -> Vec<u8> {
         // PERF-T11 terminal-paint Design A: swap the pooled buffer into the
@@ -1964,8 +1960,8 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_replays_all_visible_kitty_placements_without_releasing_cache_data(
-    ) -> io::Result<()> {
+    fn fullscreen_replays_all_visible_kitty_placements_without_releasing_cache_data()
+    -> io::Result<()> {
         const PLACEMENT_CLEAR: &[u8] = b"\x1b_Ga=d,d=a,q=2\x1b\\";
         const FIRST_DATA_DELETE: &[u8] = b"\x1b_Ga=d,d=I,i=7\x1b\\";
         const FIRST_UPLOAD: &[u8] = b"\x1b_Ga=T,f=100,q=2,i=7;u7\x1b\\";
@@ -2003,10 +1999,8 @@ mod tests {
         root.frame = KittyFrame::BothPlacements;
         tui.commit(Txn::Frame, &mut root)?;
         let returned = tui.last_payload().to_vec();
-        let clear_at =
-            find_subslice(&returned, PLACEMENT_CLEAR).ok_or_else(|| {
-                io::Error::other("missing placement clear before complete replay")
-            })?;
+        let clear_at = find_subslice(&returned, PLACEMENT_CLEAR)
+            .ok_or_else(|| io::Error::other("missing placement clear before complete replay"))?;
         let first_placement_at = find_subslice(&returned, FIRST_PLACEMENT)
             .ok_or_else(|| io::Error::other("missing reappeared placement"))?;
         let second_placement_at = find_subslice(&returned, SECOND_PLACEMENT)
@@ -2035,15 +2029,17 @@ mod tests {
         root.frame = KittyFrame::EvictFirst;
         tui.commit(Txn::Frame, &mut root)?;
         let eviction = tui.last_payload().to_vec();
-        let clear_at =
-            find_subslice(&eviction, PLACEMENT_CLEAR).ok_or_else(|| {
-                io::Error::other("missing placement clear before cache eviction")
-            })?;
+        let clear_at = find_subslice(&eviction, PLACEMENT_CLEAR)
+            .ok_or_else(|| io::Error::other("missing placement clear before cache eviction"))?;
         let delete_at = find_subslice(&eviction, FIRST_DATA_DELETE)
             .ok_or_else(|| io::Error::other("missing cache data deletion"))?;
         assert!(clear_at < delete_at);
-        let wrapped_delete =
-            [b"\x1b7\x1b[1;1H".as_slice(), FIRST_DATA_DELETE, b"\x1b8".as_slice()].concat();
+        let wrapped_delete = [
+            b"\x1b7\x1b[1;1H".as_slice(),
+            FIRST_DATA_DELETE,
+            b"\x1b8".as_slice(),
+        ]
+        .concat();
         assert!(find_subslice(&eviction, &wrapped_delete).is_none());
         Ok(())
     }

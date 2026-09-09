@@ -254,10 +254,13 @@ impl HarnessEventBus {
         // listener keep FIFO order — `push_front` would reverse them.
         if reentrant_from_drain(&self.core) {
             let boundary = state.reentrant_front;
-            state.queue.insert(boundary, DeliveryItem::Batch {
-                events: bound,
-                done: Some(done),
-            });
+            state.queue.insert(
+                boundary,
+                DeliveryItem::Batch {
+                    events: bound,
+                    done: Some(done),
+                },
+            );
             state.reentrant_front = boundary + 1;
             drop(state);
             return deliver_reentrant_batch(Arc::clone(&self.core), observation).boxed();
@@ -1296,7 +1299,10 @@ fn panic_message(panic: &(dyn Any + Send)) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, reason = "bus tests use contextual fixture failures")]
+#[allow(
+    clippy::expect_used,
+    reason = "bus tests use contextual fixture failures"
+)]
 mod tests {
     use super::{Arc, EventFilter, HarnessError, HarnessEventBus};
     use crate::context::Context;

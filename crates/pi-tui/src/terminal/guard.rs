@@ -107,7 +107,6 @@ pub struct TerminalGuard<W: Write> {
     viewport_bottom_row: u16,
 }
 
-
 impl<W: Write> TerminalGuard<W> {
     /// Create a guard that has not yet activated any modes.
     pub fn new(writer: W) -> Self {
@@ -790,9 +789,7 @@ mod tests {
         guard.applied.push(RestoreStep::RawMode);
 
         let Err(error) = guard.enter_fullscreen() else {
-            return Err(io::Error::other(
-                "activation must fail at the third step",
-            ));
+            return Err(io::Error::other("activation must fail at the third step"));
         };
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(
@@ -804,9 +801,10 @@ mod tests {
             .and_then(|payload| payload.downcast_ref::<FullscreenActivationError>())
             .ok_or_else(|| io::Error::other("compound activation payload"))?;
         assert_eq!(compound.primary.to_string(), "latched write failure");
-        let rollback = compound.rollback.as_ref().ok_or_else(|| {
-            io::Error::other("rollback failure must be reported, not swallowed")
-        })?;
+        let rollback = compound
+            .rollback
+            .as_ref()
+            .ok_or_else(|| io::Error::other("rollback failure must be reported, not swallowed"))?;
         assert_eq!(rollback.to_string(), "latched write failure");
 
         // Only the two successful activation steps reached the wire.
@@ -814,8 +812,7 @@ mod tests {
         // Every activation step and every restore step must have attempted a
         // write — including the second restore step (CSI ?1049l) even though
         // the first restore write (CSI ?7h) already failed.
-        let attempted: Vec<&[u8]> =
-            guard.writer().attempted.iter().map(Vec::as_slice).collect();
+        let attempted: Vec<&[u8]> = guard.writer().attempted.iter().map(Vec::as_slice).collect();
         for expected in [
             b"\x1b[?1049h".as_slice(), // activation step 1 (recorded)
             b"\x1b[?7l".as_slice(),    // activation step 2 (recorded)

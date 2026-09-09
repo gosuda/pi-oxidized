@@ -239,7 +239,10 @@ pub fn to_provider_tool(tool: &dyn HarnessTool) -> Tool {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, reason = "unwind-safety regression needs an exploding callback")]
+#[allow(
+    clippy::panic,
+    reason = "unwind-safety regression needs an exploding callback"
+)]
 mod tests {
     use super::*;
     use serde_json::json;

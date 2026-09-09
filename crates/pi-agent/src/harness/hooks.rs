@@ -1580,7 +1580,10 @@ impl std::fmt::Debug for HookRegistry {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, reason = "hook tests use contextual fixture failures")]
+#[allow(
+    clippy::expect_used,
+    reason = "hook tests use contextual fixture failures"
+)]
 mod tests {
     use super::*;
     use crate::message::user_text;
@@ -1736,8 +1739,7 @@ mod tests {
                         .race(tokio::time::sleep(Duration::from_millis(20)))
                         .await
                         .is_ok()
-                    {
-                    }
+                    {}
                     seen_cancellation.store(context.is_cancelled(), Ordering::SeqCst);
                     Ok::<_, HookError>(None)
                 })

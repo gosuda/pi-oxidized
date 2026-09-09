@@ -146,7 +146,8 @@ impl LineDocument {
     /// do not fit in `usize`.
     pub fn prepare(&mut self, width: u16) -> Result<DocumentMetrics, RowSourceError> {
         if width == 0 {
-            let changed = self.width != Some(width) || self.blocks.iter().any(|entry| entry.rows != 0);
+            let changed =
+                self.width != Some(width) || self.blocks.iter().any(|entry| entry.rows != 0);
             for entry in &mut self.blocks {
                 entry.rows = 0;
                 entry.dirty = false;

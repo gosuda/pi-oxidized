@@ -1884,7 +1884,10 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
 /// missing, cancelling, or generation-replaced scope, answering the host with
 /// a correlated error instead of running user code after cancel/timeout. A
 /// callback that passed the re-check and already began runs to completion.
-#[allow(clippy::too_many_lines, reason = "callback dispatch decodes, re-checks scope, and spawns per-kind tasks")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "callback dispatch decodes, re-checks scope, and spawns per-kind tasks"
+)]
 fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
     let is_before = frame.method == PROVIDER_BEFORE_PAYLOAD_METHOD;
     let is_response = frame.method == PROVIDER_ON_RESPONSE_METHOD;
@@ -1972,21 +1975,21 @@ fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
             return Some(true);
         };
         shared.runtime.spawn(async move {
-            let mut request =
-                match serde_json::from_value::<ProviderBeforePayloadRequest>(payload) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        let message = format!("malformed provider callback request: {error}");
-                        let _ = outbound
-                            .send(callback_error_frame(
-                                callback_frame_id,
-                                &callback_method,
-                                &message,
-                            ))
-                            .await;
-                        return;
-                    }
-                };
+            let mut request = match serde_json::from_value::<ProviderBeforePayloadRequest>(payload)
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    let message = format!("malformed provider callback request: {error}");
+                    let _ = outbound
+                        .send(callback_error_frame(
+                            callback_frame_id,
+                            &callback_method,
+                            &message,
+                        ))
+                        .await;
+                    return;
+                }
+            };
             if !callback_scope_live(&pending, origin_id, scope_generation) {
                 let _ = outbound
                     .send(callback_error_frame(

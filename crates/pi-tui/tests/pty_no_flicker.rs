@@ -98,8 +98,7 @@ fn pty_cursor_restore_after_success_abort_provider_error_panic_and_sigint() {
                 report.raw.len()
             );
             assert_eq!(
-                report.emergency_alternate_screen_restore_count,
-                0,
+                report.emergency_alternate_screen_restore_count, 0,
                 "exit={exit}: alternate-screen emergency restore emitted although the fixture never entered the alternate screen"
             );
         } else {

@@ -386,8 +386,7 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let factory_calls = std::sync::Arc::clone(&calls);
         let recovery_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let recovery_successes =
-            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recovery_successes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let recovery_latched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let recovery_calls_for_task = std::sync::Arc::clone(&recovery_calls);
         let recovery_successes_for_task = std::sync::Arc::clone(&recovery_successes);
@@ -420,8 +419,7 @@ mod tests {
                 let recovered =
                     recovery_latched_for_task.swap(false, std::sync::atomic::Ordering::SeqCst);
                 if recovered {
-                    recovery_successes_for_task
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    recovery_successes_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 recovered
             },

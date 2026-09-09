@@ -1784,7 +1784,10 @@ async fn publish_deferred_response(
         .current_operation()
         .await
         .ok_or_else(|| invariant("deferred operation disappeared before publication"))?;
-    if matches!(&pending.state.scope().control, Control::CancelRequested { .. }) {
+    if matches!(
+        &pending.state.scope().control,
+        Control::CancelRequested { .. }
+    ) {
         let response_id = pending_response_id(&pending.state)?;
         let record = publish_interrupted(lane, &pending, &response_id, cx).await?;
         return Ok(DriveStep::Settled(record));
@@ -4504,8 +4507,8 @@ mod tests {
     use crate::session::lane_state::{LaneConfiguration, ModelIdentity};
     use crate::session::operation::{NormalizedRetryPolicy, OperationMeta, RunSettings};
     use crate::session::{
-        set_value, Entry, MemoryStorage, Session, SessionMetadata, StorageBackedSession,
-        UuidV7Generator,
+        Entry, MemoryStorage, Session, SessionMetadata, StorageBackedSession, UuidV7Generator,
+        set_value,
     };
     use futures::stream::{self, BoxStream, StreamExt as FuturesStreamExt};
     use std::collections::{BTreeMap, HashMap};
@@ -4723,7 +4726,8 @@ mod tests {
             _model: &pi_ai::Model,
             _context: pi_ai::Context,
             _options: pi_ai::StreamOptions,
-        ) -> BoxStream<'static, Result<pi_ai::AssistantMessageEvent, pi_ai::ProviderError>> {
+        ) -> BoxStream<'static, Result<pi_ai::AssistantMessageEvent, pi_ai::ProviderError>>
+        {
             let mut message = pi_ai::AssistantMessage::new(
                 self.model.api.clone(),
                 self.model.provider.clone(),
@@ -4732,7 +4736,9 @@ mod tests {
             );
             message
                 .content
-                .push(pi_ai::AssistantContent::Text(pi_ai::TextContent::new("done")));
+                .push(pi_ai::AssistantContent::Text(pi_ai::TextContent::new(
+                    "done",
+                )));
             message.stop_reason = pi_ai::StopReason::Stop;
             stream::iter(vec![Ok(pi_ai::AssistantMessageEvent::Start {
                 partial: Arc::new(message.clone()),
@@ -4762,7 +4768,8 @@ mod tests {
             _model: &pi_ai::Model,
             _context: pi_ai::Context,
             _options: pi_ai::StreamOptions,
-        ) -> BoxStream<'static, Result<pi_ai::AssistantMessageEvent, pi_ai::ProviderError>> {
+        ) -> BoxStream<'static, Result<pi_ai::AssistantMessageEvent, pi_ai::ProviderError>>
+        {
             stream::empty().boxed()
         }
     }
@@ -4824,8 +4831,7 @@ mod tests {
             let Some(response_id) = record.tip_id.as_ref() else {
                 return Err("aborted recovery did not publish an assistant entry".into());
             };
-            let Some(Entry::Message { message, .. }) =
-                session.get_entry(response_id, cx).await?
+            let Some(Entry::Message { message, .. }) = session.get_entry(response_id, cx).await?
             else {
                 return Err("assistant entry not found".into());
             };
@@ -4846,8 +4852,8 @@ mod tests {
     /// N14 regression: recovery with no persisted frames must use the model
     /// identity captured on the operation, not the lane's current model.
     #[tokio::test(flavor = "current_thread")]
-    async fn recovery_uses_captured_model_identity_for_no_frame_tombstone(
-    ) -> Result<(), Box<dyn Error>> {
+    async fn recovery_uses_captured_model_identity_for_no_frame_tombstone()
+    -> Result<(), Box<dyn Error>> {
         let cx = Context::background();
         let session = new_session("no-frame-recovery");
         let lane_name = LaneName::from("main");
@@ -4880,7 +4886,8 @@ mod tests {
         )
         .await?;
         assert_eq!(record.status, TerminalStatus::Aborted);
-        let assistant = assistant.ok_or("captured-api recovery did not publish an assistant entry")?;
+        let assistant =
+            assistant.ok_or("captured-api recovery did not publish an assistant entry")?;
         assert_eq!(assistant.provider, original_model.provider);
         assert_eq!(assistant.model, original_model.id);
         assert_eq!(assistant.api, original_model.api);
@@ -4926,7 +4933,8 @@ mod tests {
         )
         .await?;
         assert_eq!(record.status, TerminalStatus::Aborted);
-        let assistant = assistant.ok_or("old-record recovery did not publish an assistant entry")?;
+        let assistant =
+            assistant.ok_or("old-record recovery did not publish an assistant entry")?;
         assert_eq!(assistant.provider, original_model.provider);
         assert_eq!(assistant.model, original_model.id);
         assert_eq!(assistant.api, original_model.api);

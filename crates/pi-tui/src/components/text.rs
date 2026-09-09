@@ -164,7 +164,6 @@ impl Text {
         result.extend(content_lines);
         for _ in 0..self.padding_y {
             result.push(empty.clone());
-
         }
         if result.is_empty() {
             vec![String::new()]
@@ -193,13 +192,10 @@ impl Component for Text {
         if self.prepared_width != Some(cache.width) {
             return Err(RowSourceError::NotPrepared);
         }
-        let keyed = cache
-            .lines
-            .get(row)
-            .ok_or(RowSourceError::RowOutOfBounds {
-                row,
-                rows: cache.lines.len(),
-            })?;
+        let keyed = cache.lines.get(row).ok_or(RowSourceError::RowOutOfBounds {
+            row,
+            rows: cache.lines.len(),
+        })?;
         emit(DisplayRowSpan {
             column: 0,
             width: cache.width,

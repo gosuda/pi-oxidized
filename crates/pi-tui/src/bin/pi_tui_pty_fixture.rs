@@ -988,7 +988,12 @@ mod tests {
             EventResult::Ignored
         );
         assert_eq!(
-            (root.paste_count, root.cursor_moves, root.resize_count, root.generation),
+            (
+                root.paste_count,
+                root.cursor_moves,
+                root.resize_count,
+                root.generation
+            ),
             (0, 0, 0, 0),
             "a declined pointer event must not advance any live counter"
         );

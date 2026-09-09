@@ -188,7 +188,8 @@ pub(crate) mod opaque_json {
     use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
     use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 
-    const BYTE_STRING_ERROR: &str = "protocol values must be strict JSON: byte strings are not permitted";
+    const BYTE_STRING_ERROR: &str =
+        "protocol values must be strict JSON: byte strings are not permitted";
     const UNICODE_ERROR: &str = "CBOR text strings must contain valid Unicode scalar values";
     const DUPLICATE_KEY_ERROR: &str = "CBOR map contains a duplicate key";
 
@@ -201,10 +202,9 @@ pub(crate) mod opaque_json {
             JsonValue::Bool(value) => serializer.serialize_bool(*value),
             JsonValue::Number(value) => serializer.serialize_f64(*value),
             JsonValue::String(value) => {
-                let value =
-                    value.try_to_utf8().map_err(|_| {
-                        <S::Error as serde::ser::Error>::custom(UNICODE_ERROR)
-                    })?;
+                let value = value
+                    .try_to_utf8()
+                    .map_err(|_| <S::Error as serde::ser::Error>::custom(UNICODE_ERROR))?;
                 serializer.serialize_str(&value)
             }
             JsonValue::Array(values) => {
@@ -217,9 +217,9 @@ pub(crate) mod opaque_json {
             JsonValue::Object(entries) => {
                 let mut map = serializer.serialize_map(Some(entries.len()))?;
                 for (key, value) in entries {
-                    let key = key.try_to_utf8().map_err(|_| {
-                        <S::Error as serde::ser::Error>::custom(UNICODE_ERROR)
-                    })?;
+                    let key = key
+                        .try_to_utf8()
+                        .map_err(|_| <S::Error as serde::ser::Error>::custom(UNICODE_ERROR))?;
                     map.serialize_entry(&key, &super::OpaqueJson(value))?;
                 }
                 map.end()
@@ -379,7 +379,6 @@ pub(crate) mod opaque_json {
     {
         deserializer.deserialize_any(JsonValueVisitor)
     }
-
 }
 
 // ---------------------------------------------------------------------------

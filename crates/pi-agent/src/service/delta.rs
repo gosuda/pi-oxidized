@@ -2019,7 +2019,10 @@ fn integer(value: u64) -> JsInteger {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, reason = "decoder tests use contextual fixture failures")]
+#[allow(
+    clippy::expect_used,
+    reason = "decoder tests use contextual fixture failures"
+)]
 mod tests {
     use super::*;
     use crate::service::value::{JsonError, ValueError, parse_json, stringify_json};

@@ -14,8 +14,8 @@
 
 use std::any::Any;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -29,11 +29,17 @@ use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::client::{HostClient, HostClientError, ProviderCallbackRegistration};
+use crate::protocol::{
+    Frame, KeyEventKindWire, KeyModifiersWire, NamedColor, ProviderCallbackFlags,
+    ProviderCancelDeferredRequest, ProviderDeferredOptions, ProviderFetchDeferredRequest,
+    SlotPlacement, ToolUpdate, UiEventWire, WireColor, from_payload,
+};
+use crate::sanitize::{SanitizedSlot, sanitize_slot};
 use pi_agent::{AgentTool, AgentToolResult, ToolError, ToolExecutionMode, ToolUpdates};
 use pi_ai::ConstrainedSampling;
 use pi_ai::provider::{
-    CancelDeferredFn, DeferredCallbacks, FetchDeferredFn, Provider, ProviderError,
-    StreamOptions,
+    CancelDeferredFn, DeferredCallbacks, FetchDeferredFn, Provider, ProviderError, StreamOptions,
 };
 use pi_ai::types::{
     AssistantMessage, AssistantMessageEvent, Context, DeferredHandle, ErrorReason, Model,
@@ -44,13 +50,6 @@ use pi_tui::focus::{FocusId, Focusable};
 use pi_tui::frame::{RawRegion, claim_opaque_span, push_raw_region, set_cursor};
 use pi_tui::link::{format_link_close, format_link_open};
 use pi_tui::text::{slice_with_width, visible_width};
-use crate::client::{HostClient, HostClientError, ProviderCallbackRegistration};
-use crate::protocol::{
-    Frame, KeyEventKindWire, KeyModifiersWire, NamedColor, ProviderCallbackFlags,
-    ProviderCancelDeferredRequest, ProviderDeferredOptions, ProviderFetchDeferredRequest,
-    SlotPlacement, ToolUpdate, UiEventWire, WireColor, from_payload,
-};
-use crate::sanitize::{SanitizedSlot, sanitize_slot};
 
 /// Open lifecycle method strings used by the tool bridge.
 pub mod methods {
@@ -93,10 +92,7 @@ pub struct ProviderCapabilities {
 impl ProviderCapabilities {
     /// Build capability flags from the callbacks actually present.
     #[must_use]
-    pub const fn from_callbacks(
-        stream_simple: bool,
-        callbacks: &DeferredCallbacks,
-    ) -> Self {
+    pub const fn from_callbacks(stream_simple: bool, callbacks: &DeferredCallbacks) -> Self {
         Self {
             stream_simple,
             fetch_deferred: callbacks.fetch.is_some(),
@@ -362,21 +358,25 @@ impl ExtensionProvider {
                 let client = Arc::clone(&client);
                 let provider_id = provider_id.clone();
                 let timeout = Arc::clone(&timeout);
-                let callback: FetchDeferredFn = Arc::new(
-                    move |model: &Model,
-                          handle: DeferredHandle,
-                          options: StreamOptions|
-                     -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
-                        deferred_fetch_stream(
-                            Arc::clone(&client),
-                            provider_id.clone(),
-                            current_timeout(&timeout),
-                            model,
-                            handle,
-                            options,
-                        )
-                    },
-                );
+                let callback: FetchDeferredFn =
+                    Arc::new(
+                        move |model: &Model,
+                              handle: DeferredHandle,
+                              options: StreamOptions|
+                              -> BoxStream<
+                            'static,
+                            Result<AssistantMessageEvent, ProviderError>,
+                        > {
+                            deferred_fetch_stream(
+                                Arc::clone(&client),
+                                provider_id.clone(),
+                                current_timeout(&timeout),
+                                model,
+                                handle,
+                                options,
+                            )
+                        },
+                    );
                 Some(callback)
             } else {
                 None
@@ -442,7 +442,10 @@ impl ExtensionProvider {
     }
 }
 
-#[allow(clippy::too_many_lines, reason = "pre-existing adapter shape; narrowing the surface is a separate port task")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "pre-existing adapter shape; narrowing the surface is a separate port task"
+)]
 impl Provider for ExtensionProvider {
     fn stream(
         &self,
@@ -622,10 +625,7 @@ fn callback_registration(
     })
 }
 
-fn deferred_options_wire(
-    options: &StreamOptions,
-    wait: Option<u64>,
-) -> ProviderDeferredOptions {
+fn deferred_options_wire(options: &StreamOptions, wait: Option<u64>) -> ProviderDeferredOptions {
     let mut map = stream_options_wire(options)
         .as_object()
         .cloned()
@@ -666,15 +666,17 @@ fn deferred_terminal_result(
     error: HostClientError,
 ) -> Result<AssistantMessageEvent, ProviderError> {
     match error {
-        HostClientError::Remote { code, message } => Ok(provider_error_event(
-            model,
-            format!("{code}: {message}"),
-        )),
+        HostClientError::Remote { code, message } => {
+            Ok(provider_error_event(model, format!("{code}: {message}")))
+        }
         other => Err(provider_error(other)),
     }
 }
 
-#[allow(clippy::needless_pass_by_value, reason = "pre-existing adapter shape; narrowing the surface is a separate port task")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "pre-existing adapter shape; narrowing the surface is a separate port task"
+)]
 fn deferred_fetch_stream(
     client: Arc<HostClient>,
     provider_id: String,
@@ -748,7 +750,10 @@ fn deferred_fetch_stream(
     Box::pin(ProviderStream { rx })
 }
 
-#[allow(clippy::needless_pass_by_value, reason = "pre-existing adapter shape; narrowing the surface is a separate port task")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "pre-existing adapter shape; narrowing the surface is a separate port task"
+)]
 fn deferred_cancel_future(
     client: Arc<HostClient>,
     provider_id: String,
@@ -1206,9 +1211,7 @@ pub fn map_ui_event(event: &UiEvent) -> Option<UiEventWire> {
             kind: map_key_kind(key.kind),
         }),
         UiEvent::Mouse(_) => None,
-        UiEvent::Paste(text) => Some(UiEventWire::Paste {
-            text: text.clone(),
-        }),
+        UiEvent::Paste(text) => Some(UiEventWire::Paste { text: text.clone() }),
         UiEvent::FocusGained => Some(UiEventWire::FocusGained),
         UiEvent::FocusLost => Some(UiEventWire::FocusLost),
         UiEvent::Resize { width, height } => Some(UiEventWire::Resize {
@@ -2198,12 +2201,11 @@ mod tests {
                 .with_timeout(Duration::from_millis(10))
                 .with_capabilities(capabilities)
                 .with_timeout(Duration::from_millis(40));
-            let cancel = tokio::spawn(provider.cancel_deferred(
-                &model,
-                handle,
-                StreamOptions::default(),
-            ));
-            let request = host.require_frame(methods::PROVIDER_CANCEL_DEFERRED).await?;
+            let cancel =
+                tokio::spawn(provider.cancel_deferred(&model, handle, StreamOptions::default()));
+            let request = host
+                .require_frame(methods::PROVIDER_CANCEL_DEFERRED)
+                .await?;
             assert_eq!(request.method, methods::PROVIDER_CANCEL_DEFERRED);
             let result = tokio::time::timeout(Duration::from_secs(1), cancel).await??;
             let Err(error) = result else {

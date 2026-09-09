@@ -152,13 +152,11 @@ impl DocumentImage {
         let default_max_height = u16::try_from(default_max_height.max(1))
             .unwrap_or(u16::MAX)
             .max(1);
-        let max_height = options.max_height_cells.unwrap_or(default_max_height).max(1);
-        let size = calculate_image_cell_size(
-            dimensions,
-            max_width,
-            Some(max_height),
-            cell,
-        );
+        let max_height = options
+            .max_height_cells
+            .unwrap_or(default_max_height)
+            .max(1);
+        let size = calculate_image_cell_size(dimensions, max_width, Some(max_height), cell);
         let decoded_bytes = usize::try_from(
             u128::from(dimensions.width_px)
                 .checked_mul(u128::from(dimensions.height_px))
@@ -218,7 +216,11 @@ impl DocumentImage {
             protocol,
             dimensions,
             columns: size.columns,
-            rows: if protocol.is_none() { 1 } else { size.rows.max(1) },
+            rows: if protocol.is_none() {
+                1
+            } else {
+                size.rows.max(1)
+            },
             image_id,
             sequence: Arc::<[u8]>::from(sequence.into_bytes()),
             fallback,
@@ -364,11 +366,7 @@ impl DocumentImage {
                 if emission == ImageEmission::Upload {
                     Some(cropped.into_bytes())
                 } else {
-                    Some(kitty_placement_from_line(
-                        &cropped,
-                        self.image_id?,
-                    )?
-                    .into_bytes())
+                    Some(kitty_placement_from_line(&cropped, self.image_id?)?.into_bytes())
                 }
             }
             ImageProtocol::ITerm2 => Some(self.sequence.to_vec()),
@@ -510,11 +508,14 @@ impl KittyImageCache {
                 continue;
             }
             seen_ids.push(image_id);
-            let index = self.entries.iter().position(|entry| entry.image_id == image_id);
+            let index = self
+                .entries
+                .iter()
+                .position(|entry| entry.image_id == image_id);
             let current = index.and_then(|index| self.entries.get(index).copied());
-            if current.is_some_and(|entry| {
-                entry.transmission_generation == image.transmission_generation
-            }) {
+            if current
+                .is_some_and(|entry| entry.transmission_generation == image.transmission_generation)
+            {
                 if let Some(index) = index
                     && let Some(entry) = self.entries.remove(index)
                 {
@@ -574,11 +575,7 @@ impl KittyImageCache {
     /// it is now retained in cache metadata; only a prior generation may use
     /// a placement-only command.
     #[must_use]
-    pub fn emission_for(
-        &self,
-        image: &DocumentImage,
-        output: &ImageCacheOutput,
-    ) -> ImageEmission {
+    pub fn emission_for(&self, image: &DocumentImage, output: &ImageCacheOutput) -> ImageEmission {
         if image.protocol != Some(ImageProtocol::Kitty)
             || output.uploads.iter().any(|upload| {
                 Some(upload.image_id) == image.image_id
@@ -602,11 +599,7 @@ impl KittyImageCache {
         evictions
     }
 
-    fn evict_offscreen(
-        &mut self,
-        visible_ids: &[u32],
-        evictions: &mut Vec<ImageCacheEviction>,
-    ) {
+    fn evict_offscreen(&mut self, visible_ids: &[u32], evictions: &mut Vec<ImageCacheEviction>) {
         loop {
             let mut offscreen_count: usize = 0;
             let mut transmission_bytes: usize = 0;
@@ -1113,10 +1106,13 @@ pub(crate) fn register_kitty_image_metadata(metadata: KittyImageMetadata) {
 }
 
 fn kitty_metadata(image_id: u32) -> Option<KittyImageMetadata> {
-    metadata_table()
-        .lock()
-        .ok()
-        .and_then(|table| table.iter().rev().find(|entry| entry.image_id == image_id).copied())
+    metadata_table().lock().ok().and_then(|table| {
+        table
+            .iter()
+            .rev()
+            .find(|entry| entry.image_id == image_id)
+            .copied()
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1173,9 +1169,7 @@ fn parse_kitty_header(line: &str, start: usize) -> Result<KittyHeader, ImageErro
     let columns = metadata.columns;
     let rows = metadata.rows;
 
-    let mut sequence_end = controls_end
-        .checked_add(1)
-        .ok_or(ImageError::Overflow)?;
+    let mut sequence_end = controls_end.checked_add(1).ok_or(ImageError::Overflow)?;
     let mut current_controls = controls;
     loop {
         let terminator_offset = line
@@ -1317,10 +1311,8 @@ fn parse_iterm2_document_image(
     };
     let filename = match find_control(&parsed, "name") {
         Some(name) => {
-            let filename = String::from_utf8(
-                decode_b64(name).ok_or(ImageError::InvalidEncoding)?,
-            )
-            .map_err(|_| ImageError::InvalidEncoding)?;
+            let filename = String::from_utf8(decode_b64(name).ok_or(ImageError::InvalidEncoding)?)
+                .map_err(|_| ImageError::InvalidEncoding)?;
             if filename.chars().any(char::is_control) {
                 return Err(ImageError::InvalidProtocol);
             }
@@ -1328,11 +1320,7 @@ fn parse_iterm2_document_image(
         }
         None => None,
     };
-    let fallback = image_fallback(
-        "image/unknown",
-        Some(dimensions),
-        filename.as_deref(),
-    );
+    let fallback = image_fallback("image/unknown", Some(dimensions), filename.as_deref());
     let decoded_bytes = usize::try_from(
         u128::from(dimensions.width_px)
             .checked_mul(u128::from(dimensions.height_px))
@@ -1403,13 +1391,19 @@ fn find_control_in_str<'a>(controls: &'a str, key: &str) -> Option<&'a str> {
 
 fn parse_positive_u16(value: Option<&str>) -> Result<u16, ImageError> {
     let value = value.ok_or(ImageError::MissingMetadata)?;
-    let parsed = value.parse::<u16>().map_err(|_| ImageError::InvalidDimensions)?;
-    (parsed > 0).then_some(parsed).ok_or(ImageError::InvalidDimensions)
+    let parsed = value
+        .parse::<u16>()
+        .map_err(|_| ImageError::InvalidDimensions)?;
+    (parsed > 0)
+        .then_some(parsed)
+        .ok_or(ImageError::InvalidDimensions)
 }
 
 fn parse_positive_u32(value: Option<&str>) -> Result<u32, ImageError> {
     let value = value.ok_or(ImageError::MissingMetadata)?;
-    let parsed = value.parse::<u32>().map_err(|_| ImageError::InvalidProtocol)?;
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| ImageError::InvalidProtocol)?;
     validate_image_id(parsed)?;
     Ok(parsed)
 }
@@ -1421,7 +1415,9 @@ fn parse_cell_control(value: Option<&str>) -> Result<Option<u32>, ImageError> {
     if value == "auto" {
         return Ok(None);
     }
-    let parsed = value.parse::<u32>().map_err(|_| ImageError::InvalidDimensions)?;
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| ImageError::InvalidDimensions)?;
     (parsed > 0)
         .then_some(Some(parsed))
         .ok_or(ImageError::InvalidDimensions)
@@ -1493,15 +1489,32 @@ pub fn crop_kitty_image_line(line: &str, hidden_rows: usize, visible_rows: usize
 fn kitty_placement_from_line(line: &str, image_id: u32) -> Option<String> {
     let start = line.find(KITTY_PREFIX)?;
     let controls_start = start.checked_add(KITTY_PREFIX.len())?;
-    let controls_end = line.get(controls_start..)?.find(';')?.checked_add(controls_start)?;
+    let controls_end = line
+        .get(controls_start..)?
+        .find(';')?
+        .checked_add(controls_start)?;
     let controls = line.get(controls_start..controls_end)?;
     let mut placement = vec!["a=p".to_owned(), "q=2".to_owned()];
     for control in controls.split(',') {
         let key = control.split_once('=').map_or(control, |(key, _)| key);
         if matches!(
             key,
-            "i" | "p" | "x" | "y" | "w" | "h" | "X" | "Y" | "c" | "r" | "C" | "U" | "z"
-                | "P" | "Q" | "H" | "V"
+            "i" | "p"
+                | "x"
+                | "y"
+                | "w"
+                | "h"
+                | "X"
+                | "Y"
+                | "c"
+                | "r"
+                | "C"
+                | "U"
+                | "z"
+                | "P"
+                | "Q"
+                | "H"
+                | "V"
         ) {
             placement.push(control.to_owned());
         }
@@ -1512,7 +1525,10 @@ fn kitty_placement_from_line(line: &str, image_id: u32) -> Option<String> {
     Some(format!("{KITTY_PREFIX}{}\u{1b}\\", placement.join(",")))
 }
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "unit tests use contextual failure messages")]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
 mod tests {
     use super::*;
     use base64::Engine as _;
@@ -1603,10 +1619,7 @@ mod tests {
     fn delete_kitty_goldens() {
         assert_eq!(delete_kitty_image(42), "\u{1b}_Ga=d,d=I,i=42,q=2\u{1b}\\");
         assert_eq!(delete_all_kitty_images(), "\u{1b}_Ga=d,d=A,q=2\u{1b}\\");
-        assert_eq!(
-            delete_all_kitty_placements(),
-            "\u{1b}_Ga=d,d=a,q=2\u{1b}\\"
-        );
+        assert_eq!(delete_all_kitty_placements(), "\u{1b}_Ga=d,d=a,q=2\u{1b}\\");
     }
 
     #[test]
@@ -1926,9 +1939,11 @@ mod tests {
         assert_eq!(image.columns(), 2);
         assert_eq!(image.rows(), 3);
         assert_eq!(image.image_id(), Some(0x2222));
-        assert!(DocumentImage::try_from_line("plain text")
-            .expect("plain text classification")
-            .is_none());
+        assert!(
+            DocumentImage::try_from_line("plain text")
+                .expect("plain text classification")
+                .is_none()
+        );
         let malformed = line.trim_end_matches("\u{1b}\\");
         assert_eq!(
             DocumentImage::try_from_line(malformed),
