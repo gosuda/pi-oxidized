@@ -638,24 +638,10 @@ impl FullscreenViewport {
                 let emission = context
                     .image_cache
                     .emission_for(image, context.image_cache_output);
-                // A refused band (currently only a scrolled iTerm2 slice,
-                // which OSC 1337 cannot crop) degrades to the text fallback
-                // instead of failing the row: the viewport stays alive and
-                // the chrome below the band is left intact.
                 let Some(region) =
                     image.raw_region(image_area, image_row, usize::from(visible_rows), emission)
                 else {
-                    if let Some(text) = image.fallback_text() {
-                        paint_line(
-                            context.x,
-                            context.area.y.saturating_add(context.offset),
-                            usize::from(context.span_width),
-                            buf,
-                            text,
-                        );
-                    }
-                    context.previous_image = None;
-                    return Ok(false);
+                    return Err(crate::component::RowSourceError::InvalidImage);
                 };
                 mark_image_cells(buf, image_area);
                 crate::frame::push_raw_region(region);

@@ -369,11 +369,7 @@ impl DocumentImage {
                     Some(kitty_placement_from_line(&cropped, self.image_id?)?.into_bytes())
                 }
             }
-            // iTerm2 carries no source-rect control, so a partial slice cannot
-            // be cropped. Refuse the region; the caller paints the text
-            // fallback instead of emitting the whole bitmap over the band.
-            ImageProtocol::ITerm2 if hidden_rows == 0 => Some(self.sequence.to_vec()),
-            ImageProtocol::ITerm2 => None,
+            ImageProtocol::ITerm2 => Some(self.sequence.to_vec()),
         }
     }
 
