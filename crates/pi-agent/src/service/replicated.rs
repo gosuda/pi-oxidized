@@ -627,8 +627,8 @@ impl MutableReplicatedState {
             }
             DispatchRoute::Queued => {}
         }
-        let listeners = Arc::clone(&self.listeners);
-        let inner = Arc::clone(&self.inner);
+        let listeners = Arc::downgrade(&self.listeners);
+        let inner = Arc::downgrade(&self.inner);
         let closed = Arc::new(AtomicBool::new(false));
         Ok(Arc::new(move || {
             // Idempotent: a second call must neither re-tombstone (the id
@@ -636,6 +636,12 @@ impl MutableReplicatedState {
             if closed.swap(true, Ordering::AcqRel) {
                 return;
             }
+            // Weak captures: a listener holding its own remove handle must
+            // not keep the state alive.  If the state is gone, the tombstone
+            // is moot.  Lock order matches dispatch: inner, then listeners.
+            let (Some(inner), Some(listeners)) = (inner.upgrade(), listeners.upgrade()) else {
+                return;
+            };
             // One hold, one map op: a dispatched listener is removed, an
             // undispatched hydration is tombstoned.  Split holds would let a
             // dispatch slip between the map check and the tombstone and
