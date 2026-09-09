@@ -1,12 +1,14 @@
 use std::sync::{Arc, Weak};
 
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use super::{ClientCore, ClientError, ConnectionState, lock};
 use crate::remote::codec::{ServerMessageDecoder, encode_client_message};
 use crate::remote::framing::FrameDecoderOptions;
 use crate::remote::schemas::{ClientMessage, PROTOCOL_VERSION, ServerHello, ServerMessage};
-use crate::remote::transport::{ByteTransport, ByteTransportFactory, ByteTransportHandlers, TransportError};
+use crate::remote::transport::{
+    ByteTransport, ByteTransportFactory, ByteTransportHandlers, TransportError,
+};
 
 pub(super) struct ConnectionOptions {
     pub factory: ByteTransportFactory,
@@ -29,6 +31,7 @@ struct State {
     decoder: ServerMessageDecoder,
     handshake: Option<oneshot::Sender<Result<ServerHello, ClientError>>>,
 }
+type HandshakeReceiver = oneshot::Receiver<Result<ServerHello, ClientError>>;
 
 pub(super) struct Connection {
     pub id: u64,
@@ -39,17 +42,32 @@ pub(super) struct Connection {
 }
 
 impl Connection {
-    pub fn new(id: u64, options: ConnectionOptions, core: Weak<ClientCore>) -> Result<(Arc<Self>, oneshot::Receiver<Result<ServerHello, ClientError>>), ClientError> {
-        let decoder = ServerMessageDecoder::new(Some(FrameDecoderOptions { max_frame_length: options.max_frame_length }))?;
+    pub fn new(
+        id: u64,
+        options: ConnectionOptions,
+        core: Weak<ClientCore>,
+    ) -> Result<(Arc<Self>, HandshakeReceiver), ClientError> {
+        let decoder = ServerMessageDecoder::new(Some(FrameDecoderOptions {
+            max_frame_length: options.max_frame_length,
+        }))?;
         let (tx, rx) = oneshot::channel();
-        Ok((Arc::new(Self { id, options, core, shutdown: Arc::new(Notify::new()), state: std::sync::Mutex::new(State {
-            lifecycle: ConnectionLifecycle::Connecting,
-            transport: None,
-            sender: None,
-            hello_sent: false,
-            decoder,
-            handshake: Some(tx),
-        }) }), rx))
+        Ok((
+            Arc::new(Self {
+                id,
+                options,
+                core,
+                shutdown: Arc::new(Notify::new()),
+                state: std::sync::Mutex::new(State {
+                    lifecycle: ConnectionLifecycle::Connecting,
+                    transport: None,
+                    sender: None,
+                    hello_sent: false,
+                    decoder,
+                    handshake: Some(tx),
+                }),
+            }),
+            rx,
+        ))
     }
 
     pub fn state(&self) -> ConnectionState {
@@ -63,14 +81,26 @@ impl Connection {
     pub fn fail(&self, error: ClientError) {
         let (transport, handshake, sender) = {
             let mut state = lock(&self.state);
-            if matches!(state.lifecycle, ConnectionLifecycle::Disconnected) { return; }
+            if matches!(state.lifecycle, ConnectionLifecycle::Disconnected) {
+                return;
+            }
             state.lifecycle = ConnectionLifecycle::Disconnected;
-            (state.transport.take(), state.handshake.take(), state.sender.take())
+            (
+                state.transport.take(),
+                state.handshake.take(),
+                state.sender.take(),
+            )
         };
         drop(sender);
-        if let Some(core) = self.core.upgrade() { core.on_disconnected(self.id, error.clone()); }
-        if let Some(handshake) = handshake { let _ = handshake.send(Err(error)); }
-        if let Some(transport) = transport { transport.close(); }
+        if let Some(core) = self.core.upgrade() {
+            core.on_disconnected(self.id, error.clone());
+        }
+        if let Some(handshake) = handshake {
+            let _ = handshake.send(Err(error));
+        }
+        if let Some(transport) = transport {
+            transport.close();
+        }
     }
 
     pub fn send(&self, message: &ClientMessage) -> Result<(), ClientError> {
@@ -90,13 +120,12 @@ impl Connection {
                 .clone()
                 .ok_or_else(|| ClientError::disconnected("Transport writer unavailable"))?
         };
-        match sender.send(frame) {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                let error = ClientError::disconnected("Transport writer closed");
-                self.fail(error.clone());
-                Err(error)
-            }
+        if let Ok(()) = sender.send(frame) {
+            Ok(())
+        } else {
+            let error = ClientError::disconnected("Transport writer closed");
+            self.fail(error.clone());
+            Err(error)
         }
     }
 
@@ -109,14 +138,26 @@ impl Connection {
         }
         let messages = {
             let mut state = lock(&self.state);
-            if matches!(state.lifecycle, ConnectionLifecycle::Disconnected) { return; }
-            if matches!(state.lifecycle, ConnectionLifecycle::Connecting) && !state.hello_sent {
-                Err(ClientError::protocol("Received server data before client hello"))
-            } else if state.transport.is_none() {
-                Err(ClientError::protocol("Received server data before client hello"))
-            } else { state.decoder.push(chunk).map_err(ClientError::from) }
+            if matches!(state.lifecycle, ConnectionLifecycle::Disconnected) {
+                return;
+            }
+            let handshake_pending =
+                matches!(state.lifecycle, ConnectionLifecycle::Connecting) && !state.hello_sent;
+            if handshake_pending || state.transport.is_none() {
+                Err(ClientError::protocol(
+                    "Received server data before client hello",
+                ))
+            } else {
+                state.decoder.push(chunk).map_err(ClientError::from)
+            }
         };
-        let messages = match messages { Ok(messages) => messages, Err(error) => { self.fail(error); return; } };
+        let messages = match messages {
+            Ok(messages) => messages,
+            Err(error) => {
+                self.fail(error);
+                return;
+            }
+        };
         for message in messages {
             if !core.is_current(self.id) {
                 return;
@@ -133,7 +174,9 @@ impl Connection {
                         }
                         ServerMessage::HelloError { error } => {
                             if error.code.is_empty() {
-                                self.fail(ClientError::protocol("Handshake error has an empty code"));
+                                self.fail(ClientError::protocol(
+                                    "Handshake error has an empty code",
+                                ));
                             } else {
                                 self.fail(error.into());
                             }
@@ -163,8 +206,15 @@ impl Connection {
                     }
                 }
                 ConnectionState::Connected => match message {
-                    ServerMessage::Hello { .. } | ServerMessage::HelloError { .. } => { self.fail(ClientError::protocol("Unexpected handshake message")); return; }
-                    message => if let Some(core) = self.core.upgrade() { core.on_message(self.id, message); },
+                    ServerMessage::Hello { .. } | ServerMessage::HelloError { .. } => {
+                        self.fail(ClientError::protocol("Unexpected handshake message"));
+                        return;
+                    }
+                    message => {
+                        if let Some(core) = self.core.upgrade() {
+                            core.on_message(self.id, message);
+                        }
+                    }
                 },
             }
         }
@@ -212,9 +262,10 @@ impl ByteTransportHandlers for ConnHandlers {
                 let mut state = lock(&connection.state);
                 state.decoder.end()
             };
-            let error = decoder_result
-                .err()
-                .map_or_else(|| ClientError::disconnected("Byte transport closed"), ClientError::from);
+            let error = decoder_result.err().map_or_else(
+                || ClientError::disconnected("Byte transport closed"),
+                ClientError::from,
+            );
             connection.fail(error);
         }
     }
@@ -255,7 +306,7 @@ pub(super) async fn open_transport(connection: Arc<Connection>) {
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown.notified() => {
+                () = shutdown.notified() => {
                     transport.close();
                     break;
                 }

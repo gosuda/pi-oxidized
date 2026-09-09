@@ -35,14 +35,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-use crate::remote::framing::DEFAULT_MAX_FRAME_LENGTH;
-use crate::remote::schemas::ServerId;
-use crate::remote::transport::TransportError;
 use super::{
     ByteConnection, ConnectionAcceptor, ConnectionHandler, ListenSpec, ListenerError, Server,
     ServerErrorHandler, ServerHost, ServerListener, ServerOptions, ServerOptionsError,
     build_listener,
 };
+use crate::remote::framing::DEFAULT_MAX_FRAME_LENGTH;
+use crate::remote::schemas::ServerId;
+use crate::remote::transport::TransportError;
 
 /// Default socket mode (owner read/write only).
 pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
@@ -62,7 +62,7 @@ const MAX_UNIX_SOCKET_PATH_BYTES: usize = if cfg!(target_os = "linux") { 107 } e
 const CLOSE_SETTLE_TIMEOUT_MS: u64 = 5_000;
 /// Derives the public Unix socket path for one canonical server identity.
 ///
-/// `ServerId` has already enforced the lowercase UUIDv4 wire spelling, so the
+/// `ServerId` has already enforced the lowercase `UUIDv4` wire spelling, so the
 /// helper can append the source-compatible `.sock` suffix without accepting a
 /// second, unchecked string identity.
 #[must_use]
@@ -115,7 +115,10 @@ pub enum UnixListenerOptionsError {
     /// The socket path is the empty string.
     EmptyPath,
     /// The socket path exceeds the platform's `sun_path` budget.
-    PathTooLong { max: usize },
+    PathTooLong {
+        /// Maximum allowed path length in UTF-8 bytes.
+        max: usize,
+    },
     /// The socket mode is outside `0o000..=0o777`.
     InvalidMode,
     /// The frame bound is outside the protocol range.
@@ -131,18 +134,29 @@ impl std::fmt::Display for UnixListenerOptionsError {
         match self {
             Self::EmptyPath => formatter.write_str("unix listener path must not be empty"),
             Self::PathTooLong { max } => {
-                write!(formatter, "unix listener path is too long; maximum is {max} UTF-8 bytes")
+                write!(
+                    formatter,
+                    "unix listener path is too long; maximum is {max} UTF-8 bytes"
+                )
             }
-            Self::InvalidMode => formatter.write_str("unix listener mode must be between 0o000 and 0o777"),
-            Self::InvalidMaxFrameLength => formatter.write_str("unix listener maxFrameLength is invalid"),
-            Self::InvalidMaxPendingBytes => formatter.write_str("unix listener maxPendingBytes must be at least maxFrameLength + 4"),
-            Self::InvalidGracefulTimeout => formatter.write_str("unix listener gracefulCloseTimeoutMs must be positive"),
+            Self::InvalidMode => {
+                formatter.write_str("unix listener mode must be between 0o000 and 0o777")
+            }
+            Self::InvalidMaxFrameLength => {
+                formatter.write_str("unix listener maxFrameLength is invalid")
+            }
+            Self::InvalidMaxPendingBytes => formatter
+                .write_str("unix listener maxPendingBytes must be at least maxFrameLength + 4"),
+            Self::InvalidGracefulTimeout => {
+                formatter.write_str("unix listener gracefulCloseTimeoutMs must be positive")
+            }
         }
     }
 }
 
 impl std::error::Error for UnixListenerOptionsError {}
 
+/// Options for [`create_server`], combining server and Unix listener settings.
 #[derive(Clone)]
 pub struct UnixServerOptions {
     /// Socket path.
@@ -166,6 +180,10 @@ pub struct UnixServerOptions {
 }
 
 impl Default for UnixServerOptions {
+    #[expect(
+        clippy::expect_used,
+        reason = "the built-in server id is a canonical UUIDv4 literal"
+    )]
     fn default() -> Self {
         Self {
             path: PathBuf::new(),
@@ -196,6 +214,7 @@ impl std::fmt::Debug for UnixServerOptions {
     }
 }
 
+/// Failure while constructing a Unix-domain [`Server`].
 #[derive(Debug)]
 pub enum UnixServerError {
     /// The listen spec was rejected (typed shared owner).
@@ -228,6 +247,13 @@ impl std::error::Error for UnixServerError {}
 // ---------------------------------------------------------------------------
 
 /// Composes [`Server`] with one Unix-domain socket listener.
+///
+/// # Errors
+///
+/// Returns [`UnixServerError::Spec`] or [`UnixServerError::Options`] when the
+/// socket specification or listener options are invalid, respectively. It
+/// returns [`UnixServerError::Server`] when the composed server options are
+/// invalid.
 pub fn create_server<H: ServerHost>(
     host: Arc<H>,
     options: UnixServerOptions,
@@ -302,6 +328,11 @@ fn validate_options(
     Ok(())
 }
 
+/// Creates a Unix-domain listener from the supplied options.
+///
+/// Invalid options are reported as [`ListenerError::Io`] when the listener is
+/// started because the [`ServerListener`] construction surface is infallible.
+#[must_use]
 pub fn create_listener(options: UnixListenerOptions) -> Arc<dyn ServerListener> {
     let max_frame_length = options.max_frame_length.unwrap_or(DEFAULT_MAX_FRAME_LENGTH);
     let max_pending_bytes = options
@@ -485,7 +516,8 @@ impl ListenerRunner {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|error| ListenerError::Io(error.to_string()))?;
-            let _ = tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await;
+            let _ =
+                tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await;
         }
         remove_stale_socket(path).await?;
         let listener =
@@ -500,7 +532,9 @@ impl ListenerRunner {
             )));
         }
         *lock(&self.identity_tx.0) = Some((metadata.dev(), metadata.ino()));
-        let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(self.options.mode)).await;
+        let _ =
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(self.options.mode))
+                .await;
         Ok(listener)
     }
 
@@ -534,7 +568,6 @@ impl ListenerRunner {
         }
         self.cleanup_owned_socket();
         *lock(&self.closed) = true;
-
     }
     /// Unlinks the socket only while its identity still matches the
     /// bound one (port of `cleanupOwnedSocket`, simplified to a
@@ -633,11 +666,7 @@ impl PendingBytesReservation {
     /// Attempts to reserve `bytes` from `pending` without exceeding `max`.
     /// Returns `Some(...)` if the reservation was made, `None` if the budget
     /// would be exceeded (or the addition would overflow).
-    fn try_reserve(
-        pending: &Arc<AtomicUsize>,
-        bytes: usize,
-        max: usize,
-    ) -> Option<Self> {
+    fn try_reserve(pending: &Arc<AtomicUsize>, bytes: usize, max: usize) -> Option<Self> {
         if bytes == 0 {
             return Some(Self {
                 pending: Arc::clone(pending),
@@ -650,12 +679,7 @@ impl PendingBytesReservation {
             if next > max {
                 return None;
             }
-            match pending.compare_exchange_weak(
-                current,
-                next,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match pending.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
                 Ok(_) => {
                     return Some(Self {
                         pending: Arc::clone(pending),
@@ -809,11 +833,7 @@ impl ByteConnection for UnixServerConnection {
             task
         };
         tokio::spawn(task);
-        Box::pin(async move {
-            receiver
-                .await
-                .unwrap_or(Err(TransportError::Closed))
-        })
+        Box::pin(async move { receiver.await.unwrap_or(Err(TransportError::Closed)) })
     }
 
     fn close(
@@ -866,11 +886,7 @@ impl ByteConnection for UnixServerConnection {
             task
         };
         tokio::spawn(task);
-        Box::pin(async move {
-            receiver
-                .await
-                .unwrap_or(Err(TransportError::Closed))
-        })
+        Box::pin(async move { receiver.await.unwrap_or(Err(TransportError::Closed)) })
     }
 }
 impl PartialEq for UnixServerConnection {

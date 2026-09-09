@@ -3,7 +3,7 @@
 //! experimental entrypoint.
 
 use super::command_options::{
-    AUTH_TOKEN_FILE_OPTION, AUTH_TOKEN_OPTION, CONNECT, CONNECT_OPTION, AuthInput, OptionSpec,
+    AUTH_TOKEN_FILE_OPTION, AUTH_TOKEN_OPTION, AuthInput, CONNECT, CONNECT_OPTION, OptionSpec,
     TransportAddress, parse_auth, parse_options, parse_text, unsupported_options,
 };
 
@@ -55,6 +55,11 @@ const CLIENT_OPTIONS: [OptionSpec; 11] = [
 
 /// Parses the arguments following the `client` command name
 /// (source `clientCommand` builder).
+///
+/// # Errors
+///
+/// Returns a `Vec<String>` of human-readable validation errors when the
+/// arguments are invalid or mutually exclusive.
 pub fn parse_client_command(args: &[String]) -> Result<ClientCommand, Vec<String>> {
     let input = parse_options(args, &CLIENT_OPTIONS);
     let mut errors = input.errors().to_vec();
@@ -68,6 +73,14 @@ pub fn parse_client_command(args: &[String]) -> Result<ClientCommand, Vec<String
     let model = input.first_text(MODEL).map(str::to_owned);
     let plugin_packages = input.all_text(PLUGIN_PACKAGE);
     let remaining_args = input.remaining_args();
+    // A lone `--` is only the prompt separator with no prompt word behind
+    // it: it carries no option meaning and must not trip the unsupported
+    // path below.
+    let remaining_args: &[String] = if remaining_args == ["--"] {
+        &[]
+    } else {
+        remaining_args
+    };
     let prompt_args: &[String] = if remaining_args.first().map(String::as_str) == Some("--") {
         &remaining_args[1..]
     } else {
@@ -121,6 +134,10 @@ mod tests {
         values.iter().copied().map(str::to_owned).collect()
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "test assertion: parse must succeed for this valid invocation"
+    )]
     #[test]
     fn accepts_explicit_session_with_double_dash_prompt() {
         let command = match parse_client_command(&strings(&[
@@ -171,6 +188,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "test assertion: parse must succeed for this valid invocation"
+    )]
     #[test]
     fn double_dash_prompt_keeps_leading_dash_but_bare_dash_prefix_is_unsupported() {
         let dashed = match parse_client_command(&strings(&["--", "-weird"])) {
@@ -181,11 +202,16 @@ mod tests {
         assert_eq!(
             parse_client_command(&strings(&["-weird"])),
             Err(vec![
-                "The experimental client command does not support existing CLI options yet".to_owned()
+                "The experimental client command does not support existing CLI options yet"
+                    .to_owned()
             ])
         );
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "test assertion: parse must succeed for this valid invocation"
+    )]
     #[test]
     fn lone_double_dash_yields_no_prompt() {
         let command = match parse_client_command(&strings(&["--"])) {
@@ -210,7 +236,8 @@ mod tests {
         assert_eq!(
             parse_client_command(&strings(&["hello", "world"])),
             Err(vec![
-                "The experimental client command does not support existing CLI options yet".to_owned()
+                "The experimental client command does not support existing CLI options yet"
+                    .to_owned()
             ])
         );
         assert_eq!(

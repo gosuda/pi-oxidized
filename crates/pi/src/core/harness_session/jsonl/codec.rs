@@ -35,7 +35,10 @@ pub struct JsonlStorageHeader {
     #[serde(rename = "parentSessionId", skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     /// Legacy parent path retained when importing a v3 session.
-    #[serde(rename = "legacyParentSessionPath", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "legacyParentSessionPath",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub legacy_parent_session_path: Option<String>,
     /// Sequence high-water mark retained by snapshot rewrites.
     #[serde(rename = "nextSeq", skip_serializing_if = "Option::is_none")]
@@ -70,11 +73,22 @@ pub enum ParsedHeader {
     LegacyV3(LegacyV3Header),
 }
 
-fn failure(code: StorageErrorCode, message: impl Into<String>, source: Option<Arc<dyn std::error::Error + Send + Sync>>) -> SessionError {
-    SessionError::Backend(StorageFailure { code, message: message.into(), source })
+fn failure(
+    code: StorageErrorCode,
+    message: impl Into<String>,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
+) -> SessionError {
+    SessionError::Backend(StorageFailure {
+        code,
+        message: message.into(),
+        source,
+    })
 }
 
-fn invalid_header(message: impl Into<String>, source: Option<Arc<dyn std::error::Error + Send + Sync>>) -> SessionError {
+fn invalid_header(
+    message: impl Into<String>,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
+) -> SessionError {
     failure(StorageErrorCode::InvalidHeader, message, source)
 }
 
@@ -84,6 +98,11 @@ fn invalid_header(message: impl Into<String>, source: Option<Arc<dyn std::error:
 /// older than this implementation; the open path performs that explicit
 /// version gate so callers can distinguish malformed headers from unsupported
 /// storage layouts.
+///
+/// # Errors
+///
+/// Returns `InvalidHeader` for malformed JSON, an unrecognized header shape, or
+/// invalid header fields or timestamps.
 pub fn parse_header(line: &str) -> Result<ParsedHeader, SessionError> {
     let value: Value = serde_json::from_str(line).map_err(|error| {
         invalid_header(
@@ -98,11 +117,14 @@ pub fn parse_header(line: &str) -> Result<ParsedHeader, SessionError> {
     if object.get("kind").and_then(Value::as_str) == Some("header")
         && object.get("v").and_then(Value::as_u64) == Some(u64::from(JSONL_FORMAT_VERSION))
     {
-        let header: JsonlStorageHeader = serde_json::from_value(value.clone()).map_err(|error| {
-            invalid_header("invalid JSONL session header", Some(Arc::new(error)))
-        })?;
+        let header: JsonlStorageHeader =
+            serde_json::from_value(value.clone()).map_err(|error| {
+                invalid_header("invalid JSONL session header", Some(Arc::new(error)))
+            })?;
         let created_at = u64::try_from(header.created_at).ok();
-        let next_seq_safe = header.next_seq.is_none_or(|next_seq| next_seq <= MAX_SAFE_INTEGER);
+        let next_seq_safe = header
+            .next_seq
+            .is_none_or(|next_seq| next_seq <= MAX_SAFE_INTEGER);
         if header.v != JSONL_FORMAT_VERSION
             || header.kind != "header"
             || header.storage_version == 0
@@ -121,15 +143,19 @@ pub fn parse_header(line: &str) -> Result<ParsedHeader, SessionError> {
         && object.get("id").is_some_and(Value::is_string)
         && object.get("cwd").is_some_and(Value::is_string)
         && object.get("timestamp").is_some_and(Value::is_string)
-        && object
-            .get("parentSession")
-            .is_none_or(|parent| parent.is_string())
+        && object.get("parentSession").is_none_or(Value::is_string)
     {
         let header: LegacyV3Header = serde_json::from_value(value).map_err(|error| {
-            invalid_header("invalid legacy v3 JSONL session header", Some(Arc::new(error)))
+            invalid_header(
+                "invalid legacy v3 JSONL session header",
+                Some(Arc::new(error)),
+            )
         })?;
         if header.timestamp.parse::<jiff::Timestamp>().is_err() {
-            return Err(invalid_header("invalid legacy v3 JSONL session header", None));
+            return Err(invalid_header(
+                "invalid legacy v3 JSONL session header",
+                None,
+            ));
         }
         return Ok(ParsedHeader::LegacyV3(header));
     }
@@ -137,7 +163,10 @@ pub fn parse_header(line: &str) -> Result<ParsedHeader, SessionError> {
     Err(invalid_header("invalid JSONL session header", None))
 }
 
-fn wire_corrupt(message: impl Into<String>, source: Option<Arc<dyn std::error::Error + Send + Sync>>) -> SessionError {
+fn wire_corrupt(
+    message: impl Into<String>,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
+) -> SessionError {
     failure(StorageErrorCode::Corrupt, message, source)
 }
 
@@ -156,6 +185,11 @@ fn validate_committed_wire(write: &CommittedWrite) -> Result<(), SessionError> {
 }
 
 /// Parses one transaction line, accepting either one write object or an array.
+///
+/// # Errors
+///
+/// Returns `Corrupt` for malformed JSON or writes with invalid fields, sequence
+/// numbers, or timestamps.
 pub fn parse_transaction(line: &str) -> Result<Vec<CommittedWrite>, SessionError> {
     let value: Value = serde_json::from_str(line).map_err(|error| {
         wire_corrupt(
@@ -184,6 +218,16 @@ pub fn parse_transaction(line: &str) -> Result<Vec<CommittedWrite>, SessionError
 /// use an array. `CommittedWrite` contains only JSON values whose serialization
 /// is infallible in practice, so a serialization failure is treated as a
 /// violated internal invariant rather than emitted as a malformed record.
+///
+/// # Panics
+///
+/// Panics if serialization violates the internal invariant that committed
+/// writes contain only JSON-serializable values.
+#[must_use]
+#[expect(
+    clippy::expect_used,
+    reason = "the String-returning API preserves invariant panics; committed writes contain only JSON-serializable values"
+)]
 pub fn serialize_transaction(writes: &[CommittedWrite]) -> String {
     if writes.len() == 1 {
         serde_json::to_string(&writes[0]).expect("committed JSONL writes must serialize")
@@ -194,9 +238,15 @@ pub fn serialize_transaction(writes: &[CommittedWrite]) -> String {
 
 /// Splits a file into complete newline-terminated records and reports a torn
 /// final record. Empty content has no complete lines and is considered torn.
+#[must_use]
 pub fn split_complete_lines(content: &str) -> (Vec<&str>, bool) {
     if content.ends_with('\n') {
-        return (content[..content.len().saturating_sub(1)].split('\n').collect(), false);
+        return (
+            content[..content.len().saturating_sub(1)]
+                .split('\n')
+                .collect(),
+            false,
+        );
     }
     let Some(last_newline) = content.rfind('\n') else {
         return (Vec::new(), true);
@@ -208,15 +258,27 @@ pub fn split_complete_lines(content: &str) -> (Vec<&str>, bool) {
 ///
 /// The temporary file is removed after every failed stage. The caller owns the
 /// serialized content and must include its final newline.
+///
+/// # Errors
+///
+/// Returns `Io` if creating directories, opening, writing, flushing, or renaming
+/// the temporary file fails.
 pub fn publish_file_atomically(path: &Path, content: &str) -> Result<(), SessionError> {
     let mut temp_path = path.as_os_str().to_os_string();
     temp_path.push(".tmp");
     let temp_path = PathBuf::from(temp_path);
     let result = (|| -> io::Result<()> {
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&temp_path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)?;
         file.write_all(content.as_bytes())?;
         file.flush()?;
         drop(file);
@@ -236,8 +298,16 @@ pub fn publish_file_atomically(path: &Path, content: &str) -> Result<(), Session
 }
 
 /// Checks cancellation before an owned blocking file operation starts.
+///
+/// # Errors
+///
+/// Returns `Aborted` if the context has been cancelled.
 pub fn check_context(cx: &Context) -> Result<(), SessionError> {
     cx.check().map_err(|error| {
-        failure(StorageErrorCode::Aborted, "operation cancelled", Some(Arc::new(error)))
+        failure(
+            StorageErrorCode::Aborted,
+            "operation cancelled",
+            Some(Arc::new(error)),
+        )
     })
 }

@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures::stream::{self, BoxStream};
 use futures::future::{BoxFuture, FutureExt};
+use futures::stream::{self, BoxStream};
 // Config-value resolution has exactly one owner: `pi_ai::auth::config_value`
 // (one parser, one process-wide command cache). The historical
 // `pi::core::config_value` HashMap-shaped wrapper had zero internal callers
@@ -22,6 +22,9 @@ use pi_ai::auth::config_value::{
     is_config_value_configured, resolve_config_value, resolve_headers,
 };
 use pi_ai::auth::context::{DefaultAuthContext, overlay_env_auth_context};
+use pi_ai::auth::oauth::radius::{
+    DEFAULT_RADIUS_GATEWAY, RadiusOAuth, RadiusOAuthOptions, normalize_radius_gateway_url,
+};
 use pi_ai::auth::resolve::resolve_provider_auth_with_signal;
 use pi_ai::auth::{
     AMBIENT_AUTH_MARKER, AuthCheck, AuthContext, AuthInteraction, AuthResolutionOverrides,
@@ -29,25 +32,22 @@ use pi_ai::auth::{
     InMemoryCredentialStore, ModelAuth, ModelsError, ModelsErrorCode, OAuthAuth, ProviderEnv,
     RuntimeCredentials, default_provider_auth, find_env_keys, get_env_api_key,
 };
-use pi_ai::auth::oauth::radius::{
-    normalize_radius_gateway_url, RadiusOAuth, RadiusOAuthOptions, DEFAULT_RADIUS_GATEWAY,
-};
 use pi_ai::catalog::{BuiltinModels, ModelsStoreEntry, builtin_models};
 use pi_ai::models_store::{
     FileModelsStore, InMemoryModelsStore, ModelOverrides, ModelsStore, apply_model_overrides,
     compose_provider_models, models_error_from_catalog,
 };
-use pi_ai::radius_config::{
-    RadiusCatalogError, RadiusCatalogLoader, get_radius_models, get_radius_models_from_config,
-};
 use pi_ai::provider::{
-    CancelDeferredFn, DeferredCallbacks, FetchDeferredFn, Provider, ProviderError,
-    StreamOptionKey, StreamOptions,
+    CancelDeferredFn, DeferredCallbacks, FetchDeferredFn, Provider, ProviderError, StreamOptionKey,
+    StreamOptions,
 };
 use pi_ai::providers::{
     AnthropicMessages, AzureOpenAiResponses, BedrockConverseStream, DefaultBedrockClientFactory,
     GoogleGenerativeAi, GoogleVertex, MistralConversations, OpenAiCodexResponses,
     OpenAiCompletions, OpenAiResponses, PiMessages, ProviderRegistry,
+};
+use pi_ai::radius_config::{
+    RadiusCatalogError, RadiusCatalogLoader, get_radius_models, get_radius_models_from_config,
 };
 use pi_ai::types::{
     AssistantMessageEvent, Context, DeferredHandle, Model, ModelCost, ModelInput,
@@ -357,10 +357,7 @@ impl RuntimeDeferredCallbacks {
                     return Box::pin(stream::once(async {
                         Err(ProviderError::new("model runtime unavailable"))
                     }))
-                        as BoxStream<
-                            'static,
-                            Result<AssistantMessageEvent, ProviderError>,
-                        >;
+                        as BoxStream<'static, Result<AssistantMessageEvent, ProviderError>>;
                 };
                 ModelRuntime { inner }.fetch_deferred(model, handle, options)
             })
@@ -477,19 +474,20 @@ impl ModelRuntime {
             .cloned()
             .map_err(|error| models_error_from_catalog(&error))?;
 
-        let credentials: Arc<dyn CredentialStore> = match options.credentials {
-            Some(credentials) => credentials,
-            None if options.auth_path.is_none() => Arc::new(InMemoryCredentialStore::new()),
-            None => {
-                let path = options
-                    .auth_path
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from("auth.json"));
-                Arc::new(FileCredentialStore::new(path).map_err(|error| {
-                    ModelsError::new(ModelsErrorCode::Auth, error.to_string())
-                })?)
-            }
-        };
+        let credentials: Arc<dyn CredentialStore> =
+            match options.credentials {
+                Some(credentials) => credentials,
+                None if options.auth_path.is_none() => Arc::new(InMemoryCredentialStore::new()),
+                None => {
+                    let path = options
+                        .auth_path
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("auth.json"));
+                    Arc::new(FileCredentialStore::new(path).map_err(|error| {
+                        ModelsError::new(ModelsErrorCode::Auth, error.to_string())
+                    })?)
+                }
+            };
         let credentials = RuntimeCredentials::new(credentials);
 
         let models_path = options.models_path.clone();
@@ -1264,10 +1262,7 @@ impl ModelRuntime {
                 if !self.is_radius_provider(provider_id) {
                     continue;
                 }
-                match self
-                    .refresh_radius_catalog(provider_id, signal)
-                    .await
-                {
+                match self.refresh_radius_catalog(provider_id, signal).await {
                     Ok(()) => {
                         errors.remove(provider_id);
                     }
@@ -1291,16 +1286,27 @@ impl ModelRuntime {
             });
         }
 
+        Ok(self
+            .refresh_provider_availability(&target_ids, signal, errors)
+            .await)
+    }
+
+    async fn refresh_provider_availability(
+        &self,
+        target_ids: &[String],
+        signal: Option<&CancellationToken>,
+        errors: BTreeMap<String, String>,
+    ) -> ModelsRefreshResult {
         // Probe availability for each target provider individually so errors
         // are recorded per-provider rather than aborting the whole refresh.
         let mut auth = HashMap::new();
         let mut configured = BTreeSet::new();
-        for provider_id in &target_ids {
+        for provider_id in target_ids {
             if signal.is_some_and(CancellationToken::is_cancelled) {
-                return Ok(ModelsRefreshResult {
+                return ModelsRefreshResult {
                     aborted: true,
                     errors,
-                });
+                };
             }
             let check = self.probe_auth(provider_id).await;
             if check.is_some() {
@@ -1335,7 +1341,7 @@ impl ModelRuntime {
         // providers, overlay the new results for target providers.
         {
             let mut snapshot = lock(&self.inner.snapshot);
-            for provider_id in &target_ids {
+            for provider_id in target_ids {
                 snapshot.auth.insert(
                     provider_id.clone(),
                     auth.get(provider_id).cloned().flatten(),
@@ -1371,10 +1377,10 @@ impl ModelRuntime {
         }
         *lock(&self.inner.availability_error) = None;
 
-        Ok(ModelsRefreshResult {
+        ModelsRefreshResult {
             aborted: false,
             errors,
-        })
+        }
     }
     fn provider_auth(&self, provider_id: &str) -> pi_ai::auth::ProviderAuth {
         let handler = self
@@ -1386,10 +1392,7 @@ impl ModelRuntime {
         default_provider_auth(provider_id, handler)
     }
 
-    fn radius_oauth_handler(
-        &self,
-        provider_id: &str,
-    ) -> Option<Arc<dyn OAuthAuth>> {
+    fn radius_oauth_handler(&self, provider_id: &str) -> Option<Arc<dyn OAuthAuth>> {
         if !self.is_radius_provider(provider_id) {
             return None;
         }
@@ -1404,7 +1407,9 @@ impl ModelRuntime {
     }
 
     fn radius_config(&self, provider_id: &str) -> Option<ProviderConfigInput> {
-        let extension = lock(&self.inner.extension_providers).get(provider_id).cloned();
+        let extension = lock(&self.inner.extension_providers)
+            .get(provider_id)
+            .cloned();
         if extension
             .as_ref()
             .is_some_and(|config| config.oauth.as_deref() == Some("radius"))
@@ -2377,19 +2382,15 @@ impl Provider for ModelRuntime {
                         prepared
                             .options
                             .insert_extra(StreamOptionKey::WAIT, Value::from(0_u64));
-                        let provider =
-                            runtime.select_deferred_provider(&prepared.model, native);
+                        let provider = runtime.select_deferred_provider(&prepared.model, native);
                         provider.fetch_deferred(&prepared.model, handle, prepared.options)
                     }
                     Err(error) => {
                         let message = error.to_string();
-                        Box::pin(stream::once(async move {
-                            Err(ProviderError::new(message))
-                        }))
-                            as BoxStream<
-                                'static,
-                                Result<AssistantMessageEvent, ProviderError>,
-                            >
+                        Box::pin(stream::once(
+                            async move { Err(ProviderError::new(message)) },
+                        ))
+                            as BoxStream<'static, Result<AssistantMessageEvent, ProviderError>>
                     }
                 }
             }
@@ -2838,7 +2839,7 @@ fn radius_catalog_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
-            duration.as_millis().min(i64::MAX as u128) as i64
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
         })
 }
 
@@ -2852,6 +2853,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use crate::core::settings::{Settings, SettingsManagerCreateOptions};
+    use pi_agent::harness::api::HarnessModels;
+    use pi_ai::Provider;
     use pi_ai::auth::OAuthCredential;
     use pi_ai::types::{AssistantMessage, DeferredHandle, DoneReason, StopReason};
     use serde_json::json;
@@ -2859,28 +2862,22 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use pi_agent::harness::api::HarnessModels;
-    use pi_ai::Provider;
 
     async fn spawn_http_fixture(
         expected_requests: usize,
-    ) -> (
+    ) -> std::io::Result<(
         String,
         Arc<Mutex<Vec<String>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("bind local HTTP fixture");
-        let address = listener.local_addr().expect("fixture address");
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    )> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&requests);
         let task = tokio::spawn(async move {
             for _ in 0..expected_requests {
-                let (mut socket, _) = listener.accept().await.expect("accept fixture request");
-                let request = read_fixture_request(&mut socket)
-                    .await
-                    .expect("read fixture request");
+                let (mut socket, _) = listener.accept().await?;
+                let request = read_fixture_request(&mut socket).await?;
                 lock(&captured).push(request);
                 let body = r#"{"ok":true}"#;
                 let response = format!(
@@ -2888,13 +2885,11 @@ mod tests {
                     body.len(),
                     body
                 );
-                socket
-                    .write_all(response.as_bytes())
-                    .await
-                    .expect("write fixture response");
+                socket.write_all(response.as_bytes()).await?;
             }
+            Ok(())
         });
-        (format!("http://{address}"), requests, task)
+        Ok((format!("http://{address}"), requests, task))
     }
 
     async fn read_fixture_request(socket: &mut tokio::net::TcpStream) -> std::io::Result<String> {
@@ -3061,9 +3056,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "integration test")]
     async fn harness_models_dispatch_authenticated_http_and_clear_deferred_callbacks()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (endpoint, requests, server) = spawn_http_fixture(3).await;
+        let (endpoint, requests, server) = spawn_http_fixture(3).await?;
         let runtime = ModelRuntime::create_in_memory().await?;
         runtime.register_provider(
             "local-http",
@@ -3213,7 +3209,7 @@ mod tests {
         assert!(runtime.get_model("local-http", "local-model").is_none());
         server
             .await
-            .map_err(|error| std::io::Error::other(format!("fixture task failed: {error}")))?;
+            .map_err(|error| std::io::Error::other(format!("fixture task failed: {error}")))??;
         let requests = lock(&requests);
         assert_eq!(requests.len(), 3);
         for request in requests.iter() {
@@ -3221,17 +3217,33 @@ mod tests {
             assert!(lower.contains("authorization: bearer sk-local"));
             assert!(lower.contains("x-provider: configured"));
         }
-        assert!(requests.iter().any(|request| request.contains("\"kind\":\"stream\"")));
-        assert!(requests.iter().any(|request| request.contains("\"kind\":\"fetch\"")));
-        assert!(requests.iter().any(|request| request.contains("\"wait\":0")));
-        assert!(requests.iter().any(|request| request.contains("\"kind\":\"cancel\"")));
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("\"kind\":\"stream\""))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("\"kind\":\"fetch\""))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("\"wait\":0"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("\"kind\":\"cancel\""))
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn deferred_only_provider_does_not_hijack_stream()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (endpoint, requests, server) = spawn_http_fixture(2).await;
+        let (endpoint, requests, server) = spawn_http_fixture(2).await?;
         let runtime = ModelRuntime::create_in_memory().await?;
         let mut model_definition = custom_model("deferred-only", "deferred-model");
         model_definition.api = None;
@@ -3280,8 +3292,7 @@ mod tests {
             poll_after_ms: None,
             data: Some(json!({"opaque": true})),
         };
-        let mut fetch =
-            runtime.fetch_deferred(&model, handle.clone(), StreamOptions::default());
+        let mut fetch = runtime.fetch_deferred(&model, handle.clone(), StreamOptions::default());
         let Some(fetch_event) = futures::StreamExt::next(&mut fetch).await else {
             return Err(std::io::Error::other("deferred fetch emitted no event").into());
         };
@@ -3300,18 +3311,24 @@ mod tests {
         assert!(runtime.deferred().is_none());
         server
             .await
-            .map_err(|error| std::io::Error::other(format!("fixture task failed: {error}")))?;
+            .map_err(|error| std::io::Error::other(format!("fixture task failed: {error}")))??;
         let requests = lock(&requests);
         assert_eq!(requests.len(), 2);
-        assert!(!requests
-            .iter()
-            .any(|request| request.contains("\"kind\":\"stream\"")));
-        assert!(requests
-            .iter()
-            .any(|request| request.contains("\"kind\":\"fetch\"")));
-        assert!(requests
-            .iter()
-            .any(|request| request.contains("\"kind\":\"cancel\"")));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.contains("\"kind\":\"stream\""))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("\"kind\":\"fetch\""))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("\"kind\":\"cancel\""))
+        );
         Ok(())
     }
 

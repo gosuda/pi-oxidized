@@ -34,7 +34,7 @@ pub enum TransportAddress {
     },
     /// `--connect radius://<server-id>`.
     Radius {
-        /// Canonical lowercase UUIDv4 server identity.
+        /// Canonical lowercase `UUIDv4` server identity.
         server_id: ServerId,
     },
 }
@@ -62,7 +62,10 @@ pub(crate) struct OptionSpec {
 
 impl OptionSpec {
     /// Declares a value-taking option.
-    pub(crate) const fn value(name: &'static str, parse: fn(&str) -> Result<ParsedValue, String>) -> Self {
+    pub(crate) const fn value(
+        name: &'static str,
+        parse: fn(&str) -> Result<ParsedValue, String>,
+    ) -> Self {
         Self {
             name,
             flag: false,
@@ -99,7 +102,10 @@ impl ParsedCommandInput {
     /// First recorded value for `name` (source `input.value`).
     #[must_use]
     pub(crate) fn first(&self, name: &str) -> Option<&ParsedValue> {
-        self.values.iter().find(|(option, _)| *option == name).map(|(_, value)| value)
+        self.values
+            .iter()
+            .find(|(option, _)| *option == name)
+            .map(|(_, value)| value)
     }
 
     /// First recorded string value.
@@ -188,23 +194,22 @@ pub(crate) fn parse_options(args: &[String], options: &[OptionSpec]) -> ParsedCo
             input.remaining_args.extend_from_slice(&args[index..]);
             break;
         };
+        if spec.flag && equals.is_some() {
+            input.errors.push(format!("{name} does not take a value"));
+            index += 1;
+            continue;
+        }
         let value;
         if spec.flag {
-            if equals.is_some() {
-                input.errors.push(format!("{name} does not take a value"));
-                index += 1;
-                continue;
-            }
             value = String::new();
         } else {
             let mut candidate = equals.map(|position| argument[position + 1..].to_owned());
-            if candidate.is_none() {
-                if let Some(next) = args.get(index + 1) {
-                    if !next.starts_with('-') {
-                        candidate = Some(next.clone());
-                        index += 1;
-                    }
-                }
+            if candidate.is_none()
+                && let Some(next) = args.get(index + 1)
+                && !next.starts_with('-')
+            {
+                candidate = Some(next.clone());
+                index += 1;
             }
             match candidate {
                 Some(candidate) if !candidate.is_empty() => value = candidate,
@@ -217,7 +222,9 @@ pub(crate) fn parse_options(args: &[String], options: &[OptionSpec]) -> ParsedCo
         }
         let seen = input.values.iter().any(|(option, _)| *option == spec.name);
         if seen && !spec.repeatable {
-            input.errors.push(format!("{name} may only be specified once"));
+            input
+                .errors
+                .push(format!("{name} may only be specified once"));
             index += 1;
             continue;
         }
@@ -240,15 +247,24 @@ pub(crate) const CONNECT: &str = "--connect";
 /// Shared `--auth-token` option (source `authTokenOption`).
 pub(crate) const AUTH_TOKEN_OPTION: OptionSpec = OptionSpec::value(AUTH_TOKEN, parse_text);
 /// Shared `--auth-token-file` option (source `authTokenFileOption`).
-pub(crate) const AUTH_TOKEN_FILE_OPTION: OptionSpec = OptionSpec::value(AUTH_TOKEN_FILE, parse_text);
+pub(crate) const AUTH_TOKEN_FILE_OPTION: OptionSpec =
+    OptionSpec::value(AUTH_TOKEN_FILE, parse_text);
 /// Shared `--connect` option (source `connectOption`).
 pub(crate) const CONNECT_OPTION: OptionSpec = OptionSpec::value(CONNECT, parse_connect_value);
 
 /// Plain string option parser (source `stringOption`).
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "OptionSpec stores a uniform fn(&str) -> Result parser so fallible parsers can report errors; this infallible parser matches that signature"
+)]
 pub(crate) fn parse_text(value: &str) -> Result<ParsedValue, String> {
     Ok(ParsedValue::Text(value.to_owned()))
 }
 
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "OptionSpec stores a uniform fn(&str) -> Result parser so fallible parsers can report errors; this infallible parser matches that signature"
+)]
 fn parse_flag_value(_value: &str) -> Result<ParsedValue, String> {
     Ok(ParsedValue::Flag)
 }
@@ -259,13 +275,26 @@ fn parse_connect_value(value: &str) -> Result<ParsedValue, String> {
 
 /// Resolves `--auth-token`/`--auth-token-file` (source `parseAuthInput`).
 pub(crate) fn parse_auth(input: &ParsedCommandInput) -> (Option<AuthInput>, Vec<String>) {
-    match (input.first_text(AUTH_TOKEN), input.first_text(AUTH_TOKEN_FILE)) {
+    match (
+        input.first_text(AUTH_TOKEN),
+        input.first_text(AUTH_TOKEN_FILE),
+    ) {
         (Some(_), Some(_)) => (
             None,
             vec!["--auth-token and --auth-token-file are mutually exclusive".to_owned()],
         ),
-        (Some(token), None) => (Some(AuthInput::Token { token: token.to_owned() }), Vec::new()),
-        (None, Some(path)) => (Some(AuthInput::File { path: path.to_owned() }), Vec::new()),
+        (Some(token), None) => (
+            Some(AuthInput::Token {
+                token: token.to_owned(),
+            }),
+            Vec::new(),
+        ),
+        (None, Some(path)) => (
+            Some(AuthInput::File {
+                path: path.to_owned(),
+            }),
+            Vec::new(),
+        ),
         (None, None) => (None, Vec::new()),
     }
 }
@@ -304,9 +333,15 @@ fn parse_transport_address(value: &str) -> Result<TransportAddress, String> {
         return Ok(TransportAddress::Radius { server_id });
     }
     if url.scheme() != "unix" {
-        return Err(format!("Unsupported --connect transport \"{}:\"", url.scheme()));
+        return Err(format!(
+            "Unsupported --connect transport \"{}:\"",
+            url.scheme()
+        ));
     }
-    if has_userinfo(&url) || url.port().is_some() || url.host_str().is_some_and(|host| !host.is_empty()) {
+    if has_userinfo(&url)
+        || url.port().is_some()
+        || url.host_str().is_some_and(|host| !host.is_empty())
+    {
         return Err("Unix transport address must not include an authority".to_owned());
     }
     if !value.starts_with("unix:///")
@@ -333,7 +368,7 @@ fn has_userinfo(url: &Url) -> bool {
     !url.username().is_empty() || url.password().is_some_and(|password| !password.is_empty())
 }
 
-/// Strict `decodeURIComponent`: rejects truncated or non-hex escapes and invalid UTF-8.
+/// Strict `decodeURIComponent`: rejects truncated or non-hex escapes and invalid `UTF-8`.
 fn decode_uri_component(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -417,11 +452,15 @@ mod tests {
         let server_id = "00000000-0000-4000-8000-000000000001";
         assert_eq!(
             parse_transport_address(&format!("radius://{server_id}:443")),
-            Err(format!("Invalid --connect address \"radius://{server_id}:443\""))
+            Err(format!(
+                "Invalid --connect address \"radius://{server_id}:443\""
+            ))
         );
         assert_eq!(
             parse_transport_address(&format!("radius://{server_id}/extra")),
-            Err(format!("Invalid --connect address \"radius://{server_id}/extra\""))
+            Err(format!(
+                "Invalid --connect address \"radius://{server_id}/extra\""
+            ))
         );
         assert_eq!(
             parse_transport_address("radius://not-a-uuid"),
@@ -439,10 +478,20 @@ mod tests {
             CONNECT_OPTION,
             OptionSpec::value("--auth-token", parse_text),
         ];
-        let input = parse_options(&strings(&["--connect", "--auth-token", "t", "--auth-token", "u"]), &options);
+        let input = parse_options(
+            &strings(&["--connect", "--auth-token", "t", "--auth-token", "u"]),
+            &options,
+        );
         assert_eq!(
-            input.errors().iter().map(String::as_str).collect::<Vec<_>>(),
-            ["--connect requires a value", "--auth-token may only be specified once"]
+            input
+                .errors()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "--connect requires a value",
+                "--auth-token may only be specified once"
+            ]
         );
         assert_eq!(input.first_text("--auth-token"), Some("t"));
         assert!(input.remaining_args().is_empty());
@@ -458,7 +507,10 @@ mod tests {
     #[test]
     fn parse_auth_rejects_both_sources_and_accepts_each() {
         let options = [AUTH_TOKEN_OPTION, AUTH_TOKEN_FILE_OPTION];
-        let both = parse_options(&strings(&["--auth-token", "t", "--auth-token-file", "f"]), &options);
+        let both = parse_options(
+            &strings(&["--auth-token", "t", "--auth-token-file", "f"]),
+            &options,
+        );
         assert_eq!(
             parse_auth(&both),
             (
@@ -467,8 +519,18 @@ mod tests {
             )
         );
         let token = parse_options(&strings(&["--auth-token", "t"]), &options);
-        assert_eq!(parse_auth(&token).0, Some(AuthInput::Token { token: "t".to_owned() }));
+        assert_eq!(
+            parse_auth(&token).0,
+            Some(AuthInput::Token {
+                token: "t".to_owned()
+            })
+        );
         let file = parse_options(&strings(&["--auth-token-file", "f"]), &options);
-        assert_eq!(parse_auth(&file).0, Some(AuthInput::File { path: "f".to_owned() }));
+        assert_eq!(
+            parse_auth(&file).0,
+            Some(AuthInput::File {
+                path: "f".to_owned()
+            })
+        );
     }
 }

@@ -3,21 +3,21 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use pi_agent::session::{
-    CommittedValueWrite, CommittedWrite, Entry, EntryId, IdGenerator, LaneState, ModelIdentity, NewEntry,
-    NewEntryBody, SessionError, StorageErrorCode, StorageFailure,
-};
 use pi_agent::AgentMessage;
+use pi_agent::session::{
+    CommittedValueWrite, CommittedWrite, Entry, EntryId, IdGenerator, LaneState, ModelIdentity,
+    NewEntry, NewEntryBody, SessionError, StorageErrorCode, StorageFailure,
+};
 use pi_ai::{Message, ModelThinkingLevel, Usage};
 use serde_json::Value;
 
 use crate::core::messages::{
-    create_branch_summary_message, create_compaction_summary_message, create_custom_message,
-    CustomMessageContent,
+    CustomMessageContent, create_branch_summary_message, create_compaction_summary_message,
+    create_custom_message,
 };
 use crate::core::sessions::{FileEntry, SessionEntry};
 
-use super::codec::{parse_header, JsonlStorageHeader, LegacyV3Header, ParsedHeader};
+use super::codec::{JsonlStorageHeader, LegacyV3Header, ParsedHeader, parse_header};
 
 /// Result of normalizing a historical v3 session in memory.
 #[derive(Clone, Debug)]
@@ -30,7 +30,10 @@ pub struct NormalizedLegacyV3Records {
     pub next_seq: u64,
 }
 
-fn corrupt(message: impl Into<String>, source: Option<Arc<dyn std::error::Error + Send + Sync>>) -> SessionError {
+fn corrupt(
+    message: impl Into<String>,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
+) -> SessionError {
     SessionError::Backend(StorageFailure {
         code: StorageErrorCode::Corrupt,
         message: message.into(),
@@ -38,16 +41,27 @@ fn corrupt(message: impl Into<String>, source: Option<Arc<dyn std::error::Error 
     })
 }
 fn invalid_data(message: impl Into<String>) -> Arc<dyn std::error::Error + Send + Sync> {
-    Arc::new(std::io::Error::new(std::io::ErrorKind::InvalidData, message.into()))
+    Arc::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.into(),
+    ))
 }
 
 fn timestamp_millis(timestamp: &str) -> Result<i64, SessionError> {
     let millis = timestamp
         .parse::<jiff::Timestamp>()
-        .map(|timestamp| timestamp.as_millisecond())
-        .map_err(|error| corrupt(format!("invalid legacy v3 timestamp {timestamp}"), Some(Arc::new(error))))?;
+        .map(jiff::Timestamp::as_millisecond)
+        .map_err(|error| {
+            corrupt(
+                format!("invalid legacy v3 timestamp {timestamp}"),
+                Some(Arc::new(error)),
+            )
+        })?;
     if millis < 0 {
-        return Err(corrupt(format!("invalid legacy v3 timestamp {timestamp}"), None));
+        return Err(corrupt(
+            format!("invalid legacy v3 timestamp {timestamp}"),
+            None,
+        ));
     }
     Ok(millis)
 }
@@ -85,10 +99,12 @@ fn parse_record(line: &str, line_number: usize) -> Result<LegacyRecord, SessionE
             Some(Arc::new(error)),
         )
     })?;
-    let kind = raw
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| corrupt(format!("unsupported legacy v3 record type at line {line_number}"), None))?;
+    let kind = raw.get("type").and_then(Value::as_str).ok_or_else(|| {
+        corrupt(
+            format!("unsupported legacy v3 record type at line {line_number}"),
+            None,
+        )
+    })?;
     if !accepted_kind(kind) {
         return Err(corrupt(
             format!("unsupported legacy v3 record type at line {line_number}: {kind}"),
@@ -98,17 +114,32 @@ fn parse_record(line: &str, line_number: usize) -> Result<LegacyRecord, SessionE
     let id = raw
         .get("id")
         .and_then(Value::as_str)
-        .ok_or_else(|| corrupt(format!("invalid legacy v3 record id at line {line_number}"), None))?
+        .ok_or_else(|| {
+            corrupt(
+                format!("invalid legacy v3 record id at line {line_number}"),
+                None,
+            )
+        })?
         .to_owned();
     let parent_id = match raw.get("parentId") {
         None | Some(Value::Null) => None,
         Some(Value::String(parent)) => Some(parent.clone()),
-        Some(_) => return Err(corrupt(format!("invalid legacy v3 parent id at line {line_number}"), None)),
+        Some(_) => {
+            return Err(corrupt(
+                format!("invalid legacy v3 parent id at line {line_number}"),
+                None,
+            ));
+        }
     };
     let timestamp = raw
         .get("timestamp")
         .and_then(Value::as_str)
-        .ok_or_else(|| corrupt(format!("invalid legacy v3 timestamp at line {line_number}"), None))?
+        .ok_or_else(|| {
+            corrupt(
+                format!("invalid legacy v3 timestamp at line {line_number}"),
+                None,
+            )
+        })?
         .to_owned();
     let _ = timestamp_millis(&timestamp)?;
 
@@ -147,7 +178,10 @@ struct RetainedIdResolver<'a> {
 }
 
 impl<'a> RetainedIdResolver<'a> {
-    fn new(records: &'a HashMap<String, LegacyRecord>, reminted_ids: &'a HashMap<String, EntryId>) -> Self {
+    fn new(
+        records: &'a HashMap<String, LegacyRecord>,
+        reminted_ids: &'a HashMap<String, EntryId>,
+    ) -> Self {
         Self {
             records,
             reminted_ids,
@@ -210,11 +244,24 @@ fn custom_agent_message(
     timestamp: &str,
 ) -> Result<AgentMessage, SessionError> {
     let message = create_custom_message(custom_type, content, display, details, timestamp)
-        .map_err(|error| corrupt("legacy custom message conversion failed", Some(Arc::new(error))))?;
-    let value = serde_json::to_value(message)
-        .map_err(|error| corrupt("legacy custom message serialization failed", Some(Arc::new(error))))?;
-    serde_json::from_value(value)
-        .map_err(|error| corrupt("legacy custom message conversion failed", Some(Arc::new(error))))
+        .map_err(|error| {
+            corrupt(
+                "legacy custom message conversion failed",
+                Some(Arc::new(error)),
+            )
+        })?;
+    let value = serde_json::to_value(message).map_err(|error| {
+        corrupt(
+            "legacy custom message serialization failed",
+            Some(Arc::new(error)),
+        )
+    })?;
+    serde_json::from_value(value).map_err(|error| {
+        corrupt(
+            "legacy custom message conversion failed",
+            Some(Arc::new(error)),
+        )
+    })
 }
 
 fn summary_agent_message(
@@ -223,19 +270,39 @@ fn summary_agent_message(
     timestamp: &str,
 ) -> Result<AgentMessage, SessionError> {
     let from_id = from_id.map_or_else(|| "root".to_owned(), ToString::to_string);
-    let message = create_branch_summary_message(summary, &from_id, timestamp)
-        .map_err(|error| corrupt("legacy branch summary conversion failed", Some(Arc::new(error))))?;
-    let value = serde_json::to_value(message)
-        .map_err(|error| corrupt("legacy branch summary serialization failed", Some(Arc::new(error))))?;
-    serde_json::from_value(value)
-        .map_err(|error| corrupt("legacy branch summary conversion failed", Some(Arc::new(error))))
+    let message = create_branch_summary_message(summary, &from_id, timestamp).map_err(|error| {
+        corrupt(
+            "legacy branch summary conversion failed",
+            Some(Arc::new(error)),
+        )
+    })?;
+    let value = serde_json::to_value(message).map_err(|error| {
+        corrupt(
+            "legacy branch summary serialization failed",
+            Some(Arc::new(error)),
+        )
+    })?;
+    serde_json::from_value(value).map_err(|error| {
+        corrupt(
+            "legacy branch summary conversion failed",
+            Some(Arc::new(error)),
+        )
+    })
 }
 
-fn compaction_agent_message(summary: &str, tokens_before: i64, timestamp: &str) -> Result<AgentMessage, SessionError> {
+fn compaction_agent_message(
+    summary: &str,
+    tokens_before: i64,
+    timestamp: &str,
+) -> Result<AgentMessage, SessionError> {
     let message = create_compaction_summary_message(summary, tokens_before, timestamp)
         .map_err(|error| corrupt("legacy compaction conversion failed", Some(Arc::new(error))))?;
-    let value = serde_json::to_value(message)
-        .map_err(|error| corrupt("legacy compaction serialization failed", Some(Arc::new(error))))?;
+    let value = serde_json::to_value(message).map_err(|error| {
+        corrupt(
+            "legacy compaction serialization failed",
+            Some(Arc::new(error)),
+        )
+    })?;
     serde_json::from_value(value)
         .map_err(|error| corrupt("legacy compaction conversion failed", Some(Arc::new(error))))
 }
@@ -259,7 +326,11 @@ fn context_messages(
             } else {
                 resolver.resolve(Some(&entry.from_id))?
             };
-            Ok(vec![summary_agent_message(&entry.summary, from_id.as_ref(), &entry.timestamp)?])
+            Ok(vec![summary_agent_message(
+                &entry.summary,
+                from_id.as_ref(),
+                &entry.timestamp,
+            )?])
         }
         SessionEntry::Compaction(entry) => Ok(vec![compaction_agent_message(
             &entry.summary,
@@ -279,19 +350,16 @@ fn materialize_retained_tail(
     let mut reversed = Vec::new();
     let mut visited = HashSet::new();
     let mut current = compaction.parent_id.clone();
-    while let Some(id) = current {
+    while let Some(ref id) = current {
         if !visited.insert(id.clone()) {
             return Err(corrupt(
                 format!("cycle in legacy v3 parent chain at entry {id}"),
                 None,
             ));
         }
-        let record = records.get(&id).ok_or_else(|| {
-            corrupt(
-                format!("missing legacy v3 parent entry: {id}"),
-                None,
-            )
-        })?;
+        let record = records
+            .get(id)
+            .ok_or_else(|| corrupt(format!("missing legacy v3 parent entry: {id}"), None))?;
         reversed.push(record.clone());
         if id == first_kept_id {
             let mut output = Vec::new();
@@ -300,7 +368,7 @@ fn materialize_retained_tail(
             }
             return Ok(output);
         }
-        current = record.parent_id.clone();
+        current.clone_from(&record.parent_id);
     }
     Err(corrupt(
         format!(
@@ -348,7 +416,12 @@ fn normalize_retained_entry(
         },
         SessionEntry::Compaction(entry) => NewEntryBody::Compaction {
             summary: entry.summary.clone(),
-            retained_tail: materialize_retained_tail(record, records, resolver, &entry.first_kept_entry_id)?,
+            retained_tail: materialize_retained_tail(
+                record,
+                records,
+                resolver,
+                &entry.first_kept_entry_id,
+            )?,
             tokens_before: u64::try_from(entry.tokens_before).map_err(|_| {
                 corrupt(
                     format!("legacy compaction {} has a negative token count", record.id),
@@ -370,7 +443,12 @@ fn normalize_retained_entry(
             ));
         }
     };
-    Ok(NewEntry { id, parent_id, body }.materialize(seq, timestamp))
+    Ok(NewEntry {
+        id,
+        parent_id,
+        body,
+    }
+    .materialize(seq, timestamp))
 }
 
 fn add_usage(total: &mut Usage, add: &Usage) {
@@ -436,7 +514,12 @@ fn aggregate_usage(records: &[LegacyRecord]) -> Usage {
     total
 }
 
-fn value_write(seq: &mut u64, namespace: &str, key: &str, value: Value) -> Result<CommittedWrite, SessionError> {
+fn value_write(
+    seq: &mut u64,
+    namespace: &str,
+    key: &str,
+    value: Value,
+) -> Result<CommittedWrite, SessionError> {
     let current = *seq;
     *seq = seq
         .checked_add(1)
@@ -461,19 +544,16 @@ fn selected_configuration(
     let mut saw_active_tool_names = false;
     let mut visited = HashSet::new();
     let mut current = final_id.map(str::to_owned);
-    while let Some(id) = current {
+    while let Some(ref id) = current {
         if saw_model && saw_thinking_level && saw_active_tool_names {
             break;
         }
         if !visited.insert(id.clone()) {
             return Err(corrupt("cycle in legacy v3 parent chain", None));
         }
-        let record = records.get(&id).ok_or_else(|| {
-            corrupt(
-                format!("missing legacy v3 parent entry: {id}"),
-                None,
-            )
-        })?;
+        let record = records
+            .get(id)
+            .ok_or_else(|| corrupt(format!("missing legacy v3 parent entry: {id}"), None))?;
         match record.kind.as_str() {
             "model_change" if !saw_model => {
                 saw_model = true;
@@ -493,7 +573,9 @@ fn selected_configuration(
             "thinking_level_change" if !saw_thinking_level => {
                 saw_thinking_level = true;
                 if let Some(level) = record.raw.get("thinkingLevel").and_then(Value::as_str)
-                    && let Ok(parsed) = serde_json::from_value::<ModelThinkingLevel>(Value::String(level.to_owned()))
+                    && let Ok(parsed) = serde_json::from_value::<ModelThinkingLevel>(Value::String(
+                        level.to_owned(),
+                    ))
                 {
                     thinking_level = Some(parsed);
                 }
@@ -514,7 +596,7 @@ fn selected_configuration(
             }
             _ => {}
         }
-        current = record.parent_id.clone();
+        current.clone_from(&record.parent_id);
     }
     Ok(model.zip(thinking_level).map(|(model, thinking_level)| {
         pi_agent::session::LaneConfiguration {
@@ -526,7 +608,19 @@ fn selected_configuration(
 }
 
 /// Normalizes v3 records without touching the source file.
-pub fn normalize_legacy_v3_records(record_lines: &[&str]) -> Result<NormalizedLegacyV3Records, SessionError> {
+///
+/// # Errors
+///
+/// Returns an error for malformed records or timestamps, duplicate ids, missing
+/// or cyclic references, invalid compaction or configuration data, identifier
+/// generation failures, serialization failures, or sequence overflow.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass index, link, and validate over legacy records; splitting would scatter the phases"
+)]
+pub fn normalize_legacy_v3_records(
+    record_lines: &[&str],
+) -> Result<NormalizedLegacyV3Records, SessionError> {
     let mut records = Vec::with_capacity(record_lines.len());
     let mut by_id = HashMap::with_capacity(record_lines.len());
     for (index, line) in record_lines.iter().enumerate() {
@@ -542,7 +636,12 @@ pub fn normalize_legacy_v3_records(record_lines: &[&str]) -> Result<NormalizedLe
 
     let retained: Vec<&LegacyRecord> = records
         .iter()
-        .filter(|record| matches!(record.kind.as_str(), "message" | "custom" | "custom_message" | "branch_summary" | "compaction"))
+        .filter(|record| {
+            matches!(
+                record.kind.as_str(),
+                "message" | "custom" | "custom_message" | "branch_summary" | "compaction"
+            )
+        })
         .collect();
     let generator = pi_agent::session::UuidV7Generator::new();
     let mut reminted_ids = HashMap::with_capacity(retained.len());
@@ -554,7 +653,12 @@ pub fn normalize_legacy_v3_records(record_lines: &[&str]) -> Result<NormalizedLe
     let mut resolver = RetainedIdResolver::new(&by_id, &reminted_ids);
     let mut writes = Vec::with_capacity(retained.len().saturating_add(4));
     for (index, record) in retained.iter().enumerate() {
-        let entry = normalize_retained_entry(record, u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1), &by_id, &mut resolver)?;
+        let entry = normalize_retained_entry(
+            record,
+            u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1),
+            &by_id,
+            &mut resolver,
+        )?;
         writes.push(CommittedWrite::Entry(entry));
     }
 
@@ -569,7 +673,12 @@ pub fn normalize_legacy_v3_records(record_lines: &[&str]) -> Result<NormalizedLe
     if let Some(Some(name)) = latest_name
         && !name.is_empty()
     {
-        writes.push(value_write(&mut next_seq, "pi.session.name", "", Value::String(name))?);
+        writes.push(value_write(
+            &mut next_seq,
+            "pi.session.name",
+            "",
+            Value::String(name),
+        )?);
     }
 
     let mut labels: Vec<(String, String)> = Vec::new();
@@ -581,8 +690,11 @@ pub fn normalize_legacy_v3_records(record_lines: &[&str]) -> Result<NormalizedLe
             continue;
         };
         if let Some(label) = entry.label.as_deref().filter(|label| !label.is_empty()) {
-            if let Some(existing) = labels.iter_mut().find(|(id, _)| id.as_str() == target.as_str()) {
-                existing.1 = label.to_owned();
+            if let Some(existing) = labels
+                .iter_mut()
+                .find(|(id, _)| id.as_str() == target.as_str())
+            {
+                label.clone_into(&mut existing.1);
             } else {
                 labels.push((target.to_string(), label.to_owned()));
             }
@@ -591,7 +703,12 @@ pub fn normalize_legacy_v3_records(record_lines: &[&str]) -> Result<NormalizedLe
         }
     }
     for (target, label) in labels {
-        writes.push(value_write(&mut next_seq, "pi.entry.label", &target, Value::String(label))?);
+        writes.push(value_write(
+            &mut next_seq,
+            "pi.entry.label",
+            &target,
+            Value::String(label),
+        )?);
     }
 
     let final_tip = records
@@ -603,20 +720,37 @@ pub fn normalize_legacy_v3_records(record_lines: &[&str]) -> Result<NormalizedLe
         &mut next_seq,
         "pi.branch.tip",
         "main",
-        serde_json::to_value(&final_tip).map_err(|error| corrupt("legacy branch tip serialization failed", Some(Arc::new(error))))?,
+        serde_json::to_value(&final_tip).map_err(|error| {
+            corrupt(
+                "legacy branch tip serialization failed",
+                Some(Arc::new(error)),
+            )
+        })?,
     )?);
-    if let Some(configuration) = selected_configuration(&by_id, records.last().map(|record| record.id.as_str()))? {
+    if let Some(configuration) =
+        selected_configuration(&by_id, records.last().map(|record| record.id.as_str()))?
+    {
         writes.push(value_write(
             &mut next_seq,
             "pi.lane.config",
             "main",
-            serde_json::to_value(configuration).map_err(|error| corrupt("legacy lane configuration serialization failed", Some(Arc::new(error))))?,
+            serde_json::to_value(configuration).map_err(|error| {
+                corrupt(
+                    "legacy lane configuration serialization failed",
+                    Some(Arc::new(error)),
+                )
+            })?,
         )?);
         writes.push(value_write(
             &mut next_seq,
             "pi.lane.state",
             "main",
-            serde_json::to_value(LaneState::default()).map_err(|error| corrupt("legacy lane state serialization failed", Some(Arc::new(error))))?,
+            serde_json::to_value(LaneState::default()).map_err(|error| {
+                corrupt(
+                    "legacy lane state serialization failed",
+                    Some(Arc::new(error)),
+                )
+            })?,
         )?);
     }
 
@@ -629,7 +763,15 @@ pub fn normalize_legacy_v3_records(record_lines: &[&str]) -> Result<NormalizedLe
 
 /// Normalizes legacy metadata in memory. The source file is only read when a
 /// parent id can be resolved; it is never rewritten.
-pub fn normalize_legacy_v3_header(path: &Path, header: &LegacyV3Header) -> Result<JsonlStorageHeader, SessionError> {
+///
+/// # Errors
+///
+/// Returns `Corrupt` if the header timestamp is invalid or predates the Unix
+/// epoch. An unreadable or invalid parent file is retained as an unresolved path.
+pub fn normalize_legacy_v3_header(
+    path: &Path,
+    header: &LegacyV3Header,
+) -> Result<JsonlStorageHeader, SessionError> {
     let created_at = timestamp_millis(&header.timestamp)?;
     let mut parent_session_id = None;
     let mut legacy_parent_session_path = None;

@@ -7,21 +7,24 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures::future::BoxFuture;
 use pi_agent::context::Context;
 use pi_agent::session::{
-    create_fork_snapshot, ForkOptions, ForkSource, ForkSourceSnapshot, IdGenerator,
-    Session, SessionError, SessionMetadata, SessionMetadataLike, SessionRepo, Storage,
-    StorageBackedSession, StorageErrorCode, StorageFailure, UuidV7Generator,
+    ForkOptions, ForkSource, ForkSourceSnapshot, IdGenerator, Session, SessionError,
+    SessionMetadata, SessionMetadataLike, SessionRepo, Storage, StorageBackedSession,
+    StorageErrorCode, StorageFailure, UuidV7Generator, create_fork_snapshot,
 };
 
 use super::schema::{SQLITE_SESSION_EXTENSION, SQLITE_STORAGE_VERSION};
 use super::storage::{self, SqliteStorage};
 
 fn aborted() -> SessionError {
-    SessionError::Backend(StorageFailure::new(StorageErrorCode::Aborted, "operation cancelled"))
+    SessionError::Backend(StorageFailure::new(
+        StorageErrorCode::Aborted,
+        "operation cancelled",
+    ))
 }
 
 fn not_found(message: impl Into<String>) -> SessionError {
@@ -29,14 +32,21 @@ fn not_found(message: impl Into<String>) -> SessionError {
 }
 
 fn repo_closed() -> SessionError {
-    SessionError::Backend(StorageFailure::new(StorageErrorCode::Closed, "SqliteSessionRepo is closed"))
+    SessionError::Backend(StorageFailure::new(
+        StorageErrorCode::Closed,
+        "SqliteSessionRepo is closed",
+    ))
 }
 
 fn invariant(message: impl Into<String>) -> SessionError {
     SessionError::Invariant(message.into())
 }
 
-fn io_failure(path: &Path, action: &str, source: impl std::error::Error + Send + Sync + 'static) -> SessionError {
+fn io_failure(
+    path: &Path,
+    action: &str,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> SessionError {
     SessionError::Backend(StorageFailure {
         code: StorageErrorCode::Io,
         message: format!("{action}: {}", path.display()),
@@ -59,7 +69,7 @@ fn is_not_found(error: &SessionError) -> bool {
 /// Options for creating a SQLite session.
 #[derive(Clone, Debug, Default)]
 pub struct SqliteSessionCreateOptions {
-    /// Explicit session identity, or `None` to generate a UUIDv7.
+    /// Explicit session identity, or `None` to generate a `UUIDv7`.
     pub id: Option<String>,
     /// Parent session identity for a forked session.
     pub parent_session_id: Option<String>,
@@ -196,7 +206,10 @@ fn session_file_name(id: &str) -> String {
         for unit in id.encode_utf16() {
             utf16le.extend_from_slice(&unit.to_le_bytes());
         }
-        format!("~{}{SQLITE_SESSION_EXTENSION}", URL_SAFE_NO_PAD.encode(utf16le))
+        format!(
+            "~{}{SQLITE_SESSION_EXTENSION}",
+            URL_SAFE_NO_PAD.encode(utf16le)
+        )
     }
 }
 fn storage_identity(path: &Path, session_id: &str) -> StorageIdentity {
@@ -206,11 +219,10 @@ fn storage_identity(path: &Path, session_id: &str) -> StorageIdentity {
     }
 }
 
-fn parent_directory(path: &Path) -> Result<&Path, SessionError> {
-    Ok(path
-        .parent()
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new(".")))
+        .unwrap_or_else(|| Path::new("."))
 }
 
 /// Removes a container and its SQLite sidecars. The primary file must exist;
@@ -245,17 +257,24 @@ async fn remove_one(path: &Path) -> Result<(), SessionError> {
             "session file does not exist: {}",
             path.display()
         ))),
-        Err(source) => Err(io_failure(&path, "failed to remove SQLite session file", source)),
+        Err(source) => Err(io_failure(
+            &path,
+            "failed to remove SQLite session file",
+            source,
+        )),
     })
     .await
     .map_err(|source| join_failure("session removal", source))?
 }
 
 async fn remove_one_if_present(path: &Path) -> Result<(), SessionError> {
-    match remove_one(path).await {
-        Err(error) if is_not_found(&error) => Ok(()),
-        result => result,
+    let result = remove_one(path).await;
+    if let Err(error) = &result
+        && is_not_found(error)
+    {
+        return Ok(());
     }
+    result
 }
 
 async fn create_dir_all(path: &Path) -> Result<(), SessionError> {
@@ -264,7 +283,13 @@ async fn create_dir_all(path: &Path) -> Result<(), SessionError> {
     tokio::task::spawn_blocking(move || std::fs::create_dir_all(&path))
         .await
         .map_err(|source| join_failure("session directory", source))?
-        .map_err(|source| io_failure(&path_for_error, "failed to create SQLite session directory", source))
+        .map_err(|source| {
+            io_failure(
+                &path_for_error,
+                "failed to create SQLite session directory",
+                source,
+            )
+        })
 }
 
 async fn canonical_path(path: &Path) -> Result<PathBuf, SessionError> {
@@ -295,7 +320,7 @@ async fn reserve_container(path: &Path, id: &str) -> Result<(), SessionError> {
             .write(true)
             .create_new(true)
             .open(&path)
-            .map(|file| drop(file))
+            .map(drop)
             .map_err(|source| {
                 if source.kind() == std::io::ErrorKind::AlreadyExists {
                     invariant(format!("SQLite session already exists: {id}"))
@@ -322,7 +347,11 @@ async fn list_container_paths(directory: &Path) -> Result<Vec<PathBuf>, SessionE
             Ok(paths)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(source) => Err(io_failure(&directory, "failed to list SQLite session directory", source)),
+        Err(source) => Err(io_failure(
+            &directory,
+            "failed to list SQLite session directory",
+            source,
+        )),
     })
     .await
     .map_err(|source| join_failure("session listing", source))?
@@ -341,8 +370,9 @@ async fn cleanup_created(
     if shared {
         let path = path.to_path_buf();
         let session_id = session_id.to_owned();
-        let _ = tokio::task::spawn_blocking(move || storage::delete_session_row(&path, &session_id))
-            .await;
+        let _ =
+            tokio::task::spawn_blocking(move || storage::delete_session_row(&path, &session_id))
+                .await;
     } else {
         let _ = remove_session_files_if_present(path).await;
     }
@@ -368,13 +398,20 @@ impl SqliteSessionRepo {
     /// Each session close drains its admitted backend operations before the
     /// connection is released. One failure surfaces verbatim; several are
     /// aggregated without discarding their causes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is cancelled, the open-session lock is
+    /// poisoned, or any session fails to close.
     pub async fn close(&self, cx: &Context) -> Result<(), SessionError> {
         cx.check().map_err(|_| aborted())?;
         self.closed.store(true, Ordering::Release);
 
         let sessions: Vec<Arc<dyn Session>> = {
             let open = self.open.lock().map_err(|_| lock_failed("close"))?;
-            open.values().map(|record| Arc::clone(&record.session)).collect()
+            open.values()
+                .map(|record| Arc::clone(&record.session))
+                .collect()
         };
 
         let mut errors = Vec::new();
@@ -396,7 +433,8 @@ impl SqliteSessionRepo {
                 let Some(first) = errors.first().cloned() else {
                     return Ok(());
                 };
-                let source = Arc::new(CloseErrors(errors)) as Arc<dyn std::error::Error + Send + Sync>;
+                let source =
+                    Arc::new(CloseErrors(errors)) as Arc<dyn std::error::Error + Send + Sync>;
                 Err(SessionError::Backend(StorageFailure {
                     code: StorageErrorCode::Closed,
                     message: format!("Failed to close SQLite Sessions: {first}"),
@@ -444,14 +482,20 @@ impl SqliteSessionRepo {
         let expected_path = self.path_for_session(&metadata.session.id);
         let expected = canonical_path(&expected_path).await.map_err(|error| {
             if is_not_found(&error) {
-                not_found(format!("session file does not exist: {}", expected_path.display()))
+                not_found(format!(
+                    "session file does not exist: {}",
+                    expected_path.display()
+                ))
             } else {
                 error
             }
         })?;
         let actual = canonical_path(&metadata.path).await.map_err(|error| {
             if is_not_found(&error) {
-                not_found(format!("session file does not exist: {}", metadata.path.display()))
+                not_found(format!(
+                    "session file does not exist: {}",
+                    metadata.path.display()
+                ))
             } else {
                 error
             }
@@ -473,7 +517,10 @@ impl SqliteSessionRepo {
         cx.check().map_err(|_| aborted())?;
         let path = canonical_path(&source.path).await.map_err(|error| {
             if is_not_found(&error) {
-                not_found(format!("session file does not exist: {}", source.path.display()))
+                not_found(format!(
+                    "session file does not exist: {}",
+                    source.path.display()
+                ))
             } else {
                 error
             }
@@ -481,7 +528,8 @@ impl SqliteSessionRepo {
         let identity = storage_identity(&path, &source.session.id);
         let open_storage = {
             let open = self.open.lock().map_err(|_| lock_failed("fork"))?;
-            open.get(&identity).map(|record| Arc::clone(&record.storage))
+            open.get(&identity)
+                .map(|record| Arc::clone(&record.storage))
         };
         if let Some(storage) = open_storage {
             return storage.capture_fork_source(cx).await;
@@ -494,7 +542,7 @@ impl SqliteSessionRepo {
 
     fn publish_open(
         &self,
-        metadata: SqliteSessionMetadata,
+        metadata: &SqliteSessionMetadata,
         storage: Arc<SqliteStorage>,
         reservation: IdReservation,
     ) -> Result<Arc<dyn Session>, SessionError> {
@@ -525,10 +573,10 @@ impl SqliteSessionRepo {
                     Ok(open) => open,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                if let Some(record) = open.get(&callback_key) {
-                    if Arc::ptr_eq(&record.dyn_storage, &callback_storage) {
-                        open.remove(&callback_key);
-                    }
+                if let Some(record) = open.get(&callback_key)
+                    && Arc::ptr_eq(&record.dyn_storage, &callback_storage)
+                {
+                    open.remove(&callback_key);
                 }
             })),
         );
@@ -569,7 +617,7 @@ impl SessionRepo for SqliteSessionRepo {
             cx.check().map_err(|_| aborted())?;
             self.ensure_open()?;
             let path = self.path_for_session(&id);
-            create_dir_all(parent_directory(&path)?).await?;
+            create_dir_all(parent_directory(&path)).await?;
 
             let mut reserved_file = false;
             if !self.uses_shared_database() {
@@ -620,7 +668,7 @@ impl SessionRepo for SqliteSessionRepo {
                 canonical,
             );
             let session_id = metadata.session.id.clone();
-            match self.publish_open(metadata, Arc::clone(&storage), reservation) {
+            match self.publish_open(&metadata, Arc::clone(&storage), reservation) {
                 Ok(session) => Ok(session),
                 Err(error) => {
                     cleanup_created(
@@ -661,7 +709,7 @@ impl SessionRepo for SqliteSessionRepo {
 
             cx.check().map_err(|_| aborted())?;
             self.ensure_open()?;
-            match self.publish_open(stored, Arc::clone(&storage), reservation) {
+            match self.publish_open(&stored, Arc::clone(&storage), reservation) {
                 Ok(session) => Ok(session),
                 Err(error) => {
                     let _ = storage.close(&Context::background()).await;
@@ -690,14 +738,13 @@ impl SessionRepo for SqliteSessionRepo {
                 let Ok(canonical) = canonical_path(&path).await else {
                     continue;
                 };
-                match tokio::task::spawn_blocking({
+                if let Ok(Ok(rows)) = tokio::task::spawn_blocking({
                     let canonical = canonical.clone();
                     move || storage::list_container(&canonical)
                 })
                 .await
                 {
-                    Ok(Ok(rows)) => sessions.extend(rows),
-                    _ => continue,
+                    sessions.extend(rows);
                 }
             }
 
@@ -771,7 +818,7 @@ impl SessionRepo for SqliteSessionRepo {
             cx.check().map_err(|_| aborted())?;
             self.ensure_open()?;
             let path = self.path_for_session(&id);
-            create_dir_all(parent_directory(&path)?).await?;
+            create_dir_all(parent_directory(&path)).await?;
 
             let mut reserved_file = false;
             if !self.uses_shared_database() {
@@ -823,7 +870,7 @@ impl SessionRepo for SqliteSessionRepo {
                 canonical,
             );
             let session_id = metadata.session.id.clone();
-            match self.publish_open(metadata, Arc::clone(&storage), reservation) {
+            match self.publish_open(&metadata, Arc::clone(&storage), reservation) {
                 Ok(session) => Ok(session),
                 Err(error) => {
                     cleanup_created(

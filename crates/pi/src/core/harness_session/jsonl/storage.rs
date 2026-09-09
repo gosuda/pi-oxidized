@@ -1,3 +1,5 @@
+use futures::future::BoxFuture;
+use pi_agent::context::Context;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -5,22 +7,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::Notify;
-use futures::future::BoxFuture;
-use pi_agent::context::Context;
 
 use pi_agent::session::{
-    address::{resolve_list_read_options, RawAddress, LIST_READ_DEFAULT_LIMIT, LIST_READ_MAX_LIMIT},
-    CommitResult, CommittedWrite, Entry, EntryId, EntryScan, EntryStructure, ForkDestinationSnapshot,
-    ForkSource, ForkSourceSnapshot, IdGenerator, InMemoryStorageState, RawListElement, RawStoredValue,
-    ScanOrder, SessionError, SessionStats, Storage, StorageBranchScan, StorageErrorCode, StorageFailure,
-    UsageRow, UsageScan, Write, commit_writes, validate_committed_writes,
+    CommitResult, CommittedWrite, Entry, EntryId, EntryScan, EntryStructure,
+    ForkDestinationSnapshot, ForkSource, ForkSourceSnapshot, IdGenerator, InMemoryStorageState,
+    RawListElement, RawStoredValue, ScanOrder, SessionError, SessionStats, Storage,
+    StorageBranchScan, StorageErrorCode, StorageFailure, UsageRow, UsageScan, Write,
+    address::{
+        LIST_READ_DEFAULT_LIMIT, LIST_READ_MAX_LIMIT, RawAddress, resolve_list_read_options,
+    },
+    commit_writes, validate_committed_writes,
 };
 use pi_ai::Usage;
 
 use super::codec::{
+    JSONL_FORMAT_VERSION, JSONL_STORAGE_VERSION, JsonlStorageHeader, LegacyV3Header, ParsedHeader,
     parse_header, parse_transaction, publish_file_atomically, serialize_transaction,
-    split_complete_lines, JsonlStorageHeader, LegacyV3Header, ParsedHeader, JSONL_FORMAT_VERSION,
-    JSONL_STORAGE_VERSION,
+    split_complete_lines,
 };
 use super::legacy_v3::{normalize_legacy_v3_header, normalize_legacy_v3_records};
 
@@ -75,14 +78,22 @@ fn failure(
 }
 
 fn aborted(error: pi_agent::context::Cancelled) -> SessionError {
-    failure(StorageErrorCode::Aborted, "operation cancelled", Some(Arc::new(error)))
+    failure(
+        StorageErrorCode::Aborted,
+        "operation cancelled",
+        Some(Arc::new(error)),
+    )
 }
 
 fn closed() -> SessionError {
     failure(StorageErrorCode::Closed, "session storage is closed", None)
 }
 
-fn io_failure(path: &Path, action: &str, error: impl std::error::Error + Send + Sync + 'static) -> SessionError {
+fn io_failure(
+    path: &Path,
+    action: &str,
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> SessionError {
     failure(
         StorageErrorCode::Io,
         format!("{action} {}", path.display()),
@@ -91,7 +102,9 @@ fn io_failure(path: &Path, action: &str, error: impl std::error::Error + Send + 
 }
 
 fn lock_inner<T>(inner: &Mutex<T>) -> MutexGuard<'_, T> {
-    inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 fn now_millis() -> i64 {
     jiff::Timestamp::now().as_millisecond()
@@ -130,7 +143,10 @@ fn serialize_header(header: &JsonlStorageHeader) -> Result<String, SessionError>
     })
 }
 
-fn complete_file(header: &JsonlStorageHeader, transactions: impl IntoIterator<Item = String>) -> Result<String, SessionError> {
+fn complete_file(
+    header: &JsonlStorageHeader,
+    transactions: impl IntoIterator<Item = String>,
+) -> Result<String, SessionError> {
     let mut content = serialize_header(header)?;
     for transaction in transactions {
         content.push('\n');
@@ -158,9 +174,18 @@ impl JsonlStorage {
     }
 
     /// Creates and publishes an empty v4 file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header kind or format version is invalid, header
+    /// serialization fails, or the file cannot be published.
     pub fn create_sync(path: &Path, header: JsonlStorageHeader) -> Result<Arc<Self>, SessionError> {
         if header.v != JSONL_FORMAT_VERSION || header.kind != "header" {
-            return Err(failure(StorageErrorCode::InvalidHeader, "invalid JSONL storage header", None));
+            return Err(failure(
+                StorageErrorCode::InvalidHeader,
+                "invalid JSONL storage header",
+                None,
+            ));
         }
         let content = complete_file(&header, std::iter::empty())?;
         publish_file_atomically(path, &content)?;
@@ -175,8 +200,15 @@ impl JsonlStorage {
     }
 
     /// Opens a v4 or legacy v3 file, repairing only a torn final record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, its header or records are
+    /// invalid, its storage version is unsupported, replay or legacy normalization
+    /// fails, or a torn final record cannot be repaired.
     pub fn open_sync(path: &Path) -> Result<(JsonlStorageHeader, Arc<Self>), SessionError> {
-        let content = fs::read_to_string(path).map_err(|error| io_failure(path, "failed to read JSONL storage", error))?;
+        let content = fs::read_to_string(path)
+            .map_err(|error| io_failure(path, "failed to read JSONL storage", error))?;
         let (lines, torn) = split_complete_lines(&content);
         if lines.first().is_none_or(|line| line.is_empty()) {
             return Err(failure(
@@ -194,15 +226,23 @@ impl JsonlStorage {
         })?;
         match parsed {
             ParsedHeader::V4(header) => Self::open_v4(path, header, &lines, torn),
-            ParsedHeader::LegacyV3(header) => Self::open_v3(path, header, &lines[1..]),
+            ParsedHeader::LegacyV3(header) => Self::open_v3(path, &header, &lines[1..]),
         }
     }
 
-    fn open_v4(path: &Path, header: JsonlStorageHeader, lines: &[&str], torn: bool) -> Result<(JsonlStorageHeader, Arc<Self>), SessionError> {
+    fn open_v4(
+        path: &Path,
+        header: JsonlStorageHeader,
+        lines: &[&str],
+        torn: bool,
+    ) -> Result<(JsonlStorageHeader, Arc<Self>), SessionError> {
         if header.storage_version != JSONL_STORAGE_VERSION {
             return Err(failure(
                 StorageErrorCode::VersionMismatch,
-                format!("session {} uses unsupported storage version {}", header.id, header.storage_version),
+                format!(
+                    "session {} uses unsupported storage version {}",
+                    header.id, header.storage_version
+                ),
                 None,
             ));
         }
@@ -211,14 +251,22 @@ impl JsonlStorage {
             let writes = parse_transaction(line).map_err(|error| {
                 failure(
                     StorageErrorCode::Corrupt,
-                    format!("invalid JSONL storage {}: line {}", path.display(), index + 1),
+                    format!(
+                        "invalid JSONL storage {}: line {}",
+                        path.display(),
+                        index + 1
+                    ),
                     Some(Arc::new(error)),
                 )
             })?;
             state.replay(&writes).map_err(|error| {
                 failure(
                     StorageErrorCode::Corrupt,
-                    format!("invalid JSONL storage {}: line {}", path.display(), index + 1),
+                    format!(
+                        "invalid JSONL storage {}: line {}",
+                        path.display(),
+                        index + 1
+                    ),
                     Some(Arc::new(error)),
                 )
             })?;
@@ -241,9 +289,13 @@ impl JsonlStorage {
         Ok((header, storage))
     }
 
-    fn open_v3(path: &Path, header: LegacyV3Header, record_lines: &[&str]) -> Result<(JsonlStorageHeader, Arc<Self>), SessionError> {
+    fn open_v3(
+        path: &Path,
+        header: &LegacyV3Header,
+        record_lines: &[&str],
+    ) -> Result<(JsonlStorageHeader, Arc<Self>), SessionError> {
         let normalized = normalize_legacy_v3_records(record_lines)?;
-        let mut target_header = normalize_legacy_v3_header(path, &header)?;
+        let mut target_header = normalize_legacy_v3_header(path, header)?;
         target_header.next_seq = Some(normalized.next_seq);
         let mut state = InMemoryStorageState::new();
         state.replay(&normalized.writes).map_err(|error| {
@@ -268,10 +320,21 @@ impl JsonlStorage {
     }
 
     /// Creates and publishes a v4 file from an already captured fork snapshot.
-    pub fn create_from_fork_sync(path: &Path, mut header: JsonlStorageHeader, snapshot: &ForkDestinationSnapshot) -> Result<Arc<Self>, SessionError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if header serialization or file publication fails, or if
+    /// opening the published snapshot rejects its header, version, or records.
+    pub fn create_from_fork_sync(
+        path: &Path,
+        mut header: JsonlStorageHeader,
+        snapshot: &ForkDestinationSnapshot,
+    ) -> Result<Arc<Self>, SessionError> {
         header.next_seq = Some(snapshot.next_seq);
         let writes = pi_agent::session::fork_snapshot_writes(snapshot);
-        let transactions = writes.iter().map(|write| serialize_transaction(std::slice::from_ref(write)));
+        let transactions = writes
+            .iter()
+            .map(|write| serialize_transaction(std::slice::from_ref(write)));
         let content = complete_file(&header, transactions)?;
         publish_file_atomically(path, &content)?;
         Self::open_sync(path).map(|(_, storage)| storage)
@@ -296,7 +359,11 @@ impl JsonlStorage {
         })
     }
 
-    fn commit_sync(inner_handle: &Arc<Mutex<Inner>>, path: &Path, writes: Vec<Write>) -> Result<CommitResult, SessionError> {
+    fn commit_sync(
+        inner_handle: &Arc<Mutex<Inner>>,
+        path: &Path,
+        writes: Vec<Write>,
+    ) -> Result<CommitResult, SessionError> {
         let mut inner = lock_inner(inner_handle);
         match &inner.backing {
             Backing::V3 { .. } if writes.is_empty() => {
@@ -336,7 +403,11 @@ impl JsonlStorage {
         })
     }
 
-    fn upgrade_v3_locked(inner: &mut Inner, path: &Path, caller_writes: Vec<Write>) -> Result<CommitResult, SessionError> {
+    fn upgrade_v3_locked(
+        inner: &mut Inner,
+        path: &Path,
+        caller_writes: Vec<Write>,
+    ) -> Result<CommitResult, SessionError> {
         let (imported_usage, baseline) = match &inner.backing {
             Backing::V3 {
                 imported_usage,
@@ -361,7 +432,10 @@ impl JsonlStorage {
         validate_committed_writes(&writes, first_seq, &inner.state)?;
         let (committed, seqs) = commit_writes(writes, first_seq, timestamp)?;
         let next_seq = first_seq
-            .checked_add(u64::try_from(committed.len()).map_err(|_| SessionError::Invariant("sequence overflow".to_owned()))?)
+            .checked_add(
+                u64::try_from(committed.len())
+                    .map_err(|_| SessionError::Invariant("sequence overflow".to_owned()))?,
+            )
             .ok_or_else(|| SessionError::Invariant("sequence overflow".to_owned()))?;
         let mut header = inner.header.clone();
         header.next_seq = Some(next_seq);
@@ -397,7 +471,11 @@ fn stats_with_imported_usage(stats: &SessionStats, backing: &Backing) -> Session
 }
 
 impl Storage for JsonlStorage {
-    fn commit<'a>(&'a self, writes: Vec<Write>, cx: &'a Context) -> BoxFuture<'a, Result<CommitResult, SessionError>> {
+    fn commit<'a>(
+        &'a self,
+        writes: Vec<Write>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<CommitResult, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(aborted)?;
             let permit = self.admit()?;
@@ -408,31 +486,60 @@ impl Storage for JsonlStorage {
                 JsonlStorage::commit_sync(&inner, &path, writes)
             })
             .await
-            .map_err(|error| failure(StorageErrorCode::Io, "JSONL commit task failed", Some(Arc::new(error))))?
+            .map_err(|error| {
+                failure(
+                    StorageErrorCode::Io,
+                    "JSONL commit task failed",
+                    Some(Arc::new(error)),
+                )
+            })?
         })
     }
 
-    fn get_entries<'a>(&'a self, ids: &'a [EntryId], cx: &'a Context) -> BoxFuture<'a, Result<HashMap<EntryId, Entry>, SessionError>> {
+    fn get_entries<'a>(
+        &'a self,
+        ids: &'a [EntryId],
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<HashMap<EntryId, Entry>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(aborted)?;
             self.ensure_open()?;
             Ok(self.with_state(|state| {
                 ids.iter()
-                    .filter_map(|id| state.entries.get(id).cloned().map(|entry| (id.clone(), entry)))
+                    .filter_map(|id| {
+                        state
+                            .entries
+                            .get(id)
+                            .cloned()
+                            .map(|entry| (id.clone(), entry))
+                    })
                     .collect()
             }))
         })
     }
 
-    fn get_value<'a>(&'a self, address: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<Option<RawStoredValue>, SessionError>> {
+    fn get_value<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<RawStoredValue>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(aborted)?;
             self.ensure_open()?;
-            Ok(self.with_state(|state| state.values.get(&(address.namespace.clone(), address.key.clone())).cloned()))
+            Ok(self.with_state(|state| {
+                state
+                    .values
+                    .get(&(address.namespace.clone(), address.key.clone()))
+                    .cloned()
+            }))
         })
     }
 
-    fn scan_values<'a>(&'a self, prefix: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<Vec<RawStoredValue>, SessionError>> {
+    fn scan_values<'a>(
+        &'a self,
+        prefix: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<RawStoredValue>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(aborted)?;
             self.ensure_open()?;
@@ -440,14 +547,21 @@ impl Storage for JsonlStorage {
                 state
                     .values
                     .values()
-                    .filter(|value| value.namespace == prefix.namespace && value.key.starts_with(&prefix.key))
+                    .filter(|value| {
+                        value.namespace == prefix.namespace && value.key.starts_with(&prefix.key)
+                    })
                     .cloned()
                     .collect()
             }))
         })
     }
 
-    fn read_list<'a>(&'a self, address: &'a RawAddress, options: Option<pi_agent::session::ListReadOptions>, cx: &'a Context) -> BoxFuture<'a, Result<Vec<RawListElement>, SessionError>> {
+    fn read_list<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        options: Option<pi_agent::session::ListReadOptions>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<RawListElement>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(aborted)?;
             self.ensure_open()?;
@@ -474,7 +588,11 @@ impl Storage for JsonlStorage {
         })
     }
 
-    fn scan_branch<'a>(&'a self, query: &'a StorageBranchScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+    fn scan_branch<'a>(
+        &'a self,
+        query: &'a StorageBranchScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(aborted)?;
             self.ensure_open()?;
@@ -482,7 +600,11 @@ impl Storage for JsonlStorage {
         })
     }
 
-    fn scan_branch_structure<'a>(&'a self, query: &'a StorageBranchScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<EntryStructure>, SessionError>> {
+    fn scan_branch_structure<'a>(
+        &'a self,
+        query: &'a StorageBranchScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<EntryStructure>, SessionError>> {
         Box::pin(async move {
             self.scan_branch(query, cx)
                 .await
@@ -490,7 +612,11 @@ impl Storage for JsonlStorage {
         })
     }
 
-    fn scan_entries<'a>(&'a self, query: &'a EntryScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+    fn scan_entries<'a>(
+        &'a self,
+        query: &'a EntryScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(aborted)?;
             self.ensure_open()?;
@@ -500,21 +626,42 @@ impl Storage for JsonlStorage {
                     .values()
                     .filter(|entry| query.from_seq.is_none_or(|value| entry.seq() >= value))
                     .filter(|entry| query.to_seq.is_none_or(|value| entry.seq() <= value))
-                    .filter(|entry| query.entry_type.is_none_or(|value| entry.entry_type() == value))
-                    .filter(|entry| query.custom_type.as_deref().is_none_or(|value| entry.custom_type() == Some(value)))
+                    .filter(|entry| {
+                        query
+                            .entry_type
+                            .is_none_or(|value| entry.entry_type() == value)
+                    })
+                    .filter(|entry| {
+                        query
+                            .custom_type
+                            .as_deref()
+                            .is_none_or(|value| entry.custom_type() == Some(value))
+                    })
                     .cloned()
                     .collect();
                 entries.sort_by_key(Entry::seq);
                 if query.order == Some(ScanOrder::Desc) {
                     entries.reverse();
                 }
-                entries.truncate(usize::try_from(query.limit.unwrap_or(LIST_READ_DEFAULT_LIMIT).min(LIST_READ_MAX_LIMIT)).unwrap_or(usize::MAX));
+                entries.truncate(
+                    usize::try_from(
+                        query
+                            .limit
+                            .unwrap_or(LIST_READ_DEFAULT_LIMIT)
+                            .min(LIST_READ_MAX_LIMIT),
+                    )
+                    .unwrap_or(usize::MAX),
+                );
                 entries
             }))
         })
     }
 
-    fn scan_usage<'a>(&'a self, query: &'a UsageScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<UsageRow>, SessionError>> {
+    fn scan_usage<'a>(
+        &'a self,
+        query: &'a UsageScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<UsageRow>, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(aborted)?;
             self.ensure_open()?;
@@ -530,18 +677,32 @@ impl Storage for JsonlStorage {
                 if query.order == Some(ScanOrder::Desc) {
                     rows.reverse();
                 }
-                rows.truncate(usize::try_from(query.limit.unwrap_or(LIST_READ_DEFAULT_LIMIT).min(LIST_READ_MAX_LIMIT)).unwrap_or(usize::MAX));
+                rows.truncate(
+                    usize::try_from(
+                        query
+                            .limit
+                            .unwrap_or(LIST_READ_DEFAULT_LIMIT)
+                            .min(LIST_READ_MAX_LIMIT),
+                    )
+                    .unwrap_or(usize::MAX),
+                );
                 rows
             }))
         })
     }
 
-    fn get_stats<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<SessionStats, SessionError>> {
+    fn get_stats<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<SessionStats, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(aborted)?;
             self.ensure_open()?;
             let inner = lock_inner(&self.inner);
-            Ok(stats_with_imported_usage(&inner.state.stats, &inner.backing))
+            Ok(stats_with_imported_usage(
+                &inner.state.stats,
+                &inner.backing,
+            ))
         })
     }
 
@@ -563,12 +724,21 @@ impl Storage for JsonlStorage {
                 }
             })
             .await
-            .map_err(|error| failure(StorageErrorCode::Io, "JSONL close task failed", Some(Arc::new(error))))?
+            .map_err(|error| {
+                failure(
+                    StorageErrorCode::Io,
+                    "JSONL close task failed",
+                    Some(Arc::new(error)),
+                )
+            })?
         })
     }
 }
 impl ForkSource for JsonlStorage {
-    fn capture_fork_source<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<ForkSourceSnapshot, SessionError>> {
+    fn capture_fork_source<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<ForkSourceSnapshot, SessionError>> {
         Box::pin(async move {
             cx.check().map_err(aborted)?;
             let permit = self.admit()?;

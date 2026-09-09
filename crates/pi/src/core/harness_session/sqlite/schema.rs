@@ -7,7 +7,7 @@ pub const SQLITE_SESSION_EXTENSION: &str = ".sqlite";
 /// Sequence assigned to the first committed write in a new session.
 pub const FIRST_COMMIT_SEQ: u64 = 1;
 
-const SOURCE_SCHEMA: &str = r#"
+const SOURCE_SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL,
@@ -113,23 +113,31 @@ CREATE TABLE IF NOT EXISTS branch_meta (
 ) WITHOUT ROWID;
 
 CREATE UNIQUE INDEX IF NOT EXISTS ix_bm_tip ON branch_meta(session_id, tip_entry_id);
-"#;
+";
 
 /// Opens a writable connection without creating a missing database.
 pub(crate) fn open_existing(path: &std::path::Path) -> rusqlite::Result<Connection> {
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI)
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+    )
 }
 
 /// Opens a read-only connection without creating a missing database.
 pub(crate) fn open_read_only(path: &std::path::Path) -> rusqlite::Result<Connection> {
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
 }
 
 /// Opens a writable connection, creating a fresh file when needed.
 pub(crate) fn open_create(path: &std::path::Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(
         path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_URI,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_URI,
     )
 }
 

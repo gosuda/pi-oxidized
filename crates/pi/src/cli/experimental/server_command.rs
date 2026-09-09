@@ -50,6 +50,11 @@ fn parse_server_id_value(value: &str) -> Result<ParsedValue, String> {
 
 /// Parses the arguments following the `server` command name
 /// (source `serverCommand` builder).
+///
+/// # Errors
+///
+/// Returns a `Vec<String>` of human-readable validation errors when the
+/// arguments are invalid or mutually exclusive.
 pub fn parse_server_command(args: &[String]) -> Result<ServerCommand, Vec<String>> {
     let input = parse_options(args, &SERVER_OPTIONS);
     let mut errors = input.errors().to_vec();
@@ -86,6 +91,10 @@ mod tests {
         values.iter().copied().map(str::to_owned).collect()
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "test assertion: parse must succeed for this valid invocation"
+    )]
     #[test]
     fn accepts_full_source_flag_set() {
         let command = match parse_server_command(&strings(&[
@@ -160,13 +169,15 @@ mod tests {
         assert_eq!(
             parse_server_command(&strings(&["extra"])),
             Err(vec![
-                "The experimental server command does not support existing CLI options yet".to_owned()
+                "The experimental server command does not support existing CLI options yet"
+                    .to_owned()
             ])
         );
         assert_eq!(
             parse_server_command(&strings(&["--connect", "unix:///tmp/pi.sock"])),
             Err(vec![
-                "The experimental server command does not support existing CLI options yet".to_owned()
+                "The experimental server command does not support existing CLI options yet"
+                    .to_owned()
             ])
         );
     }
@@ -175,7 +186,9 @@ mod tests {
     fn rejects_mutually_exclusive_auth_and_invalid_server_id() {
         assert_eq!(
             parse_server_command(&strings(&["--auth-token", "t", "--auth-token-file", "f"])),
-            Err(vec!["--auth-token and --auth-token-file are mutually exclusive".to_owned()])
+            Err(vec![
+                "--auth-token and --auth-token-file are mutually exclusive".to_owned()
+            ])
         );
         assert_eq!(
             parse_server_command(&strings(&["--server-id", "00000000-0000-4000-8000-0000000000010"])),

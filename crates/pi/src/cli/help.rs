@@ -286,7 +286,6 @@ mod tests {
         assert!(!text.contains('\u{1b}'));
     }
 
-
     #[test]
     fn styled_help_uses_ansi_bold_on_headers() {
         let text = format_help(None, HelpStyle { styled: true });

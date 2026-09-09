@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 
 use pi_agent::service::value::{JsObject, JsString, JsonValue};
 use pi_agent::service::wire::{
-    parse_service_call, parse_service_catalogue, parse_service_provider_update, ServiceCall,
-    ServiceCatalogueEntry, ServiceProviderUpdate, WireError,
+    ServiceCall, ServiceCatalogueEntry, ServiceProviderUpdate, WireError, parse_service_call,
+    parse_service_catalogue, parse_service_provider_update,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -59,8 +59,17 @@ impl FacetHostEntry {
     }
 
     /// Parse the source spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacetWireError::Invalid`] when the value is not a known
+    /// host entry spelling.
     pub fn parse(value: &JsonValue) -> Result<Self, FacetWireError> {
-        match value.as_str().and_then(|value| value.try_to_utf8().ok()).as_deref() {
+        match value
+            .as_str()
+            .and_then(|value| value.try_to_utf8().ok())
+            .as_deref()
+        {
             Some("session") => Ok(Self::Session),
             Some("tui") => Ok(Self::Tui),
             _ => Err(FacetWireError::Invalid("facet host entry")),
@@ -107,7 +116,7 @@ pub struct FacetBundleArtifactWire {
     pub entry_name: String,
     /// Manifest entry metadata.
     pub entry: FacetBundleEntryWire,
-    /// Content-addressed CommonJS source.
+    /// Content-addressed `CommonJS` source.
     pub source: String,
     /// Optional source-map contents.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,6 +245,12 @@ pub enum FacetWireError {
 
 impl FacetServiceInvokeRequest {
     /// Decode `{hostId, call}` while retaining canonical Chord values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacetWireError::Invalid`] for a non-record, a field-set
+    /// mismatch, or a mistyped member, and [`FacetWireError::Service`] when
+    /// the embedded call fails service-call validation.
     pub fn from_json(value: &JsonValue) -> Result<Self, FacetWireError> {
         let fields = record(value, "facet service invocation")?;
         assert_keys(fields, &["hostId", "call"], &[])?;
@@ -256,6 +271,10 @@ impl FacetServiceInvokeRequest {
 
 impl FacetServiceInvokeResult {
     /// Decode a result envelope. Absent `result` is not the same as `null`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacetWireError::Invalid`] when the value is not a record.
     pub fn from_json(value: &JsonValue) -> Result<Self, FacetWireError> {
         let fields = record(value, "facet service invocation result")?;
         assert_keys(fields, &[], &["result"])?;
@@ -277,13 +296,27 @@ impl FacetServiceInvokeResult {
 
 impl FacetServiceUpdateEvent {
     /// Decode `{hostId, subscriptionId, update}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacetWireError::Invalid`] for a non-record, a field-set
+    /// mismatch, or a mistyped member, and [`FacetWireError::Service`] when
+    /// the embedded update fails service-update validation.
     pub fn from_json(value: &JsonValue) -> Result<Self, FacetWireError> {
         let fields = record(value, "facet service update")?;
         assert_keys(fields, &["hostId", "subscriptionId", "update"], &[])?;
         let host_id = required_string(fields, "hostId", "facet service update.hostId")?;
-        let subscription_id = required_string(fields, "subscriptionId", "facet service update.subscriptionId")?;
+        let subscription_id = required_string(
+            fields,
+            "subscriptionId",
+            "facet service update.subscriptionId",
+        )?;
         let update = parse_service_provider_update(required(fields, "update")?)?;
-        Ok(Self { host_id, subscription_id, update })
+        Ok(Self {
+            host_id,
+            subscription_id,
+            update,
+        })
     }
 
     /// Encode a service update event.
@@ -291,7 +324,10 @@ impl FacetServiceUpdateEvent {
     pub fn into_json(self) -> JsonValue {
         JsonValue::Object(JsObject::from([
             (key("hostId"), JsonValue::String(self.host_id)),
-            (key("subscriptionId"), JsonValue::String(self.subscription_id)),
+            (
+                key("subscriptionId"),
+                JsonValue::String(self.subscription_id),
+            ),
             (key("update"), self.update.into_json()),
         ]))
     }
@@ -300,11 +336,22 @@ impl FacetServiceUpdateEvent {
 /// Convert a canonical service catalogue to its wire array.
 #[must_use]
 pub fn catalogue_into_json(catalogue: Vec<ServiceCatalogueEntry>) -> JsonValue {
-    JsonValue::Array(catalogue.into_iter().map(ServiceCatalogueEntry::into_json).collect())
+    JsonValue::Array(
+        catalogue
+            .into_iter()
+            .map(ServiceCatalogueEntry::into_json)
+            .collect(),
+    )
 }
 
 /// Parse a canonical service catalogue.
-pub fn catalogue_from_json(value: &JsonValue) -> Result<Vec<ServiceCatalogueEntry>, FacetWireError> {
+///
+/// # Errors
+///
+/// Returns [`FacetWireError`] when the value is not a valid service catalogue.
+pub fn catalogue_from_json(
+    value: &JsonValue,
+) -> Result<Vec<ServiceCatalogueEntry>, FacetWireError> {
     parse_service_catalogue(value).map_err(FacetWireError::from)
 }
 
@@ -312,12 +359,19 @@ fn key(name: &str) -> JsString {
     JsString::from_utf8(name)
 }
 
-fn record<'a>(value: &'a JsonValue, description: &'static str) -> Result<&'a JsObject, FacetWireError> {
-    value.as_object().ok_or(FacetWireError::Invalid(description))
+fn record<'a>(
+    value: &'a JsonValue,
+    description: &'static str,
+) -> Result<&'a JsObject, FacetWireError> {
+    value
+        .as_object()
+        .ok_or(FacetWireError::Invalid(description))
 }
 
 fn required<'a>(fields: &'a JsObject, name: &str) -> Result<&'a JsonValue, FacetWireError> {
-    fields.get(&key(name)).ok_or(FacetWireError::Invalid("missing required facet field"))
+    fields
+        .get(&key(name))
+        .ok_or(FacetWireError::Invalid("missing required facet field"))
 }
 
 fn required_string(
@@ -340,8 +394,14 @@ fn assert_keys(
     required_names: &[&str],
     optional_names: &[&str],
 ) -> Result<(), FacetWireError> {
-    let required = required_names.iter().map(|name| key(name)).collect::<Vec<_>>();
-    let optional = optional_names.iter().map(|name| key(name)).collect::<Vec<_>>();
+    let required = required_names
+        .iter()
+        .map(|name| key(name))
+        .collect::<Vec<_>>();
+    let optional = optional_names
+        .iter()
+        .map(|name| key(name))
+        .collect::<Vec<_>>();
     if fields.keys().any(|field| {
         !required.iter().any(|required| required == field)
             && !optional.iter().any(|optional| optional == field)

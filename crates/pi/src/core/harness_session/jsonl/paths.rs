@@ -3,8 +3,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use pi_agent::session::{SessionError, StorageErrorCode, StorageFailure};
 use percent_encoding::{percent_decode_str, percent_encode_byte};
+use pi_agent::session::{SessionError, StorageErrorCode, StorageFailure};
 
 use crate::core::sessions::{encode_cwd_for_session_dir, entries::iso_from_millis};
 
@@ -18,7 +18,12 @@ use crate::core::sessions::{encode_cwd_for_session_dir, entries::iso_from_millis
 pub(super) fn encode_session_id(id: &str) -> String {
     let mut encoded = String::with_capacity(id.len());
     for &byte in id.as_bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')') {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+            )
+        {
             encoded.push(char::from(byte));
         } else {
             encoded.push_str(percent_encode_byte(byte));
@@ -42,7 +47,13 @@ pub(super) fn session_directory_name(cwd: &str) -> String {
 pub(super) fn session_file_name(created_at: i64, id: &str) -> String {
     let timestamp: String = iso_from_millis(created_at)
         .chars()
-        .map(|character| if matches!(character, ':' | '.') { '-' } else { character })
+        .map(|character| {
+            if matches!(character, ':' | '.') {
+                '-'
+            } else {
+                character
+            }
+        })
         .collect();
     format!("{timestamp}_{}.jsonl", encode_session_id(id))
 }
@@ -63,7 +74,7 @@ pub(super) async fn resolve_new_session_path(
     let id_for_error = id.to_owned();
     let path_for_error = directory.clone();
     let path_for_worker_error = directory.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => Some(entries),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -78,29 +89,43 @@ pub(super) async fn resolve_new_session_path(
         if let Some(entries) = entries {
             for entry in entries {
                 let entry = entry.map_err(|source| {
-                    io_failure(&path_for_error, "failed to inspect sessions directory", source)
+                    io_failure(
+                        &path_for_error,
+                        "failed to inspect sessions directory",
+                        source,
+                    )
                 })?;
                 if entry
                     .file_type()
-                    .map_err(|source| io_failure(&path_for_error, "failed to inspect session file", source))?
+                    .map_err(|source| {
+                        io_failure(&path_for_error, "failed to inspect session file", source)
+                    })?
                     .is_dir()
                 {
                     continue;
                 }
-                if entry.file_name().to_string_lossy().ends_with(&duplicate_suffix) {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(&duplicate_suffix)
+                {
                     return Err(SessionError::Invariant(format!(
                         "Session already exists: {id_for_error}"
                     )));
                 }
             }
         }
-        fs::create_dir_all(&directory)
-            .map_err(|source| io_failure(&path_for_error, "failed to create sessions directory", source))?;
+        fs::create_dir_all(&directory).map_err(|source| {
+            io_failure(
+                &path_for_error,
+                "failed to create sessions directory",
+                source,
+            )
+        })?;
         Ok(directory.join(file_name))
     })
     .await
-    .map_err(|source| io_failure(&path_for_worker_error, "session path worker failed", source))?;
-    result
+    .map_err(|source| io_failure(&path_for_worker_error, "session path worker failed", source))?
 }
 
 /// Lists session files below encoded cwd directories.
@@ -126,7 +151,11 @@ pub(super) async fn list_session_files(
                 Ok(entries) => entries,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
                 Err(source) => {
-                    return Err(io_failure(&path_for_error, "failed to list sessions root", source));
+                    return Err(io_failure(
+                        &path_for_error,
+                        "failed to list sessions root",
+                        source,
+                    ));
                 }
             };
             let mut directories = Vec::new();
@@ -136,7 +165,13 @@ pub(super) async fn list_session_files(
                 })?;
                 let is_directory = entry
                     .file_type()
-                    .map_err(|source| io_failure(&path_for_error, "failed to inspect session directory", source))?
+                    .map_err(|source| {
+                        io_failure(
+                            &path_for_error,
+                            "failed to inspect session directory",
+                            source,
+                        )
+                    })?
                     .is_dir();
                 if is_directory {
                     directories.push(entry.path());
@@ -164,7 +199,9 @@ pub(super) async fn list_session_files(
                 })?;
                 if entry
                     .file_type()
-                    .map_err(|source| io_failure(&directory, "failed to inspect session file", source))?
+                    .map_err(|source| {
+                        io_failure(&directory, "failed to inspect session file", source)
+                    })?
                     .is_dir()
                 {
                     continue;
@@ -178,7 +215,13 @@ pub(super) async fn list_session_files(
         Ok(files)
     })
     .await
-    .map_err(|source| io_failure(&path_for_worker_error, "session listing worker failed", source))?
+    .map_err(|source| {
+        io_failure(
+            &path_for_worker_error,
+            "session listing worker failed",
+            source,
+        )
+    })?
 }
 
 /// Removes a session file. A missing file is an error.
@@ -191,7 +234,13 @@ pub(super) async fn remove_session_file(path: &Path) -> Result<(), SessionError>
             .map_err(|source| io_failure(&path_for_error, "failed to remove session", source))
     })
     .await
-    .map_err(|source| io_failure(&path_for_worker_error, "session removal worker failed", source))?
+    .map_err(|source| {
+        io_failure(
+            &path_for_worker_error,
+            "session removal worker failed",
+            source,
+        )
+    })?
 }
 
 /// Removes a session file left behind by a failed admission. A missing file is
@@ -200,15 +249,23 @@ pub(super) async fn discard_session_file(path: &Path) -> Result<(), SessionError
     let path = path.to_path_buf();
     let path_for_error = path.clone();
     let path_for_worker_error = path.clone();
-    tokio::task::spawn_blocking(move || {
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(io_failure(&path_for_error, "failed to remove session", source)),
-        }
+    tokio::task::spawn_blocking(move || match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_failure(
+            &path_for_error,
+            "failed to remove session",
+            source,
+        )),
     })
     .await
-    .map_err(|source| io_failure(&path_for_worker_error, "session removal worker failed", source))?
+    .map_err(|source| {
+        io_failure(
+            &path_for_worker_error,
+            "session removal worker failed",
+            source,
+        )
+    })?
 }
 
 /// Verifies that `path` is the repository-owned session file for `id` below
@@ -244,11 +301,15 @@ pub(super) async fn verify_owned_session_path(
                 )));
             }
             Err(source) => {
-                return Err(io_failure(&path_for_error, "failed to resolve session path", source));
+                return Err(io_failure(
+                    &path_for_error,
+                    "failed to resolve session path",
+                    source,
+                ));
             }
         };
-        let owned = fs::canonicalize(&root).ok().is_some_and(|canonical_root| {
-            fs::canonicalize(&directory).ok().is_some_and(|canonical_dir| {
+        let owned = fs::canonicalize(&root).is_ok_and(|canonical_root| {
+            fs::canonicalize(&directory).is_ok_and(|canonical_dir| {
                 canonical_dir.parent() == Some(canonical_root.as_path())
                     && canonical_dir.file_name() == directory.file_name()
                     && canonical_file.starts_with(canonical_root.as_path())
@@ -300,43 +361,41 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn ownership_matches_the_complete_id() {
-        let root = tempdir().expect("root tempdir");
+    async fn ownership_matches_the_complete_id() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
         let directory = root.path().join(session_directory_name("/cwd"));
-        fs::create_dir(&directory).expect("create storage directory");
+        fs::create_dir_all(&directory)?;
         for id in ["q_abc", "q_bc", "space id", "日本語", "literal%20"] {
             let path = directory.join(session_file_name(0, id));
-            fs::write(&path, "").expect("write session");
-            verify_owned_session_path(root.path(), "/cwd", id, &path)
-                .await
-                .expect("complete id owns file");
+            fs::write(&path, "")?;
+            verify_owned_session_path(root.path(), "/cwd", id, &path).await?;
             let result = verify_owned_session_path(root.path(), "/cwd", "bc", &path).await;
             assert!(matches!(result, Err(SessionError::Invariant(_))));
         }
         let legacy = directory.join("different-timestamp_raw space_id.jsonl");
-        fs::write(&legacy, "").expect("write legacy session");
-        verify_owned_session_path(root.path(), "/cwd", "raw space_id", &legacy)
-            .await
-            .expect("legacy raw id and original timestamp remain supported");
+        fs::write(&legacy, "")?;
+        verify_owned_session_path(root.path(), "/cwd", "raw space_id", &legacy).await?;
 
         // A shorter id must not match the trailing component of an id that
         // contains an underscore.
         let q_abc = directory.join(session_file_name(0, "q_abc"));
         let result = verify_owned_session_path(root.path(), "/cwd", "abc", &q_abc).await;
         assert!(matches!(result, Err(SessionError::Invariant(_))));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn ownership_rejects_storage_symlink_outside_root() {
-        let root = tempdir().expect("root tempdir");
-        let foreign = tempdir().expect("foreign tempdir");
+    async fn ownership_rejects_storage_symlink_outside_root() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let foreign = tempdir()?;
         let directory = root.path().join(session_directory_name("/cwd"));
-        std::os::unix::fs::symlink(foreign.path(), &directory).expect("symlink storage");
+        std::os::unix::fs::symlink(foreign.path(), &directory)?;
         let path = directory.join(session_file_name(0, "shared-id"));
-        fs::write(&path, "foreign session").expect("write foreign session");
+        fs::write(&path, "foreign session")?;
         let result = verify_owned_session_path(root.path(), "/cwd", "shared-id", &path).await;
         assert!(matches!(result, Err(SessionError::Invariant(_))));
-        assert_eq!(fs::read_to_string(&path).expect("foreign file remains"), "foreign session");
+        assert_eq!(fs::read_to_string(&path)?, "foreign session");
+        Ok(())
     }
 }

@@ -14,8 +14,8 @@ use crate::remote::framing::{
     assert_complete_frame, encode_frame,
 };
 use crate::remote::schemas::{
-    ClientMessage, PROTOCOL_VERSION, ProtocolError, RpcTarget, ServerMessage, ServerId,
-    SessionTarget, ServerTarget, is_server_id,
+    ClientMessage, PROTOCOL_VERSION, ProtocolError, RpcTarget, ServerId, ServerMessage,
+    ServerTarget, SessionTarget, is_server_id,
 };
 use crate::remote::serde_cbor::{CborValue, CborValueDeserializer, CborValueSerializer, SerError};
 
@@ -23,6 +23,7 @@ const DEFAULT_MAX_CBOR_CONTAINER_LENGTH: usize = 1_000_000;
 const DEFAULT_MAX_CBOR_DEPTH: usize = 64;
 const MAX_JSON_DEPTH: usize = 512;
 const MAX_SAFE_CBOR_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_SAFE_CBOR_INTEGER_I64: i64 = 9_007_199_254_740_991;
 const MAX_SAFE_CBOR_INTEGER_F64: f64 = 9_007_199_254_740_991.0;
 const MAX_PROTOCOL_ERROR_CHARS: usize = 500;
 
@@ -44,7 +45,8 @@ struct CborOptions {
 impl CborOptions {
     fn from_frame(options: Option<FrameDecoderOptions>) -> Self {
         Self {
-            max_byte_length: options.map_or(DEFAULT_MAX_FRAME_LENGTH, |value| value.max_frame_length),
+            max_byte_length: options
+                .map_or(DEFAULT_MAX_FRAME_LENGTH, |value| value.max_frame_length),
             max_container_length: DEFAULT_MAX_CBOR_CONTAINER_LENGTH,
             max_depth: DEFAULT_MAX_CBOR_DEPTH,
         }
@@ -167,13 +169,13 @@ impl<'a> CborEncoder<'a> {
     }
 
     fn ensure_capacity(&mut self, additional: usize) -> Result<(), CborError> {
-        let required = self
-            .buf
-            .len()
-            .checked_add(additional)
-            .ok_or(CborError::ByteLengthExceeded {
-                limit: self.options.max_byte_length,
-            })?;
+        let required =
+            self.buf
+                .len()
+                .checked_add(additional)
+                .ok_or(CborError::ByteLengthExceeded {
+                    limit: self.options.max_byte_length,
+                })?;
         if required > self.options.max_byte_length {
             return Err(CborError::ByteLengthExceeded {
                 limit: self.options.max_byte_length,
@@ -184,29 +186,23 @@ impl<'a> CborEncoder<'a> {
 
     fn write_argument(&mut self, major_type: u8, value: u64) -> Result<(), CborError> {
         let prefix = major_type << 5;
-        if value < 24 {
-            self.write_byte(prefix | u8::try_from(value).map_err(|_| CborError::UnsafeInteger)?)
-        } else if value <= u64::from(u8::MAX) {
+        if let Ok(value) = u8::try_from(value) {
+            if value < 24 {
+                return self.write_byte(prefix | value);
+            }
             self.write_byte(prefix | 0x18)?;
-            self.write_byte(u8::try_from(value).map_err(|_| CborError::UnsafeInteger)?)
-        } else if value <= u64::from(u16::MAX) {
-            self.write_byte(prefix | 0x19)?;
-            self.write_bytes(
-                &u16::try_from(value)
-                    .map_err(|_| CborError::UnsafeInteger)?
-                    .to_be_bytes(),
-            )
-        } else if value <= u64::from(u32::MAX) {
-            self.write_byte(prefix | 0x1a)?;
-            self.write_bytes(
-                &u32::try_from(value)
-                    .map_err(|_| CborError::UnsafeInteger)?
-                    .to_be_bytes(),
-            )
-        } else {
-            self.write_byte(prefix | 0x1b)?;
-            self.write_bytes(&value.to_be_bytes())
+            return self.write_byte(value);
         }
+        if let Ok(value) = u16::try_from(value) {
+            self.write_byte(prefix | 0x19)?;
+            return self.write_bytes(&value.to_be_bytes());
+        }
+        if let Ok(value) = u32::try_from(value) {
+            self.write_byte(prefix | 0x1a)?;
+            return self.write_bytes(&value.to_be_bytes());
+        }
+        self.write_byte(prefix | 0x1b)?;
+        self.write_bytes(&value.to_be_bytes())
     }
 
     fn encode_text(&mut self, value: &str) -> Result<(), CborError> {
@@ -242,7 +238,7 @@ impl<'a> CborEncoder<'a> {
                 self.write_argument(0, *number)
             }
             CborValue::NInt(number) => {
-                if *number < -(MAX_SAFE_CBOR_INTEGER as i64) {
+                if *number < -MAX_SAFE_CBOR_INTEGER_I64 {
                     return Err(CborError::UnsafeInteger);
                 }
                 let argument = u64::try_from(-1i128 - i128::from(*number))
@@ -342,10 +338,7 @@ impl<'a> CborDecoder<'a> {
             .get(self.offset)
             .copied()
             .ok_or(CborError::Truncated)?;
-        self.offset = self
-            .offset
-            .checked_add(1)
-            .ok_or(CborError::Truncated)?;
+        self.offset = self.offset.checked_add(1).ok_or(CborError::Truncated)?;
         Ok(value)
     }
 
@@ -620,7 +613,9 @@ fn check_discriminant(
 
 fn validate_json_value(value: &JsonValue, depth: usize) -> Result<(), String> {
     if depth > MAX_JSON_DEPTH {
-        return Err(format!("JSON nesting depth exceeds configured limit of {MAX_JSON_DEPTH}"));
+        return Err(format!(
+            "JSON nesting depth exceeds configured limit of {MAX_JSON_DEPTH}"
+        ));
     }
     match value {
         JsonValue::Null | JsonValue::Bool(_) => Ok(()),
@@ -760,7 +755,7 @@ fn validate_cbor_value(value: &CborValue, depth: usize) -> Result<(), CborError>
             }
         }
         CborValue::NInt(number) => {
-            if *number < -(MAX_SAFE_CBOR_INTEGER as i64) {
+            if *number < -MAX_SAFE_CBOR_INTEGER_I64 {
                 Err(CborError::UnsafeInteger)
             } else {
                 Ok(())
@@ -804,32 +799,40 @@ fn validate_cbor_value(value: &CborValue, depth: usize) -> Result<(), CborError>
     }
 }
 
-fn decode_client_payload(payload: &[u8], options: &CborOptions) -> Result<ClientMessage, CodecError> {
+fn decode_client_payload(
+    payload: &[u8],
+    options: &CborOptions,
+) -> Result<ClientMessage, CodecError> {
     let value = decode_cbor_value(payload, options)?;
     check_discriminant(&value, "type", CLIENT_DISCRIMINANTS, "client")?;
-    let message = ClientMessage::deserialize(CborValueDeserializer { value })
-        .map_err(|error: SerError| {
+    let message = ClientMessage::deserialize(CborValueDeserializer { value }).map_err(
+        |error: SerError| {
             if error.0.contains("unknown variant") {
                 CodecError::UnknownDiscriminant(bounded_error_message(error))
             } else {
                 invalid_client(error)
             }
-        })?;
+        },
+    )?;
     validate_client_message(&message)?;
     Ok(message)
 }
 
-fn decode_server_payload(payload: &[u8], options: &CborOptions) -> Result<ServerMessage, CodecError> {
+fn decode_server_payload(
+    payload: &[u8],
+    options: &CborOptions,
+) -> Result<ServerMessage, CodecError> {
     let value = decode_cbor_value(payload, options)?;
     check_discriminant(&value, "type", SERVER_DISCRIMINANTS, "server")?;
-    let message = ServerMessage::deserialize(CborValueDeserializer { value })
-        .map_err(|error: SerError| {
+    let message = ServerMessage::deserialize(CborValueDeserializer { value }).map_err(
+        |error: SerError| {
             if error.0.contains("unknown variant") {
                 CodecError::UnknownDiscriminant(bounded_error_message(error))
             } else {
                 invalid_server(error)
             }
-        })?;
+        },
+    )?;
     validate_server_message(&message)?;
     Ok(message)
 }
@@ -944,6 +947,13 @@ impl ClientMessageDecoder {
     /// Feeds arbitrary bytes and returns every complete decoded message.
     ///
     /// Any frame, CBOR, or schema error permanently fails this decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::Frame`] for malformed framing,
+    /// [`CodecError::Cbor`] for malformed CBOR, or a validation variant for
+    /// an invalid envelope. Once an error occurs, subsequent calls also
+    /// return a latched decoder failure.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<ClientMessage>, CodecError> {
         if self.failed {
             return Err(invalid_client("client message decoder has failed"));
@@ -969,6 +979,12 @@ impl ClientMessageDecoder {
     }
 
     /// Ends the input stream, rejecting a partial frame and latching failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::Frame`] when the input ends with a partial frame.
+    /// Once an error occurs, subsequent calls return a latched decoder
+    /// failure.
     pub fn end(&mut self) -> Result<(), CodecError> {
         if self.failed {
             return Err(invalid_client("client message decoder has failed"));
@@ -1007,6 +1023,13 @@ impl ServerMessageDecoder {
     /// Feeds arbitrary bytes and returns every complete decoded message.
     ///
     /// Any frame, CBOR, or schema error permanently fails this decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::Frame`] for malformed framing,
+    /// [`CodecError::Cbor`] for malformed CBOR, or a validation variant for
+    /// an invalid envelope. Once an error occurs, subsequent calls also
+    /// return a latched decoder failure.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<ServerMessage>, CodecError> {
         if self.failed {
             return Err(invalid_server("server message decoder has failed"));
@@ -1032,6 +1055,12 @@ impl ServerMessageDecoder {
     }
 
     /// Ends the input stream, rejecting a partial frame and latching failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::Frame`] when the input ends with a partial frame.
+    /// Once an error occurs, subsequent calls return a latched decoder
+    /// failure.
     pub fn end(&mut self) -> Result<(), CodecError> {
         if self.failed {
             return Err(invalid_server("server message decoder has failed"));
@@ -1073,44 +1102,51 @@ mod tests {
     use super::*;
     use pi_agent::service::value::{JsString, JsonValue, parse_json};
 
-    fn server_id() -> crate::remote::schemas::ServerId {
-        crate::remote::schemas::ServerId::new("00000000-0000-4000-8000-000000000001")
-            .expect("valid test server id")
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn test_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
+        Box::new(std::io::Error::other(message.into()))
     }
 
-    fn request() -> ClientMessage {
-        ClientMessage::Request {
+    fn server_id() -> TestResult<crate::remote::schemas::ServerId> {
+        Ok(crate::remote::schemas::ServerId::new(
+            "00000000-0000-4000-8000-000000000001",
+        )?)
+    }
+
+    fn request() -> TestResult<ClientMessage> {
+        Ok(ClientMessage::Request {
             id: "request-1".to_owned(),
             target: RpcTarget::Session(SessionTarget {
-                server_id: server_id(),
+                server_id: server_id()?,
                 session_id: "session-1".to_owned(),
                 attachment_id: "attachment-1".to_owned(),
             }),
-            call: parse_json(r#"{"serviceId":"application.custom","args":[null,true]}"#)
-                .expect("valid test JSON"),
-        }
+            call: parse_json(r#"{"serviceId":"application.custom","args":[null,true]}"#)?,
+        })
     }
 
     #[test]
-    fn roundtrips_opaque_request_and_v8_hello() {
+    fn roundtrips_opaque_request_and_v8_hello() -> TestResult {
         let hello = encode_client_message(
             &ClientMessage::Hello {
                 version: PROTOCOL_VERSION,
             },
             None,
-        )
-        .expect("encode hello");
+        )?;
         assert!(matches!(
-            decode_client_message(&hello, None).expect("decode hello"),
+            decode_client_message(&hello, None)?,
             ClientMessage::Hello { version: 8 }
         ));
 
-        let frame = encode_client_message(&request(), None).expect("encode request");
-        assert_eq!(decode_client_message(&frame, None).expect("decode request"), request());
+        let request = request()?;
+        let frame = encode_client_message(&request, None)?;
+        assert_eq!(decode_client_message(&frame, None)?, request);
+        Ok(())
     }
 
     #[test]
-    fn response_absence_and_null_remain_distinct_on_wire() {
+    fn response_absence_and_null_remain_distinct_on_wire() -> TestResult {
         let absent = ServerMessage::Response {
             id: "request-1".to_owned(),
             result: None,
@@ -1119,17 +1155,14 @@ mod tests {
             id: "request-1".to_owned(),
             result: Some(JsonValue::Null),
         };
-        let absent = decode_server_message(
-            &encode_server_message(&absent, None).expect("encode absent"),
-            None,
-        )
-        .expect("decode absent");
-        let explicit_null = decode_server_message(
-            &encode_server_message(&explicit_null, None).expect("encode null"),
-            None,
-        )
-        .expect("decode null");
-        assert!(matches!(absent, ServerMessage::Response { result: None, .. }));
+        let absent_frame = encode_server_message(&absent, None)?;
+        let absent = decode_server_message(&absent_frame, None)?;
+        let explicit_null_frame = encode_server_message(&explicit_null, None)?;
+        let explicit_null = decode_server_message(&explicit_null_frame, None)?;
+        assert!(matches!(
+            absent,
+            ServerMessage::Response { result: None, .. }
+        ));
         assert!(matches!(
             explicit_null,
             ServerMessage::Response {
@@ -1137,128 +1170,141 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
     }
 
     #[test]
-    fn encode_rejects_lone_surrogate_in_opaque_value() {
+    fn encode_rejects_lone_surrogate_in_opaque_value() -> TestResult {
         let message = ClientMessage::Request {
             id: "request-1".to_owned(),
             target: RpcTarget::Server(ServerTarget {
-                server_id: server_id(),
+                server_id: server_id()?,
             }),
             call: JsonValue::String(JsString::from_utf16(vec![0xd800])),
         };
-        let error = encode_client_message(&message, None).expect_err("surrogate must be rejected");
+        let Err(error) = encode_client_message(&message, None) else {
+            return Err(test_error("surrogate must be rejected"));
+        };
         match error {
             CodecError::InvalidClient(message) => {
                 assert!(message.contains("valid Unicode scalar values"));
             }
-            other => panic!("expected InvalidClient, got {other:?}"),
+            other => return Err(test_error(format!("expected InvalidClient, got {other:?}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn decode_rejects_byte_string_in_opaque_value() {
+    fn decode_rejects_byte_string_in_opaque_value() -> TestResult {
         let mut payload = vec![
             0xa4, // map(4)
-            0x64, b't', b'y', b'p', b'e',
-            0x67, b'r', b'e', b'q', b'u', b'e', b's', b't',
-            0x62, b'i', b'd',
-            0x69, b'r', b'e', b'q', b'u', b'e', b's', b't', b'-', b'1',
-            0x66, b't', b'a', b'r', b'g', b'e', b't',
-            0xa1, // map(1)
-            0x68, b's', b'e', b'r', b'v', b'e', b'r', b'I', b'd',
-            0x78, 0x24,
+            0x64, b't', b'y', b'p', b'e', 0x67, b'r', b'e', b'q', b'u', b'e', b's', b't', 0x62,
+            b'i', b'd', 0x69, b'r', b'e', b'q', b'u', b'e', b's', b't', b'-', b'1', 0x66, b't',
+            b'a', b'r', b'g', b'e', b't', 0xa1, // map(1)
+            0x68, b's', b'e', b'r', b'v', b'e', b'r', b'I', b'd', 0x78, 0x24,
         ];
         payload.extend_from_slice(b"00000000-0000-4000-8000-000000000001");
         payload.extend_from_slice(&[0x64, b'c', b'a', b'l', b'l', 0x43, 1, 2, 3]);
         let frame = encode_frame(&payload);
-        let error = decode_client_message(&frame, None).expect_err("byte string must be rejected");
+        let Err(error) = decode_client_message(&frame, None) else {
+            return Err(test_error("byte string must be rejected"));
+        };
         match error {
             CodecError::InvalidClient(message) => {
                 assert!(message.contains("byte strings are not permitted"));
             }
-            other => panic!("expected InvalidClient, got {other:?}"),
+            other => return Err(test_error(format!("expected InvalidClient, got {other:?}"))),
         }
+        Ok(())
     }
+
     #[test]
-    fn encode_rejects_unsafe_integral_json_number() {
+    fn encode_rejects_unsafe_integral_json_number() -> TestResult {
         let message = ClientMessage::Request {
             id: "request-1".to_owned(),
             target: RpcTarget::Server(ServerTarget {
-                server_id: server_id(),
+                server_id: server_id()?,
             }),
             call: JsonValue::Number(MAX_SAFE_CBOR_INTEGER_F64 + 1.0),
         };
-        let error = encode_client_message(&message, None).expect_err("unsafe integer must fail");
+        let Err(error) = encode_client_message(&message, None) else {
+            return Err(test_error("unsafe integer must fail"));
+        };
         match error {
             CodecError::InvalidClient(message) => {
                 assert!(message.contains("outside the safe range"));
             }
-            other => panic!("expected InvalidClient, got {other:?}"),
+            other => return Err(test_error(format!("expected InvalidClient, got {other:?}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn decode_rejects_non_string_cbor_map_key() {
+    fn decode_rejects_non_string_cbor_map_key() -> TestResult {
         let frame = encode_frame(&[0xa1, 0x01, 0x00]);
-        let error = decode_client_message(&frame, None).expect_err("numeric key must fail");
-        assert!(matches!(
-            error,
-            CodecError::Cbor(CborError::NonStringKey)
-        ));
+        let Err(error) = decode_client_message(&frame, None) else {
+            return Err(test_error("numeric key must fail"));
+        };
+        assert!(matches!(error, CodecError::Cbor(CborError::NonStringKey)));
+        Ok(())
     }
 
     #[test]
-    fn response_negative_zero_roundtrips_with_sign() {
+    fn response_negative_zero_roundtrips_with_sign() -> TestResult {
         let message = ServerMessage::Response {
             id: "request-1".to_owned(),
             result: Some(JsonValue::Number(-0.0)),
         };
-        let decoded = decode_server_message(
-            &encode_server_message(&message, None).expect("encode response"),
-            None,
-        )
-        .expect("decode response");
+        let frame = encode_server_message(&message, None)?;
+        let decoded = decode_server_message(&frame, None)?;
         let ServerMessage::Response {
             result: Some(JsonValue::Number(value)),
             ..
         } = &decoded
         else {
-            panic!("expected response with numeric result");
+            return Err(test_error("expected response with numeric result"));
         };
         assert!(*value == 0.0 && value.is_sign_negative());
+        Ok(())
     }
 
     #[test]
-    fn integral_binary64_uses_cbor_integer_encoding() {
+    fn integral_binary64_uses_cbor_integer_encoding() -> TestResult {
         let message = ServerMessage::Response {
             id: "request-1".to_owned(),
             result: Some(JsonValue::Number(1.0)),
         };
-        let frame = encode_server_message(&message, None).expect("encode response");
+        let frame = encode_server_message(&message, None)?;
         assert!(frame.ends_with(&[0x66, b'r', b'e', b's', b'u', b'l', b't', 0x01]));
+        Ok(())
     }
 
     #[test]
-    fn incremental_decoder_latches_after_schema_failure() {
-        let invalid = encode_frame(&[0xa2, 0x64, b't', b'y', b'p', b'e', 0x65, b'h', b'e', b'l', b'l', b'o', 0x67, b'e', b'x', b't', b'r', b'a', 0xf5]);
-        let mut decoder = ClientMessageDecoder::new(None).expect("decoder");
+    fn incremental_decoder_latches_after_schema_failure() -> TestResult {
+        let invalid = encode_frame(&[
+            0xa2, 0x64, b't', b'y', b'p', b'e', 0x65, b'h', b'e', b'l', b'l', b'o', 0x67, b'e',
+            b'x', b't', b'r', b'a', 0xf5,
+        ]);
+        let mut decoder = ClientMessageDecoder::new(None)?;
         assert!(decoder.push(&invalid).is_err());
-        assert!(decoder
-            .push(&encode_client_message(&ClientMessage::Hello { version: 8 }, None).expect("hello"))
-            .is_err());
+        let hello = encode_client_message(&ClientMessage::Hello { version: 8 }, None)?;
+        assert!(decoder.push(&hello).is_err());
+        Ok(())
     }
 
     #[test]
-    fn server_hello_requires_v8_and_canonical_server_id() {
+    fn server_hello_requires_v8_and_canonical_server_id() -> TestResult {
         let wrong_version = ServerMessage::Hello {
             version: 7,
-            server_id: server_id(),
+            server_id: server_id()?,
         };
         assert!(matches!(
             encode_server_message(&wrong_version, None),
-            Err(CodecError::VersionMismatch { expected: 8, got: 7 })
+            Err(CodecError::VersionMismatch {
+                expected: 8,
+                got: 7
+            })
         ));
+        Ok(())
     }
 }

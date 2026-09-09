@@ -16,7 +16,10 @@ use pi_agent::service::wire::ServiceCall;
 use crate::remote::schemas::{RpcTarget, ServerId, SessionTarget};
 
 use super::errors::{HostError, ServerError, duplicate_host_error};
-use super::host::{PublishUpdate, RoutedServerPresentation, RoutedSessionAttachment, RoutedSessionHandle, ServerHost};
+use super::host::{
+    PublishUpdate, RoutedServerPresentation, RoutedSessionAttachment, RoutedSessionHandle,
+    ServerHost,
+};
 
 fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -37,7 +40,9 @@ struct Opening {
 
 impl Opening {
     fn new() -> Self {
-        Self { done: Notify::new() }
+        Self {
+            done: Notify::new(),
+        }
     }
 }
 
@@ -119,7 +124,9 @@ pub(super) struct SessionRouterOptions<H: ServerHost> {
     pub(super) host: Arc<H>,
     pub(super) server_id: ServerId,
     pub(super) is_closing: Arc<dyn Fn() -> bool + Send + Sync>,
-    pub(super) publish_attachment: Arc<dyn Fn(ClientKey, Option<SessionTarget>, Context) -> BoxFuture<'static, ()> + Send + Sync>,
+    pub(super) publish_attachment: Arc<
+        dyn Fn(ClientKey, Option<SessionTarget>, Context) -> BoxFuture<'static, ()> + Send + Sync,
+    >,
     pub(super) report_error: super::ServerErrorHandler,
 }
 
@@ -211,7 +218,9 @@ impl<H: ServerHost> SessionRouter<H> {
                 .run_for_client(client, move |router| {
                     Box::pin(async move {
                         if let Some(attachment) = router.attachment_for(client) {
-                            router.release_attachment(attachment, context, false).await?;
+                            router
+                                .release_attachment(attachment, context, false)
+                                .await?;
                         }
                         Ok(())
                     })
@@ -222,7 +231,10 @@ impl<H: ServerHost> SessionRouter<H> {
         })
     }
 
-    pub(crate) fn close(self: Arc<Self>, context: Context) -> BoxFuture<'static, Result<(), HostError>> {
+    pub(crate) fn close(
+        self: Arc<Self>,
+        context: Context,
+    ) -> BoxFuture<'static, Result<(), HostError>> {
         Box::pin(async move {
             if self.closing.swap(true, Ordering::AcqRel) {
                 return Ok(());
@@ -239,11 +251,10 @@ impl<H: ServerHost> SessionRouter<H> {
                 .values()
                 .cloned()
                 .collect::<Vec<_>>();
-            let release_results = join_all(
-                attachments
-                    .into_iter()
-                    .map(|attachment| self.clone().release_attachment(attachment, context.clone(), false)),
-            )
+            let release_results = join_all(attachments.into_iter().map(|attachment| {
+                self.clone()
+                    .release_attachment(attachment, context.clone(), false)
+            }))
             .await;
             let mut errors = Vec::new();
             for result in release_results {
@@ -256,11 +267,15 @@ impl<H: ServerHost> SessionRouter<H> {
                 .values()
                 .cloned()
                 .collect::<Vec<_>>();
-            let close_results = join_all(hosted.iter().map(|session| session.handle.close(context.clone())))
-                .await;
+            let close_results = join_all(
+                hosted
+                    .iter()
+                    .map(|session| session.handle.close(context.clone())),
+            )
+            .await;
             for result in close_results {
                 if let Err(error) = result {
-                    errors.push(error.into());
+                    errors.push(error);
                 }
             }
             lock(&self.hosted_sessions).clear();
@@ -287,10 +302,10 @@ impl<H: ServerHost> SessionRouter<H> {
         let router = Arc::clone(&self);
         let (task, token) = {
             let mut operations = lock(&self.client_operations);
-            let previous = operations
-                .get(&client)
-                .map(|tail| tail.future.clone())
-                .unwrap_or_else(|| futures::future::ready(()).boxed().shared());
+            let previous = operations.get(&client).map_or_else(
+                || futures::future::ready(()).boxed().shared(),
+                |tail| tail.future.clone(),
+            );
             let token = Arc::new(());
             let token_for_task = Arc::clone(&token);
             let task = async move {
@@ -321,9 +336,11 @@ impl<H: ServerHost> SessionRouter<H> {
         drop(token);
         tokio::spawn(task);
         Box::pin(async move {
-            receiver
-                .await
-                .unwrap_or_else(|_| Err(HostError::Protocol("client operation queue closed".to_owned())))
+            receiver.await.unwrap_or_else(|_| {
+                Err(HostError::Protocol(
+                    "client operation queue closed".to_owned(),
+                ))
+            })
         })
     }
 
@@ -343,12 +360,17 @@ impl<H: ServerHost> SessionRouter<H> {
         {
             return Ok(());
         }
-        let hosted = self.clone().acquire(session_id.clone(), context.clone()).await?;
+        let hosted = self
+            .clone()
+            .acquire(session_id.clone(), context.clone())
+            .await?;
         if self.is_closing() || lock(&self.disconnected_clients).contains(&client) {
             return Err(ServerError::server_draining().into());
         }
         if let Some(current) = current {
-            self.clone().release_attachment(current, context.clone(), false).await?;
+            self.clone()
+                .release_attachment(current, context.clone(), false)
+                .await?;
         }
         let attachment = Arc::new(ClientAttachment {
             id: Uuid::new_v4().to_string(),
@@ -365,7 +387,9 @@ impl<H: ServerHost> SessionRouter<H> {
                 .get(&hosted.id)
                 .is_some_and(|current| Arc::ptr_eq(current, &hosted))
         {
-            self.clone().release_attachment(attachment, context, false).await?;
+            self.clone()
+                .release_attachment(attachment, context, false)
+                .await?;
             return Err(ServerError::server_draining().into());
         }
         lock(&self.attachments_by_client).insert(client, Arc::clone(&attachment));
@@ -471,7 +495,8 @@ impl<H: ServerHost> SessionRouter<H> {
     ) -> Result<(), HostError> {
         attachment.operations.finish().await;
         let lease_result = attachment.lease.release(context.clone()).await;
-        self.clear_attachment(&attachment, context.clone(), publish).await;
+        self.clear_attachment(&attachment, context.clone(), publish)
+            .await;
         match lease_result {
             Ok(()) => Ok(()),
             Err(error) => Err(error),
@@ -545,7 +570,11 @@ impl<H: ServerHost> SessionRouter<H> {
         if metadata_id != session_id {
             return Err(ServerError::session_not_found("Session was not found").into());
         }
-        let handle = self.options.host.open_session(metadata, context.clone()).await?;
+        let handle = self
+            .options
+            .host
+            .open_session(metadata, context.clone())
+            .await?;
         if self.is_closing() {
             if let Err(error) = handle.close(context).await {
                 (self.options.report_error)(&error);
@@ -617,11 +646,10 @@ impl<H: ServerHost> SessionRouter<H> {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let releases = join_all(
-            attachments
-                .into_iter()
-                .map(|attachment| self.clone().release_attachment(attachment, context.clone(), true)),
-        )
+        let releases = join_all(attachments.into_iter().map(|attachment| {
+            self.clone()
+                .release_attachment(attachment, context.clone(), true)
+        }))
         .await;
         let mut first_error = None;
         for result in releases {
@@ -630,7 +658,7 @@ impl<H: ServerHost> SessionRouter<H> {
             }
         }
         if let Err(error) = hosted.handle.close(context).await {
-            first_error.get_or_insert(error.into());
+            first_error.get_or_insert(error);
         }
         if lock(&self.hosted_sessions)
             .get(session_id)
@@ -672,7 +700,11 @@ impl<H: ServerHost> ServerPresentation<H> {
 }
 
 impl<H: ServerHost> RoutedServerPresentation for ServerPresentation<H> {
-    fn attach_session(&self, session_id: String, context: Context) -> BoxFuture<'_, Result<(), HostError>> {
+    fn attach_session(
+        &self,
+        session_id: String,
+        context: Context,
+    ) -> BoxFuture<'_, Result<(), HostError>> {
         self.router
             .clone()
             .attach_client(self.client, session_id, context)

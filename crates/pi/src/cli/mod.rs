@@ -4,6 +4,7 @@ pub mod args;
 pub mod bootstrap;
 pub mod config_selector;
 pub mod entry;
+pub mod experimental;
 pub mod help;
 pub mod package_manager_cli;
 

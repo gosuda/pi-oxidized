@@ -13,7 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use pi_agent::service::value::JsonValue;
 
-use crate::remote::serde_cbor::{opaque_json, CborValue, CborValueDeserializer, OpaqueJson};
+use crate::remote::serde_cbor::{CborValue, CborValueDeserializer, OpaqueJson, opaque_json};
 
 /// Protocol version implemented by the native remote wire.
 pub const PROTOCOL_VERSION: u64 = 8;
@@ -34,7 +34,7 @@ pub struct ProtocolError {
     pub message: String,
 }
 
-/// Error returned when a server identifier is not a canonical lowercase UUIDv4.
+/// Error returned when a server identifier is not a canonical lowercase `UUIDv4`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerIdError;
 
@@ -52,6 +52,11 @@ pub struct ServerId(String);
 
 impl ServerId {
     /// Creates a server identifier after validating its exact wire spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerIdError`] when `value` is not a canonical lowercase
+    /// `UUIDv4` identifier.
     pub fn new(value: impl Into<String>) -> Result<Self, ServerIdError> {
         let value = value.into();
         if is_server_id(&value) {
@@ -61,7 +66,7 @@ impl ServerId {
         }
     }
 
-    /// Borrows the canonical UUIDv4 spelling.
+    /// Borrows the canonical `UUIDv4` spelling.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -129,7 +134,7 @@ impl<'de> Deserialize<'de> for ServerId {
     }
 }
 
-/// Returns whether `value` is an exact lowercase UUIDv4 server identifier.
+/// Returns whether `value` is an exact lowercase `UUIDv4` server identifier.
 #[must_use]
 pub fn is_server_id(value: &str) -> bool {
     let bytes = value.as_bytes();
@@ -565,13 +570,15 @@ fn parse_response_value(value: CborValue) -> Result<ResponseEnvelope, String> {
     let type_name = object_type(&value)?;
     require_type(type_name, "response")?;
     let ok = match &value {
-        CborValue::Map(entries) => entries
-            .iter()
-            .find(|(key, _)| key == "ok")
-            .and_then(|(_, value)| match value {
-                CborValue::Bool(value) => Some(*value),
-                _ => None,
-            }),
+        CborValue::Map(entries) => {
+            entries
+                .iter()
+                .find(|(key, _)| key == "ok")
+                .and_then(|(_, value)| match value {
+                    CborValue::Bool(value) => Some(*value),
+                    _ => None,
+                })
+        }
         _ => None,
     }
     .ok_or_else(|| "response field `ok` must be a boolean".to_owned())?;
@@ -977,6 +984,12 @@ impl<'de> Deserialize<'de> for ServerMessage {
 mod tests {
     use super::*;
 
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn test_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
+        Box::new(std::io::Error::other(message.into()))
+    }
+
     #[test]
     fn server_ids_require_canonical_lowercase_uuidv4() {
         assert!(is_server_id("00000000-0000-4000-8000-000000000001"));
@@ -986,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn response_result_distinguishes_absence_from_null() {
+    fn response_result_distinguishes_absence_from_null() -> TestResult {
         let absent = CborValue::Map(vec![
             ("type".to_owned(), CborValue::Text("response".to_owned())),
             ("id".to_owned(), CborValue::Text("request-1".to_owned())),
@@ -998,9 +1011,12 @@ mod tests {
             ("ok".to_owned(), CborValue::Bool(true)),
             ("result".to_owned(), CborValue::Null),
         ]);
-        let absent = parse_response_value(absent).expect("valid response");
-        let explicit_null = parse_response_value(explicit_null).expect("valid response");
-        assert!(matches!(absent, ResponseEnvelope::Success { result: None, .. }));
+        let absent = parse_response_value(absent).map_err(test_error)?;
+        let explicit_null = parse_response_value(explicit_null).map_err(test_error)?;
+        assert!(matches!(
+            absent,
+            ResponseEnvelope::Success { result: None, .. }
+        ));
         assert!(matches!(
             explicit_null,
             ResponseEnvelope::Success {
@@ -1008,6 +1024,7 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
     }
 
     #[test]

@@ -9,12 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures::future::BoxFuture;
 use pi_agent::context::Context;
 use pi_agent::session::{
-    create_fork_snapshot, ForkDestinationSnapshot, ForkOptions, ForkSource, ForkSourceSnapshot,
-    IdGenerator, Session, SessionError, SessionMetadata, SessionMetadataLike, SessionRepo, Storage,
-    StorageBackedSession, StorageErrorCode, StorageFailure, UuidV7Generator,
+    ForkDestinationSnapshot, ForkOptions, ForkSource, ForkSourceSnapshot, IdGenerator, Session,
+    SessionError, SessionMetadata, SessionMetadataLike, SessionRepo, Storage, StorageBackedSession,
+    StorageErrorCode, StorageFailure, UuidV7Generator, create_fork_snapshot,
 };
 
-use super::codec::{self, JsonlStorageHeader, JSONL_FORMAT_VERSION, JSONL_STORAGE_VERSION};
+use super::codec::{self, JSONL_FORMAT_VERSION, JSONL_STORAGE_VERSION, JsonlStorageHeader};
 use super::legacy_v3;
 use super::paths::{
     discard_session_file, io_failure, list_session_files, remove_session_file,
@@ -29,7 +29,7 @@ use super::storage::JsonlStorage;
 /// `--a-b--`).
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct JsonlSessionMetadata {
-    /// Unique session id, normally a UUIDv7.
+    /// Unique session id, normally a `UUIDv7`.
     pub id: String,
     /// Creation time, milliseconds since the Unix epoch.
     #[serde(rename = "createdAt")]
@@ -44,7 +44,10 @@ pub struct JsonlSessionMetadata {
     pub parent_session_id: Option<String>,
     /// Filesystem path of the parent session recorded by older on-disk
     /// formats; retained so legacy forks keep their provenance.
-    #[serde(rename = "legacyParentSessionPath", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "legacyParentSessionPath",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub legacy_parent_session_path: Option<String>,
     /// Physical session file path.
     pub path: PathBuf,
@@ -75,7 +78,7 @@ impl JsonlSessionMetadata {
 pub struct JsonlSessionCreateOptions {
     /// Working directory to resolve and persist in the header.
     pub cwd: String,
-    /// Explicit session identity, or `None` to generate a UUIDv7.
+    /// Explicit session identity, or `None` to generate a `UUIDv7`.
     pub id: Option<String>,
     /// Parent session identity for a forked session.
     pub parent_session_id: Option<String>,
@@ -108,10 +111,10 @@ impl Drop for IdReservation {
     }
 }
 
-/// JSONL session repository: one file per session below an encoded cwd
+/// JSONL session repository: one file per session below an encoded `cwd`
 /// directory.
 ///
-/// Open handles are exclusive per `(cwd, id)` within this repository process;
+/// Open handles are exclusive per (`cwd`, `id`) within this repository process;
 /// closing the repository seals new admissions but deliberately leaves
 /// existing session handles usable.
 pub struct JsonlSessionRepo {
@@ -141,7 +144,12 @@ impl JsonlSessionRepo {
     ///
     /// Existing sessions are intentionally not closed; each remains usable
     /// until its own [`Session::close`] call.
-    pub async fn close(&self, cx: &Context) -> Result<(), SessionError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is cancelled or the open-session lock
+    /// is poisoned.
+    pub fn close(&self, cx: &Context) -> Result<(), SessionError> {
         cx.check().map_err(|_| aborted_error())?;
         let _open = self.open_guard()?;
         self.closed.store(true, Ordering::Release);
@@ -171,10 +179,15 @@ impl JsonlSessionRepo {
             .map_err(|_| SessionError::Invariant("session id registry poisoned".to_owned()))?;
         let open = self.open_guard()?;
         if open.contains_key(key) || pending.contains(key) {
-            return Err(SessionError::Invariant(format!("Session already exists: {id}")));
+            return Err(SessionError::Invariant(format!(
+                "Session already exists: {id}"
+            )));
         }
         pending.insert(key.to_owned());
-        Ok(IdReservation { pending: Arc::clone(&self.pending), key: key.to_owned() })
+        Ok(IdReservation {
+            pending: Arc::clone(&self.pending),
+            key: key.to_owned(),
+        })
     }
 
     fn session_key(cwd: &str, id: &str) -> String {
@@ -187,7 +200,7 @@ impl JsonlSessionRepo {
 
     fn publish_open(
         &self,
-        metadata: JsonlSessionMetadata,
+        metadata: &JsonlSessionMetadata,
         storage: Arc<JsonlStorage>,
         key: &str,
     ) -> Result<Arc<dyn Session>, SessionError> {
@@ -222,7 +235,13 @@ impl JsonlSessionRepo {
                 }
             })),
         );
-        open.insert(key.to_owned(), OpenStorage { storage, dyn_storage });
+        open.insert(
+            key.to_owned(),
+            OpenStorage {
+                storage,
+                dyn_storage,
+            },
+        );
         Ok(session as Arc<dyn Session>)
     }
 
@@ -233,7 +252,10 @@ impl JsonlSessionRepo {
     ) -> Result<(JsonlStorageHeader, Arc<JsonlStorage>), SessionError> {
         cx.check().map_err(|_| aborted_error())?;
         if !path_exists(&metadata.path).await? {
-            return Err(not_found(format!("session file does not exist: {}", metadata.path.display())));
+            return Err(not_found(format!(
+                "session file does not exist: {}",
+                metadata.path.display()
+            )));
         }
         verify_owned_session_path(&self.root, &metadata.cwd, &metadata.id, &metadata.path).await?;
         let (header, storage) = open_storage(&metadata.path, cx).await?;
@@ -257,9 +279,9 @@ impl JsonlSessionRepo {
             Ok(())
         })();
         if let Err(error) = validation {
-            return match storage.close(cx).await {
-                Ok(()) => Err(error),
-                Err(close_error) => Err(close_error),
+            return {
+                storage.close(cx).await?;
+                Err(error)
             };
         }
         Ok((header, storage))
@@ -282,11 +304,8 @@ impl JsonlSessionRepo {
         let (_, storage) = self.load_storage(source, cx).await?;
         let snapshot = storage.capture_fork_source(cx).await;
         let close = storage.close(cx).await;
-        match (snapshot, close) {
-            (Ok(snapshot), Ok(())) => Ok(snapshot),
-            (Err(error), Ok(())) => Err(error),
-            (_, Err(error)) => Err(error),
-        }
+        close?;
+        snapshot
     }
 }
 
@@ -316,9 +335,8 @@ impl SessionRepo for JsonlSessionRepo {
 
             let directory = self.session_directory(&cwd);
             let path = resolve_new_session_path(&directory, created_at, &id).await?;
-            if let Err(error) = cx.check().map_err(|_| aborted_error()).and_then(|()| self.ensure_open()) {
-                return Err(error);
-            }
+            cx.check().map_err(|_| aborted_error())?;
+            self.ensure_open()?;
             let header = JsonlStorageHeader {
                 v: JSONL_FORMAT_VERSION,
                 kind: "header".to_owned(),
@@ -344,12 +362,16 @@ impl SessionRepo for JsonlSessionRepo {
                     return Err(error);
                 }
             };
-            if let Err(error) = cx.check().map_err(|_| aborted_error()).and_then(|()| self.ensure_open()) {
+            if let Err(error) = cx
+                .check()
+                .map_err(|_| aborted_error())
+                .and_then(|()| self.ensure_open())
+            {
                 discard_new_storage(Some(Arc::clone(&storage)), Some(&path)).await;
                 return Err(error);
             }
             let metadata = metadata_from_header(header, path.clone(), modified_at);
-            match self.publish_open(metadata, Arc::clone(&storage), &key) {
+            match self.publish_open(&metadata, Arc::clone(&storage), &key) {
                 Ok(session) => Ok(session),
                 Err(error) => {
                     discard_new_storage(Some(storage), Some(&path)).await;
@@ -379,11 +401,15 @@ impl SessionRepo for JsonlSessionRepo {
             }
             let _reservation = self.reserve_id(&key, &metadata.id)?;
             let (_, storage) = self.load_storage(metadata, cx).await?;
-            if let Err(error) = cx.check().map_err(|_| aborted_error()).and_then(|()| self.ensure_open()) {
+            if let Err(error) = cx
+                .check()
+                .map_err(|_| aborted_error())
+                .and_then(|()| self.ensure_open())
+            {
                 discard_new_storage(Some(storage), None).await;
                 return Err(error);
             }
-            let result = self.publish_open(metadata.clone(), Arc::clone(&storage), &key);
+            let result = self.publish_open(metadata, Arc::clone(&storage), &key);
             match result {
                 Ok(session) => Ok(session),
                 Err(error) => {
@@ -417,7 +443,10 @@ impl SessionRepo for JsonlSessionRepo {
                     Ok(Some(header)) => header,
                     Ok(None) => continue,
                     Err(SessionError::Backend(failure))
-                        if matches!(failure.code, StorageErrorCode::InvalidHeader | StorageErrorCode::Corrupt) =>
+                        if matches!(
+                            failure.code,
+                            StorageErrorCode::InvalidHeader | StorageErrorCode::Corrupt
+                        ) =>
                     {
                         continue;
                     }
@@ -461,9 +490,13 @@ impl SessionRepo for JsonlSessionRepo {
             }
             let _reservation = self.reserve_id(&key, &metadata.id)?;
             if !path_exists(&metadata.path).await? {
-                return Err(not_found(format!("session file does not exist: {}", metadata.path.display())));
+                return Err(not_found(format!(
+                    "session file does not exist: {}",
+                    metadata.path.display()
+                )));
             }
-            verify_owned_session_path(&self.root, &metadata.cwd, &metadata.id, &metadata.path).await?;
+            verify_owned_session_path(&self.root, &metadata.cwd, &metadata.id, &metadata.path)
+                .await?;
             // A legacy raw id can share an encoded filename; the header is the
             // authoritative identity before deletion.
             let Some(header) = read_header(&metadata.path, cx).await? else {
@@ -499,7 +532,9 @@ impl SessionRepo for JsonlSessionRepo {
             self.ensure_open()?;
             let cwd = source.cwd.clone();
             let id = match &options {
-                ForkOptions::Branch { id: Some(id), .. } | ForkOptions::Tree { id: Some(id) } => id.clone(),
+                ForkOptions::Branch { id: Some(id), .. } | ForkOptions::Tree { id: Some(id) } => {
+                    id.clone()
+                }
                 ForkOptions::Branch { id: None, .. } | ForkOptions::Tree { id: None } => {
                     self.id_generator.next(Some(created_at))?
                 }
@@ -511,9 +546,8 @@ impl SessionRepo for JsonlSessionRepo {
             let directory = self.session_directory(&cwd);
             let path = resolve_new_session_path(&directory, created_at, &id).await?;
             let snapshot = create_fork_snapshot(&source_snapshot, &options)?;
-            if let Err(error) = cx.check().map_err(|_| aborted_error()).and_then(|()| self.ensure_open()) {
-                return Err(error);
-            }
+            cx.check().map_err(|_| aborted_error())?;
+            self.ensure_open()?;
             let header = JsonlStorageHeader {
                 v: JSONL_FORMAT_VERSION,
                 kind: "header".to_owned(),
@@ -539,12 +573,16 @@ impl SessionRepo for JsonlSessionRepo {
                     return Err(error);
                 }
             };
-            if let Err(error) = cx.check().map_err(|_| aborted_error()).and_then(|()| self.ensure_open()) {
+            if let Err(error) = cx
+                .check()
+                .map_err(|_| aborted_error())
+                .and_then(|()| self.ensure_open())
+            {
                 discard_new_storage(Some(Arc::clone(&storage)), Some(&path)).await;
                 return Err(error);
             }
             let metadata = metadata_from_header(header, path.clone(), modified_at);
-            match self.publish_open(metadata, Arc::clone(&storage), &key) {
+            match self.publish_open(&metadata, Arc::clone(&storage), &key) {
                 Ok(session) => Ok(session),
                 Err(error) => {
                     discard_new_storage(Some(storage), Some(&path)).await;
@@ -574,7 +612,10 @@ fn metadata_from_header(
 
 /// Reads a JSONL session header, returning `None` when the file is absent,
 /// empty, or not a recognized JSONL session format.
-async fn read_header(path: &Path, cx: &Context) -> Result<Option<JsonlStorageHeader>, SessionError> {
+async fn read_header(
+    path: &Path,
+    cx: &Context,
+) -> Result<Option<JsonlStorageHeader>, SessionError> {
     cx.check().map_err(aborted)?;
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
@@ -582,10 +623,20 @@ async fn read_header(path: &Path, cx: &Context) -> Result<Option<JsonlStorageHea
         let mut reader = match File::open(&path) {
             Ok(file) => BufReader::new(file),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(failure(StorageErrorCode::Io, format!("failed to read JSONL header {}", path.display()), Some(Arc::new(error)))),
+            Err(error) => {
+                return Err(failure(
+                    StorageErrorCode::Io,
+                    format!("failed to read JSONL header {}", path.display()),
+                    Some(Arc::new(error)),
+                ));
+            }
         };
         if let Err(error) = reader.read_line(&mut line) {
-            return Err(failure(StorageErrorCode::Io, format!("failed to read JSONL header {}", path.display()), Some(Arc::new(error))));
+            return Err(failure(
+                StorageErrorCode::Io,
+                format!("failed to read JSONL header {}", path.display()),
+                Some(Arc::new(error)),
+            ));
         }
         let line = line.trim_end_matches(['\n', '\r']);
         if line.is_empty() {
@@ -635,9 +686,11 @@ async fn create_fork_storage(
     cx.check().map_err(aborted)?;
     let path = path.to_owned();
     let snapshot = snapshot.clone();
-    tokio::task::spawn_blocking(move || JsonlStorage::create_from_fork_sync(&path, header, &snapshot))
-        .await
-        .map_err(|error| join_error(error, "JSONL fork task failed"))?
+    tokio::task::spawn_blocking(move || {
+        JsonlStorage::create_from_fork_sync(&path, header, &snapshot)
+    })
+    .await
+    .map_err(|error| join_error(error, "JSONL fork task failed"))?
 }
 
 async fn discard_new_storage(storage: Option<Arc<JsonlStorage>>, path: Option<&Path>) {
@@ -654,7 +707,9 @@ async fn resolve_cwd(input: &str) -> Result<String, SessionError> {
     let input = input.to_owned();
     let path_for_error = PathBuf::from(&input);
     tokio::task::spawn_blocking(move || {
-        Ok(crate::core::config::resolve_path(input).to_string_lossy().into_owned())
+        Ok(crate::core::config::resolve_path(input)
+            .to_string_lossy()
+            .into_owned())
     })
     .await
     .map_err(|source| io_failure(&path_for_error, "session cwd worker failed", source))?
@@ -667,10 +722,20 @@ async fn path_exists(path: &Path) -> Result<bool, SessionError> {
     tokio::task::spawn_blocking(move || match fs::metadata(&path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(io_failure(&path_for_error, "failed to check session", source)),
+        Err(source) => Err(io_failure(
+            &path_for_error,
+            "failed to check session",
+            source,
+        )),
     })
     .await
-    .map_err(|source| io_failure(&path_for_worker_error, "session check worker failed", source))?
+    .map_err(|source| {
+        io_failure(
+            &path_for_worker_error,
+            "session check worker failed",
+            source,
+        )
+    })?
 }
 
 async fn file_modified_at(path: &Path) -> Result<f64, SessionError> {
@@ -679,13 +744,27 @@ async fn file_modified_at(path: &Path) -> Result<f64, SessionError> {
     let path_for_worker_error = path.clone();
     tokio::task::spawn_blocking(move || {
         let modified = fs::metadata(&path)
-            .map_err(|source| io_failure(&path_for_error, "failed to read session metadata", source))?
+            .map_err(|source| {
+                io_failure(&path_for_error, "failed to read session metadata", source)
+            })?
             .modified()
-            .map_err(|source| io_failure(&path_for_error, "failed to read session modification time", source))?;
+            .map_err(|source| {
+                io_failure(
+                    &path_for_error,
+                    "failed to read session modification time",
+                    source,
+                )
+            })?;
         Ok(system_time_millis_f64(modified))
     })
     .await
-    .map_err(|source| io_failure(&path_for_worker_error, "session metadata worker failed", source))?
+    .map_err(|source| {
+        io_failure(
+            &path_for_worker_error,
+            "session metadata worker failed",
+            source,
+        )
+    })?
 }
 
 /// [`SystemTime`] → fractional Unix milliseconds, matching the precision and
@@ -711,7 +790,11 @@ fn failure(
 }
 
 fn aborted(error: pi_agent::context::Cancelled) -> SessionError {
-    failure(StorageErrorCode::Aborted, "operation cancelled", Some(Arc::new(error)))
+    failure(
+        StorageErrorCode::Aborted,
+        "operation cancelled",
+        Some(Arc::new(error)),
+    )
 }
 
 fn join_error(error: tokio::task::JoinError, action: &str) -> SessionError {
@@ -723,20 +806,27 @@ fn not_found(message: String) -> SessionError {
 }
 
 fn repo_closed_error() -> SessionError {
-    SessionError::Backend(StorageFailure::new(StorageErrorCode::Closed, "session repository is closed"))
+    SessionError::Backend(StorageFailure::new(
+        StorageErrorCode::Closed,
+        "session repository is closed",
+    ))
 }
 
 fn aborted_error() -> SessionError {
-    SessionError::Backend(StorageFailure::new(StorageErrorCode::Aborted, "operation cancelled"))
+    SessionError::Backend(StorageFailure::new(
+        StorageErrorCode::Aborted,
+        "operation cancelled",
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::paths::session_file_name;
+    use super::*;
     use tempfile::tempdir;
 
     /// Creates then closes a session and returns its listed metadata.
+    #[expect(clippy::expect_used, reason = "test setup")]
     async fn create_closed_metadata(
         repo: &JsonlSessionRepo,
         cwd: &str,
@@ -755,14 +845,24 @@ mod tests {
             .await
             .expect("create session");
         session.close(&cx).await.expect("close session");
-        repo.list(Some(JsonlSessionListOptions { cwd: Some(cwd.to_owned()) }), &cx)
-            .await
-            .expect("list sessions")
-            .into_iter()
-            .find(|metadata| metadata.id == id)
-            .expect("created session is listed")
+        repo.list(
+            Some(JsonlSessionListOptions {
+                cwd: Some(cwd.to_owned()),
+            }),
+            &cx,
+        )
+        .await
+        .expect("list sessions")
+        .into_iter()
+        .find(|metadata| metadata.id == id)
+        .expect("created session is listed")
     }
 
+    #[expect(
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test assertions use expect and panic for irrecoverable failures"
+    )]
     #[tokio::test]
     async fn open_rejects_session_file_outside_repository() {
         let cx = Context::background();
@@ -786,6 +886,7 @@ mod tests {
         assert!(foreign_metadata.path.exists());
     }
 
+    #[expect(clippy::expect_used, reason = "test assertions use expect")]
     #[tokio::test]
     async fn delete_rejects_session_file_outside_repository() {
         let cx = Context::background();
@@ -828,6 +929,11 @@ mod tests {
         assert!(foreign_metadata.path.exists());
     }
 
+    #[expect(
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test assertions use expect and panic for irrecoverable failures"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_open_and_delete_are_mutually_exclusive() {
         let cx = Context::background();
@@ -844,7 +950,9 @@ mod tests {
                 (Ok(session), Err(_)) => {
                     assert!(metadata.path.exists(), "open winner keeps the file");
                     session.close(&cx).await.expect("close raced-open session");
-                    repo.delete(&metadata, &cx).await.expect("delete after close");
+                    repo.delete(&metadata, &cx)
+                        .await
+                        .expect("delete after close");
                 }
                 (Err(_), Ok(())) => {
                     assert!(!metadata.path.exists(), "delete winner removes the file");
@@ -857,6 +965,7 @@ mod tests {
         }
     }
 
+    #[expect(clippy::expect_used, reason = "test assertions use expect")]
     #[tokio::test]
     async fn delete_rejects_percent_encoded_id_collision() {
         let cx = Context::background();

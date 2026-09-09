@@ -5,18 +5,17 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
-use rusqlite::{named_params, params, Connection, Row, Transaction, TransactionBehavior};
+use rusqlite::{Connection, Row, Transaction, TransactionBehavior, named_params, params};
 use tokio::sync::Notify;
 
 use pi_agent::context::Context;
 use pi_agent::session::{
-    commit_writes, fork_snapshot_writes, validate_committed_writes,
-    validate_replayed_writes, AddressKind, CommittedIdView, CommittedListWrite,
-    CommittedValueWrite, CommittedWrite, Entry, EntryId, EntryScan, EntryStructure, EntryType,
-    ForkDestinationSnapshot, ForkSource, ForkSourceSnapshot, ListReadOptions, RawAddress,
-    RawListElement, RawStoredValue, ScanOrder, SessionError, SessionMetadata, SessionStats, Storage,
-    StorageBranchScan, StorageErrorCode, StorageFailure, UsageRow, UsageScan, Write,
-    LIST_READ_DEFAULT_LIMIT, LIST_READ_MAX_LIMIT,
+    AddressKind, CommittedIdView, CommittedListWrite, CommittedValueWrite, CommittedWrite, Entry,
+    EntryId, EntryScan, EntryStructure, EntryType, ForkDestinationSnapshot, ForkSource,
+    ForkSourceSnapshot, LIST_READ_DEFAULT_LIMIT, LIST_READ_MAX_LIMIT, ListReadOptions, RawAddress,
+    RawListElement, RawStoredValue, ScanOrder, SessionError, SessionMetadata, SessionStats,
+    Storage, StorageBranchScan, StorageErrorCode, StorageFailure, UsageRow, UsageScan, Write,
+    commit_writes, fork_snapshot_writes, validate_committed_writes, validate_replayed_writes,
 };
 
 use super::repo::SqliteSessionMetadata;
@@ -27,11 +26,17 @@ fn invariant(message: impl Into<String>) -> SessionError {
 }
 
 pub(crate) fn aborted() -> SessionError {
-    SessionError::Backend(StorageFailure::new(StorageErrorCode::Aborted, "operation cancelled"))
+    SessionError::Backend(StorageFailure::new(
+        StorageErrorCode::Aborted,
+        "operation cancelled",
+    ))
 }
 
 fn closed() -> SessionError {
-    SessionError::Backend(StorageFailure::new(StorageErrorCode::Closed, "session storage is closed"))
+    SessionError::Backend(StorageFailure::new(
+        StorageErrorCode::Closed,
+        "session storage is closed",
+    ))
 }
 
 fn not_found(message: impl Into<String>) -> SessionError {
@@ -61,7 +66,6 @@ fn json_failure(code: StorageErrorCode, operation: &str, error: serde_json::Erro
         source: Some(Arc::new(error)),
     })
 }
-
 
 fn lock_failure(operation: &str) -> SessionError {
     invariant(format!("{operation}: SQLite mutex is poisoned"))
@@ -117,9 +121,13 @@ impl Inner {
             return Err(closed());
         }
         self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| active.checked_add(1))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
             .map_err(|_| invariant("SQLite operation counter overflow"))?;
-        Ok(OperationPermit { inner: Arc::clone(self) })
+        Ok(OperationPermit {
+            inner: Arc::clone(self),
+        })
     }
 
     async fn drain(&self) {
@@ -156,7 +164,11 @@ impl SqliteStorage {
         })
     }
 
-    fn run_blocking<'a, T, F>(&'a self, cx: &'a Context, operation: F) -> BoxFuture<'a, Result<T, SessionError>>
+    fn run_blocking<'a, T, F>(
+        &'a self,
+        cx: &'a Context,
+        operation: F,
+    ) -> BoxFuture<'a, Result<T, SessionError>>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, SessionError> + Send + 'static,
@@ -174,43 +186,78 @@ impl SqliteStorage {
                 let connection = connection.as_mut().ok_or_else(closed)?;
                 operation(connection)
             });
-            task.await.map_err(|error| join_failure("SQLite task failed", error))?
+            task.await
+                .map_err(|error| join_failure("SQLite task failed", error))?
         })
     }
-
 }
 
 impl Storage for SqliteStorage {
-    fn commit<'a>(&'a self, writes: Vec<Write>, cx: &'a Context) -> BoxFuture<'a, Result<pi_agent::session::CommitResult, SessionError>> {
+    fn commit<'a>(
+        &'a self,
+        writes: Vec<Write>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<pi_agent::session::CommitResult, SessionError>> {
         let session_id = self.session_id.clone();
-        self.run_blocking(cx, move |connection| apply_commit_on_connection(connection, &session_id, writes))
+        self.run_blocking(cx, move |connection| {
+            apply_commit_on_connection(connection, &session_id, writes)
+        })
     }
 
-    fn get_entries<'a>(&'a self, ids: &'a [EntryId], cx: &'a Context) -> BoxFuture<'a, Result<HashMap<EntryId, Entry>, SessionError>> {
+    fn get_entries<'a>(
+        &'a self,
+        ids: &'a [EntryId],
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<HashMap<EntryId, Entry>, SessionError>> {
         let session_id = self.session_id.clone();
         let ids = ids.to_vec();
-        self.run_blocking(cx, move |connection| read_entries(connection, &session_id, &ids))
+        self.run_blocking(cx, move |connection| {
+            read_entries(connection, &session_id, &ids)
+        })
     }
 
-    fn get_value<'a>(&'a self, address: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<Option<RawStoredValue>, SessionError>> {
+    fn get_value<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Option<RawStoredValue>, SessionError>> {
         let session_id = self.session_id.clone();
         let address = address.clone();
-        self.run_blocking(cx, move |connection| read_scalar_value(connection, &session_id, &address))
+        self.run_blocking(cx, move |connection| {
+            read_scalar_value(connection, &session_id, &address)
+        })
     }
 
-    fn scan_values<'a>(&'a self, prefix: &'a RawAddress, cx: &'a Context) -> BoxFuture<'a, Result<Vec<RawStoredValue>, SessionError>> {
+    fn scan_values<'a>(
+        &'a self,
+        prefix: &'a RawAddress,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<RawStoredValue>, SessionError>> {
         let session_id = self.session_id.clone();
         let prefix = prefix.clone();
-        self.run_blocking(cx, move |connection| scan_scalar_values(connection, &session_id, &prefix))
+        self.run_blocking(cx, move |connection| {
+            scan_scalar_values(connection, &session_id, &prefix)
+        })
     }
 
-    fn read_list<'a>(&'a self, address: &'a RawAddress, options: Option<ListReadOptions>, cx: &'a Context) -> BoxFuture<'a, Result<Vec<RawListElement>, SessionError>> {
+    fn read_list<'a>(
+        &'a self,
+        address: &'a RawAddress,
+        options: Option<ListReadOptions>,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<RawListElement>, SessionError>> {
         let session_id = self.session_id.clone();
         let address = address.clone();
-        self.run_blocking(cx, move |connection| read_list_values(connection, &session_id, &address, options))
+        self.run_blocking(cx, move |connection| {
+            read_list_values(connection, &session_id, &address, options)
+        })
     }
 
-    fn scan_branch<'a>(&'a self, query: &'a StorageBranchScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+    fn scan_branch<'a>(
+        &'a self,
+        query: &'a StorageBranchScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
         let session_id = self.session_id.clone();
         let query = query.clone();
         self.run_blocking(cx, move |connection| {
@@ -221,7 +268,11 @@ impl Storage for SqliteStorage {
         })
     }
 
-    fn scan_branch_structure<'a>(&'a self, query: &'a StorageBranchScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<EntryStructure>, SessionError>> {
+    fn scan_branch_structure<'a>(
+        &'a self,
+        query: &'a StorageBranchScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<EntryStructure>, SessionError>> {
         let session_id = self.session_id.clone();
         let query = query.clone();
         self.run_blocking(cx, move |connection| {
@@ -232,7 +283,11 @@ impl Storage for SqliteStorage {
         })
     }
 
-    fn scan_entries<'a>(&'a self, query: &'a EntryScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
+    fn scan_entries<'a>(
+        &'a self,
+        query: &'a EntryScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<Entry>, SessionError>> {
         let session_id = self.session_id.clone();
         let query = query.clone();
         self.run_blocking(cx, move |connection| {
@@ -243,13 +298,22 @@ impl Storage for SqliteStorage {
         })
     }
 
-    fn scan_usage<'a>(&'a self, query: &'a UsageScan, cx: &'a Context) -> BoxFuture<'a, Result<Vec<UsageRow>, SessionError>> {
+    fn scan_usage<'a>(
+        &'a self,
+        query: &'a UsageScan,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<Vec<UsageRow>, SessionError>> {
         let session_id = self.session_id.clone();
         let query = query.clone();
-        self.run_blocking(cx, move |connection| scan_usage_rows(connection, &session_id, &query))
+        self.run_blocking(cx, move |connection| {
+            scan_usage_rows(connection, &session_id, &query)
+        })
     }
 
-    fn get_stats<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<SessionStats, SessionError>> {
+    fn get_stats<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<SessionStats, SessionError>> {
         let session_id = self.session_id.clone();
         self.run_blocking(cx, move |connection| read_stats(connection, &session_id))
     }
@@ -284,7 +348,10 @@ impl Storage for SqliteStorage {
 }
 
 impl ForkSource for SqliteStorage {
-    fn capture_fork_source<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<ForkSourceSnapshot, SessionError>> {
+    fn capture_fork_source<'a>(
+        &'a self,
+        cx: &'a Context,
+    ) -> BoxFuture<'a, Result<ForkSourceSnapshot, SessionError>> {
         let session_id = self.session_id.clone();
         self.run_blocking(cx, move |connection| {
             let transaction = connection
@@ -307,7 +374,6 @@ impl ForkSource for SqliteStorage {
     }
 }
 
-
 fn apply_commit_on_connection(
     connection: &mut Connection,
     session_id: &str,
@@ -324,13 +390,20 @@ fn apply_commit_on_connection(
     let mut stats = read_stats(&transaction, session_id)?;
     apply_committed_rows(&transaction, session_id, &committed, &mut stats)?;
     let next_seq = first_seq
-        .checked_add(u64::try_from(committed.len()).map_err(|_| invariant("commit sequence overflow"))?)
+        .checked_add(
+            u64::try_from(committed.len()).map_err(|_| invariant("commit sequence overflow"))?,
+        )
         .ok_or_else(|| invariant("commit sequence overflow"))?;
     update_session_totals(&transaction, session_id, next_seq, &stats)?;
     transaction
         .commit()
         .map_err(|error| db_failure("failed to commit SQLite transaction", error))?;
-    Ok(pi_agent::session::CommitResult { first_seq, seqs, timestamp, stats })
+    Ok(pi_agent::session::CommitResult {
+        first_seq,
+        seqs,
+        timestamp,
+        stats,
+    })
 }
 #[derive(Clone)]
 struct EntryRow {
@@ -377,8 +450,12 @@ fn parse_entry_type(value: &str) -> Result<EntryType, SessionError> {
     }
 }
 
-fn json_value<T: serde::Serialize>(operation: &str, value: &T) -> Result<serde_json::Value, SessionError> {
-    serde_json::to_value(value).map_err(|error| json_failure(StorageErrorCode::Corrupt, operation, error))
+fn json_value<T: serde::Serialize>(
+    operation: &str,
+    value: &T,
+) -> Result<serde_json::Value, SessionError> {
+    serde_json::to_value(value)
+        .map_err(|error| json_failure(StorageErrorCode::Corrupt, operation, error))
 }
 
 fn entry_payload(entry: &Entry) -> Result<String, SessionError> {
@@ -387,7 +464,10 @@ fn entry_payload(entry: &Entry) -> Result<String, SessionError> {
         Entry::Message {
             message, terminate, ..
         } => {
-            payload.insert("message".to_owned(), json_value("failed to encode message entry", message)?);
+            payload.insert(
+                "message".to_owned(),
+                json_value("failed to encode message entry", message)?,
+            );
             if *terminate {
                 payload.insert("terminate".to_owned(), serde_json::Value::Bool(true));
             }
@@ -401,14 +481,26 @@ fn entry_payload(entry: &Entry) -> Result<String, SessionError> {
             from_hook,
             ..
         } => {
-            payload.insert("summary".to_owned(), serde_json::Value::String(summary.clone()));
-            payload.insert("retainedTail".to_owned(), json_value("failed to encode compaction tail", retained_tail)?);
-            payload.insert("tokensBefore".to_owned(), json_value("failed to encode compaction token count", tokens_before)?);
+            payload.insert(
+                "summary".to_owned(),
+                serde_json::Value::String(summary.clone()),
+            );
+            payload.insert(
+                "retainedTail".to_owned(),
+                json_value("failed to encode compaction tail", retained_tail)?,
+            );
+            payload.insert(
+                "tokensBefore".to_owned(),
+                json_value("failed to encode compaction token count", tokens_before)?,
+            );
             if let Some(details) = details {
                 payload.insert("details".to_owned(), details.clone());
             }
             if let Some(usage) = usage {
-                payload.insert("usage".to_owned(), json_value("failed to encode compaction usage", usage)?);
+                payload.insert(
+                    "usage".to_owned(),
+                    json_value("failed to encode compaction usage", usage)?,
+                );
             }
             payload.insert("fromHook".to_owned(), serde_json::Value::Bool(*from_hook));
         }
@@ -421,14 +513,23 @@ fn entry_payload(entry: &Entry) -> Result<String, SessionError> {
             ..
         } => {
             if let Some(from_id) = from_id {
-                payload.insert("fromId".to_owned(), serde_json::Value::String(from_id.to_string()));
+                payload.insert(
+                    "fromId".to_owned(),
+                    serde_json::Value::String(from_id.to_string()),
+                );
             }
-            payload.insert("summary".to_owned(), serde_json::Value::String(summary.clone()));
+            payload.insert(
+                "summary".to_owned(),
+                serde_json::Value::String(summary.clone()),
+            );
             if let Some(details) = details {
                 payload.insert("details".to_owned(), details.clone());
             }
             if let Some(usage) = usage {
-                payload.insert("usage".to_owned(), json_value("failed to encode branch summary usage", usage)?);
+                payload.insert(
+                    "usage".to_owned(),
+                    json_value("failed to encode branch summary usage", usage)?,
+                );
             }
             payload.insert("fromHook".to_owned(), serde_json::Value::Bool(*from_hook));
         }
@@ -438,13 +539,23 @@ fn entry_payload(entry: &Entry) -> Result<String, SessionError> {
             }
         }
     }
-    serde_json::to_string(&serde_json::Value::Object(payload))
-        .map_err(|error| json_failure(StorageErrorCode::Corrupt, "failed to encode entry payload", error))
+    serde_json::to_string(&serde_json::Value::Object(payload)).map_err(|error| {
+        json_failure(
+            StorageErrorCode::Corrupt,
+            "failed to encode entry payload",
+            error,
+        )
+    })
 }
 
 fn decode_entry_row(row: EntryRow) -> Result<Entry, SessionError> {
-    let mut payload = serde_json::from_str::<serde_json::Value>(&row.payload)
-        .map_err(|error| json_failure(StorageErrorCode::Corrupt, "stored entry payload decode failed", error))?;
+    let mut payload = serde_json::from_str::<serde_json::Value>(&row.payload).map_err(|error| {
+        json_failure(
+            StorageErrorCode::Corrupt,
+            "stored entry payload decode failed",
+            error,
+        )
+    })?;
     let object = payload.as_object_mut().ok_or_else(|| {
         SessionError::Backend(StorageFailure::new(
             StorageErrorCode::Corrupt,
@@ -466,10 +577,18 @@ fn decode_entry_row(row: EntryRow) -> Result<Entry, SessionError> {
         serde_json::Value::Number(serde_json::Number::from(row.timestamp)),
     );
     if let Some(custom_type) = row.custom_type {
-        object.insert("customType".to_owned(), serde_json::Value::String(custom_type));
+        object.insert(
+            "customType".to_owned(),
+            serde_json::Value::String(custom_type),
+        );
     }
-    serde_json::from_value(payload)
-        .map_err(|error| json_failure(StorageErrorCode::Corrupt, "stored entry decode failed", error))
+    serde_json::from_value(payload).map_err(|error| {
+        json_failure(
+            StorageErrorCode::Corrupt,
+            "stored entry decode failed",
+            error,
+        )
+    })
 }
 
 fn entry_structure_from_row(row: EntryRow) -> Result<EntryStructure, SessionError> {
@@ -483,7 +602,11 @@ fn entry_structure_from_row(row: EntryRow) -> Result<EntryStructure, SessionErro
     })
 }
 
-fn insert_entry_row(tx: &Transaction<'_>, session_id: &str, entry: &Entry) -> Result<(), SessionError> {
+fn insert_entry_row(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    entry: &Entry,
+) -> Result<(), SessionError> {
     tx.execute(
         "INSERT INTO entries (session_id, id, parent_id, seq, type, custom_type, timestamp, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
@@ -518,7 +641,10 @@ fn read_entry_row(
     }
 }
 
-fn read_all_entry_rows(connection: &Connection, session_id: &str) -> Result<Vec<EntryRow>, SessionError> {
+fn read_all_entry_rows(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<EntryRow>, SessionError> {
     let mut statement = connection
         .prepare("SELECT id, parent_id, seq, type, custom_type, timestamp, payload FROM entries WHERE session_id = ?1 ORDER BY seq ASC")
         .map_err(|error| db_failure("failed to prepare SQLite entry scan", error))?;
@@ -554,20 +680,29 @@ fn read_entries(
         .prepare(&query)
         .map_err(|error| db_failure("failed to prepare SQLite entry lookup", error))?;
     let rows = statement
-        .query_map(rusqlite::params_from_iter(parameters), read_entry_row_from_sql)
+        .query_map(
+            rusqlite::params_from_iter(parameters),
+            read_entry_row_from_sql,
+        )
         .map_err(|error| db_failure("failed to query SQLite entries", error))?;
     let mut by_id = HashMap::new();
     for row in rows {
-        let entry = decode_entry_row(row.map_err(|error| db_failure("failed to decode SQLite entry row", error))?)?;
+        let entry = decode_entry_row(
+            row.map_err(|error| db_failure("failed to decode SQLite entry row", error))?,
+        )?;
         by_id.insert(entry.id().clone(), entry);
     }
-    Ok(ids.iter().filter_map(|id| by_id.remove(id).map(|entry| (id.clone(), entry))).collect())
+    Ok(ids
+        .iter()
+        .filter_map(|id| by_id.remove(id).map(|entry| (id.clone(), entry)))
+        .collect())
 }
 
 fn effective_scan_limit(limit: Option<u32>) -> u32 {
-    limit.unwrap_or(LIST_READ_DEFAULT_LIMIT).min(LIST_READ_MAX_LIMIT)
+    limit
+        .unwrap_or(LIST_READ_DEFAULT_LIMIT)
+        .min(LIST_READ_MAX_LIMIT)
 }
-
 
 fn scan_entry_rows(
     connection: &Connection,
@@ -654,8 +789,13 @@ fn decode_scalar_row(row: ScalarValueRow) -> Result<RawStoredValue, SessionError
         namespace: row.namespace,
         key: row.key,
         kind: AddressKind::Value,
-        value: serde_json::from_str(&row.value)
-            .map_err(|error| json_failure(StorageErrorCode::Corrupt, "stored scalar value decode failed", error))?,
+        value: serde_json::from_str(&row.value).map_err(|error| {
+            json_failure(
+                StorageErrorCode::Corrupt,
+                "stored scalar value decode failed",
+                error,
+            )
+        })?,
         seq: from_sqlite_seq(row.seq)?,
     })
 }
@@ -677,7 +817,10 @@ fn read_scalar_value(
     }
 }
 
-fn read_all_scalar_values(connection: &Connection, session_id: &str) -> Result<Vec<RawStoredValue>, SessionError> {
+fn read_all_scalar_values(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<RawStoredValue>, SessionError> {
     let mut statement = connection
         .prepare("SELECT namespace, key, seq, value FROM scalar_values WHERE session_id = ?1 ORDER BY seq ASC")
         .map_err(|error| db_failure("failed to prepare SQLite scalar scan", error))?;
@@ -686,7 +829,9 @@ fn read_all_scalar_values(connection: &Connection, session_id: &str) -> Result<V
         .map_err(|error| db_failure("failed to scan SQLite scalar values", error))?;
     let mut output = Vec::new();
     for row in rows {
-        output.push(decode_scalar_row(row.map_err(|error| db_failure("failed to decode SQLite scalar row", error))?)?);
+        output.push(decode_scalar_row(row.map_err(|error| {
+            db_failure("failed to decode SQLite scalar row", error)
+        })?)?);
     }
     Ok(output)
 }
@@ -714,7 +859,9 @@ fn scan_scalar_values(
         .map_err(|error| db_failure("failed to scan SQLite scalar values", error))?;
     let mut output = Vec::new();
     for row in rows {
-        output.push(decode_scalar_row(row.map_err(|error| db_failure("failed to decode SQLite scalar row", error))?)?);
+        output.push(decode_scalar_row(row.map_err(|error| {
+            db_failure("failed to decode SQLite scalar row", error)
+        })?)?);
     }
     Ok(output)
 }
@@ -728,7 +875,10 @@ fn read_list_values(
     let options = pi_agent::session::resolve_list_read_options(options)
         .map_err(|_| invariant("list limit must be positive"))?;
     let limit = i64::from(options.limit);
-    let cursor = options.cursor.map(|value| sqlite_seq(value.seq)).transpose()?;
+    let cursor = options
+        .cursor
+        .map(|value| sqlite_seq(value.seq))
+        .transpose()?;
     let (order, comparator) = match options.order {
         ScanOrder::Asc => ("ASC", ">"),
         ScanOrder::Desc => ("DESC", "<"),
@@ -753,11 +903,17 @@ fn read_list_values(
         .map_err(|error| db_failure("failed to read SQLite list", error))?;
     let mut output = Vec::new();
     for row in rows {
-        let (seq, value) = row.map_err(|error| db_failure("failed to decode SQLite list row", error))?;
+        let (seq, value) =
+            row.map_err(|error| db_failure("failed to decode SQLite list row", error))?;
         output.push(RawListElement {
             seq: from_sqlite_seq(seq)?,
-            value: serde_json::from_str(&value)
-                .map_err(|error| json_failure(StorageErrorCode::Corrupt, "stored list value decode failed", error))?,
+            value: serde_json::from_str(&value).map_err(|error| {
+                json_failure(
+                    StorageErrorCode::Corrupt,
+                    "stored list value decode failed",
+                    error,
+                )
+            })?,
         });
     }
     Ok(output)
@@ -788,15 +944,25 @@ fn decode_usage_row(row: UsageRowSql) -> Result<UsageRow, SessionError> {
     Ok(UsageRow {
         id: pi_agent::session::UsageId::from(row.id),
         seq: from_sqlite_seq(row.seq)?,
-        usage: serde_json::from_str(&row.usage)
-            .map_err(|error| json_failure(StorageErrorCode::Corrupt, "stored usage decode failed", error))?,
+        usage: serde_json::from_str(&row.usage).map_err(|error| {
+            json_failure(
+                StorageErrorCode::Corrupt,
+                "stored usage decode failed",
+                error,
+            )
+        })?,
         entry_id: row.entry_id.map(pi_agent::session::EntryId::from),
         adjustment: row.adjustment != 0,
         details: row
             .details
             .map(|details| {
-                serde_json::from_str(&details)
-                    .map_err(|error| json_failure(StorageErrorCode::Corrupt, "stored usage details decode failed", error))
+                serde_json::from_str(&details).map_err(|error| {
+                    json_failure(
+                        StorageErrorCode::Corrupt,
+                        "stored usage details decode failed",
+                        error,
+                    )
+                })
             })
             .transpose()?,
     })
@@ -833,7 +999,9 @@ fn scan_usage_rows(
         .map_err(|error| db_failure("failed to scan SQLite usage", error))?;
     let mut output = Vec::new();
     for row in rows {
-        output.push(decode_usage_row(row.map_err(|error| db_failure("failed to decode SQLite usage row", error))?)?);
+        output.push(decode_usage_row(row.map_err(|error| {
+            db_failure("failed to decode SQLite usage row", error)
+        })?)?);
     }
     Ok(output)
 }
@@ -869,7 +1037,9 @@ fn read_next_seq(connection: &Connection, session_id: &str) -> Result<u64, Sessi
     );
     match result {
         Ok(value) => from_sqlite_seq(value),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Err(not_found(format!("unknown SQLite session {session_id}"))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            Err(not_found(format!("unknown SQLite session {session_id}")))
+        }
         Err(error) => Err(db_failure("failed to read SQLite sequence", error)),
     }
 }
@@ -882,13 +1052,21 @@ fn read_stats(connection: &Connection, session_id: &str) -> Result<SessionStats,
     );
     let (message_count, usage_payload) = match result {
         Ok(value) => value,
-        Err(rusqlite::Error::QueryReturnedNoRows) => return Err(not_found(format!("unknown SQLite session {session_id}"))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err(not_found(format!("unknown SQLite session {session_id}")));
+        }
         Err(error) => return Err(db_failure("failed to read SQLite session stats", error)),
     };
     Ok(SessionStats {
-        message_count: u64::try_from(message_count).map_err(|_| invariant("stored message count is negative"))?,
-        usage: serde_json::from_str(&usage_payload)
-            .map_err(|error| json_failure(StorageErrorCode::Corrupt, "stored usage totals decode failed", error))?,
+        message_count: u64::try_from(message_count)
+            .map_err(|_| invariant("stored message count is negative"))?,
+        usage: serde_json::from_str(&usage_payload).map_err(|error| {
+            json_failure(
+                StorageErrorCode::Corrupt,
+                "stored usage totals decode failed",
+                error,
+            )
+        })?,
     })
 }
 
@@ -910,7 +1088,9 @@ fn update_session_totals(
         )
         .map_err(|error| db_failure("failed to update SQLite session totals", error))?;
     if changed != 1 {
-        return Err(invariant(format!("expected one SQLite session update, changed {changed}")));
+        return Err(invariant(format!(
+            "expected one SQLite session update, changed {changed}"
+        )));
     }
     Ok(())
 }
@@ -950,7 +1130,8 @@ fn load_id_view(
             .query_map(params![session_id], |row| row.get::<_, String>(0))
             .map_err(|error| db_failure("failed to scan SQLite entry identities", error))?;
         for row in rows {
-            let id = row.map_err(|error| db_failure("failed to decode SQLite entry identity", error))?;
+            let id =
+                row.map_err(|error| db_failure("failed to decode SQLite entry identity", error))?;
             ids.insert(id.clone());
             entry_ids.insert(EntryId::from(id));
         }
@@ -962,7 +1143,9 @@ fn load_id_view(
         .query_map(params![session_id], |row| row.get::<_, String>(0))
         .map_err(|error| db_failure("failed to scan SQLite usage identities", error))?;
     for row in rows {
-        ids.insert(row.map_err(|error| db_failure("failed to decode SQLite usage identity", error))?);
+        ids.insert(
+            row.map_err(|error| db_failure("failed to decode SQLite usage identity", error))?,
+        );
     }
     Ok(SqliteIdView {
         ids,
@@ -971,15 +1154,30 @@ fn load_id_view(
     })
 }
 
-fn insert_usage_row(tx: &Transaction<'_>, session_id: &str, row: &UsageRow) -> Result<(), SessionError> {
-    let usage = serde_json::to_string(&row.usage)
-        .map_err(|error| json_failure(StorageErrorCode::Corrupt, "failed to encode usage row", error))?;
+fn insert_usage_row(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    row: &UsageRow,
+) -> Result<(), SessionError> {
+    let usage = serde_json::to_string(&row.usage).map_err(|error| {
+        json_failure(
+            StorageErrorCode::Corrupt,
+            "failed to encode usage row",
+            error,
+        )
+    })?;
     let details = row
         .details
         .as_ref()
         .map(serde_json::to_string)
         .transpose()
-        .map_err(|error| json_failure(StorageErrorCode::Corrupt, "failed to encode usage details", error))?;
+        .map_err(|error| {
+            json_failure(
+                StorageErrorCode::Corrupt,
+                "failed to encode usage details",
+                error,
+            )
+        })?;
     tx.execute(
         "INSERT INTO usage_ledger (session_id, id, seq, entry_id, adjustment, usage, details) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
@@ -987,7 +1185,7 @@ fn insert_usage_row(tx: &Transaction<'_>, session_id: &str, row: &UsageRow) -> R
             row.id.as_str(),
             sqlite_seq(row.seq)?,
             row.entry_id.as_ref().map(EntryId::as_str),
-            if row.adjustment { 1_i64 } else { 0_i64 },
+            i64::from(row.adjustment),
             usage,
             details,
         ],
@@ -1058,7 +1256,6 @@ fn apply_committed_rows(
     Ok(())
 }
 
-
 #[derive(Clone)]
 struct BranchSegment {
     branch_id: String,
@@ -1083,7 +1280,12 @@ fn read_branch_tip_for_parent(
     }
 }
 
-fn insert_branch_entry(tx: &Transaction<'_>, session_id: &str, branch_id: &str, entry: &Entry) -> Result<(), SessionError> {
+fn insert_branch_entry(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    branch_id: &str,
+    entry: &Entry,
+) -> Result<(), SessionError> {
     tx.execute(
         "INSERT INTO branch_entries (session_id, branch_id, entry_id, entry_seq, entry_type) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![session_id, branch_id, entry.id().as_str(), sqlite_seq(entry.seq())?, entry_type_name(entry)],
@@ -1106,12 +1308,18 @@ fn append_entry_to_existing_branch(
         )
         .map_err(|error| db_failure("failed to update SQLite branch index", error))?;
     if changed != 1 {
-        return Err(invariant(format!("expected one branch update, changed {changed}")));
+        return Err(invariant(format!(
+            "expected one branch update, changed {changed}"
+        )));
     }
     Ok(())
 }
 
-fn create_root_branch(tx: &Transaction<'_>, session_id: &str, entry: &Entry) -> Result<(), SessionError> {
+fn create_root_branch(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    entry: &Entry,
+) -> Result<(), SessionError> {
     tx.execute(
         "INSERT INTO branch_meta (session_id, branch_id, tip_entry_id, tip_seq, base_branch_id, base_seq) VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
         params![session_id, entry.id().as_str(), entry.id().as_str(), sqlite_seq(entry.seq())?],
@@ -1131,7 +1339,9 @@ fn read_branch_membership(
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
     );
     result.map_err(|error| match error {
-        rusqlite::Error::QueryReturnedNoRows => invariant(format!("branch cache missing entry {entry_id}")),
+        rusqlite::Error::QueryReturnedNoRows => {
+            invariant(format!("branch cache missing entry {entry_id}"))
+        }
         other => db_failure("failed to read SQLite branch membership", other),
     })
 }
@@ -1154,7 +1364,9 @@ fn read_branch_meta(
         },
     );
     result.map_err(|error| match error {
-        rusqlite::Error::QueryReturnedNoRows => invariant(format!("branch metadata missing for {branch_id}")),
+        rusqlite::Error::QueryReturnedNoRows => {
+            invariant(format!("branch metadata missing for {branch_id}"))
+        }
         other => db_failure("failed to read SQLite branch metadata", other),
     })
 }
@@ -1171,7 +1383,8 @@ fn read_branch_segments(
         if !visited.insert(branch_id.clone()) {
             return Err(invariant("cycle in SQLite branch metadata"));
         }
-        let (_tip_entry_id, _tip_seq, base_branch_id, base_seq) = read_branch_meta(connection, session_id, &branch_id)?;
+        let (_tip_entry_id, _tip_seq, base_branch_id, base_seq) =
+            read_branch_meta(connection, session_id, &branch_id)?;
         let lower_seq = base_seq.unwrap_or(0);
         segments.push(BranchSegment {
             branch_id: branch_id.clone(),
@@ -1182,7 +1395,9 @@ fn read_branch_segments(
             break;
         };
         let Some(base_seq) = base_seq else {
-            return Err(invariant(format!("branch {branch_id} has base without base sequence")));
+            return Err(invariant(format!(
+                "branch {branch_id} has base without base sequence"
+            )));
         };
         branch_id = base_branch_id;
         upper_seq = base_seq;
@@ -1201,14 +1416,14 @@ fn newest_compaction(
             params![session_id, segment.branch_id, segment.lower_seq, segment.upper_seq],
             |row| row.get::<_, Option<i64>>(0),
         );
-        let value = result.map_err(|error| db_failure("failed to read SQLite compaction boundary", error))?;
+        let value = result
+            .map_err(|error| db_failure("failed to read SQLite compaction boundary", error))?;
         if let Some(seq) = value {
             return Ok(Some((segment.branch_id.clone(), seq)));
         }
     }
     Ok(None)
 }
-
 
 fn copy_branch_entries_after(
     tx: &Transaction<'_>,
@@ -1231,28 +1446,45 @@ fn copy_branch_entries_after(
     Ok(())
 }
 
-fn create_divergent_branch(tx: &Transaction<'_>, session_id: &str, entry: &Entry) -> Result<(), SessionError> {
-    let parent = entry.parent_id().ok_or_else(|| invariant("root entry cannot diverge a branch"))?;
+fn create_divergent_branch(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    entry: &Entry,
+) -> Result<(), SessionError> {
+    let parent = entry
+        .parent_id()
+        .ok_or_else(|| invariant("root entry cannot diverge a branch"))?;
     let segments = read_branch_segments(tx, session_id, parent.as_str())?;
     let compaction = newest_compaction(tx, session_id, &segments)?;
-    let (base_branch, base_seq) = compaction
-        .as_ref()
-        .map(|(branch, seq)| (Some(branch.as_str()), Some(*seq)))
-        .unwrap_or((None, None));
+    let (base_branch, base_seq) = compaction.as_ref().map_or((None, None), |(branch, seq)| {
+        (Some(branch.as_str()), Some(*seq))
+    });
     tx.execute(
         "INSERT INTO branch_meta (session_id, branch_id, tip_entry_id, tip_seq, base_branch_id, base_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![session_id, entry.id().as_str(), entry.id().as_str(), sqlite_seq(entry.seq())?, base_branch, base_seq],
     )
     .map_err(|error| db_failure("failed to create SQLite divergent branch", error))?;
-    copy_branch_entries_after(tx, session_id, entry.id().as_str(), &segments, base_seq.unwrap_or(0))?;
+    copy_branch_entries_after(
+        tx,
+        session_id,
+        entry.id().as_str(),
+        &segments,
+        base_seq.unwrap_or(0),
+    )?;
     insert_branch_entry(tx, session_id, entry.id().as_str(), entry)
 }
 
-fn append_entry_to_branch_index(tx: &Transaction<'_>, session_id: &str, entry: &Entry) -> Result<(), SessionError> {
+fn append_entry_to_branch_index(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    entry: &Entry,
+) -> Result<(), SessionError> {
     if entry.parent_id().is_none() {
         return create_root_branch(tx, session_id, entry);
     }
-    let parent = entry.parent_id().ok_or_else(|| invariant("missing entry parent"))?;
+    let parent = entry
+        .parent_id()
+        .ok_or_else(|| invariant("missing entry parent"))?;
     match read_branch_tip_for_parent(tx, session_id, parent.as_str())? {
         Some(branch) => append_entry_to_existing_branch(tx, session_id, &branch, entry),
         None => create_divergent_branch(tx, session_id, entry),
@@ -1285,7 +1517,8 @@ fn scan_branch_rows(
         if remaining == 0 {
             break;
         }
-        let remaining = u32::try_from(remaining).map_err(|_| invariant("branch scan limit overflow"))?;
+        let remaining =
+            u32::try_from(remaining).map_err(|_| invariant("branch scan limit overflow"))?;
         let stop_seq = read_stop_seq(connection, session_id, segment, query, oldest_first)?;
         rows.extend(scan_branch_segment_rows(
             connection,
@@ -1322,8 +1555,7 @@ fn read_stop_seq(
     if query.stop_at_type.is_none() && query.stop_at_id.is_none() {
         return Ok(None);
     }
-    let stop_predicate =
-        "(:stop_type IS NOT NULL AND b.entry_type = :stop_type) OR (:stop_id IS NOT NULL AND b.entry_id = :stop_id)";
+    let stop_predicate = "(:stop_type IS NOT NULL AND b.entry_type = :stop_type) OR (:stop_id IS NOT NULL AND b.entry_id = :stop_id)";
     let sql = format!(
         "SELECT MIN(b.entry_seq), MAX(b.entry_seq) FROM branch_entries b WHERE b.session_id = :session AND b.branch_id = :branch AND b.entry_seq > :lower_seq AND b.entry_seq <= :upper_seq AND ({stop_predicate})"
     );
@@ -1359,7 +1591,10 @@ fn scan_branch_segment_rows(
     let stop_comparator = if oldest_first { "<=" } else { ">=" };
     let cursor_comparator = if oldest_first { ">" } else { "<" };
     let entry_type = query.entry_type.map(entry_type_filter_name);
-    let cursor = query.cursor.map(|cursor| sqlite_seq(cursor.seq)).transpose()?;
+    let cursor = query
+        .cursor
+        .map(|cursor| sqlite_seq(cursor.seq))
+        .transpose()?;
     let sql = format!(
         "SELECT e.id, e.parent_id, e.seq, e.type, e.custom_type, e.timestamp, e.payload FROM branch_entries b JOIN entries e ON e.session_id = b.session_id AND e.id = b.entry_id WHERE b.session_id = :session AND b.branch_id = :branch AND b.entry_seq > :lower_seq AND b.entry_seq <= :upper_seq AND (:stop_seq IS NULL OR b.entry_seq {stop_comparator} :stop_seq) AND (:entry_type IS NULL OR b.entry_type = :entry_type) AND (:custom_type IS NULL OR e.custom_type = :custom_type) AND (:cursor IS NULL OR b.entry_seq {cursor_comparator} :cursor) ORDER BY b.entry_seq {order} LIMIT :limit"
     );
@@ -1389,14 +1624,18 @@ fn scan_branch_segment_rows(
     Ok(output)
 }
 
-
 fn insert_session_row(
     tx: &Transaction<'_>,
     metadata: &SessionMetadata,
     next_seq: u64,
 ) -> Result<(), SessionError> {
-    let usage = serde_json::to_string(&pi_ai::Usage::default())
-        .map_err(|error| json_failure(StorageErrorCode::Corrupt, "failed to encode empty usage totals", error))?;
+    let usage = serde_json::to_string(&pi_ai::Usage::default()).map_err(|error| {
+        json_failure(
+            StorageErrorCode::Corrupt,
+            "failed to encode empty usage totals",
+            error,
+        )
+    })?;
     tx.execute(
         "INSERT INTO sessions (id, created_at, parent_session_id, storage_version, metadata, message_count, usage_payload, next_seq) VALUES (?1, ?2, ?3, ?4, NULL, 0, ?5, ?6)",
         params![
@@ -1431,7 +1670,10 @@ fn session_row_from_sql(row: &Row<'_>) -> rusqlite::Result<SessionRow> {
     })
 }
 
-pub(crate) fn read_session_row(connection: &Connection, session_id: &str) -> Result<SessionRow, SessionError> {
+pub(crate) fn read_session_row(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<SessionRow, SessionError> {
     let result = connection.query_row(
         "SELECT id, created_at, parent_session_id, storage_version, next_seq FROM sessions WHERE id = ?1",
         params![session_id],
@@ -1446,9 +1688,13 @@ pub(crate) fn read_session_row(connection: &Connection, session_id: &str) -> Res
     }
 }
 
-pub(crate) fn read_all_session_rows(connection: &Connection) -> Result<Vec<SessionRow>, SessionError> {
+pub(crate) fn read_all_session_rows(
+    connection: &Connection,
+) -> Result<Vec<SessionRow>, SessionError> {
     let mut statement = connection
-        .prepare("SELECT id, created_at, parent_session_id, storage_version, next_seq FROM sessions")
+        .prepare(
+            "SELECT id, created_at, parent_session_id, storage_version, next_seq FROM sessions",
+        )
         .map_err(|error| db_failure("failed to prepare SQLite session listing", error))?;
     let rows = statement
         .query_map([], session_row_from_sql)
@@ -1460,7 +1706,10 @@ pub(crate) fn read_all_session_rows(connection: &Connection) -> Result<Vec<Sessi
     Ok(output)
 }
 
-pub(crate) fn has_session_row(connection: &Connection, session_id: &str) -> Result<bool, SessionError> {
+pub(crate) fn has_session_row(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<bool, SessionError> {
     let result = connection.query_row(
         "SELECT id FROM sessions WHERE id = ?1",
         params![session_id],
@@ -1514,7 +1763,10 @@ pub(crate) fn metadata_from_session_row(
     })
 }
 
-pub(crate) fn delete_session_rows(tx: &Transaction<'_>, session_id: &str) -> Result<(), SessionError> {
+pub(crate) fn delete_session_rows(
+    tx: &Transaction<'_>,
+    session_id: &str,
+) -> Result<(), SessionError> {
     for (table, label) in [
         ("entries", "entries"),
         ("scalar_values", "scalar values"),
@@ -1708,4 +1960,3 @@ pub(crate) fn create_fork_session(
         metadata.session.id.clone(),
     ))
 }
-

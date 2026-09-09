@@ -2,6 +2,7 @@
 
 pub mod adapters;
 pub mod client;
+pub mod facet;
 pub mod host;
 pub mod protocol;
 pub mod sanitize;

@@ -11,8 +11,8 @@ use pi_agent::service::transport::{
 use pi_agent::service::value::{JsString, JsonValue};
 use pi_agent::service::wire::{ServiceCall, ServiceMode, ServiceSubscriptionSnapshot};
 
-use crate::remote::schemas::RpcTarget;
 use super::{CancelToken, Client, ServiceSubscription};
+use crate::remote::schemas::RpcTarget;
 
 /// Adapts a lazily resolved remote route to the native service binding seam.
 pub fn create_client_service_transport(
@@ -39,9 +39,8 @@ impl RemoteServiceTransport for ClientServiceTransport {
         let client = Arc::clone(&self.client);
         let target = Arc::clone(&self.target);
         Box::pin(async move {
-            let target = (target)().ok_or_else(|| {
-                ServiceError::local("Remote service target is unavailable")
-            })?;
+            let target = (target)()
+                .ok_or_else(|| ServiceError::local("Remote service target is unavailable"))?;
             let cancel = cancel_from(&context);
             client
                 .request(target, call, cancel.as_ref())
@@ -60,9 +59,8 @@ impl RemoteServiceTransport for ClientServiceTransport {
         let client = Arc::clone(&self.client);
         let target = Arc::clone(&self.target);
         Box::pin(async move {
-            let target = (target)().ok_or_else(|| {
-                ServiceError::local("Remote service target is unavailable")
-            })?;
+            let target = (target)()
+                .ok_or_else(|| ServiceError::local("Remote service target is unavailable"))?;
             let callback: super::ServiceUpdateListener = Arc::new(move |update| {
                 listener(update, &Context::background());
             });
@@ -71,8 +69,7 @@ impl RemoteServiceTransport for ClientServiceTransport {
                 .subscribe_service(target, service_id, mode, callback, cancel.as_ref())
                 .await
                 .map_err(ServiceError::transport)?;
-            Ok(Arc::new(AdapterSubscription { subscription })
-                as Arc<dyn AgentServiceSubscription>)
+            Ok(Arc::new(AdapterSubscription { subscription }) as Arc<dyn AgentServiceSubscription>)
         })
     }
 }
@@ -104,4 +101,3 @@ impl AgentServiceSubscription for AdapterSubscription {
 fn cancel_from(context: &Context) -> Option<CancelToken> {
     CancelToken::from_context(context)
 }
-

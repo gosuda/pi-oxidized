@@ -884,6 +884,10 @@ impl Settings {
         map
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one insert per scalar settings field; splitting would scatter the field table"
+    )]
     fn insert_scalar_fields(&self, map: &mut Map<String, Value>) {
         insert_opt_string(
             map,
@@ -918,7 +922,8 @@ impl Settings {
         insert_opt_value(
             map,
             "tuiMode",
-            self.tui_mode.map(|mode| Value::String(mode.as_str().to_owned())),
+            self.tui_mode
+                .map(|mode| Value::String(mode.as_str().to_owned())),
         );
         insert_opt_value(
             map,
@@ -932,7 +937,11 @@ impl Settings {
             self.fullscreen_scrollbar
                 .map(|mode| Value::String(mode.as_str().to_owned())),
         );
-        insert_opt_bool(map, "fullscreenCopyOnSelect", self.fullscreen_copy_on_select);
+        insert_opt_bool(
+            map,
+            "fullscreenCopyOnSelect",
+            self.fullscreen_copy_on_select,
+        );
         insert_opt_bool(map, "hideThinkingBlock", self.hide_thinking_block);
         insert_opt_bool(map, "showCacheMissNotices", self.show_cache_miss_notices);
         insert_opt_string(map, "externalEditor", self.external_editor.as_deref());
@@ -4116,7 +4125,10 @@ mod tests {
         assert_eq!(FullscreenScrollbar::Auto.as_str(), "auto");
         assert_eq!(FullscreenScrollbar::Always.as_str(), "always");
         assert_eq!(FullscreenScrollbar::Hidden.as_str(), "hidden");
-        assert_eq!(FullscreenScrollbar::Auto.to_scrollbar_mode(), ScrollbarMode::Auto);
+        assert_eq!(
+            FullscreenScrollbar::Auto.to_scrollbar_mode(),
+            ScrollbarMode::Auto
+        );
         assert_eq!(
             FullscreenScrollbar::Always.to_scrollbar_mode(),
             ScrollbarMode::Always
@@ -4180,14 +4192,8 @@ mod tests {
         for (key, stored) in [
             ("tuiMode", Value::String("other".to_owned())),
             ("tuiMode", Value::from(5)),
-            (
-                "fullscreenExitOutput",
-                Value::String("nothing".to_owned()),
-            ),
-            (
-                "fullscreenScrollbar",
-                Value::String("sometimes".to_owned()),
-            ),
+            ("fullscreenExitOutput", Value::String("nothing".to_owned())),
+            ("fullscreenScrollbar", Value::String("sometimes".to_owned())),
             ("fullscreenScrollbar", Value::Bool(true)),
         ] {
             let mut map = Map::new();

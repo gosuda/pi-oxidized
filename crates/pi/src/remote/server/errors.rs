@@ -208,9 +208,7 @@ pub(crate) fn duplicate_host_error(error: &HostError) -> HostError {
         HostError::Service(ServiceError::Disposed(message)) => {
             HostError::Service(ServiceError::Disposed(message.clone()))
         }
-        HostError::Service(ServiceError::Cancelled) => {
-            HostError::Service(ServiceError::Cancelled)
-        }
+        HostError::Service(ServiceError::Cancelled) => HostError::Service(ServiceError::Cancelled),
         HostError::Service(ServiceError::Delta(error)) => {
             HostError::Service(ServiceError::Delta(error.clone()))
         }

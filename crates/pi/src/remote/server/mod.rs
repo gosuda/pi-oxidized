@@ -28,8 +28,8 @@ use pi_agent::service::delta::DeltaOp;
 use pi_agent::service::state_codec::ServiceStateEncoder;
 use pi_agent::service::value::JsonValue;
 use pi_agent::service::wire::{
-    ServiceControlCall, ServiceProviderUpdate, decode_service_control_call, parse_service_call,
-    parse_service_subscription_snapshot,
+    ServiceCall, ServiceControlCall, ServiceProviderUpdate, decode_service_control_call,
+    parse_service_call, parse_service_subscription_snapshot,
 };
 
 use crate::remote::codec::{
@@ -37,14 +37,14 @@ use crate::remote::codec::{
 };
 use crate::remote::framing::{DEFAULT_MAX_FRAME_LENGTH, FrameDecoderOptions};
 use crate::remote::schemas::{
-    ClientMessage, ProtocolError, PROTOCOL_VERSION, RpcTarget, ServerId, ServerMessage,
+    ClientMessage, PROTOCOL_VERSION, ProtocolError, RpcTarget, ServerId, ServerMessage,
     SessionTarget,
 };
 use crate::remote::transport::TransportError;
 
 mod connection;
-mod errors;
-mod host;
+pub(crate) mod errors;
+pub(crate) mod host;
 mod router;
 
 #[cfg(unix)]
@@ -77,9 +77,19 @@ pub type ServerErrorHandler = Arc<dyn Fn(&(dyn Error + 'static)) + Send + Sync>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServerOptionsError {
     /// The frame bound is outside the unsigned 32-bit protocol range.
-    InvalidMaxFrameLength { value: u64, max: u64 },
+    InvalidMaxFrameLength {
+        /// Requested maximum framed payload length.
+        value: u64,
+        /// Largest supported framed payload length.
+        max: u64,
+    },
     /// The handshake deadline is outside the signed 32-bit timer range.
-    InvalidHandshakeTimeout { value: u64, max: u64 },
+    InvalidHandshakeTimeout {
+        /// Requested handshake deadline in milliseconds.
+        value: u64,
+        /// Largest supported handshake deadline in milliseconds.
+        max: u64,
+    },
 }
 
 impl fmt::Display for ServerOptionsError {
@@ -117,6 +127,10 @@ pub struct ServerOptions {
 }
 
 impl Default for ServerOptions {
+    #[expect(
+        clippy::expect_used,
+        reason = "the built-in server id is a canonical UUIDv4 literal"
+    )]
     fn default() -> Self {
         Self {
             listeners: Vec::new(),
@@ -170,7 +184,11 @@ impl fmt::Display for ServerStartError {
             Self::Closing => formatter.write_str("server is closing or closed"),
             Self::Listener(error) => write!(formatter, "listener startup failed: {error}"),
             Self::Cleanup { start, cleanup } => {
-                write!(formatter, "server startup failed ({start}); cleanup failures: {}", cleanup.len())
+                write!(
+                    formatter,
+                    "server startup failed ({start}); cleanup failures: {}",
+                    cleanup.len()
+                )
             }
         }
     }
@@ -205,7 +223,11 @@ impl fmt::Display for ServerCloseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Listener(error) => write!(formatter, "listener shutdown failed: {error}"),
-            Self::Sessions(errors) => write!(formatter, "{} routed session cleanup failures", errors.len()),
+            Self::Sessions(errors) => write!(
+                formatter,
+                "{} routed session cleanup failures",
+                errors.len()
+            ),
         }
     }
 }
@@ -332,14 +354,13 @@ impl ServerConnection {
             task
         };
         tokio::spawn(task);
-        Box::pin(async move {
-            receiver
-                .await
-                .unwrap_or(Err(TransportError::Closed))
-        })
+        Box::pin(async move { receiver.await.unwrap_or(Err(TransportError::Closed)) })
     }
 
-    fn close_frame(&self, final_chunk: Option<Vec<u8>>) -> BoxFuture<'static, Result<(), TransportError>> {
+    fn close_frame(
+        &self,
+        final_chunk: Option<Vec<u8>>,
+    ) -> BoxFuture<'static, Result<(), TransportError>> {
         let connection = Arc::clone(&self.connection);
         let (sender, receiver) = oneshot::channel();
         let task = {
@@ -356,13 +377,11 @@ impl ServerConnection {
             task
         };
         tokio::spawn(task);
-        Box::pin(async move {
-            receiver
-                .await
-                .unwrap_or(Err(TransportError::Closed))
-        })
+        Box::pin(async move { receiver.await.unwrap_or(Err(TransportError::Closed)) })
     }
 }
+
+type CloseFuture = Shared<BoxFuture<'static, Result<(), ServerCloseError>>>;
 
 struct ServerCore<H: ServerHost> {
     host: Arc<H>,
@@ -378,7 +397,7 @@ struct ServerCore<H: ServerHost> {
     next_connection: AtomicU64,
     start_done: Notify,
     closed: Arc<ClosedSignal>,
-    close_future: StdMutex<Option<Shared<BoxFuture<'static, Result<(), ServerCloseError>>>>>,
+    close_future: StdMutex<Option<CloseFuture>>,
     router: Arc<router::SessionRouter<H>>,
 }
 
@@ -398,6 +417,13 @@ impl<H: ServerHost> fmt::Debug for Server<H> {
 
 impl<H: ServerHost> Server<H> {
     /// Validates options and constructs an unstarted server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerOptionsError::InvalidMaxFrameLength`] when the frame
+    /// bound is zero or exceeds the protocol range. Returns
+    /// [`ServerOptionsError::InvalidHandshakeTimeout`] when the handshake
+    /// deadline is zero or exceeds the supported timer range.
     pub fn new(host: Arc<H>, options: ServerOptions) -> Result<Self, ServerOptionsError> {
         let max_frame_length = options.max_frame_length.unwrap_or(DEFAULT_MAX_FRAME_LENGTH);
         if max_frame_length == 0 || (max_frame_length as u64) > MAX_UINT32 {
@@ -423,24 +449,36 @@ impl<H: ServerHost> Server<H> {
         let core = Arc::new_cyclic(|weak: &Weak<ServerCore<H>>| {
             let is_closing: Arc<dyn Fn() -> bool + Send + Sync> = {
                 let weak = weak.clone();
-                Arc::new(move || weak.upgrade().is_none_or(|core| core.closing.load(Ordering::Acquire)))
+                Arc::new(move || {
+                    weak.upgrade()
+                        .is_none_or(|core| core.closing.load(Ordering::Acquire))
+                })
             };
             let publish_attachment = {
                 let weak = weak.clone();
                 Arc::new(move |client, attachment, _context| {
                     let weak = weak.clone();
                     Box::pin(async move {
-                        let Some(core) = weak.upgrade() else { return; };
-                        let Some(connection) = core.connection(client) else { return; };
+                        let Some(core) = weak.upgrade() else {
+                            return;
+                        };
+                        let Some(connection) = core.connection(client) else {
+                            return;
+                        };
                         let _ = core
-                            .send_message(
-                                &connection,
-                                ServerMessage::Attachment { attachment },
-                            )
+                            .send_message(&connection, ServerMessage::Attachment { attachment })
                             .await;
                     }) as BoxFuture<'static, ()>
                 })
-                    as Arc<dyn Fn(router::ClientKey, Option<SessionTarget>, Context) -> BoxFuture<'static, ()> + Send + Sync>
+                    as Arc<
+                        dyn Fn(
+                                router::ClientKey,
+                                Option<SessionTarget>,
+                                Context,
+                            ) -> BoxFuture<'static, ()>
+                            + Send
+                            + Sync,
+                    >
             };
             let report_error = {
                 let weak = weak.clone();
@@ -458,7 +496,7 @@ impl<H: ServerHost> Server<H> {
                 report_error,
             }));
             ServerCore {
-                host: Arc::clone(&host),
+                host,
                 server_id: server_id.clone(),
                 listeners: listeners.clone(),
                 max_frame_length,
@@ -483,8 +521,16 @@ impl<H: ServerHost> Server<H> {
     pub fn server_id(&self) -> &ServerId {
         &self.core.server_id
     }
-
     /// Starts every configured listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerStartError::AlreadyStarting`] or
+    /// [`ServerStartError::AlreadyStarted`] when startup is already in
+    /// progress or has completed. Returns [`ServerStartError::Closing`] when
+    /// shutdown has begun, or [`ServerStartError::Listener`] when a listener
+    /// rejects startup. If cleanup also fails, returns
+    /// [`ServerStartError::Cleanup`] with both failure sets.
     pub async fn start(&self) -> Result<(), ServerStartError> {
         {
             let mut lifecycle = lock(&self.core.lifecycle);
@@ -558,15 +604,16 @@ impl<H: ServerHost> Server<H> {
             });
         }
         let key = router::ClientKey(self.core.next_connection.fetch_add(1, Ordering::Relaxed));
-        let connection_state = match ServerConnection::new(key, Arc::clone(&connection), self.core.max_frame_length) {
-            Ok(connection_state) => Arc::new(connection_state),
-            Err(error) => {
-                self.core.report_error(&error);
-                return Arc::new(ClosedHandler {
-                    on_error: self.core.on_error.clone(),
-                });
-            }
-        };
+        let connection_state =
+            match ServerConnection::new(key, Arc::clone(&connection), self.core.max_frame_length) {
+                Ok(connection_state) => Arc::new(connection_state),
+                Err(error) => {
+                    self.core.report_error(&error);
+                    return Arc::new(ClosedHandler {
+                        on_error: self.core.on_error.clone(),
+                    });
+                }
+            };
         lock(&self.core.connections).insert(key, Arc::clone(&connection_state));
         self.core.notify_connection_count_changed();
         self.install_watchdog(&connection_state);
@@ -575,8 +622,13 @@ impl<H: ServerHost> Server<H> {
             connection: Arc::downgrade(&connection_state),
         })
     }
-
     /// Begins an idempotent graceful shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerCloseError::Listener`] when a listener reports a
+    /// shutdown failure, or [`ServerCloseError::Sessions`] when routed-session
+    /// or connection cleanup reports one or more failures.
     pub async fn close(&self) -> Result<(), ServerCloseError> {
         let future = {
             let mut slot = lock(&self.core.close_future);
@@ -592,8 +644,8 @@ impl<H: ServerHost> Server<H> {
         };
         future.await
     }
-
     /// Returns a future that settles when shutdown has completed.
+    #[must_use]
     pub fn closed(&self) -> BoxFuture<'static, Result<(), ServerCloseError>> {
         let signal = Arc::clone(&self.core.closed);
         Box::pin(async move {
@@ -610,7 +662,9 @@ impl<H: ServerHost> Server<H> {
     fn acceptor(&self) -> ConnectionAcceptor {
         let core = Arc::clone(&self.core);
         Arc::new(move |connection| {
-            let server = Server { core: Arc::clone(&core) };
+            let server = Server {
+                core: Arc::clone(&core),
+            };
             server.accept(connection)
         })
     }
@@ -621,10 +675,14 @@ impl<H: ServerHost> Server<H> {
         let timeout = self.core.handshake_timeout_ms;
         let task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(timeout)).await;
-            let (Some(core), Some(connection)) = (weak_core.upgrade(), weak_connection.upgrade()) else {
+            let (Some(core), Some(connection)) = (weak_core.upgrade(), weak_connection.upgrade())
+            else {
                 return;
             };
-            if matches!(lock(&connection.inner).stage, Stage::AwaitingHello | Stage::Handshaking) {
+            if matches!(
+                lock(&connection.inner).stage,
+                Stage::AwaitingHello | Stage::Handshaking
+            ) {
                 core.fail_protocol(
                     &connection,
                     ProtocolError {
@@ -645,7 +703,9 @@ impl<H: ServerHost> ServerCore<H> {
     }
 
     fn notify_connection_count_changed(&self) {
-        let Some(callback) = self.on_connection_count_changed.as_ref() else { return; };
+        let Some(callback) = self.on_connection_count_changed.as_ref() else {
+            return;
+        };
         let count = lock(&self.connections).len();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(count)));
         if result.is_err() {
@@ -654,7 +714,9 @@ impl<H: ServerHost> ServerCore<H> {
     }
 
     fn report_error(&self, error: &(dyn Error + 'static)) {
-        let Some(callback) = self.on_error.as_ref() else { return; };
+        let Some(callback) = self.on_error.as_ref() else {
+            return;
+        };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(error)));
     }
 
@@ -690,7 +752,10 @@ impl<H: ServerHost> ServerCore<H> {
     }
 
     async fn close_server_state(&self) -> Vec<HostError> {
-        let connections = lock(&self.connections).values().cloned().collect::<Vec<_>>();
+        let connections = lock(&self.connections)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         for connection in &connections {
             let mut inner = lock(&connection.inner);
             inner.stage = Stage::Closing;
@@ -699,7 +764,12 @@ impl<H: ServerHost> ServerCore<H> {
             }
             connection.handshake_done.notify_waiters();
         }
-        let close_results = join_all(connections.iter().map(|connection| connection.close_frame(None))).await;
+        let close_results = join_all(
+            connections
+                .iter()
+                .map(|connection| connection.close_frame(None)),
+        )
+        .await;
         let mut errors = Vec::new();
         for result in close_results {
             if let Err(error) = result {
@@ -727,7 +797,8 @@ impl<H: ServerHost> ServerCore<H> {
         let messages = match messages {
             Ok(messages) => messages,
             Err(error) => {
-                self.fail_protocol(&connection, self.to_protocol_error(&error)).await;
+                self.fail_protocol(&connection, Self::to_protocol_error(&error))
+                    .await;
                 return;
             }
         };
@@ -735,7 +806,9 @@ impl<H: ServerHost> ServerCore<H> {
             if connection.terminal() {
                 return;
             }
-            Arc::clone(&self).dispatch_message(&connection, message).await;
+            Arc::clone(&self)
+                .dispatch_message(&connection, message)
+                .await;
         }
     }
 
@@ -775,7 +848,9 @@ impl<H: ServerHost> ServerCore<H> {
                 }
             }
             Stage::Ready => match message {
-                ClientMessage::Cancel { id, target } => self.handle_cancel(connection, id, target),
+                ClientMessage::Cancel { id, target } => {
+                    self.handle_cancel(connection, &id, &target);
+                }
                 ClientMessage::Request { id, target, call } => {
                     let core = Arc::clone(&self);
                     let connection = Arc::clone(connection);
@@ -798,14 +873,15 @@ impl<H: ServerHost> ServerCore<H> {
         }
     }
 
-
     async fn finish_handshake(&self, connection: &Arc<ServerConnection>, version: u64) {
         if !is_supported_protocol_version(version) {
             self.fail_protocol(
                 connection,
                 ProtocolError {
                     code: "version".to_owned(),
-                    message: format!("Unsupported protocol version {version}; expected {PROTOCOL_VERSION}"),
+                    message: format!(
+                        "Unsupported protocol version {version}; expected {PROTOCOL_VERSION}"
+                    ),
                 },
             )
             .await;
@@ -814,10 +890,9 @@ impl<H: ServerHost> ServerCore<H> {
         if self.closing.load(Ordering::Acquire) || connection.terminal() {
             return;
         }
-        let presentation: Arc<dyn RoutedServerPresentation> = Arc::new(router::ServerPresentation::new(
-            Arc::clone(&self.router),
-            connection.key,
-        ));
+        let presentation: Arc<dyn RoutedServerPresentation> = Arc::new(
+            router::ServerPresentation::new(Arc::clone(&self.router), connection.key),
+        );
         let services = match self
             .host
             .server_services()
@@ -826,7 +901,8 @@ impl<H: ServerHost> ServerCore<H> {
         {
             Ok(services) => services,
             Err(error) => {
-                self.fail_protocol(connection, to_protocol_error(&error)).await;
+                self.fail_protocol(connection, to_protocol_error(&error))
+                    .await;
                 return;
             }
         };
@@ -856,14 +932,14 @@ impl<H: ServerHost> ServerCore<H> {
         }
     }
 
-    fn handle_cancel(&self, connection: &Arc<ServerConnection>, id: String, target: RpcTarget) {
+    fn handle_cancel(&self, connection: &Arc<ServerConnection>, id: &str, target: &RpcTarget) {
         if target.server_id() != &self.server_id {
             return;
         }
         let token = lock(&connection.inner)
             .active_requests
-            .get(&id)
-            .filter(|active| same_target(&active.target, &target))
+            .get(id)
+            .filter(|active| same_target(&active.target, target))
             .map(|active| active.token.clone());
         if let Some(token) = token {
             token.cancel();
@@ -878,102 +954,110 @@ impl<H: ServerHost> ServerCore<H> {
         raw_call: JsonValue,
     ) {
         if lock(&connection.inner).active_requests.contains_key(&id) {
-            let _ = self
-                .send_message(
-                    connection,
-                    ServerMessage::ResponseError {
-                        id,
-                        error: ProtocolError {
-                            code: "invalid_request".to_owned(),
-                            message: "Request ID is already active".to_owned(),
-                        },
-                    },
-                )
-                .await;
+            self.send_response_error(
+                connection,
+                id,
+                ProtocolError {
+                    code: "invalid_request".to_owned(),
+                    message: "Request ID is already active".to_owned(),
+                },
+            )
+            .await;
             return;
         }
-        let call = match parse_service_call(&raw_call) {
-            Ok(call) => call,
-            Err(_) => {
-                let _ = self
-                    .send_message(
-                        connection,
-                        ServerMessage::ResponseError {
-                            id,
-                            error: ProtocolError {
-                                code: "invalid_request".to_owned(),
-                                message: "Invalid service call".to_owned(),
-                            },
-                        },
-                    )
-                    .await;
-                return;
-            }
+        let Ok(call) = parse_service_call(&raw_call) else {
+            self.send_response_error(
+                connection,
+                id,
+                ProtocolError {
+                    code: "invalid_request".to_owned(),
+                    message: "Invalid service call".to_owned(),
+                },
+            )
+            .await;
+            return;
         };
         let (context, token) = Context::background().with_cancel();
-        let active = ActiveRequest {
-            token,
-            target: target.clone(),
-        };
-        lock(&connection.inner)
-            .active_requests
-            .insert(id.clone(), active);
+        lock(&connection.inner).active_requests.insert(
+            id.clone(),
+            ActiveRequest {
+                token,
+                target: target.clone(),
+            },
+        );
 
         let control = decode_service_control_call(&call);
         let subscription_id = match control.as_ref() {
-            Some(ServiceControlCall::Subscribe { subscription_id, .. }) => {
-                match subscription_id.try_to_utf8() {
-                    Ok(value) => Some(value),
-                    Err(_) => {
-                        lock(&connection.inner).active_requests.remove(&id);
-                        let _ = self
-                            .send_message(
-                                connection,
-                                ServerMessage::ResponseError {
-                                    id,
-                                    error: ProtocolError {
-                                        code: "invalid_request".to_owned(),
-                                        message: "Invalid service call".to_owned(),
-                                    },
-                                },
-                            )
-                            .await;
-                        return;
-                    }
-                }
-            }
-            _ => None,
-        };
-        if let Some(subscription_id) = subscription_id.as_ref() {
-            if lock(&connection.inner)
-                .state_encoders
-                .contains_key(subscription_id)
-            {
-                let error = HostError::Protocol(format!(
-                    "Duplicate service subscription {subscription_id}"
-                ));
-                let _ = self
-                    .send_message(
+            Some(ServiceControlCall::Subscribe {
+                subscription_id, ..
+            }) => {
+                let Ok(subscription_id) = subscription_id.try_to_utf8() else {
+                    lock(&connection.inner).active_requests.remove(&id);
+                    self.send_response_error(
                         connection,
-                        ServerMessage::ResponseError {
-                            id: id.clone(),
-                            error: to_protocol_error(&error),
+                        id,
+                        ProtocolError {
+                            code: "invalid_request".to_owned(),
+                            message: "Invalid service call".to_owned(),
                         },
                     )
                     .await;
-                lock(&connection.inner).active_requests.remove(&id);
-                return;
+                    return;
+                };
+                Some(subscription_id)
             }
+            _ => None,
+        };
+        if let Some(subscription_id) = subscription_id.as_ref()
+            && lock(&connection.inner)
+                .state_encoders
+                .contains_key(subscription_id)
+        {
+            let error =
+                HostError::Protocol(format!("Duplicate service subscription {subscription_id}"));
+            self.send_response_error(connection, id.clone(), to_protocol_error(&error))
+                .await;
+            lock(&connection.inner).active_requests.remove(&id);
+            return;
         }
 
         let pending = Arc::new(PendingUpdates::new(subscription_id.clone()));
-        let pending_for_publish = Arc::clone(&pending);
-        let core = Arc::clone(&self);
-        let connection_for_publish = Arc::clone(connection);
-        let publish: PublishUpdate = Arc::new(move |subscription, update, _context| {
-            let pending = Arc::clone(&pending_for_publish);
+        let publish = Self::make_publish(
+            Arc::clone(&self),
+            Arc::clone(connection),
+            Arc::clone(&pending),
+        );
+        let result = self
+            .invoke_request(connection, target, call, publish, context.clone())
+            .await;
+
+        let (installed, result) = Self::process_control_result(
+            connection,
+            control.as_ref(),
+            subscription_id.as_deref(),
+            result,
+        );
+        self.finish_request(
+            connection,
+            id,
+            subscription_id,
+            pending,
+            context,
+            installed,
+            result,
+        )
+        .await;
+    }
+
+    fn make_publish(
+        core: Arc<Self>,
+        connection: Arc<ServerConnection>,
+        pending: Arc<PendingUpdates>,
+    ) -> PublishUpdate {
+        Arc::new(move |subscription, update, _context| {
+            let pending = Arc::clone(&pending);
             let core = Arc::clone(&core);
-            let connection = Arc::clone(&connection_for_publish);
+            let connection = Arc::clone(&connection);
             Box::pin(async move {
                 if pending.buffer(&subscription, update.clone()) {
                     return;
@@ -982,63 +1066,105 @@ impl<H: ServerHost> ServerCore<H> {
                     .send_service_update(&connection, subscription, update)
                     .await;
             })
-        });
+        })
+    }
 
-        let result = if target.server_id() != &self.server_id {
-            Err(ServerError::wrong_server().into())
-        } else {
-            match &target {
-                RpcTarget::Session(_) => self
-                    .router
+    async fn invoke_request(
+        &self,
+        connection: &Arc<ServerConnection>,
+        target: RpcTarget,
+        call: ServiceCall,
+        publish: PublishUpdate,
+        context: Context,
+    ) -> Result<Option<JsonValue>, HostError> {
+        if target.server_id() != &self.server_id {
+            return Err(ServerError::wrong_server().into());
+        }
+        match target {
+            target @ RpcTarget::Session(_) => {
+                self.router
                     .clone()
-                    .execute_service_call(call, target.clone(), connection.key, publish.clone(), context.clone())
-                    .await,
-                RpcTarget::Server(_) => {
-                    let services = lock(&connection.inner).server_services.clone();
-                    match services {
-                        Some(services) => services
-                            .invoke_service(call, publish, context.clone())
-                            .await,
-                        None => Err(HostError::Protocol(
-                            "Unknown service member".to_owned(),
-                        )),
-                    }
+                    .execute_service_call(call, target, connection.key, publish, context)
+                    .await
+            }
+            RpcTarget::Server(_) => {
+                let services = lock(&connection.inner).server_services.clone();
+                match services {
+                    Some(services) => services.invoke_service(call, publish, context).await,
+                    None => Err(HostError::Protocol("Unknown service member".to_owned())),
                 }
             }
+        }
+    }
+
+    async fn send_response_error(
+        &self,
+        connection: &Arc<ServerConnection>,
+        id: String,
+        error: ProtocolError,
+    ) {
+        let _ = self
+            .send_message(connection, ServerMessage::ResponseError { id, error })
+            .await;
+    }
+
+    fn process_control_result(
+        connection: &Arc<ServerConnection>,
+        control: Option<&ServiceControlCall>,
+        subscription_id: Option<&str>,
+        result: Result<Option<JsonValue>, HostError>,
+    ) -> (bool, Result<Option<JsonValue>, HostError>) {
+        let Some(subscription_id) = subscription_id else {
+            if let Some(ServiceControlCall::Unsubscribe { subscription_id }) = control
+                && let Ok(subscription_id) = subscription_id.try_to_utf8()
+            {
+                lock(&connection.inner)
+                    .state_encoders
+                    .remove(&subscription_id);
+            }
+            return (false, result);
         };
 
         let mut installed = false;
-        let mut result = result;
-        if let Some(subscription_id) = subscription_id.as_ref() {
-            let original = result;
-            result = match original {
-                Ok(Some(snapshot)) => match parse_service_subscription_snapshot(&snapshot) {
-                    Ok(snapshot) => {
-                        let mut encoder = ServiceStateEncoder::new();
-                        match encoder.encode_snapshot(&snapshot) {
-                            Ok(snapshot) => {
-                                lock(&connection.inner)
-                                    .state_encoders
-                                    .insert(subscription_id.clone(), encoder);
-                                installed = true;
-                                Ok(Some(snapshot.into_json()))
-                            }
-                            Err(error) => Err(HostError::Protocol(error.to_string())),
+        let result = match result {
+            Ok(Some(snapshot)) => match parse_service_subscription_snapshot(&snapshot) {
+                Ok(snapshot) => {
+                    let mut encoder = ServiceStateEncoder::new();
+                    match encoder.encode_snapshot(&snapshot) {
+                        Ok(snapshot) => {
+                            lock(&connection.inner)
+                                .state_encoders
+                                .insert(subscription_id.to_owned(), encoder);
+                            installed = true;
+                            Ok(Some(snapshot.into_json()))
                         }
+                        Err(error) => Err(HostError::Protocol(error.to_string())),
                     }
-                    Err(error) => Err(HostError::Protocol(error.to_string())),
-                },
-                Ok(None) => Err(HostError::Protocol(
-                    "Service subscription did not return a snapshot".to_owned(),
-                )),
-                Err(error) => Err(error),
-            };
-        } else if let Some(ServiceControlCall::Unsubscribe { subscription_id }) = control.as_ref() {
-            if let Ok(subscription_id) = subscription_id.try_to_utf8() {
-                lock(&connection.inner).state_encoders.remove(&subscription_id);
-            }
-        }
+                }
+                Err(error) => Err(HostError::Protocol(error.to_string())),
+            },
+            Ok(None) => Err(HostError::Protocol(
+                "Service subscription did not return a snapshot".to_owned(),
+            )),
+            Err(error) => Err(error),
+        };
+        (installed, result)
+    }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "established constructor contract: all parameters are required to finalize the routed request"
+    )]
+    async fn finish_request(
+        &self,
+        connection: &Arc<ServerConnection>,
+        id: String,
+        subscription_id: Option<String>,
+        pending: Arc<PendingUpdates>,
+        context: Context,
+        installed: bool,
+        result: Result<Option<JsonValue>, HostError>,
+    ) {
         match result {
             Ok(result) => {
                 let sent = self
@@ -1050,10 +1176,9 @@ impl<H: ServerHost> ServerCore<H> {
                         },
                     )
                     .await;
-                if sent && subscription_id.is_some() {
+                if sent && let Some(subscription_id) = subscription_id {
                     let updates = pending.activate();
                     for update in updates {
-                        let Some(subscription_id) = subscription_id.as_ref() else { break; };
                         let _ = self
                             .send_service_update(connection, subscription_id.clone(), update)
                             .await;
@@ -1061,10 +1186,10 @@ impl<H: ServerHost> ServerCore<H> {
                 }
             }
             Err(error) => {
-                if installed {
-                    if let Some(subscription_id) = subscription_id.as_ref() {
-                        lock(&connection.inner).state_encoders.remove(subscription_id);
-                    }
+                if installed && let Some(subscription_id) = subscription_id.as_ref() {
+                    lock(&connection.inner)
+                        .state_encoders
+                        .remove(subscription_id);
                 }
                 let error = if context.is_cancelled() {
                     ProtocolError {
@@ -1074,14 +1199,7 @@ impl<H: ServerHost> ServerCore<H> {
                 } else {
                     to_protocol_error(&error)
                 };
-                let _ = self
-                    .send_message(
-                        connection,
-                        ServerMessage::ResponseError {
-                            id: id.clone(),
-                            error,
-                        },
-                    )
+                self.send_response_error(connection, id.clone(), error)
                     .await;
             }
         }
@@ -1120,7 +1238,11 @@ impl<H: ServerHost> ServerCore<H> {
         .await
     }
 
-    async fn send_message(&self, connection: &Arc<ServerConnection>, message: ServerMessage) -> bool {
+    async fn send_message(
+        &self,
+        connection: &Arc<ServerConnection>,
+        message: ServerMessage,
+    ) -> bool {
         if connection.terminal() || connection.connection.closed() {
             return false;
         }
@@ -1212,15 +1334,17 @@ impl<H: ServerHost> ServerCore<H> {
             self.notify_connection_count_changed();
         }
         let router = Arc::clone(&self.router).disconnect(key, Context::background());
-        let service = services.as_ref().map(|service| service.release(Context::background()));
+        let service = services
+            .as_ref()
+            .map(|service| service.release(Context::background()));
         let router_result = router.await;
         if let Err(error) = router_result {
             self.report_error(&error);
         }
-        if let Some(service) = service {
-            if let Err(error) = service.await {
-                self.report_error(&error);
-            }
+        if let Some(service) = service
+            && let Err(error) = service.await
+        {
+            self.report_error(&error);
         }
     }
 
@@ -1232,7 +1356,7 @@ impl<H: ServerHost> ServerCore<H> {
         connection.close_frame(final_chunk).await
     }
 
-    fn to_protocol_error(&self, error: &CodecError) -> ProtocolError {
+    fn to_protocol_error(error: &CodecError) -> ProtocolError {
         ProtocolError {
             code: "invalid_request".to_owned(),
             message: error.to_string(),
@@ -1247,7 +1371,8 @@ struct ServerHandler<H: ServerHost> {
 
 impl<H: ServerHost> ConnectionHandler for ServerHandler<H> {
     fn on_data(&self, chunk: Vec<u8>) {
-        let (Some(core), Some(connection)) = (self.core.upgrade(), self.connection.upgrade()) else {
+        let (Some(core), Some(connection)) = (self.core.upgrade(), self.connection.upgrade())
+        else {
             return;
         };
         let event_connection = Arc::clone(&connection);
@@ -1257,7 +1382,8 @@ impl<H: ServerHost> ConnectionHandler for ServerHandler<H> {
     }
 
     fn on_close(&self) {
-        let (Some(core), Some(connection)) = (self.core.upgrade(), self.connection.upgrade()) else {
+        let (Some(core), Some(connection)) = (self.core.upgrade(), self.connection.upgrade())
+        else {
             return;
         };
         let event_connection = Arc::clone(&connection);
@@ -1267,7 +1393,8 @@ impl<H: ServerHost> ConnectionHandler for ServerHandler<H> {
     }
 
     fn on_error(&self, error: TransportError) {
-        let (Some(core), Some(connection)) = (self.core.upgrade(), self.connection.upgrade()) else {
+        let (Some(core), Some(connection)) = (self.core.upgrade(), self.connection.upgrade())
+        else {
             return;
         };
         let event_connection = Arc::clone(&connection);
@@ -1333,7 +1460,6 @@ fn same_target(left: &RpcTarget, right: &RpcTarget) -> bool {
         _ => false,
     }
 }
-
 
 trait RpcTargetServerId {
     fn server_id(&self) -> &ServerId;

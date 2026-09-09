@@ -6,9 +6,9 @@
 
 mod connection;
 mod errors;
-mod transport_adapter;
 #[cfg(test)]
 mod tests;
+mod transport_adapter;
 
 pub use errors::{
     CancelledError, ClientDisposedError, ClientError, ClientOptionsError, DisconnectedError,
@@ -31,9 +31,8 @@ use pi_agent::service::delta::DeltaOp;
 use pi_agent::service::state_codec::ServiceStateDecoder;
 use pi_agent::service::value::{JsString, JsonValue};
 use pi_agent::service::wire::{
-    create_service_catalogue_call, create_service_subscribe_call,
-    create_service_unsubscribe_call, parse_service_catalogue,
-    parse_service_call, parse_wire_service_provider_update,
+    create_service_catalogue_call, create_service_subscribe_call, create_service_unsubscribe_call,
+    parse_service_call, parse_service_catalogue, parse_wire_service_provider_update,
     parse_wire_service_subscription_snapshot,
 };
 use tokio::sync::{Notify, oneshot};
@@ -52,8 +51,7 @@ pub type ConnectionStateListener = Arc<dyn Fn(&ConnectionStateChange) + Send + S
 /// An attachment-route callback.
 pub type AttachmentChangeListener = Arc<dyn Fn(&Option<SessionTarget>) + Send + Sync>;
 /// A service-update callback.
-pub type ServiceUpdateListener =
-    Arc<dyn Fn(&ServiceProviderUpdate<DeltaOp>) + Send + Sync>;
+pub type ServiceUpdateListener = Arc<dyn Fn(&ServiceProviderUpdate<DeltaOp>) + Send + Sync>;
 /// Receives isolated listener failures.
 pub type ListenerErrorHandler = Arc<dyn Fn(ClientError) + Send + Sync>;
 
@@ -102,7 +100,9 @@ impl Subscription {
 
 impl fmt::Debug for Subscription {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("Subscription").finish_non_exhaustive()
+        formatter
+            .debug_struct("Subscription")
+            .finish_non_exhaustive()
     }
 }
 
@@ -176,7 +176,11 @@ impl CancelToken {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.state.cancelled.load(Ordering::Acquire)
-            || self.state.source.as_ref().is_some_and(CancellationToken::is_cancelled)
+            || self
+                .state
+                .source
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
     }
 
     async fn cancelled(&self) {
@@ -192,8 +196,8 @@ impl CancelToken {
         if let Some(source) = self.state.source.clone() {
             tokio::select! {
                 biased;
-                _ = notified => {}
-                _ = source.cancelled() => {}
+                () = notified => {}
+                () = source.cancelled() => {}
             }
         } else {
             notified.await;
@@ -206,7 +210,7 @@ impl CancelToken {
 pub struct ClientOptions {
     /// Factory that opens one fresh byte transport per connection attempt.
     pub transport_factory: ByteTransportFactory,
-    /// Canonical lowercase UUIDv4 identity expected from the endpoint.
+    /// Canonical lowercase `UUIDv4` identity expected from the endpoint.
     pub server_id: String,
     /// Maximum accepted frame payload; defaults to 16 MiB when omitted.
     pub max_frame_length: Option<usize>,
@@ -243,6 +247,7 @@ struct ActiveServiceListener {
     state: StdMutex<ActiveServiceState>,
 }
 
+#[derive(Default)]
 struct Inner {
     connection: Option<Arc<Connection>>,
     next_connection_id: u64,
@@ -256,25 +261,6 @@ struct Inner {
     hello: Option<ServerHello>,
     attachment: Option<SessionTarget>,
     disposed: bool,
-}
-
-impl Default for Inner {
-    fn default() -> Self {
-        Self {
-            connection: None,
-            next_connection_id: 0,
-            next_request_id: 0,
-            next_service_id: 0,
-            next_listener_id: 0,
-            pending: HashMap::new(),
-            service_listeners: HashMap::new(),
-            connection_state_listeners: HashMap::new(),
-            attachment_listeners: HashMap::new(),
-            hello: None,
-            attachment: None,
-            disposed: false,
-        }
-    }
 }
 
 /// Shared client state used by [`Client`] and its connection callback seam.
@@ -326,6 +312,13 @@ impl fmt::Debug for ServiceSubscription {
 
 impl Client {
     /// Validates options and creates a disconnected client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientOptionsError::InvalidServerId`] when the server
+    /// identity is not a canonical lowercase `UUIDv4`, or
+    /// [`ClientOptionsError::InvalidMaxFrameLength`] when the frame limit is
+    /// zero or exceeds the protocol's supported range.
     pub fn new(options: ClientOptions) -> Result<Self, ClientOptionsError> {
         if !is_server_id(&options.server_id) {
             return Err(ClientOptionsError::InvalidServerId);
@@ -350,11 +343,21 @@ impl Client {
     }
 
     /// Opens a fresh transport and completes the v8 hello handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the transport, framing, or server
+    /// handshake fails.
     pub async fn connect(&self) -> Result<ServerHello, ClientError> {
         self.core.connect().await
     }
 
     /// Opens a fresh transport after the client is disconnected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when connecting the fresh transport or
+    /// completing the server handshake fails.
     pub async fn reconnect(&self) -> Result<ServerHello, ClientError> {
         self.connect().await
     }
@@ -405,6 +408,12 @@ impl Client {
         lock(&self.core.inner).disposed
     }
 
+    /// Registers a connection-state listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Disposed`] when the client has already been
+    /// disposed.
     pub fn on_connection_state_change(
         &self,
         listener: ConnectionStateListener,
@@ -428,6 +437,11 @@ impl Client {
     }
 
     /// Registers an attachment-route listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Disposed`] when the client has already been
+    /// disposed.
     pub fn on_attachment_change(
         &self,
         listener: AttachmentChangeListener,
@@ -451,6 +465,11 @@ impl Client {
     }
 
     /// Sends one generic opaque service call to an explicit route.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the route, service call, connection, or
+    /// response is invalid.
     pub async fn request(
         &self,
         target: RpcTarget,
@@ -461,6 +480,11 @@ impl Client {
     }
 
     /// Requests and validates the service catalogue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the request fails or the response is not
+    /// a valid service catalogue.
     pub async fn service_catalogue(
         &self,
         target: RpcTarget,
@@ -482,6 +506,11 @@ impl Client {
     }
 
     /// Subscribes to one service and defers update delivery until `start`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the subscription request or its initial
+    /// snapshot is invalid.
     pub async fn subscribe_service(
         &self,
         target: RpcTarget,
@@ -496,7 +525,6 @@ impl Client {
     }
 }
 
-
 impl ClientCore {
     async fn connect(self: &Arc<Self>) -> Result<ServerHello, ClientError> {
         let (connection, handshake) = {
@@ -507,7 +535,9 @@ impl ClientCore {
             if let Some(existing) = inner.connection.as_ref() {
                 let state = existing.state();
                 if state != ConnectionState::Disconnected {
-                    return Err(ClientError::disconnected(format!("Client is already {state}")));
+                    return Err(ClientError::disconnected(format!(
+                        "Client is already {state}"
+                    )));
                 }
             }
             inner.hello = None;
@@ -523,7 +553,7 @@ impl ClientCore {
             inner.connection = Some(Arc::clone(&connection));
             (connection, handshake)
         };
-        self.fire_connection_state(ConnectionStateChange {
+        self.fire_connection_state(&ConnectionStateChange {
             state: ConnectionState::Connecting,
             error: None,
         });
@@ -532,12 +562,16 @@ impl ClientCore {
                 handle.spawn(open_transport(connection));
             }
             Err(_) => {
-                connection.fail(ClientError::disconnected("connect requires a Tokio runtime"));
+                connection.fail(ClientError::disconnected(
+                    "connect requires a Tokio runtime",
+                ));
             }
         }
-        handshake
-            .await
-            .unwrap_or_else(|_| Err(ClientError::disconnected("Connection attempt was abandoned")))
+        handshake.await.unwrap_or_else(|_| {
+            Err(ClientError::disconnected(
+                "Connection attempt was abandoned",
+            ))
+        })
     }
 
     fn disconnect(&self, reason: String) {
@@ -580,7 +614,9 @@ impl ClientCore {
         lock(&self.inner)
             .connection
             .as_ref()
-            .map_or(ConnectionState::Disconnected, |connection| connection.state())
+            .map_or(ConnectionState::Disconnected, |connection| {
+                connection.state()
+            })
     }
 
     fn connected(&self) -> bool {
@@ -649,7 +685,7 @@ impl ClientCore {
             Some(token) => {
                 tokio::select! {
                     result = &mut receiver => result.unwrap_or_else(|_| Err(ClientError::disconnected("Client is disconnected"))),
-                    _ = token.cancelled() => {
+                    () = token.cancelled() => {
                         if self.take_pending(&id).is_some() {
                             if connection.state() == ConnectionState::Connected {
                                 let cancel_message = ClientMessage::Cancel {
@@ -826,7 +862,7 @@ impl ClientCore {
             return;
         }
         lock(&self.inner).hello = Some(hello);
-        self.fire_connection_state(ConnectionStateChange {
+        self.fire_connection_state(&ConnectionStateChange {
             state: ConnectionState::Connected,
             error: None,
         });
@@ -887,7 +923,7 @@ impl ClientCore {
                     );
                     return;
                 }
-                self.on_service_update(connection_id, &subscription_id, update);
+                self.on_service_update(connection_id, &subscription_id, &update);
             }
             ServerMessage::Attachment { attachment } => {
                 if let Some(attachment) = attachment.as_ref() {
@@ -903,7 +939,7 @@ impl ClientCore {
                         return;
                     }
                 }
-                self.set_attachment(attachment);
+                self.set_attachment(attachment.as_ref());
             }
             ServerMessage::Hello { .. } | ServerMessage::HelloError { .. } => {
                 self.fail_connection(
@@ -917,32 +953,36 @@ impl ClientCore {
     pub(crate) fn on_disconnected(&self, connection_id: u64, error: ClientError) {
         let (pending, attachment_changed) = {
             let mut inner = lock(&self.inner);
-            if !inner
+            if inner
                 .connection
                 .as_ref()
-                .is_some_and(|connection| connection.id == connection_id)
+                .is_none_or(|connection| connection.id != connection_id)
             {
                 return;
             }
             inner.hello = None;
             let attachment_changed = inner.attachment.take().is_some();
-            let pending = inner.pending.drain().map(|(_, pending)| pending.sender).collect::<Vec<_>>();
+            let pending = inner
+                .pending
+                .drain()
+                .map(|(_, pending)| pending.sender)
+                .collect::<Vec<_>>();
             inner.service_listeners.clear();
             (pending, attachment_changed)
         };
         if attachment_changed {
-            self.fire_attachment(None);
+            self.fire_attachment(&None);
         }
         for sender in pending {
             let _ = sender.send(Err(error.clone()));
         }
-        self.fire_connection_state(ConnectionStateChange {
+        self.fire_connection_state(&ConnectionStateChange {
             state: ConnectionState::Disconnected,
             error: Some(error),
         });
     }
 
-    fn on_service_update(&self, connection_id: u64, subscription_id: &str, update: JsonValue) {
+    fn on_service_update(&self, connection_id: u64, subscription_id: &str, update: &JsonValue) {
         let active = lock(&self.inner)
             .service_listeners
             .get(subscription_id)
@@ -956,11 +996,11 @@ impl ClientCore {
         let parsed = {
             let mut state = lock(&active.state);
             if !state.hydrated {
-                state.queued_wire.push(update);
+                state.queued_wire.push(update.clone());
                 return;
             }
             let wire_update =
-                match parse_wire_service_provider_update(&update).map_err(ClientError::from) {
+                match parse_wire_service_provider_update(update).map_err(ClientError::from) {
                     Ok(update) => update,
                     Err(error) => {
                         drop(state);
@@ -1003,23 +1043,24 @@ impl ClientCore {
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| listener(update))) {
             self.report_listener_error(ClientError::protocol(format!(
                 "Service listener panicked: {}",
-                panic_message(payload),
+                panic_message(&payload),
             )));
         }
     }
 
-    fn set_attachment(&self, attachment: Option<SessionTarget>) {
+    fn set_attachment(&self, attachment: Option<&SessionTarget>) {
         let changed = {
             let mut inner = lock(&self.inner);
-            if inner.attachment == attachment {
+            if inner.attachment.as_ref() == attachment {
                 false
             } else {
-                inner.attachment = attachment.clone();
+                inner.attachment = attachment.cloned();
                 true
             }
         };
         if changed {
-            self.fire_attachment(attachment);
+            let current = lock(&self.inner).attachment.clone();
+            self.fire_attachment(&current);
         }
     }
 
@@ -1038,40 +1079,44 @@ impl ClientCore {
         }
     }
 
-    fn fire_connection_state(&self, change: ConnectionStateChange) {
+    fn fire_connection_state(&self, change: &ConnectionStateChange) {
         let listeners = lock(&self.inner)
             .connection_state_listeners
             .values()
             .cloned()
             .collect::<Vec<_>>();
         for listener in listeners {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| listener(&change))) {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| listener(change))) {
                 self.report_listener_error(ClientError::protocol(format!(
                     "Connection-state listener panicked: {}",
-                    panic_message(payload),
+                    panic_message(&payload),
                 )));
             }
         }
     }
 
-    fn fire_attachment(&self, attachment: Option<SessionTarget>) {
+    #[expect(
+        clippy::ref_option,
+        reason = "AttachmentChangeListener callback receives &Option<SessionTarget>"
+    )]
+    fn fire_attachment(&self, attachment: &Option<SessionTarget>) {
         let listeners = lock(&self.inner)
             .attachment_listeners
             .values()
             .cloned()
             .collect::<Vec<_>>();
         for listener in listeners {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| listener(&attachment))) {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| listener(attachment))) {
                 self.report_listener_error(ClientError::protocol(format!(
                     "Attachment listener panicked: {}",
-                    panic_message(payload),
+                    panic_message(&payload),
                 )));
             }
         }
     }
 
     fn report_listener_error(&self, error: ClientError) {
-        let Some(handler) = self.on_listener_error.as_ref().cloned() else {
+        let Some(handler) = self.on_listener_error.clone() else {
             return;
         };
         let _ = catch_unwind(AssertUnwindSafe(|| handler(error)));
@@ -1086,7 +1131,9 @@ fn validate_target(target: &RpcTarget) -> Result<(), ClientError> {
 
 fn validate_session_target(session: &SessionTarget) -> Result<(), ClientError> {
     if session.session_id.is_empty() || session.attachment_id.is_empty() {
-        return Err(ClientError::protocol("Session target identifiers must be non-empty"));
+        return Err(ClientError::protocol(
+            "Session target identifiers must be non-empty",
+        ));
     }
     Ok(())
 }
@@ -1132,6 +1179,11 @@ impl ServiceSubscription {
     }
 
     /// Removes this listener and, when still routable, sends unsubscribe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the unsubscribe request fails. Disposal
+    /// remains idempotent and succeeds when the client is already gone.
     pub async fn dispose(&self) -> Result<(), ClientError> {
         if self.disposed.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -1157,8 +1209,7 @@ impl ServiceSubscription {
         result
     }
 }
-
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         return (*message).to_string();
     }

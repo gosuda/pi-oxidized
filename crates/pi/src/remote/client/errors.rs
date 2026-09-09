@@ -119,7 +119,6 @@ impl From<ServiceCodecError> for ClientError {
     }
 }
 
-
 impl From<TransportError> for ClientError {
     fn from(error: TransportError) -> Self {
         Self::disconnected(error.to_string())

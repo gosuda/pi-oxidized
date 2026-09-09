@@ -24,7 +24,7 @@ pub trait ByteConnection: Send + Sync + 'static {
     fn send(&self, chunk: Vec<u8>) -> BoxFuture<'static, Result<(), TransportError>>;
     /// Closes the connection, optionally delivering one final chunk first.
     fn close(&self, final_chunk: Option<Vec<u8>>)
-        -> BoxFuture<'static, Result<(), TransportError>>;
+    -> BoxFuture<'static, Result<(), TransportError>>;
 }
 
 /// Receives connection events for one accepted connection.
@@ -96,9 +96,12 @@ pub enum ListenSpec {
 ///
 /// Unix path and budget validation is delegated to the shared endpoint-spec
 /// owner, so client and server adapters cannot drift.
-pub fn build_listener(
-    spec: &ListenSpec,
-) -> Result<Arc<dyn ServerListener>, EndpointSpecError> {
+///
+/// # Errors
+///
+/// Returns [`EndpointSpecError`] when the Unix specification is invalid or
+/// Unix listeners are unsupported on the current platform.
+pub fn build_listener(spec: &ListenSpec) -> Result<Arc<dyn ServerListener>, EndpointSpecError> {
     match spec {
         ListenSpec::InMemory { listener } => {
             Ok(Arc::new(InMemoryServerListener::new(Arc::clone(listener))))
@@ -113,14 +116,16 @@ pub fn build_listener(
             })?;
             #[cfg(unix)]
             {
-                Ok(super::unix::create_listener(super::unix::UnixListenerOptions {
-                    path: path.clone(),
-                    mode: None,
-                    max_pending_bytes: *max_pending_bytes,
-                    max_frame_length: None,
-                    graceful_close_timeout_ms: None,
-                    on_error: None,
-                }))
+                Ok(super::unix::create_listener(
+                    super::unix::UnixListenerOptions {
+                        path: path.clone(),
+                        mode: None,
+                        max_pending_bytes: *max_pending_bytes,
+                        max_frame_length: None,
+                        graceful_close_timeout_ms: None,
+                        on_error: None,
+                    },
+                ))
             }
             #[cfg(not(unix))]
             {
@@ -194,8 +199,8 @@ impl InMemoryConnection {
         }
     }
 
-    fn fill(&self, transport: Arc<dyn ByteTransport>) {
-        self.slot_tx.send_replace(Some(Arc::clone(&transport)));
+    fn fill(&self, transport: &Arc<dyn ByteTransport>) {
+        self.slot_tx.send_replace(Some(Arc::clone(transport)));
         if self.closed.load(Ordering::SeqCst) || self.closing.load(Ordering::SeqCst) {
             transport.close();
         }
@@ -250,11 +255,7 @@ impl ByteConnection for InMemoryConnection {
             task
         };
         tokio::spawn(task);
-        Box::pin(async move {
-            receiver
-                .await
-                .unwrap_or(Err(TransportError::Closed))
-        })
+        Box::pin(async move { receiver.await.unwrap_or(Err(TransportError::Closed)) })
     }
 
     fn close(
@@ -293,11 +294,7 @@ impl ByteConnection for InMemoryConnection {
             task
         };
         tokio::spawn(task);
-        Box::pin(async move {
-            receiver
-                .await
-                .unwrap_or(Err(TransportError::Closed))
-        })
+        Box::pin(async move { receiver.await.unwrap_or(Err(TransportError::Closed)) })
     }
 }
 
@@ -356,7 +353,10 @@ impl ServerListener for InMemoryServerListener {
                     accepted = listener.accept(handlers) => accepted,
                 };
                 match accepted {
-                    Ok(transport) => connection.fill(Arc::new(transport)),
+                    Ok(transport) => {
+                        let transport: Arc<dyn ByteTransport> = Arc::new(transport);
+                        connection.fill(&transport);
+                    }
                     Err(_) => break,
                 }
             }
@@ -367,9 +367,10 @@ impl ServerListener for InMemoryServerListener {
     fn close(&self) -> BoxFuture<'static, ()> {
         {
             let mut state = lock(&self.state);
-            if matches!(*state, InMemoryListenerState::Idle) {
-                *state = InMemoryListenerState::Closing;
-            } else if matches!(*state, InMemoryListenerState::Started) {
+            if matches!(
+                *state,
+                InMemoryListenerState::Idle | InMemoryListenerState::Started
+            ) {
                 *state = InMemoryListenerState::Closing;
             }
         }
@@ -392,7 +393,12 @@ mod tests {
 
     impl ByteTransportHandlers for RecordingHandlers {
         fn on_data(&self, chunk: Vec<u8>) {
-            if let Some(sender) = self.sender.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            if let Some(sender) = self
+                .sender
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
                 let _ = sender.send(chunk);
             }
         }
@@ -410,10 +416,7 @@ mod tests {
         fn on_error(&self, _error: TransportError) {}
     }
 
-    #[expect(
-        clippy::expect_used,
-        reason = "in-memory transport setup must succeed"
-    )]
+    #[expect(clippy::expect_used, reason = "in-memory transport setup must succeed")]
     #[tokio::test]
     async fn in_memory_server_connection_round_trip_preserves_chunks() {
         let (listener, endpoint) = InMemoryListener::new();
@@ -421,13 +424,16 @@ mod tests {
         let client_handlers = Arc::new(RecordingHandlers {
             sender: Mutex::new(Some(sender)),
         });
-        let client = (endpoint.factory())(client_handlers).await.expect("client transport");
+        let client = (endpoint.factory())(client_handlers)
+            .await
+            .expect("client transport");
         let server_transport = listener
             .accept(Arc::new(NoopHandlers))
             .await
             .expect("server transport");
         let connection = InMemoryConnection::new();
-        connection.fill(Arc::new(server_transport));
+        let server_transport: Arc<dyn ByteTransport> = Arc::new(server_transport);
+        connection.fill(&server_transport);
 
         connection
             .send(b"server-to-client".to_vec())
@@ -439,7 +445,10 @@ mod tests {
             .expect("client handler remains live");
         assert_eq!(chunk, b"server-to-client");
 
-        connection.close(None).await.expect("close server connection");
+        connection
+            .close(None)
+            .await
+            .expect("close server connection");
         client.close();
     }
 
