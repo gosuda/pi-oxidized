@@ -13,6 +13,7 @@
  * upstream `@earendil-works/*` packages so prebundled entries and the lean
  * runner share zero runtime graph with Mode 1.
  */
+import { isRecord } from "./wire-validators.ts";
 
 /** Lifecycle event discriminants (mirrors Rust `ALL_EVENT_TYPES`). */
 export const LEAN_EVENT_TYPES = [
@@ -421,11 +422,6 @@ export class LeanSurfaceError extends Error {
 		this.name = "LeanSurfaceError";
 	}
 }
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 
 function validateJsonValue(
 	context: string,
