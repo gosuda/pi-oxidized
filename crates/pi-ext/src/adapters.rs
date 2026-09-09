@@ -14,6 +14,7 @@
 
 use std::any::Any;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -316,7 +317,7 @@ fn parse_tool_result(frame: &Frame) -> Result<AgentToolResult, ToolError> {
 pub struct ExtensionProvider {
     provider_id: String,
     client: Arc<HostClient>,
-    timeout: Duration,
+    timeout: Arc<AtomicU64>,
     capabilities: ProviderCapabilities,
     deferred: Option<DeferredCallbacks>,
     /// Test-only probe notified immediately before a bounded consumer send
@@ -337,7 +338,7 @@ impl ExtensionProvider {
         Self {
             provider_id: provider_id.into(),
             client,
-            timeout: DEFAULT_CALL_TIMEOUT,
+            timeout: Arc::new(AtomicU64::new(timeout_millis(DEFAULT_CALL_TIMEOUT))),
             capabilities: ProviderCapabilities {
                 stream_simple: true,
                 ..ProviderCapabilities::default()
@@ -355,11 +356,12 @@ impl ExtensionProvider {
     pub fn with_capabilities(mut self, capabilities: ProviderCapabilities) -> Self {
         let provider_id = self.provider_id.clone();
         let client = Arc::clone(&self.client);
-        let timeout = self.timeout;
+        let timeout = Arc::clone(&self.timeout);
         let deferred = {
             let fetch = if capabilities.fetch_deferred {
                 let client = Arc::clone(&client);
                 let provider_id = provider_id.clone();
+                let timeout = Arc::clone(&timeout);
                 let callback: FetchDeferredFn = Arc::new(
                     move |model: &Model,
                           handle: DeferredHandle,
@@ -368,7 +370,7 @@ impl ExtensionProvider {
                         deferred_fetch_stream(
                             Arc::clone(&client),
                             provider_id.clone(),
-                            timeout,
+                            current_timeout(&timeout),
                             model,
                             handle,
                             options,
@@ -382,6 +384,7 @@ impl ExtensionProvider {
             let cancel = if capabilities.cancel_deferred {
                 let client = Arc::clone(&client);
                 let provider_id = provider_id.clone();
+                let timeout = Arc::clone(&timeout);
                 let callback: CancelDeferredFn = Arc::new(
                     move |model: &Model,
                           handle: DeferredHandle,
@@ -390,7 +393,7 @@ impl ExtensionProvider {
                         deferred_cancel_future(
                             Arc::clone(&client),
                             provider_id.clone(),
-                            timeout,
+                            current_timeout(&timeout),
                             model,
                             handle,
                             options,
@@ -422,8 +425,9 @@ impl ExtensionProvider {
 
     /// Override the per-call deadline.
     #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+    pub fn with_timeout(self, timeout: Duration) -> Self {
+        self.timeout
+            .store(timeout_millis(timeout), Ordering::Relaxed);
         self
     }
 
@@ -455,7 +459,7 @@ impl Provider for ExtensionProvider {
         }
         let client = Arc::clone(&self.client);
         let provider_id = self.provider_id.clone();
-        let timeout = self.timeout;
+        let timeout = current_timeout(&self.timeout);
         let cancel = options.signal.clone().unwrap_or_default();
         let callback_scope = callback_registration(model, &options);
         let callback_flags = callback_flags(&options);
@@ -586,6 +590,14 @@ impl Provider for ExtensionProvider {
     fn deferred(&self) -> Option<&DeferredCallbacks> {
         self.deferred.as_ref()
     }
+}
+
+fn timeout_millis(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn current_timeout(timeout: &AtomicU64) -> Duration {
+    Duration::from_millis(timeout.load(Ordering::Relaxed))
 }
 
 fn callback_flags(options: &StreamOptions) -> ProviderCallbackFlags {
@@ -2156,6 +2168,55 @@ mod tests {
         );
         Ok(())
     }
+    #[tokio::test]
+    async fn extension_provider_deferred_cancel_uses_timeout_set_after_capabilities() -> R {
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let handle = DeferredHandle {
+            provider: "custom".to_owned(),
+            model_id: "m".to_owned(),
+            api: "custom".to_owned(),
+            id: "deferred-1".to_owned(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: None,
+        };
+        let capabilities = ProviderCapabilities {
+            stream_simple: false,
+            fetch_deferred: true,
+            cancel_deferred: true,
+        };
+
+        {
+            let (client, mut host) = make_pair().await;
+            let provider = ExtensionProvider::new("custom", Arc::new(client))
+                .with_timeout(Duration::from_millis(10))
+                .with_capabilities(capabilities)
+                .with_timeout(Duration::from_millis(40));
+            let cancel = tokio::spawn(provider.cancel_deferred(
+                &model,
+                handle,
+                StreamOptions::default(),
+            ));
+            let request = host.require_frame(methods::PROVIDER_CANCEL_DEFERRED).await?;
+            assert_eq!(request.method, methods::PROVIDER_CANCEL_DEFERRED);
+            let result = tokio::time::timeout(Duration::from_secs(1), cancel).await??;
+            let Err(error) = result else {
+                return Err("deferred cancellation unexpectedly succeeded".into());
+            };
+            assert!(
+                error.to_string().contains("timed out after 40ms"),
+                "unexpected deferred cancellation timeout: {error}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn linked_styled_run_emits_balanced_safe_osc8_and_keeps_buffer_style() {
         use std::cell::RefCell;
