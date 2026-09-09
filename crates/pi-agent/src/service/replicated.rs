@@ -630,7 +630,14 @@ impl MutableReplicatedState {
         let remove = remove_listener(&self.listeners, id);
         let listeners = Arc::clone(&self.listeners);
         let inner = Arc::clone(&self.inner);
+        let closed = Arc::new(AtomicBool::new(false));
         Ok(Arc::new(move || {
+            // Idempotent like the inner remove: a second call must neither
+            // re-tombstone (the id never repeats, so the entry would leak)
+            // nor disturb a listener that reused nothing.
+            if closed.swap(true, Ordering::AcqRel) {
+                return;
+            }
             // One hold decides both halves: an already-dispatched listener
             // is removed, an undispatched hydration is tombstoned.  Split
             // holds would let a dispatch slip between the map check and the
