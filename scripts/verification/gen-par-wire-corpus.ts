@@ -7,11 +7,20 @@
  * Offline-deterministic: the upstream encoder is invoked over fixed messages;
  * outputs are hex records.
  *
- * The message declarations below intentionally mirror the pinned protocol
- * locally. Keeping those types in tracked source lets type-aware verification
- * inspect this generator without traversing the untracked reference checkout.
- * Runtime framing and encoding still come from the pinned checkout, but only
- * after its identity has been verified.
+ * The structural declarations below mirror the pinned canonical schema in
+ * `.references/pi-2.0/packages/protocol/src/schemas.ts` (SHA
+ * 853a80d26c90a14c1886f0ebb8ffaae133ca2185). They are declared here rather
+ * than imported because the reference checkout is untracked and N2 forbids
+ * static type imports into `.references`; runtime framing and encoding still
+ * come from the pinned checkout, but only after its identity has been verified.
+ *
+ * COMPATIBILITY NOTE: the current Rust product's
+ * `crates/pi/src/remote/schemas.rs` still declares wire protocol version 8 with
+ * a different ClientMessage/ServerMessage universe: a request envelope carrying
+ * `target` + `call`, a `cancel` envelope, a `response` with optional/null
+ * result, a `service_update` envelope, and an `attachment` envelope. Those
+ * v8-only shapes are absent from the pinned v1 reference and are intentionally
+ * omitted below rather than fabricated.
  *
  * Corpus shape (packages/pi-remote-protocol/tests/fixtures/par-wire-corpus.jsonl):
  *   { kind, message?, frameHex, note }
@@ -35,188 +44,212 @@ type JsonValue =
 type Identifier = string;
 type ServerId = Identifier;
 
+type ProtocolErrorCode =
+	| "version"
+	| "busy"
+	| "session_locked"
+	| "not_found"
+	| "invalid_request"
+	| "not_implemented"
+	| "internal_error";
+
 interface ProtocolError {
-	code: Identifier;
+	code: ProtocolErrorCode;
 	message: string;
+	details?: JsonValue;
 }
 
-interface ServerTarget {
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+interface ModelCost {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+}
+
+interface ModelMetadata {
+	provider: Identifier;
+	id: Identifier;
+	name: string;
+	api: Identifier;
+	reasoning: boolean;
+	input: Array<"text" | "image">;
+	contextWindow: number;
+	maxTokens: number;
+	cost: ModelCost;
+	supportedThinkingLevels: ThinkingLevel[];
+	authenticated: boolean;
+}
+
+interface SessionMetadata {
+	id: Identifier;
+	createdAt: number;
+	updatedAt?: number;
+	parentSessionId?: Identifier;
+	sessionName?: string;
+	cwd?: string;
+}
+
+interface ServerSnapshot {
 	serverId: ServerId;
+	protocolVersion: 1;
+	revision: number;
+	sessions: SessionMetadata[];
+	models: ModelMetadata[];
 }
 
-interface SessionTarget {
-	serverId: ServerId;
-	sessionId: Identifier;
-	attachmentId: Identifier;
+interface ListResult {
+	command: "list";
+	sessions: SessionMetadata[];
 }
 
-type RpcTarget = ServerTarget | SessionTarget;
+type ServerEvent =
+	| { type: "server_snapshot"; snapshot: ServerSnapshot }
+	| { type: "session_snapshot"; snapshot: ServerSnapshot }
+	| { type: "session_progress"; sessionId: Identifier; progress: JsonValue }
+	| { type: "session_removed"; sessionId: Identifier };
 
-type ClientMessage =
-	| { type: "hello"; version: number }
-	| { type: "request"; id: Identifier; target: RpcTarget; call: JsonValue }
-	| { type: "cancel"; id: Identifier; target: RpcTarget };
+interface ClientHello {
+	type: "hello";
+	version: number;
+}
 
-type ServerMessage =
-	| { type: "hello"; version: number; serverId: ServerId }
-	| { type: "hello_error"; error: ProtocolError }
-	| {
-			type: "response";
-			id: Identifier;
-			ok: true;
-			result?: JsonValue;
-	  }
-	| {
-			type: "response";
-			id: Identifier;
-			ok: false;
-			error: ProtocolError;
-	  }
-	| { type: "service_update"; subscriptionId: Identifier; update: JsonValue }
-	| { type: "attachment"; attachment: SessionTarget | null };
+type ClientMessage = ClientHello;
+
+interface ServerHello {
+	type: "hello";
+	version: 1;
+	connectionId: Identifier;
+	snapshot: ServerSnapshot;
+}
+
+interface ServerHelloError {
+	type: "hello_error";
+	error: ProtocolError;
+}
+
+interface ResponseOk {
+	type: "response";
+	id: Identifier;
+	ok: true;
+	result: ListResult;
+}
+
+interface ResponseError {
+	type: "response";
+	id: Identifier;
+	ok: false;
+	error: ProtocolError;
+}
+
+interface EventEnvelope {
+	type: "event";
+	event: ServerEvent;
+}
+
+type ServerMessage = ServerHello | ServerHelloError | ResponseOk | ResponseError | EventEnvelope;
+
+type WireMessage = ClientMessage | ServerMessage;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const upstreamRoot = join(canonicalReferenceRoot(), "packages/protocol/src");
 
-// Dynamic imports: the specifiers are only known after the canonical checkout
-// has been identity-verified, and the gate must run before any reference read.
+// Exception for ts-no-dynamic-import: the module paths are only known after
+// the canonical checkout has been identity-verified, and the gate must run
+// before any reference read. Static imports would bypass that guard and
+// hard-code an untracked path.
 assertCanonicalReference();
 const { FrameDecoder, DEFAULT_MAX_FRAME_LENGTH } = await import(join(upstreamRoot, "framing.ts"));
 const { encodeClientMessage, encodeServerMessage } = await import(join(upstreamRoot, "codec.ts"));
-const { PROTOCOL_VERSION } = await import(join(upstreamRoot, "protocol.ts"));
+const { PROTOCOL_VERSION } = await import(join(upstreamRoot, "schemas.ts"));
 
-// --- Client message witnesses (v8 ClientMessage union) ---
+// --- Client message witnesses ---
 
-const clientHello = { type: "hello" as const, version: PROTOCOL_VERSION };
+const clientHello: ClientMessage = { type: "hello", version: PROTOCOL_VERSION };
 
-/** RequestEnvelope with a session (session-fenced) target. */
-const requestEnvelope = {
-	type: "request" as const,
-	id: "req-1",
-	target: {
-		serverId: "00000000-0000-4000-8000-000000000001",
-		sessionId: "session-1",
-		attachmentId: "attach-1",
-	},
-	call: { command: "list" },
+// --- Server message witnesses ---
+
+const serverId: ServerId = "server-1";
+const connectionId: Identifier = "connection-1";
+const sessionId: Identifier = "session-1";
+
+const emptyServerSnapshot: ServerSnapshot = {
+	serverId,
+	protocolVersion: 1,
+	revision: 0,
+	sessions: [],
+	models: [],
 };
 
-/** CancelEnvelope with a serverId (server-wide) target. */
-const cancelEnvelope = {
-	type: "cancel" as const,
-	id: "req-2",
-	target: { serverId: "00000000-0000-4000-8000-000000000001" },
-};
-
-// --- Server message witnesses (v8 ServerMessage union) ---
-
-const serverHello = {
-	type: "hello" as const,
+const serverHello: ServerMessage = {
+	type: "hello",
 	version: PROTOCOL_VERSION,
-	serverId: "00000000-0000-4000-8000-000000000001",
+	connectionId,
+	snapshot: emptyServerSnapshot,
 };
 
-const serverHelloError = {
-	type: "hello_error" as const,
+const serverHelloError: ServerMessage = {
+	type: "hello_error",
 	error: { code: "version", message: "unsupported protocol version" },
 };
 
-/** ok=true with result present. */
-const responseOk = {
-	type: "response" as const,
+const responseOk: ServerMessage = {
+	type: "response",
 	id: "req-1",
-	ok: true as const,
+	ok: true,
 	result: { command: "list", sessions: [] },
 };
 
-/** ok=true with result explicit null. */
-const responseNull = {
-	type: "response" as const,
-	id: "req-4",
-	ok: true as const,
-	result: null,
-};
-
-/** ok=true with result absent (field omitted, not null). */
-const responseAbsent = {
-	type: "response" as const,
+const responseError: ServerMessage = {
+	type: "response",
 	id: "req-2",
-	ok: true as const,
-};
-
-/** ok=false with error present. */
-const responseErr = {
-	type: "response" as const,
-	id: "req-3",
-	ok: false as const,
+	ok: false,
 	error: { code: "session_locked", message: "session is locked" },
 };
 
-/** ServiceEventEnvelope: type is "service_update", not "event". */
-const serviceUpdateEnvelope = {
-	type: "service_update" as const,
-	subscriptionId: "sub-1",
-	update: { command: "list" },
-};
-
-/** AttachmentEnvelope with attachment: null (no active route). */
-const attachmentEnvelopeNull = {
-	type: "attachment" as const,
-	attachment: null,
-};
-
-/** AttachmentEnvelope with a live session target. */
-const attachmentEnvelopeSession = {
-	type: "attachment" as const,
-	attachment: {
-		serverId: "00000000-0000-4000-8000-000000000001",
-		sessionId: "session-1",
-		attachmentId: "attach-1",
-	},
+const eventEnvelope: ServerMessage = {
+	type: "event",
+	event: { type: "session_removed", sessionId },
 };
 
 // --- Row contract shared with codec test owner ---
 
 interface Row {
 	kind: string;
-	message?: unknown;
+	message?: WireMessage;
 	frameHex: string;
 	note: string;
 }
 
 /** Encodes and records a client message row. */
-function clientRow(
-	kind: string,
-	message: ClientMessage,
-	note: string,
-): Row {
+function clientRow(kind: string, message: ClientMessage, note: string): Row {
 	const frame = encodeClientMessage(message);
 	return { kind, message, frameHex: Buffer.from(frame).toString("hex"), note };
 }
 
 /** Encodes and records a server message row. */
-function serverRow(
-	kind: string,
-	message: ServerMessage,
-	note: string,
-): Row {
+function serverRow(kind: string, message: ServerMessage, note: string): Row {
 	const frame = encodeServerMessage(message);
 	return { kind, message, frameHex: Buffer.from(frame).toString("hex"), note };
 }
 
+// The corpus intentionally covers only the pinned v1 message universe.
+// The following v8-only cases from the legacy generator are incompatible with
+// the canonical reference and are therefore omitted rather than fabricated:
+//   - ClientMessage request envelope with `target` + `call`
+//   - ClientMessage cancel envelope
+//   - ServerMessage response with `ok=true` and a null or omitted result
+//   - ServerMessage service_update envelope
+//   - ServerMessage attachment envelope (null or live session route)
+
 const rows: Row[] = [
-	clientRow("client_hello", clientHello, "ClientMessage hello, protocol v8"),
-	clientRow("request", requestEnvelope, "RequestEnvelope session target, list call"),
-	clientRow("cancel", cancelEnvelope, "CancelEnvelope serverId target"),
-	serverRow("server_hello", serverHello, "ServerMessage hello, serverId, no snapshot"),
+	clientRow("client_hello", clientHello, "ClientMessage hello, protocol v1"),
+	serverRow("server_hello", serverHello, "ServerMessage hello with empty snapshot"),
 	serverRow("server_hello_error", serverHelloError, "hello_error with version code"),
-	serverRow("response_ok", responseOk, "response ok=true with result"),
-	serverRow("response_null", responseNull, "response ok=true, result null"),
-	serverRow("response_absent", responseAbsent, "response ok=true, result absent"),
-	serverRow("response_error", responseErr, "response ok=false, session_locked"),
-	serverRow("service_update", serviceUpdateEnvelope, "service_update envelope"),
-	serverRow("attachment_null", attachmentEnvelopeNull, "attachment envelope, route null"),
-	serverRow("attachment_session", attachmentEnvelopeSession, "attachment envelope, live session route"),
+	serverRow("response_ok", responseOk, "response envelope ok=true list result"),
+	serverRow("response_error", responseError, "response envelope ok=false session_locked"),
+	serverRow("event_envelope", eventEnvelope, "event envelope session_removed"),
 ];
 
 // --- Frame-bound rejection witness: declared length exceeds 16 MiB limit ---

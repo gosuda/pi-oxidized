@@ -149,6 +149,121 @@ export interface ProviderEvent {
     event: string;
     data?: unknown;
 }
+/** Full opaque handle for a provider-owned deferred response. */
+export interface ProviderDeferredHandle {
+    provider: string;
+    modelId: string;
+    api: string;
+    id: string;
+    expiresAt?: number;
+    pollAfterMs?: number;
+    data?: unknown;
+}
+/** Prepared options forwarded to a deferred provider operation.
+ *
+ * Mirrors the Rust `ProviderDeferredOptions` envelope (crates/pi-ext/src/protocol.rs):
+ * every explicitly typed option is optional, camelCase on the wire, and
+ * omitted when `None`. Unknown provider-specific extras survive unreshaped
+ * through the index signature, mirroring the Rust `#[serde(flatten)] extra`.
+ */
+export interface ProviderDeferredOptions {
+    /** One-shot polling wait. Deferred fetch always sends `0`. */
+    wait?: number;
+    apiKey?: string;
+    env?: Record<string, string>;
+    headers?: Record<string, string | null>;
+    /** Request timeout in milliseconds. */
+    timeoutMs?: number;
+    /** Maximum retry attempts. */
+    maxRetries?: number;
+    /** Maximum retry delay in milliseconds. */
+    maxRetryDelayMs?: number;
+    /** Sampling temperature. */
+    temperature?: number;
+    /** Maximum output tokens. */
+    maxTokens?: number;
+    /** Provider transport tag. */
+    transport?: string;
+    /** Prompt-cache retention tag. */
+    cacheRetention?: string;
+    /** Optional session identifier. */
+    sessionId?: string;
+    /** WebSocket connect timeout in milliseconds. */
+    websocketConnectTimeoutMs?: number;
+    /** Optional request metadata. */
+    metadata?: Record<string, unknown>;
+    [key: string]: unknown;
+}
+/** Native callbacks requested for one provider operation. */
+export interface ProviderCallbackFlags {
+    beforePayload: boolean;
+    onResponse: boolean;
+}
+/** HTTP response metadata passed to the native response callback. */
+export interface ProviderResponseWire {
+    status: number;
+    headers: Record<string, string>;
+}
+/** Correlated deferred fetch request (Rust → extension host). */
+export interface ProviderFetchDeferredRequest {
+    providerId: string;
+    model: unknown;
+    handle: ProviderDeferredHandle;
+    options: ProviderDeferredOptions;
+    callbacks: ProviderCallbackFlags;
+}
+/** Correlated deferred cancellation request (Rust → extension host). */
+export interface ProviderCancelDeferredRequest {
+    providerId: string;
+    model: unknown;
+    handle: ProviderDeferredHandle;
+    options: ProviderDeferredOptions;
+    callbacks: ProviderCallbackFlags;
+}
+/** Native payload callback request (extension host → Rust). */
+export interface ProviderBeforePayloadRequest {
+    callId: string;
+    payload: unknown;
+}
+/** Native payload callback response (Rust → extension host). */
+export interface ProviderBeforePayloadResponse {
+    payload: unknown;
+}
+/** Native response callback request (extension host → Rust). */
+export interface ProviderOnResponseRequest {
+    callId: string;
+    response: ProviderResponseWire;
+}
+/** Native response callback acknowledgment (Rust → extension host). */
+export type ProviderOnResponseResponse = Record<string, never>;
+/** Independent provider capability snapshot used by product/proxy code.
+ *
+ * Mirrors the Rust `ProviderCapabilitiesWire` representation (crates/pi-ext/src/protocol.rs):
+ * camelCase on the wire, and each field is omitted when `false`, so older
+ * hosts keep the compact snapshot shape. Absence means the capability is off.
+ */
+export interface ProviderCapabilities {
+    /** Whether the endpoint exposes ordinary `streamSimple`. */
+    streamSimple?: boolean;
+    /** Whether the endpoint exposes `fetchDeferred`. */
+    fetchDeferred?: boolean;
+    /** Whether the endpoint exposes `cancelDeferred`. */
+    cancelDeferred?: boolean;
+}
+/** Provider entry in a providers.update / registry snapshot. */
+export interface ProviderUpdateEntry {
+    name: string;
+    baseUrl?: string;
+    api?: string;
+    apiKey?: string;
+    headers?: Record<string, string>;
+    authHeader?: boolean;
+    models?: unknown[];
+    streamSimple?: boolean;
+    fetchDeferred?: boolean;
+    cancelDeferred?: boolean;
+    extensionPath?: string;
+}
 /** Key modifiers on the wire. */
 export interface KeyModifiersWire {
     shift?: boolean;

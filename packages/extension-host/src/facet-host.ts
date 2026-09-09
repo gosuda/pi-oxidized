@@ -12,8 +12,14 @@ import {
 	createFacetHost,
 	createRemoteServiceBinding,
 	createRemoteServiceEndpoint,
+	createServiceSubscribeCall,
+	createServiceUnsubscribeCall,
 	defineFacet,
 	defineService,
+	parseServiceCall,
+	parseServiceCatalogue,
+	parseServiceProviderUpdate,
+	parseServiceSubscriptionSnapshot,
 	type Context,
 	type Facet,
 	type FacetEnvironment,
@@ -37,14 +43,6 @@ import {
 	readFacetBundleManifest,
 } from "@earendil-works/chord/node";
 import { bundleFacetPackage } from "@earendil-works/chord/bundler";
-import {
-	parseServiceCall,
-	parseServiceCatalogue,
-	parseServiceProviderUpdate,
-	parseServiceSubscriptionSnapshot,
-	createServiceSubscribeCall,
-	createServiceUnsubscribeCall,
-} from "@earendil-works/chord/services/wire";
 
 export const PRESENTATION_FACET_BUNDLES_KEY = "presentationFacetBundles";
 export const PI_PLUGIN_API = "@earendil-works/pi-coding-agent/experimental/plugin";
@@ -110,13 +108,13 @@ export interface FacetHostRpc {
 
 export interface FacetHostBridgeOptions {
 	readonly rpc: FacetHostRpc;
-	readonly select(
+	readonly select: (
 		title: string,
 		items: readonly PresentationSelectItem[],
 		selectedValue: string | undefined,
 		signal: AbortSignal | undefined,
-	): Promise<string | undefined>;
-	readonly showStatus(message: string): void;
+	) => Promise<string | undefined>;
+	readonly showStatus: (message: string) => void;
 	readonly onError?: (error: Error) => void;
 }
 
