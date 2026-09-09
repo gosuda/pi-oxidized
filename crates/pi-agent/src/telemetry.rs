@@ -502,6 +502,7 @@ const EVENT_TYPES: &[&str] = &[
     "lane_created",
     "usage",
 ];
+const RESTORE_MISSING: &[&str] = &["lane configuration", "lane state"];
 
 const fn attr(
     name: &'static str,
@@ -713,6 +714,22 @@ const OP_NAVIGATION_START: &[AttrDef] = &[
         AttrType::Str,
         true,
         &["navigation"],
+        None,
+    ),
+];
+const RESTORE_START: &[AttrDef] = &[
+    attr(
+        "pi.lane.name",
+        AttrType::Str,
+        true,
+        NONE,
+        Some(Cardinality::High),
+    ),
+    attr(
+        "pi.restore.missing",
+        AttrType::Str,
+        true,
+        RESTORE_MISSING,
         None,
     ),
 ];
@@ -992,6 +1009,13 @@ const HARNESS_SPANS: &[SpanDef] = &[
         parents: ParentKind::RootOrExternal,
         start: OP_NAVIGATION_START,
         end: COMPACTION_END,
+        status_default_ok: true,
+    },
+    SpanDef {
+        name: "pi.harness.restore",
+        parents: ParentKind::RootOrExternal,
+        start: RESTORE_START,
+        end: EMPTY,
         status_default_ok: true,
     },
     SpanDef {
@@ -1599,7 +1623,7 @@ mod tests {
         assert_eq!(AI_TELEMETRY_SCHEMA.version, 1);
         assert_eq!(AI_TELEMETRY_SCHEMA.spans[0].name, "pi.ai.request");
         assert_eq!(HARNESS_TELEMETRY_SCHEMA.version, 1);
-        assert_eq!(HARNESS_TELEMETRY_SCHEMA.spans.len(), 11);
+        assert_eq!(HARNESS_TELEMETRY_SCHEMA.spans.len(), 12);
         let names: Vec<_> = HARNESS_TELEMETRY_SCHEMA
             .spans
             .iter()
@@ -1611,6 +1635,7 @@ mod tests {
                 "pi.harness.run",
                 "pi.harness.compaction",
                 "pi.harness.navigation",
+                "pi.harness.restore",
                 "pi.harness.checkpoint",
                 "pi.harness.turn",
                 "pi.harness.step",
@@ -1667,7 +1692,7 @@ mod tests {
 
     /// Expected `(name, start_attrs, end_attrs)` for each harness span.
     fn expected_harness_span_attributes()
-    -> [(&'static str, Vec<&'static str>, Vec<&'static str>); 11] {
+    -> [(&'static str, Vec<&'static str>, Vec<&'static str>); 12] {
         [
             (
                 "pi.harness.run",
@@ -1701,6 +1726,11 @@ mod tests {
                     "pi.operation.kind",
                 ],
                 vec!["pi.operation.outcome", "pi.error.code", "pi.error.type"],
+            ),
+            (
+                "pi.harness.restore",
+                vec!["pi.lane.name", "pi.restore.missing"],
+                vec![],
             ),
             (
                 "pi.harness.checkpoint",
@@ -1798,19 +1828,23 @@ mod tests {
             RUN_OUTCOMES
         );
         assert_eq!(
-            HARNESS_TELEMETRY_SCHEMA.spans[5].start[2].values,
+            HARNESS_TELEMETRY_SCHEMA.spans[6].start[2].values,
             &["assistant", "compaction", "branch_summary"]
         );
         assert_eq!(
-            HARNESS_TELEMETRY_SCHEMA.spans[5].end[0].values,
+            HARNESS_TELEMETRY_SCHEMA.spans[3].start[1].values,
+            RESTORE_MISSING
+        );
+        assert_eq!(
+            HARNESS_TELEMETRY_SCHEMA.spans[6].end[0].values,
             STEP_OUTCOMES
         );
         assert_eq!(
-            HARNESS_TELEMETRY_SCHEMA.spans[7].start[2].values,
+            HARNESS_TELEMETRY_SCHEMA.spans[8].start[2].values,
             HOOK_NAMES
         );
         assert_eq!(
-            HARNESS_TELEMETRY_SCHEMA.spans[9].start[0].values,
+            HARNESS_TELEMETRY_SCHEMA.spans[10].start[0].values,
             EVENT_TYPES
         );
     }
