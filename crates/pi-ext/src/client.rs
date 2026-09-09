@@ -1893,25 +1893,23 @@ fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
     }
 
     let call_id = if is_before {
-        let Ok(request) = from_payload::<ProviderBeforePayloadRequest>(&frame.payload) else {
-            send_callback_error(
-                shared,
-                frame.id,
-                &frame.method,
-                "malformed provider callback request",
-            );
-            return Some(true);
+        let request = match from_payload::<ProviderBeforePayloadRequest>(&frame.payload) {
+            Ok(request) => request,
+            Err(error) => {
+                let message = format!("malformed provider callback request: {error}");
+                send_callback_error(shared, frame.id, &frame.method, &message);
+                return Some(true);
+            }
         };
         request.call_id
     } else {
-        let Ok(request) = from_payload::<ProviderOnResponseRequest>(&frame.payload) else {
-            send_callback_error(
-                shared,
-                frame.id,
-                &frame.method,
-                "malformed provider callback request",
-            );
-            return Some(true);
+        let request = match from_payload::<ProviderOnResponseRequest>(&frame.payload) {
+            Ok(request) => request,
+            Err(error) => {
+                let message = format!("malformed provider callback request: {error}");
+                send_callback_error(shared, frame.id, &frame.method, &message);
+                return Some(true);
+            }
         };
         request.call_id
     };
@@ -1974,10 +1972,21 @@ fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
             return Some(true);
         };
         shared.runtime.spawn(async move {
-            let Ok(mut request) = serde_json::from_value::<ProviderBeforePayloadRequest>(payload)
-            else {
-                return;
-            };
+            let mut request =
+                match serde_json::from_value::<ProviderBeforePayloadRequest>(payload) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let message = format!("malformed provider callback request: {error}");
+                        let _ = outbound
+                            .send(callback_error_frame(
+                                callback_frame_id,
+                                &callback_method,
+                                &message,
+                            ))
+                            .await;
+                        return;
+                    }
+                };
             if !callback_scope_live(&pending, origin_id, scope_generation) {
                 let _ = outbound
                     .send(callback_error_frame(
@@ -2021,8 +2030,19 @@ fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
             return Some(true);
         };
         shared.runtime.spawn(async move {
-            let Ok(request) = serde_json::from_value::<ProviderOnResponseRequest>(payload) else {
-                return;
+            let request = match serde_json::from_value::<ProviderOnResponseRequest>(payload) {
+                Ok(request) => request,
+                Err(error) => {
+                    let message = format!("malformed provider callback request: {error}");
+                    let _ = outbound
+                        .send(callback_error_frame(
+                            callback_frame_id,
+                            &callback_method,
+                            &message,
+                        ))
+                        .await;
+                    return;
+                }
             };
             let response = ProviderResponse {
                 status: request.response.status,
@@ -4637,6 +4657,64 @@ mod tests {
             .map_err(|_| "callback task never answered the host")?
             .ok_or("host stream closed")?;
         Ok(frame)
+    }
+
+    #[tokio::test]
+    async fn malformed_before_payload_callback_gets_correlated_error() -> R {
+        let (client, mut host) = make_pair().await;
+        let frame = Frame {
+            id: 9200,
+            kind: FrameKind::Req,
+            method: PROVIDER_BEFORE_PAYLOAD_METHOD.to_owned(),
+            payload: serde_json::json!({ "callId": "9001" }),
+        };
+
+        assert_eq!(
+            dispatch_provider_callback(&client.shared, &frame),
+            Some(true)
+        );
+
+        let error = callback_answer(&mut host).await?;
+        assert_eq!(error.kind, FrameKind::Error);
+        assert_eq!(error.id, 9200);
+        assert_eq!(error.method, PROVIDER_BEFORE_PAYLOAD_METHOD);
+        let message = error.payload["message"]
+            .as_str()
+            .ok_or("callback error message missing")?;
+        assert!(
+            message.contains("missing field `payload`"),
+            "expected serde detail in callback error, got {message:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_on_response_callback_gets_correlated_error() -> R {
+        let (client, mut host) = make_pair().await;
+        let frame = Frame {
+            id: 9201,
+            kind: FrameKind::Req,
+            method: PROVIDER_ON_RESPONSE_METHOD.to_owned(),
+            payload: serde_json::json!({ "callId": "9001" }),
+        };
+
+        assert_eq!(
+            dispatch_provider_callback(&client.shared, &frame),
+            Some(true)
+        );
+
+        let error = callback_answer(&mut host).await?;
+        assert_eq!(error.kind, FrameKind::Error);
+        assert_eq!(error.id, 9201);
+        assert_eq!(error.method, PROVIDER_ON_RESPONSE_METHOD);
+        let message = error.payload["message"]
+            .as_str()
+            .ok_or("callback error message missing")?;
+        assert!(
+            message.contains("missing field `response`"),
+            "expected serde detail in callback error, got {message:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
