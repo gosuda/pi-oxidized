@@ -245,6 +245,7 @@ impl ModelsService {
                     ModelIdentity {
                         provider: selected.provider.clone(),
                         model_id: selected.id.clone(),
+                        api: Some(selected.api.clone()),
                     },
                     &context,
                 )

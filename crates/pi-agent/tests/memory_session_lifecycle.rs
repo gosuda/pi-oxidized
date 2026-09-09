@@ -96,6 +96,7 @@ async fn seed_fork_fixture(repo: &MemorySessionRepo, cx: &Context) -> ForkFixtur
         model: ModelIdentity {
             provider: "provider".to_owned(),
             model_id: "model".to_owned(),
+            api: None,
         },
         thinking_level: pi_agent::pi_ai::ModelThinkingLevel::Off,
         active_tool_names: vec!["tool".to_owned()],

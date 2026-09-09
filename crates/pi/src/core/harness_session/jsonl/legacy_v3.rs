@@ -486,6 +486,7 @@ fn selected_configuration(
                     model = Some(ModelIdentity {
                         provider: provider.to_owned(),
                         model_id: model_id.to_owned(),
+                        api: None,
                     });
                 }
             }

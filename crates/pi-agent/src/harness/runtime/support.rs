@@ -234,6 +234,7 @@ pub(crate) fn captured_configuration(config: &RuntimeConfig) -> LaneConfiguratio
         model: ModelIdentity {
             provider: config.model.provider.clone(),
             model_id: config.model.id.clone(),
+            api: Some(config.model.api.clone()),
         },
         thinking_level: config.thinking_level,
         active_tool_names: config.active_tool_names.clone(),

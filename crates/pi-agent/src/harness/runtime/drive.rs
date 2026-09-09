@@ -853,7 +853,7 @@ async fn generation(
         controller,
         cx,
     };
-    let (scope, context, attempt) = match &operation.state {
+    let (scope, mut context, attempt) = match &operation.state {
         OperationState::AssistantReady {
             scope,
             generation_context,
@@ -865,6 +865,7 @@ async fn generation(
         AssistantModel::Ready(model) => model,
         AssistantModel::Settled(record) => return Ok(DriveStep::Settled(record)),
     };
+    context.configuration.model.api = Some(model.api.clone());
     let tools = configured_tools(lane, &context.configuration.active_tool_names).await?;
     let branch = lane.branch(cx).await?;
     let entries = branch_entries(branch.as_ref(), cx)
@@ -1813,20 +1814,52 @@ async fn deferred_handle(
         .ok_or_else(|| invariant("deferred source entry has no handle"))
 }
 
+/// Synthesize the aborted assistant message a no-frame recovery commits,
+/// resolving the API from the identity captured on the operation. Returns
+/// `None` when that model is no longer registered; the caller then settles
+/// the operation as a durable `model_unavailable` failure.
+fn synthesize_interrupted_assistant(
+    lane: &LaneRuntime,
+    generation_context: &GenerationContext,
+) -> Option<pi_ai::AssistantMessage> {
+    let config = &generation_context.configuration;
+    let api = if let Some(api) = config.model.api.as_ref() {
+        api.clone()
+    } else {
+        let model = lane
+            .owner
+            .models
+            .get_model(&config.model.provider, &config.model.model_id)?;
+        model.api
+    };
+    let mut message = pi_ai::AssistantMessage::new(
+        api,
+        config.model.provider.as_str(),
+        config.model.model_id.as_str(),
+        crate::message::now_millis(),
+    );
+    message.stop_reason = pi_ai::StopReason::Aborted;
+    message.error_message = Some("assistant response interrupted before completion".to_owned());
+    Some(message)
+}
+
 async fn recover_assistant_effect(
     lane: &LaneRuntime,
     operation: &Operation,
     _controller: &DriveController,
     cx: &Context,
 ) -> Result<DriveStep, HarnessError> {
-    let (response_id, usage_id) = match &operation.state {
-        OperationState::AssistantEffectPending {
-            response_entry_id,
-            usage_id,
-            ..
-        } => (response_entry_id.clone(), usage_id.clone()),
-        _ => return Err(invariant("assistant recovery received another state")),
+    let OperationState::AssistantEffectPending {
+        response_entry_id,
+        usage_id,
+        generation_context,
+        ..
+    } = &operation.state
+    else {
+        return Err(invariant("assistant recovery received another state"));
     };
+    let response_id = response_entry_id.clone();
+    let usage_id = usage_id.clone();
     let frames = lane
         .owner
         .session
@@ -1838,22 +1871,25 @@ async fn recover_assistant_effect(
         .await
         .map_err(map_session_error)?;
     let partial = if frames.is_empty() {
-        let config = lane.data.lock().await.config.clone();
-        let model = lane
-            .owner
-            .models
-            .get_model(&config.model.provider, &config.model.model_id)
-            .ok_or_else(|| HarnessError::Closed {
-                message: "recovery model is unavailable".to_owned(),
-            })?;
-        let mut message = pi_ai::AssistantMessage::new(
-            model.api.clone(),
-            model.provider.clone(),
-            model.id.clone(),
-            crate::message::now_millis(),
-        );
-        message.stop_reason = pi_ai::StopReason::Aborted;
-        message.error_message = Some("assistant response interrupted before completion".to_owned());
+        let Some(message) = synthesize_interrupted_assistant(lane, generation_context) else {
+            let config = &generation_context.configuration;
+            let record = settle(
+                lane,
+                operation,
+                TerminalStatus::Failed,
+                Some(OperationError {
+                    code: "model_unavailable".to_owned(),
+                    message: format!(
+                        "configured model {}/{} is unavailable",
+                        config.model.provider, config.model.model_id
+                    ),
+                    details: None,
+                }),
+                cx,
+            )
+            .await?;
+            return Ok(DriveStep::Settled(record));
+        };
         message
     } else {
         let frames = frames
@@ -3566,6 +3602,7 @@ async fn settle(
     ];
     writes.extend(cleanup);
     lane.commit(writes, cx).await?;
+    data.state = state;
     data.operation = None;
     data.last_result = Some(record.clone());
     let payload = match record.kind {
@@ -4456,6 +4493,23 @@ mod tests {
     use serde_json::Map;
 
     use super::*;
+    use crate::harness::api::{
+        AcquireLaneOptions, AgentHarnessBuilder, AgentHarnessOptions, HarnessModels,
+        HarnessResources, PromptInput,
+    };
+    use crate::harness::result::RunOutcome;
+    use crate::message::user_text;
+    use crate::queue::QueueMode;
+    use crate::session::configuration::CompactionSettings;
+    use crate::session::lane_state::{LaneConfiguration, ModelIdentity};
+    use crate::session::operation::{NormalizedRetryPolicy, OperationMeta, RunSettings};
+    use crate::session::{
+        set_value, Entry, MemoryStorage, Session, SessionMetadata, StorageBackedSession,
+        UuidV7Generator,
+    };
+    use futures::stream::{self, BoxStream, StreamExt as FuturesStreamExt};
+    use std::collections::{BTreeMap, HashMap};
+    use std::error::Error;
 
     fn tool_call() -> pi_ai::ToolCall {
         pi_ai::ToolCall::new("call-1", "failing_tool", Map::new())
@@ -4497,6 +4551,492 @@ mod tests {
 
         assert!(!staged.is_error);
         assert!(!native_tool_result(&tool_call(), &staged, false).is_error);
+        Ok(())
+    }
+
+    fn fixture_model() -> pi_ai::Model {
+        pi_ai::Model {
+            id: "fixture-model".to_owned(),
+            name: "Fixture model".to_owned(),
+            api: "fixture-api".to_owned(),
+            provider: "fixture-provider".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: Vec::new(),
+            cost: pi_ai::ModelCost::default(),
+            context_window: 8192,
+            max_tokens: 1024,
+            headers: None,
+            compat: None,
+            extra: BTreeMap::default(),
+        }
+    }
+
+    fn alternate_model() -> pi_ai::Model {
+        pi_ai::Model {
+            id: "current-model".to_owned(),
+            name: "Current model".to_owned(),
+            api: "current-api".to_owned(),
+            provider: "current-provider".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: Vec::new(),
+            cost: pi_ai::ModelCost::default(),
+            context_window: 8192,
+            max_tokens: 1024,
+            headers: None,
+            compat: None,
+            extra: BTreeMap::default(),
+        }
+    }
+
+    fn new_session(name: &str) -> Arc<StorageBackedSession> {
+        StorageBackedSession::new(
+            SessionMetadata {
+                id: name.to_owned(),
+                created_at: 1,
+                storage_version: MemoryStorage::STORAGE_VERSION,
+                cwd: None,
+                parent_session_id: None,
+                legacy_parent_session_path: None,
+            },
+            Arc::new(MemoryStorage::new()),
+            Arc::new(UuidV7Generator::new()),
+            None,
+        )
+    }
+
+    struct AssistantEffectSeed {
+        lane_name: LaneName,
+        operation_id: OperationId,
+        prompt_entry_id: EntryId,
+        response_entry_id: EntryId,
+        usage_id: UsageId,
+        model_identity: ModelIdentity,
+    }
+
+    async fn seed_assistant_effect(
+        session: &Arc<StorageBackedSession>,
+        seed: AssistantEffectSeed,
+        cx: &Context,
+    ) -> Result<(), Box<dyn Error>> {
+        let AssistantEffectSeed {
+            lane_name,
+            operation_id,
+            prompt_entry_id,
+            response_entry_id,
+            usage_id,
+            model_identity,
+        } = seed;
+        session.create_branch(&lane_name, None, cx).await?;
+        let mutator = session.begin_mutation(cx).await?;
+        let lane_config = LaneConfiguration {
+            model: model_identity,
+            thinking_level: pi_ai::ModelThinkingLevel::Off,
+            active_tool_names: Vec::new(),
+        };
+        let lane_state = LaneState {
+            current_operation_id: Some(operation_id.clone()),
+            ..LaneState::default()
+        };
+        let tip = Some(prompt_entry_id.clone());
+        let operation_meta = OperationMeta {
+            operation_id: operation_id.clone(),
+            lane: lane_name.clone(),
+            source_tip_id: None,
+            started_at: 1,
+            intent: OperationIntent::Run {
+                prompt_entry_ids: vec![prompt_entry_id.clone()],
+            },
+        };
+        let scope = OperationScope {
+            control: Control::Running,
+            settings: RunSettings {
+                compaction: CompactionSettings::default(),
+                steering_mode: QueueMode::All,
+                follow_up_mode: QueueMode::All,
+                tool_execution: ToolExecutionMode::default(),
+            },
+            latest_assistant_entry_id: None,
+        };
+        let generation_context = GenerationContext {
+            step_id: "step-1".to_owned(),
+            trigger_entry_id: prompt_entry_id.clone(),
+            configuration: lane_config.clone(),
+            stream_options: HarnessStreamOptions::default(),
+            retry_policy: NormalizedRetryPolicy {
+                max_attempts: 1,
+                base_delay_ms: 0,
+            },
+            overflow_recovery_used: false,
+        };
+        let operation_state = OperationState::AssistantEffectPending {
+            scope,
+            generation_context,
+            attempt: 1,
+            response_entry_id,
+            usage_id,
+            intended_output_limit: 1024,
+            context_window: 8192,
+        };
+        let writes = vec![
+            set_value(
+                &crate::session::address::lane_config(&lane_name),
+                &lane_config,
+            )?,
+            set_value(
+                &crate::session::address::lane_state(&lane_name),
+                &lane_state,
+            )?,
+            set_value(
+                &crate::session::address::branch_tip(lane_name.as_str()),
+                &tip,
+            )?,
+            entry_write(
+                prompt_entry_id,
+                None,
+                user_text("hello", Vec::<pi_ai::ImageContent>::new()),
+                false,
+            ),
+            set_value(
+                &crate::session::address::operation_meta(&operation_id),
+                &operation_meta,
+            )?,
+            set_value(
+                &crate::session::address::operation_state(&operation_id),
+                &operation_state,
+            )?,
+        ];
+        mutator.commit(writes, cx).await?;
+        Ok(())
+    }
+
+    struct StopModels {
+        model: pi_ai::Model,
+    }
+
+    impl pi_ai::Provider for StopModels {
+        fn stream(
+            &self,
+            _model: &pi_ai::Model,
+            _context: pi_ai::Context,
+            _options: pi_ai::StreamOptions,
+        ) -> BoxStream<'static, Result<pi_ai::AssistantMessageEvent, pi_ai::ProviderError>> {
+            let mut message = pi_ai::AssistantMessage::new(
+                self.model.api.clone(),
+                self.model.provider.clone(),
+                self.model.id.clone(),
+                1,
+            );
+            message
+                .content
+                .push(pi_ai::AssistantContent::Text(pi_ai::TextContent::new("done")));
+            message.stop_reason = pi_ai::StopReason::Stop;
+            stream::iter(vec![Ok(pi_ai::AssistantMessageEvent::Start {
+                partial: Arc::new(message.clone()),
+            })])
+            .chain(stream::once(async move {
+                Ok(pi_ai::AssistantMessageEvent::Done {
+                    reason: pi_ai::DoneReason::Stop,
+                    message,
+                })
+            }))
+            .boxed()
+        }
+    }
+
+    impl HarnessModels for StopModels {
+        fn get_model(&self, provider: &str, model_id: &str) -> Option<pi_ai::Model> {
+            (self.model.provider == provider && self.model.id == model_id)
+                .then(|| self.model.clone())
+        }
+    }
+
+    struct MissingModels;
+
+    impl pi_ai::Provider for MissingModels {
+        fn stream(
+            &self,
+            _model: &pi_ai::Model,
+            _context: pi_ai::Context,
+            _options: pi_ai::StreamOptions,
+        ) -> BoxStream<'static, Result<pi_ai::AssistantMessageEvent, pi_ai::ProviderError>> {
+            stream::empty().boxed()
+        }
+    }
+
+    impl HarnessModels for MissingModels {
+        fn get_model(&self, _provider: &str, _model_id: &str) -> Option<pi_ai::Model> {
+            None
+        }
+    }
+
+    async fn recover_assistant_effect_test(
+        session: Arc<StorageBackedSession>,
+        lane_name: LaneName,
+        operation_id: OperationId,
+        models: Arc<dyn HarnessModels>,
+        model: pi_ai::Model,
+        cx: &Context,
+    ) -> Result<(OperationResultRecord, Option<pi_ai::AssistantMessage>), Box<dyn Error>> {
+        let (harness, _) = AgentHarnessBuilder::create(
+            AgentHarnessOptions {
+                session: session.clone(),
+                models,
+                model,
+                thinking_level: None,
+                active_tool_names: None,
+                tools: Vec::new(),
+                tool_context: None,
+                system_prompt: None,
+                resources: HarnessResources::default(),
+                stream_options: HarnessStreamOptions::default(),
+                retry: None,
+                compaction: None,
+                steering_mode: None,
+                follow_up_mode: None,
+                tool_execution: ToolExecutionMode::default(),
+                to_provider_messages: None,
+                entry_projectors: HashMap::new(),
+            },
+            cx,
+        )
+        .await?;
+        let lane = harness
+            .lane(&lane_name, AcquireLaneOptions::default(), cx)
+            .await?;
+        let outcome = lane
+            .drive(
+                DriveOptions {
+                    operation_id,
+                    wait_for_retry: true,
+                    poll_deferred: false,
+                },
+                cx,
+            )
+            .await?;
+        let DriveOutcome::Settled(record) = outcome else {
+            return Err("expected settled outcome".into());
+        };
+        let assistant = if record.status == TerminalStatus::Aborted {
+            let Some(response_id) = record.tip_id.as_ref() else {
+                return Err("aborted recovery did not publish an assistant entry".into());
+            };
+            let Some(Entry::Message { message, .. }) =
+                session.get_entry(response_id, cx).await?
+            else {
+                return Err("assistant entry not found".into());
+            };
+            let AgentMessage::Llm(llm) = message else {
+                return Err("expected LLM message".into());
+            };
+            let pi_ai::Message::Assistant(assistant) = llm.as_ref() else {
+                return Err("expected assistant message".into());
+            };
+            Some(assistant.as_ref().clone())
+        } else {
+            None
+        };
+        harness.close(cx).await?;
+        Ok((record, assistant))
+    }
+
+    /// N14 regression: recovery with no persisted frames must use the model
+    /// identity captured on the operation, not the lane's current model.
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_uses_captured_model_identity_for_no_frame_tombstone(
+    ) -> Result<(), Box<dyn Error>> {
+        let cx = Context::background();
+        let session = new_session("no-frame-recovery");
+        let lane_name = LaneName::from("main");
+        let operation_id = OperationId::from("n14-op");
+        let original_model = fixture_model();
+        seed_assistant_effect(
+            &session,
+            AssistantEffectSeed {
+                lane_name: lane_name.clone(),
+                operation_id: operation_id.clone(),
+                prompt_entry_id: EntryId::new("n14-user"),
+                response_entry_id: EntryId::new("n14-response"),
+                usage_id: UsageId::new("n14-usage"),
+                model_identity: ModelIdentity {
+                    provider: original_model.provider.clone(),
+                    model_id: original_model.id.clone(),
+                    api: Some(original_model.api.clone()),
+                },
+            },
+            &cx,
+        )
+        .await?;
+        let (record, assistant) = recover_assistant_effect_test(
+            session,
+            lane_name,
+            operation_id,
+            Arc::new(MissingModels),
+            alternate_model(),
+            &cx,
+        )
+        .await?;
+        assert_eq!(record.status, TerminalStatus::Aborted);
+        let assistant = assistant.ok_or("captured-api recovery did not publish an assistant entry")?;
+        assert_eq!(assistant.provider, original_model.provider);
+        assert_eq!(assistant.model, original_model.id);
+        assert_eq!(assistant.api, original_model.api);
+
+        Ok(())
+    }
+
+    /// Records written before API capture omitted the optional field; recovery
+    /// must still decode them and use the captured provider/model lookup.
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_decodes_old_model_identity_without_api() -> Result<(), Box<dyn Error>> {
+        let cx = Context::background();
+        let session = new_session("old-no-api-recovery");
+        let lane_name = LaneName::from("main");
+        let operation_id = OperationId::from("old-n14-op");
+        let original_model = fixture_model();
+        seed_assistant_effect(
+            &session,
+            AssistantEffectSeed {
+                lane_name: lane_name.clone(),
+                operation_id: operation_id.clone(),
+                prompt_entry_id: EntryId::new("old-n14-user"),
+                response_entry_id: EntryId::new("old-n14-response"),
+                usage_id: UsageId::new("old-n14-usage"),
+                model_identity: ModelIdentity {
+                    provider: original_model.provider.clone(),
+                    model_id: original_model.id.clone(),
+                    api: None,
+                },
+            },
+            &cx,
+        )
+        .await?;
+        let (record, assistant) = recover_assistant_effect_test(
+            session,
+            lane_name,
+            operation_id,
+            Arc::new(StopModels {
+                model: original_model.clone(),
+            }),
+            alternate_model(),
+            &cx,
+        )
+        .await?;
+        assert_eq!(record.status, TerminalStatus::Aborted);
+        let assistant = assistant.ok_or("old-record recovery did not publish an assistant entry")?;
+        assert_eq!(assistant.provider, original_model.provider);
+        assert_eq!(assistant.model, original_model.id);
+        assert_eq!(assistant.api, original_model.api);
+        Ok(())
+    }
+
+    /// An old record with no captured API and no resolvable model must still
+    /// close recovery as a durable failure instead of remaining open.
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_record_with_missing_model_settles_failed() -> Result<(), Box<dyn Error>> {
+        let cx = Context::background();
+        let session = new_session("old-missing-model");
+        let lane_name = LaneName::from("main");
+        let operation_id = OperationId::from("old-missing-op");
+        let original_model = fixture_model();
+        seed_assistant_effect(
+            &session,
+            AssistantEffectSeed {
+                lane_name: lane_name.clone(),
+                operation_id: operation_id.clone(),
+                prompt_entry_id: EntryId::new("old-missing-user"),
+                response_entry_id: EntryId::new("old-missing-response"),
+                usage_id: UsageId::new("old-missing-usage"),
+                model_identity: ModelIdentity {
+                    provider: original_model.provider.clone(),
+                    model_id: original_model.id.clone(),
+                    api: None,
+                },
+            },
+            &cx,
+        )
+        .await?;
+        let (record, assistant) = recover_assistant_effect_test(
+            session,
+            lane_name,
+            operation_id,
+            Arc::new(MissingModels),
+            alternate_model(),
+            &cx,
+        )
+        .await?;
+        assert_eq!(record.status, TerminalStatus::Failed);
+        assert_eq!(
+            record.error.as_ref().map(|error| error.code.as_str()),
+            Some("model_unavailable")
+        );
+        assert!(assistant.is_none());
+        Ok(())
+    }
+
+    /// N20 regression: a lane whose first operation settled must be able to
+    /// accept and drive a second operation using the same runtime lane.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lane_accepts_second_operation_after_first_settles() -> Result<(), Box<dyn Error>> {
+        let cx = Context::background();
+        let session = new_session("second-admission");
+        let model = fixture_model();
+        let models = Arc::new(StopModels {
+            model: model.clone(),
+        });
+        let (harness, _) = AgentHarnessBuilder::create(
+            AgentHarnessOptions {
+                session,
+                models,
+                model,
+                thinking_level: None,
+                active_tool_names: None,
+                tools: Vec::new(),
+                tool_context: None,
+                system_prompt: None,
+                resources: HarnessResources::default(),
+                stream_options: HarnessStreamOptions::default(),
+                retry: None,
+                compaction: None,
+                steering_mode: None,
+                follow_up_mode: None,
+                tool_execution: ToolExecutionMode::default(),
+                to_provider_messages: None,
+                entry_projectors: HashMap::new(),
+            },
+            &cx,
+        )
+        .await?;
+        let lane = harness
+            .lane(&LaneName::from("main"), AcquireLaneOptions::default(), &cx)
+            .await?;
+
+        let first = lane
+            .prompt(
+                PromptInput::Text {
+                    text: "first".to_owned(),
+                    images: Vec::new(),
+                },
+                &cx,
+            )
+            .await?;
+        assert!(matches!(first, RunOutcome::Settled(_)));
+
+        let second = lane
+            .prompt(
+                PromptInput::Text {
+                    text: "second".to_owned(),
+                    images: Vec::new(),
+                },
+                &cx,
+            )
+            .await?;
+        assert!(matches!(second, RunOutcome::Settled(_)));
+
+        harness.close(&cx).await?;
         Ok(())
     }
 }

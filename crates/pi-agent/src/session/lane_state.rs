@@ -11,6 +11,11 @@ pub struct ModelIdentity {
     /// Provider-scoped model identifier.
     #[serde(rename = "modelId")]
     pub model_id: String,
+    /// API shape used for the request, when captured by a newer operation.
+    ///
+    /// `None` is retained for records written before API capture was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
 }
 
 /// Lane settings captured at reservation time so a resumed step replays under
