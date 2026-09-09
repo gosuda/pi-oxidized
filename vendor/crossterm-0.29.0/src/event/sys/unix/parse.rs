@@ -274,8 +274,14 @@ pub(crate) fn parse_csi_cursor_position(buffer: &[u8]) -> io::Result<Option<Inte
 
     let mut split = s.split(';');
 
-    let y = next_parsed::<u16>(&mut split)? - 1;
-    let x = next_parsed::<u16>(&mut split)? - 1;
+    // Vendored patch: a zero coordinate is a protocol violation (coordinates
+    // start from 1); reject it instead of underflowing.
+    let y = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
+    let x = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
 
     Ok(Some(InternalEvent::CursorPosition(x, y)))
 }
@@ -1036,6 +1042,15 @@ mod tests {
             parse_csi_cursor_position(b"\x1B[20;10R").unwrap(),
             Some(InternalEvent::CursorPosition(9, 19))
         );
+    }
+
+    // Vendored patch: zero coordinates are rejected as a protocol violation
+    // instead of underflowing.
+    #[test]
+    fn test_parse_csi_cursor_position_zero_coordinates() {
+        assert!(parse_csi_cursor_position(b"\x1B[0;0R").is_err());
+        assert!(parse_csi_cursor_position(b"\x1B[0;10R").is_err());
+        assert!(parse_csi_cursor_position(b"\x1B[20;0R").is_err());
     }
 
     #[test]

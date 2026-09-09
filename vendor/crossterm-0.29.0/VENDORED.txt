@@ -92,7 +92,12 @@ crossterm behavior are untouched. Files changed against upstream 0.29.0:
   src/event/sys/unix/parse.rs cell-size reply recognition: `CSI 4 ; h ; w t`
                               and `CSI 6 ; h ; w t` push a typed reply to
                               the sink and return ReplyConsumed instead of
-                              being dropped as unparsable key codes.
+                              being dropped as unparsable key codes; and
+                              cursor-position parsing (`CSI Cy ; Cx R`)
+                              rejects a zero coordinate as a protocol
+                              violation (could_not_parse_event_error)
+                              instead of underflowing to 65535/panicking
+                              on malformed replies like `CSI 0;0R`.
   src/event/source/unix/mio.rs   Uses the shared parser. try_read honors the
                               candidate deadline inside any caller wait,
                               surfaces the protocol error, and returns
