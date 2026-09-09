@@ -219,6 +219,7 @@ impl RemoteServiceFacade {
                 slot.hydrate(*sequence, ops, context)?;
             }
         }
+        self.inner.active.store(true, Ordering::Release);
         Ok(())
     }
 

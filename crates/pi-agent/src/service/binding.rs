@@ -561,7 +561,11 @@ async fn start_singleton(
         .facade
         .install(&snapshot.instances[0], &Context::background())
     {
-        subscription.close(Context::background()).await?;
+        binding.facade.deactivate();
+        if let Err(cleanup_error) = subscription.close(Context::background()).await {
+            *lock(&binding.subscription) = Some(Arc::clone(&subscription));
+            lifecycle.report(cleanup_error);
+        }
         return Err(error);
     }
     *lock(&binding.subscription) = Some(Arc::clone(&subscription));
