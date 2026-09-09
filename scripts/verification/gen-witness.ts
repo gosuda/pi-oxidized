@@ -356,6 +356,83 @@ export const NEW_SURFACES: readonly FrameSpec[] = [
 		payload: { type: "message_update_delta", event: { type: "text_delta", delta: "hi" } },
 	},
 	{ id: 50, kind: "res", method: "message_update_delta", payload: {} },
+	// provider.fetchDeferred / provider.cancelDeferred (protocol.rs): deferred
+	// requests carry a fully serialized Model, handle, prepared options, and
+	// callback flags. The terminal fetch value is open JSON; cancellation
+	// acknowledges with an empty object.
+	{
+		id: 51,
+		kind: "req",
+		method: "provider.fetchDeferred",
+		payload: {
+			providerId: "callbackProv",
+			model: {
+				id: "m",
+				name: "m",
+				api: "openai",
+				provider: "test",
+				baseUrl: "",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1,
+				maxTokens: 1,
+			},
+			handle: { provider: "test", modelId: "m", api: "openai", id: "h1" },
+			options: { wait: 0, testPayload: { original: true } },
+			callbacks: { beforePayload: true, onResponse: true },
+		},
+	},
+	{ id: 51, kind: "res", method: "provider.fetchDeferred", payload: {} },
+	{
+		id: 52,
+		kind: "req",
+		method: "provider.cancelDeferred",
+		payload: {
+			providerId: "callbackProv",
+			model: {
+				id: "m",
+				name: "m",
+				api: "openai",
+				provider: "test",
+				baseUrl: "",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1,
+				maxTokens: 1,
+			},
+			handle: { provider: "test", modelId: "m", api: "openai", id: "h1" },
+			options: { testPayload: { original: true } },
+			callbacks: { beforePayload: true, onResponse: true },
+		},
+	},
+	{ id: 52, kind: "res", method: "provider.cancelDeferred", payload: {} },
+	// Provider callback methods use independent request/response frames. The
+	// call id is the originating deferred operation's frame id as a string.
+	{
+		id: 53,
+		kind: "req",
+		method: "provider.beforePayload",
+		payload: { callId: "51", payload: { original: true } },
+	},
+	{
+		id: 53,
+		kind: "res",
+		method: "provider.beforePayload",
+		payload: { payload: { mutated: true } },
+	},
+	{
+		id: 54,
+		kind: "req",
+		method: "provider.onResponse",
+		payload: {
+			callId: "51",
+			response: { status: 200, headers: { "content-type": "application/json" } },
+		},
+	},
+	{ id: 54, kind: "res", method: "provider.onResponse", payload: {} },
+
 ];
 
 // ---------------------------------------------------------------------------
@@ -375,7 +452,7 @@ const LIFECYCLE_RES_REPS: readonly string[] = [
 const LIFECYCLE_ERROR_REP = "message_update";
 
 /** First id of the 35 lifecycle req frames (after the last gap-surface id). */
-const FIRST_LIFECYCLE_ID = 51;
+const FIRST_LIFECYCLE_ID = 55;
 
 function lifecycleFrames(lifecycle: readonly string[]): readonly FrameSpec[] {
 	const frames: FrameSpec[] = [];
