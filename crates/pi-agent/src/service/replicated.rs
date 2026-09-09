@@ -526,7 +526,9 @@ impl MutableReplicatedState {
             } else if inner.draining_thread == Some(current_thread) {
                 DispatchRoute::Inline(publication)
             } else {
-                inner.pending.push_back(PendingDispatch::Publication(publication));
+                inner
+                    .pending
+                    .push_back(PendingDispatch::Publication(publication));
                 DispatchRoute::Queued
             }
         };
@@ -588,7 +590,9 @@ impl MutableReplicatedState {
             } else if inner.draining_thread == Some(current_thread) {
                 DispatchRoute::Inline(hydration)
             } else {
-                inner.pending.push_back(PendingDispatch::Hydration(hydration));
+                inner
+                    .pending
+                    .push_back(PendingDispatch::Hydration(hydration));
                 DispatchRoute::Queued
             }
         };
@@ -692,9 +696,7 @@ fn dispatch_publication(
     panic_payload
 }
 
-fn dispatch_hydration(
-    hydration: &PendingHydration,
-) -> Option<Box<dyn std::any::Any + Send>> {
+fn dispatch_hydration(hydration: &PendingHydration) -> Option<Box<dyn std::any::Any + Send>> {
     let listener = Arc::clone(&hydration.listener);
     let value = Arc::clone(&hydration.value);
     let context = hydration.context.clone();
