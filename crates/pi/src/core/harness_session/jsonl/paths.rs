@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use pi_agent::session::{SessionError, StorageErrorCode, StorageFailure};
-use percent_encoding::percent_encode_byte;
+use percent_encoding::{percent_decode_str, percent_encode_byte};
 
 use crate::core::sessions::{encode_cwd_for_session_dir, entries::iso_from_millis};
 
@@ -215,14 +215,13 @@ pub(super) async fn discard_session_file(path: &Path) -> Result<(), SessionError
 /// `root`'s encoded `cwd` directory.
 ///
 /// `JsonlSessionMetadata.path` is caller-supplied (the record is
-/// deserializable), so both the candidate file and the expected directory are
-/// canonicalized before comparison: `..` segments and symlinks cannot smuggle
-/// a foreign file past the check. The file must sit directly inside the
-/// directory and carry the session id in its `_<id>.jsonl` name suffix — raw
-/// or percent-encoded, because legacy files embed the id unencoded. The
-/// timestamp prefix is deliberately not compared: a legacy header can
-/// normalize to a creation time that does not reproduce the original file
-/// name.
+/// deserializable), so the root, candidate file, and expected directory are
+/// canonicalized before comparison. The directory must remain the root's
+/// expected direct child, and the file must sit directly inside that directory.
+/// The complete id after the first underscore must match, raw for legacy files
+/// or percent-encoded. The timestamp prefix is deliberately not compared: a
+/// legacy header can normalize to a creation time that does not reproduce the
+/// original file name.
 pub(super) async fn verify_owned_session_path(
     root: &Path,
     cwd: &str,
@@ -230,10 +229,8 @@ pub(super) async fn verify_owned_session_path(
     path: &Path,
 ) -> Result<(), SessionError> {
     let directory = root.join(session_directory_name(cwd));
-    let suffixes = [
-        format!("_{}.jsonl", encode_session_id(id)),
-        format!("_{id}.jsonl"),
-    ];
+    let root = root.to_path_buf();
+    let id = id.to_owned();
     let path = path.to_path_buf();
     let path_for_error = path.clone();
     let path_for_worker_error = path.clone();
@@ -250,12 +247,26 @@ pub(super) async fn verify_owned_session_path(
                 return Err(io_failure(&path_for_error, "failed to resolve session path", source));
             }
         };
-        let owned = fs::canonicalize(&directory).ok().is_some_and(|canonical_dir| {
-            canonical_file.parent() == Some(canonical_dir.as_path())
-                && canonical_file.file_name().is_some_and(|name| {
-                    let name = name.to_string_lossy();
-                    suffixes.iter().any(|suffix| name.ends_with(suffix.as_str()))
-                })
+        let owned = fs::canonicalize(&root).ok().is_some_and(|canonical_root| {
+            fs::canonicalize(&directory).ok().is_some_and(|canonical_dir| {
+                canonical_dir.parent() == Some(canonical_root.as_path())
+                    && canonical_dir.file_name() == directory.file_name()
+                    && canonical_file.starts_with(canonical_root.as_path())
+                    && canonical_file.parent() == Some(canonical_dir.as_path())
+                    && canonical_file
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.strip_suffix(".jsonl"))
+                        .and_then(|stem| stem.split_once('_'))
+                        .is_some_and(|(timestamp, file_id)| {
+                            !timestamp.is_empty()
+                                && (file_id == id
+                                    || (file_id == encode_session_id(&id)
+                                        && percent_decode_str(file_id)
+                                            .decode_utf8()
+                                            .is_ok_and(|decoded| decoded == id)))
+                        })
+            })
         });
         if owned {
             Ok(())
@@ -281,4 +292,51 @@ pub(super) fn io_failure(
         message: format!("{action}: {}", path.display()),
         source: Some(std::sync::Arc::new(source)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn ownership_matches_the_complete_id() {
+        let root = tempdir().expect("root tempdir");
+        let directory = root.path().join(session_directory_name("/cwd"));
+        fs::create_dir(&directory).expect("create storage directory");
+        for id in ["q_abc", "q_bc", "space id", "日本語", "literal%20"] {
+            let path = directory.join(session_file_name(0, id));
+            fs::write(&path, "").expect("write session");
+            verify_owned_session_path(root.path(), "/cwd", id, &path)
+                .await
+                .expect("complete id owns file");
+            let result = verify_owned_session_path(root.path(), "/cwd", "bc", &path).await;
+            assert!(matches!(result, Err(SessionError::Invariant(_))));
+        }
+        let legacy = directory.join("different-timestamp_raw space_id.jsonl");
+        fs::write(&legacy, "").expect("write legacy session");
+        verify_owned_session_path(root.path(), "/cwd", "raw space_id", &legacy)
+            .await
+            .expect("legacy raw id and original timestamp remain supported");
+
+        // A shorter id must not match the trailing component of an id that
+        // contains an underscore.
+        let q_abc = directory.join(session_file_name(0, "q_abc"));
+        let result = verify_owned_session_path(root.path(), "/cwd", "abc", &q_abc).await;
+        assert!(matches!(result, Err(SessionError::Invariant(_))));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ownership_rejects_storage_symlink_outside_root() {
+        let root = tempdir().expect("root tempdir");
+        let foreign = tempdir().expect("foreign tempdir");
+        let directory = root.path().join(session_directory_name("/cwd"));
+        std::os::unix::fs::symlink(foreign.path(), &directory).expect("symlink storage");
+        let path = directory.join(session_file_name(0, "shared-id"));
+        fs::write(&path, "foreign session").expect("write foreign session");
+        let result = verify_owned_session_path(root.path(), "/cwd", "shared-id", &path).await;
+        assert!(matches!(result, Err(SessionError::Invariant(_))));
+        assert_eq!(fs::read_to_string(&path).expect("foreign file remains"), "foreign session");
+    }
 }

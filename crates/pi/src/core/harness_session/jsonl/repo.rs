@@ -464,6 +464,20 @@ impl SessionRepo for JsonlSessionRepo {
                 return Err(not_found(format!("session file does not exist: {}", metadata.path.display())));
             }
             verify_owned_session_path(&self.root, &metadata.cwd, &metadata.id, &metadata.path).await?;
+            // A legacy raw id can share an encoded filename; the header is the
+            // authoritative identity before deletion.
+            let Some(header) = read_header(&metadata.path, cx).await? else {
+                return Err(SessionError::Invariant(format!(
+                    "Session file is not owned by this repository: {}",
+                    metadata.path.display()
+                )));
+            };
+            if header.id != metadata.id || header.cwd != metadata.cwd {
+                return Err(SessionError::Invariant(format!(
+                    "Session identity does not match header: {}",
+                    metadata.id
+                )));
+            }
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             remove_session_file(&metadata.path).await
@@ -719,6 +733,7 @@ fn aborted_error() -> SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::paths::session_file_name;
     use tempfile::tempdir;
 
     /// Creates then closes a session and returns its listed metadata.
@@ -840,5 +855,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_percent_encoded_id_collision() {
+        let cx = Context::background();
+        let root = tempdir().expect("root tempdir");
+        let cwd_dir = tempdir().expect("cwd tempdir");
+        let cwd = cwd_dir.path().to_string_lossy().into_owned();
+        let repo = JsonlSessionRepo::new(root.path());
+        let raw = create_closed_metadata(&repo, &cwd, "%20").await;
+
+        // A session id that is itself a percent escape collides with the
+        // encoded file name of a literal-space id; the header must decide.
+        let colliding = raw
+            .path
+            .parent()
+            .expect("session directory")
+            .join(session_file_name(raw.created_at, " "));
+        fs::rename(&raw.path, &colliding).expect("rename to colliding file name");
+
+        let mut metadata = raw.clone();
+        metadata.id = " ".to_owned();
+        metadata.path = colliding.clone();
+        let error = repo
+            .delete(&metadata, &cx)
+            .await
+            .expect_err("delete must reject a filename-only ownership match");
+        assert!(matches!(error, SessionError::Invariant(_)), "{error:?}");
+        assert!(colliding.exists(), "foreign session file remains");
     }
 }
