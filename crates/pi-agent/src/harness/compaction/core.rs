@@ -32,7 +32,7 @@ use super::utils::{
     js_string_len, safe_json_stringify, serialize_conversation,
 };
 use super::{
-    context::{build_context_entries, session_entry_to_context_messages},
+    context::{build_context_entries, is_context_message, session_entry_to_context_messages},
     messages::{
         create_branch_summary_message, create_compaction_summary_message, message_timestamp,
         summary_user_message,
@@ -167,18 +167,15 @@ pub fn get_last_assistant_usage(entries: &[Entry]) -> Option<Usage> {
 }
 
 fn get_assistant_usage(message: &AgentMessage) -> Option<Usage> {
+    if !is_context_message(message) {
+        return None;
+    }
     let AgentMessage::Llm(message) = message else {
         return None;
     };
     let Message::Assistant(assistant) = message.as_ref() else {
         return None;
     };
-    if matches!(
-        assistant.stop_reason,
-        StopReason::Aborted | StopReason::Error
-    ) {
-        return None;
-    }
     (calculate_context_tokens(&assistant.usage) > 0).then(|| assistant.usage.clone())
 }
 /// Estimates one agent message using the provider's 4-character heuristic for
@@ -1131,6 +1128,10 @@ pub fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
     let Some(error) = message.error_message.as_deref() else {
         return false;
     };
+    is_retryable_error_text(error)
+}
+
+fn is_retryable_error_text(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     if NON_RETRYABLE.iter().any(|pattern| lower.contains(pattern)) {
         return false;
@@ -1144,6 +1145,10 @@ pub fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
     [429_u16, 500, 502, 503, 504, 524]
         .iter()
         .any(|code| contains_status_code(&lower, *code))
+}
+
+fn is_retryable_provider_error(error: &ProviderError) -> bool {
+    is_retryable_error_text(error.message())
 }
 
 fn contains_status_code(text: &str, code: u16) -> bool {
@@ -1204,11 +1209,11 @@ async fn notify_retry_finished(
     }
 }
 
-/// Retries a producer after retryable semantic failures.
+/// Retries a producer after retryable semantic or transport failures.
 ///
 /// # Errors
 ///
-/// Returns the provider error produced by `produce`.
+/// Returns a non-retryable or exhausted provider error produced by `produce`.
 pub async fn retry_assistant_call<F, Fut>(
     mut produce: F,
     retry: Option<&HarnessRetryPolicy>,
@@ -1227,29 +1232,32 @@ where
     let mut retry_attempt = 0_u64;
     let mut retried = false;
     loop {
-        let response = produce().await?;
+        let response = produce().await;
 
-        if response.stop_reason == StopReason::Aborted {
-            notify_retry_finished(callbacks, retried, false, retry_attempt, None).await;
-            return Ok(response);
+        if let Ok(message) = &response {
+            if message.stop_reason == StopReason::Aborted {
+                notify_retry_finished(callbacks, retried, false, retry_attempt, None).await;
+                return response;
+            }
+
+            if message.stop_reason != StopReason::Error {
+                notify_retry_finished(callbacks, retried, true, retry_attempt, None).await;
+                return response;
+            }
         }
 
-        if response.stop_reason != StopReason::Error {
-            notify_retry_finished(callbacks, retried, true, retry_attempt, None).await;
-            return Ok(response);
-        }
-
+        let retryable = match &response {
+            Ok(message) => is_retryable_assistant_error(message),
+            Err(error) => is_retryable_provider_error(error),
+        };
+        let error_message = match &response {
+            Ok(message) => message.error_message.clone(),
+            Err(error) => Some(error.message().to_owned()),
+        };
         let exhausted = retry_attempt >= max_retries;
-        if exhausted || !is_retryable_assistant_error(&response) {
-            notify_retry_finished(
-                callbacks,
-                retried,
-                false,
-                retry_attempt,
-                response.error_message.clone(),
-            )
-            .await;
-            return Ok(response);
+        if exhausted || !retryable {
+            notify_retry_finished(callbacks, retried, false, retry_attempt, error_message).await;
+            return response;
         }
 
         retry_attempt = retry_attempt.saturating_add(1);
@@ -1257,7 +1265,7 @@ where
         let shift = retry_attempt.saturating_sub(1).min(63) as u32;
         let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
         let delay_ms = base_delay_ms.saturating_mul(multiplier);
-        let error_message = response.error_message.clone().unwrap_or_default();
+        let error_message = error_message.unwrap_or_default();
         if let Some(callback) =
             callbacks.and_then(|callbacks| callbacks.on_retry_scheduled.as_ref())
         {
@@ -1276,10 +1284,14 @@ where
                         Some(error_message),
                     )
                     .await;
-                    let mut aborted = response;
-                    aborted.stop_reason = StopReason::Aborted;
-                    aborted.error_message = None;
-                    return Ok(aborted);
+                    match response {
+                        Ok(mut response) => {
+                            response.stop_reason = StopReason::Aborted;
+                            response.error_message = None;
+                            return Ok(response);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 () = sleep => {}
             }
@@ -1352,6 +1364,7 @@ mod tests {
     use futures::stream::{self, BoxStream, StreamExt};
     use pi_ai::{AssistantContent, AssistantMessage, Provider, TextContent};
     use serde_json::{Map, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn user(text: &str) -> AgentMessage {
@@ -1421,6 +1434,23 @@ mod tests {
         let result = estimate_context_tokens(&messages);
         assert_eq!(result.usage_tokens, 20);
         assert_eq!(result.last_usage_index, Some(1));
+        assert!(result.trailing_tokens > 0);
+    }
+
+    #[test]
+    fn deferred_assistant_is_not_usage_anchor() {
+        let usage = Usage {
+            total_tokens: 20,
+            ..Usage::default()
+        };
+        let messages = vec![
+            assistant("old", StopReason::Stop, Usage::default()),
+            assistant("deferred", StopReason::Deferred, usage),
+            assistant("tail", StopReason::Stop, Usage::default()),
+        ];
+        let result = estimate_context_tokens(&messages);
+        assert_eq!(result.usage_tokens, 0);
+        assert_eq!(result.last_usage_index, None);
         assert!(result.trailing_tokens > 0);
     }
 
@@ -1534,6 +1564,61 @@ mod tests {
         assert_eq!(cut.first_kept_entry_index, entries.len());
         assert_eq!(cut.turn_start_index, None);
         assert!(!cut.is_split_turn);
+    }
+
+    #[tokio::test]
+    async fn retry_assistant_call_retries_retryable_provider_errors() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scheduled = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let callbacks = SummaryRetryCallbacks {
+            on_retry_scheduled: Some({
+                let scheduled = Arc::clone(&scheduled);
+                Arc::new(move |_attempt, _max_retries, _delay_ms, _error| {
+                    scheduled.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async {})
+                })
+            }),
+            on_retry_attempt_start: None,
+            on_retry_finished: Some({
+                let finished = Arc::clone(&finished);
+                Arc::new(move |_success, _attempts, _error| {
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async {})
+                })
+            }),
+        };
+        let policy = HarnessRetryPolicy {
+            enabled: true,
+            max_retries: 1,
+            base_delay_ms: 0,
+        };
+        let result = retry_assistant_call(
+            || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(ProviderError::new(
+                            "stream ended before a terminal response event",
+                        ))
+                    } else {
+                        Ok(AssistantMessage::new("api", "provider", "model", 1))
+                    }
+                }
+            },
+            Some(&policy),
+            None,
+            Some(&callbacks),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Ok(message) if message.stop_reason == StopReason::Stop
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(scheduled.load(Ordering::SeqCst), 1);
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
