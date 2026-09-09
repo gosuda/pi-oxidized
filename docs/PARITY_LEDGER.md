@@ -65,6 +65,13 @@ Statuses are evidence-bearing: `landed` names an existing owner seam; `folded` r
 | R2 | Remote schemas | pi | remote/schemas.rs | transport-neutral schema | landed | PAR-CODEC (#31, commit c5c85c6): schema types share the codec layer's transport-neutral bytes; 20 remote_codec_golden tests cover the schema-annotated roundtrips. Portable neutral surface compiles on every target. |
 | R3 | Remote client and ByteTransport | pi | remote/client.rs, remote/transport/ | ByteTransport | landed | PAR-CLIENT (#33, landing 95e73c8, review fixes ac26369 + 38897ce): two adapters (in-memory + unix), five-class error taxonomy pinned by test, detach/reattach and mid-request disconnect typed; 40/40 remote tests green. Unix adapter is #[cfg(unix)]; the in-memory adapter and client are portable; Unix endpoints on non-Unix return typed EndpointSpecError::UnsupportedOnPlatform. Windows x86_64-pc-windows-msvc compile probe green. |
 | R4 | Remote multi-session server | pi | remote/server.rs | portable server and listener preset | landed | Unix listener preset is #[cfg(unix)]; the transport-neutral server is portable; the merge-blocking Windows-target compile check covers the transport-neutral surface. |
+
+## Design ledger
+
+Approved design scope awaiting implementation. These rows carry `DES-` identifiers, not capability IDs, so they stay outside the capability ledger whose row count and ID shape the parity witness pins.
+
+| ID | Scope | Owner | Module | Seam | Status | Evidence or contract |
+| --- | --- | --- | --- | --- | --- | --- |
 | DES-07 | Fullscreen viewport port (alt-screen transcript with wheel/keyboard scroll, incremental search, selection, proportional scrollbar with track-click/thumb-drag, clickable jump-to-end) | pi-tui framework plus pi product composition | alt_screen/, terminal/input.rs, cli/args.rs | ScreenMode plus native mouse dispatch | planned | Approved scope per `docs/TUI-G4-supersession.md` (C `9767ba275f3e9a5ee0f5c5342249b629ab1b2282`); pending implementation and Main-run witness. Bare `pi` regular output must stay snapshot-identical; G29/T6 re-witnessed with mouse; T1/T2/T9 unregressed with fresh fullscreen evidence. No pass asserted. |
 | DES-08 | Theme keys for fullscreen styling (`scrollbarTrack`/`Thumb`, `searchMatchBg`/`Text`) | pi | modes/interactive/theme.rs, core/resources/themes.rs | product theme keys | planned | Approved scope per `docs/TUI-G4-supersession.md`; pending implementation inside the DES-07 stage with parse/validate/round-trip and unchanged built-in dark/light regular snapshots. No pass asserted. |
 
