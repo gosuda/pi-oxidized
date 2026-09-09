@@ -929,7 +929,8 @@ async fn generation(
         &pending.state.scope().control,
         Control::CancelRequested { .. }
     ) {
-        let record = publish_interrupted(lane, operation, &response_id, cx).await?;
+        let response_id = pending_response_id(&pending.state)?;
+        let record = publish_interrupted(lane, &pending, &response_id, cx).await?;
         return Ok(DriveStep::Settled(record));
     }
     publish_response(lane, operation, pending.state, response, cx).await
@@ -1781,14 +1782,13 @@ async fn publish_deferred_response(
     let pending = lane
         .current_operation()
         .await
-        .ok_or_else(|| invariant("deferred operation disappeared before publication"))?
-        .state;
-    if matches!(&pending.scope().control, Control::CancelRequested { .. }) {
-        let response_id = pending_response_id(&pending)?;
-        let record = publish_interrupted(lane, operation, &response_id, cx).await?;
+        .ok_or_else(|| invariant("deferred operation disappeared before publication"))?;
+    if matches!(&pending.state.scope().control, Control::CancelRequested { .. }) {
+        let response_id = pending_response_id(&pending.state)?;
+        let record = publish_interrupted(lane, &pending, &response_id, cx).await?;
         return Ok(DriveStep::Settled(record));
     }
-    publish_response(lane, operation, pending, response, cx).await
+    publish_response(lane, operation, pending.state, response, cx).await
 }
 
 async fn deferred_handle(
@@ -3110,6 +3110,13 @@ fn summary_request(
             };
             options.transport = effective.transport;
             options.cache_retention = effective.cache_retention;
+            if let Some(deferred) = &effective.deferred {
+                options
+                    .extra
+                    .insert("deferred".to_owned(), serde_json::json!(deferred));
+            } else {
+                options.extra.remove("deferred");
+            }
             options.timeout_ms = effective.timeout_ms;
             options.max_retries = effective.max_retries;
             options.max_retry_delay_ms = effective.max_retry_delay_ms;

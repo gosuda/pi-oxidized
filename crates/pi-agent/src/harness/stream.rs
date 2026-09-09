@@ -452,6 +452,11 @@ pub(crate) fn native_stream_options(
         }),
         ..pi_ai::StreamOptions::default()
     };
+    if let Some(deferred) = &options.deferred {
+        native
+            .extra
+            .insert("deferred".to_owned(), serde_json::json!(deferred));
+    }
 
     // Native pi-ai uses a provider-neutral reasoning extra.  Do not overwrite
     // an explicit value inserted by a provider-local callback.
