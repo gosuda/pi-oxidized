@@ -550,7 +550,7 @@ impl ThinkingSelectorComponent {
     pub fn new(
         current_level: ModelThinkingLevel,
         available_levels: Vec<ModelThinkingLevel>,
-        on_select: Box<dyn FnMut(ModelThinkingLevel) + Send>,
+        mut on_select: Box<dyn FnMut(ModelThinkingLevel) + Send>,
         on_cancel: Box<dyn FnMut() + Send>,
         on_select_as_default: Option<Box<dyn FnMut(ModelThinkingLevel) + Send>>,
         default_level: Option<ModelThinkingLevel>,

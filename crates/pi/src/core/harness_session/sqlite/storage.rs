@@ -1328,7 +1328,7 @@ fn read_stop_seq(
         "SELECT MIN(b.entry_seq), MAX(b.entry_seq) FROM branch_entries b WHERE b.session_id = :session AND b.branch_id = :branch AND b.entry_seq > :lower_seq AND b.entry_seq <= :upper_seq AND ({stop_predicate})"
     );
     let stop_type = query.stop_at_type.map(entry_type_filter_name);
-    let stop_id = query.stop_at_id.as_deref();
+    let stop_id = query.stop_at_id.as_ref().map(EntryId::as_str);
     let (minimum, maximum) = connection
         .query_row(
             &sql,

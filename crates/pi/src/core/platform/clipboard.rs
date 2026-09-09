@@ -164,6 +164,15 @@ pub enum ClipboardCopyResult {
     Osc52(String),
 }
 
+/// A clipboard image and its MIME type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardImage {
+    /// Raw image bytes.
+    pub bytes: Vec<u8>,
+    /// Canonical MIME type.
+    pub mime: String,
+}
+
 /// A resolved clipboard write argv (program + args) with an optional fallback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WriteCommand {

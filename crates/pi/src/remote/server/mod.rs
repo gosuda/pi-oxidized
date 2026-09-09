@@ -420,7 +420,7 @@ impl<H: ServerHost> Server<H> {
         let server_id = options.server_id;
         let on_connection_count_changed = options.on_connection_count_changed;
         let on_error = options.on_error;
-        let core = Arc::new_cyclic(|weak| {
+        let core = Arc::new_cyclic(|weak: &Weak<ServerCore<H>>| {
             let is_closing: Arc<dyn Fn() -> bool + Send + Sync> = {
                 let weak = weak.clone();
                 Arc::new(move || weak.upgrade().is_none_or(|core| core.closing.load(Ordering::Acquire)))
@@ -444,11 +444,11 @@ impl<H: ServerHost> Server<H> {
             };
             let report_error = {
                 let weak = weak.clone();
-                Arc::new(move |error: &dyn Error| {
+                Arc::new(move |error: &(dyn Error + 'static)| {
                     if let Some(core) = weak.upgrade() {
                         core.report_error(error);
                     }
-                }) as Arc<dyn Fn(&dyn Error) + Send + Sync>
+                }) as ServerErrorHandler
             };
             let router = Arc::new(router::SessionRouter::new(router::SessionRouterOptions {
                 host: Arc::clone(&host),
@@ -513,12 +513,10 @@ impl<H: ServerHost> Server<H> {
         }
         if let Some(start_error) = start_error {
             self.core.closing.store(true, Ordering::Release);
-            let cleanup_errors = {
-                for listener in started {
-                    listener.close().await;
-                }
-                self.close_server_state().await
-            };
+            for listener in started {
+                listener.close().await;
+            }
+            let cleanup_errors = self.core.close_server_state().await;
             let cleanup = if cleanup_errors.is_empty() {
                 Vec::new()
             } else {
@@ -1214,7 +1212,7 @@ impl<H: ServerHost> ServerCore<H> {
             self.notify_connection_count_changed();
         }
         let router = Arc::clone(&self.router).disconnect(key, Context::background());
-        let service = services.map(|service| service.release(Context::background()));
+        let service = services.as_ref().map(|service| service.release(Context::background()));
         let router_result = router.await;
         if let Err(error) = router_result {
             self.report_error(&error);
@@ -1252,8 +1250,9 @@ impl<H: ServerHost> ConnectionHandler for ServerHandler<H> {
         let (Some(core), Some(connection)) = (self.core.upgrade(), self.connection.upgrade()) else {
             return;
         };
+        let event_connection = Arc::clone(&connection);
         connection.enqueue_event(Box::pin(async move {
-            core.receive(connection, chunk).await;
+            core.receive(event_connection, chunk).await;
         }));
     }
 
@@ -1261,8 +1260,9 @@ impl<H: ServerHost> ConnectionHandler for ServerHandler<H> {
         let (Some(core), Some(connection)) = (self.core.upgrade(), self.connection.upgrade()) else {
             return;
         };
+        let event_connection = Arc::clone(&connection);
         connection.enqueue_event(Box::pin(async move {
-            core.transport_closed(&connection).await;
+            core.transport_closed(&event_connection).await;
         }));
     }
 
@@ -1270,10 +1270,11 @@ impl<H: ServerHost> ConnectionHandler for ServerHandler<H> {
         let (Some(core), Some(connection)) = (self.core.upgrade(), self.connection.upgrade()) else {
             return;
         };
+        let event_connection = Arc::clone(&connection);
         connection.enqueue_event(Box::pin(async move {
             core.report_error(&error);
-            let _ = core.close_connection(&connection, None).await;
-            core.disconnect(&connection).await;
+            let _ = core.close_connection(&event_connection, None).await;
+            core.disconnect(&event_connection).await;
         }));
     }
 }

@@ -232,7 +232,8 @@ impl ByteConnection for InMemoryConnection {
                         if closed.load(Ordering::Acquire) {
                             return Err(TransportError::Closed);
                         }
-                        if let Some(transport) = transport_rx.borrow().clone() {
+                        let transport = transport_rx.borrow().clone();
+                        if let Some(transport) = transport {
                             return transport.send(chunk).await;
                         }
                         if transport_rx.changed().await.is_err() {

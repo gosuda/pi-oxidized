@@ -74,7 +74,7 @@ fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Options for [`create_listener`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UnixListenerOptions {
     /// Socket path.
     pub path: PathBuf,
@@ -88,6 +88,20 @@ pub struct UnixListenerOptions {
     pub graceful_close_timeout_ms: Option<u64>,
     /// Reports listener failures.
     pub on_error: Option<ServerErrorHandler>,
+}
+
+impl std::fmt::Debug for UnixListenerOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnixListenerOptions")
+            .field("path", &self.path)
+            .field("mode", &self.mode)
+            .field("max_pending_bytes", &self.max_pending_bytes)
+            .field("max_frame_length", &self.max_frame_length)
+            .field("graceful_close_timeout_ms", &self.graceful_close_timeout_ms)
+            .field("on_error", &self.on_error.as_ref().map(|_| "<handler>"))
+            .finish()
+    }
 }
 
 /// Construction-options failure for the Unix listener — distinct from

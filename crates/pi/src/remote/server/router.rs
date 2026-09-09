@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 
 use futures::future::{BoxFuture, FutureExt, Shared, join_all};
 use tokio::sync::{Notify, oneshot};
@@ -11,7 +11,7 @@ use uuid::Uuid;
 use pi_agent::context::Context;
 use pi_agent::service::error::ServiceError;
 use pi_agent::service::value::JsonValue;
-use pi_agent::service::wire::{ServiceCall, ServiceProviderUpdate};
+use pi_agent::service::wire::ServiceCall;
 
 use crate::remote::schemas::{RpcTarget, ServerId, SessionTarget};
 
@@ -120,7 +120,7 @@ pub(super) struct SessionRouterOptions<H: ServerHost> {
     pub(super) server_id: ServerId,
     pub(super) is_closing: Arc<dyn Fn() -> bool + Send + Sync>,
     pub(super) publish_attachment: Arc<dyn Fn(ClientKey, Option<SessionTarget>, Context) -> BoxFuture<'static, ()> + Send + Sync>,
-    pub(super) report_error: Arc<dyn Fn(&dyn std::error::Error) + Send + Sync>,
+    pub(super) report_error: super::ServerErrorHandler,
 }
 
 /// Owns durable-session handles and one live attachment per client.
@@ -560,6 +560,7 @@ impl<H: ServerHost> SessionRouter<H> {
         lock(&self.hosted_sessions).insert(hosted.id.clone(), Arc::clone(&hosted));
         if let Some(terminated) = hosted.handle.terminated() {
             let weak = Arc::downgrade(&self);
+            let hosted = Arc::clone(&hosted);
             tokio::spawn(async move {
                 let error = terminated.await;
                 if let Some(router) = weak.upgrade() {
@@ -602,7 +603,7 @@ impl<H: ServerHost> SessionRouter<H> {
     }
 
     async fn remove_session_now(
-        &self,
+        self: Arc<Self>,
         session_id: &str,
         context: Context,
     ) -> Result<(), HostError> {

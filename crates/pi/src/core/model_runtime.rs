@@ -1129,7 +1129,7 @@ impl ModelRuntime {
             .allow_network
             .unwrap_or(self.inner.allow_model_network);
         let signal = options.signal;
-        if signal.is_some_and(CancellationToken::is_cancelled) {
+        if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return Ok(ModelsRefreshResult {
                 aborted: true,
                 errors: BTreeMap::new(),
@@ -1145,7 +1145,7 @@ impl ModelRuntime {
         let provider_ids = self.provider_ids();
         let mut errors = BTreeMap::new();
         for provider_id in &provider_ids {
-            if signal.is_some_and(CancellationToken::is_cancelled) {
+            if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
                 return Ok(ModelsRefreshResult {
                     aborted: true,
                     errors,
@@ -1163,7 +1163,7 @@ impl ModelRuntime {
 
         if allow_network {
             for provider_id in &provider_ids {
-                if signal.is_some_and(CancellationToken::is_cancelled) {
+                if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
                     return Ok(ModelsRefreshResult {
                         aborted: true,
                         errors,
@@ -1192,7 +1192,7 @@ impl ModelRuntime {
             }
         }
 
-        if signal.is_some_and(CancellationToken::is_cancelled) {
+        if signal.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return Ok(ModelsRefreshResult {
                 aborted: true,
                 errors,

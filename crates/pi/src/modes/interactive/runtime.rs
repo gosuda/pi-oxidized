@@ -55,6 +55,7 @@ use pi_tui::alt_screen::{
     TranscriptSearch, transcript_search_rect,
 };
 use pi_tui::component::{Component, EventResult, UiEvent};
+use pi_tui::focus::Focusable;
 use pi_tui::components::editor::{BorderActivity, Editor, EditorOptions};
 use pi_tui::keys::{
     ParsedKeyId, encode_key_event, key_matches_parsed, parse_key_id, set_kitty_protocol_active,
@@ -84,9 +85,11 @@ use crate::core::extension_runtime_set::ExtensionRuntimeSet;
 use crate::core::platform::external_editor::{EditOutcome, edit_text_in_external_editor};
 use pi_ext::client::{DialogEnd, DialogOutcome, HostUiRequest, HostUiResponse};
 use pi_ext::protocol::{
-    KeyEventKindWire, KeyModifiersWire, SlotPlacement, ThemeCatalogEntry, ThemeColorValue,
-    ThemeUpdate, ThemeWire, UiEventRequest, UiEventWire,
+    SlotPlacement, ThemeCatalogEntry, ThemeColorValue, ThemeUpdate, ThemeWire, UiEventRequest,
+    UiEventWire,
 };
+#[cfg(test)]
+use pi_ext::protocol::{KeyEventKindWire, KeyModifiersWire};
 use pi_ext::sanitize::SanitizedSlot;
 
 use crate::core::settings::{
@@ -5451,7 +5454,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                             .with_description(entry.description.unwrap_or_default())
                     })
                     .collect();
-                Ok(self.build_select_list(kind, items, Some("app.models.save")));
+                Ok(self.build_select_list(kind, items, Some("app.models.save")))
             }
             super::state::SelectorKind::Thinking => {
                 let current = self.session.current_thinking_level();
@@ -5569,7 +5572,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                             .with_description(entry.description.unwrap_or_default())
                     })
                     .collect();
-                Ok(self.build_select_list(kind, items, None));
+                Ok(self.build_select_list(kind, items, None))
             }
             super::state::SelectorKind::Trust => {
                 let rows = self.session.get_trust_entries().await?;

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -512,7 +512,7 @@ impl SqliteSessionRepo {
         let open_sessions = Arc::downgrade(&self.open);
         let callback_key = key.clone();
         let callback_storage = Arc::clone(&dyn_storage);
-        let id_generator: Arc<dyn IdGenerator> = Arc::clone(&self.id_generator);
+        let id_generator: Arc<dyn IdGenerator> = self.id_generator.clone();
         let session = StorageBackedSession::new(
             metadata.session.clone(),
             Arc::clone(&dyn_storage),
