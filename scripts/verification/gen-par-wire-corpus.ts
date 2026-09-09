@@ -7,6 +7,12 @@
  * Offline-deterministic: the upstream encoder is invoked over fixed messages;
  * outputs are hex records.
  *
+ * The message declarations below intentionally mirror the pinned protocol
+ * locally. Keeping those types in tracked source lets type-aware verification
+ * inspect this generator without traversing the untracked reference checkout.
+ * Runtime framing and encoding still come from the pinned checkout, but only
+ * after its identity has been verified.
+ *
  * Corpus shape (packages/pi-remote-protocol/tests/fixtures/par-wire-corpus.jsonl):
  *   { kind, message?, frameHex, note }
  *
@@ -17,7 +23,57 @@ import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-identity.ts";
-import type { ClientMessage, ServerMessage } from "../../.references/pi-2.0/packages/protocol/src/protocol.ts";
+
+type JsonValue =
+	| null
+	| boolean
+	| number
+	| string
+	| JsonValue[]
+	| { [key: string]: JsonValue };
+
+type Identifier = string;
+type ServerId = Identifier;
+
+interface ProtocolError {
+	code: Identifier;
+	message: string;
+}
+
+interface ServerTarget {
+	serverId: ServerId;
+}
+
+interface SessionTarget {
+	serverId: ServerId;
+	sessionId: Identifier;
+	attachmentId: Identifier;
+}
+
+type RpcTarget = ServerTarget | SessionTarget;
+
+type ClientMessage =
+	| { type: "hello"; version: number }
+	| { type: "request"; id: Identifier; target: RpcTarget; call: JsonValue }
+	| { type: "cancel"; id: Identifier; target: RpcTarget };
+
+type ServerMessage =
+	| { type: "hello"; version: number; serverId: ServerId }
+	| { type: "hello_error"; error: ProtocolError }
+	| {
+			type: "response";
+			id: Identifier;
+			ok: true;
+			result?: JsonValue;
+	  }
+	| {
+			type: "response";
+			id: Identifier;
+			ok: false;
+			error: ProtocolError;
+	  }
+	| { type: "service_update"; subscriptionId: Identifier; update: JsonValue }
+	| { type: "attachment"; attachment: SessionTarget | null };
 
 const here = dirname(fileURLToPath(import.meta.url));
 const upstreamRoot = join(canonicalReferenceRoot(), "packages/protocol/src");
