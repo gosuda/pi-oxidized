@@ -612,7 +612,7 @@ async fn socket_is_live(path: &Path) -> bool {
 // ---------------------------------------------------------------------------
 
 struct UnixServerConnection {
-    write_tx: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
+    write_tx: StdMutex<Option<mpsc::Sender<WriteItem>>>,
     pending_bytes: Arc<AtomicUsize>,
     max_pending_bytes: usize,
     closed: Arc<AtomicBool>,
@@ -620,6 +620,69 @@ struct UnixServerConnection {
     send_tail: StdMutex<futures::future::Shared<BoxFuture<'static, ()>>>,
     writer_finished: Arc<tokio::sync::Notify>,
     graceful_close_timeout_ms: u64,
+}
+/// An RAII reservation against the connection's `pending_bytes` budget.
+/// The reserved count is released when the guard is dropped, which
+/// happens once the chunk it paid for is written or dropped.
+struct PendingBytesReservation {
+    pending: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl PendingBytesReservation {
+    /// Attempts to reserve `bytes` from `pending` without exceeding `max`.
+    /// Returns `Some(...)` if the reservation was made, `None` if the budget
+    /// would be exceeded (or the addition would overflow).
+    fn try_reserve(
+        pending: &Arc<AtomicUsize>,
+        bytes: usize,
+        max: usize,
+    ) -> Option<Self> {
+        if bytes == 0 {
+            return Some(Self {
+                pending: Arc::clone(pending),
+                bytes: 0,
+            });
+        }
+        let mut current = pending.load(Ordering::SeqCst);
+        loop {
+            let next = current.checked_add(bytes)?;
+            if next > max {
+                return None;
+            }
+            match pending.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        pending: Arc::clone(pending),
+                        bytes,
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for PendingBytesReservation {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
+/// One outbound chunk together with the budget reservation that pays for
+/// the bytes it retains until it is written or dropped.
+struct WriteItem {
+    bytes: Vec<u8>,
+    #[expect(
+        dead_code,
+        reason = "held, not read: its Drop returns the bytes to the budget"
+    )]
+    reservation: PendingBytesReservation,
 }
 
 /// Spawns the reader/writer tasks for one accepted stream and returns
@@ -629,7 +692,7 @@ fn spawn_connection(
     options: &ResolvedOptions,
     accept: &ConnectionAcceptor,
 ) -> Arc<UnixServerConnection> {
-    let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
+    let (write_tx, write_rx) = mpsc::channel::<WriteItem>(WRITE_QUEUE_CAPACITY);
     let connection = Arc::new(UnixServerConnection {
         write_tx: StdMutex::new(Some(write_tx)),
         pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -649,15 +712,17 @@ fn spawn_connection(
     // inside `connection` is dropped when all outside holders drop,
     // allowing `write_rx` to close and the writer task to exit.
     {
-        let pending_bytes = Arc::clone(&connection.pending_bytes);
         let closed = Arc::clone(&connection.closed);
         let writer_finished = Arc::clone(&connection.writer_finished);
         tokio::spawn(async move {
             let mut write_half = write_half;
             let mut write_rx = write_rx;
-            while let Some(chunk) = write_rx.recv().await {
-                let written = write_half.write_all(&chunk).await;
-                pending_bytes.fetch_sub(chunk.len(), Ordering::SeqCst);
+            while let Some(item) = write_rx.recv().await {
+                let written = write_half.write_all(&item.bytes).await;
+                // The item (and its reservation) is dropped at the end of the
+                // loop body, releasing the charge whether the write succeeded
+                // or failed. Any items still in the channel when the writer
+                // exits are released when the receiver drops.
                 if written.is_err() {
                     break;
                 }
@@ -718,18 +783,20 @@ impl ByteConnection for UnixServerConnection {
             let Some(write_tx) = lock(&self.write_tx).clone() else {
                 return futures::future::ready(Err(TransportError::Closed)).boxed();
             };
+            let bytes = chunk.len();
+            let Some(reservation) =
+                PendingBytesReservation::try_reserve(&pending_bytes, bytes, max_pending_bytes)
+            else {
+                return futures::future::ready(Err(TransportError::PendingBytesExceeded)).boxed();
+            };
+            let item = WriteItem {
+                bytes: chunk,
+                reservation,
+            };
             let previous = tail.clone();
             let task = async move {
                 previous.await;
-                let bytes = chunk.len();
-                let budget = pending_bytes
-                    .fetch_add(bytes, Ordering::SeqCst)
-                    .saturating_add(bytes);
-                let result = if budget > max_pending_bytes {
-                    pending_bytes.fetch_sub(bytes, Ordering::SeqCst);
-                    Err(TransportError::PendingBytesExceeded)
-                } else if write_tx.send(chunk).await.is_err() {
-                    pending_bytes.fetch_sub(bytes, Ordering::SeqCst);
+                let result = if write_tx.send(item).await.is_err() {
                     Err(TransportError::Closed)
                 } else {
                     Ok(())
@@ -760,6 +827,7 @@ impl ByteConnection for UnixServerConnection {
         let closed = Arc::clone(&self.closed);
         let writer_finished = Arc::clone(&self.writer_finished);
         let timeout = Duration::from_millis(self.graceful_close_timeout_ms);
+        let pending_bytes = Arc::clone(&self.pending_bytes);
         let task = {
             let mut tail = lock(&self.send_tail);
             let previous = tail.clone();
@@ -769,7 +837,19 @@ impl ByteConnection for UnixServerConnection {
                 let result = async {
                     if let Some(write_tx) = write_tx {
                         if let Some(chunk) = final_chunk {
-                            write_tx.send(chunk).await.ok();
+                            // Close's final chunk is not subject to the
+                            // pending-byte budget, but it still flows through
+                            // the same WriteItem drop path so the queue stays
+                            // uniformly typed and released.
+                            let reservation = PendingBytesReservation {
+                                pending: Arc::clone(&pending_bytes),
+                                bytes: 0,
+                            };
+                            let item = WriteItem {
+                                bytes: chunk,
+                                reservation,
+                            };
+                            let _ = write_tx.send(item).await;
                         }
                         drop(write_tx);
                         let _ = tokio::time::timeout(timeout, writer_finished.notified()).await;
@@ -811,3 +891,57 @@ impl std::hash::Hash for UnixServerConnection {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+struct NoopHandler;
+
+#[cfg(test)]
+impl ConnectionHandler for NoopHandler {
+    fn on_data(&self, _chunk: Vec<u8>) {}
+    fn on_close(&self) {}
+    fn on_error(&self, _error: TransportError) {}
+}
+
+#[cfg(test)]
+#[tokio::test(flavor = "current_thread")]
+#[expect(clippy::expect_used, reason = "test setup: socket pair and sends")]
+async fn pending_bytes_budget_rejects_retained_chunks() {
+    let (server, _client) = UnixStream::pair().expect("unix socket pair");
+    let options = ResolvedOptions {
+        path: PathBuf::new(),
+        mode: DEFAULT_SOCKET_MODE,
+        max_frame_length: DEFAULT_MAX_FRAME_LENGTH,
+        max_pending_bytes: 64,
+        graceful_close_timeout_ms: DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS,
+        on_error: None,
+    };
+    let accept: ConnectionAcceptor =
+        Arc::new(|_connection| Arc::new(NoopHandler) as Arc<dyn ConnectionHandler>);
+
+    let connection = spawn_connection(server, &options, &accept);
+
+    let first = connection.send(vec![0u8; 32]);
+    let second = connection.send(vec![0u8; 32]);
+    let third = connection.send(vec![0u8; 32]);
+
+    // The third send must be rejected synchronously, before any spawned task
+    // has run and before the first two reservations are released.
+    let third_result = third.now_or_never();
+    assert!(
+        matches!(
+            &third_result,
+            Some(Err(TransportError::PendingBytesExceeded)),
+        ),
+        "third send must exceed the retained budget synchronously, got {third_result:?}"
+    );
+
+    // The first two sends complete after their tasks run.
+    let (r1, r2) = tokio::join!(first, second);
+    r1.expect("first send");
+    r2.expect("second send");
+
+    // Let the writer drain the two queued chunks and release the reservations.
+    tokio::task::yield_now().await;
+
+    // After the queue drains, the budget is free again.
+    assert!(connection.send(vec![0u8; 32]).await.is_ok());
+}
