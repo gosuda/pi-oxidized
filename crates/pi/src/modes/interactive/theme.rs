@@ -2526,7 +2526,7 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_style_applies_fallbacks_for_wire_built_themes() {
+    fn fullscreen_style_applies_fallbacks_for_wire_built_themes() -> TestResult {
         // Extension wire objects omit absent slots (empty = reset); the
         // resolver falls back exactly like the reference constructor.
         let theme = ResolvedTheme::from_value_slots(

@@ -448,7 +448,10 @@ mod tests {
         let connection = InMemoryConnection::new();
         let send = connection.send(b"queued-before-accept".to_vec());
         let close = connection.close(None);
-        assert_eq!(close.await, Ok(()));
-        assert_eq!(send.await, Err(TransportError::Closed));
+        assert!(close.await.is_ok(), "close before accept must succeed");
+        assert!(
+            matches!(send.await, Err(TransportError::Closed)),
+            "queued send must fail with TransportError::Closed"
+        );
     }
 }

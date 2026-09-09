@@ -3580,6 +3580,7 @@ mod tests {
             .refresh(ModelsRefreshOptions {
                 allow_network: Some(false),
                 providers: Some(vec!["acme".to_owned()]),
+                ..ModelsRefreshOptions::default()
             })
             .await?;
         assert!(result.errors.is_empty(), "{:?}", result.errors);
