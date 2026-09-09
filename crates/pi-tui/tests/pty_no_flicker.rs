@@ -35,7 +35,7 @@ use pi_tui::keys::{
     KeyId, MODIFY_OTHER_KEYS_OMISSION, is_kitty_protocol_active, key_matches, key_press,
     key_press_state, set_kitty_protocol_active,
 };
-use pi_tui::terminal::guard::EMERGENCY_RESTORE_BYTES;
+use pi_tui::terminal::guard::{EMERGENCY_REGULAR_RESTORE_BYTES, EMERGENCY_RESTORE_BYTES};
 use pi_tui::terminal::{audit_bytes, probe_query_batch};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
@@ -88,17 +88,23 @@ fn pty_cursor_restore_after_success_abort_provider_error_panic_and_sigint() {
         if !BYTE_TRANSPARENT_MASTER {
             continue;
         }
-        if exit == "panic" {
+        if exit == "panic" || exit == "sigint" {
             assert_eq!(
-                report.emergency_restore_count,
+                report.emergency_regular_restore_count,
                 1,
-                "exit=panic: expected exactly one complete emergency restore sequence; got {} in {} output bytes",
-                report.emergency_restore_count,
+                "exit={exit}: expected exactly one regular-mode emergency restore sequence; got {} regular / {} alternate-screen in {} output bytes",
+                report.emergency_regular_restore_count,
+                report.emergency_alternate_screen_restore_count,
                 report.raw.len()
+            );
+            assert_eq!(
+                report.emergency_alternate_screen_restore_count,
+                0,
+                "exit={exit}: alternate-screen emergency restore emitted although the fixture never entered the alternate screen"
             );
         } else {
             assert!(
-                report.saw_cursor_show || report.emergency_restore_count > 0,
+                report.saw_cursor_show || report.emergency_regular_restore_count > 0,
                 "exit={exit}: expected cursor restoration bytes; got {} output bytes",
                 report.raw.len()
             );
@@ -397,7 +403,8 @@ struct DriveReport {
     finished_within_timeout: bool,
     sole_stdout_owner: bool,
     saw_cursor_show: bool,
-    emergency_restore_count: usize,
+    emergency_regular_restore_count: usize,
+    emergency_alternate_screen_restore_count: usize,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -747,7 +754,17 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
         && !txns.is_empty();
 
     let saw_cursor_show = find_subslice(&raw, b"\x1b[?25h").is_some();
-    let emergency_restore_count = raw
+    // The full alternate-screen sequence contains the regular-mode bytes as a
+    // subsequence (it inserts CSI ? 1049 l between CSI ? 7 h and CSI < u), so
+    // a subsequence search for one variant would conflate them. Exact-window
+    // equality keeps the counts disjoint: neither sequence is a contiguous
+    // window of the other, so each emitted restore registers in exactly one
+    // counter.
+    let emergency_regular_restore_count = raw
+        .windows(EMERGENCY_REGULAR_RESTORE_BYTES.len())
+        .filter(|window| *window == EMERGENCY_REGULAR_RESTORE_BYTES)
+        .count();
+    let emergency_alternate_screen_restore_count = raw
         .windows(EMERGENCY_RESTORE_BYTES.len())
         .filter(|window| *window == EMERGENCY_RESTORE_BYTES)
         .count();
@@ -807,7 +824,8 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
         finished_within_timeout,
         sole_stdout_owner,
         saw_cursor_show,
-        emergency_restore_count,
+        emergency_regular_restore_count,
+        emergency_alternate_screen_restore_count,
     }
 }
 

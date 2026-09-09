@@ -12157,7 +12157,35 @@ mod tests {
 
     #[test]
     fn installed_product_panic_hook_emits_complete_restore_sequence() -> io::Result<()> {
+        use pi_tui::testkit::{
+            CapabilityProfile, DriverSession, Geometry, LaunchSpec, TerminalDriver,
+        };
+        #[cfg(unix)]
+        use pi_tui::testkit::PosixPtyDriver;
+        #[cfg(windows)]
+        use pi_tui::testkit::ConPtyDriver;
+
         const CHILD_ENV: &str = "PI_TEST_PRODUCT_PANIC_HOOK_PATH";
+        const CHILD_ENTERED_ENV: &str = "PI_TEST_PRODUCT_PANIC_HOOK_ENTERED";
+        const CHILD_TEST: &str =
+            "modes::interactive::runtime::tests::installed_product_panic_hook_emits_complete_restore_sequence";
+
+        fn run_under_pty<D: TerminalDriver>(
+            driver: &D,
+            spec: &LaunchSpec,
+        ) -> io::Result<()> {
+            let session = driver
+                .open(spec)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let status = session
+                .close()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            if status.success() {
+                return Err(io::Error::other("panic fixture unexpectedly succeeded"));
+            }
+            Ok(())
+        }
+
         if let Some(path) = std::env::var_os(CHILD_ENV) {
             let writer = std::fs::OpenOptions::new()
                 .create(true)
@@ -12165,6 +12193,17 @@ mod tests {
                 .open(path)?;
             let emergency = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let _restore = install_product_panic_emergency_hook(emergency, writer);
+            let _guard = if std::env::var_os(CHILD_ENTERED_ENV).is_some() {
+                // Use the real fullscreen path. The PTY parent gives this
+                // child a controlling terminal, while stdout remains separate
+                // from the file used to capture the panic hook.
+                let mut guard = TerminalGuard::new(std::io::stdout());
+                guard.activate(false)?;
+                guard.enter_fullscreen()?;
+                Some(guard)
+            } else {
+                None
+            };
             // The fixture MUST execute the installed panic hook;
             // `resume_unwind` deliberately bypasses hooks, so an explicit
             // panic is the only honest trigger. Test-only lint exception.
@@ -12175,26 +12214,57 @@ mod tests {
         }
 
         let directory = tempfile::tempdir()?;
-        let capture = directory.path().join("panic-restore.bin");
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args([
-                "--exact",
-                "modes::interactive::runtime::tests::installed_product_panic_hook_emits_complete_restore_sequence",
-                "--nocapture",
-            ])
-            .env(CHILD_ENV, &capture)
+        let executable = std::env::current_exe()?;
+        let child_args = ["--exact", CHILD_TEST, "--nocapture"];
+
+        // Nothing entered: emitting ESC[?1049l here would tear down the
+        // alternate screen owned by a parent application.
+        let regular = directory.path().join("panic-restore-regular.bin");
+        let output = std::process::Command::new(&executable)
+            .args(child_args)
+            .env(CHILD_ENV, &regular)
+            .env_remove(CHILD_ENTERED_ENV)
             .output()?;
         assert!(
             !output.status.success(),
             "panic fixture unexpectedly succeeded"
         );
-        // The product hook uses the stateless, signal-safe fallback. It must
-        // clear a possibly unknown fullscreen state before regular protocols.
         assert_eq!(
-            std::fs::read(capture)?,
-            b"\x1b[?2026l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\
-\x1b[?7h\x1b[?1049l\x1b[<u\x1b[?2004l\
-\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[0m"
+            std::fs::read(&regular)?.as_slice(),
+            pi_tui::terminal::guard::EMERGENCY_REGULAR_RESTORE_BYTES
+        );
+
+        // Entered: real fullscreen activation arms the process-global flag,
+        // so the hook emits the complete sequence including ESC[?1049l.
+        let fullscreen = directory.path().join("panic-restore-fullscreen.bin");
+        let geometry =
+            Geometry::new(80, 24).map_err(|error| io::Error::other(error.to_string()))?;
+        let env = std::collections::BTreeMap::from([
+            (
+                CHILD_ENV.to_owned(),
+                fullscreen.display().to_string(),
+            ),
+            (CHILD_ENTERED_ENV.to_owned(), "1".to_owned()),
+        ]);
+        let spec = LaunchSpec {
+            argv: vec![
+                executable.display().to_string(),
+                "--exact".to_owned(),
+                CHILD_TEST.to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            cwd: directory.path().to_path_buf(),
+            env,
+            geometry,
+            profile: CapabilityProfile::Xterm256Color,
+        };
+        #[cfg(unix)]
+        run_under_pty(&PosixPtyDriver, &spec)?;
+        #[cfg(windows)]
+        run_under_pty(&ConPtyDriver, &spec)?;
+        assert_eq!(
+            std::fs::read(&fullscreen)?.as_slice(),
+            pi_tui::terminal::guard::EMERGENCY_RESTORE_BYTES
         );
         Ok(())
     }

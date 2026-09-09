@@ -26,16 +26,25 @@ pub const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags =
         .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
         .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
 
-/// Exact signal-safe terminal recovery sequence used by panic/signal handlers.
+/// Complete signal-safe terminal recovery sequence for a process that entered fullscreen.
 ///
-/// The sequence is deliberately conservative: it disables every fullscreen
-/// mouse mode, restores wrapping, leaves the alternate screen, then unwinds
-/// the regular guard-owned protocols. The emergency path must be useful even
-/// when the recorded activation state was lost during a panic.
+/// Mouse modes and wrapping are always restored. The emergency writer omits
+/// alternate-screen exit until this process has entered it, preserving a
+/// parent application's alternate screen.
 pub const EMERGENCY_RESTORE_BYTES: &[u8] = b"\x1b[?2026l\
 \x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\
 \x1b[?7h\x1b[?1049l\x1b[<u\x1b[?2004l\
 \x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[0m";
+
+/// Complete signal-safe terminal recovery sequence for a process that has not entered fullscreen.
+pub const EMERGENCY_REGULAR_RESTORE_BYTES: &[u8] = b"\x1b[?2026l\
+\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\
+\x1b[?7h\x1b[<u\x1b[?2004l\
+\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[0m";
+
+// Historical rather than guard-local: rollback/drop must not erase emergency
+// recovery coverage after a successful entry write.
+static ENTERED_ALTERNATE_SCREEN: AtomicBool = AtomicBool::new(false);
 
 /// Ordered restore stack entry for regular terminal modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +233,8 @@ impl<W: Write> TerminalGuard<W> {
         Ok(())
     }
 
-    /// One fallible activation path: apply every missing step, then flush.
+    /// One fallible activation path: apply every missing step, flushing the
+    /// alternate-screen entry before later steps, then flush again at the end.
     fn activate_fullscreen_steps(&mut self, steps: &[FullscreenStep]) -> io::Result<()> {
         for step in steps {
             // A failed teardown keeps its mode recorded as unresolved; retain
@@ -278,6 +288,10 @@ impl<W: Write> TerminalGuard<W> {
         match step {
             FullscreenStep::AlternateScreen => {
                 queue!(self.writer, EnterAlternateScreen)?;
+                // `queue!` may only buffer the entry. Arm emergency cleanup
+                // after the flush that proves the terminal saw it.
+                self.writer.flush()?;
+                ENTERED_ALTERNATE_SCREEN.store(true, Ordering::Release);
             }
             FullscreenStep::AutowrapDisabled => {
                 queue!(self.writer, DisableLineWrap)?;
@@ -563,7 +577,12 @@ pub fn install_panic_emergency_hook(
 ///
 /// Returns an I/O error if writing or flushing the restore sequence fails.
 pub fn write_emergency_restore_bytes<W: Write>(writer: &mut W) -> io::Result<()> {
-    writer.write_all(EMERGENCY_RESTORE_BYTES)?;
+    let bytes = if ENTERED_ALTERNATE_SCREEN.load(Ordering::Acquire) {
+        EMERGENCY_RESTORE_BYTES
+    } else {
+        EMERGENCY_REGULAR_RESTORE_BYTES
+    };
+    writer.write_all(bytes)?;
     writer.flush()
 }
 
