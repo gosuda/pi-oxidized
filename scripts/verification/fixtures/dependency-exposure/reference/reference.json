@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-09-09T15:19:15.305Z",
-	"captureHead": "354a2afd6ec5949a2e6eb02b7d66d997ef77d093",
+	"capturedAt": "2026-09-09T22:09:26.542Z",
+	"captureHead": "b689d75f192df9d72431f7ac1ad97b338f3e8957",
 	"metafile": {
-		"projectionPath": "metafile-projection.a5d1abeaf473bf8124c40df2a3eea0306e7ab3e55d3edff69631afa5b9150f2d.json",
-		"sha256": "a5d1abeaf473bf8124c40df2a3eea0306e7ab3e55d3edff69631afa5b9150f2d",
+		"projectionPath": "metafile-projection.db03ab5dd02a40ae151ba9fea188ae745cb973e9abcd4926b6ebb9c2c58b2d76.json",
+		"sha256": "db03ab5dd02a40ae151ba9fea188ae745cb973e9abcd4926b6ebb9c2c58b2d76",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -17,10 +17,10 @@
 			"--target",
 			"bun-linux-x64-baseline",
 			"--outfile",
-			"/tmp/exposure-capture-fuj60j/pi-extension-host",
-			"--metafile=/tmp/exposure-capture-fuj60j/metafile.json"
+			"/tmp/exposure-capture-eBiPZ2/pi-extension-host",
+			"--metafile=/tmp/exposure-capture-eBiPZ2/metafile.json"
 		],
-		"metafileSha256": "a7b2627e0d42793e0fa6bea82f803010bf243cd4e485502a6f686598148c62d9"
+		"metafileSha256": "6cee4f48f7ac9e26d4f9b7a392c996b4c03f895f5165db8193b27c88b21c8221"
 	},
 	"cargo": {
 		"projectionPath": "cargo-graph-projection.aa52eb1fc7d909b55d12f97c8f481588a3e17d81caade5cb6bafd86a7057c1fc.json",
