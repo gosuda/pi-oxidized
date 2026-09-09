@@ -45,6 +45,19 @@ struct ReplicaInner {
     sequence: Option<JsInteger>,
 }
 
+struct ReplicaDelivery {
+    listeners: Vec<ReplicatedStateListener>,
+    value: Arc<JsonValue>,
+    context: Context,
+    delivery: ReplicatedStateDelivery,
+}
+
+#[derive(Default)]
+struct ReplicaDeliveries {
+    pending: VecDeque<ReplicaDelivery>,
+    draining: bool,
+}
+
 /// A cold consumer replica that validates hydration and contiguous updates.
 #[derive(Clone)]
 pub struct ReplicatedState {
@@ -53,6 +66,7 @@ pub struct ReplicatedState {
     next_listener: Arc<AtomicU64>,
     report_error: Arc<dyn Fn(ServiceError) + Send + Sync>,
     transition_gate: Arc<Mutex<()>>,
+    deliveries: Arc<Mutex<ReplicaDeliveries>>,
 }
 
 impl std::fmt::Debug for ReplicatedState {
@@ -85,6 +99,7 @@ impl ReplicatedState {
             next_listener: Arc::new(AtomicU64::new(0)),
             report_error,
             transition_gate: Arc::new(Mutex::new(())),
+            deliveries: Arc::new(Mutex::new(ReplicaDeliveries::default())),
         }
     }
 
@@ -131,8 +146,7 @@ impl ReplicatedState {
             inner.value = Some(Arc::clone(&value));
             inner.sequence = Some(sequence);
         }
-        drop(transition);
-        self.deliver_all(
+        let drain = self.enqueue_delivery(
             &value,
             context,
             ReplicatedStateDelivery {
@@ -140,6 +154,10 @@ impl ReplicatedState {
                 sequence,
             },
         );
+        drop(transition);
+        if drain {
+            self.drain_deliveries();
+        }
         Ok(())
     }
     /// Installs a contiguous incremental batch and delivers an update revision.
@@ -184,8 +202,7 @@ impl ReplicatedState {
             inner.value = Some(Arc::clone(&value));
             inner.sequence = Some(sequence);
         }
-        drop(transition);
-        self.deliver_all(
+        let drain = self.enqueue_delivery(
             &value,
             context,
             ReplicatedStateDelivery {
@@ -193,6 +210,10 @@ impl ReplicatedState {
                 sequence,
             },
         );
+        drop(transition);
+        if drain {
+            self.drain_deliveries();
+        }
         Ok(())
     }
     /// Discards the hydrated revision and sequence without notifying listeners.
@@ -226,31 +247,74 @@ impl ReplicatedState {
             listeners.insert(id, listener);
             (current, listener_for_call)
         };
-        if let Some((value, sequence)) = current {
-            self.deliver_one(
-                &listener_for_call,
+        let drain = if let Some((value, sequence)) = current {
+            self.enqueue(ReplicaDelivery {
+                listeners: vec![listener_for_call],
                 value,
-                Context::background(),
-                ReplicatedStateDelivery {
+                context: Context::background(),
+                delivery: ReplicatedStateDelivery {
                     kind: ReplicatedStateDeliveryKind::Hydrate,
                     sequence,
                 },
-            );
-        }
+            })
+        } else {
+            false
+        };
         drop(transition);
+        if drain {
+            self.drain_deliveries();
+        }
         Ok(remove_listener(&self.listeners, id))
     }
 
-    fn deliver_all(
+    fn enqueue_delivery(
         &self,
         value: &Arc<JsonValue>,
         context: &Context,
         delivery: ReplicatedStateDelivery,
-    ) {
-        let listeners: Vec<ReplicatedStateListener> =
-            lock(&self.listeners).values().cloned().collect();
-        for listener in listeners {
-            self.deliver_one(&listener, Arc::clone(value), context.clone(), delivery);
+    ) -> bool {
+        let listeners = lock(&self.listeners).values().cloned().collect();
+        self.enqueue(ReplicaDelivery {
+            listeners,
+            value: Arc::clone(value),
+            context: context.clone(),
+            delivery,
+        })
+    }
+
+    // Reserve delivery order under the transition gate, but never hold it
+    // across callbacks: reentrant transitions append behind this revision.
+    fn enqueue(&self, delivery: ReplicaDelivery) -> bool {
+        let mut deliveries = lock(&self.deliveries);
+        deliveries.pending.push_back(delivery);
+        if deliveries.draining {
+            return false;
+        }
+        deliveries.draining = true;
+        true
+    }
+
+    fn drain_deliveries(&self) {
+        loop {
+            let next = {
+                let mut deliveries = lock(&self.deliveries);
+                let next = deliveries.pending.pop_front();
+                if next.is_none() {
+                    deliveries.draining = false;
+                }
+                next
+            };
+            let Some(next) = next else {
+                return;
+            };
+            for listener in next.listeners {
+                self.deliver_one(
+                    &listener,
+                    Arc::clone(&next.value),
+                    next.context.clone(),
+                    next.delivery,
+                );
+            }
         }
     }
 
@@ -277,11 +341,7 @@ struct PendingPublication {
     context: Context,
 }
 
-#[derive(Clone, Copy)]
-enum PublicationMode {
-    Inline,
-    Queued,
-}
+// Same-thread publications dispatch inline; cross-thread publications queue.
 
 enum PublicationRoute {
     Start(PendingPublication),
@@ -355,12 +415,12 @@ impl MutableReplicatedState {
 
     /// Runs a synchronous mutation against a detached tracked-state revision.
     ///
-    /// The user callback never runs while the state mutex is held.  Its
-    /// resulting value is adopted as the next tracked root afterward.
+    /// The callback runs under the state mutex to serialize read-modify-write.
+    /// It must not call methods on this state. A panic leaves the root unchanged.
     pub fn with_state_mut<R>(&self, mutate: impl FnOnce(&mut JsonValue) -> R) -> R {
-        let mut next = self.state().as_ref().clone();
-        let result = mutate(&mut next);
         let mut inner = lock(&self.inner);
+        let mut next = inner.tracker.state().clone();
+        let result = mutate(&mut next);
         *inner.tracker.state_mut() = next;
         result
     }
@@ -424,7 +484,7 @@ impl MutableReplicatedState {
         match route {
             PublicationRoute::Start(publication) => {
                 let mut panic_payload =
-                    dispatch_publication(self, &publication, PublicationMode::Inline);
+                    dispatch_publication(self, &publication);
                 if let Some(payload) = drain_publications(self) {
                     panic_payload.get_or_insert(payload);
                 }
@@ -434,7 +494,7 @@ impl MutableReplicatedState {
             }
             PublicationRoute::Inline(publication) => {
                 if let Some(payload) =
-                    dispatch_publication(self, &publication, PublicationMode::Inline)
+                    dispatch_publication(self, &publication)
                 {
                     std::panic::resume_unwind(payload);
                 }
@@ -507,7 +567,7 @@ fn drain_publications(state: &MutableReplicatedState) -> Option<Box<dyn std::any
         }) else {
             return panic_payload;
         };
-        if let Some(payload) = dispatch_publication(state, &publication, PublicationMode::Queued) {
+        if let Some(payload) = dispatch_publication(state, &publication) {
             panic_payload.get_or_insert(payload);
         }
     }
@@ -516,7 +576,6 @@ fn drain_publications(state: &MutableReplicatedState) -> Option<Box<dyn std::any
 fn dispatch_publication(
     state: &MutableReplicatedState,
     publication: &PendingPublication,
-    mode: PublicationMode,
 ) -> Option<Box<dyn std::any::Any + Send>> {
     let mut panic_payload = None;
     let source_listeners = lock(&state.source_listeners)
@@ -524,10 +583,7 @@ fn dispatch_publication(
         .cloned()
         .collect::<Vec<_>>();
     for listener in source_listeners {
-        let sequence = match mode {
-            PublicationMode::Inline => lock(&state.inner).sequence,
-            PublicationMode::Queued => publication.sequence,
-        };
+        let sequence = publication.sequence;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             listener(&publication.ops, sequence, publication.context.clone());
         }));
@@ -537,19 +593,13 @@ fn dispatch_publication(
     }
 
     let listeners = lock(&state.listeners).values().cloned().collect::<Vec<_>>();
-    let sequence = match mode {
-        PublicationMode::Inline => lock(&state.inner).sequence,
-        PublicationMode::Queued => publication.sequence,
-    };
+    let sequence = publication.sequence;
     let delivery = ReplicatedStateDelivery {
         kind: ReplicatedStateDeliveryKind::Update,
         sequence,
     };
     for listener in listeners {
-        let value = match mode {
-            PublicationMode::Inline => lock(&state.inner).published.clone(),
-            PublicationMode::Queued => Arc::clone(&publication.value),
-        };
+        let value = Arc::clone(&publication.value);
         let context = publication.context.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             listener(value, context, delivery);
@@ -672,7 +722,7 @@ mod tests {
                 ('A', 1.0, 1.0),
                 ('A', 2.0, 2.0),
                 ('B', 2.0, 2.0),
-                ('B', 2.0, 1.0),
+                ('B', 1.0, 1.0),
             ]
         );
         Ok(())
