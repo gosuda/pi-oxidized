@@ -147,9 +147,11 @@ impl HarnessRuntime {
 
     pub(crate) async fn fault(&self, fault: HarnessFault, cx: &Context) {
         let fault = Arc::new(fault);
-        if let Ok(mut slot) = self.fault.lock()
-            && slot.is_none()
         {
+            let mut slot = self.fault.lock().unwrap_or_else(|error| error.into_inner());
+            if slot.is_some() {
+                return;
+            }
             *slot = Some(Arc::clone(&fault));
         }
         if let Ok(event) = HarnessEvent::new(
@@ -285,9 +287,13 @@ impl AgentHarness for HarnessRuntime {
             if self.is_closed() {
                 return Err(self.closed_error());
             }
-            let lanes = self.lanes.lock().await;
+            // Snapshot the registry and release it before reading lane data:
+            // a fault broadcast re-enters the registry through lane_snapshot
+            // while the faulting commit path may still hold that lane's data
+            // guard, so holding the registry across info() could deadlock.
+            let lanes = self.lane_snapshot().await;
             let mut result = Vec::with_capacity(lanes.len());
-            for lane in lanes.values() {
+            for lane in &lanes {
                 result.push(lane.info(cx).await?);
             }
             Ok(result)
@@ -399,10 +405,9 @@ impl AgentHarness for HarnessRuntime {
             // active_tool_names; a swapped-out name fails closed at
             // generation. The lane registry and config write locks are held
             // across check-and-swap: `lane()` takes `lanes` before reading
-            // config and `set_active_tools` reads config before committing
-            // lane metadata, so this order cannot invert and no lane can
-            // start referencing a removed tool mid-swap. Lane metadata is
-            // read through the session, which never waits on harness locks.
+            // config and lane configuration commits hold a config read guard.
+            // Lane metadata is read through the session, which never waits
+            // on harness locks or lane data.
             let lanes = self.lanes.lock().await;
             let mut config = self.config.write().await;
             let offered: std::collections::BTreeSet<&str> =
@@ -427,6 +432,8 @@ impl AgentHarness for HarnessRuntime {
                     });
                 }
             }
+            config.active_tool_names
+                .retain(|name| offered.contains(name.as_str()));
             config.tools = tools;
             drop(config);
             drop(lanes);

@@ -160,24 +160,15 @@ impl LaneRuntime {
     /// lane `data` guard across the commit; the broadcast never awaits it
     /// because `seal` records the lane fault in a synchronous slot.
     pub(crate) async fn commit_fault(&self, error: SessionError, cx: &Context) -> HarnessError {
-        if self
-            .owner
-            .fault
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
-            .is_none()
-        {
-            self.owner
-                .fault(
-                    HarnessFault {
-                        message: format!("session operation failed: {error}"),
-                        cause: Box::new(error),
-                    },
-                    cx,
-                )
-                .await;
-        }
+        self.owner
+            .fault(
+                HarnessFault {
+                    message: format!("session operation failed: {error}"),
+                    cause: Box::new(error),
+                },
+                cx,
+            )
+            .await;
         match self.owner.fault.lock().ok().and_then(|slot| slot.clone()) {
             Some(fault) => sealed_rejection(&fault),
             None => self.owner.closed_error(),
@@ -707,21 +698,7 @@ impl AgentLane for LaneRuntime {
         cx: &'a Context,
     ) -> BoxFuture<'a, Result<(), HarnessError>> {
         Box::pin(async move {
-            let available = {
-                let guard = self.owner.config.read().await;
-                guard
-                    .tools
-                    .iter()
-                    .map(|tool| tool.name().to_owned())
-                    .collect::<std::collections::BTreeSet<_>>()
-            };
-            if let Some(name) = names.iter().find(|name| !available.contains(name.as_str())) {
-                return Err(HarnessError::InvalidLane {
-                    lane: self.name.clone(),
-                    reason: "unknown_tool".to_owned(),
-                    message: format!("active tool {name} is not registered"),
-                });
-            }
+            self.ensure_open()?;
             self.set_lane_configuration(|config| config.active_tool_names = names, cx)
                 .await
         })
@@ -745,6 +722,23 @@ impl LaneRuntime {
     {
         self.ensure_open()?;
         let mut data = self.data.lock().await;
+        // Take data before config: a commit failure holding data may need the
+        // lane registry, while set_tools holds that registry waiting for config.
+        let config = self.owner.config.read().await;
+        let previous = data.config.clone();
+        let mut next = previous.clone();
+        change(&mut next);
+        if let Some(name) = next
+            .active_tool_names
+            .iter()
+            .find(|name| !config.tools.iter().any(|tool| tool.name() == name.as_str()))
+        {
+            return Err(HarnessError::InvalidLane {
+                lane: self.name.clone(),
+                reason: "unknown_tool".to_owned(),
+                message: format!("active tool {name} is not registered"),
+            });
+        }
         if let Some(operation) = data.operation.as_ref() {
             return Err(HarnessError::LaneBusy {
                 lane: self.name.clone(),
@@ -753,12 +747,25 @@ impl LaneRuntime {
                 message: "lane configuration cannot change during an operation".to_owned(),
             });
         }
-        let previous = data.config.clone();
-        let mut next = previous.clone();
-        change(&mut next);
         let write = set_json(&super::support::lane_config_address(&self.name), &next)
             .map_err(map_session_error)?;
-        self.commit(vec![write], cx).await?;
+        let mutator = self
+            .owner
+            .session
+            .begin_mutation(cx)
+            .await
+            .map_err(map_session_error)?;
+        let result = mutator.commit(vec![write], cx).await;
+        // Fault broadcast takes the lane registry; release config before it
+        // can meet set_tools holding the registry and waiting for config.
+        drop(config);
+        if let Err(error) = result {
+            // The broadcast re-enters the lane registry, so the data guard
+            // must not be held across it either. The in-memory config was
+            // not yet updated, so releasing it here loses nothing.
+            drop(data);
+            return Err(self.commit_fault(error, cx).await);
+        }
         let event_change = if previous.model != next.model {
             crate::harness::event::ConfigUpdateChange::Model {
                 value: next.model.clone(),
