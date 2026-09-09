@@ -1016,6 +1016,7 @@ impl CoordinatorProcess {
                 ("serverConnectionId", json_string(previous.server_connection_id)),
             ]));
             self.send_value(&previous.writer, json_object([("type", json_string("server_replaced"))]));
+            self.disconnect(previous.connection_id);
         }
         self.notify_peers(json_object([
             ("type", json_string("server_connected")),
