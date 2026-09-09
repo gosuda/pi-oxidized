@@ -628,10 +628,22 @@ impl MutableReplicatedState {
             DispatchRoute::Queued => {}
         }
         let remove = remove_listener(&self.listeners, id);
+        let listeners = Arc::clone(&self.listeners);
         let inner = Arc::clone(&self.inner);
         Ok(Arc::new(move || {
-            remove();
-            lock(&inner).retired.insert(id);
+            // One hold decides both halves: an already-dispatched listener
+            // is removed, an undispatched hydration is tombstoned.  Split
+            // holds would let a dispatch slip between the map check and the
+            // tombstone and resurrect the listener.
+            let mut inner = lock(&inner);
+            let listeners = lock(&listeners);
+            if listeners.contains_key(&id) {
+                drop(listeners);
+                drop(inner);
+                remove();
+            } else {
+                inner.retired.insert(id);
+            }
         }))
     }
     /// Subscribes to source-side decoded operation batches.
