@@ -47,14 +47,20 @@ struct PluginPackageProfile {
 /// `configured == None` restores the persisted profile (or an empty list when
 /// none exists). `Some(&[])` removes the profile. A non-empty explicit list is
 /// normalized, persisted, and returned.
+///
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
 pub async fn restore_server_plugin_package_profile(
     directory: &Path,
     server_id: &ServerId,
     configured: Option<&[String]>,
 ) -> Result<Vec<String>, PluginProfileError> {
     match configured {
-        None => Ok(read_server_plugin_package_profile(directory, server_id).await?.unwrap_or_default()),
-        Some(paths) if paths.is_empty() => {
+        None => Ok(read_server_plugin_package_profile(directory, server_id)
+            .await?
+            .unwrap_or_default()),
+        Some([]) => {
             remove_server_plugin_package_profile(directory, server_id).await?;
             Ok(Vec::new())
         }
@@ -63,6 +69,9 @@ pub async fn restore_server_plugin_package_profile(
 }
 
 /// Reads the server-scoped package profile, returning `None` when absent.
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
 pub async fn read_server_plugin_package_profile(
     directory: &Path,
     server_id: &ServerId,
@@ -71,19 +80,28 @@ pub async fn read_server_plugin_package_profile(
     match read_profile(&path).await {
         Ok(profile) => {
             if profile.session_path.is_some() {
-                return Err(PluginProfileError::Invalid("server profile has a session path".to_owned()));
+                return Err(PluginProfileError::Invalid(
+                    "server profile has a session path".to_owned(),
+                ));
             }
             if profile.package_paths.is_empty() {
-                return Err(PluginProfileError::Invalid("server profile package paths must not be empty".to_owned()));
+                return Err(PluginProfileError::Invalid(
+                    "server profile package paths must not be empty".to_owned(),
+                ));
             }
             Ok(Some(profile.package_paths))
         }
-        Err(PluginProfileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(PluginProfileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
         Err(error) => Err(error),
     }
 }
 
 /// Writes the server-scoped package profile after path normalization.
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
 pub async fn write_server_plugin_package_profile(
     directory: &Path,
     server_id: &ServerId,
@@ -93,13 +111,20 @@ pub async fn write_server_plugin_package_profile(
     let path = server_profile_path(directory, server_id);
     write_profile(
         &path,
-        &PluginPackageProfile { version: PLUGIN_PACKAGE_PROFILE_VERSION, session_path: None, package_paths: package_paths.clone() },
+        &PluginPackageProfile {
+            version: PLUGIN_PACKAGE_PROFILE_VERSION,
+            session_path: None,
+            package_paths: package_paths.clone(),
+        },
     )
     .await?;
     Ok(package_paths)
 }
 
 /// Removes the server-scoped package profile. Missing files are already absent.
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
 pub async fn remove_server_plugin_package_profile(
     directory: &Path,
     server_id: &ServerId,
@@ -108,6 +133,9 @@ pub async fn remove_server_plugin_package_profile(
 }
 
 /// Reads the session-scoped profile for one session path.
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
 pub async fn read_session_plugin_package_profile(
     directory: &Path,
     server_id: &ServerId,
@@ -117,16 +145,23 @@ pub async fn read_session_plugin_package_profile(
     match read_profile(&path).await {
         Ok(profile) => {
             if profile.session_path.as_deref() != Some(session_path) {
-                return Err(PluginProfileError::Invalid("session path does not match profile name".to_owned()));
+                return Err(PluginProfileError::Invalid(
+                    "session path does not match profile name".to_owned(),
+                ));
             }
             Ok(Some(profile.package_paths))
         }
-        Err(PluginProfileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(PluginProfileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
         Err(error) => Err(error),
     }
 }
 
 /// Writes a session-scoped profile after path normalization.
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
 pub async fn write_session_plugin_package_profile(
     directory: &Path,
     server_id: &ServerId,
@@ -134,7 +169,9 @@ pub async fn write_session_plugin_package_profile(
     package_paths: &[String],
 ) -> Result<Vec<String>, PluginProfileError> {
     if session_path.is_empty() {
-        return Err(PluginProfileError::Invalid("session path must not be empty".to_owned()));
+        return Err(PluginProfileError::Invalid(
+            "session path must not be empty".to_owned(),
+        ));
     }
     let package_paths = normalize_paths(package_paths)?;
     let path = session_profile_path(directory, server_id, session_path);
@@ -151,6 +188,9 @@ pub async fn write_session_plugin_package_profile(
 }
 
 /// Removes a session-scoped profile. Missing files are already absent.
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
 pub async fn remove_session_plugin_package_profile(
     directory: &Path,
     server_id: &ServerId,
@@ -182,24 +222,40 @@ async fn read_profile(path: &Path) -> Result<PluginPackageProfile, PluginProfile
     let contents = fs::read_to_string(path).await?;
     let profile: PluginPackageProfile = serde_json::from_str(&contents)?;
     if profile.version != PLUGIN_PACKAGE_PROFILE_VERSION {
-        return Err(PluginProfileError::Invalid(format!("unsupported version {}", profile.version)));
+        return Err(PluginProfileError::Invalid(format!(
+            "unsupported version {}",
+            profile.version
+        )));
     }
-    if profile.package_paths.iter().any(|path| path.is_empty()) {
-        return Err(PluginProfileError::Invalid("package path must not be empty".to_owned()));
+    if profile.package_paths.iter().any(String::is_empty) {
+        return Err(PluginProfileError::Invalid(
+            "package path must not be empty".to_owned(),
+        ));
     }
     let mut paths = profile.package_paths.clone();
     paths.sort();
     paths.dedup();
     if paths.len() != profile.package_paths.len() {
-        return Err(PluginProfileError::Invalid("package paths must be unique".to_owned()));
+        return Err(PluginProfileError::Invalid(
+            "package paths must be unique".to_owned(),
+        ));
     }
-    if profile.package_paths.iter().any(|path| !Path::new(path).is_absolute()) {
-        return Err(PluginProfileError::Invalid("package paths must be absolute".to_owned()));
+    if profile
+        .package_paths
+        .iter()
+        .any(|path| !Path::new(path).is_absolute())
+    {
+        return Err(PluginProfileError::Invalid(
+            "package paths must be absolute".to_owned(),
+        ));
     }
     Ok(profile)
 }
 
-async fn write_profile(path: &Path, profile: &PluginPackageProfile) -> Result<(), PluginProfileError> {
+async fn write_profile(
+    path: &Path,
+    profile: &PluginPackageProfile,
+) -> Result<(), PluginProfileError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -237,15 +293,19 @@ fn normalize_paths(paths: &[String]) -> Result<Vec<String>, PluginProfileError> 
     let mut normalized = Vec::with_capacity(paths.len());
     for path in paths {
         if path.trim().is_empty() {
-            return Err(PluginProfileError::Invalid("package path must not be empty".to_owned()));
+            return Err(PluginProfileError::Invalid(
+                "package path must not be empty".to_owned(),
+            ));
         }
         let candidate = absolute_lexical(Path::new(path));
         let value = candidate
             .to_str()
             .ok_or_else(|| PluginProfileError::NonUtf8(candidate.clone()))?
             .to_owned();
-        if normalized.iter().any(|item| item == &value) {
-            return Err(PluginProfileError::Invalid("package paths must be unique".to_owned()));
+        if normalized.contains(&value) {
+            return Err(PluginProfileError::Invalid(
+                "package paths must be unique".to_owned(),
+            ));
         }
         normalized.push(value);
     }
@@ -265,7 +325,9 @@ fn absolute_lexical(path: &Path) -> PathBuf {
             std::path::Component::ParentDir => {
                 output.pop();
             }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => output.push(component.as_os_str()),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                output.push(component.as_os_str());
+            }
             std::path::Component::Normal(value) => output.push(value),
         }
     }
@@ -273,9 +335,20 @@ fn absolute_lexical(path: &Path) -> PathBuf {
 }
 
 fn hex_prefix(bytes: &[u8], digits: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if digits == 0 {
+        return String::new();
+    }
     let mut output = String::with_capacity(digits);
     for byte in bytes {
-        output.push_str(&format!("{byte:02x}"));
+        let high = (byte >> 4) as usize;
+        output.push(HEX[high] as char);
+        if output.len() >= digits {
+            output.truncate(digits);
+            break;
+        }
+        let low = (byte & 0x0f) as usize;
+        output.push(HEX[low] as char);
         if output.len() >= digits {
             output.truncate(digits);
             break;
@@ -283,4 +356,3 @@ fn hex_prefix(bytes: &[u8], digits: usize) -> String {
     }
     output
 }
-

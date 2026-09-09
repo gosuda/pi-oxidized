@@ -4,6 +4,7 @@
 //! bundling and this module only derives its deterministic output location and
 //! forwards the real build request supplied by the caller.
 
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,7 +23,9 @@ pub const FACET_BUNDLE_MANIFEST_FILE: &str = "chord-facets.json";
 
 /// Request callback used by [`RemotePluginPackageBuilder`].
 pub type PluginBuildRequest = Arc<
-    dyn Fn(FacetBundleBuildRequest) -> BoxFuture<'static, Result<FacetBundleBuildResponse, HostError>>
+    dyn Fn(
+            FacetBundleBuildRequest,
+        ) -> BoxFuture<'static, Result<FacetBundleBuildResponse, HostError>>
         + Send
         + Sync,
 >;
@@ -32,6 +35,10 @@ pub trait PluginPackageBuilder: Send + Sync {
     /// Returns the deterministic manifest path for one package.
     fn manifest_path(&self, package_path: &str) -> PathBuf;
     /// Builds the package and returns transportable `tui` artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError`] if the host build fails or produces no artifacts.
     fn build(&self, package_path: &str) -> BoxFuture<'_, Result<Vec<JsonValue>, HostError>>;
 }
 
@@ -53,7 +60,11 @@ impl RemotePluginPackageBuilder {
         server_id: impl Into<String>,
         build_request: PluginBuildRequest,
     ) -> Self {
-        Self { directory: directory.into(), server_id: server_id.into(), build_request }
+        Self {
+            directory: directory.into(),
+            server_id: server_id.into(),
+            build_request,
+        }
     }
 
     /// Returns the output directory used in the host build request.
@@ -68,15 +79,27 @@ impl RemotePluginPackageBuilder {
 
 impl PluginPackageBuilder for RemotePluginPackageBuilder {
     fn manifest_path(&self, package_path: &str) -> PathBuf {
-        self.build_directory(package_path).join(FACET_BUNDLE_MANIFEST_FILE)
+        self.build_directory(package_path)
+            .join(FACET_BUNDLE_MANIFEST_FILE)
     }
 
+    /// Builds the package through the configured host request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError`] if the host build fails or produces no artifacts.
     fn build(&self, package_path: &str) -> BoxFuture<'_, Result<Vec<JsonValue>, HostError>> {
         let request = FacetBundleBuildRequest {
             package_path: package_path.to_owned(),
-            outdir: self.build_directory(package_path).to_string_lossy().into_owned(),
+            outdir: self
+                .build_directory(package_path)
+                .to_string_lossy()
+                .into_owned(),
             default_facets: [
-                ("session".to_owned(), DEFAULT_PLUGIN_SESSION_ENTRY.to_owned()),
+                (
+                    "session".to_owned(),
+                    DEFAULT_PLUGIN_SESSION_ENTRY.to_owned(),
+                ),
                 ("tui".to_owned(), DEFAULT_PLUGIN_TUI_ENTRY.to_owned()),
             ]
             .into_iter()
@@ -101,10 +124,16 @@ pub fn normalize_plugin_package_paths(paths: &[String]) -> Vec<String> {
 }
 
 /// Fallible package-path normalization for configuration boundaries.
+///
+/// # Errors
+///
+/// Returns [`HostError::NotConfigured`] when a path is empty or duplicated.
 pub fn try_normalize_plugin_package_paths(paths: &[String]) -> Result<Vec<String>, HostError> {
     let normalized = normalize_plugin_package_paths(paths);
     if paths.iter().any(|path| path.trim().is_empty()) {
-        return Err(HostError::NotConfigured { env: "PI_PLUGIN_PACKAGE" });
+        return Err(HostError::NotConfigured {
+            env: "PI_PLUGIN_PACKAGE",
+        });
     }
     if normalized.windows(2).any(|pair| pair[0] == pair[1]) || {
         let mut unique = normalized.clone();
@@ -112,7 +141,9 @@ pub fn try_normalize_plugin_package_paths(paths: &[String]) -> Result<Vec<String
         unique.dedup();
         unique.len() != normalized.len()
     } {
-        return Err(HostError::NotConfigured { env: "PI_PLUGIN_PACKAGE" });
+        return Err(HostError::NotConfigured {
+            env: "PI_PLUGIN_PACKAGE",
+        });
     }
     Ok(normalized)
 }
@@ -121,17 +152,20 @@ pub fn try_normalize_plugin_package_paths(paths: &[String]) -> Result<Vec<String
 #[must_use]
 pub fn plugin_build_directory_name(package_path: &str) -> String {
     let normalized = normalized_package_path(package_path);
-    let package_leaf = if normalized.file_name().is_some_and(|name| name == "package.json") {
+    let package_leaf = if normalized
+        .file_name()
+        .is_some_and(|name| name == "package.json")
+    {
         normalized
             .parent()
             .and_then(Path::file_name)
-            .unwrap_or_else(|| Path::new("plugin"))
+            .unwrap_or_else(|| OsStr::new("plugin"))
             .to_string_lossy()
             .into_owned()
     } else {
         normalized
             .file_name()
-            .unwrap_or_else(|| Path::new("plugin"))
+            .unwrap_or_else(|| OsStr::new("plugin"))
             .to_string_lossy()
             .into_owned()
     };
@@ -156,15 +190,6 @@ pub fn plugin_build_directory_name(package_path: &str) -> String {
     format!("{stem}-{}", hex_prefix(&digest, 12))
 }
 
-fn package_directory_path(package_path: &str) -> PathBuf {
-    let normalized = normalized_package_path(package_path);
-    if normalized.file_name().is_some_and(|name| name == "package.json") {
-        normalized.parent().map_or(normalized, Path::to_path_buf)
-    } else {
-        normalized
-    }
-}
-
 fn normalized_package_path(package_path: &str) -> PathBuf {
     let candidate = Path::new(package_path);
     let absolute = if candidate.is_absolute() {
@@ -172,10 +197,10 @@ fn normalized_package_path(package_path: &str) -> PathBuf {
     } else {
         std::env::current_dir().map_or_else(|_| PathBuf::from("."), |cwd| cwd.join(candidate))
     };
-    normalize_components(absolute)
+    normalize_components(&absolute)
 }
 
-fn normalize_components(path: PathBuf) -> PathBuf {
+fn normalize_components(path: &Path) -> PathBuf {
     let mut output = PathBuf::new();
     for component in path.components() {
         match component {
@@ -191,9 +216,20 @@ fn normalize_components(path: PathBuf) -> PathBuf {
 }
 
 fn hex_prefix(bytes: &[u8], digits: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if digits == 0 {
+        return String::new();
+    }
     let mut output = String::with_capacity(digits);
     for byte in bytes {
-        output.push_str(&format!("{byte:02x}"));
+        let high = (byte >> 4) as usize;
+        output.push(HEX[high] as char);
+        if output.len() >= digits {
+            output.truncate(digits);
+            break;
+        }
+        let low = (byte & 0x0f) as usize;
+        output.push(HEX[low] as char);
         if output.len() >= digits {
             output.truncate(digits);
             break;

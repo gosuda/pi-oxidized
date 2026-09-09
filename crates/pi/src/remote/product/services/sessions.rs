@@ -7,7 +7,9 @@ use crate::remote::schemas::ServerId;
 use pi_agent::service::error::ServiceError;
 use pi_agent::service::value::JsonValue;
 
-use super::{array, integer, invalid, json_object, nullable_string, object, optional, required, string, ProductJsonConvert};
+use super::{
+    ProductJsonConvert, array, integer, invalid, json_object, object, optional, required, string,
+};
 
 /// Chord service identifier for the server-wide session directory.
 pub const SESSION_DIRECTORY_ID: &str = "pi.session-directory";
@@ -18,9 +20,15 @@ pub const SESSION_MANAGEMENT_ID: &str = "pi.session-management";
 pub const SESSION_DIRECTORY_STATE_MEMBER: &str = "state";
 /// Session-management method names.
 pub const SESSION_MANAGEMENT_CREATE_MEMBER: &str = "create";
+/// Session-management method for removing a session.
 pub const SESSION_MANAGEMENT_REMOVE_MEMBER: &str = "remove";
+/// Session-management method for attaching to a session.
 pub const SESSION_MANAGEMENT_ATTACH_MEMBER: &str = "attach";
+/// Session-management method for detaching from a session.
 pub const SESSION_MANAGEMENT_DETACH_MEMBER: &str = "detach";
+
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+const MAX_SAFE_INTEGER_F64: f64 = 9_007_199_254_740_991.0;
 
 /// Address of a session on one product server.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,15 +67,29 @@ pub struct SessionDirectoryState {
 impl ProductJsonConvert for SessionAddress {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "session address")?;
-        let server_id = ServerId::new(string(required(fields, "serverId", "session address.serverId")?, "session address.serverId")?)
-            .map_err(|_| invalid("session address.serverId"))?;
-        let session_id = string(required(fields, "sessionId", "session address.sessionId")?, "session address.sessionId")?;
-        Ok(Self { server_id, session_id })
+        let server_id = ServerId::new(string(
+            required(fields, "serverId", "session address.serverId")?,
+            "session address.serverId",
+        )?)
+        .map_err(|_| invalid("session address.serverId"))?;
+        let session_id = string(
+            required(fields, "sessionId", "session address.sessionId")?,
+            "session address.sessionId",
+        )?;
+        Ok(Self {
+            server_id,
+            session_id,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
         Ok(json_object([
-            ("serverId", JsonValue::String(pi_agent::service::value::JsString::from_utf8(self.server_id.as_str()))),
+            (
+                "serverId",
+                JsonValue::String(pi_agent::service::value::JsString::from_utf8(
+                    self.server_id.as_str(),
+                )),
+            ),
             ("sessionId", JsonValue::String(self.session_id.into())),
         ]))
     }
@@ -82,24 +104,31 @@ impl ProductJsonConvert for SessionSummary {
             .as_f64()
             .filter(|number| number.is_finite() && number.fract() == 0.0)
             .ok_or_else(|| invalid("session summary.createdAt"))?;
-        if created_at < i64::MIN as f64 || created_at > i64::MAX as f64 {
+        if !(-MAX_SAFE_INTEGER_F64..=MAX_SAFE_INTEGER_F64).contains(&created_at) {
             return Err(invalid("session summary.createdAt"));
         }
-        #[expect(clippy::cast_possible_truncation, reason = "bounds and integral check make this conversion exact")]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "bounds and integral check make this conversion exact"
+        )]
         let created_at = created_at as i64;
-        Ok(Self { address, created_at })
+        Ok(Self {
+            address,
+            created_at,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
-        let mut fields = match self.address.into_json()? {
-            JsonValue::Object(fields) => fields,
-            _ => return Err(invalid("session summary address")),
+        let Some(mut fields) = self.address.into_json()?.into_object() else {
+            return Err(invalid("session summary address"));
         };
-        const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
         if self.created_at < -MAX_SAFE_INTEGER || self.created_at > MAX_SAFE_INTEGER {
             return Err(invalid("session summary.createdAt"));
         }
-        #[expect(clippy::cast_precision_loss, reason = "bounded to the exact binary64 integer range")]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "bounded to the exact binary64 integer range"
+        )]
         let created_at = self.created_at as f64;
         fields.insert("createdAt".into(), JsonValue::Number(created_at));
         Ok(JsonValue::Object(fields))
@@ -128,12 +157,18 @@ impl ProductJsonConvert for SessionCreateOptions {
 impl ProductJsonConvert for SessionDirectoryState {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "session directory state")?;
-        let revision = integer(required(fields, "revision", "session directory state.revision")?, "session directory state.revision")?;
-        let sessions = array(required(fields, "sessions", "session directory state.sessions")?, "session directory state.sessions")?
-            .iter()
-            .cloned()
-            .map(SessionSummary::from_json)
-            .collect::<Result<Vec<_>, _>>()?;
+        let revision = integer(
+            required(fields, "revision", "session directory state.revision")?,
+            "session directory state.revision",
+        )?;
+        let sessions = array(
+            required(fields, "sessions", "session directory state.sessions")?,
+            "session directory state.sessions",
+        )?
+        .iter()
+        .cloned()
+        .map(SessionSummary::from_json)
+        .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { revision, sessions })
     }
 
@@ -150,3 +185,40 @@ impl ProductJsonConvert for SessionDirectoryState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_summary(created_at: f64) -> JsonValue {
+        json_object([
+            (
+                "serverId",
+                JsonValue::String("00000000-0000-4000-8000-000000000000".into()),
+            ),
+            ("sessionId", JsonValue::String("session".into())),
+            ("createdAt", JsonValue::Number(created_at)),
+        ])
+    }
+
+    #[test]
+    fn decode_accepts_maximum_safe_integer_timestamp() -> Result<(), ServiceError> {
+        let summary = SessionSummary::from_json(session_summary(MAX_SAFE_INTEGER_F64))?;
+        assert_eq!(summary.created_at, MAX_SAFE_INTEGER);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_rejects_timestamp_past_safe_integer_range() -> Result<(), ServiceError> {
+        let Err(error) = SessionSummary::from_json(session_summary(MAX_SAFE_INTEGER_F64 + 1.0))
+        else {
+            return Err(ServiceError::local(
+                "timestamp past safe integer range was accepted",
+            ));
+        };
+        assert_eq!(
+            error.to_string(),
+            "Invalid product service session summary.createdAt"
+        );
+        Ok(())
+    }
+}

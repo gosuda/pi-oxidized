@@ -7,15 +7,16 @@
 use pi_agent::service::error::ServiceError;
 use pi_agent::service::value::JsonValue;
 
-use super::{array, json_object, object, required, string, ProductJsonConvert};
+use super::{ProductJsonConvert, array, json_object, object, required, string, strings};
 
 /// Chord service identifier for server-built presentation plugin generations.
 pub const PRESENTATION_PLUGINS_ID: &str = "pi.presentation-plugins";
 /// Chord service identifier for the attached session worker's plugins.
 pub const SESSION_PLUGINS_ID: &str = "pi.session-plugins";
 
-/// Presentation plugin member names.
+/// Wire method that asks `pi.presentation-plugins` to prepare a session's package selection.
 pub const PRESENTATION_PLUGINS_PREPARE_SESSION_MEMBER: &str = "prepareSession";
+/// Wire method that asks `pi.presentation-plugins` to reload its prepared plugin generation.
 pub const PRESENTATION_PLUGINS_RELOAD_MEMBER: &str = "reload";
 /// Session plugin member name.
 pub const SESSION_PLUGINS_RELOAD_MEMBER: &str = "reload";
@@ -54,7 +55,10 @@ impl ProductJsonConvert for PrepareSessionRequest {
             "packagePaths",
             "plugin preparation request.packagePaths",
         )?)?;
-        Ok(Self { session_id, package_paths })
+        Ok(Self {
+            session_id,
+            package_paths,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
@@ -86,7 +90,9 @@ impl ProductJsonConvert for PreparePluginsResult {
             "plugin preparation result.presentationFacetBundles",
         )?
         .to_vec();
-        Ok(Self { presentation_facet_bundles: bundles })
+        Ok(Self {
+            presentation_facet_bundles: bundles,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
@@ -102,10 +108,5 @@ fn nullable_string_array(value: &JsonValue) -> Result<Option<Vec<String>>, Servi
         return Ok(None);
     }
     let values = array(value, "plugin preparation request.packagePaths")?;
-    values
-        .iter()
-        .map(|value| string(value, "plugin preparation request.packagePaths[]"))
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+    strings(values, "plugin preparation request.packagePaths[]").map(Some)
 }
-

@@ -44,7 +44,7 @@ impl InternalProcessRole {
 
     /// Parses one exact role spelling.
     #[must_use]
-    pub const fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "coordinator" => Some(Self::Coordinator),
             "server" => Some(Self::Server),
@@ -142,10 +142,7 @@ pub fn spawn_internal_process(
     command.env(INTERNAL_PROCESS_ENV, role.as_str());
 
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    command.process_group(0);
 
     command.spawn()
 }

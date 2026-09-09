@@ -10,23 +10,24 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pi_agent::context::Context;
 use pi_agent::harness::api::AgentLane;
-use pi_agent::harness::result::HarnessCall;
+use pi_agent::harness::result::HarnessError;
 use pi_agent::service::error::{RemoteServiceErrorCode, ServiceError};
 use pi_agent::service::provider::{ServiceImplementation, ServiceMember, ServiceMethod};
 use pi_agent::service::replicated::MutableReplicatedState;
 use pi_agent::service::value::{JsInteger, JsObject, JsString, JsonValue};
 use pi_agent::session::ModelIdentity;
-use pi_ai::ModelThinkingLevel;
+use pi_ai::types::ModelThinkingLevel;
 use thiserror::Error;
 
+use crate::core::agent_session::model::supported_thinking_levels;
 use crate::core::model_runtime::{ModelRuntime, ModelsRefreshOptions};
 use crate::core::settings::SettingsManager;
-use crate::remote::product::services::models::{
-    ModelRef, ModelSummary, ModelsCatalog, ModelsConfiguration, ModelsRefreshState, ModelsState,
-    MODELS_CYCLE_THINKING_MEMBER, MODELS_GET_THINKING_LEVELS_MEMBER, MODELS_REFRESH_MEMBER,
-    MODELS_SELECT_MEMBER, MODELS_SELECT_THINKING_MEMBER, MODELS_STATE_MEMBER,
-};
 use crate::remote::product::services::ProductJsonConvert;
+use crate::remote::product::services::models::{
+    MODELS_CYCLE_THINKING_MEMBER, MODELS_GET_THINKING_LEVELS_MEMBER, MODELS_REFRESH_MEMBER,
+    MODELS_SELECT_MEMBER, MODELS_SELECT_THINKING_MEMBER, MODELS_STATE_MEMBER, ModelRef,
+    ModelSummary, ModelsCatalog, ModelsConfiguration, ModelsRefreshState, ModelsState,
+};
 
 /// Native implementation of the singleton `pi.models` service.
 ///
@@ -84,7 +85,7 @@ impl ModelsService {
             ServiceMember::Method(method(move |args, context| {
                 let service = Arc::clone(&service);
                 async move {
-                    expect_no_args(args, MODELS_CYCLE_THINKING_MEMBER)?;
+                    expect_no_args(&args, MODELS_CYCLE_THINKING_MEMBER)?;
                     service.cycle_thinking(context).await?;
                     Ok(None)
                 }
@@ -97,7 +98,7 @@ impl ModelsService {
             ServiceMember::Method(method(move |args, context| {
                 let service = Arc::clone(&service);
                 async move {
-                    expect_no_args(args, MODELS_GET_THINKING_LEVELS_MEMBER)?;
+                    expect_no_args(&args, MODELS_GET_THINKING_LEVELS_MEMBER)?;
                     let levels = service.get_thinking_levels(&context).await?;
                     Ok(Some(JsonValue::Array(
                         levels.into_iter().map(thinking_level_json).collect(),
@@ -112,7 +113,7 @@ impl ModelsService {
             ServiceMember::Method(method(move |args, context| {
                 let service = Arc::clone(&service);
                 async move {
-                    expect_no_args(args, MODELS_REFRESH_MEMBER)?;
+                    expect_no_args(&args, MODELS_REFRESH_MEMBER)?;
                     service.refresh(context).await?;
                     Ok(None)
                 }
@@ -125,7 +126,7 @@ impl ModelsService {
             ServiceMember::Method(method(move |args, context| {
                 let service = Arc::clone(&service);
                 async move {
-                    let model = ModelRef::from_json(one_arg(args, MODELS_SELECT_MEMBER)?)?;
+                    let model = ModelRef::from_json(one_arg(&args, MODELS_SELECT_MEMBER)?)?;
                     service.select(model, context).await?;
                     Ok(None)
                 }
@@ -138,7 +139,8 @@ impl ModelsService {
             ServiceMember::Method(method(move |args, context| {
                 let service = Arc::clone(&service);
                 async move {
-                    let level = parse_thinking_level(one_arg(args, MODELS_SELECT_THINKING_MEMBER)?)?;
+                    let level =
+                        parse_thinking_level(&one_arg(&args, MODELS_SELECT_THINKING_MEMBER)?)?;
                     service.select_thinking(level, context).await?;
                     Ok(None)
                 }
@@ -149,6 +151,11 @@ impl ModelsService {
     }
 
     /// Reads the initial catalogue/configuration and publishes activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] if the catalogue or configuration cannot be
+    /// read, or the initial state cannot be published.
     pub async fn activate(&self, context: Context) -> Result<(), ServiceError> {
         let (catalog, configuration) = tokio::try_join!(
             self.read_catalog(&context),
@@ -174,7 +181,10 @@ impl ModelsService {
                 .iter()
                 .position(|level| *level == current)
                 .map_or(0, |index| (index + 1) % levels.len());
-            levels.get(index).copied().unwrap_or(ModelThinkingLevel::Off)
+            levels
+                .get(index)
+                .copied()
+                .unwrap_or(ModelThinkingLevel::Off)
         };
         into_service_result(self.lane.set_thinking_level(next, &context).await)?;
         let configuration = self.read_configuration(&context).await?;
@@ -238,7 +248,12 @@ impl ModelsService {
             .model_runtime
             .as_ref()
             .and_then(|runtime| runtime.get_model(&model.provider, &model.model_id))
-            .ok_or_else(|| source_error(format!("Unknown model: {}/{}", model.provider, model.model_id)))?;
+            .ok_or_else(|| {
+                source_error(format!(
+                    "Unknown model: {}/{}",
+                    model.provider, model.model_id
+                ))
+            })?;
         into_service_result(
             self.lane
                 .set_model(
@@ -285,9 +300,13 @@ impl ModelsService {
         self.update_configuration(configuration, context)
     }
 
-    async fn read_configuration(&self, context: &Context) -> Result<ModelsConfiguration, ServiceError> {
+    async fn read_configuration(
+        &self,
+        context: &Context,
+    ) -> Result<ModelsConfiguration, ServiceError> {
         let selected = async { into_service_result(self.lane.get_model(context).await) };
-        let thinking_level = async { into_service_result(self.lane.get_thinking_level(context).await) };
+        let thinking_level =
+            async { into_service_result(self.lane.get_thinking_level(context).await) };
         let (selected, thinking_level) = tokio::try_join!(selected, thinking_level)?;
         Ok(ModelsConfiguration {
             model: selected.map(|model| ModelRef {
@@ -305,7 +324,7 @@ impl ModelsService {
         let selected = into_service_result(self.lane.get_model(context).await)?;
         Ok(match selected.as_ref() {
             None => vec![ModelThinkingLevel::Off],
-            Some(model) => pi_ai::supported_thinking_levels(model),
+            Some(model) => supported_thinking_levels(model),
         })
     }
 
@@ -420,18 +439,19 @@ fn member(name: &str) -> JsString {
     JsString::from_utf8(name)
 }
 
-fn one_arg(mut args: Vec<JsonValue>, member_name: &str) -> Result<JsonValue, ServiceError> {
+fn one_arg(args: &[JsonValue], member_name: &str) -> Result<JsonValue, ServiceError> {
     if args.len() != 1 {
         return Err(invalid_value(format!(
             "{member_name} expects one argument, got {}",
             args.len()
         )));
     }
-    args.pop()
+    args.first()
+        .cloned()
         .ok_or_else(|| invalid_value(format!("{member_name} expects one argument")))
 }
 
-fn expect_no_args(args: Vec<JsonValue>, member_name: &str) -> Result<(), ServiceError> {
+fn expect_no_args(args: &[JsonValue], member_name: &str) -> Result<(), ServiceError> {
     if args.is_empty() {
         Ok(())
     } else {
@@ -439,12 +459,16 @@ fn expect_no_args(args: Vec<JsonValue>, member_name: &str) -> Result<(), Service
     }
 }
 
-fn parse_thinking_level(value: JsonValue) -> Result<ModelThinkingLevel, ServiceError> {
+fn parse_thinking_level(value: &JsonValue) -> Result<ModelThinkingLevel, ServiceError> {
     let value = value
         .as_str()
         .ok_or_else(|| invalid_value("selectThinking expects one thinking level string"))?
         .try_to_utf8()
-        .map_err(|error| invalid_value(format!("selectThinking argument is not valid UTF-8: {error}")))?;
+        .map_err(|error| {
+            invalid_value(format!(
+                "selectThinking argument is not valid UTF-8: {error}"
+            ))
+        })?;
     match value.as_str() {
         "off" => Ok(ModelThinkingLevel::Off),
         "minimal" => Ok(ModelThinkingLevel::Minimal),
@@ -453,7 +477,9 @@ fn parse_thinking_level(value: JsonValue) -> Result<ModelThinkingLevel, ServiceE
         "high" => Ok(ModelThinkingLevel::High),
         "xhigh" => Ok(ModelThinkingLevel::Xhigh),
         "max" => Ok(ModelThinkingLevel::Max),
-        _ => Err(invalid_value("selectThinking expects a known thinking level")),
+        _ => Err(invalid_value(
+            "selectThinking expects a known thinking level",
+        )),
     }
 }
 
@@ -485,7 +511,7 @@ fn source_error(message: impl Into<String>) -> ServiceError {
     ServiceError::handler(ModelsServiceError(message.into()))
 }
 
-fn into_service_result<T>(result: HarnessCall<T>) -> Result<T, ServiceError> {
+fn into_service_result<T>(result: Result<T, HarnessError>) -> Result<T, ServiceError> {
     result.map_err(ServiceError::handler)
 }
 

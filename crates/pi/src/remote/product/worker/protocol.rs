@@ -33,8 +33,8 @@
 //! foreign JSON tree.
 
 use pi_agent::service::error::RemoteServiceErrorCode;
-use pi_agent::service::value::{is_json_value, JsInteger, JsObject, JsString, JsonValue};
-use pi_agent::service::wire::{parse_service_call, ServiceCall, WireError};
+use pi_agent::service::value::{JsInteger, JsObject, JsString, JsonValue, is_json_value};
+use pi_agent::service::wire::{ServiceCall, WireError, parse_service_call};
 use thiserror::Error;
 
 /// Environment variable carrying the worker's control socket address
@@ -104,7 +104,10 @@ impl SessionWorkerMetadata {
         let mut object = JsObject::new();
         object.insert(key("id"), JsonValue::String(self.id));
         object.insert(key("createdAt"), JsonValue::Number(self.created_at));
-        object.insert(key("storageVersion"), JsonValue::Number(self.storage_version));
+        object.insert(
+            key("storageVersion"),
+            JsonValue::Number(self.storage_version),
+        );
         object.insert(key("cwd"), JsonValue::String(self.cwd));
         object.insert(key("path"), JsonValue::String(self.path));
         object.insert(key("modifiedAt"), JsonValue::Number(self.modified_at));
@@ -121,15 +124,30 @@ impl SessionWorkerMetadata {
 /// Returns [`WorkerWireError::Invalid`] for a non-record, a missing or
 /// mistyped member, an unknown key, a non-integral `createdAt`/
 /// `storageVersion`, or a present `null` `parentSessionId`.
-pub fn parse_session_worker_metadata(value: &JsonValue) -> Result<SessionWorkerMetadata, WorkerWireError> {
+pub fn parse_session_worker_metadata(
+    value: &JsonValue,
+) -> Result<SessionWorkerMetadata, WorkerWireError> {
     let record = record(value, METADATA)?;
-    assert_keys(record, &["id", "createdAt", "storageVersion", "cwd", "path", "modifiedAt"], &["parentSessionId"], METADATA)?;
+    assert_keys(
+        record,
+        &[
+            "id",
+            "createdAt",
+            "storageVersion",
+            "cwd",
+            "path",
+            "modifiedAt",
+        ],
+        &["parentSessionId"],
+        METADATA,
+    )?;
     let Some(id) = id_field(record, "id") else {
         return Err(invalid(METADATA));
     };
     let created_at = integer_field(record, "createdAt", METADATA)?;
     let storage_version = integer_field(record, "storageVersion", METADATA)?;
-    let (Some(cwd), Some(path)) = (string_field(record, "cwd"), string_field(record, "path")) else {
+    let (Some(cwd), Some(path)) = (string_field(record, "cwd"), string_field(record, "path"))
+    else {
         return Err(invalid(METADATA));
     };
     let modified_at = number_field(record, "modifiedAt", METADATA)?;
@@ -176,7 +194,12 @@ impl SessionWorkerOptions {
         }
         object.insert(
             key("pluginManifestPaths"),
-            JsonValue::Array(self.plugin_manifest_paths.into_iter().map(JsonValue::String).collect()),
+            JsonValue::Array(
+                self.plugin_manifest_paths
+                    .into_iter()
+                    .map(JsonValue::String)
+                    .collect(),
+            ),
         );
         JsonValue::Object(object)
     }
@@ -191,9 +214,16 @@ impl SessionWorkerOptions {
 /// Returns [`WorkerWireError::Invalid`] for a non-record, a missing or
 /// mistyped member, an unknown key, an empty identifier where the source
 /// demands `minLength: 1`, or a present `null` optional.
-pub fn parse_session_worker_options(value: &JsonValue) -> Result<SessionWorkerOptions, WorkerWireError> {
+pub fn parse_session_worker_options(
+    value: &JsonValue,
+) -> Result<SessionWorkerOptions, WorkerWireError> {
     let options = record(value, OPTIONS)?;
-    assert_keys(options, &["sessionDir", "metadata", "pluginManifestPaths"], &["provider", "model"], OPTIONS)?;
+    assert_keys(
+        options,
+        &["sessionDir", "metadata", "pluginManifestPaths"],
+        &["provider", "model"],
+        OPTIONS,
+    )?;
     let Some(session_dir) = id_field(options, "sessionDir") else {
         return Err(invalid(OPTIONS));
     };
@@ -242,7 +272,10 @@ impl WorkerOperationScope {
     #[must_use]
     pub fn into_json(self) -> JsonValue {
         let mut object = JsObject::new();
-        object.insert(key("serverConnectionId"), JsonValue::String(self.server_connection_id));
+        object.insert(
+            key("serverConnectionId"),
+            JsonValue::String(self.server_connection_id),
+        );
         object.insert(key("attachmentId"), JsonValue::String(self.attachment_id));
         JsonValue::Object(object)
     }
@@ -253,12 +286,15 @@ impl WorkerOperationScope {
 /// # Errors
 /// Returns [`WorkerWireError::Invalid`] for a non-record, missing or
 /// non-string members, or an unknown key.
-pub fn parse_worker_operation_scope(value: &JsonValue) -> Result<WorkerOperationScope, WorkerWireError> {
+pub fn parse_worker_operation_scope(
+    value: &JsonValue,
+) -> Result<WorkerOperationScope, WorkerWireError> {
     let scope = record(value, SCOPE)?;
     assert_keys(scope, &["serverConnectionId", "attachmentId"], &[], SCOPE)?;
-    let (Some(server_connection_id), Some(attachment_id)) =
-        (string_field(scope, "serverConnectionId"), string_field(scope, "attachmentId"))
-    else {
+    let (Some(server_connection_id), Some(attachment_id)) = (
+        string_field(scope, "serverConnectionId"),
+        string_field(scope, "attachmentId"),
+    ) else {
         return Err(invalid(SCOPE));
     };
     Ok(WorkerOperationScope {
@@ -301,7 +337,9 @@ impl WorkerOperationRequest {
 /// mistyped member, an unknown key, or an empty `requestId`; returns
 /// [`WorkerWireError::ServiceCall`] when the call fails service-call
 /// validation.
-pub fn parse_worker_operation_request(value: &JsonValue) -> Result<WorkerOperationRequest, WorkerWireError> {
+pub fn parse_worker_operation_request(
+    value: &JsonValue,
+) -> Result<WorkerOperationRequest, WorkerWireError> {
     let request = record(value, REQUEST)?;
     let Some(tag) = string_field(request, "type") else {
         return Err(invalid(REQUEST));
@@ -309,7 +347,12 @@ pub fn parse_worker_operation_request(value: &JsonValue) -> Result<WorkerOperati
     if !same_text(tag, "operation") {
         return Err(invalid(REQUEST));
     }
-    assert_keys(request, &["type", "requestId", "scope", "call"], &[], REQUEST)?;
+    assert_keys(
+        request,
+        &["type", "requestId", "scope", "call"],
+        &[],
+        REQUEST,
+    )?;
     let Some(request_id) = id_field(request, "requestId") else {
         return Err(invalid(REQUEST));
     };
@@ -362,7 +405,11 @@ impl WorkerOperationResponse {
     #[must_use]
     pub fn into_json(self) -> JsonValue {
         match self {
-            Self::OperationResult { request_id, scope, result } => {
+            Self::OperationResult {
+                request_id,
+                scope,
+                result,
+            } => {
                 let mut object = JsObject::new();
                 object.insert(key("type"), string("operation_result"));
                 object.insert(key("requestId"), JsonValue::String(request_id));
@@ -372,7 +419,12 @@ impl WorkerOperationResponse {
                 }
                 JsonValue::Object(object)
             }
-            Self::OperationError { request_id, scope, code, message } => {
+            Self::OperationError {
+                request_id,
+                scope,
+                code,
+                message,
+            } => {
                 let mut object = JsObject::new();
                 object.insert(key("type"), string("operation_error"));
                 object.insert(key("requestId"), JsonValue::String(request_id));
@@ -394,14 +446,23 @@ impl WorkerOperationResponse {
 /// missing or mistyped member, an unknown key, an empty `requestId`, a
 /// `code` outside the eight protocol codes (including a present `null`), or
 /// a `result` that is not strict JSON.
-pub fn parse_worker_operation_response(value: &JsonValue) -> Result<WorkerOperationResponse, WorkerWireError> {
+pub fn parse_worker_operation_response(
+    value: &JsonValue,
+) -> Result<WorkerOperationResponse, WorkerWireError> {
     let response = record(value, RESPONSE)?;
     let Some(tag) = string_field(response, "type") else {
         return Err(invalid(RESPONSE));
     };
     if same_text(tag, "operation_result") {
-        assert_keys(response, &["type", "requestId", "scope"], &["result"], RESPONSE)?;
-        let (Some(request_id), Some(scope)) = (id_field(response, "requestId"), field(response, "scope")) else {
+        assert_keys(
+            response,
+            &["type", "requestId", "scope"],
+            &["result"],
+            RESPONSE,
+        )?;
+        let (Some(request_id), Some(scope)) =
+            (id_field(response, "requestId"), field(response, "scope"))
+        else {
             return Err(invalid(RESPONSE));
         };
         let scope = parse_worker_operation_scope(scope)?;
@@ -418,7 +479,12 @@ pub fn parse_worker_operation_response(value: &JsonValue) -> Result<WorkerOperat
             result,
         })
     } else if same_text(tag, "operation_error") {
-        assert_keys(response, &["type", "requestId", "scope", "message"], &["code"], RESPONSE)?;
+        assert_keys(
+            response,
+            &["type", "requestId", "scope", "message"],
+            &["code"],
+            RESPONSE,
+        )?;
         let (Some(request_id), Some(scope), Some(message)) = (
             id_field(response, "requestId"),
             field(response, "scope"),
@@ -465,7 +531,10 @@ impl SessionDemand {
     pub fn into_json(self) -> JsonValue {
         let mut object = JsObject::new();
         object.insert(key("type"), string("session_demand"));
-        object.insert(key("serverConnectionId"), JsonValue::String(self.server_connection_id));
+        object.insert(
+            key("serverConnectionId"),
+            JsonValue::String(self.server_connection_id),
+        );
         object.insert(key("requestId"), JsonValue::String(self.request_id));
         object.insert(key("attachmentId"), JsonValue::String(self.attachment_id));
         object.insert(key("attached"), JsonValue::Bool(self.attached));
@@ -543,7 +612,9 @@ impl SessionWorkerCommand {
 /// Returns [`WorkerWireError::Invalid`] for a non-record, an unknown `type`
 /// tag, a missing or mistyped member, or — for the strict variants — an
 /// unknown key, an empty `requestId`, or a malformed call/scope.
-pub fn parse_session_worker_command(value: &JsonValue) -> Result<SessionWorkerCommand, WorkerWireError> {
+pub fn parse_session_worker_command(
+    value: &JsonValue,
+) -> Result<SessionWorkerCommand, WorkerWireError> {
     let command = record(value, COMMAND)?;
     let Some(tag) = string_field(command, "type") else {
         return Err(invalid(COMMAND));
@@ -575,7 +646,9 @@ pub fn parse_session_worker_command(value: &JsonValue) -> Result<SessionWorkerCo
     }
     if same_text(tag, "operation_cancel") {
         assert_keys(command, &["type", "requestId", "scope"], &[], COMMAND)?;
-        let (Some(request_id), Some(scope)) = (id_field(command, "requestId"), field(command, "scope")) else {
+        let (Some(request_id), Some(scope)) =
+            (id_field(command, "requestId"), field(command, "scope"))
+        else {
             return Err(invalid(COMMAND));
         };
         let scope = parse_worker_operation_scope(scope)?;
@@ -671,7 +744,14 @@ impl SessionWorkerEvent {
     #[must_use]
     pub fn into_json(self) -> JsonValue {
         match self {
-            Self::WorkerReady { token, session_key, session_id, pid, metadata, plugin_manifest_paths } => {
+            Self::WorkerReady {
+                token,
+                session_key,
+                session_id,
+                pid,
+                metadata,
+                plugin_manifest_paths,
+            } => {
                 let mut object = JsObject::new();
                 object.insert(key("type"), string("worker_ready"));
                 object.insert(key("token"), JsonValue::String(token));
@@ -681,34 +761,64 @@ impl SessionWorkerEvent {
                 object.insert(key("metadata"), metadata.into_json());
                 object.insert(
                     key("pluginManifestPaths"),
-                    JsonValue::Array(plugin_manifest_paths.into_iter().map(JsonValue::String).collect()),
+                    JsonValue::Array(
+                        plugin_manifest_paths
+                            .into_iter()
+                            .map(JsonValue::String)
+                            .collect(),
+                    ),
                 );
                 JsonValue::Object(object)
             }
-            Self::WorkerFailed { token, session_key, message } => {
+            Self::WorkerFailed {
+                token,
+                session_key,
+                message,
+            } => {
                 let mut object = tagged("worker_failed", &token, &session_key);
                 object.insert(key("message"), JsonValue::String(message));
                 JsonValue::Object(object)
             }
-            Self::DemandApplied { token, session_key, request_id, attachment_id, attached } => {
+            Self::DemandApplied {
+                token,
+                session_key,
+                request_id,
+                attachment_id,
+                attached,
+            } => {
                 let mut object = tagged("demand_applied", &token, &session_key);
                 object.insert(key("requestId"), JsonValue::String(request_id));
                 object.insert(key("attachmentId"), JsonValue::String(attachment_id));
                 object.insert(key("attached"), JsonValue::Bool(attached));
                 JsonValue::Object(object)
             }
-            Self::DemandRejected { token, session_key, request_id, message } => {
+            Self::DemandRejected {
+                token,
+                session_key,
+                request_id,
+                message,
+            } => {
                 let mut object = tagged("demand_rejected", &token, &session_key);
                 object.insert(key("requestId"), JsonValue::String(request_id));
                 object.insert(key("message"), JsonValue::String(message));
                 JsonValue::Object(object)
             }
-            Self::OperationResponse { token, session_key, response } => {
+            Self::OperationResponse {
+                token,
+                session_key,
+                response,
+            } => {
                 let mut object = tagged("operation_response", &token, &session_key);
                 object.insert(key("response"), response.into_json());
                 JsonValue::Object(object)
             }
-            Self::ServiceUpdate { token, session_key, scope, subscription_id, update } => {
+            Self::ServiceUpdate {
+                token,
+                session_key,
+                scope,
+                subscription_id,
+                update,
+            } => {
                 let mut object = tagged("service_update", &token, &session_key);
                 object.insert(key("scope"), scope.into_json());
                 object.insert(key("subscriptionId"), JsonValue::String(subscription_id));
@@ -719,6 +829,10 @@ impl SessionWorkerEvent {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "mirrors the source TypeScript schema validator (session-worker.ts:142-188) and is kept as one exhaustive match over the wire type tag"
+)]
 /// Validates one raw event record.
 ///
 /// # Errors
@@ -726,7 +840,9 @@ impl SessionWorkerEvent {
 /// tag, a missing or mistyped member, a non-integral or sub-one `pid`, an
 /// invalid nested metadata/response/scope, or an empty `subscriptionId` or
 /// manifest path.
-pub fn parse_session_worker_event(value: &JsonValue) -> Result<SessionWorkerEvent, WorkerWireError> {
+pub fn parse_session_worker_event(
+    value: &JsonValue,
+) -> Result<SessionWorkerEvent, WorkerWireError> {
     let event = record(value, EVENT)?;
     let Some(tag) = string_field(event, "type") else {
         return Err(invalid(EVENT));
@@ -855,6 +971,16 @@ pub fn parse_session_worker_event(value: &JsonValue) -> Result<SessionWorkerEven
     Err(invalid(EVENT))
 }
 
+/// Builds a canonical object key from a source field name.
+fn key(name: &str) -> JsString {
+    JsString::from_utf8(name)
+}
+
+/// Builds a canonical string value from a fixed ASCII discriminant.
+fn string(value: &str) -> JsonValue {
+    JsonValue::String(JsString::from_utf8(value))
+}
+
 /// The leading `type`/`token`/`sessionKey` members shared by every event.
 fn tagged(tag: &str, token: &JsString, session_key: &JsString) -> JsObject {
     let mut object = JsObject::new();
@@ -865,7 +991,10 @@ fn tagged(tag: &str, token: &JsString, session_key: &JsString) -> JsObject {
 }
 
 /// Rejects non-object values, including arrays and `null`.
-fn record<'a>(value: &'a JsonValue, description: &'static str) -> Result<&'a JsObject, WorkerWireError> {
+fn record<'a>(
+    value: &'a JsonValue,
+    description: &'static str,
+) -> Result<&'a JsObject, WorkerWireError> {
     match value {
         JsonValue::Object(object) => Ok(object),
         _ => Err(invalid(description)),
@@ -947,14 +1076,21 @@ fn optional_string<'a>(
 }
 
 /// Reads an absence-only non-empty optional identifier.
-fn optional_id<'a>(object: &'a JsObject, name: &str) -> Result<Option<&'a JsString>, WorkerWireError> {
+fn optional_id<'a>(
+    object: &'a JsObject,
+    name: &str,
+) -> Result<Option<&'a JsString>, WorkerWireError> {
     match field(object, name) {
         Some(value) => id_value(value).map(Some).ok_or_else(|| invalid(OPTIONS)),
         None => Ok(None),
     }
 }
 
-fn number_field(object: &JsObject, name: &str, description: &'static str) -> Result<f64, WorkerWireError> {
+fn number_field(
+    object: &JsObject,
+    name: &str,
+    description: &'static str,
+) -> Result<f64, WorkerWireError> {
     match field(object, name) {
         Some(JsonValue::Number(value)) if value.is_finite() => Ok(*value),
         _ => Err(invalid(description)),
@@ -976,7 +1112,11 @@ fn integer_member(
     Ok(value)
 }
 
-fn integer_field(object: &JsObject, name: &str, description: &'static str) -> Result<f64, WorkerWireError> {
+fn integer_field(
+    object: &JsObject,
+    name: &str,
+    description: &'static str,
+) -> Result<f64, WorkerWireError> {
     let value = number_field(object, name, description)?;
     if value.fract() != 0.0 {
         return Err(invalid(description));

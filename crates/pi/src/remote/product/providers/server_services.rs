@@ -15,64 +15,73 @@ use pi_agent::context::Context;
 use pi_agent::service::error::{RemoteServiceErrorCode, ServiceError};
 use pi_agent::service::provider::{
     RemoteServiceProvider, ServiceDefinition, ServiceImplementation, ServiceMember, ServiceMethod,
-    ServiceMode,
 };
 use pi_agent::service::replicated::MutableReplicatedState;
 use pi_agent::service::value::{JsInteger, JsString, JsonValue};
+use pi_agent::service::wire::ServiceMode;
 use tokio::sync::oneshot;
 
 use crate::remote::product::providers::attachment::ProviderAttachment;
+use crate::remote::product::services::ProductJsonConvert;
 use crate::remote::product::services::plugins::{
-    PrepareSessionRequest, PRESENTATION_PLUGINS_ID, PRESENTATION_PLUGINS_PREPARE_SESSION_MEMBER,
-    PRESENTATION_PLUGINS_RELOAD_MEMBER,
+    PRESENTATION_PLUGINS_ID, PRESENTATION_PLUGINS_PREPARE_SESSION_MEMBER,
+    PRESENTATION_PLUGINS_RELOAD_MEMBER, PrepareSessionRequest,
 };
 use crate::remote::product::services::sessions::{
-    SessionCreateOptions, SessionDirectoryState, SessionSummary, SESSION_DIRECTORY_ID,
-    SESSION_DIRECTORY_STATE_MEMBER, SESSION_MANAGEMENT_ATTACH_MEMBER,
+    SESSION_DIRECTORY_ID, SESSION_DIRECTORY_STATE_MEMBER, SESSION_MANAGEMENT_ATTACH_MEMBER,
     SESSION_MANAGEMENT_CREATE_MEMBER, SESSION_MANAGEMENT_DETACH_MEMBER, SESSION_MANAGEMENT_ID,
-    SESSION_MANAGEMENT_REMOVE_MEMBER,
+    SESSION_MANAGEMENT_REMOVE_MEMBER, SessionCreateOptions, SessionDirectoryState, SessionSummary,
 };
-use crate::remote::product::services::ProductJsonConvert;
-use crate::remote::server::errors::{duplicate_host_error, HostError};
+use crate::remote::server::errors::{HostError, duplicate_host_error};
 use crate::remote::server::host::{
     RoutedServerPresentation, RoutedServerServiceAttachment, RoutedServerServiceHost,
 };
+
+/// Callback that lists sessions, sorted by `sessionId` then `createdAt`.
+pub type ListSessionsFn = Arc<
+    dyn Fn(Context) -> BoxFuture<'static, Result<Vec<SessionSummary>, HostError>> + Send + Sync,
+>;
+
+/// Callback that creates a new session and returns its summary.
+pub type CreateSessionFn = Arc<
+    dyn Fn(SessionCreateOptions, Context) -> BoxFuture<'static, Result<SessionSummary, HostError>>
+        + Send
+        + Sync,
+>;
+
+/// Callback that removes an existing session.
+pub type RemoveSessionFn =
+    Arc<dyn Fn(String, Context) -> BoxFuture<'static, Result<(), HostError>> + Send + Sync>;
+
+/// Callback that resolves and validates plugin packages for a session.
+pub type PrepareSessionPluginsFn = Arc<
+    dyn Fn(
+            String,
+            Option<Vec<String>>,
+            Context,
+        ) -> BoxFuture<'static, Result<PreparedSessionPlugins, HostError>>
+        + Send
+        + Sync,
+>;
+
+/// Callback that reloads presentation plugin bundles from a prepared selection.
+pub type ReloadPresentationPluginsFn = Arc<
+    dyn Fn(Vec<String>, Context) -> BoxFuture<'static, Result<JsonValue, HostError>> + Send + Sync,
+>;
 
 /// Host ports supplied by the native server owner for the three server-scoped
 /// service families.
 pub struct ServerServiceCallbacks {
     /// Returns the current session list, sorted by `sessionId` then `createdAt`.
-    pub list: Arc<
-        dyn Fn(Context) -> BoxFuture<'static, Result<Vec<SessionSummary>, HostError>>
-            + Send
-            + Sync,
-    >,
+    pub list: ListSessionsFn,
     /// Creates a new session and returns its summary.
-    pub create: Arc<
-        dyn Fn(SessionCreateOptions, Context) -> BoxFuture<'static, Result<SessionSummary, HostError>>
-            + Send
-            + Sync,
-    >,
+    pub create: CreateSessionFn,
     /// Removes an existing session.
-    pub remove: Arc<
-        dyn Fn(String, Context) -> BoxFuture<'static, Result<(), HostError>> + Send + Sync,
-    >,
+    pub remove: RemoveSessionFn,
     /// Resolves and validates plugin packages for a session.
-    pub prepare_session_plugins: Arc<
-        dyn Fn(
-                String,
-                Option<Vec<String>>,
-                Context,
-            ) -> BoxFuture<'static, Result<PreparedSessionPlugins, HostError>>
-            + Send
-            + Sync,
-    >,
+    pub prepare_session_plugins: PrepareSessionPluginsFn,
     /// Reloads presentation plugin bundles from a prepared selection.
-    pub reload_presentation_plugins: Arc<
-        dyn Fn(Vec<String>, Context) -> BoxFuture<'static, Result<JsonValue, HostError>>
-            + Send
-            + Sync,
-    >,
+    pub reload_presentation_plugins: ReloadPresentationPluginsFn,
 }
 
 /// Result of preparing session plugins.
@@ -94,14 +103,19 @@ pub struct ExperimentalServerServices {
 
 impl ExperimentalServerServices {
     /// Creates the service composition after loading the initial directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError`] if the initial session list cannot be loaded or
+    /// the directory state cannot be serialized.
     pub async fn create(callbacks: ServerServiceCallbacks) -> Result<Arc<Self>, HostError> {
-        let initial = callbacks.list(Context::background()).await?;
+        let initial = (callbacks.list)(Context::background()).await?;
         let initial_state = SessionDirectoryState {
             revision: JsInteger::one(),
             sessions: initial,
         }
         .into_json()
-        .map_err(|error| HostError::from(map_product_error(error)))?;
+        .map_err(|error| HostError::from(map_product_error(&error)))?;
         Ok(Self::new(callbacks, initial_state))
     }
 
@@ -119,6 +133,11 @@ impl ExperimentalServerServices {
     }
 
     /// Refreshes the session directory state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError`] if the session list cannot be refreshed or the
+    /// directory state cannot be published.
     pub async fn refresh(&self, cx: Context) -> Result<(), HostError> {
         let callbacks = Arc::clone(&self.callbacks);
         let directory = Arc::clone(&self.directory);
@@ -127,14 +146,18 @@ impl ExperimentalServerServices {
 
         mutation_tail
             .run(move || {
-                Box::pin(async move {
-                    refresh_now_impl(callbacks, directory, revision, cx).await
-                })
+                Box::pin(
+                    async move { refresh_now_impl(&callbacks, &directory, &revision, cx).await },
+                )
             })
             .await
     }
 
     /// Disposes every attachment and waits for the mutation tail to drain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError`] if one or more attachments fail to release.
     pub async fn dispose(&self) -> Result<(), HostError> {
         let attachments = {
             let mut guard = lock(&self.attachments);
@@ -160,10 +183,20 @@ impl ExperimentalServerServices {
 }
 
 impl RoutedServerServiceHost for ExperimentalServerServices {
+    /// Attaches a client presentation and builds the provider for this connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError`] if the provider cannot be built or any service
+    /// family cannot be registered.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "assembles the full routed server provider; splitting would fragment service wiring"
+    )]
     fn attach_client(
         &self,
         presentation: Arc<dyn RoutedServerPresentation>,
-        cx: Context,
+        _cx: Context,
     ) -> BoxFuture<'_, Result<Arc<dyn RoutedServerServiceAttachment>, HostError>> {
         let callbacks = Arc::clone(&self.callbacks);
         let directory = Arc::clone(&self.directory);
@@ -222,18 +255,17 @@ impl RoutedServerServiceHost for ExperimentalServerServices {
                             .run(move || {
                                 Box::pin(async move {
                                     let request = PrepareSessionRequest::from_json(one_arg(
-                                        args,
+                                        &args,
                                         PRESENTATION_PLUGINS_PREPARE_SESSION_MEMBER,
                                     )?)
-                                    .map_err(map_product_error)?;
-                                    let selected = callbacks
-                                        .prepare_session_plugins(
-                                            request.session_id,
-                                            request.package_paths,
-                                            cx,
-                                        )
-                                        .await
-                                        .map_err(host_error_to_service_error)?;
+                                    .map_err(|error| map_product_error(&error))?;
+                                    let selected = (callbacks.prepare_session_plugins)(
+                                        request.session_id,
+                                        request.package_paths,
+                                        cx,
+                                    )
+                                    .await
+                                    .map_err(host_error_to_service_error)?;
                                     *lock(&prepared_package_paths) =
                                         Some(selected.package_paths.clone());
                                     Ok(Some(selected.presentation_plugins))
@@ -258,7 +290,7 @@ impl RoutedServerServiceHost for ExperimentalServerServices {
                         mutation_tail
                             .run(move || {
                                 Box::pin(async move {
-                                    expect_no_args(args, PRESENTATION_PLUGINS_RELOAD_MEMBER)?;
+                                    expect_no_args(&args, PRESENTATION_PLUGINS_RELOAD_MEMBER)?;
                                     let package_paths = lock(&prepared_package_paths).clone();
                                     let package_paths = package_paths.ok_or_else(|| {
                                         ServiceError::remote(
@@ -266,10 +298,10 @@ impl RoutedServerServiceHost for ExperimentalServerServices {
                                             "No Session plugin selection is prepared",
                                         )
                                     })?;
-                                    let result = callbacks
-                                        .reload_presentation_plugins(package_paths, cx)
-                                        .await
-                                        .map_err(host_error_to_service_error)?;
+                                    let result =
+                                        (callbacks.reload_presentation_plugins)(package_paths, cx)
+                                            .await
+                                            .map_err(host_error_to_service_error)?;
                                     Ok(Some(result))
                                 })
                             })
@@ -301,23 +333,18 @@ impl RoutedServerServiceHost for ExperimentalServerServices {
                             .run(move || {
                                 Box::pin(async move {
                                     let options = SessionCreateOptions::from_json(one_arg(
-                                        args,
+                                        &args,
                                         SESSION_MANAGEMENT_CREATE_MEMBER,
                                     )?)
-                                    .map_err(map_product_error)?;
-                                    let created = callbacks
-                                        .create(options, cx.clone())
+                                    .map_err(|error| map_product_error(&error))?;
+                                    let created = (callbacks.create)(options, cx.clone())
                                         .await
                                         .map_err(host_error_to_service_error)?;
-                                    refresh_now_impl(
-                                        Arc::clone(&callbacks),
-                                        directory,
-                                        revision,
-                                        cx.clone(),
-                                    )
-                                    .await?;
-                                    let result =
-                                        created.into_json().map_err(map_product_error)?;
+                                    refresh_now_impl(&callbacks, &directory, &revision, cx.clone())
+                                        .await?;
+                                    let result = created
+                                        .into_json()
+                                        .map_err(|error| map_product_error(&error))?;
                                     Ok(Some(result))
                                 })
                             })
@@ -345,24 +372,18 @@ impl RoutedServerServiceHost for ExperimentalServerServices {
                             .run(move || {
                                 Box::pin(async move {
                                     let session_id = decode_string(
-                                        one_arg(args, SESSION_MANAGEMENT_REMOVE_MEMBER)?,
+                                        &one_arg(&args, SESSION_MANAGEMENT_REMOVE_MEMBER)?,
                                         SESSION_MANAGEMENT_REMOVE_MEMBER,
                                     )?;
                                     presentation
                                         .prepare_session_removal(session_id.clone(), cx.clone())
                                         .await
                                         .map_err(host_error_to_service_error)?;
-                                    callbacks
-                                        .remove(session_id, cx.clone())
+                                    (callbacks.remove)(session_id, cx.clone())
                                         .await
                                         .map_err(host_error_to_service_error)?;
-                                    refresh_now_impl(
-                                        Arc::clone(&callbacks),
-                                        directory,
-                                        revision,
-                                        cx.clone(),
-                                    )
-                                    .await?;
+                                    refresh_now_impl(&callbacks, &directory, &revision, cx.clone())
+                                        .await?;
                                     Ok(None)
                                 })
                             })
@@ -384,7 +405,7 @@ impl RoutedServerServiceHost for ExperimentalServerServices {
                             .run(move || {
                                 Box::pin(async move {
                                     let session_id = decode_string(
-                                        one_arg(args, SESSION_MANAGEMENT_ATTACH_MEMBER)?,
+                                        &one_arg(&args, SESSION_MANAGEMENT_ATTACH_MEMBER)?,
                                         SESSION_MANAGEMENT_ATTACH_MEMBER,
                                     )?;
                                     presentation
@@ -413,7 +434,7 @@ impl RoutedServerServiceHost for ExperimentalServerServices {
                         mutation_tail
                             .run(move || {
                                 Box::pin(async move {
-                                    expect_no_args(args, SESSION_MANAGEMENT_DETACH_MEMBER)?;
+                                    expect_no_args(&args, SESSION_MANAGEMENT_DETACH_MEMBER)?;
                                     presentation
                                         .detach_session(cx)
                                         .await
@@ -477,22 +498,23 @@ impl MutationTail {
         F: FnOnce() -> BoxFuture<'static, Result<T, HostError>> + Send + 'static,
         T: Send + 'static,
     {
-        let (result_tx, result_rx) = oneshot::channel();
-
-        let mut guard = lock(&self.previous);
-        let previous = std::mem::take(&mut *guard);
-
-        let handle = tokio::spawn(async move {
-            if let Some(previous) = previous {
-                previous.await;
-            }
-            let result = operation().await;
-            let _ = result_tx.send(result);
-        });
-
-        let new_tail: BoxFuture<'static, ()> =
-            Box::pin(async move { let _ = handle.await; });
-        *guard = Some(new_tail);
+        let result_rx = {
+            let (result_tx, result_rx) = oneshot::channel();
+            let mut guard = lock(&self.previous);
+            let previous = std::mem::take(&mut *guard);
+            let handle = tokio::spawn(async move {
+                if let Some(previous) = previous {
+                    previous.await;
+                }
+                let result = operation().await;
+                let _ = result_tx.send(result);
+            });
+            let new_tail: BoxFuture<'static, ()> = Box::pin(async move {
+                let _ = handle.await;
+            });
+            *guard = Some(new_tail);
+            result_rx
+        };
 
         result_rx
             .await
@@ -514,20 +536,20 @@ impl MutationTail {
 }
 
 async fn refresh_now_impl(
-    callbacks: Arc<ServerServiceCallbacks>,
-    directory: Arc<MutableReplicatedState>,
-    revision: Arc<Mutex<JsInteger>>,
+    callbacks: &Arc<ServerServiceCallbacks>,
+    directory: &Arc<MutableReplicatedState>,
+    revision: &Arc<Mutex<JsInteger>>,
     cx: Context,
 ) -> Result<(), HostError> {
-    let sessions = callbacks.list(cx.clone()).await?;
+    let sessions = (callbacks.list)(cx.clone()).await?;
     let revision = {
-        let mut guard = lock(&revision);
+        let mut guard = lock(revision);
         *guard = guard.next();
-        guard.clone()
+        *guard
     };
     let state = SessionDirectoryState { revision, sessions }
         .into_json()
-        .map_err(|error| HostError::from(map_product_error(error)))?;
+        .map_err(|error| HostError::from(map_product_error(&error)))?;
     directory.with_state_mut(|value| *value = state);
     directory.publish(cx).map_err(HostError::from)?;
     Ok(())
@@ -541,18 +563,19 @@ where
     Arc::new(move |args, cx| Box::pin(handler(args, cx)))
 }
 
-fn one_arg(mut args: Vec<JsonValue>, member: &str) -> Result<JsonValue, ServiceError> {
+fn one_arg(args: &[JsonValue], member: &str) -> Result<JsonValue, ServiceError> {
     if args.len() != 1 {
         return Err(invalid_value(format!(
             "{member} expects one argument, got {}",
             args.len()
         )));
     }
-    args.pop()
+    args.first()
+        .cloned()
         .ok_or_else(|| invalid_value(format!("{member} expects one argument")))
 }
 
-fn expect_no_args(args: Vec<JsonValue>, member: &str) -> Result<(), ServiceError> {
+fn expect_no_args(args: &[JsonValue], member: &str) -> Result<(), ServiceError> {
     if args.is_empty() {
         Ok(())
     } else {
@@ -560,10 +583,10 @@ fn expect_no_args(args: Vec<JsonValue>, member: &str) -> Result<(), ServiceError
     }
 }
 
-fn decode_string(value: JsonValue, member: &str) -> Result<String, ServiceError> {
-    let value = value.as_str().ok_or_else(|| {
-        invalid_value(format!("{member} expects one string argument"))
-    })?;
+fn decode_string(value: &JsonValue, member: &str) -> Result<String, ServiceError> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| invalid_value(format!("{member} expects one string argument")))?;
     value
         .try_to_utf8()
         .map_err(|error| invalid_value(format!("{member} argument is not valid UTF-8: {error}")))
@@ -573,8 +596,11 @@ fn invalid_value(message: impl Into<String>) -> ServiceError {
     ServiceError::remote(RemoteServiceErrorCode::ServiceInvalidValue, message)
 }
 
-fn map_product_error(error: ServiceError) -> ServiceError {
-    ServiceError::remote(RemoteServiceErrorCode::ServiceInvalidValue, error.to_string())
+fn map_product_error(error: &ServiceError) -> ServiceError {
+    ServiceError::remote(
+        RemoteServiceErrorCode::ServiceInvalidValue,
+        error.to_string(),
+    )
 }
 
 fn host_error_to_service_error(error: HostError) -> ServiceError {
@@ -590,7 +616,11 @@ struct AggregateReleaseError(Vec<HostError>);
 impl fmt::Display for AggregateReleaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Failed to release server service attachments: ")?;
-        let messages: Vec<String> = self.0.iter().map(|error| error.to_string()).collect();
+        let messages: Vec<String> = self
+            .0
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         formatter.write_str(&messages.join("; "))
     }
 }

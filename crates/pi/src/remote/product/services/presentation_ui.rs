@@ -7,13 +7,14 @@
 use pi_agent::service::error::ServiceError;
 use pi_agent::service::value::JsonValue;
 
-use super::{array, object, required, string, ProductJsonConvert};
+use super::{ProductJsonConvert, array, object, required, string};
 
 /// Chord service identifier for process-local presentation UI.
 pub const PRESENTATION_UI_ID: &str = "pi.local.presentation-ui";
 
-/// Local presentation UI member names.
+/// Wire method that asks the local presentation UI service to open a selection dialog.
 pub const PRESENTATION_UI_SELECT_MEMBER: &str = "select";
+/// Wire method that asks the local presentation UI service to show a status message.
 pub const PRESENTATION_UI_SHOW_STATUS_MEMBER: &str = "showStatus";
 
 /// One selectable item.
@@ -44,14 +45,28 @@ pub struct PresentationSelectArgs {
 impl ProductJsonConvert for PresentationSelectItem {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "presentation select item")?;
-        let value = string(required(fields, "value", "presentation select item.value")?, "presentation select item.value")?;
-        let label = string(required(fields, "label", "presentation select item.label")?, "presentation select item.label")?;
-        let description = match fields.get(&pi_agent::service::value::JsString::from_utf8("description")) {
+        let value = string(
+            required(fields, "value", "presentation select item.value")?,
+            "presentation select item.value",
+        )?;
+        let label = string(
+            required(fields, "label", "presentation select item.label")?,
+            "presentation select item.label",
+        )?;
+        let description = match fields.get(&pi_agent::service::value::JsString::from_utf8(
+            "description",
+        )) {
             None => None,
-            Some(value) if value.is_null() => return Err(super::invalid("presentation select item.description")),
+            Some(value) if value.is_null() => {
+                return Err(super::invalid("presentation select item.description"));
+            }
             Some(value) => Some(string(value, "presentation select item.description")?),
         };
-        Ok(Self { value, label, description })
+        Ok(Self {
+            value,
+            label,
+            description,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
@@ -81,7 +96,11 @@ impl ProductJsonConvert for PresentationSelectArgs {
             None => None,
             Some(value) => Some(string(value, "presentation select selectedValue")?),
         };
-        Ok(Self { title, items, selected_value })
+        Ok(Self {
+            title,
+            items,
+            selected_value,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {

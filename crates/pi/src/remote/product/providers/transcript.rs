@@ -13,19 +13,20 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+type RebaseHandle = JoinHandle<Result<(), Arc<ServiceError>>>;
+
 use pi_agent::context::Context;
 use pi_agent::harness::api::AgentLane;
 use pi_agent::harness::bus::{EventListener, WatchHandle};
 use pi_agent::harness::event::{ConfigUpdateChange, HarnessEvent, HarnessEventPayload};
-use pi_agent::harness::result::HarnessCall;
-use pi_agent::harness::snapshot::{reduce_lane_snapshot, LaneSnapshot, ReduceOutcome};
+use pi_agent::harness::snapshot::{LaneSnapshot, ReduceOutcome, reduce_lane_snapshot};
 use pi_agent::service::error::ServiceError;
 use pi_agent::service::provider::{ServiceImplementation, ServiceMember};
 use pi_agent::service::replicated::MutableReplicatedState;
-use pi_agent::service::value::{from_serde_json, JsString, JsonValue};
+use pi_agent::service::value::{JsString, JsonValue, from_serde_json};
 
 use crate::remote::product::services::ProductJsonConvert;
-use crate::remote::product::services::transcript::{TranscriptState, TRANSCRIPT_STATE_MEMBER};
+use crate::remote::product::services::transcript::{TRANSCRIPT_STATE_MEMBER, TranscriptState};
 
 /// Native transcript service implementation used by session workers.
 ///
@@ -37,7 +38,7 @@ pub struct TranscriptService {
     lane: Arc<dyn AgentLane>,
     snapshot: Mutex<Option<LaneSnapshot>>,
     watch: Mutex<Option<Arc<WatchHandle<LaneSnapshot>>>>,
-    rebase: Mutex<Option<JoinHandle<Result<(), Arc<ServiceError>>>>>,
+    rebase: Mutex<Option<RebaseHandle>>,
     rebase_error: Mutex<Option<Arc<ServiceError>>>,
     activating: AtomicBool,
 }
@@ -54,7 +55,10 @@ impl std::fmt::Debug for TranscriptService {
 
 impl TranscriptService {
     /// Creates an inactive transcript service with the source's empty state.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] if the initial state cannot be encoded.
     pub fn new(lane: Arc<dyn AgentLane>) -> Result<Arc<Self>, ServiceError> {
         let initial = TranscriptState {
             snapshot: None,
@@ -73,7 +77,6 @@ impl TranscriptService {
     }
 
     /// Returns the singleton service member implementation.
-    #[must_use]
     pub fn implementation(self: &Arc<Self>) -> ServiceImplementation {
         let mut implementation = ServiceImplementation::new();
         implementation.insert(
@@ -86,15 +89,20 @@ impl TranscriptService {
     /// Captures a lane watcher, publishes its initial snapshot, and starts
     /// ordered event delivery.
     ///
-    /// The outer [`HarnessCall`] rejection is an infrastructure exception and
-    /// is retained as the source of a [`ServiceError::Handler`].  It is never
-    /// converted into an expected harness `Closed` result.
+    /// Lane watcher creation reports its direct
+    /// [`pi_agent::harness::result::HarnessError`] as a service handler failure.
+    /// It is never converted into an expected harness `Closed` result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] if the watcher cannot be started or the
+    /// initial snapshot cannot be published.
     pub async fn activate(self: &Arc<Self>) -> Result<(), ServiceError> {
         if self.activating.swap(true, Ordering::AcqRel) {
             return Err(ServiceError::local("Transcript service is already active"));
         }
 
-        let watched: HarnessCall<WatchHandle<LaneSnapshot>> = self.lane.watch(&Context::background()).await;
+        let watched = self.lane.watch(&Context::background()).await;
         let opened = match watched {
             Ok(handle) => Arc::new(handle),
             Err(error) => {
@@ -125,7 +133,7 @@ impl TranscriptService {
             let service = Arc::clone(&service);
             Box::pin(async move {
                 if let Err(error) = service.on_event(event, context).await {
-                    std::panic::panic_any(error);
+                    service.latch_rebase_error(error);
                 }
             })
         });
@@ -141,6 +149,10 @@ impl TranscriptService {
     }
 
     /// Waits for an active rebase, then closes the watcher exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] if the rebase task or state publication fails.
     pub async fn dispose(&self) -> Result<(), ServiceError> {
         let rebase = lock(&self.rebase).take();
         let latched_before = lock(&self.rebase_error).take();
@@ -168,9 +180,13 @@ impl TranscriptService {
         rebase_result
     }
 
-    async fn on_event(self: &Arc<Self>, event: HarnessEvent, context: Context) -> Result<(), ServiceError> {
+    async fn on_event(
+        self: &Arc<Self>,
+        event: HarnessEvent,
+        context: Context,
+    ) -> Result<(), ServiceError> {
         if let Some(error) = lock(&self.rebase_error).as_ref().map(Arc::clone) {
-            std::panic::panic_any(error);
+            return Err(map_shared_service_error(&error));
         }
 
         let Some(forwarded) = to_lane_watch_event(&event)? else {
@@ -181,7 +197,10 @@ impl TranscriptService {
             .as_ref()
             .cloned()
             .ok_or_else(|| ServiceError::local("Transcript service is not active"))?;
-        let needs_rebase = matches!(reduce_lane_snapshot(&mut snapshot, &event), ReduceOutcome::NeedsResnapshot);
+        let needs_rebase = matches!(
+            reduce_lane_snapshot(&mut snapshot, &event),
+            ReduceOutcome::NeedsResnapshot
+        );
 
         // The source starts the watch-boundary capture before publishing the
         // navigation event.  `schedule_rebase` waits only until the native
@@ -228,7 +247,7 @@ impl TranscriptService {
             // navigation event cannot be overtaken by a later bus event.
             let mut resnapshot = Box::pin(watch.resnapshot(&context));
             let mut started_sender = Some(started_sender);
-            let result: HarnessCall<Arc<LaneSnapshot>> = futures::future::poll_fn(move |poll_context| {
+            let result = futures::future::poll_fn(move |poll_context| {
                 let result = resnapshot.as_mut().poll(poll_context);
                 if let Some(sender) = started_sender.take() {
                     let _ = sender.send(());
@@ -265,7 +284,9 @@ impl TranscriptService {
         started_receiver
             .await
             .map(|()| Some(release_sender))
-            .map_err(|error| ServiceError::internal_with_source("Transcript resnapshot did not start", error))
+            .map_err(|error| {
+                ServiceError::internal_with_source("Transcript resnapshot did not start", error)
+            })
     }
 
     fn publish_snapshot(
@@ -294,7 +315,10 @@ impl TranscriptService {
 
     fn clear_watch(&self, expected: &Arc<WatchHandle<LaneSnapshot>>) {
         let mut watch = lock(&self.watch);
-        if watch.as_ref().is_some_and(|current| Arc::ptr_eq(current, expected)) {
+        if watch
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
             *watch = None;
         }
     }
@@ -355,8 +379,6 @@ impl Drop for RebaseRelease {
             let _ = sender.send(());
         }
     }
-
-
 }
 #[derive(Debug)]
 struct SharedServiceError(Arc<ServiceError>);
@@ -376,4 +398,3 @@ impl std::error::Error for SharedServiceError {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
-

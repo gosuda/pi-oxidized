@@ -96,7 +96,10 @@ impl std::fmt::Debug for RadiusRelayAuthResolver {
             .debug_struct("RadiusRelayAuthResolver")
             .field("input", &self.input.as_ref().map(|_| "[redacted]"))
             .field("gateway", &self.gateway)
-            .field("model_runtime_initialized", &self.model_runtime.get().is_some())
+            .field(
+                "model_runtime_initialized",
+                &self.model_runtime.get().is_some(),
+            )
             .finish()
     }
 }
@@ -135,12 +138,21 @@ impl RadiusRelayAuthResolver {
     /// OAuth credentials are resolved through `ModelRuntime`, including any
     /// required refresh, and only the resulting bearer material is returned.
     /// No credential value is logged or included in an error.
+    ///
+    /// # Errors
+    /// Returns [`RadiusRelayAuthError::Offline`] when the user is in offline mode
+    /// and credentials are required; [`RadiusRelayAuthError::TokenFile`] when an
+    /// explicit token file cannot be read; [`RadiusRelayAuthError::EmptyToken`]
+    /// when the resolved token is empty; [`RadiusRelayAuthError::Required`] when
+    /// no stored credential is available and credentials are required;
+    /// [`RadiusRelayAuthError::Cancelled`] when the resolution signal is fired;
+    /// or [`RadiusRelayAuthError::Runtime`] when the native auth runtime fails.
     pub async fn resolve(
         &self,
         options: RadiusRelayAuthResolveOptions,
     ) -> Result<Option<RadiusRelayAuth>, RadiusRelayAuthError> {
         check_cancelled(options.signal.as_ref())?;
-        if std::env::var_os("PI_OFFLINE").is_some() {
+        if relay_offline(std::env::var("PI_OFFLINE").ok().as_deref()) {
             return if options.required {
                 Err(RadiusRelayAuthError::Offline)
             } else {
@@ -238,9 +250,7 @@ fn extract_auth_token(auth: &AuthResult) -> Option<String> {
             .then_some(value.as_deref())
             .flatten()
     })?;
-    let Some(separator) = authorization.find(char::is_whitespace) else {
-        return None;
-    };
+    let separator = authorization.find(char::is_whitespace)?;
     let (scheme, remainder) = authorization.split_at(separator);
     let token = remainder.trim_start();
 
@@ -271,9 +281,38 @@ where
     };
     tokio::select! {
         biased;
-        _ = signal.cancelled() => Err(RadiusRelayAuthError::Cancelled),
+        () = signal.cancelled() => Err(RadiusRelayAuthError::Cancelled),
         value = future => Ok(value),
     }
 }
 
- 
+/// Whether relay authentication should short-circuit as offline for the given
+/// `PI_OFFLINE` value.
+///
+/// This delegates to the shared CLI truthiness parser so one environment
+/// variable has one meaning across the product: `PI_OFFLINE=0`/`false`/`no`
+/// (and an unset value) leave relay authentication online, matching
+/// `initialize_bootstrap` and the `--offline` help text, instead of the old
+/// presence-only test that treated any export as offline.
+fn relay_offline(value: Option<&str>) -> bool {
+    crate::cli::bootstrap::is_truthy_env_flag(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_offline_honors_truthiness_not_presence() {
+        // Falsy values must NOT enable offline mode (the old presence-only bug).
+        assert!(!relay_offline(Some("0")));
+        assert!(!relay_offline(Some("false")));
+        assert!(!relay_offline(Some("no")));
+        // Unset is online.
+        assert!(!relay_offline(None));
+        // Truthy values enable offline mode, matching the rest of the CLI.
+        assert!(relay_offline(Some("1")));
+        assert!(relay_offline(Some("true")));
+        assert!(relay_offline(Some("yes")));
+    }
+}

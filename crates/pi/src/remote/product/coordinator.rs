@@ -15,8 +15,10 @@ use futures::future::BoxFuture;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
-use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
+use tokio::process::Child;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -24,8 +26,8 @@ use uuid::Uuid;
 use pi_agent::service::value::{JsObject, JsString, JsonValue, parse_json, stringify_json};
 
 use super::process::{
-    InternalProcessRole, InternalProcessSpawnOptions, MAX_CONTROL_LINE_BYTES,
-    encode_control_line, spawn_internal_process,
+    InternalProcessRole, InternalProcessSpawnOptions, MAX_CONTROL_LINE_BYTES, encode_control_line,
+    spawn_internal_process, terminate_internal_process,
 };
 
 /// Version of the coordinator control protocol.
@@ -80,8 +82,8 @@ impl Serialize for JsonValueWire<'_> {
     where
         S: Serializer,
     {
-        let raw = RawValue::from_string(stringify_json(self.0))
-            .map_err(serde::ser::Error::custom)?;
+        let raw =
+            RawValue::from_string(stringify_json(self.0)).map_err(serde::ser::Error::custom)?;
         raw.serialize(serializer)
     }
 }
@@ -93,7 +95,10 @@ impl Serialize for CoordinatorMessage {
     {
         let mut map = serializer.serialize_map(None)?;
         match self {
-            Self::ServerRegistered { server_connection_id, peers } => {
+            Self::ServerRegistered {
+                server_connection_id,
+                peers,
+            } => {
                 map.serialize_entry("type", "server_registered")?;
                 map.serialize_entry("serverConnectionId", server_connection_id)?;
                 map.serialize_entry("peers", peers)?;
@@ -127,16 +132,26 @@ impl<'de> Deserialize<'de> for CoordinatorMessage {
     }
 }
 
-
 /// Events emitted by a connected server-side [`CoordinatorConnection`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum CoordinatorConnectionEvent {
     /// A peer is now known to the current server.
-    PeerConnected { peer_id: String },
+    PeerConnected {
+        /// Connected peer id.
+        peer_id: String,
+    },
     /// A peer is no longer connected.
-    PeerDisconnected { peer_id: String },
+    PeerDisconnected {
+        /// Disconnected peer id.
+        peer_id: String,
+    },
     /// An opaque message arrived from a peer.
-    Message { from: String, payload: JsonValue },
+    Message {
+        /// Sender endpoint (`server` or a peer id).
+        from: String,
+        /// Canonical arbitrary JSON payload.
+        payload: JsonValue,
+    },
 }
 
 /// Options for a server-side coordinator connection.
@@ -190,7 +205,6 @@ fn json_key(key: &str) -> JsString {
     JsString::from_utf8(key)
 }
 
-
 fn json_string(value: impl AsRef<str>) -> JsonValue {
     JsonValue::String(JsString::from_utf8(value.as_ref()))
 }
@@ -215,6 +229,10 @@ fn payload_field(value: &JsonValue) -> Option<JsonValue> {
     object_field(value, "payload").cloned()
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "exact wire protocol version discriminant comparison"
+)]
 fn protocol_is_supported(value: &JsonValue) -> bool {
     object_field(value, "protocol")
         .and_then(JsonValue::as_f64)
@@ -222,15 +240,19 @@ fn protocol_is_supported(value: &JsonValue) -> bool {
 }
 
 fn encode_json_line(value: &JsonValue) -> Result<Vec<u8>, CoordinatorError> {
-    encode_control_line(&JsonValueWire(value)).map_err(|error| CoordinatorError::Encoding(error.to_string()))
+    encode_control_line(&JsonValueWire(value))
+        .map_err(|error| CoordinatorError::Encoding(error.to_string()))
 }
 
 fn parse_coordinator_message(value: &JsonValue) -> Result<CoordinatorMessage, String> {
-    let message_type = string_field(value, "type").ok_or_else(|| "Coordinator message must have a type".to_owned())?;
+    let message_type = string_field(value, "type")
+        .ok_or_else(|| "Coordinator message must have a type".to_owned())?;
     match message_type.as_str() {
         "server_registered" => {
-            let server_connection_id = string_field(value, "serverConnectionId")
-                .ok_or_else(|| "Coordinator server registration is missing serverConnectionId".to_owned())?;
+            let server_connection_id =
+                string_field(value, "serverConnectionId").ok_or_else(|| {
+                    "Coordinator server registration is missing serverConnectionId".to_owned()
+                })?;
             let peers = object_field(value, "peers")
                 .and_then(JsonValue::as_array)
                 .ok_or_else(|| "Coordinator server registration is missing peers".to_owned())?
@@ -238,10 +260,15 @@ fn parse_coordinator_message(value: &JsonValue) -> Result<CoordinatorMessage, St
                 .map(|peer| {
                     peer.as_str()
                         .and_then(|value| value.try_to_utf8().ok())
-                        .ok_or_else(|| "Coordinator server registration has an invalid peer id".to_owned())
+                        .ok_or_else(|| {
+                            "Coordinator server registration has an invalid peer id".to_owned()
+                        })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(CoordinatorMessage::ServerRegistered { server_connection_id, peers })
+            Ok(CoordinatorMessage::ServerRegistered {
+                server_connection_id,
+                peers,
+            })
         }
         "server_replaced" => Ok(CoordinatorMessage::ServerReplaced),
         "peer_connected" => Ok(CoordinatorMessage::PeerConnected {
@@ -266,10 +293,14 @@ struct WriteRequest {
     bytes: Vec<u8>,
     result: oneshot::Sender<Result<(), String>>,
 }
-
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "connection lifecycle state is naturally a set of boolean flags"
+)]
 struct ConnectionState {
     sender: Option<mpsc::UnboundedSender<WriteRequest>>,
     reader_task: Option<JoinHandle<()>>,
+    attempt_id: u64,
     registration: Option<oneshot::Sender<Result<(), String>>>,
     listeners: BTreeMap<u64, Arc<dyn Fn(CoordinatorConnectionEvent) + Send + Sync>>,
     next_listener_id: u64,
@@ -303,6 +334,7 @@ impl CoordinatorConnection {
         let server_connection_id = options
             .server_connection_id
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let cancel = CancellationToken::new();
         Self {
             inner: Arc::new(CoordinatorConnectionInner {
                 control_path: options.control_path,
@@ -311,6 +343,7 @@ impl CoordinatorConnection {
                 state: Mutex::new(ConnectionState {
                     sender: None,
                     reader_task: None,
+                    attempt_id: 0,
                     registration: None,
                     listeners: BTreeMap::new(),
                     next_listener_id: 0,
@@ -321,7 +354,7 @@ impl CoordinatorConnection {
                     replaced: false,
                 }),
                 replaced: Arc::new(Notify::new()),
-                cancel: CancellationToken::new(),
+                cancel,
             }),
             server_connection_id,
         }
@@ -376,6 +409,12 @@ impl CoordinatorConnection {
     }
 
     /// Connects and waits for the server registration acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::Closed`] if the connection is closed,
+    /// [`CoordinatorError::Protocol`] if registration is rejected, or
+    /// [`CoordinatorError::Unsupported`] on non-Unix platforms.
     pub async fn connect(&self) -> Result<(), CoordinatorError> {
         #[cfg(unix)]
         {
@@ -388,7 +427,16 @@ impl CoordinatorConnection {
     }
 
     /// Sends one opaque payload to a peer.
-    pub async fn send(&self, peer_id: impl AsRef<str>, payload: JsonValue) -> Result<(), CoordinatorError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::Closed`] if the connection is closed or
+    /// [`CoordinatorError::Protocol`] if the server is not registered.
+    pub async fn send(
+        &self,
+        peer_id: impl AsRef<str>,
+        payload: JsonValue,
+    ) -> Result<(), CoordinatorError> {
         let value = json_object([
             ("type", json_string("send")),
             ("to", json_string(peer_id.as_ref())),
@@ -398,11 +446,13 @@ impl CoordinatorConnection {
     }
 
     /// Broadcasts one opaque payload to every peer through the current server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::Closed`] if the connection is closed or
+    /// [`CoordinatorError::Protocol`] if the server is not registered.
     pub async fn broadcast(&self, payload: JsonValue) -> Result<(), CoordinatorError> {
-        let value = json_object([
-            ("type", json_string("broadcast")),
-            ("payload", payload),
-        ]);
+        let value = json_object([("type", json_string("broadcast")), ("payload", payload)]);
         self.write_value(value, true).await
     }
 
@@ -429,7 +479,11 @@ impl CoordinatorConnection {
         }
     }
 
-    async fn write_value(&self, value: JsonValue, require_registration: bool) -> Result<(), CoordinatorError> {
+    async fn write_value(
+        &self,
+        value: JsonValue,
+        require_registration: bool,
+    ) -> Result<(), CoordinatorError> {
         let bytes = encode_json_line(&value)?;
         let sender = {
             let state = lock(&self.inner.state);
@@ -437,12 +491,13 @@ impl CoordinatorConnection {
                 return Err(CoordinatorError::Closed);
             }
             if require_registration && !state.registered {
-                return Err(CoordinatorError::Protocol("Coordinator server is not connected".to_owned()));
+                return Err(CoordinatorError::Protocol(
+                    "Coordinator server is not connected".to_owned(),
+                ));
             }
-            state
-                .sender
-                .clone()
-                .ok_or_else(|| CoordinatorError::Protocol("Coordinator server is not connected".to_owned()))?
+            state.sender.clone().ok_or_else(|| {
+                CoordinatorError::Protocol("Coordinator server is not connected".to_owned())
+            })?
         };
         let (result, receiver) = oneshot::channel();
         sender
@@ -454,17 +509,21 @@ impl CoordinatorConnection {
             .map_err(CoordinatorError::Protocol)
     }
 
-    fn emit(&self, event: CoordinatorConnectionEvent) {
-        let listeners = lock(&self.inner.state).listeners.values().cloned().collect::<Vec<_>>();
+    fn emit(&self, event: &CoordinatorConnectionEvent) {
+        let listeners = lock(&self.inner.state)
+            .listeners
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         for listener in listeners {
             listener(event.clone());
         }
     }
 
-    fn mark_replaced(&self) {
+    fn mark_replaced(&self, attempt_id: u64) {
         let should_notify = {
             let mut state = lock(&self.inner.state);
-            if state.replaced {
+            if state.attempt_id != attempt_id || !state.connected || state.replaced {
                 false
             } else {
                 state.replaced = true;
@@ -476,38 +535,59 @@ impl CoordinatorConnection {
         }
     }
 
-    fn disconnected(&self, error: impl Into<String>) {
-        let registration = {
+    fn disconnected(&self, error: impl Into<String>, attempt_id: u64, cancel: &CancellationToken) {
+        let (registration, current, should_notify) = {
             let mut state = lock(&self.inner.state);
-            state.sender = None;
-            state.connected = false;
-            state.registration.take()
+            if state.attempt_id != attempt_id || !state.connected {
+                (None, false, false)
+            } else {
+                state.sender = None;
+                state.connected = false;
+                let should_notify = !(state.closed || state.replaced);
+                if should_notify {
+                    state.replaced = true;
+                }
+                (state.registration.take(), true, should_notify)
+            }
         };
+        cancel.cancel();
+        if !current {
+            return;
+        }
         if let Some(registration) = registration {
             let _ = registration.send(Err(error.into()));
         }
-        self.inner.cancel.cancel();
-        if !lock(&self.inner.state).closed {
-            self.mark_replaced();
+        if should_notify {
+            self.inner.replaced.notify_waiters();
         }
     }
 
-    fn handle_message(&self, value: JsonValue) {
-        let message = match parse_coordinator_message(&value) {
+    fn handle_message(&self, value: &JsonValue, attempt_id: u64, cancel: &CancellationToken) {
+        let message = match parse_coordinator_message(value) {
             Ok(message) => message,
             Err(error) => {
-                self.disconnected(error);
+                self.disconnected(error, attempt_id, cancel);
                 return;
             }
         };
         match message {
-            CoordinatorMessage::ServerRegistered { server_connection_id, peers } => {
+            CoordinatorMessage::ServerRegistered {
+                server_connection_id,
+                peers,
+            } => {
                 if server_connection_id != self.server_connection_id {
-                    self.disconnected("Coordinator returned an invalid server registration");
+                    self.disconnected(
+                        "Coordinator returned an invalid server registration",
+                        attempt_id,
+                        cancel,
+                    );
                     return;
                 }
                 let registration = {
                     let mut state = lock(&self.inner.state);
+                    if state.attempt_id != attempt_id || !state.connected {
+                        return;
+                    }
                     state.peer_ids.extend(peers);
                     state.registered = true;
                     state.registration.take()
@@ -516,17 +596,43 @@ impl CoordinatorConnection {
                     let _ = registration.send(Ok(()));
                 }
             }
-            CoordinatorMessage::ServerReplaced => self.mark_replaced(),
+            CoordinatorMessage::ServerReplaced => self.mark_replaced(attempt_id),
             CoordinatorMessage::PeerConnected { peer_id } => {
-                lock(&self.inner.state).peer_ids.insert(peer_id.clone());
-                self.emit(CoordinatorConnectionEvent::PeerConnected { peer_id });
+                let current = {
+                    let mut state = lock(&self.inner.state);
+                    if state.attempt_id != attempt_id || !state.connected {
+                        false
+                    } else {
+                        state.peer_ids.insert(peer_id.clone());
+                        true
+                    }
+                };
+                if current {
+                    self.emit(&CoordinatorConnectionEvent::PeerConnected { peer_id });
+                }
             }
             CoordinatorMessage::PeerDisconnected { peer_id } => {
-                lock(&self.inner.state).peer_ids.remove(&peer_id);
-                self.emit(CoordinatorConnectionEvent::PeerDisconnected { peer_id });
+                let current = {
+                    let mut state = lock(&self.inner.state);
+                    if state.attempt_id != attempt_id || !state.connected {
+                        false
+                    } else {
+                        state.peer_ids.remove(&peer_id);
+                        true
+                    }
+                };
+                if current {
+                    self.emit(&CoordinatorConnectionEvent::PeerDisconnected { peer_id });
+                }
             }
             CoordinatorMessage::Message { from, payload } => {
-                self.emit(CoordinatorConnectionEvent::Message { from, payload });
+                let current = {
+                    let state = lock(&self.inner.state);
+                    state.attempt_id == attempt_id && state.connected
+                };
+                if current {
+                    self.emit(&CoordinatorConnectionEvent::Message { from, payload });
+                }
             }
         }
     }
@@ -541,46 +647,80 @@ impl CoordinatorConnection {
                 return Err(CoordinatorError::Closed);
             }
             if state.connected || state.sender.is_some() {
-                return Err(CoordinatorError::Protocol("Coordinator server is already connected".to_owned()));
+                return Err(CoordinatorError::Protocol(
+                    "Coordinator server is already connected".to_owned(),
+                ));
             }
         }
         let endpoint = self
             .inner
             .endpoint
             .to_str()
-            .ok_or_else(|| CoordinatorError::Protocol("Coordinator endpoint is not valid UTF-8".to_owned()))?
+            .ok_or_else(|| {
+                CoordinatorError::Protocol("Coordinator endpoint is not valid UTF-8".to_owned())
+            })?
             .to_owned();
         let socket = UnixStream::connect(&self.inner.control_path).await?;
         let (reader, writer) = socket.into_split();
         let (sender, receiver) = mpsc::unbounded_channel();
         let (registration, registered) = oneshot::channel();
-        {
+        let cancel = self.inner.cancel.child_token();
+        let attempt_id = {
             let mut state = lock(&self.inner.state);
+            if state.closed {
+                return Err(CoordinatorError::Closed);
+            }
+            if state.connected || state.sender.is_some() {
+                return Err(CoordinatorError::Protocol(
+                    "Coordinator server is already connected".to_owned(),
+                ));
+            }
+            state.attempt_id = state.attempt_id.wrapping_add(1);
+            state.registered = false;
+            state.replaced = false;
+            state.peer_ids.clear();
             state.sender = Some(sender.clone());
             state.registration = Some(registration);
             state.connected = true;
-        }
+            state.attempt_id
+        };
         let writer_inner = Arc::clone(&self.inner);
-        let writer_cancel = self.inner.cancel.clone();
+        let writer_cancel = cancel.clone();
         tokio::spawn(async move {
-            writer_loop(writer, receiver, writer_inner, writer_cancel).await;
+            writer_loop(writer, receiver, writer_inner, writer_cancel, attempt_id).await;
         });
         let reader_inner = Arc::clone(&self.inner);
-        let reader_connection = Self { inner: Arc::clone(&self.inner), server_connection_id: self.server_connection_id.clone() };
-        let reader_cancel = self.inner.cancel.clone();
+        let reader_connection = Self {
+            inner: Arc::clone(&self.inner),
+            server_connection_id: self.server_connection_id.clone(),
+        };
+        let reader_cancel = cancel.clone();
         let reader_task = tokio::spawn(async move {
-            reader_loop(reader, reader_connection, reader_inner, reader_cancel).await;
+            reader_loop(
+                reader,
+                reader_connection,
+                reader_inner,
+                reader_cancel,
+                attempt_id,
+            )
+            .await;
         });
         lock(&self.inner.state).reader_task = Some(reader_task);
 
         let register = json_object([
             ("type", json_string("register_server")),
-            ("protocol", JsonValue::Number(f64::from(COORDINATOR_PROTOCOL_VERSION))),
-            ("serverConnectionId", json_string(&self.server_connection_id)),
+            (
+                "protocol",
+                JsonValue::Number(f64::from(COORDINATOR_PROTOCOL_VERSION)),
+            ),
+            (
+                "serverConnectionId",
+                json_string(&self.server_connection_id),
+            ),
             ("endpoint", json_string(endpoint)),
         ]);
         if let Err(error) = self.write_value(register, false).await {
-            self.disconnected(error.to_string());
+            self.disconnected(error.to_string(), attempt_id, &cancel);
             return Err(error);
         }
         match registered.await {
@@ -597,10 +737,11 @@ async fn writer_loop(
     mut receiver: mpsc::UnboundedReceiver<WriteRequest>,
     connection: Arc<CoordinatorConnectionInner>,
     cancel: CancellationToken,
+    attempt_id: u64,
 ) {
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            () = cancel.cancelled() => break,
             request = receiver.recv() => {
                 let Some(request) = request else { break };
                 match writer.write_all(&request.bytes).await {
@@ -612,7 +753,7 @@ async fn writer_loop(
                             inner: Arc::clone(&connection),
                             server_connection_id: connection.server_connection_id.clone(),
                         };
-                        connection_view.disconnected(message);
+                        connection_view.disconnected(message, attempt_id, &cancel);
                         break;
                     }
                 }
@@ -662,28 +803,29 @@ async fn reader_loop(
     connection: CoordinatorConnection,
     _inner: Arc<CoordinatorConnectionInner>,
     cancel: CancellationToken,
+    attempt_id: u64,
 ) {
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
     loop {
         line.clear();
         let result = tokio::select! {
-            _ = cancel.cancelled() => break,
+            () = cancel.cancelled() => break,
             result = read_control_line(&mut reader, &mut line) => result,
         };
         let complete = match result {
             Ok(Some(complete)) => complete,
             Ok(None) => {
-                connection.disconnected("Coordinator connection closed");
+                connection.disconnected("Coordinator connection closed", attempt_id, &cancel);
                 break;
             }
             Err(error) => {
-                connection.disconnected(error.to_string());
+                connection.disconnected(error.to_string(), attempt_id, &cancel);
                 break;
             }
         };
         if !complete {
-            connection.disconnected("Coordinator connection closed");
+            connection.disconnected("Coordinator connection closed", attempt_id, &cancel);
             break;
         }
         let mut end = line.len().saturating_sub(1);
@@ -693,33 +835,95 @@ async fn reader_loop(
         let text = match std::str::from_utf8(&line[..end]) {
             Ok(text) => text,
             Err(error) => {
-                connection.disconnected(format!("Coordinator sent invalid UTF-8: {error}"));
+                connection.disconnected(
+                    format!("Coordinator sent invalid UTF-8: {error}"),
+                    attempt_id,
+                    &cancel,
+                );
                 break;
             }
         };
         match parse_json(text) {
-            Ok(value) => connection.handle_message(value),
+            Ok(value) => connection.handle_message(&value, attempt_id, &cancel),
             Err(error) => {
-                connection.disconnected(format!("Coordinator sent invalid JSON: {error}"));
+                connection.disconnected(
+                    format!("Coordinator sent invalid JSON: {error}"),
+                    attempt_id,
+                    &cancel,
+                );
                 break;
             }
         }
     }
 }
 
-
 /// A lease keeping a startup probe socket open until the caller is ready.
 pub struct CoordinatorStartupLease {
     #[cfg(unix)]
+    #[expect(
+        dead_code,
+        reason = "socket is held by ownership to keep the probe listener alive"
+    )]
     socket: Option<tokio::net::UnixStream>,
 }
 
 impl CoordinatorStartupLease {
     /// Closes the probe connection.
-    pub fn close(self) {}
+    pub fn close(self) {
+        drop(self);
+    }
+}
+
+#[cfg(unix)]
+struct CoordinatorChildGuard {
+    child: Child,
+    disarmed: bool,
+}
+
+#[cfg(unix)]
+impl CoordinatorChildGuard {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            disarmed: false,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+
+    async fn terminate(mut self) -> io::Result<()> {
+        let result = terminate_internal_process(&mut self.child).await;
+        if result.is_ok() {
+            self.disarmed = true;
+        }
+        result
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CoordinatorChildGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            // Drop cannot await the documented terminate-and-reap helper.
+            // Start termination synchronously so cancellation cannot orphan it.
+            let _ = self.child.start_kill();
+        }
+    }
 }
 
 /// Ensures that a coordinator is reachable, starting one when necessary.
+///
+/// # Errors
+///
+/// Returns [`CoordinatorError::ProcessExited`] if the coordinator exits during startup,
+/// [`CoordinatorError::StartupTimeout`] if it does not become reachable in time,
+/// or [`CoordinatorError::Unsupported`] on non-Unix platforms.
 pub async fn ensure_coordinator(
     public_path: impl AsRef<Path>,
     control_path: impl AsRef<Path>,
@@ -729,29 +933,30 @@ pub async fn ensure_coordinator(
         let public_path = public_path.as_ref().to_path_buf();
         let control_path = control_path.as_ref().to_path_buf();
         if let Some(socket) = try_connect(&control_path).await? {
-            return Ok(CoordinatorStartupLease { socket: Some(socket) });
+            return Ok(CoordinatorStartupLease {
+                socket: Some(socket),
+            });
         }
         let args = vec![
             public_path.to_string_lossy().into_owned(),
             control_path.to_string_lossy().into_owned(),
         ];
-        let mut child = spawn_internal_process(
+        let child = spawn_internal_process(
             InternalProcessRole::Coordinator,
             &args,
             &InternalProcessSpawnOptions { env: Vec::new() },
         )?;
-        let deadline = tokio::time::Instant::now() + COORDINATOR_START_TIMEOUT;
-        loop {
-            if let Some(socket) = try_connect(&control_path).await? {
-                return Ok(CoordinatorStartupLease { socket: Some(socket) });
+        let mut child = CoordinatorChildGuard::new(child);
+        let startup = wait_for_coordinator_startup(&control_path, child.child_mut()).await;
+        match startup {
+            Ok(lease) => {
+                child.disarm();
+                Ok(lease)
             }
-            if child.try_wait()?.is_some() {
-                return Err(CoordinatorError::ProcessExited);
+            Err(error) => {
+                let _ = child.terminate().await;
+                Err(error)
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(CoordinatorError::StartupTimeout);
-            }
-            tokio::time::sleep(COORDINATOR_RETRY).await;
         }
     }
     #[cfg(not(unix))]
@@ -762,6 +967,27 @@ pub async fn ensure_coordinator(
 }
 
 #[cfg(unix)]
+async fn wait_for_coordinator_startup(
+    control_path: &Path,
+    child: &mut Child,
+) -> Result<CoordinatorStartupLease, CoordinatorError> {
+    let deadline = tokio::time::Instant::now() + COORDINATOR_START_TIMEOUT;
+    loop {
+        if let Some(socket) = try_connect(control_path).await? {
+            return Ok(CoordinatorStartupLease {
+                socket: Some(socket),
+            });
+        }
+        if child.try_wait()?.is_some() {
+            return Err(CoordinatorError::ProcessExited);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CoordinatorError::StartupTimeout);
+        }
+        tokio::time::sleep(COORDINATOR_RETRY).await;
+    }
+}
+#[cfg(unix)]
 async fn try_connect(path: &Path) -> Result<Option<tokio::net::UnixStream>, CoordinatorError> {
     match tokio::net::UnixStream::connect(path).await {
         Ok(socket) => Ok(Some(socket)),
@@ -769,7 +995,10 @@ async fn try_connect(path: &Path) -> Result<Option<tokio::net::UnixStream>, Coor
             if matches!(
                 error.kind(),
                 io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) => Ok(None),
+            ) =>
+        {
+            Ok(None)
+        }
         Err(error) => Err(CoordinatorError::Io(error)),
     }
 }
@@ -780,6 +1009,12 @@ static COORDINATOR_RUNNING: std::sync::atomic::AtomicBool =
 
 /// Runs the standalone coordinator process until it becomes empty or receives
 /// SIGINT/SIGTERM.
+///
+/// # Errors
+///
+/// Returns [`CoordinatorError::Protocol`] if the coordinator is already running,
+/// [`CoordinatorError::Io`] if socket setup fails,
+/// or [`CoordinatorError::Unsupported`] on non-Unix platforms.
 pub async fn run_coordinator_process(args: &[String]) -> Result<(), CoordinatorError> {
     #[cfg(unix)]
     {
@@ -831,9 +1066,16 @@ enum ProcessEvent {
         writer: mpsc::UnboundedSender<Vec<u8>>,
         cancel: CancellationToken,
     },
-    ControlLine { connection_id: u64, value: JsonValue },
-    ControlClosed { connection_id: u64 },
-    PublicClosed { connection_id: u64 },
+    ControlLine {
+        connection_id: u64,
+        value: JsonValue,
+    },
+    ControlClosed {
+        connection_id: u64,
+    },
+    PublicClosed {
+        connection_id: u64,
+    },
     EmptyTimer,
 }
 
@@ -872,8 +1114,8 @@ impl CoordinatorProcess {
         self.empty_timer = Some(cancel);
         tokio::spawn(async move {
             tokio::select! {
-                _ = timer_cancel.cancelled() => {}
-                _ = tokio::time::sleep(delay) => { let _ = event_tx.send(ProcessEvent::EmptyTimer); }
+                () = timer_cancel.cancelled() => {}
+                () = tokio::time::sleep(delay) => { let _ = event_tx.send(ProcessEvent::EmptyTimer); }
             }
         });
     }
@@ -909,7 +1151,11 @@ impl CoordinatorProcess {
         }
         self.control_connections.insert(
             connection_id,
-            ControlState { writer, cancel, role: ControlRole::Unknown },
+            ControlState {
+                writer,
+                cancel,
+                role: ControlRole::Unknown,
+            },
         );
     }
 
@@ -918,29 +1164,28 @@ impl CoordinatorProcess {
             drop(stream);
             return;
         }
-        let endpoint = match self.current_server.as_ref() {
-            Some(server) => server.endpoint.clone(),
-            None => {
-                drop(stream);
-                return;
-            }
+        let Some(server) = self.current_server.as_ref() else {
+            drop(stream);
+            return;
         };
+        let endpoint = server.endpoint.clone();
         self.cancel_empty_shutdown();
         let cancel = CancellationToken::new();
-        self.public_connections.insert(connection_id, cancel.clone());
+        self.public_connections
+            .insert(connection_id, cancel.clone());
         let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
             proxy_public(stream, endpoint, connection_id, cancel, event_tx).await;
         });
     }
 
-    fn handle_line(&mut self, connection_id: u64, value: JsonValue) {
+    fn handle_line(&mut self, connection_id: u64, value: &JsonValue) {
         let Some(connection) = self.control_connections.get(&connection_id).cloned() else {
             return;
         };
         match connection.role {
             ControlRole::Unknown => {
-                let Some(message_type) = string_field(&value, "type") else {
+                let Some(message_type) = string_field(value, "type") else {
                     self.disconnect(connection_id);
                     return;
                 };
@@ -954,26 +1199,27 @@ impl CoordinatorProcess {
                 }
             }
             ControlRole::Server => {
-                if self.current_server.as_ref().is_some_and(|server| server.connection_id == connection_id) {
-                    self.handle_routed_message("server", &value, connection_id);
+                if self
+                    .current_server
+                    .as_ref()
+                    .is_some_and(|server| server.connection_id == connection_id)
+                {
+                    self.handle_routed_message("server", value, connection_id);
                 }
             }
             ControlRole::Peer(peer_id) => {
-                self.handle_routed_message(&peer_id, &value, connection_id);
+                self.handle_routed_message(&peer_id, value, connection_id);
             }
         }
     }
 
-    fn register_server(&mut self, connection_id: u64, value: JsonValue) -> Result<(), String> {
-        if !protocol_is_supported(&value) {
-            return Err("Unsupported coordinator protocol".to_owned());
-        }
-        let server_connection_id = string_field(&value, "serverConnectionId")
+    fn register_server(&mut self, connection_id: u64, value: &JsonValue) -> Result<(), String> {
+        let server_connection_id = string_field(value, "serverConnectionId")
             .ok_or_else(|| "Coordinator serverConnectionId must be a string".to_owned())?;
         if server_connection_id.is_empty() {
             return Err("Coordinator serverConnectionId must be a string".to_owned());
         }
-        let endpoint = string_field(&value, "endpoint")
+        let endpoint = string_field(value, "endpoint")
             .ok_or_else(|| "Coordinator endpoint must be a string".to_owned())?;
         if endpoint.is_empty() {
             return Err("Coordinator endpoint must be a string".to_owned());
@@ -995,15 +1241,10 @@ impl CoordinatorProcess {
             connection.role = ControlRole::Server;
         }
         self.cancel_empty_shutdown();
-        let peers = JsonValue::Array(
-            self.peers
-                .keys()
-                .map(|peer_id| json_string(peer_id))
-                .collect(),
-        );
-        self.send_value(
+        let peers = JsonValue::Array(self.peers.keys().map(json_string).collect());
+        Self::send_value(
             &writer,
-            json_object([
+            &json_object([
                 ("type", json_string("server_registered")),
                 ("serverConnectionId", json_string(&server_connection_id)),
                 ("peers", peers),
@@ -1011,25 +1252,31 @@ impl CoordinatorProcess {
         );
         if let Some(previous) = previous {
             self.close_public_connections();
-            self.notify_peers(json_object([
+            self.notify_peers(&json_object([
                 ("type", json_string("server_disconnected")),
-                ("serverConnectionId", json_string(previous.server_connection_id)),
+                (
+                    "serverConnectionId",
+                    json_string(previous.server_connection_id),
+                ),
             ]));
-            self.send_value(&previous.writer, json_object([("type", json_string("server_replaced"))]));
+            Self::send_value(
+                &previous.writer,
+                &json_object([("type", json_string("server_replaced"))]),
+            );
             self.disconnect(previous.connection_id);
         }
-        self.notify_peers(json_object([
+        self.notify_peers(&json_object([
             ("type", json_string("server_connected")),
             ("serverConnectionId", json_string(&server_connection_id)),
         ]));
         Ok(())
     }
 
-    fn register_peer(&mut self, connection_id: u64, value: JsonValue) -> Result<(), String> {
-        if !protocol_is_supported(&value) {
+    fn register_peer(&mut self, connection_id: u64, value: &JsonValue) -> Result<(), String> {
+        if !protocol_is_supported(value) {
             return Err("Unsupported coordinator protocol".to_owned());
         }
-        let peer_id = string_field(&value, "peerId")
+        let peer_id = string_field(value, "peerId")
             .ok_or_else(|| "Coordinator peerId must be a string".to_owned())?;
         if peer_id.is_empty() {
             return Err("Coordinator peerId must be a string".to_owned());
@@ -1045,21 +1292,30 @@ impl CoordinatorProcess {
             .clone();
         self.peers.insert(
             peer_id.clone(),
-            PeerState { connection_id, writer: writer.clone() },
+            PeerState {
+                connection_id,
+                writer: writer.clone(),
+            },
         );
         if let Some(connection) = self.control_connections.get_mut(&connection_id) {
             connection.role = ControlRole::Peer(peer_id.clone());
         }
         self.cancel_empty_shutdown();
-        let mut registration = vec![("type", json_string("peer_registered")), ("peerId", json_string(&peer_id))];
+        let mut registration = vec![
+            ("type", json_string("peer_registered")),
+            ("peerId", json_string(&peer_id)),
+        ];
         if let Some(server) = &self.current_server {
-            registration.push(("serverConnectionId", json_string(&server.server_connection_id)));
+            registration.push((
+                "serverConnectionId",
+                json_string(&server.server_connection_id),
+            ));
         }
-        self.send_value(&writer, json_object(registration));
+        Self::send_value(&writer, &json_object(registration));
         if let Some(server) = &self.current_server {
-            self.send_value(
+            Self::send_value(
                 &server.writer,
-                json_object([
+                &json_object([
                     ("type", json_string("peer_connected")),
                     ("peerId", json_string(&peer_id)),
                 ]),
@@ -1084,15 +1340,17 @@ impl CoordinatorProcess {
                     return;
                 }
                 let writer = if target == "server" {
-                    self.current_server.as_ref().map(|server| server.writer.clone())
+                    self.current_server
+                        .as_ref()
+                        .map(|server| server.writer.clone())
                 } else {
                     self.peers.get(&target).map(|peer| peer.writer.clone())
                 };
                 if let Some(writer) = writer {
                     let payload = payload_field(value).unwrap_or(JsonValue::Null);
-                    self.send_value(
+                    Self::send_value(
                         &writer,
-                        json_object([
+                        &json_object([
                             ("type", json_string("message")),
                             ("from", json_string(from)),
                             ("payload", payload),
@@ -1101,20 +1359,20 @@ impl CoordinatorProcess {
                 }
             }
             "broadcast" => {
-                if from != "server"
-                    || !self
+                let addressed_to_server = from == "server"
+                    && self
                         .current_server
                         .as_ref()
-                        .is_some_and(|server| server.connection_id == connection_id)
-                {
+                        .is_some_and(|server| server.connection_id == connection_id);
+                if !addressed_to_server {
                     self.disconnect(connection_id);
                     return;
                 }
                 let payload = payload_field(value).unwrap_or(JsonValue::Null);
                 for peer in self.peers.values() {
-                    self.send_value(
+                    Self::send_value(
                         &peer.writer,
-                        json_object([
+                        &json_object([
                             ("type", json_string("message")),
                             ("from", json_string(from)),
                             ("payload", payload.clone()),
@@ -1126,15 +1384,15 @@ impl CoordinatorProcess {
         }
     }
 
-    fn send_value(&self, writer: &mpsc::UnboundedSender<Vec<u8>>, value: JsonValue) {
-        if let Ok(bytes) = encode_json_line(&value) {
+    fn send_value(writer: &mpsc::UnboundedSender<Vec<u8>>, value: &JsonValue) {
+        if let Ok(bytes) = encode_json_line(value) {
             let _ = writer.send(bytes);
         }
     }
 
-    fn notify_peers(&self, value: JsonValue) {
+    fn notify_peers(&self, value: &JsonValue) {
         for peer in self.peers.values() {
-            self.send_value(&peer.writer, value.clone());
+            Self::send_value(&peer.writer, value);
         }
     }
 
@@ -1157,9 +1415,12 @@ impl CoordinatorProcess {
                     .as_ref()
                     .is_some_and(|server| server.connection_id == connection_id)
                 {
-                    let server_connection_id = self.current_server.take().map(|server| server.server_connection_id);
+                    let server_connection_id = self
+                        .current_server
+                        .take()
+                        .map(|server| server.server_connection_id);
                     if let Some(server_connection_id) = server_connection_id {
-                        self.notify_peers(json_object([
+                        self.notify_peers(&json_object([
                             ("type", json_string("server_disconnected")),
                             ("serverConnectionId", json_string(server_connection_id)),
                         ]));
@@ -1174,9 +1435,9 @@ impl CoordinatorProcess {
                 {
                     self.peers.remove(&peer_id);
                     if let Some(server) = &self.current_server {
-                        self.send_value(
+                        Self::send_value(
                             &server.writer,
-                            json_object([
+                            &json_object([
                                 ("type", json_string("peer_disconnected")),
                                 ("peerId", json_string(peer_id)),
                             ]),
@@ -1191,10 +1452,17 @@ impl CoordinatorProcess {
 
     fn handle_event(&mut self, event: ProcessEvent) {
         match event {
-            ProcessEvent::ControlAccepted { connection_id, writer, cancel } => {
+            ProcessEvent::ControlAccepted {
+                connection_id,
+                writer,
+                cancel,
+            } => {
                 self.accept_control(connection_id, writer, cancel);
             }
-            ProcessEvent::ControlLine { connection_id, value } => self.handle_line(connection_id, value),
+            ProcessEvent::ControlLine {
+                connection_id,
+                value,
+            } => self.handle_line(connection_id, &value),
             ProcessEvent::ControlClosed { connection_id } => self.disconnect(connection_id),
             ProcessEvent::PublicClosed { connection_id } => {
                 self.public_connections.remove(&connection_id);
@@ -1240,7 +1508,7 @@ async fn control_connection(
         let mut writer = writer;
         loop {
             tokio::select! {
-                _ = writer_cancel.cancelled() => break,
+                () = writer_cancel.cancelled() => break,
                 message = writer_rx.recv() => {
                     let Some(message) = message else { break };
                     if writer.write_all(&message).await.is_err() {
@@ -1252,7 +1520,11 @@ async fn control_connection(
         }
     });
     if event_tx
-        .send(ProcessEvent::ControlAccepted { connection_id, writer: writer_tx, cancel: cancel.clone() })
+        .send(ProcessEvent::ControlAccepted {
+            connection_id,
+            writer: writer_tx,
+            cancel: cancel.clone(),
+        })
         .is_err()
     {
         cancel.cancel();
@@ -1263,12 +1535,13 @@ async fn control_connection(
     loop {
         line.clear();
         let result = tokio::select! {
-            _ = cancel.cancelled() => break,
+            () = cancel.cancelled() => break,
             result = read_control_line(&mut reader, &mut line) => result,
         };
-        let complete = match result {
-            Ok(Some(complete)) => complete,
-            _ => false,
+        let complete = if let Ok(Some(complete)) = result {
+            complete
+        } else {
+            false
         };
         if !complete {
             break;
@@ -1277,15 +1550,17 @@ async fn control_connection(
         if end > 0 && line[end - 1] == b'\r' {
             end -= 1;
         }
-        let text = match std::str::from_utf8(&line[..end]) {
-            Ok(text) => text,
-            Err(_) => break,
+        let Ok(text) = std::str::from_utf8(&line[..end]) else {
+            break;
         };
-        let value = match parse_json(text) {
-            Ok(value) => value,
-            Err(_) => break,
-        };
-        if event_tx.send(ProcessEvent::ControlLine { connection_id, value }).is_err() {
+        let Ok(value) = parse_json(text) else { break };
+        if event_tx
+            .send(ProcessEvent::ControlLine {
+                connection_id,
+                value,
+            })
+            .is_err()
+        {
             break;
         }
     }
@@ -1302,12 +1577,12 @@ async fn proxy_public(
     event_tx: mpsc::UnboundedSender<ProcessEvent>,
 ) {
     let upstream = tokio::select! {
-        _ = cancel.cancelled() => None,
+        () = cancel.cancelled() => None,
         result = tokio::net::UnixStream::connect(endpoint) => result.ok(),
     };
     if let Some(mut upstream) = upstream {
         tokio::select! {
-            _ = cancel.cancelled() => {}
+            () = cancel.cancelled() => {}
             _ = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {}
         }
     }
@@ -1316,21 +1591,35 @@ async fn proxy_public(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-owner startup sequence for listeners, tasks, and shutdown; splitting would separate setup from teardown"
+)]
 async fn run_coordinator_process_unix(args: &[String]) -> Result<(), CoordinatorError> {
     if COORDINATOR_RUNNING.load(std::sync::atomic::Ordering::Acquire) {
-        return Err(CoordinatorError::Protocol("Coordinator process is already running".to_owned()));
+        return Err(CoordinatorError::Protocol(
+            "Coordinator process is already running".to_owned(),
+        ));
     }
     let Some(public_arg) = args.first() else {
-        return Err(CoordinatorError::Protocol("Coordinator requires public and control socket paths".to_owned()));
+        return Err(CoordinatorError::Protocol(
+            "Coordinator requires public and control socket paths".to_owned(),
+        ));
     };
     let Some(control_arg) = args.get(1) else {
-        return Err(CoordinatorError::Protocol("Coordinator requires public and control socket paths".to_owned()));
+        return Err(CoordinatorError::Protocol(
+            "Coordinator requires public and control socket paths".to_owned(),
+        ));
     };
     if public_arg.is_empty() || control_arg.is_empty() {
-        return Err(CoordinatorError::Protocol("Coordinator requires public and control socket paths".to_owned()));
+        return Err(CoordinatorError::Protocol(
+            "Coordinator requires public and control socket paths".to_owned(),
+        ));
     }
     if COORDINATOR_RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        return Err(CoordinatorError::Protocol("Coordinator process is already running".to_owned()));
+        return Err(CoordinatorError::Protocol(
+            "Coordinator process is already running".to_owned(),
+        ));
     }
     let public_path = PathBuf::from(public_arg);
     let control_path = PathBuf::from(control_arg);
@@ -1445,9 +1734,11 @@ async fn remove_stale_socket(path: &Path) -> Result<(), CoordinatorError> {
             if matches!(
                 error.kind(),
                 io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-            ) => {
-                cleanup_socket(path).await
-            }
+            ) =>
+        {
+            cleanup_socket(path).await
+        }
+        Err(error) => Err(CoordinatorError::Io(error)),
     }
 }
 
@@ -1465,9 +1756,13 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions use expect for concise failure messages"
+    )]
     fn coordinator_message_preserves_canonical_payload() {
-        let payload = parse_json(r#"{"surrogate":"\ud800","number":-0}"#)
-            .expect("canonical JSON fixture");
+        let payload =
+            parse_json(r#"{"surrogate":"\ud800","number":-0}"#).expect("canonical JSON fixture");
         let line = encode_json_line(&json_object([
             ("type", json_string("message")),
             ("from", json_string("server")),
@@ -1475,7 +1770,86 @@ mod tests {
         ]))
         .expect("control line");
         let text = String::from_utf8(line).expect("UTF-8 control line");
-        assert!(text.contains(r#"\ud800"#));
+        assert!(text.contains(r"\ud800"));
         assert!(text.ends_with('\n'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions use expect for concise failure messages"
+    )]
+    async fn connection_can_reconnect_after_transport_closure() {
+        let temporary_directory = tempfile::tempdir().expect("temporary directory");
+        let control_path = temporary_directory.path().join("control.sock");
+        let endpoint = temporary_directory.path().join("endpoint.sock");
+        let listener = tokio::net::UnixListener::bind(&control_path).expect("control socket");
+        let connection = CoordinatorConnection::new(CoordinatorConnectionOptions {
+            control_path,
+            endpoint,
+            server_connection_id: Some("test-server".to_owned()),
+        });
+        let server_connection_id = connection.server_connection_id.clone();
+        let connection_inner = Arc::clone(&connection.inner);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut release_rx = Some(release_rx);
+        let server_task = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (stream, _) = listener.accept().await.expect("server connection");
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = Vec::new();
+                assert_eq!(
+                    read_control_line(&mut reader, &mut line)
+                        .await
+                        .expect("registration line"),
+                    Some(true)
+                );
+                if attempt == 1 {
+                    assert!(
+                        !connection_inner.cancel.is_cancelled(),
+                        "reconnect must keep the shutdown root alive"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                let response = json_object([
+                    ("type", json_string("server_registered")),
+                    ("serverConnectionId", json_string(&server_connection_id)),
+                    ("peers", JsonValue::Array(Vec::new())),
+                ]);
+                let response = encode_json_line(&response).expect("registration response");
+                writer
+                    .write_all(&response)
+                    .await
+                    .expect("registration response write");
+                if attempt == 0 {
+                    drop(writer);
+                    drop(reader);
+                } else {
+                    // Hold the reconnected transport open until the test has
+                    // observed the fresh generation: exiting here would drop
+                    // the socket and race the assertion below with EOF, the
+                    // same race the first generation exercises deliberately.
+                    if let Some(release) = release_rx.take() {
+                        let _ = release.await;
+                    }
+                }
+            }
+        });
+
+        connection.connect().await.expect("initial connection");
+        // No freshness assert here: the server drops the transport right
+        // after acknowledging, so the EOF races registration-ack delivery
+        // and the generation is already ended by the time we observe it.
+        // Freshness of the new generation is asserted after reconnect.
+        connection.replaced().await;
+        tokio::time::timeout(Duration::from_secs(1), connection.connect())
+            .await
+            .expect("reconnect registration timed out")
+            .expect("reconnected connection");
+        assert!(!connection.was_replaced());
+        let _ = release_tx.send(());
+        server_task.await.expect("server task");
     }
 }

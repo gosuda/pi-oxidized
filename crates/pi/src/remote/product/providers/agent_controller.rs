@@ -1,34 +1,41 @@
+//! Native provider for the session agent controller service.
+
+use std::future::Future;
 use std::sync::Arc;
 
 use pi_agent::context::Context;
 use pi_agent::harness::api::{AgentLane, NavigateOptions, PromptInput, QueueInput};
-use pi_agent::harness::result::{
-    CancelQueuedKind, HarnessCall, HarnessError, HarnessException, OperationResultRecord,
-    RunOutcome, SuspendedRun,
-};
+use pi_agent::harness::result::{CancelQueuedKind, HarnessError, RunOutcome, SuspendedRun};
 use pi_agent::service::error::{RemoteServiceErrorCode, ServiceError};
 use pi_agent::service::provider::{ServiceImplementation, ServiceMember, ServiceMethod};
 use pi_agent::service::value::{JsString, JsonValue};
-use pi_agent::session::{EntryId, OperationId};
+use pi_agent::session::{EntryId, OperationId, OperationResultRecord};
 
+use crate::remote::product::services::ProductJsonConvert;
 use crate::remote::product::services::agent_controller::{
-    AgentCompactionRequest, AgentNavigationRequest, AgentOperationError, AgentOperationResponse,
-    AgentPromptRequest, AgentQueueResponse, CancelQueuedOutcome,
     AGENT_CONTROLLER_CANCEL_QUEUED_MEMBER, AGENT_CONTROLLER_COMPACT_MEMBER,
     AGENT_CONTROLLER_FOLLOW_UP_MEMBER, AGENT_CONTROLLER_NAVIGATE_MEMBER,
     AGENT_CONTROLLER_NEXT_RUN_MEMBER, AGENT_CONTROLLER_PROMPT_MEMBER,
     AGENT_CONTROLLER_REQUEST_ABORT_MEMBER, AGENT_CONTROLLER_RESUME_MEMBER,
-    AGENT_CONTROLLER_STEER_MEMBER,
+    AGENT_CONTROLLER_STEER_MEMBER, AgentCompactionRequest, AgentNavigationRequest,
+    AgentOperationError, AgentOperationResponse, AgentPromptRequest, AgentQueueResponse,
+    CancelQueuedOutcome,
 };
-use crate::remote::product::services::ProductJsonConvert;
 
 /// Builds the singleton implementation of the presentation-safe agent facade.
 ///
-/// The lane methods have two result layers: [`HarnessCall`] represents a thrown
-/// infrastructure rejection, while each existing harness result alias retains
-/// expected operation failures as its inner `HarnessError`.  The former becomes
-/// a service failure; the latter follows the source provider's response or
-/// throw behavior member by member.
+/// Lane methods return direct `Result` aliases. Expected operation errors become
+/// source-shaped responses for prompt, queue, resume, compaction, and navigation;
+/// request-abort and queued-cancel errors remain service failures, matching the
+/// source provider's throw behavior.
+#[expect(
+    clippy::too_many_lines,
+    reason = "mirrors the source service member table; splitting would obscure dispatch symmetry"
+)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "service method closures receive Vec<JsonValue> from the provider signature and only borrow it to dispatch"
+)]
 pub fn agent_controller_implementation(lane: Arc<dyn AgentLane>) -> ServiceImplementation {
     let mut implementation = std::collections::BTreeMap::new();
 
@@ -38,11 +45,8 @@ pub fn agent_controller_implementation(lane: Arc<dyn AgentLane>) -> ServiceImple
         ServiceMember::Method(method(move |args, context| {
             let lane = Arc::clone(&prompt_lane);
             async move {
-                let request = decode_prompt(args, AGENT_CONTROLLER_PROMPT_MEMBER)?;
-                let result = into_service_result(
-                    lane.prompt(to_prompt_input(request), &context).await,
-                )?;
-                let response = match result {
+                let request = decode_prompt(&args, AGENT_CONTROLLER_PROMPT_MEMBER)?;
+                let response = match lane.prompt(to_prompt_input(request), &context).await {
                     Ok(outcome) => to_operation_response(&outcome),
                     Err(error) => rejected_response(operation_id(&error), &error),
                 };
@@ -57,12 +61,11 @@ pub fn agent_controller_implementation(lane: Arc<dyn AgentLane>) -> ServiceImple
         ServiceMember::Method(method(move |args, context| {
             let lane = Arc::clone(&abort_lane);
             async move {
-                let operation_id = decode_string(args, AGENT_CONTROLLER_REQUEST_ABORT_MEMBER)?;
+                let operation_id = decode_string(&args, AGENT_CONTROLLER_REQUEST_ABORT_MEMBER)?;
                 let operation_id = OperationId::new(operation_id);
-                let result = into_service_result(
-                    lane.request_abort(&operation_id, &context).await,
-                )?;
-                result.map_err(expected_harness_error_to_service_error)?;
+                lane.request_abort(&operation_id, &context)
+                    .await
+                    .map_err(ServiceError::handler)?;
                 Ok(None)
             }
         })),
@@ -74,10 +77,7 @@ pub fn agent_controller_implementation(lane: Arc<dyn AgentLane>) -> ServiceImple
     );
     implementation.insert(
         service_member(AGENT_CONTROLLER_FOLLOW_UP_MEMBER),
-        ServiceMember::Method(queue_method(
-            Arc::clone(&lane),
-            QueueOperation::FollowUp,
-        )),
+        ServiceMember::Method(queue_method(Arc::clone(&lane), QueueOperation::FollowUp)),
     );
     implementation.insert(
         service_member(AGENT_CONTROLLER_NEXT_RUN_MEMBER),
@@ -90,12 +90,12 @@ pub fn agent_controller_implementation(lane: Arc<dyn AgentLane>) -> ServiceImple
         ServiceMember::Method(method(move |args, context| {
             let lane = Arc::clone(&cancel_lane);
             async move {
-                let entry_id = decode_string(args, AGENT_CONTROLLER_CANCEL_QUEUED_MEMBER)?;
+                let entry_id = decode_string(&args, AGENT_CONTROLLER_CANCEL_QUEUED_MEMBER)?;
                 let entry_id = EntryId::new(entry_id);
-                let result = into_service_result(
-                    lane.cancel_queued(&entry_id, &context).await,
-                )?;
-                let outcome = result.map_err(expected_harness_error_to_service_error)?;
+                let outcome = lane
+                    .cancel_queued(&entry_id, &context)
+                    .await
+                    .map_err(ServiceError::handler)?;
                 let outcome = match outcome {
                     CancelQueuedKind::Cancelled => CancelQueuedOutcome::Cancelled,
                     CancelQueuedKind::AlreadyConsumed => CancelQueuedOutcome::AlreadyConsumed,
@@ -112,9 +112,8 @@ pub fn agent_controller_implementation(lane: Arc<dyn AgentLane>) -> ServiceImple
         ServiceMember::Method(method(move |args, context| {
             let lane = Arc::clone(&resume_lane);
             async move {
-                expect_no_args(args, AGENT_CONTROLLER_RESUME_MEMBER)?;
-                let result = into_service_result(lane.resume(&context).await)?;
-                let response = match result {
+                expect_no_args(&args, AGENT_CONTROLLER_RESUME_MEMBER)?;
+                let response = match lane.resume(&context).await {
                     Ok(outcome) => to_operation_response(&outcome),
                     Err(error) => rejected_response(None, &error),
                 };
@@ -129,11 +128,11 @@ pub fn agent_controller_implementation(lane: Arc<dyn AgentLane>) -> ServiceImple
         ServiceMember::Method(method(move |args, context| {
             let lane = Arc::clone(&compact_lane);
             async move {
-                let request = decode_compaction(args, AGENT_CONTROLLER_COMPACT_MEMBER)?;
-                let result = into_service_result(
-                    lane.compact(request.custom_instructions.as_deref(), &context).await,
-                )?;
-                let response = match result {
+                let request = decode_compaction(&args, AGENT_CONTROLLER_COMPACT_MEMBER)?;
+                let response = match lane
+                    .compact(request.custom_instructions.as_deref(), &context)
+                    .await
+                {
                     Ok(outcome) => to_operation_response_record(&outcome.compaction),
                     Err(error) => rejected_response(operation_id(&error), &error),
                 };
@@ -148,17 +147,14 @@ pub fn agent_controller_implementation(lane: Arc<dyn AgentLane>) -> ServiceImple
         ServiceMember::Method(method(move |args, context| {
             let lane = Arc::clone(&navigate_lane);
             async move {
-                let request = decode_navigation(args, AGENT_CONTROLLER_NAVIGATE_MEMBER)?;
+                let request = decode_navigation(&args, AGENT_CONTROLLER_NAVIGATE_MEMBER)?;
                 let target = request.target_id.map(EntryId::new);
                 let options = NavigateOptions {
                     summarize: Some(request.summarize),
                     label: request.label,
                     custom_instructions: request.custom_instructions,
                 };
-                let result = into_service_result(
-                    lane.navigate_tree(target.as_ref(), options, &context).await,
-                )?;
-                let response = match result {
+                let response = match lane.navigate_tree(target.as_ref(), options, &context).await {
                     Ok(outcome) => to_operation_response_record(&outcome.navigation),
                     Err(error) => rejected_response(operation_id(&error), &error),
                 };
@@ -181,14 +177,14 @@ fn queue_method(lane: Arc<dyn AgentLane>, operation: QueueOperation) -> ServiceM
     method(move |args, context| {
         let lane = Arc::clone(&lane);
         async move {
-            let request = decode_prompt(args, queue_member(operation))?;
+            let request = decode_prompt(&args, queue_member(operation))?;
             let input = to_queue_input(request);
-            let result = into_service_result(match operation {
+            let response = match operation {
                 QueueOperation::Steer => lane.steer(input, &context).await,
                 QueueOperation::FollowUp => lane.follow_up(input, &context).await,
                 QueueOperation::NextRun => lane.next_run(input, &context).await,
-            })?;
-            let response = match result {
+            };
+            let response = match response {
                 Ok(entry_id) => AgentQueueResponse {
                     accepted: true,
                     entry_id: Some(entry_id.to_string()),
@@ -227,7 +223,9 @@ fn to_queue_input(request: AgentPromptRequest) -> QueueInput {
     }
 }
 
-fn to_images(images: Option<Vec<crate::remote::product::services::agent_controller::AgentPromptImage>>) -> Vec<pi_ai::ImageContent> {
+fn to_images(
+    images: Option<Vec<crate::remote::product::services::agent_controller::AgentPromptImage>>,
+) -> Vec<pi_ai::ImageContent> {
     images
         .unwrap_or_default()
         .into_iter()
@@ -300,59 +298,52 @@ fn operation_id(error: &HarnessError) -> Option<String> {
     }
 }
 
-fn into_service_result<T>(result: HarnessCall<T>) -> Result<T, ServiceError> {
-    result.map_err(harness_exception_to_service_error)
-}
-
-
-fn harness_exception_to_service_error(error: HarnessException) -> ServiceError {
-    ServiceError::handler(error)
-}
-
-fn expected_harness_error_to_service_error(error: HarnessError) -> ServiceError {
-    ServiceError::handler(error)
-}
-
-fn decode_prompt(args: Vec<JsonValue>, member: &str) -> Result<AgentPromptRequest, ServiceError> {
-    AgentPromptRequest::from_json(one_arg(args, member)?).map_err(|error| invalid_value(error.to_string()))
+fn decode_prompt(args: &[JsonValue], member: &str) -> Result<AgentPromptRequest, ServiceError> {
+    AgentPromptRequest::from_json(one_arg(args, member)?)
+        .map_err(|error| invalid_value(error.to_string()))
 }
 
 fn decode_compaction(
-    args: Vec<JsonValue>,
+    args: &[JsonValue],
     member: &str,
 ) -> Result<AgentCompactionRequest, ServiceError> {
-    AgentCompactionRequest::from_json(one_arg(args, member)?).map_err(|error| invalid_value(error.to_string()))
+    AgentCompactionRequest::from_json(one_arg(args, member)?)
+        .map_err(|error| invalid_value(error.to_string()))
 }
 
 fn decode_navigation(
-    args: Vec<JsonValue>,
+    args: &[JsonValue],
     member: &str,
 ) -> Result<AgentNavigationRequest, ServiceError> {
-    AgentNavigationRequest::from_json(one_arg(args, member)?).map_err(|error| invalid_value(error.to_string()))
+    AgentNavigationRequest::from_json(one_arg(args, member)?)
+        .map_err(|error| invalid_value(error.to_string()))
 }
 
-fn decode_string(args: Vec<JsonValue>, member: &str) -> Result<String, ServiceError> {
+fn decode_string(args: &[JsonValue], member: &str) -> Result<String, ServiceError> {
     let value = one_arg(args, member)?;
     let Some(value) = value.as_str() else {
-        return Err(invalid_value(format!("{member} expects one string argument")));
+        return Err(invalid_value(format!(
+            "{member} expects one string argument"
+        )));
     };
     value
         .try_to_utf8()
         .map_err(|error| invalid_value(format!("{member} argument is not valid UTF-8: {error}")))
 }
 
-fn one_arg(mut args: Vec<JsonValue>, member: &str) -> Result<JsonValue, ServiceError> {
+fn one_arg(args: &[JsonValue], member: &str) -> Result<JsonValue, ServiceError> {
     if args.len() != 1 {
         return Err(invalid_value(format!(
             "{member} expects one argument, got {}",
             args.len()
         )));
     }
-    args.pop()
+    args.first()
+        .cloned()
         .ok_or_else(|| invalid_value(format!("{member} expects one argument")))
 }
 
-fn expect_no_args(args: Vec<JsonValue>, member: &str) -> Result<(), ServiceError> {
+fn expect_no_args(args: &[JsonValue], member: &str) -> Result<(), ServiceError> {
     if args.is_empty() {
         Ok(())
     } else {
@@ -375,5 +366,3 @@ fn queue_member(operation: QueueOperation) -> &'static str {
         QueueOperation::NextRun => AGENT_CONTROLLER_NEXT_RUN_MEMBER,
     }
 }
-
-

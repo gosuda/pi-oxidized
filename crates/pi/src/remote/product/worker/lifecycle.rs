@@ -59,7 +59,10 @@ pub enum WorkerLifecycleError {
     InactiveAttachment,
     /// A lifecycle delay was not a non-negative JavaScript safe integer.
     #[error("{name} must be a non-negative safe integer")]
-    InvalidDelay { name: String },
+    InvalidDelay {
+        /// Name of the delay that was out of range (e.g. an environment variable).
+        name: String,
+    },
 }
 
 /// Retirement callback shared by the lifecycle and its timer driver.
@@ -166,6 +169,10 @@ struct Inner {
     on_retire: OnRetire,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "lifecycle state uses four explicit boolean flags for the retiring/closed/demand/timer predicates"
+)]
 struct State {
     current_server_connection_id: Option<JsString>,
     demands: HashMap<DemandKey, Demand>,
@@ -299,7 +306,10 @@ impl WorkerLifecycle {
                 {
                     continue;
                 }
-                demand.orphan_deadline = Some(Deadline { at: deadline, token });
+                demand.orphan_deadline = Some(Deadline {
+                    at: deadline,
+                    token,
+                });
                 token = next_timer_token(token);
             }
             state.next_timer_token = token;
@@ -683,9 +693,7 @@ pub fn lifecycle_delay(
     if let Some(integer) = prefixed_integer(value) {
         return delay_from_u64(name, integer);
     }
-    let Some(parsed) = value.parse::<f64>().ok() else {
-        return Err(invalid_delay(name));
-    };
+    let parsed = value.parse::<f64>().map_err(|_| invalid_delay(name))?;
     if !parsed.is_finite()
         || parsed < 0.0
         || parsed.fract() != 0.0
@@ -709,6 +717,11 @@ pub fn lifecycle_delay(
 ///
 /// A missing variable selects `fallback_ms`. Present values use
 /// [`lifecycle_delay`], including its empty-string and safe-integer rules.
+///
+/// # Errors
+///
+/// Returns [`WorkerLifecycleError`] when the variable holds a non-unicode,
+/// empty, or out-of-range delay.
 pub fn lifecycle_delay_from_env(
     name: &str,
     fallback_ms: u64,
@@ -720,6 +733,11 @@ pub fn lifecycle_delay_from_env(
     }
 }
 
+/// Returns a duration when `millis` is within the safe-integer bound.
+///
+/// # Errors
+/// Returns [`WorkerLifecycleError::InvalidDelay`] when `millis` exceeds
+/// [`MAX_SAFE_INTEGER_MILLIS`].
 fn delay_from_u64(name: &str, millis: u64) -> Result<Duration, WorkerLifecycleError> {
     if millis > MAX_SAFE_INTEGER_MILLIS {
         return Err(invalid_delay(name));
@@ -744,15 +762,13 @@ fn prefixed_integer(value: &str) -> Option<u64> {
         (2, digits)
     } else if let Some(digits) = value.strip_prefix("0o") {
         (8, digits)
-    } else if let Some(digits) = value.strip_prefix("0O") {
-        (8, digits)
     } else {
-        return None;
+        let digits = value.strip_prefix("0O")?;
+        (8, digits)
     };
-    if digits.is_empty() {
-        return None;
-    }
-    u64::from_str_radix(digits, radix).ok()
+    (!digits.is_empty())
+        .then(|| u64::from_str_radix(digits, radix).ok())
+        .flatten()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

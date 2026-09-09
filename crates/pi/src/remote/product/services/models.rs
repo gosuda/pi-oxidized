@@ -10,17 +10,24 @@ use pi_agent::service::error::ServiceError;
 use pi_agent::service::value::{JsObject, JsString, JsonValue};
 use pi_ai::types::ModelThinkingLevel;
 
-use super::{array, bool_value, integer, invalid, json_object, nullable, object, required, string, ProductJsonConvert};
+use super::{
+    ProductJsonConvert, array, bool_value, integer, invalid, json_object, nullable, object,
+    required, string,
+};
 
 /// Chord service identifier for model catalogue and selection.
 pub const MODELS_ID: &str = "pi.models";
 /// Replicated state member name.
 pub const MODELS_STATE_MEMBER: &str = "state";
-/// Method member names.
+/// Wire method that asks `pi.models` to cycle the selected model's thinking level.
 pub const MODELS_CYCLE_THINKING_MEMBER: &str = "cycleThinking";
+/// Wire method that asks `pi.models` for thinking levels supported by the active model.
 pub const MODELS_GET_THINKING_LEVELS_MEMBER: &str = "getThinkingLevels";
+/// Wire method that asks `pi.models` to refresh its model catalogue.
 pub const MODELS_REFRESH_MEMBER: &str = "refresh";
+/// Wire method that asks `pi.models` to select a provider-scoped model.
 pub const MODELS_SELECT_MEMBER: &str = "select";
+/// Wire method that asks `pi.models` to select the active model's thinking level.
 pub const MODELS_SELECT_THINKING_MEMBER: &str = "selectThinking";
 
 /// Provider-scoped model identity.
@@ -93,8 +100,14 @@ pub struct ModelsState {
 impl ProductJsonConvert for ModelRef {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "model reference")?;
-        let provider = string(required(fields, "provider", "model reference.provider")?, "model reference.provider")?;
-        let model_id = string(required(fields, "modelId", "model reference.modelId")?, "model reference.modelId")?;
+        let provider = string(
+            required(fields, "provider", "model reference.provider")?,
+            "model reference.provider",
+        )?;
+        let model_id = string(
+            required(fields, "modelId", "model reference.modelId")?,
+            "model reference.modelId",
+        )?;
         Ok(Self { provider, model_id })
     }
 
@@ -110,8 +123,14 @@ impl ProductJsonConvert for ModelSummary {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "model summary")?;
         let identity = ModelRef::from_json(value.clone())?;
-        let name = string(required(fields, "name", "model summary.name")?, "model summary.name")?;
-        let reasoning = bool_value(required(fields, "reasoning", "model summary.reasoning")?, "model summary.reasoning")?;
+        let name = string(
+            required(fields, "name", "model summary.name")?,
+            "model summary.name",
+        )?;
+        let reasoning = bool_value(
+            required(fields, "reasoning", "model summary.reasoning")?,
+            "model summary.reasoning",
+        )?;
         Ok(Self {
             provider: identity.provider,
             model_id: identity.model_id,
@@ -133,7 +152,10 @@ impl ProductJsonConvert for ModelSummary {
 impl ProductJsonConvert for ModelsCatalog {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "models catalog")?;
-        let revision = integer(required(fields, "revision", "models catalog.revision")?, "models catalog.revision")?;
+        let revision = integer(
+            required(fields, "revision", "models catalog.revision")?,
+            "models catalog.revision",
+        )?;
         let available_models = array(
             required(fields, "availableModels", "models catalog.availableModels")?,
             "models catalog.availableModels",
@@ -142,7 +164,10 @@ impl ProductJsonConvert for ModelsCatalog {
         .cloned()
         .map(ModelSummary::from_json)
         .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { revision, available_models })
+        Ok(Self {
+            revision,
+            available_models,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
@@ -161,15 +186,19 @@ impl ProductJsonConvert for ModelsCatalog {
 impl ProductJsonConvert for ModelsConfiguration {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "models configuration")?;
-        let model = nullable(required(fields, "model", "models configuration.model")?, |value| {
-            ModelRef::from_json(value.clone())
-        })?;
+        let model = nullable(
+            required(fields, "model", "models configuration.model")?,
+            |value| ModelRef::from_json(value.clone()),
+        )?;
         let thinking_level = thinking_level(required(
             fields,
             "thinkingLevel",
             "models configuration.thinkingLevel",
         )?)?;
-        Ok(Self { model, thinking_level })
+        Ok(Self {
+            model,
+            thinking_level,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
@@ -187,7 +216,10 @@ impl ProductJsonConvert for ModelsConfiguration {
 impl ProductJsonConvert for ModelsRefreshState {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "models refresh state")?;
-        let status = string(required(fields, "status", "models refresh state.status")?, "models refresh state.status")?;
+        let status = string(
+            required(fields, "status", "models refresh state.status")?,
+            "models refresh state.status",
+        )?;
         match status.as_str() {
             "idle" => Ok(Self::Idle),
             "refreshing" => Ok(Self::Refreshing),
@@ -199,9 +231,9 @@ impl ProductJsonConvert for ModelsRefreshState {
                 )?;
                 let mut errors = BTreeMap::new();
                 for (key, value) in error_fields {
-                    let key = key
-                        .try_to_utf8()
-                        .map_err(|error| invalid(format!("models refresh state.errors key: {error}")))?;
+                    let key = key.try_to_utf8().map_err(|error| {
+                        invalid(format!("models refresh state.errors key: {error}"))
+                    })?;
                     errors.insert(key, string(value, "models refresh state.errors value")?);
                 }
                 Ok(Self::Warning { errors })
@@ -213,7 +245,10 @@ impl ProductJsonConvert for ModelsRefreshState {
     fn into_json(self) -> Result<JsonValue, ServiceError> {
         match self {
             Self::Idle => Ok(json_object([("status", JsonValue::String("idle".into()))])),
-            Self::Refreshing => Ok(json_object([("status", JsonValue::String("refreshing".into()))])),
+            Self::Refreshing => Ok(json_object([(
+                "status",
+                JsonValue::String("refreshing".into()),
+            )])),
             Self::Done => Ok(json_object([("status", JsonValue::String("done".into()))])),
             Self::Warning { errors } => {
                 let mut error_fields = JsObject::new();
@@ -232,15 +267,19 @@ impl ProductJsonConvert for ModelsRefreshState {
 impl ProductJsonConvert for ModelsState {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "models state")?;
-        let catalog = ModelsCatalog::from_json(required(fields, "catalog", "models state.catalog")?.clone())?;
-        let configuration = ModelsConfiguration::from_json(required(
-            fields,
-            "configuration",
-            "models state.configuration",
-        )?
-        .clone())?;
-        let refresh = ModelsRefreshState::from_json(required(fields, "refresh", "models state.refresh")?.clone())?;
-        Ok(Self { catalog, configuration, refresh })
+        let catalog =
+            ModelsCatalog::from_json(required(fields, "catalog", "models state.catalog")?.clone())?;
+        let configuration = ModelsConfiguration::from_json(
+            required(fields, "configuration", "models state.configuration")?.clone(),
+        )?;
+        let refresh = ModelsRefreshState::from_json(
+            required(fields, "refresh", "models state.refresh")?.clone(),
+        )?;
+        Ok(Self {
+            catalog,
+            configuration,
+            refresh,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
@@ -251,7 +290,6 @@ impl ProductJsonConvert for ModelsState {
         ]))
     }
 }
-
 
 fn thinking_level(value: &JsonValue) -> Result<ModelThinkingLevel, ServiceError> {
     let value = string(value, "models thinkingLevel")?;

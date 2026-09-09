@@ -32,6 +32,7 @@ mod serde_cbor;
 pub mod client;
 pub mod codec;
 pub mod framing;
+pub mod product;
 pub mod schemas;
 pub mod server;
 pub mod transport;

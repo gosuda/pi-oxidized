@@ -7,20 +7,31 @@
 use pi_agent::service::error::ServiceError;
 use pi_agent::service::value::JsonValue;
 
-use super::{array, bool_value, json_object, nullable, nullable_string, object, required, string, ProductJsonConvert};
+use super::{
+    ProductJsonConvert, array, bool_value, json_object, nullable, nullable_string, object,
+    required, string,
+};
 
 /// Chord service identifier for the worker-owned agent controller.
 pub const AGENT_CONTROLLER_ID: &str = "pi.agent-controller";
 
-/// Agent-controller method names.
+/// Wire method that asks `pi.agent-controller` to submit a prompt to the lane.
 pub const AGENT_CONTROLLER_PROMPT_MEMBER: &str = "prompt";
+/// Wire method that asks `pi.agent-controller` to abort a running operation.
 pub const AGENT_CONTROLLER_REQUEST_ABORT_MEMBER: &str = "requestAbort";
+/// Wire method that asks `pi.agent-controller` to queue a steering prompt.
 pub const AGENT_CONTROLLER_STEER_MEMBER: &str = "steer";
+/// Wire method that asks `pi.agent-controller` to queue a follow-up prompt.
 pub const AGENT_CONTROLLER_FOLLOW_UP_MEMBER: &str = "followUp";
+/// Wire method that asks `pi.agent-controller` to enqueue a prompt for the next run.
 pub const AGENT_CONTROLLER_NEXT_RUN_MEMBER: &str = "nextRun";
+/// Wire method that asks `pi.agent-controller` to cancel a queued entry.
 pub const AGENT_CONTROLLER_CANCEL_QUEUED_MEMBER: &str = "cancelQueued";
+/// Wire method that asks `pi.agent-controller` to resume the lane.
 pub const AGENT_CONTROLLER_RESUME_MEMBER: &str = "resume";
+/// Wire method that asks `pi.agent-controller` to compact the lane with custom instructions.
 pub const AGENT_CONTROLLER_COMPACT_MEMBER: &str = "compact";
+/// Wire method that asks `pi.agent-controller` to navigate the lane tree.
 pub const AGENT_CONTROLLER_NAVIGATE_MEMBER: &str = "navigate";
 
 /// One image supplied with a prompt.
@@ -142,18 +153,23 @@ impl ProductJsonConvert for AgentPromptImage {
     }
 }
 
-
 impl ProductJsonConvert for AgentPromptRequest {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "agent prompt request")?;
-        let message = string(required(fields, "message", "agent prompt request.message")?, "agent prompt request.message")?;
-        let images = nullable(required(fields, "images", "agent prompt request.images")?, |value| {
-            array(value, "agent prompt request.images")?
-                .iter()
-                .cloned()
-                .map(AgentPromptImage::from_json)
-                .collect()
-        })?;
+        let message = string(
+            required(fields, "message", "agent prompt request.message")?,
+            "agent prompt request.message",
+        )?;
+        let images = nullable(
+            required(fields, "images", "agent prompt request.images")?,
+            |value| {
+                array(value, "agent prompt request.images")?
+                    .iter()
+                    .cloned()
+                    .map(AgentPromptImage::from_json)
+                    .collect()
+            },
+        )?;
         Ok(Self { message, images })
     }
 
@@ -177,8 +193,14 @@ impl ProductJsonConvert for AgentPromptRequest {
 impl ProductJsonConvert for AgentOperationError {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "agent operation error")?;
-        let code = string(required(fields, "code", "agent operation error.code")?, "agent operation error.code")?;
-        let message = string(required(fields, "message", "agent operation error.message")?, "agent operation error.message")?;
+        let code = string(
+            required(fields, "code", "agent operation error.code")?,
+            "agent operation error.code",
+        )?;
+        let message = string(
+            required(fields, "message", "agent operation error.message")?,
+            "agent operation error.message",
+        )?;
         Ok(Self { code, message })
     }
 
@@ -193,16 +215,27 @@ impl ProductJsonConvert for AgentOperationError {
 impl ProductJsonConvert for AgentOperationResponse {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "agent operation response")?;
-        let accepted = bool_value(required(fields, "accepted", "agent operation response.accepted")?, "agent operation response.accepted")?;
-        let operation_id = nullable_string(required(
-            fields,
-            "operationId",
+        let accepted = bool_value(
+            required(fields, "accepted", "agent operation response.accepted")?,
+            "agent operation response.accepted",
+        )?;
+        let operation_id = nullable_string(
+            required(
+                fields,
+                "operationId",
+                "agent operation response.operationId",
+            )?,
             "agent operation response.operationId",
-        )?, "agent operation response.operationId")?;
-        let error = nullable(required(fields, "error", "agent operation response.error")?, |value| {
-            AgentOperationError::from_json(value.clone())
-        })?;
-        Ok(Self { accepted, operation_id, error })
+        )?;
+        let error = nullable(
+            required(fields, "error", "agent operation response.error")?,
+            |value| AgentOperationError::from_json(value.clone()),
+        )?;
+        Ok(Self {
+            accepted,
+            operation_id,
+            error,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
@@ -212,7 +245,11 @@ impl ProductJsonConvert for AgentOperationResponse {
         };
         Ok(json_object([
             ("accepted", JsonValue::Bool(self.accepted)),
-            ("operationId", self.operation_id.map_or(JsonValue::Null, |id| JsonValue::String(id.into()))),
+            (
+                "operationId",
+                self.operation_id
+                    .map_or(JsonValue::Null, |id| JsonValue::String(id.into())),
+            ),
             ("error", error),
         ]))
     }
@@ -221,12 +258,23 @@ impl ProductJsonConvert for AgentOperationResponse {
 impl ProductJsonConvert for AgentQueueResponse {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "agent queue response")?;
-        let accepted = bool_value(required(fields, "accepted", "agent queue response.accepted")?, "agent queue response.accepted")?;
-        let entry_id = nullable_string(required(fields, "entryId", "agent queue response.entryId")?, "agent queue response.entryId")?;
-        let error = nullable(required(fields, "error", "agent queue response.error")?, |value| {
-            AgentOperationError::from_json(value.clone())
-        })?;
-        Ok(Self { accepted, entry_id, error })
+        let accepted = bool_value(
+            required(fields, "accepted", "agent queue response.accepted")?,
+            "agent queue response.accepted",
+        )?;
+        let entry_id = nullable_string(
+            required(fields, "entryId", "agent queue response.entryId")?,
+            "agent queue response.entryId",
+        )?;
+        let error = nullable(
+            required(fields, "error", "agent queue response.error")?,
+            |value| AgentOperationError::from_json(value.clone()),
+        )?;
+        Ok(Self {
+            accepted,
+            entry_id,
+            error,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
@@ -236,7 +284,11 @@ impl ProductJsonConvert for AgentQueueResponse {
         };
         Ok(json_object([
             ("accepted", JsonValue::Bool(self.accepted)),
-            ("entryId", self.entry_id.map_or(JsonValue::Null, |id| JsonValue::String(id.into()))),
+            (
+                "entryId",
+                self.entry_id
+                    .map_or(JsonValue::Null, |id| JsonValue::String(id.into())),
+            ),
             ("error", error),
         ]))
     }
@@ -245,18 +297,24 @@ impl ProductJsonConvert for AgentQueueResponse {
 impl ProductJsonConvert for AgentCompactionRequest {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "agent compaction request")?;
-        let custom_instructions = nullable_string(required(
-            fields,
-            "customInstructions",
+        let custom_instructions = nullable_string(
+            required(
+                fields,
+                "customInstructions",
+                "agent compaction request.customInstructions",
+            )?,
             "agent compaction request.customInstructions",
-        )?, "agent compaction request.customInstructions")?;
-        Ok(Self { custom_instructions })
+        )?;
+        Ok(Self {
+            custom_instructions,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
         Ok(json_object([(
             "customInstructions",
-            self.custom_instructions.map_or(JsonValue::Null, |value| JsonValue::String(value.into())),
+            self.custom_instructions
+                .map_or(JsonValue::Null, |value| JsonValue::String(value.into())),
         )]))
     }
 }
@@ -264,23 +322,52 @@ impl ProductJsonConvert for AgentCompactionRequest {
 impl ProductJsonConvert for AgentNavigationRequest {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "agent navigation request")?;
-        let target_id = nullable_string(required(fields, "targetId", "agent navigation request.targetId")?, "agent navigation request.targetId")?;
-        let summarize = bool_value(required(fields, "summarize", "agent navigation request.summarize")?, "agent navigation request.summarize")?;
-        let label = nullable_string(required(fields, "label", "agent navigation request.label")?, "agent navigation request.label")?;
-        let custom_instructions = nullable_string(required(
-            fields,
-            "customInstructions",
+        let target_id = nullable_string(
+            required(fields, "targetId", "agent navigation request.targetId")?,
+            "agent navigation request.targetId",
+        )?;
+        let summarize = bool_value(
+            required(fields, "summarize", "agent navigation request.summarize")?,
+            "agent navigation request.summarize",
+        )?;
+        let label = nullable_string(
+            required(fields, "label", "agent navigation request.label")?,
+            "agent navigation request.label",
+        )?;
+        let custom_instructions = nullable_string(
+            required(
+                fields,
+                "customInstructions",
+                "agent navigation request.customInstructions",
+            )?,
             "agent navigation request.customInstructions",
-        )?, "agent navigation request.customInstructions")?;
-        Ok(Self { target_id, summarize, label, custom_instructions })
+        )?;
+        Ok(Self {
+            target_id,
+            summarize,
+            label,
+            custom_instructions,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
         Ok(json_object([
-            ("targetId", self.target_id.map_or(JsonValue::Null, |value| JsonValue::String(value.into()))),
+            (
+                "targetId",
+                self.target_id
+                    .map_or(JsonValue::Null, |value| JsonValue::String(value.into())),
+            ),
             ("summarize", JsonValue::Bool(self.summarize)),
-            ("label", self.label.map_or(JsonValue::Null, |value| JsonValue::String(value.into()))),
-            ("customInstructions", self.custom_instructions.map_or(JsonValue::Null, |value| JsonValue::String(value.into()))),
+            (
+                "label",
+                self.label
+                    .map_or(JsonValue::Null, |value| JsonValue::String(value.into())),
+            ),
+            (
+                "customInstructions",
+                self.custom_instructions
+                    .map_or(JsonValue::Null, |value| JsonValue::String(value.into())),
+            ),
         ]))
     }
 }
@@ -288,7 +375,10 @@ impl ProductJsonConvert for AgentNavigationRequest {
 impl ProductJsonConvert for CancelQueuedOutcome {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "cancel queued response")?;
-        let outcome = string(required(fields, "outcome", "cancel queued response.outcome")?, "cancel queued response.outcome")?;
+        let outcome = string(
+            required(fields, "outcome", "cancel queued response.outcome")?,
+            "cancel queued response.outcome",
+        )?;
         match outcome.as_str() {
             "cancelled" => Ok(Self::Cancelled),
             "already_consumed" => Ok(Self::AlreadyConsumed),
@@ -303,6 +393,9 @@ impl ProductJsonConvert for CancelQueuedOutcome {
             Self::AlreadyConsumed => "already_consumed",
             Self::NotFound => "not_found",
         };
-        Ok(json_object([("outcome", JsonValue::String(outcome.into()))]))
+        Ok(json_object([(
+            "outcome",
+            JsonValue::String(outcome.into()),
+        )]))
     }
 }

@@ -9,13 +9,17 @@ use pi_agent::service::error::ServiceError;
 use pi_agent::service::value::JsonValue;
 
 use super::agent_controller::{AgentOperationResponse, AgentQueueResponse};
-use super::{object, optional, required, string, ProductJsonConvert};
+use super::{ProductJsonConvert, object, optional, required, string};
+/// Chord service identifier for the process-local slash-command service.
 pub const SLASH_COMMANDS_ID: &str = "pi.local.slash-commands";
 
-/// Local slash-command member names.
+/// Wire method that asks the local slash-command service to register a contribution.
 pub const SLASH_COMMANDS_REGISTER_MEMBER: &str = "register";
+/// Wire method that asks the local slash-command service to stage a same-name replacement.
 pub const SLASH_COMMANDS_REPLACE_MEMBER: &str = "replace";
+/// Wire method that asks the local slash-command service for registered contributions.
 pub const SLASH_COMMANDS_LIST_MEMBER: &str = "list";
+/// Wire method that asks the local slash-command service to subscribe to contribution updates.
 pub const SLASH_COMMANDS_SUBSCRIBE_MEMBER: &str = "subscribe";
 
 /// Completion row shown by a slash-command provider.
@@ -64,8 +68,14 @@ pub enum SlashCommandRunResult {
 impl ProductJsonConvert for SlashCommandCompletion {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "slash command completion")?;
-        let value = string(required(fields, "value", "slash command completion.value")?, "slash command completion.value")?;
-        let label = string(required(fields, "label", "slash command completion.label")?, "slash command completion.label")?;
+        let value = string(
+            required(fields, "value", "slash command completion.value")?,
+            "slash command completion.value",
+        )?;
+        let label = string(
+            required(fields, "label", "slash command completion.label")?,
+            "slash command completion.label",
+        )?;
         let description = match optional(fields, "description") {
             None => None,
             Some(value) if value.is_null() => {
@@ -73,7 +83,11 @@ impl ProductJsonConvert for SlashCommandCompletion {
             }
             Some(value) => Some(string(value, "slash command completion.description")?),
         };
-        Ok(Self { value, label, description })
+        Ok(Self {
+            value,
+            label,
+            description,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
@@ -90,7 +104,10 @@ impl ProductJsonConvert for SlashCommandCompletion {
 impl ProductJsonConvert for SlashCommandContribution {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "slash command contribution")?;
-        let name = string(required(fields, "name", "slash command contribution.name")?, "slash command contribution.name")?;
+        let name = string(
+            required(fields, "name", "slash command contribution.name")?,
+            "slash command contribution.name",
+        )?;
         let description = match optional(fields, "description") {
             None => None,
             Some(value) if value.is_null() => {
@@ -105,7 +122,11 @@ impl ProductJsonConvert for SlashCommandContribution {
             }
             Some(value) => Some(string(value, "slash command contribution.argumentHint")?),
         };
-        Ok(Self { name, description, argument_hint })
+        Ok(Self {
+            name,
+            description,
+            argument_hint,
+        })
     }
 
     fn into_json(self) -> Result<JsonValue, ServiceError> {
@@ -115,7 +136,10 @@ impl ProductJsonConvert for SlashCommandContribution {
             fields.insert("description".into(), JsonValue::String(description.into()));
         }
         if let Some(argument_hint) = self.argument_hint {
-            fields.insert("argumentHint".into(), JsonValue::String(argument_hint.into()));
+            fields.insert(
+                "argumentHint".into(),
+                JsonValue::String(argument_hint.into()),
+            );
         }
         Ok(JsonValue::Object(fields))
     }

@@ -34,15 +34,16 @@ use crate::remote::server::{ByteConnection, ConnectionHandler, Server, ServerHos
 use crate::remote::transport::{
     ByteTransport, ByteTransportFactory, ByteTransportHandlers, SendFuture, TransportError,
 };
-use tokio_tungstenite::tungstenite::http::Request;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
-use tokio_tungstenite::tungstenite::protocol::{CloseCode, CloseFrame};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use super::relay_auth::{
-    RadiusRelayAuth, RadiusRelayAuthError, RadiusRelayAuthResolveOptions,
-    RadiusRelayAuthResolver,
+    RadiusRelayAuth, RadiusRelayAuthError, RadiusRelayAuthResolveOptions, RadiusRelayAuthResolver,
 };
 
 /// Subprotocol requested by a Radius relay host.
@@ -106,7 +107,7 @@ pub struct RadiusRelayHostOptions {
     pub server: Arc<dyn RelayServerAcceptor>,
     /// Native explicit/stored credential resolver.
     pub auth: Arc<RadiusRelayAuthResolver>,
-    /// Optional status observer.  Callback failures cannot affect transport.
+    /// Optional status observer.  Callback panics cannot affect the transport loop.
     pub on_status: Option<Arc<dyn Fn(RadiusRelayHostStatus) + Send + Sync>>,
 }
 
@@ -168,7 +169,7 @@ impl RadiusRelayHost {
         }
         let state = Arc::clone(&self.state);
         *task = Some(tokio::spawn(async move {
-            run_host_loop(state).await;
+            Box::pin(run_host_loop(state)).await;
         }));
     }
 
@@ -180,9 +181,7 @@ impl RadiusRelayHost {
         }
         let writer = lock_std(&self.state.writer).take();
         if let Some(writer) = writer {
-            writer
-                .close_with_code(1000, "Pi server stopped")
-                .await;
+            writer.close_with_code(1000, "Pi server stopped").await;
         }
         self.state.drop_connections(None);
         let task = lock_std(&self.task).take();
@@ -226,7 +225,7 @@ pub fn create_radius_client_transport_factory(
                     signal: None,
                 })
                 .await
-                .map_err(auth_error_to_transport)?;
+                .map_err(|error| auth_error_to_transport(&error))?;
             let credentials = resolved.ok_or_else(|| {
                 TransportError::Message("Radius authentication is required".to_owned())
             })?;
@@ -238,8 +237,7 @@ pub fn create_radius_client_transport_factory(
             )
             .await
             .map_err(relay_error_to_transport)?;
-            Ok(RadiusClientByteTransport::new(socket, handlers)
-                as Arc<dyn ByteTransport>)
+            Ok(RadiusClientByteTransport::new(socket, handlers) as Arc<dyn ByteTransport>)
         })
     })
 }
@@ -262,19 +260,17 @@ impl fmt::Debug for RadiusClientReconnect {
 
 impl RadiusClientReconnect {
     /// Installs reconnect/attachment listeners on `client`.
-    pub fn new<F, Fut>(
-        client: Arc<Client>,
-        reattach: F,
-    ) -> Result<Self, ClientError>
+    ///
+    /// # Errors
+    /// Returns [`ClientError`] when listener registration fails.
+    pub fn new<F, Fut>(client: &Arc<Client>, reattach: F) -> Result<Self, ClientError>
     where
         F: Fn(String) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), ClientError>> + Send + 'static,
     {
-        let reattach: ReattachCallback = Arc::new(move |session_id| {
-            Box::pin(reattach(session_id))
-        });
+        let reattach: ReattachCallback = Arc::new(move |session_id| Box::pin(reattach(session_id)));
         let state = Arc::new(ReconnectState {
-            client: Arc::clone(&client),
+            client: Arc::clone(client),
             reattach,
             desired_session: StdMutex::new(client.attachment().map(|target| target.session_id)),
             cancel: CancellationToken::new(),
@@ -329,7 +325,8 @@ impl RadiusClientReconnect {
         if self.state.client.connection_state() != ConnectionState::Disconnected {
             self.state.client.disconnect("Radius reconnect stopped");
         }
-        if let Some(task) = lock_std(&self.state.task).take() {
+        let task = lock_std(&self.state.task).take();
+        if let Some(task) = task {
             let _ = task.await;
         }
     }
@@ -363,9 +360,7 @@ struct ActiveRelayConnection {
 
 impl HostState {
     fn emit_status(&self, status: RadiusRelayHostStatus) {
-        if let Some(on_status) = self.on_status.as_ref() {
-            on_status(status);
-        }
+        invoke_status_callback(self.on_status.as_ref(), status);
     }
 
     fn current_writer(&self) -> Option<Arc<OrderedWebSocketWriter>> {
@@ -390,17 +385,36 @@ impl HostState {
         lock_std(&self.connections).contains_key(connection_id)
     }
 
-    fn drop_connections(&self, error: Option<TransportError>) {
+    fn drop_connections(&self, error: Option<&TransportError>) {
         let connections = std::mem::take(&mut *lock_std(&self.connections));
         for active in connections.into_values() {
             active.connection.mark_closed();
-            if let Some(error) = error.as_ref() {
+            if let Some(error) = error {
                 active.handler.on_error(error.clone());
             } else {
                 active.handler.on_close();
             }
         }
     }
+}
+
+fn invoke_status_callback(
+    on_status: Option<&Arc<dyn Fn(RadiusRelayHostStatus) + Send + Sync>>,
+    status: RadiusRelayHostStatus,
+) {
+    let Some(on_status) = on_status else {
+        return;
+    };
+    // `on_status` is caller-supplied code crossing a trust boundary: a
+    // panic inside it must not unwind `run_host_loop`, or its retry path
+    // becomes unreachable while `closed` stays false and the relay wedges
+    // silently.  The stored type `Arc<dyn Fn(..) + Send + Sync>` is not
+    // `UnwindSafe`, so the invocation asserts unwind safety — the callback
+    // receives an owned status and the loop never observes its captured
+    // state — mirroring `ServerCore::notify_connection_count_changed`.
+    // The default panic hook reports the payload before this boundary catches
+    // it; dropping the result only prevents the unwind from killing the loop.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_status(status)));
 }
 
 async fn run_host_loop(state: Arc<HostState>) {
@@ -481,6 +495,10 @@ async fn run_host_loop(state: Arc<HostState>) {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "accept loop with interleaved control, data, and shutdown arms; splitting would separate the frame handlers"
+)]
 async fn serve_host_socket(
     state: Arc<HostState>,
     socket: RelayWebSocket,
@@ -492,23 +510,33 @@ async fn serve_host_socket(
     let result = loop {
         let next = tokio::select! {
             biased;
-            _ = state.cancel.cancelled() => break Ok(()),
+            () = state.cancel.cancelled() => break Ok(()),
             message = stream.next() => message,
         };
         let Some(message) = next else {
-            break Err(RelayError::Message("Radius relay host closed (1006)".to_owned()));
+            break Err(RelayError::Message(
+                "Radius relay host closed (1006)".to_owned(),
+            ));
         };
         let message = match message {
             Ok(message) => message,
-            Err(error) => break Err(RelayError::Message(format!("Radius relay WebSocket failed: {error}"))),
+            Err(error) => {
+                break Err(RelayError::Message(format!(
+                    "Radius relay WebSocket failed: {error}"
+                )));
+            }
         };
         match message {
             Message::Text(text) => {
                 if text.len() > MAX_CONTROL_MESSAGE_BYTES {
-                    let error =
-                        RelayError::Protocol("Radius relay control message is too large".to_owned());
+                    let error = RelayError::Protocol(
+                        "Radius relay control message is too large".to_owned(),
+                    );
                     writer
-                        .close_with_code(LOCAL_PROTOCOL_ERROR_CLOSE_CODE, "Radius relay protocol error")
+                        .close_with_code(
+                            LOCAL_PROTOCOL_ERROR_CLOSE_CODE,
+                            "Radius relay protocol error",
+                        )
                         .await;
                     break Err(error);
                 }
@@ -528,14 +556,20 @@ async fn serve_host_socket(
                 if data.len() > MAX_RELAY_DATA_MESSAGE_BYTES {
                     let error = RelayError::Protocol("Invalid Radius relay data frame".to_owned());
                     writer
-                        .close_with_code(LOCAL_PROTOCOL_ERROR_CLOSE_CODE, "Radius relay protocol error")
+                        .close_with_code(
+                            LOCAL_PROTOCOL_ERROR_CLOSE_CODE,
+                            "Radius relay protocol error",
+                        )
                         .await;
                     break Err(error);
                 }
                 let Some((connection_id, payload)) = parse_relay_data_frame(data.as_ref()) else {
                     let error = RelayError::Protocol("Invalid Radius relay data frame".to_owned());
                     writer
-                        .close_with_code(LOCAL_PROTOCOL_ERROR_CLOSE_CODE, "Radius relay protocol error")
+                        .close_with_code(
+                            LOCAL_PROTOCOL_ERROR_CLOSE_CODE,
+                            "Radius relay protocol error",
+                        )
                         .await;
                     break Err(error);
                 };
@@ -562,7 +596,9 @@ async fn serve_host_socket(
                 )));
             }
             Message::Close(None) => {
-                break Err(RelayError::Message("Radius relay host closed (1005)".to_owned()));
+                break Err(RelayError::Message(
+                    "Radius relay host closed (1005)".to_owned(),
+                ));
             }
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
         }
@@ -578,7 +614,7 @@ async fn serve_host_socket(
             .err()
             .map(|error| TransportError::Message(error.to_string()))
     };
-    state.drop_connections(connection_error);
+    state.drop_connections(connection_error.as_ref());
     result
 }
 
@@ -594,7 +630,9 @@ async fn handle_host_control(
         HostInputControlMessage::Pong => Ok(()),
         HostInputControlMessage::ConnectionOpen { connection_id } => {
             if state.has_connection(&connection_id) {
-                return Err(RelayError::Protocol("Radius relay reused a connection ID".to_owned()));
+                return Err(RelayError::Protocol(
+                    "Radius relay reused a connection ID".to_owned(),
+                ));
             }
             let connection = Arc::new(RelayServerByteConnection {
                 state: Arc::downgrade(state),
@@ -609,7 +647,10 @@ async fn handle_host_control(
             } else {
                 lock_std(&state.connections).insert(
                     connection_id,
-                    ActiveRelayConnection { connection, handler },
+                    ActiveRelayConnection {
+                        connection,
+                        handler,
+                    },
                 );
             }
             Ok(())
@@ -648,8 +689,9 @@ async fn send_control(
     writer: &Arc<OrderedWebSocketWriter>,
     message: HostOutputControlMessage,
 ) -> Result<(), RelayError> {
-    let text = serde_json::to_string(&message)
-        .map_err(|error| RelayError::Message(format!("Radius relay control encode failed: {error}")))?;
+    let text = serde_json::to_string(&message).map_err(|error| {
+        RelayError::Message(format!("Radius relay control encode failed: {error}"))
+    })?;
     writer
         .send_text(text)
         .await
@@ -694,7 +736,10 @@ impl ByteConnection for RelayServerByteConnection {
         })
     }
 
-    fn close(&self, final_chunk: Option<Vec<u8>>) -> BoxFuture<'static, Result<(), TransportError>> {
+    fn close(
+        &self,
+        final_chunk: Option<Vec<u8>>,
+    ) -> BoxFuture<'static, Result<(), TransportError>> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Box::pin(async { Ok(()) });
         }
@@ -705,7 +750,6 @@ impl ByteConnection for RelayServerByteConnection {
         Box::pin(async move { close_server_connection(&state, &connection_id, final_chunk).await })
     }
 }
-
 async fn close_server_connection(
     state: &Arc<HostState>,
     connection_id: &str,
@@ -727,7 +771,9 @@ async fn close_server_connection(
         connection_id: connection_id.to_owned(),
         code: Some(1000),
     })
-    .map_err(|error| TransportError::Message(format!("Radius relay control encode failed: {error}")))?;
+    .map_err(|error| {
+        TransportError::Message(format!("Radius relay control encode failed: {error}"))
+    })?;
     writer.send_text(text).await
 }
 
@@ -768,7 +814,7 @@ impl RadiusClientByteTransport {
         loop {
             let next = tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => return,
+                () = self.cancel.cancelled() => return,
                 message = reader.next() => message,
             };
             let Some(message) = next else {
@@ -781,7 +827,8 @@ impl RadiusClientByteTransport {
                         self.finish_error(
                             &handlers,
                             TransportError::Message(
-                                "Radius relay client received an oversized binary message".to_owned(),
+                                "Radius relay client received an oversized binary message"
+                                    .to_owned(),
                             ),
                         )
                         .await;
@@ -827,17 +874,16 @@ impl RadiusClientByteTransport {
         handlers.on_close();
     }
 
-    async fn finish_error(
-        &self,
-        handlers: &Arc<dyn ByteTransportHandlers>,
-        error: TransportError,
-    ) {
+    async fn finish_error(&self, handlers: &Arc<dyn ByteTransportHandlers>, error: TransportError) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
         self.cancel.cancel();
         self.writer
-            .close_with_code(LOCAL_TRANSPORT_ERROR_CLOSE_CODE, "Radius relay transport error")
+            .close_with_code(
+                LOCAL_TRANSPORT_ERROR_CLOSE_CODE,
+                "Radius relay transport error",
+            )
             .await;
         handlers.on_error(error);
     }
@@ -927,17 +973,18 @@ impl OrderedWebSocketWriter {
         };
         Box::pin(async move {
             let _reservation = reservation;
-            let mut sink = writer.sink.lock().await;
+            let mut maybe_sink = writer.sink.lock().await;
             if writer.closed.load(Ordering::Acquire) {
-                sink.take();
+                maybe_sink.take();
                 return Err(TransportError::Closed);
             }
-            let Some(sink) = sink.as_mut() else {
+            let Some(mut sink) = maybe_sink.take() else {
                 return Err(TransportError::Closed);
             };
-            sink.send(message)
-                .await
-                .map_err(|error| TransportError::Message(format!("Radius relay WebSocket write failed: {error}")))
+            drop(maybe_sink);
+            sink.send(message).await.map_err(|error| {
+                TransportError::Message(format!("Radius relay WebSocket write failed: {error}"))
+            })
         })
     }
 
@@ -953,8 +1000,11 @@ impl OrderedWebSocketWriter {
             return;
         }
         let close = async {
-            let mut sink = self.sink.lock().await;
-            if let Some(sink) = sink.as_mut() {
+            let maybe_sink = {
+                let mut sink = self.sink.lock().await;
+                sink.take()
+            };
+            if let Some(mut sink) = maybe_sink {
                 let frame = CloseFrame {
                     code: close_code(code),
                     reason: reason.to_owned().into(),
@@ -962,7 +1012,6 @@ impl OrderedWebSocketWriter {
                 let _ = sink.send(Message::Close(Some(frame))).await;
                 let _ = sink.close().await;
             }
-            sink.take();
         };
         let _ = tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, close).await;
         if let Ok(mut sink) = self.sink.try_lock() {
@@ -994,12 +1043,7 @@ fn reserve_pending(pending: &AtomicUsize, bytes: usize) -> bool {
         if next > MAX_PENDING_BYTES {
             return false;
         }
-        match pending.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match pending.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return true,
             Err(observed) => current = observed,
         }
@@ -1018,9 +1062,10 @@ enum RelayError {
     Cancelled,
 }
 
+/// Errors in the Radius relay data-frame protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RelayProtocolError {
-    /// Connection ID is not a lowercase UUIDv4.
+    /// Connection ID is not a lowercase `UUIDv4`.
     #[error("Invalid Radius relay connection ID")]
     InvalidConnectionId,
     /// Data exceeds the released remote frame budget.
@@ -1032,8 +1077,17 @@ pub enum RelayProtocolError {
 enum HostInputControlMessage {
     Ping,
     Pong,
-    ConnectionOpen { connection_id: String },
-    ConnectionClose { connection_id: String, code: Option<u16> },
+    ConnectionOpen {
+        connection_id: String,
+    },
+    ConnectionClose {
+        connection_id: String,
+        #[expect(
+            dead_code,
+            reason = "parsed wire field retained for future close-code propagation"
+        )]
+        code: Option<u16>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -1122,6 +1176,11 @@ fn parse_host_control_message(text: &str) -> Result<HostInputControlMessage, Rel
 ///
 /// The returned bytes contain only the relay envelope; the payload is passed
 /// through unchanged and is not interpreted as CBOR here.
+///
+/// # Errors
+/// Returns [`RelayProtocolError::InvalidConnectionId`] when `connection_id` is
+/// not a lowercase `UUIDv4`, or [`RelayProtocolError::PayloadTooLarge`] when
+/// `payload` exceeds the maximum frame length.
 pub fn encode_relay_data_frame(
     connection_id: &str,
     payload: &[u8],
@@ -1134,13 +1193,15 @@ pub fn encode_relay_data_frame(
     }
     let mut frame = Vec::with_capacity(RELAY_DATA_HEADER_BYTES + payload.len());
     frame.extend_from_slice(&[RELAY_DATA_FRAME_VERSION, RELAY_DATA_FRAME_TYPE]);
-    let mut index = 0;
     let mut hex = [0_u8; 32];
-    for byte in connection_id.bytes().filter(|byte| *byte != b'-') {
+    for (index, byte) in connection_id
+        .bytes()
+        .filter(|byte| *byte != b'-')
+        .enumerate()
+    {
         hex[index] = byte;
-        index += 1;
     }
-    for pair in hex.chunks_exact(2) {
+    for pair in hex.as_chunks::<2>().0 {
         let high = hex_value(pair[0]).ok_or(RelayProtocolError::InvalidConnectionId)?;
         let low = hex_value(pair[1]).ok_or(RelayProtocolError::InvalidConnectionId)?;
         frame.push((high << 4) | low);
@@ -1182,6 +1243,14 @@ fn json_integer(value: &Value) -> Option<u64> {
         return Some(value);
     }
     let value = value.as_f64()?;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "value is finite, non-negative, and whole before conversion"
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "negative and non-finite values are rejected before conversion"
+    )]
     (value.is_finite() && value >= 0.0 && value.fract() == 0.0).then_some(value as u64)
 }
 
@@ -1214,7 +1283,10 @@ fn relay_websocket_url(gateway: &str, server_id: &ServerId) -> Result<String, Re
             )));
         }
     }
-    url.set_path(&format!("/v1/session-relays/{}/connect", server_id.as_str()));
+    url.set_path(&format!(
+        "/v1/session-relays/{}/connect",
+        server_id.as_str()
+    ));
     url.set_query(None);
     url.set_fragment(None);
     Ok(url.to_string())
@@ -1232,14 +1304,26 @@ async fn open_radius_relay_websocket(
         ));
     }
     let url = relay_websocket_url(&auth.gateway, server_id)?;
-    let request = Request::builder()
-        .uri(url.as_str())
-        .header(AUTHORIZATION, format!("Bearer {}", auth.token))
-        .header(SEC_WEBSOCKET_PROTOCOL, protocol)
-        .body(())
+    // `connect_async` sends a prebuilt request verbatim, so the request must
+    // come from `IntoClientRequest` to carry the mandatory handshake headers
+    // (`Host`, `Connection: Upgrade`, `Upgrade: websocket`,
+    // `Sec-WebSocket-Version`, `Sec-WebSocket-Key`); only the relay's extra
+    // headers are layered on top, like the Codex WebSocket path.
+    let mut request = url
+        .into_client_request()
         .map_err(|error| RelayError::Message(format!("Radius relay request failed: {error}")))?;
+    let authorization =
+        HeaderValue::from_str(&format!("Bearer {}", auth.token)).map_err(|error| {
+            RelayError::Message(format!("Invalid Radius authorization header: {error}"))
+        })?;
+    let protocol_header = HeaderValue::from_str(protocol).map_err(|error| {
+        RelayError::Message(format!("Invalid Radius relay protocol header: {error}"))
+    })?;
+    let headers = request.headers_mut();
+    headers.insert(AUTHORIZATION, authorization);
+    headers.insert(SEC_WEBSOCKET_PROTOCOL, protocol_header);
     let connect = connect_async(request);
-    let (socket, response) = wait_connect(connect, signal).await?;
+    let (socket, response) = Box::pin(wait_connect(connect, signal)).await?;
     let selected = response
         .headers()
         .get(SEC_WEBSOCKET_PROTOCOL)
@@ -1254,19 +1338,26 @@ async fn open_radius_relay_websocket(
 }
 
 async fn wait_connect(
-    connect: impl Future<Output = Result<(RelayWebSocket, tungstenite::handshake::client::Response), tungstenite::Error>>,
+    connect: impl Future<
+        Output = Result<
+            (RelayWebSocket, tungstenite::handshake::client::Response),
+            tungstenite::Error,
+        >,
+    >,
     signal: Option<&CancellationToken>,
 ) -> Result<(RelayWebSocket, tungstenite::handshake::client::Response), RelayError> {
     let result = if let Some(signal) = signal {
         tokio::select! {
             biased;
-            _ = signal.cancelled() => return Err(RelayError::Cancelled),
+            () = signal.cancelled() => return Err(RelayError::Cancelled),
             result = connect => result,
         }
     } else {
         connect.await
     };
-    result.map_err(|error| RelayError::Message(format!("Radius relay WebSocket connection failed: {error}")))
+    result.map_err(|error| {
+        RelayError::Message(format!("Radius relay WebSocket connection failed: {error}"))
+    })
 }
 
 fn close_code(code: u16) -> CloseCode {
@@ -1286,19 +1377,23 @@ fn close_code(code: u16) -> CloseCode {
     }
 }
 
-fn delay_or_cancel(cancel: &CancellationToken, duration: Duration) -> impl Future<Output = bool> + Send + 'static {
+fn delay_or_cancel(
+    cancel: &CancellationToken,
+    duration: Duration,
+) -> impl Future<Output = bool> + Send + 'static {
     let cancel = cancel.clone();
     async move {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => false,
+            () = cancel.cancelled() => false,
             () = tokio::time::sleep(duration) => true,
         }
     }
 }
 
 type RelayWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type ReattachCallback = Arc<dyn Fn(String) -> BoxFuture<'static, Result<(), ClientError>> + Send + Sync>;
+type ReattachCallback =
+    Arc<dyn Fn(String) -> BoxFuture<'static, Result<(), ClientError>> + Send + Sync>;
 
 struct ReconnectState {
     client: Arc<Client>,
@@ -1335,14 +1430,14 @@ async fn run_reconnect(state: Arc<ReconnectState>) {
         match state.client.reconnect().await {
             Ok(_) => {
                 let session_id = lock_std(&state.desired_session).clone();
-                if let Some(session_id) = session_id {
-                    if let Err(error) = (state.reattach)(session_id).await {
-                        if state.client.connected() {
-                            state.client.disconnect(error.to_string());
-                        }
-                        retry = retry.saturating_mul(2).min(CLIENT_RETRY_MAX);
-                        continue;
+                if let Some(session_id) = session_id
+                    && let Err(error) = (state.reattach)(session_id).await
+                {
+                    if state.client.connected() {
+                        state.client.disconnect(error.to_string());
                     }
+                    retry = retry.saturating_mul(2).min(CLIENT_RETRY_MAX);
+                    continue;
                 }
                 return;
             }
@@ -1359,7 +1454,7 @@ async fn run_reconnect(state: Arc<ReconnectState>) {
     }
 }
 
-fn auth_error_to_transport(error: RadiusRelayAuthError) -> TransportError {
+fn auth_error_to_transport(error: &RadiusRelayAuthError) -> TransportError {
     TransportError::Message(error.to_string())
 }
 
@@ -1375,5 +1470,47 @@ fn relay_error_from_transport(error: TransportError) -> RelayError {
 }
 
 fn lock_std<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use super::{RadiusRelayHostStatus, invoke_status_callback, lock_std};
+
+    #[test]
+    #[expect(
+        clippy::panic,
+        reason = "the callback must panic to exercise the containment boundary"
+    )]
+    fn status_callback_panic_is_contained() {
+        let callback: Arc<dyn Fn(RadiusRelayHostStatus) + Send + Sync> =
+            Arc::new(|_| panic!("status callback panic"));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            invoke_status_callback(Some(&callback), RadiusRelayHostStatus::Connecting);
+        }));
+        assert!(
+            result.is_ok(),
+            "status callback panic escaped the relay boundary"
+        );
+    }
+
+    #[test]
+    fn status_callback_receives_status() {
+        let observed = Arc::new(StdMutex::new(None));
+        let callback_observed = Arc::clone(&observed);
+        let callback: Arc<dyn Fn(RadiusRelayHostStatus) + Send + Sync> = Arc::new(move |status| {
+            *lock_std(&callback_observed) = Some(status);
+        });
+
+        invoke_status_callback(Some(&callback), RadiusRelayHostStatus::Connected);
+
+        assert_eq!(
+            lock_std(&observed).clone(),
+            Some(RadiusRelayHostStatus::Connected)
+        );
+    }
 }

@@ -9,7 +9,10 @@ use pi_agent::harness::snapshot::LaneSnapshot;
 use pi_agent::service::error::ServiceError;
 use pi_agent::service::value::JsonValue;
 
-use super::{invalid, json_object, nullable, object, required, serde_decode, serde_encode, ProductJsonConvert};
+use super::{
+    ProductJsonConvert, invalid, json_object, nullable, object, required, serde_decode,
+    serde_encode,
+};
 
 /// Chord service identifier for the attached lane transcript.
 pub const TRANSCRIPT_ID: &str = "pi.transcript";
@@ -28,16 +31,20 @@ pub struct TranscriptState {
 impl ProductJsonConvert for TranscriptState {
     fn from_json(value: JsonValue) -> Result<Self, ServiceError> {
         let fields = object(&value, "transcript state")?;
-        let snapshot = nullable(required(fields, "snapshot", "transcript state.snapshot")?, |value| {
-            serde_decode(value, "transcript state.snapshot")
-        })?;
-        let event = nullable(required(fields, "event", "transcript state.event")?, |value| {
-            if pi_agent::service::value::is_json_value(value) {
-                Ok(value.clone())
-            } else {
-                Err(invalid("transcript state.event"))
-            }
-        })?;
+        let snapshot = nullable(
+            required(fields, "snapshot", "transcript state.snapshot")?,
+            |value| serde_decode(value, "transcript state.snapshot"),
+        )?;
+        let event = nullable(
+            required(fields, "event", "transcript state.event")?,
+            |value| {
+                if pi_agent::service::value::is_json_value(value) {
+                    Ok(value.clone())
+                } else {
+                    Err(invalid("transcript state.event"))
+                }
+            },
+        )?;
         Ok(Self { snapshot, event })
     }
 

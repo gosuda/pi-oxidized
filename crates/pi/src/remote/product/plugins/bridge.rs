@@ -12,20 +12,20 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::future::BoxFuture;
 use pi_agent::context::Context;
-use pi_agent::service::delta::{apply_immutable, DeltaOp};
+use pi_agent::service::delta::{DeltaOp, apply_immutable};
 use pi_agent::service::error::ServiceError;
 use pi_agent::service::provider::{
     RemoteServiceProvider, ServiceDefinition, ServiceImplementation, ServiceMember, ServiceMethod,
 };
 use pi_agent::service::value::{JsInteger, JsString, JsonValue};
 use pi_agent::service::wire::{
-    parse_service_subscription_snapshot, ServiceCall, ServiceCatalogueEntry, ServiceInstanceAddress,
-    ServiceInstanceSnapshot, ServiceMemberSnapshot, ServiceMode, ServiceProviderUpdate,
+    ServiceCall, ServiceCatalogueEntry, ServiceInstanceAddress, ServiceInstanceSnapshot,
+    ServiceMemberSnapshot, ServiceMode, ServiceProviderUpdate, parse_service_subscription_snapshot,
 };
 use pi_ext::facet::{
-    catalogue_into_json, FacetHostEntry, FacetHostLoadResponse, FacetServiceInvokeRequest,
-    FacetServiceInvokeResult, FacetServiceUpdateEvent, FACET_HOST_DISPOSE_METHOD,
-    FACET_HOST_LOAD_METHOD, FACET_HOST_RELOAD_METHOD, FACET_SERVICE_INVOKE_METHOD,
+    FACET_HOST_DISPOSE_METHOD, FACET_HOST_LOAD_METHOD, FACET_HOST_RELOAD_METHOD,
+    FACET_SERVICE_INVOKE_METHOD, FacetHostEntry, FacetHostLoadResponse, FacetServiceInvokeRequest,
+    FacetServiceInvokeResult, FacetServiceUpdateEvent, catalogue_into_json,
 };
 
 /// Request/response seam implemented by the extension-runtime owner.
@@ -63,6 +63,10 @@ pub trait PluginFacetHost: Send + Sync {
     /// Returns the loaded host's remote service definitions.
     fn catalogue(&self) -> Vec<ServiceDefinition>;
     /// Publishes the discovered implementations into a native provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when a definition cannot be published.
     fn provide_into(&self, provider: &RemoteServiceProvider) -> Result<(), ServiceError>;
     /// Reloads the host generation in place.
     fn reload(&self) -> BoxFuture<'static, Result<(), ServiceError>>;
@@ -93,7 +97,6 @@ struct ServiceRegistration {
 
 struct StateRoute {
     subscription_id: JsString,
-    service_id: JsString,
     instance: Option<ServiceInstanceAddress>,
     member: JsString,
     sequence: JsInteger,
@@ -102,6 +105,11 @@ struct StateRoute {
 
 impl RemotePluginFacetHost {
     /// Loads one host generation and discovers all service member shapes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] if the host load request fails or the response
+    /// cannot be parsed.
     pub fn load(
         transport: Arc<dyn FacetHostTransport>,
         options: PluginFacetHostOptions,
@@ -120,23 +128,49 @@ impl RemotePluginFacetHost {
                 disposed: Arc::new(AtomicBool::new(false)),
             });
             let response = host.request_load(&options, context).await?;
-            host.prime_services(&response.catalogue, response.slash_commands.clone(), Context::background()).await?;
+            host.prime_services(
+                &response.catalogue,
+                response.slash_commands.clone(),
+                Context::background(),
+            )
+            .await?;
             Ok((host, response))
         })
     }
 
     /// Routes a canonical host update into the matching provider-owned state.
-    pub fn handle_service_update(&self, event: FacetServiceUpdateEvent, context: Context) -> Result<(), ServiceError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] if the update is not addressed to this host or
+    /// cannot be applied to the matching provider-owned state.
+    pub fn handle_service_update(
+        &self,
+        event: FacetServiceUpdateEvent,
+        context: Context,
+    ) -> Result<(), ServiceError> {
         if event.host_id != self.host_id.as_str() {
-            return Err(ServiceError::local("facet service update addressed another host"));
+            return Err(ServiceError::local(
+                "facet service update addressed another host",
+            ));
         }
         let subscription_id = event.subscription_id;
         match event.update {
-            ServiceProviderUpdate::State { instance, member, sequence, ops } => {
-                self.apply_state_update(&subscription_id, instance.as_ref(), &member, sequence, &ops, context)
-            }
+            ServiceProviderUpdate::State {
+                instance,
+                member,
+                sequence,
+                ops,
+            } => self.apply_state_update(
+                &subscription_id,
+                instance.as_ref(),
+                &member,
+                sequence,
+                &ops,
+                context,
+            ),
             ServiceProviderUpdate::Replaced { snapshot } => {
-                self.apply_snapshot_update(&subscription_id, &snapshot, context)
+                self.apply_snapshot_update(&subscription_id, &snapshot, &context)
             }
             ServiceProviderUpdate::Unavailable
             | ServiceProviderUpdate::Spawned { .. }
@@ -156,8 +190,14 @@ impl RemotePluginFacetHost {
         context: Context,
     ) -> Result<FacetHostLoadResponse, ServiceError> {
         let mut fields = BTreeMap::new();
-        fields.insert(string_key("hostId"), JsonValue::String(options.host_id.clone().into()));
-        fields.insert(string_key("entry"), JsonValue::String(options.entry.as_str().into()));
+        fields.insert(
+            string_key("hostId"),
+            JsonValue::String(options.host_id.clone().into()),
+        );
+        fields.insert(
+            string_key("entry"),
+            JsonValue::String(options.entry.as_str().into()),
+        );
         if let Some(paths) = &options.manifest_paths {
             fields.insert(
                 string_key("manifestPaths"),
@@ -196,16 +236,21 @@ impl RemotePluginFacetHost {
             slash_commands,
         };
         for (index, entry) in catalogue.iter().enumerate() {
-            let subscription_id = JsString::from_utf8(format!("{}:native:{}", self.host_id, index).as_str());
-            let snapshot = self.subscribe_shape(entry, &subscription_id, context.clone()).await?;
+            let subscription_id =
+                JsString::from_utf8(format!("{}:native:{}", self.host_id, index).as_str());
+            let snapshot = self
+                .subscribe_shape(entry, &subscription_id, context.clone())
+                .await?;
             if snapshot.service_id != entry.service_id || snapshot.mode != entry.mode {
-                return Err(ServiceError::local("facet service returned a mismatched subscription shape"));
+                return Err(ServiceError::local(
+                    "facet service returned a mismatched subscription shape",
+                ));
             }
             let registration = registration_from_snapshot(
                 entry,
                 &snapshot.instances,
                 &subscription_id,
-                Arc::clone(&self.transport),
+                &self.transport,
                 &self.host_id,
                 &mut next_state.routes,
             )?;
@@ -241,12 +286,16 @@ impl RemotePluginFacetHost {
             .request(FACET_SERVICE_INVOKE_METHOD, request.into_json(), context)
             .await?
             .ok_or_else(|| ServiceError::local("facet service subscription returned undefined"))?;
-        let FacetServiceInvokeResult::Present(snapshot) = FacetServiceInvokeResult::from_json(&result)
-            .map_err(|error| ServiceError::local(error.to_string()))?
+        let FacetServiceInvokeResult::Present(snapshot) =
+            FacetServiceInvokeResult::from_json(&result)
+                .map_err(|error| ServiceError::local(error.to_string()))?
         else {
-            return Err(ServiceError::local("facet service subscription returned undefined"));
+            return Err(ServiceError::local(
+                "facet service subscription returned undefined",
+            ));
         };
-        parse_service_subscription_snapshot(&snapshot).map_err(|error| ServiceError::local(error.to_string()))
+        parse_service_subscription_snapshot(&snapshot)
+            .map_err(|error| ServiceError::local(error.to_string()))
     }
 
     fn apply_state_update(
@@ -265,14 +314,17 @@ impl RemotePluginFacetHost {
                     && &route.member == member
                     && route.instance.as_ref() == instance
             }) else {
-                return Err(ServiceError::local("facet service update has no matching state member"));
+                return Err(ServiceError::local(
+                    "facet service update has no matching state member",
+                ));
             };
             if sequence <= route.sequence {
                 return Ok(());
             }
             let current = route.state.state();
-            let next = apply_immutable(Some(current.as_ref()), ops)?
-                .ok_or_else(|| ServiceError::local("facet service state update cleared its value"))?;
+            let next = apply_immutable(Some(current.as_ref()), ops)?.ok_or_else(|| {
+                ServiceError::local("facet service state update cleared its value")
+            })?;
             route.state.with_state_mut(|value| *value = next);
             route.sequence = sequence;
             Arc::clone(&route.state)
@@ -284,13 +336,18 @@ impl RemotePluginFacetHost {
         &self,
         subscription_id: &JsString,
         snapshot: &ServiceInstanceSnapshot<DeltaOp>,
-        context: Context,
+        context: &Context,
     ) -> Result<(), ServiceError> {
         let states = {
             let mut host_state = lock_checked(&self.state)?;
             let mut states = Vec::new();
             for member in &snapshot.members {
-                let ServiceMemberSnapshot::State { name, sequence, ops } = member else {
+                let ServiceMemberSnapshot::State {
+                    name,
+                    sequence,
+                    ops,
+                } = member
+                else {
                     continue;
                 };
                 let Some(route) = host_state.routes.iter_mut().find(|route| {
@@ -324,20 +381,29 @@ impl PluginFacetHost for RemotePluginFacetHost {
             .collect()
     }
 
+    /// Publishes the discovered implementations into a native provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] if a service cannot be registered with the
+    /// native provider.
     fn provide_into(&self, provider: &RemoteServiceProvider) -> Result<(), ServiceError> {
         let services = lock_checked(&self.state)?.services.clone();
         for service in &services {
             match service.definition.mode {
                 ServiceMode::Singleton => {
-                    let implementation = service
-                        .singleton
-                        .clone()
-                        .ok_or_else(|| ServiceError::local("singleton facet service has no implementation"))?;
+                    let implementation = service.singleton.clone().ok_or_else(|| {
+                        ServiceError::local("singleton facet service has no implementation")
+                    })?;
                     provider.provide(&service.definition.id, implementation)?;
                 }
                 ServiceMode::Keyed => {
                     for (key, implementation) in &service.keyed {
-                        provider.spawn(&service.definition.id, key.clone(), implementation.clone())?;
+                        provider.spawn(
+                            &service.definition.id,
+                            key.clone(),
+                            implementation.clone(),
+                        )?;
                     }
                 }
             }
@@ -375,7 +441,9 @@ impl PluginFacetHost for RemotePluginFacetHost {
                 })
                 .collect::<Vec<_>>();
             if current_catalogue != response.catalogue {
-                return Err(ServiceError::local("facet host reload changed its service catalogue"));
+                return Err(ServiceError::local(
+                    "facet host reload changed its service catalogue",
+                ));
             }
             drop(current);
             lock_checked(&state)?.slash_commands = response.slash_commands;
@@ -409,7 +477,11 @@ impl PluginFacetHost for RemotePluginFacetHost {
                     call,
                 };
                 if let Err(error) = transport
-                    .request(FACET_SERVICE_INVOKE_METHOD, request.into_json(), Context::background())
+                    .request(
+                        FACET_SERVICE_INVOKE_METHOD,
+                        request.into_json(),
+                        Context::background(),
+                    )
                     .await
                 {
                     errors.push(error);
@@ -436,14 +508,14 @@ impl PluginFacetHost for RemotePluginFacetHost {
             }
             Ok(())
         })
-}
+    }
 }
 
 fn registration_from_snapshot(
     entry: &ServiceCatalogueEntry,
     instances: &[ServiceInstanceSnapshot<DeltaOp>],
     subscription_id: &JsString,
-    transport: Arc<dyn FacetHostTransport>,
+    transport: &Arc<dyn FacetHostTransport>,
     host_id: &str,
     routes: &mut Vec<StateRoute>,
 ) -> Result<ServiceRegistration, ServiceError> {
@@ -455,43 +527,56 @@ fn registration_from_snapshot(
     match entry.mode {
         ServiceMode::Singleton => {
             let [instance] = instances else {
-                return Err(ServiceError::local("singleton facet service must return one instance"));
+                return Err(ServiceError::local(
+                    "singleton facet service must return one instance",
+                ));
             };
             if instance.instance.is_some() {
-                return Err(ServiceError::local("singleton facet service returned an instance address"));
+                return Err(ServiceError::local(
+                    "singleton facet service returned an instance address",
+                ));
             }
             let implementation = implementation_from_instance(
                 &entry.service_id,
                 None,
                 instance,
                 subscription_id,
-                Arc::clone(&transport),
+                transport,
                 host_id,
                 routes,
             )?;
-            Ok(ServiceRegistration { definition, singleton: Some(implementation), keyed: BTreeMap::new() })
+            Ok(ServiceRegistration {
+                definition,
+                singleton: Some(implementation),
+                keyed: BTreeMap::new(),
+            })
         }
         ServiceMode::Keyed => {
             let mut keyed = BTreeMap::new();
             for instance in instances {
-                let address = instance
-                    .instance
-                    .as_ref()
-                    .ok_or_else(|| ServiceError::local("keyed facet service omitted its instance address"))?;
+                let address = instance.instance.as_ref().ok_or_else(|| {
+                    ServiceError::local("keyed facet service omitted its instance address")
+                })?;
                 let implementation = implementation_from_instance(
                     &entry.service_id,
                     Some(address),
                     instance,
                     subscription_id,
-                    Arc::clone(&transport),
+                    transport,
                     host_id,
                     routes,
                 )?;
                 if keyed.insert(address.key.clone(), implementation).is_some() {
-                    return Err(ServiceError::local("keyed facet service returned duplicate instance keys"));
+                    return Err(ServiceError::local(
+                        "keyed facet service returned duplicate instance keys",
+                    ));
                 }
             }
-            Ok(ServiceRegistration { definition, singleton: None, keyed })
+            Ok(ServiceRegistration {
+                definition,
+                singleton: None,
+                keyed,
+            })
         }
     }
 }
@@ -501,7 +586,7 @@ fn implementation_from_instance(
     instance: Option<&ServiceInstanceAddress>,
     snapshot: &ServiceInstanceSnapshot<DeltaOp>,
     subscription_id: &JsString,
-    transport: Arc<dyn FacetHostTransport>,
+    transport: &Arc<dyn FacetHostTransport>,
     host_id: &str,
     routes: &mut Vec<StateRoute>,
 ) -> Result<ServiceImplementation, ServiceError> {
@@ -512,21 +597,20 @@ fn implementation_from_instance(
                 implementation.insert(
                     name.clone(),
                     ServiceMember::Method(remote_method(
-                        Arc::clone(&transport),
-                        host_id,
-                        service_id,
-                        instance,
-                        name,
+                        transport, host_id, service_id, instance, name,
                     )),
                 );
             }
-            ServiceMemberSnapshot::State { name, sequence, ops } => {
+            ServiceMemberSnapshot::State {
+                name,
+                sequence,
+                ops,
+            } => {
                 let initial = apply_immutable(None, ops)?
                     .ok_or_else(|| ServiceError::local("facet state snapshot has no value"))?;
                 let state = pi_agent::service::replicated::MutableReplicatedState::new(initial);
                 routes.push(StateRoute {
                     subscription_id: subscription_id.clone(),
-                    service_id: service_id.clone(),
                     instance: instance.cloned(),
                     member: name.clone(),
                     sequence: *sequence,
@@ -540,7 +624,7 @@ fn implementation_from_instance(
 }
 
 fn remote_method(
-    transport: Arc<dyn FacetHostTransport>,
+    transport: &Arc<dyn FacetHostTransport>,
     host_id: &str,
     service_id: &JsString,
     instance: Option<&ServiceInstanceAddress>,
@@ -550,6 +634,7 @@ fn remote_method(
     let service_id = service_id.clone();
     let instance = instance.cloned();
     let member = member.clone();
+    let transport = Arc::clone(transport);
     Arc::new(move |args, context| {
         let request = FacetServiceInvokeRequest {
             host_id: host_id.clone(),
@@ -561,7 +646,11 @@ fn remote_method(
             },
         };
         let transport = Arc::clone(&transport);
-        Box::pin(async move { transport.request(FACET_SERVICE_INVOKE_METHOD, request.into_json(), context).await })
+        Box::pin(async move {
+            transport
+                .request(FACET_SERVICE_INVOKE_METHOD, request.into_json(), context)
+                .await
+        })
     })
 }
 
@@ -580,7 +669,10 @@ fn parse_host_response(value: Option<JsonValue>) -> Result<FacetHostLoadResponse
         .and_then(JsonValue::as_array)
         .ok_or_else(|| ServiceError::local("facet host response omitted slashCommands"))?
         .clone();
-    Ok(FacetHostLoadResponse { catalogue, slash_commands })
+    Ok(FacetHostLoadResponse {
+        catalogue,
+        slash_commands,
+    })
 }
 
 fn object_value<const N: usize>(fields: [(JsString, JsonValue); N]) -> JsonValue {
@@ -591,10 +683,14 @@ fn string_key(value: &str) -> JsString {
     JsString::from_utf8(value)
 }
 
-fn lock_checked<'a, T>(value: &'a Mutex<T>) -> Result<MutexGuard<'a, T>, ServiceError> {
-    value.lock().map_err(|_| ServiceError::internal("facet host state lock poisoned"))
+fn lock_checked<T>(value: &Mutex<T>) -> Result<MutexGuard<'_, T>, ServiceError> {
+    value
+        .lock()
+        .map_err(|_| ServiceError::internal("facet host state lock poisoned"))
 }
 
 fn lock_unpoisoned<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
-    value.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    value
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

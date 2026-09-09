@@ -41,6 +41,7 @@ syntect = { version = "=5.3.0", default-features = false, features = ["parsing",
 thiserror = "=2.0.20"
 tokio = { version = "=1.53.1", default-features = false, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "=0.7.19", default-features = false, features = ["rt"] }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 unicode-normalization = "=0.1.25"
 url = "=2.5.8"
 uuid = { version = "=1.26.0", features = ["v4", "v7"] }

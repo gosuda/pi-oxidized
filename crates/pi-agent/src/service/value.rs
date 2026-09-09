@@ -479,6 +479,15 @@ impl JsonValue {
         }
     }
 
+    /// Takes an owned object without destructuring a `Drop` type.
+    #[must_use]
+    pub fn into_object(mut self) -> Option<JsObject> {
+        match &mut self {
+            Self::Object(value) => Some(std::mem::take(value)),
+            _ => None,
+        }
+    }
+
     /// Replaces this value with [`JsonValue::Null`] and returns the old value.
     #[must_use]
     pub fn take(&mut self) -> JsonValue {

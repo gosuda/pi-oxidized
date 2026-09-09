@@ -15,23 +15,24 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use futures::future::BoxFuture;
 use pi_agent::context::Context;
-use pi_agent::service::delta::DeltaOp;
 use pi_agent::service::endpoint::{RemoteServiceEndpoint, ServiceUpdatePublisher};
 use pi_agent::service::error::ServiceError;
 use pi_agent::service::provider::RemoteServiceProvider;
 use pi_agent::service::value::{JsString, JsonValue};
-use pi_agent::service::wire::{ServiceCall, ServiceProviderUpdate};
+use pi_agent::service::wire::ServiceCall;
 use tokio::sync::Notify;
 
-use crate::remote::server::errors::{duplicate_host_error, HostError};
+use crate::remote::server::errors::{HostError, duplicate_host_error};
 use crate::remote::server::host::{PublishUpdate, RoutedServerServiceAttachment};
+
+type ReleaseCallback = Box<dyn FnOnce() + Send + 'static>;
 
 /// Releases the endpoint and provider once, then invokes the owner-supplied
 /// `on_release` callback.
 pub struct ProviderAttachment {
     endpoint: Arc<RemoteServiceEndpoint>,
     provider: Arc<RemoteServiceProvider>,
-    on_release: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    on_release: Arc<Mutex<Option<ReleaseCallback>>>,
     release_state: Arc<Mutex<ReleaseState>>,
 }
 
@@ -56,7 +57,7 @@ impl ProviderAttachment {
     ///
     /// This is an internal seam used by `server_services` so it can create the
     /// `Arc` with `Arc::new_cyclic` and capture a weak reference for the
-    /// release callback.
+    /// `release` callback.
     pub(crate) fn new_unwrapped(
         provider: Arc<RemoteServiceProvider>,
         on_release: impl FnOnce() + Send + 'static,
@@ -70,19 +71,16 @@ impl ProviderAttachment {
     }
 
     async fn release_impl(&self, cx: Context) -> Result<(), HostError> {
-        let notify = loop {
+        let notify = {
             let mut guard = lock(&self.release_state);
             match std::mem::replace(&mut *guard, ReleaseState::Idle) {
                 ReleaseState::Done(result) => {
                     *guard = ReleaseState::Done(result.clone());
-                    return result
-                        .as_ref()
-                        .map(|_| ())
-                        .map_err(|error| duplicate_host_error(error.as_ref()));
+                    return result.map_err(|error| duplicate_host_error(&error));
                 }
                 ReleaseState::Releasing(notify) => {
                     *guard = ReleaseState::Releasing(notify.clone());
-                    break notify;
+                    notify
                 }
                 ReleaseState::Idle => {
                     let notify = Arc::new(Notify::new());
@@ -116,7 +114,7 @@ impl ProviderAttachment {
                         guard.complete(result);
                     });
 
-                    break notify;
+                    notify
                 }
             }
         };
@@ -127,7 +125,7 @@ impl ProviderAttachment {
         if let ReleaseState::Done(result) = &*guard {
             return result
                 .as_ref()
-                .map(|_| ())
+                .copied()
                 .map_err(|error| duplicate_host_error(error.as_ref()));
         }
         unreachable!("release state must be Done after notification")
@@ -166,8 +164,8 @@ impl RoutedServerServiceAttachment for ProviderAttachment {
     }
 }
 
-/// Adapts the host `PublishUpdate` (String id, infallible delivery) to the
-/// endpoint's `ServiceUpdatePublisher` (JsString id, fallible delivery).
+/// Adapts the host `PublishUpdate` (`String` id, infallible delivery) to the
+/// endpoint's `ServiceUpdatePublisher` (`JsString` id, fallible delivery).
 ///
 /// Subscription ids are converted from canonical UTF-16 to a Rust `String` at
 /// this boundary.  An invalid id is reported as a local `ServiceError`; the
@@ -242,9 +240,9 @@ impl Drop for ReleaseGuard {
         }
         {
             let mut guard = lock(&self.state);
-            *guard = ReleaseState::Done(Err(Arc::new(HostError::Other(Box::new(
-                PanicError("release task panicked"),
-            )))));
+            *guard = ReleaseState::Done(Err(Arc::new(HostError::Other(Box::new(PanicError(
+                "release task panicked",
+            ))))));
         }
         self.notify.notify_waiters();
     }
