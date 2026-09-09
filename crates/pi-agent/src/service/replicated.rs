@@ -4,7 +4,7 @@
 //! Consumer state keeps immutable `Arc` revisions and never calls user code
 //! while holding its internal locks.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
@@ -347,6 +347,7 @@ struct PendingPublication {
 
 /// A subscribe-time hydration routed through the serialized dispatch queue.
 struct PendingHydration {
+    id: u64,
     listener: ReplicatedStateListener,
     value: Arc<JsonValue>,
     context: Context,
@@ -372,17 +373,24 @@ struct MutableInner {
     draining: bool,
     draining_thread: Option<thread::ThreadId>,
     mutating_thread: Option<thread::ThreadId>,
+    retired: BTreeSet<u64>,
 }
-
 /// Clears the reentry marker when a `with_state_mut` callback exits,
 /// including by panic, so a pooled thread never inherits a stale marker.
+/// Only clears a marker owned by the entering thread: a concurrent call
+/// from another thread may have replaced it, and clearing that would
+/// reopen the silent-discard window the marker exists to close.
 struct MutatingGuard<'a> {
     inner: &'a Mutex<MutableInner>,
+    thread: thread::ThreadId,
 }
 
 impl Drop for MutatingGuard<'_> {
     fn drop(&mut self) {
-        lock(self.inner).mutating_thread = None;
+        let mut inner = lock(self.inner);
+        if inner.mutating_thread == Some(self.thread) {
+            inner.mutating_thread = None;
+        }
     }
 }
 
@@ -423,6 +431,7 @@ impl MutableReplicatedState {
                 draining: false,
                 draining_thread: None,
                 mutating_thread: None,
+                retired: BTreeSet::new(),
             })),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
             source_listeners: Arc::new(Mutex::new(BTreeMap::new())),
@@ -449,8 +458,9 @@ impl MutableReplicatedState {
     /// may call `state()`, `value()`, `sequence()`, or `publish()` on this
     /// state without deadlocking.  Concurrent calls are last-writer-wins:
     /// every current caller replaces the whole value from independently
-    /// mutation (nesting deadlocked before the lock was lifted, so nesting
-    /// was never a working path).  A panic leaves the root unchanged.
+    /// computed data, so no caller can lose a partial update.  A nested
+    /// `with_state_mut` call panics; nesting deadlocked before the lock was
+    /// lifted, so it was never a working path.  A panic leaves the root unchanged.
     ///
     /// # Panics
     ///
@@ -467,7 +477,10 @@ impl MutableReplicatedState {
             );
             inner.mutating_thread = Some(current);
         }
-        let _guard = MutatingGuard { inner: &self.inner };
+        let _guard = MutatingGuard {
+            inner: &self.inner,
+            thread: current,
+        };
         let mut next = lock(&self.inner).tracker.state().clone();
         let result = mutate(&mut next);
         *lock(&self.inner).tracker.state_mut() = next;
@@ -556,9 +569,11 @@ impl MutableReplicatedState {
     /// then the listener receives a hydrate delivery of the current value.
     ///
     /// The hydration's value and sequence are captured under one state-lock
-    /// hold and dispatched through the same serialized queue publications
-    /// use, so a concurrent publish can neither label the hydrated value with
-    /// a newer sequence nor deliver an update before the hydration.
+    /// hold at subscribe time, and the listener is inserted when the
+    /// hydration dispatches, so no update can reach the listener before its
+    /// hydration and the hydrated value always matches its sequence.
+    /// Unsubscribing before dispatch retires the id so the hydration is
+    /// skipped instead of resurrecting the listener.
     ///
     /// # Errors
     ///
@@ -572,17 +587,16 @@ impl MutableReplicatedState {
         let current_thread = thread::current().id();
         let route = {
             let mut inner = lock(&self.inner);
-            let mut listeners = lock(&self.listeners);
             // Value and sequence must leave under one hold: reading the
             // sequence after release would let a concurrent publication label
             // a stale value as a newer revision.
             let hydration = PendingHydration {
-                listener: listener.clone(),
+                id,
+                listener,
                 value: Arc::clone(&inner.published),
                 context: Context::background(),
                 sequence: inner.sequence,
             };
-            listeners.insert(id, listener);
             if !inner.draining {
                 inner.draining = true;
                 inner.draining_thread = Some(current_thread);
@@ -598,7 +612,7 @@ impl MutableReplicatedState {
         };
         match route {
             DispatchRoute::Start(hydration) => {
-                let mut panic_payload = dispatch_hydration(&hydration);
+                let mut panic_payload = dispatch_hydration(self, &hydration);
                 if let Some(payload) = drain_dispatches(self) {
                     panic_payload.get_or_insert(payload);
                 }
@@ -607,15 +621,19 @@ impl MutableReplicatedState {
                 }
             }
             DispatchRoute::Inline(hydration) => {
-                if let Some(payload) = dispatch_hydration(&hydration) {
+                if let Some(payload) = dispatch_hydration(self, &hydration) {
                     std::panic::resume_unwind(payload);
                 }
             }
             DispatchRoute::Queued => {}
         }
-        Ok(remove_listener(&self.listeners, id))
+        let remove = remove_listener(&self.listeners, id);
+        let inner = Arc::clone(&self.inner);
+        Ok(Arc::new(move || {
+            remove();
+            lock(&inner).retired.insert(id);
+        }))
     }
-
     /// Subscribes to source-side decoded operation batches.
     pub fn subscribe_source(
         &self,
@@ -650,7 +668,7 @@ fn drain_dispatches(state: &MutableReplicatedState) -> Option<Box<dyn std::any::
         };
         let payload = match &dispatch {
             PendingDispatch::Publication(publication) => dispatch_publication(state, publication),
-            PendingDispatch::Hydration(hydration) => dispatch_hydration(hydration),
+            PendingDispatch::Hydration(hydration) => dispatch_hydration(state, hydration),
         };
         if let Some(payload) = payload {
             panic_payload.get_or_insert(payload);
@@ -696,7 +714,22 @@ fn dispatch_publication(
     panic_payload
 }
 
-fn dispatch_hydration(hydration: &PendingHydration) -> Option<Box<dyn std::any::Any + Send>> {
+fn dispatch_hydration(
+    state: &MutableReplicatedState,
+    hydration: &PendingHydration,
+) -> Option<Box<dyn std::any::Any + Send>> {
+    // Insert under the hold so no update can reach the listener before this
+    // hydration; the value and sequence travel with the hydration from its
+    // atomic capture at subscribe time.  A hydration retired by an early
+    // unsubscribe is skipped instead of resurrecting its listener.
+    {
+        let mut inner = lock(&state.inner);
+        let mut listeners = lock(&state.listeners);
+        if inner.retired.remove(&hydration.id) {
+            return None;
+        }
+        listeners.insert(hydration.id, Arc::clone(&hydration.listener));
+    }
     let listener = Arc::clone(&hydration.listener);
     let value = Arc::clone(&hydration.value);
     let context = hydration.context.clone();
@@ -1096,6 +1129,67 @@ mod tests {
         remove();
 
         assert_eq!(*lock(&events), vec![JsInteger::zero(), JsInteger::one()]);
+        Ok(())
+    }
+    /// The Queued-hydration path must label every hydrate with the revision it
+    /// captured: racing a publish against a subscribe may resolve either way
+    /// (hydrate-then-update or a newer single hydrate), but a hydrate carrying
+    /// a stale value under a newer sequence is never valid.  Each published
+    /// revision `r` carries value `r`, so value and sequence must agree on
+    /// every event.  Loops to force the interleaving across runs.
+    #[test]
+    fn mutable_subscribe_hydration_matches_sequence_under_race() -> Result<(), String> {
+        for _ in 0..30 {
+            let state = MutableReplicatedState::new(object(0.0));
+            let events = Arc::new(Mutex::new(Vec::<(bool, f64, f64)>::new()));
+            let state_for_publish = Arc::clone(&state);
+            let publisher = thread::spawn(move || -> Result<(), String> {
+                for revision in [1.0, 2.0, 3.0] {
+                    state_for_publish.with_state_mut(|value| set_number(value, revision));
+                    state_for_publish
+                        .publish(Context::background())
+                        .map_err(|error| format!("publish failed: {error}"))?;
+                }
+                Ok(())
+            });
+            let events_for_subscribe = Arc::clone(&events);
+            let subscriber = thread::spawn(move || {
+                state.subscribe(Arc::new(
+                    move |value: Arc<JsonValue>,
+                          _context: Context,
+                          delivery: ReplicatedStateDelivery| {
+                        lock(&events_for_subscribe).push((
+                            delivery.kind == ReplicatedStateDeliveryKind::Hydrate,
+                            delivery.sequence.as_f64(),
+                            number(value.as_ref()),
+                        ));
+                    },
+                ))
+            });
+            publisher
+                .join()
+                .map_err(|_| "publisher thread panicked".to_owned())?
+                .map_err(|error| format!("publisher failed: {error}"))?;
+            subscriber
+                .join()
+                .map_err(|_| "subscriber thread panicked".to_owned())?
+                .map_err(|error| format!("subscribe failed: {error}"))?();
+            let events = lock(&events).clone();
+            assert!(!events.is_empty(), "subscriber saw no events");
+            assert!(events[0].0, "first event must hydrate, got update");
+            let mut previous = f64::NEG_INFINITY;
+            for (_, sequence, value) in &events {
+                assert!(
+                    *sequence > previous,
+                    "event sequences must increase: {events:?}"
+                );
+                assert!(
+                    value.to_bits() == sequence.to_bits(),
+                    "hydrate/update value must match its revision: {events:?}"
+                );
+                previous = *sequence;
+            }
+        }
         Ok(())
     }
 }
