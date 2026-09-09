@@ -161,14 +161,16 @@ pub fn poll_reply(timeout: Option<Duration>) -> io::Result<Option<TerminalReply>
     let mut reader = super::lock_internal_event_reader();
     let wait = PollTimeout::new(timeout);
     loop {
-        if let Some(reply) = take_sink_reply() {
-            return Ok(Some(reply));
-        }
         #[cfg(unix)]
         {
+            // Vendored patch: parser-generated replies may already be queued
+            // in the shared reader while sink replies are still pending.
             if let Some(internal) = reader.take_queued_reply() {
                 return Ok(Some(internal_event_to_reply(internal)));
             }
+        }
+        if let Some(reply) = take_sink_reply() {
+            return Ok(Some(reply));
         }
         match reader.probe_try_read(wait.leftover()) {
             #[cfg(unix)]
