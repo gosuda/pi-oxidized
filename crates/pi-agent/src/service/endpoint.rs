@@ -33,8 +33,13 @@ pub type ServiceUpdatePublisher = Arc<
         + Sync,
 >;
 
+struct EndpointSubscription {
+    subscription: Arc<dyn ServiceSubscription>,
+    token: Arc<()>,
+}
+
 struct EndpointState {
-    subscriptions: BTreeMap<JsString, Arc<dyn ServiceSubscription>>,
+    subscriptions: BTreeMap<JsString, EndpointSubscription>,
     delivery_errors: BTreeMap<JsString, ServiceError>,
     pending_ids: BTreeSet<JsString>,
     closing_ids: BTreeSet<JsString>,
@@ -100,7 +105,7 @@ impl EndpointInner {
         state.closing_ids.insert(id.clone());
         state.pending_operations += 1;
         Ok((
-            subscription,
+            subscription.subscription,
             PendingOperation::new(Arc::clone(self), Some(Reservation::Closing(id.clone()))),
         ))
     }
@@ -115,7 +120,13 @@ impl EndpointInner {
         if state.disposed {
             return false;
         }
-        let previous = state.subscriptions.insert(id.clone(), subscription);
+        let previous = state.subscriptions.insert(
+            id.clone(),
+            EndpointSubscription {
+                subscription,
+                token: Arc::new(()),
+            },
+        );
         debug_assert!(previous.is_none());
         true
     }
@@ -137,6 +148,7 @@ impl EndpointInner {
         let mut state = lock(&self.state);
         std::mem::take(&mut state.subscriptions)
             .into_values()
+            .map(|entry| entry.subscription)
             .collect()
     }
 
@@ -145,11 +157,31 @@ impl EndpointInner {
     fn fail_subscription(
         &self,
         id: &JsString,
+        token: Option<&Arc<()>>,
         error: ServiceError,
     ) -> Option<Arc<dyn ServiceSubscription>> {
         let mut state = lock(&self.state);
+        if !state
+            .subscriptions
+            .get(id)
+            .is_some_and(|entry| token.is_some_and(|token| Arc::ptr_eq(&entry.token, token)))
+        {
+            return None;
+        }
         state.delivery_errors.insert(id.clone(), error);
-        state.subscriptions.remove(id)
+        state
+            .subscriptions
+            .remove(id)
+            .map(|entry| entry.subscription)
+    }
+
+    fn admit_delivery(self: &Arc<Self>) -> Option<PendingOperation> {
+        let mut state = lock(&self.state);
+        if state.disposed {
+            return None;
+        }
+        state.pending_operations += 1;
+        Some(PendingOperation::new(Arc::clone(self), None))
     }
 
     /// Takes the recorded delivery failure for one subscription, if any.
@@ -414,20 +446,27 @@ fn spawn_update_worker(
     publish: ServiceUpdatePublisher,
     inner: Arc<EndpointInner>,
 ) {
+    let token = lock(&inner.state)
+        .subscriptions
+        .get(&subscription_id)
+        .map(|entry| Arc::clone(&entry.token));
     tokio::spawn(async move {
         while let Some((update, context)) = receiver.recv().await {
-            let result = std::panic::AssertUnwindSafe(publish(
-                subscription_id.clone(),
-                update,
-                context.clone(),
-            ))
+            let Some(_pending) = inner.admit_delivery() else {
+                return;
+            };
+            let result = std::panic::AssertUnwindSafe(async {
+                publish(subscription_id.clone(), update, context.clone()).await
+            })
             .catch_unwind()
             .await;
             let result = result.unwrap_or_else(|_| {
                 Err(ServiceError::internal("service update delivery panicked"))
             });
             if let Err(error) = result {
-                if let Some(subscription) = inner.fail_subscription(&subscription_id, error) {
+                if let Some(subscription) =
+                    inner.fail_subscription(&subscription_id, token.as_ref(), error)
+                {
                     let _ = subscription.close(context).await;
                 }
                 return;
@@ -800,5 +839,204 @@ mod tests {
             .await
             .expect_err("dispose reports the delivery failure");
         assert_eq!(error.to_string(), "delivery failed");
+    }
+
+    #[tokio::test]
+    async fn stale_delivery_failure_cannot_remove_a_reused_subscription_id() {
+        let (endpoint, state) = endpoint_with_state();
+        let (started, started_rx) = oneshot::channel::<()>();
+        let (release, released) = oneshot::channel::<()>();
+        let (failing, failed_rx) = oneshot::channel::<()>();
+        let started = Arc::new(Mutex::new(Some(started)));
+        let released = Arc::new(Mutex::new(Some(released)));
+        let failing = Arc::new(Mutex::new(Some(failing)));
+        let stale_publish: ServiceUpdatePublisher = Arc::new(move |_id, _update, _context| {
+            let started = Arc::clone(&started);
+            let released = Arc::clone(&released);
+            let failing = Arc::clone(&failing);
+            Box::pin(async move {
+                if let Some(started) = lock(&started).take() {
+                    let _ = started.send(());
+                }
+                let released = lock(&released).take();
+                if let Some(released) = released {
+                    let _ = released.await;
+                }
+                if let Some(failing) = lock(&failing).take() {
+                    let _ = failing.send(());
+                }
+                Err(ServiceError::local("stale delivery failed"))
+            })
+        });
+        endpoint
+            .invoke(
+                create_service_subscribe_call("subscription", "svc", ServiceMode::Singleton),
+                stale_publish,
+                Context::background(),
+            )
+            .await
+            .expect("subscribe");
+        state.with_state_mut(|value| *value = object(1.0));
+        state.publish(Context::background()).expect("publish");
+        started_rx.await.expect("stale delivery started");
+        endpoint
+            .invoke(
+                create_service_unsubscribe_call("subscription"),
+                publisher(Arc::new(Mutex::new(Vec::new()))),
+                Context::background(),
+            )
+            .await
+            .expect("unsubscribe first generation");
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        endpoint
+            .invoke(
+                create_service_subscribe_call("subscription", "svc", ServiceMode::Singleton),
+                publisher(Arc::clone(&updates)),
+                Context::background(),
+            )
+            .await
+            .expect("re-subscribe reuses the id");
+        release.send(()).expect("release stale delivery");
+        failed_rx.await.expect("stale delivery failed");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        state.with_state_mut(|value| *value = object(2.0));
+        state
+            .publish(Context::background())
+            .expect("publish after reuse");
+        timeout(Duration::from_secs(1), async {
+            while lock(&updates).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reused subscription still delivers");
+        endpoint
+            .invoke(
+                create_service_unsubscribe_call("subscription"),
+                publisher(Arc::new(Mutex::new(Vec::new()))),
+                Context::background(),
+            )
+            .await
+            .expect("stale failure must not poison the reused id");
+        endpoint
+            .dispose(Context::background())
+            .await
+            .expect("dispose");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::panic,
+        reason = "the publisher must panic during invocation to cover the catch_unwind boundary"
+    )]
+    async fn publish_invocation_panic_is_caught_and_terminates_the_subscription() {
+        let (endpoint, state) = endpoint_with_state();
+        let calls = Arc::new(Mutex::new(0usize));
+        let panic_calls = Arc::clone(&calls);
+        let publish: ServiceUpdatePublisher = Arc::new(
+            move |_id, _update, _context| -> BoxFuture<'static, Result<(), ServiceError>> {
+                *lock(&panic_calls) += 1;
+                panic!("publish invocation panicked")
+            },
+        );
+        endpoint
+            .invoke(
+                create_service_subscribe_call("subscription", "svc", ServiceMode::Singleton),
+                publish,
+                Context::background(),
+            )
+            .await
+            .expect("subscribe");
+        state.with_state_mut(|value| *value = object(1.0));
+        state.publish(Context::background()).expect("publish");
+        let subscription_id = JsString::from_utf8("subscription");
+        timeout(Duration::from_secs(1), async {
+            while !lock(&endpoint.inner.state)
+                .delivery_errors
+                .contains_key(&subscription_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("panic recorded as a delivery error");
+        let error = endpoint
+            .invoke(
+                create_service_unsubscribe_call("subscription"),
+                publisher(Arc::new(Mutex::new(Vec::new()))),
+                Context::background(),
+            )
+            .await
+            .expect_err("unsubscribe reports the panic");
+        assert_eq!(error.to_string(), "service update delivery panicked");
+        state.with_state_mut(|value| *value = object(2.0));
+        state
+            .publish(Context::background())
+            .expect("publish after panic");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *lock(&calls),
+            1,
+            "panicked subscription receives no further updates"
+        );
+        endpoint
+            .dispose(Context::background())
+            .await
+            .expect("dispose");
+    }
+
+    #[tokio::test]
+    async fn dispose_waits_for_an_in_flight_delivery_and_reports_its_error() {
+        let (endpoint, state) = endpoint_with_state();
+        let (started, started_rx) = oneshot::channel::<()>();
+        let (release, released) = oneshot::channel::<()>();
+        let started = Arc::new(Mutex::new(Some(started)));
+        let released = Arc::new(Mutex::new(Some(released)));
+        let publish: ServiceUpdatePublisher = Arc::new(move |_id, _update, _context| {
+            let started = Arc::clone(&started);
+            let released = Arc::clone(&released);
+            Box::pin(async move {
+                if let Some(started) = lock(&started).take() {
+                    let _ = started.send(());
+                }
+                let released = lock(&released).take();
+                if let Some(released) = released {
+                    let _ = released.await;
+                }
+                Err(ServiceError::local("in-flight delivery failed"))
+            })
+        });
+        endpoint
+            .invoke(
+                create_service_subscribe_call("subscription", "svc", ServiceMode::Singleton),
+                publish,
+                Context::background(),
+            )
+            .await
+            .expect("subscribe");
+        state.with_state_mut(|value| *value = object(1.0));
+        state.publish(Context::background()).expect("publish");
+        started_rx.await.expect("delivery started");
+        let dispose_endpoint = Arc::clone(&endpoint);
+        let dispose =
+            tokio::spawn(async move { dispose_endpoint.dispose(Context::background()).await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !dispose.is_finished(),
+            "dispose must wait for the in-flight delivery"
+        );
+        release.send(()).expect("release delivery");
+        let error = timeout(Duration::from_secs(1), dispose)
+            .await
+            .expect("dispose completes")
+            .expect("dispose task")
+            .expect_err("dispose reports the in-flight delivery error");
+        assert_eq!(error.to_string(), "in-flight delivery failed");
     }
 }
