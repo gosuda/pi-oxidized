@@ -1278,8 +1278,11 @@ impl HostClient {
     ///
     /// # Errors
     ///
-    /// Returns [`HostClientError`] when the client is not running, when the
-    /// host answers with an error frame, or when the stream setup times out.
+    /// Returns [`HostClientError::NotRunning`] when the client is not
+    /// running, or [`HostClientError::Closed`] when the outbound pipe is
+    /// broken. This call only publishes the request frame; the host response,
+    /// remote errors, and setup timeout surface later from
+    /// [`StreamHandle::finish`].
     pub async fn open_stream_raw_with_callbacks(
         &self,
         method: &str,
