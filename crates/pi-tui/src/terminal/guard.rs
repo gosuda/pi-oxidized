@@ -191,11 +191,11 @@ impl<W: Write> TerminalGuard<W> {
     /// Returns an I/O error when the guard is already restored, fullscreen
     /// mode activation fails, or its rollback cannot complete.
     pub fn enter_fullscreen(&mut self) -> io::Result<()> {
-        if self.screen_mode == ScreenMode::Fullscreen {
-            return Ok(());
-        }
         if self.restored {
             return Err(io::Error::other("terminal guard already restored"));
+        }
+        if self.screen_mode == ScreenMode::Fullscreen {
+            return Ok(());
         }
         if self.applied.is_empty() {
             self.activate(false)?;
@@ -224,10 +224,14 @@ impl<W: Write> TerminalGuard<W> {
         Ok(())
     }
 
-    /// One fallible activation path: apply every step, then flush.
+    /// One fallible activation path: apply every missing step, then flush.
     fn activate_fullscreen_steps(&mut self, steps: &[FullscreenStep]) -> io::Result<()> {
         for step in steps {
-            self.apply_fullscreen_step(*step)?;
+            // A failed teardown keeps its mode recorded as unresolved; retain
+            // that entry while adding only the missing fullscreen modes.
+            if !self.fullscreen_applied.contains(step) {
+                self.apply_fullscreen_step(*step)?;
+            }
         }
         self.writer.flush()?;
         Ok(())
@@ -250,9 +254,10 @@ impl<W: Write> TerminalGuard<W> {
             return Ok(());
         }
         let result = self.restore_fullscreen_modes();
-        if result.is_ok() {
-            self.screen_mode = ScreenMode::Regular;
-        }
+        // Report Regular even after a failed teardown so a rollback can
+        // re-enter and rebuild the complete fullscreen set. Failed steps
+        // remain recorded for a direct retry or final restore.
+        self.screen_mode = ScreenMode::Regular;
         result
     }
 
@@ -811,11 +816,12 @@ mod tests {
     }
 
     #[test]
-    fn leave_fullscreen_retains_failed_steps_and_stays_fullscreen() {
+    fn leave_fullscreen_retains_failed_steps_and_reports_regular() {
         // Activation order: alternate screen, then autowrap, then SGR mouse.
-        // Budget 15 lets the first two restore writes (SGR 7, autowrap 5)
-        // succeed, then fails the alternate-screen restore (8) and Show. The
-        // failed step stays recorded and the screen mode stays Fullscreen.
+        // Budget 15 lets the first two restore writes (SGR mouse 8,
+        // autowrap 5) succeed, then fails the alternate-screen restore (8)
+        // and Show. The failed step stays recorded for retry while the
+        // logical mode reports Regular so a rollback can re-enter fullscreen.
         let mut guard = TerminalGuard::new(LatchingFailureWriter {
             bytes: Vec::new(),
             attempted: Vec::new(),
@@ -836,8 +842,8 @@ mod tests {
         );
         assert_eq!(
             guard.screen_mode(),
-            ScreenMode::Fullscreen,
-            "screen mode must not advance on a failed restore"
+            ScreenMode::Regular,
+            "failed teardown must permit fullscreen rollback"
         );
         assert_eq!(
             guard.fullscreen_applied,
@@ -846,18 +852,75 @@ mod tests {
         );
 
         // Increase the budget and retry; the remaining step, Show, and flush
-        // now all succeed, so the mode finally becomes Regular.
+        // now all succeed, so the mode remains Regular with no steps pending.
         guard.writer_mut().budget = 100;
         let result = guard.leave_fullscreen();
         assert!(result.is_ok(), "retry should succeed with a healthy writer");
         assert_eq!(
             guard.screen_mode(),
             ScreenMode::Regular,
-            "mode advances only after full success"
+            "mode remains Regular after full success"
         );
         assert!(guard.fullscreen_applied.is_empty(), "all steps restored");
     }
 
+    #[test]
+    fn failed_leave_reentry_reapplies_missing_fullscreen_steps() -> io::Result<()> {
+        let mut guard = TerminalGuard::new(LatchingFailureWriter {
+            bytes: Vec::new(),
+            attempted: Vec::new(),
+            budget: 15,
+        });
+        guard.applied.push(RestoreStep::RawMode);
+        guard.fullscreen_applied = vec![
+            FullscreenStep::AlternateScreen,
+            FullscreenStep::AutowrapDisabled,
+            FullscreenStep::MouseSgr,
+        ];
+        guard.screen_mode = ScreenMode::Fullscreen;
+
+        let result = guard.leave_fullscreen();
+        assert!(result.is_err(), "the seeded teardown must fail first");
+        guard.writer_mut().budget = 100;
+
+        // Re-entry keeps the unresolved mode and adds only missing modes.
+        guard.enter_fullscreen()?;
+        let mut expected = vec![
+            FullscreenStep::AlternateScreen,
+            FullscreenStep::AutowrapDisabled,
+            FullscreenStep::MouseNormal,
+            FullscreenStep::MouseButton,
+        ];
+        if !multiplexer_detected() {
+            expected.push(FullscreenStep::MouseAll);
+        }
+        expected.push(FullscreenStep::MouseSgr);
+        assert_eq!(guard.screen_mode(), ScreenMode::Fullscreen);
+        assert_eq!(
+            guard.fullscreen_applied, expected,
+            "re-entry must not duplicate or lose fullscreen steps"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restored_fullscreen_guard_rejects_reentry() {
+        let mut guard = TerminalGuard::new(Cursor::new(Vec::new()));
+        guard.screen_mode = ScreenMode::Fullscreen;
+
+        guard.restore_modes(false);
+
+        let result = guard.enter_fullscreen();
+        assert!(result.is_err(), "restored guards must reject re-entry");
+        assert!(
+            !guard
+                .writer()
+                .get_ref()
+                .windows(8)
+                .any(|window| window == b"\x1b[?1049h"),
+            "re-entry must not report success without activation"
+        );
+    }
     // MUTATION RECIPE — reverting `enter_fullscreen` to the pre-fix shape
     // must fail the test above:
     //     if let Err(error) = self.activate_fullscreen_steps(&steps) {
