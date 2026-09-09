@@ -627,28 +627,22 @@ impl MutableReplicatedState {
             }
             DispatchRoute::Queued => {}
         }
-        let remove = remove_listener(&self.listeners, id);
         let listeners = Arc::clone(&self.listeners);
         let inner = Arc::clone(&self.inner);
         let closed = Arc::new(AtomicBool::new(false));
         Ok(Arc::new(move || {
-            // Idempotent like the inner remove: a second call must neither
-            // re-tombstone (the id never repeats, so the entry would leak)
-            // nor disturb a listener that reused nothing.
+            // Idempotent: a second call must neither re-tombstone (the id
+            // never repeats, so the entry would leak) nor disturb anything.
             if closed.swap(true, Ordering::AcqRel) {
                 return;
             }
-            // One hold decides both halves: an already-dispatched listener
-            // is removed, an undispatched hydration is tombstoned.  Split
-            // holds would let a dispatch slip between the map check and the
-            // tombstone and resurrect the listener.
+            // One hold, one map op: a dispatched listener is removed, an
+            // undispatched hydration is tombstoned.  Split holds would let a
+            // dispatch slip between the map check and the tombstone and
+            // resurrect the listener.
             let mut inner = lock(&inner);
-            let listeners = lock(&listeners);
-            if listeners.contains_key(&id) {
-                drop(listeners);
-                drop(inner);
-                remove();
-            } else {
+            let mut listeners = lock(&listeners);
+            if listeners.remove(&id).is_none() {
                 inner.retired.insert(id);
             }
         }))
