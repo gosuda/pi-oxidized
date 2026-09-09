@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-09-08T02:35:54.061Z",
-	"captureHead": "14ee03b0e2c2a8aaa473c7a1999c6bd93a230bcb",
+	"capturedAt": "2026-09-09T15:19:15.305Z",
+	"captureHead": "354a2afd6ec5949a2e6eb02b7d66d997ef77d093",
 	"metafile": {
-		"projectionPath": "metafile-projection.json",
-		"sha256": "500b4a3362f058a6520a278848609f93cc36d1a5c30b658127916e4b078f67d2",
+		"projectionPath": "metafile-projection.a5d1abeaf473bf8124c40df2a3eea0306e7ab3e55d3edff69631afa5b9150f2d.json",
+		"sha256": "a5d1abeaf473bf8124c40df2a3eea0306e7ab3e55d3edff69631afa5b9150f2d",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -17,14 +17,14 @@
 			"--target",
 			"bun-linux-x64-baseline",
 			"--outfile",
-			"/tmp/exposure-capture-staging/pi-extension-host/pi-extension-host",
-			"--metafile=/tmp/exposure-capture-staging/metafile.json"
+			"/tmp/exposure-capture-fuj60j/pi-extension-host",
+			"--metafile=/tmp/exposure-capture-fuj60j/metafile.json"
 		],
-		"metafileSha256": "b199681b80bd2798e00cb6f443990af5050fa6a7aa31dda21798440c7e411225"
+		"metafileSha256": "a7b2627e0d42793e0fa6bea82f803010bf243cd4e485502a6f686598148c62d9"
 	},
 	"cargo": {
-		"projectionPath": "cargo-graph-projection.json",
-		"sha256": "2abab14b079f9396e783597f4893a34ac9893c25bed0737c0d6b3ba9716564a0",
+		"projectionPath": "cargo-graph-projection.aa52eb1fc7d909b55d12f97c8f481588a3e17d81caade5cb6bafd86a7057c1fc.json",
+		"sha256": "aa52eb1fc7d909b55d12f97c8f481588a3e17d81caade5cb6bafd86a7057c1fc",
 		"argv": [
 			"metadata",
 			"--format-version",
@@ -53,10 +53,11 @@
 		},
 		{
 			"path": "packages/extension-host/package.json",
-			"sha256": "abe74c42b241f91087aa5280bd8444b1dc2c8e0c2f3e8c131ce19c5d6882577e",
+			"sha256": "025757210c3d5bf16af718dff86a449469fac13da99e01543cc5d4efa71ec17d",
 			"packageName": "@earendil-works/pi-extension-host",
 			"depFields": {
 				"dependencies": [
+					"@earendil-works/chord",
 					"@earendil-works/pi-tui-protocol",
 					"jiti",
 					"typebox"
@@ -92,11 +93,11 @@
 	"cargoFiles": [
 		{
 			"path": "Cargo.lock",
-			"sha256": "bcf2f0791f910f97888a23221058d46bf48f5792cab051612510b49b05923f53"
+			"sha256": "8c422c0c89ac688212eeb35b9ff50663ffc380526ad36d24019a779724b2e118"
 		},
 		{
 			"path": "Cargo.toml",
-			"sha256": "f49071c1d56541cc7186ee83e51633b4b8caeb86520f9e9502c0a4bdefa08728"
+			"sha256": "cbf1cd966b7b4462adb47289201efd8932f735352e4a7a4268c51df7606c21f9"
 		},
 		{
 			"path": "crates/pi-agent/Cargo.toml",
@@ -112,17 +113,239 @@
 		},
 		{
 			"path": "crates/pi-tui/Cargo.toml",
-			"sha256": "ad3dc8d05f15ae603cca3bdff628becfa555c7f96665a3a590606ec6fe5dbcf8"
+			"sha256": "1def06b1684d5b75f8ad2c7eaa6d20fce14163ee6557d637cdf4ccbba4f1c0ad"
 		},
 		{
 			"path": "crates/pi/Cargo.toml",
-			"sha256": "afe0e14ee77b0f91b1d348da3d7d7eccf00036870f9a06d7ee4008591e9a2204"
+			"sha256": "0ece69f51b6e8753b612f100e4ac0aa81a9af868570392e313c8733111ef7433"
+		}
+	],
+	"vendorFiles": [
+		{
+			"path": "vendor/crossterm-0.29.0/.cargo_vcs_info.json",
+			"sha256": "c36e7cbcffc6c12772c1e6f9205c9eeb139af7d9dd702f9dcdb266e8f03d43ad"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/Cargo.lock",
+			"sha256": "c05ea83405bfb2e4238460213ccd3e8a4c793b1bdaec3405fbcff894093e9243"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/Cargo.toml",
+			"sha256": "fe17aaa5081f4d433222e8668723baa1a031ad23996db73f25db5b374741b6b5"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/Cargo.toml.orig",
+			"sha256": "8d87a16b486f2543653f1bf0dad9960134f7bb6c5baa0543f0796d946e46bc96"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/LICENSE",
+			"sha256": "3fea97e00df9a8e30027f4298d6941b6970c542ffd49de68b4a2bcafedcbfe02"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/VENDORED.txt",
+			"sha256": "e2e58bf7bd88fc2a26af0c6f0e3d2f625ca557d0a18f4bcd3011b9fd3de82a3e"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/ansi_support.rs",
+			"sha256": "448fb698820e6ec484ca9af2fb1787bd116151bd7ecc094619fb6d6fb82c26f0"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/clipboard.rs",
+			"sha256": "bafe97119af69b28a84e99305b231a47452d6878458884c739febb6e7cc2b482"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/command.rs",
+			"sha256": "d708a54f5817b2d482db0405d622c1c0c9f27ed8dc5bcba622a84e25bbaba6d8"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/cursor.rs",
+			"sha256": "9da6d3829ca686c6fb1349b3df89a66275d1188f987866d4ba14fb1c48e812ed"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/cursor/sys.rs",
+			"sha256": "ba420a9c7e3d7a5f3c63d9477e6f203b41ffd179e905783b0d6e99453a097e17"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/cursor/sys/unix.rs",
+			"sha256": "58a01b9ff63dabf2643bcdf061a30c53004ea3a2901ac63df32295ad0d7a49f4"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/cursor/sys/windows.rs",
+			"sha256": "be4241a9eda7664fc7ebf2b81f74a71272ab858b8019bdf9cf52d432ebf8a2c8"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event.rs",
+			"sha256": "9fe5492083db815cb9f14dbd92a9f8cacbb6e4075fb365376be05b45bf763263"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/filter.rs",
+			"sha256": "b5252ef197551d18228e3b94bfe10712dca9c1d8f4debeb42f7738ea3419e2e8"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/read.rs",
+			"sha256": "0f75e87ff2375062456001165fc15f80e2a54fe721043bd9d96048167d57b2c2"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/reply.rs",
+			"sha256": "172d252936d3a725761cb5fbeff01633e5d272d4ba07b05796dbdb0e02a1381f"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/source.rs",
+			"sha256": "2a7d864c24a3d703c9f908b93926ec98d122e578a2da499787af4d26140b13ce"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/source/unix.rs",
+			"sha256": "41f1657521bd0b1da2a50e519a337477e435fe6f8b8281fd1c888119ddc60ca9"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/source/unix/mio.rs",
+			"sha256": "3cd45649957570be389054b41f3aa695e392770840fd81ef9b7313789b9902dc"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/source/unix/parser.rs",
+			"sha256": "887879e97a26d30e1713e562dc3503be665803b0358eb94cbbdb5ca284589dc2"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/source/unix/tty.rs",
+			"sha256": "f34c1b82e762e8ce9c4a0155b31e38d8ebfdc9f514518d53c4d5ad06d81b5a5f"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/source/windows.rs",
+			"sha256": "a72c54493d59a4644f3c7d963a97fc33c4bba026271a8ff0c33c3b9c8272b0ea"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/stream.rs",
+			"sha256": "03cea949ceff61a3c701e338442bd7073ae1e001e6b79ee7ee22e0c57ccf70a5"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/sys.rs",
+			"sha256": "83178ce09bde11cebbd0e88d4b8bfa04b9ca09c063e9fe6ddc42b0a9f7f30f94"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/sys/unix.rs",
+			"sha256": "d59069208030bf35a8c49868f0afaef619b65f761abd7249c267f97226cc9d4a"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/sys/unix/parse.rs",
+			"sha256": "8804461072b3af08245e026e684ebc7a39e7e46b6380cb91aaada46f5c774acd"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker.rs",
+			"sha256": "ee4a3919a6efd345c36b439646b34d8d653949d002b0151816b7dc75a5037a00"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker/mio.rs",
+			"sha256": "b804a0fc038efd7e4c330c728631c4fb993f61462b7c95922dbcca347ef26d83"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker/tty.rs",
+			"sha256": "e4aa438fdff35d01fef23917461479f29539d76e8ff7c4f37e170dc1f959e2bb"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/sys/windows.rs",
+			"sha256": "7dac602a97be6ddb3549503f243538b9f26f1f2fbadf72676b4159271cf886ac"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/sys/windows/parse.rs",
+			"sha256": "ae94dac1df1ea51f5568413c6c52eadace7cc2271e52dc44528295591c72f1dc"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/sys/windows/poll.rs",
+			"sha256": "758b62859494a4899bbc5cac5cbda4fb64546fbf86f61158a392287a2b93f803"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/sys/windows/waker.rs",
+			"sha256": "482694d0c7c4958389888cf4936ef232726f98c01456537ae85cad28fab50f46"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/event/timeout.rs",
+			"sha256": "3925941551c65ee91d73c9a6329ae04a4e25993a3592dfab02d3eb866ada6004"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/lib.rs",
+			"sha256": "5a1b80d777521a592afe5740d5b74ad92cae3728434e7b1d000d68891ec56c04"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/macros.rs",
+			"sha256": "0920397c6549ad356e49de43032c587104a4f25d6ffcff2a42b8798770c97767"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/style.rs",
+			"sha256": "bb7f3340bd97727bf71c0ea55833f07fdfc4ed97d66dc9696e3757efca356494"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/style/attributes.rs",
+			"sha256": "b6fcf6c4078b3766dd357a519ec188f78a64566fd805c93c9bc64bf1a521a64d"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/style/content_style.rs",
+			"sha256": "d66fe8512fb24a3c6da1e5643d3de67f490095dc1ecb0b9de7ab6483d96cf53e"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/style/styled_content.rs",
+			"sha256": "a2767a96d4cf32ebc34291be68e3f34b51f3f92bb15800e157eaea3ee6bfcfbe"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/style/stylize.rs",
+			"sha256": "513a0606ac5bbcfcaa5ae2a24d800719df91df978d3c460266b2a71ce120eecd"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/style/sys.rs",
+			"sha256": "903a72d85b9e8f8338c07e1fed63bbe60b17c4f55717235a991e644ec9fe23c8"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/style/sys/windows.rs",
+			"sha256": "faed0c37988eb4c8dfae350ad7e467e1b99fe9bf93e3f4e4d0f0b68f7d625971"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/style/types.rs",
+			"sha256": "a67aa3d3a6d3aa0146da820c48d1cbed707126e1ba29aef24aa9aa711f07cb3e"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/style/types/attribute.rs",
+			"sha256": "65ec6a50426c99bf4a5a841507c63076a09f03c0036cd406e623a00453414e53"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/style/types/color.rs",
+			"sha256": "cf89ee2d48e0f34c459351ca68434f4b5feeefb0d5e651b31863c3aa0b13f837"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/style/types/colored.rs",
+			"sha256": "de1e14c130d45886f2cfcb71ae4450faf15960599f211da94feb426cec3a63da"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/style/types/colors.rs",
+			"sha256": "413d455e4ea18e34bb034cd751b2bafe526de142609d6953f4b31c6fdeaadf81"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/terminal.rs",
+			"sha256": "a2c2be0e684ead8096db2804a0ca45112fac10cee7633c1f08092d7ac85fd759"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/terminal/sys.rs",
+			"sha256": "aac896a84c47fb830f71f3cf3627db6a4ca67e51c289a54297ee66b6b191e9e9"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/terminal/sys/file_descriptor.rs",
+			"sha256": "dfe7c23834cb47ca9531db0bb6b20c4ff6fc433ce3b433e0ce3da4d8ad1ede74"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/terminal/sys/unix.rs",
+			"sha256": "d96ffbbfc5a4fe5923c66d956a21a407dda3037cd7f8d9dd7bd3bd5dd89821b5"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/terminal/sys/windows.rs",
+			"sha256": "9854180b52eca2335d329ab5a0382c2f88a8ee20f7f7c18b0211210a39617508"
+		},
+		{
+			"path": "vendor/crossterm-0.29.0/src/tty.rs",
+			"sha256": "2586695bed85f0b8aa84f49dd80fe973f4a78258d43d37a0bb709e87f74394d0"
 		}
 	],
 	"authority": [
 		{
 			"path": "scripts/release/host.ts",
-			"sha256": "aa41b92301f4dda7bc9853046125e687f3293330c9f85a0c96de666740a55108"
+			"sha256": "b08e1d9908eebcf5ddee9a433449cf618ba47dac26bdf5277005e2280acfee3d"
 		},
 		{
 			"path": "scripts/release/targets.ts",
