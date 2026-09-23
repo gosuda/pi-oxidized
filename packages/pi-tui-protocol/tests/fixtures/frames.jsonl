@@ -115,6 +115,8 @@
 {"id":53,"kind":"res","method":"provider.beforePayload","payload":{"payload":{"mutated":true}}}
 {"id":54,"kind":"req","method":"provider.onResponse","payload":{"callId":"51","response":{"status":200,"headers":{"content-type":"application/json"}}}}
 {"id":54,"kind":"res","method":"provider.onResponse","payload":{}}
+{"id":33,"kind":"req","method":"session.previewBoundary","payload":{"boundary":"turn_end","entries":[{"type":"custom","customType":"note","data":{"tag":"draft"}},{"type":"custom_message","customType":"status","content":"settling","display":true},{"type":"context_edit","targetId":"e1","replacement":null},{"type":"compaction","summary":"kept the plan","firstKeptEntryId":"e9"}]}}
+{"id":33,"kind":"res","method":"session.previewBoundary","payload":{"context":{"contextEntries":[],"contextMessages":[],"llmMessages":[],"pendingMessages":[],"canContinue":true}}}
 {"id":55,"kind":"req","method":"project_trust","payload":{"type":"project_trust"}}
 {"id":56,"kind":"req","method":"resources_discover","payload":{"type":"resources_discover"}}
 {"id":57,"kind":"req","method":"session_start","payload":{"type":"session_start"}}

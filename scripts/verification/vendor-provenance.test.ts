@@ -304,6 +304,7 @@ describe("inventory derives from declared patch paths", () => {
 			"vendor/nested/deep/buried-crate-0.3.1/Cargo.toml.orig",
 			"vendor/nested/deep/buried-crate-0.3.1/LICENSE",
 			"vendor/nested/deep/buried-crate-0.3.1/VENDORED.txt",
+			"vendor/nested/deep/buried-crate-0.3.1/build.rs",
 			"vendor/nested/deep/buried-crate-0.3.1/src/**",
 			"vendor/plain-0.1.0/.cargo_vcs_info.json",
 			"vendor/plain-0.1.0/Cargo.lock",
@@ -311,8 +312,40 @@ describe("inventory derives from declared patch paths", () => {
 			"vendor/plain-0.1.0/Cargo.toml.orig",
 			"vendor/plain-0.1.0/LICENSE",
 			"vendor/plain-0.1.0/VENDORED.txt",
+			"vendor/plain-0.1.0/build.rs",
 			"vendor/plain-0.1.0/src/**",
 		]);
+	});
+
+	test("a tracked crate-root build script is inventoried, and changing it drifts the pins", () => {
+		const root = freshRoot("vprov-buildrs");
+		writeFileSync(
+			resolve(root, "Cargo.toml"),
+			`[workspace]\nmembers = []\nresolver = "2"\nexclude = ["vendor/builder-0.1.0"]\n\n[patch.crates-io]\nbuilder = { path = "vendor/builder-0.1.0" }\n`,
+		);
+		writeCrate(root, "vendor/builder-0.1.0", "builder", "0.1.0");
+		writeFileSync(
+			resolve(root, "vendor/builder-0.1.0/build.rs"),
+			`fn main() { println!("cargo:rerun-if-changed=build.rs"); }\n`,
+		);
+		commitAll(root, "declare crate with a tracked build script");
+
+		// Cargo compiles and executes the crate-root build script, so it must
+		// carry the same scope and pin coverage as the src/** bytes.
+		expect(vendorInputScopes(root)).toContain("vendor/builder-0.1.0/build.rs");
+		const pinFor = (path: string): string => {
+			const pin = readVendorSourcePins(root).find((entry) => entry.path === path);
+			if (!pin) throw new Error(`missing pin for ${path}`);
+			return pin.sha256;
+		};
+		expect(pinFor("vendor/builder-0.1.0/build.rs")).toMatch(/^[0-9a-f]{64}$/);
+		const before = pinFor("vendor/builder-0.1.0/build.rs");
+
+		// A changed tracked build script must change the vendorPins, or a
+		// doctored vendored crate ships modified build behavior with no drift.
+		writeFileSync(resolve(root, "vendor/builder-0.1.0/build.rs"), "fn main() {}\n");
+		commitAll(root, "mutate the vendored build script");
+		expect(pinFor("vendor/builder-0.1.0/build.rs")).not.toBe(before);
 	});
 
 	test("patch paths that cannot be pinned are refused rather than silently skipped", () => {

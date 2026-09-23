@@ -79,7 +79,7 @@ export function rootPatchCrates(root: string): readonly RootPatchCrate[] {
 }
 
 /** Fixed input classes, applied to each parsed declaration rather than a parallel directory glob. */
-const VENDOR_INPUT_CLASSES = ["Cargo.lock", "Cargo.toml", "Cargo.toml.orig", "LICENSE", ".cargo_vcs_info.json", "VENDORED.txt", "src/**"] as const;
+const VENDOR_INPUT_CLASSES = ["Cargo.lock", "Cargo.toml", "Cargo.toml.orig", "LICENSE", ".cargo_vcs_info.json", "VENDORED.txt", "build.rs", "src/**"] as const;
 
 export function vendorInputScopes(root: string): readonly string[] {
 	return [...new Set(rootPatchCrates(root).flatMap(({ path }) => VENDOR_INPUT_CLASSES.map((suffix) => `${path}/${suffix}`)))].sort();

@@ -1,6 +1,6 @@
 {
 	"generator": "scripts/verification/gen-witness.ts",
-	"totalLines": 159,
+	"totalLines": 161,
 	"methodKindPairs": [
 		[
 			"after_provider_response",
@@ -296,6 +296,14 @@
 		],
 		[
 			"session.newSession",
+			"res"
+		],
+		[
+			"session.previewBoundary",
+			"req"
+		],
+		[
+			"session.previewBoundary",
 			"res"
 		],
 		[
@@ -610,5 +618,5 @@
 			"kind": "release"
 		}
 	],
-	"fixtureSha256": "0af0f09b101458b293c7304f6f3241f18c3abcaec831bd6f543eed10557ca9c7"
+	"fixtureSha256": "02c38919f6451c50295fcc7b5e68c204f37cb341fca43aac652c19f7403d4928"
 }

@@ -42,9 +42,9 @@ describe("gen-witness determinism", () => {
 		expect(violations[0]).toContain("first differing line");
 	});
 
-	test("lifecycle parses to exactly 35 ordered discriminants", () => {
-		expect(lifecycle).toHaveLength(35);
+	test("lifecycle parses to exactly 39 ordered discriminants", () => {
+		expect(lifecycle).toHaveLength(39);
 		expect(lifecycle[0]).toBe("project_trust");
-		expect(lifecycle[34]).toBe("input");
+		expect(lifecycle[38]).toBe("input");
 	});
 });

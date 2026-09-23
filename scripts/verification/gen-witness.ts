@@ -163,8 +163,9 @@ export const BASE_SURFACES: readonly FrameSpec[] = [
 
 // ---------------------------------------------------------------------------
 // Layer 1 — ARC11 gap surfaces (plan Decision 2). Payload literals mirror the
-// producing handlers. Ids start at 40 (committed corpus max is 32); streaming
-// updates reuse the parent request id; cancel control frames use id 0.
+// producing handlers. Id 33 (previewBoundary) and the ARC11 batch (40+) sit
+// above the committed corpus max of 32; streaming updates reuse the parent
+// request id; cancel control frames use id 0.
 // ---------------------------------------------------------------------------
 
 export const NEW_SURFACES: readonly FrameSpec[] = [
@@ -432,6 +433,39 @@ export const NEW_SURFACES: readonly FrameSpec[] = [
 		},
 	},
 	{ id: 54, kind: "res", method: "provider.onResponse", payload: {} },
+	// session.previewBoundary (protocol.rs SESSION_PREVIEW_BOUNDARY_METHOD):
+	// correlated request from the host — boundary names the turn_end /
+	// agent_before_settle decoder gate and entries carry one of each wire
+	// draft variant; the response mirrors the projection preview object the
+	// product returns (empty draft projection on a fresh session).
+	{
+		id: 33,
+		kind: "req",
+		method: "session.previewBoundary",
+		payload: {
+			boundary: "turn_end",
+			entries: [
+				{ type: "custom", customType: "note", data: { tag: "draft" } },
+				{ type: "custom_message", customType: "status", content: "settling", display: true },
+				{ type: "context_edit", targetId: "e1", replacement: null },
+				{ type: "compaction", summary: "kept the plan", firstKeptEntryId: "e9" },
+			],
+		},
+	},
+	{
+		id: 33,
+		kind: "res",
+		method: "session.previewBoundary",
+		payload: {
+			context: {
+				contextEntries: [],
+				contextMessages: [],
+				llmMessages: [],
+				pendingMessages: [],
+				canContinue: true,
+			},
+		},
+	},
 
 ];
 
