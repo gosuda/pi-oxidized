@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { canonicalReferenceRoot } from "../reference-identity.ts";
+import { extensionCompatReferenceRoot } from "../reference-identity.ts";
 import {
 	acquireDataDirectoryLock,
 	defaultInversionProof,
@@ -34,7 +34,7 @@ import { buildSortedCatalog, encodeCatalog } from "../generate-builtin-models.ts
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const REAL_CATALOG_PATH = join(REPO_ROOT, "crates/pi-ai/data/builtin-models.json");
 const REAL_PROVIDERS_DIR = join(
-	canonicalReferenceRoot(REPO_ROOT),
+	extensionCompatReferenceRoot(REPO_ROOT),
 	"packages/ai/src/providers",
 );
 const REAL_DATA_DIR = join(REAL_PROVIDERS_DIR, "data");

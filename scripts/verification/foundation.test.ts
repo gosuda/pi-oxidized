@@ -16,7 +16,7 @@ import verificationExtension, {
 	VERIFICATION_PROVIDER,
 } from "./extension.ts";
 import { PTY_KEYS, spawnPty } from "./pty.ts";
-import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-identity.ts";
+import { assertExtensionCompatReference, extensionCompatReferenceRoot } from "../reference-identity.ts";
 
 // The PTY driver shells to util-linux `setsid`/`script`, absent on macOS
 // (BSD userland) and Windows. Gate the suites that need it on Linux.
@@ -338,7 +338,7 @@ describe.skipIf(lacksUtilLinuxPty)("shared interactive provider smoke", () => {
 	test("drives Rust and TypeScript CLIs with one extension and model", async () => {
 		// Gate before the first reference spawn: the TypeScript fixture runs the
 		// canonical checkout's CLI, so its HEAD must match the pinned SHA.
-		assertCanonicalReference();
+		assertExtensionCompatReference();
 		const rustBinary = resolve("target/debug/pi");
 		const hostBinary = resolve("packages/extension-host/dist/pi-extension-host");
 		expect(existsSync(rustBinary), `missing ${rustBinary}; run cargo build -p pi`).toBe(true);
@@ -350,7 +350,7 @@ describe.skipIf(lacksUtilLinuxPty)("shared interactive provider smoke", () => {
 		const fixtures: readonly CliFixture[] = [
 			{
 				name: "typescript",
-				argvPrefix: [bun, join(canonicalReferenceRoot(), "packages/coding-agent/src/cli.ts")],
+				argvPrefix: [bun, join(extensionCompatReferenceRoot(), "packages/coding-agent/src/cli.ts")],
 			},
 			{ name: "rust", argvPrefix: [rustBinary] },
 		];

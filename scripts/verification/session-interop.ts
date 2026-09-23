@@ -9,7 +9,7 @@
 
 import { readdir, readFile, rm } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
-import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-identity.ts";
+import { assertExtensionCompatReference, extensionCompatReferenceRoot } from "../reference-identity.ts";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
 const FIXTURES = join(
@@ -19,7 +19,7 @@ const FIXTURES = join(
 const OUTPUT = join(REPO_ROOT, "target/verification/session-interop");
 // Canonical pi-2.0 module map — what canonical session-manager.ts actually pulls in:
 // AgentMessage (type-only) from packages/agent/src/types.ts, uuidv7 from packages/ai/src/utils/uuid.ts.
-const REFERENCE_ROOT = canonicalReferenceRoot(REPO_ROOT);
+const REFERENCE_ROOT = extensionCompatReferenceRoot(REPO_ROOT);
 const REFERENCE_AGENT_TYPES = join(REFERENCE_ROOT, "packages/agent/src/types.ts");
 const REFERENCE_AI_UUID = join(REFERENCE_ROOT, "packages/ai/src/utils/uuid.ts");
 
@@ -90,7 +90,7 @@ function installReferenceResolver(): void {
 }
 
 async function referenceSessionManager(): Promise<SessionManagerStatic> {
-	assertCanonicalReference(REPO_ROOT);
+	assertExtensionCompatReference(REPO_ROOT);
 	installReferenceResolver();
 	// Bun plugins register at runtime, so this source-pinned import cannot be static.
 	const module = (await import(

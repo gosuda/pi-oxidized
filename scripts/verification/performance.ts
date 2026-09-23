@@ -13,9 +13,9 @@ import { arch, platform, release } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { PTY_KEYS, type PtyProcess, type PtySnapshot, spawnPty } from "./pty.ts";
 import {
-	CANONICAL_REFERENCE_ROOT,
-	assertCanonicalReference,
-	canonicalReferenceRoot,
+	EXTENSION_COMPAT_REFERENCE_ROOT,
+	assertExtensionCompatReference,
+	extensionCompatReferenceRoot,
 } from "../reference-identity.ts";
 import {
 	NOISE_EXIT_CODE,
@@ -31,7 +31,7 @@ const REPOSITORY_ROOT = resolve(import.meta.dirname, "../..");
 const ARTIFACT_PATH = resolve(REPOSITORY_ROOT, "target/bench/performance-comparison.json");
 const RUST_BINARY = resolve(REPOSITORY_ROOT, "target/release/pi");
 const TYPESCRIPT_BINARY = resolve(
-	canonicalReferenceRoot(REPOSITORY_ROOT),
+	extensionCompatReferenceRoot(REPOSITORY_ROOT),
 	"packages/coding-agent/dist/pi",
 );
 const HOST_BUILD_ROOT = resolve(REPOSITORY_ROOT, "target/bench/performance-extension-host");
@@ -59,12 +59,12 @@ const RUST_SOURCE_ROOTS = [
 	"scripts/release",
 ] as const;
 const TYPESCRIPT_SOURCE_ROOTS = [
-	join(CANONICAL_REFERENCE_ROOT, "package.json"),
-	join(CANONICAL_REFERENCE_ROOT, "package-lock.json"),
-	join(CANONICAL_REFERENCE_ROOT, "packages/ai"),
-	join(CANONICAL_REFERENCE_ROOT, "packages/agent"),
-	join(CANONICAL_REFERENCE_ROOT, "packages/tui"),
-	join(CANONICAL_REFERENCE_ROOT, "packages/coding-agent"),
+	join(EXTENSION_COMPAT_REFERENCE_ROOT, "package.json"),
+	join(EXTENSION_COMPAT_REFERENCE_ROOT, "package-lock.json"),
+	join(EXTENSION_COMPAT_REFERENCE_ROOT, "packages/ai"),
+	join(EXTENSION_COMPAT_REFERENCE_ROOT, "packages/agent"),
+	join(EXTENSION_COMPAT_REFERENCE_ROOT, "packages/tui"),
+	join(EXTENSION_COMPAT_REFERENCE_ROOT, "packages/coding-agent"),
 ] as const;
 const SOURCE_IGNORED_DIRECTORIES: Record<string, true> = {
 	".git": true,
@@ -2162,13 +2162,13 @@ async function buildProducts(): Promise<void> {
 	});
 	await runCheckedCommand({
 		label: "TypeScript pi locked dependency install",
-		cwd: canonicalReferenceRoot(REPOSITORY_ROOT),
+		cwd: extensionCompatReferenceRoot(REPOSITORY_ROOT),
 		argv: [npm, "ci", "--ignore-scripts"],
 	});
 	await runCheckedCommand({
 		label: "TypeScript pi official package binary build",
 		cwd: REPOSITORY_ROOT,
-		argv: [npm, "--prefix", join(CANONICAL_REFERENCE_ROOT, "packages/coding-agent"), "run", "build:binary"],
+		argv: [npm, "--prefix", join(EXTENSION_COMPAT_REFERENCE_ROOT, "packages/coding-agent"), "run", "build:binary"],
 	});
 	artifact.build.artifacts = {
 		rustPi: fileRecord(RUST_BINARY),
@@ -2180,7 +2180,7 @@ async function buildProducts(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-	assertCanonicalReference();
+	assertExtensionCompatReference();
 	artifact.machine = machineMetadata();
 	const ticksPerSecond = clockTicksPerSecond();
 	const python = requiredExecutable("python3");

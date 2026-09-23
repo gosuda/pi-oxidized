@@ -20,7 +20,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { CANONICAL_REFERENCE_SHA } from "../reference-identity.ts";
+import { EXTENSION_COMPAT_REFERENCE_SHA } from "../reference-identity.ts";
 import {
 	TOOL_VERSION,
 	checkUnreleasedEntriesHaveEvidence,
@@ -58,7 +58,7 @@ function scratchCheck(
 	const scDir = sidecarDir ?? join(dir, "sidecars");
 	mkdirSync(scDir, { recursive: true });
 	const result = runCheck(
-		{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows },
+		{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows },
 		{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: rows.map((r) => r.surface) }] },
 		REPO_ROOT,
 		scDir,
@@ -102,7 +102,7 @@ describe("DOC-G2: stale-sidecar-reuse after code change", () => {
 		});
 
 		const result = runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			REPO_ROOT,
 			scDir,
@@ -234,7 +234,7 @@ describe("DOC-G2: out-of-band-deps-doc-edit", () => {
 
 		// Second run: should detect contentHash mismatch
 		const result = runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			dir,
 			scDir,
@@ -317,7 +317,7 @@ describe("DOC-G2: disguised-example-product-import", () => {
 		};
 
 		const result = runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			dir,
 			scDir,
@@ -441,7 +441,7 @@ describe("DOC-G2: evidence-free-unreleased-entry", () => {
 		};
 
 		const result = runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			dir,
 			scDir,

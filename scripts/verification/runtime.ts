@@ -12,10 +12,16 @@
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-identity.ts";
+import {
+	assertExtensionCompatReference,
+	extensionCompatReferenceRoot,
+} from "../reference-identity.ts";
 import type { AssistantMessageEventStream } from "@earendil-works/pi-ai";
 
-const REFERENCE_MODULE = join(canonicalReferenceRoot(), "packages/ai/src/utils/event-stream.ts");
+const REFERENCE_MODULE = join(
+	extensionCompatReferenceRoot(),
+	"packages/ai/src/utils/event-stream.ts",
+);
 
 type CreateAssistantMessageEventStream = () => AssistantMessageEventStream;
 
@@ -25,7 +31,7 @@ interface ReferenceEventStreamModule {
 }
 
 export function createAssistantMessageEventStream(): AssistantMessageEventStream {
-	assertCanonicalReference();
+	assertExtensionCompatReference();
 	const modulePath = REFERENCE_MODULE;
 
 	if (!existsSync(modulePath)) {

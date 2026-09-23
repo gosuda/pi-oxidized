@@ -22,9 +22,9 @@
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-	CANONICAL_REFERENCE_ROOT,
-	assertCanonicalReference,
-	canonicalReferenceRoot,
+	EXTENSION_COMPAT_REFERENCE_ROOT,
+	assertExtensionCompatReference,
+	extensionCompatReferenceRoot,
 } from "../reference-identity.ts";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -32,11 +32,11 @@ const RUST_BINARY = resolve(REPO_ROOT, "target/release/pi");
 const EXTENSION_HOST = resolve(REPO_ROOT, "packages/extension-host/dist/pi-extension-host");
 const EXTENSION_PATH = resolve(import.meta.dirname, "extension.ts");
 const TYPESCRIPT_CLI = resolve(
-	canonicalReferenceRoot(REPO_ROOT),
+	extensionCompatReferenceRoot(REPO_ROOT),
 	"packages/coding-agent/src/cli.ts",
 );
 export const AUTHORITATIVE_RPC_TYPES_PATH = resolve(
-	canonicalReferenceRoot(REPO_ROOT),
+	extensionCompatReferenceRoot(REPO_ROOT),
 	"packages/coding-agent/src/modes/rpc/rpc-types.ts",
 );
 const EVIDENCE_ROOT = resolve(REPO_ROOT, "target/verification/rpc-parity");
@@ -727,7 +727,7 @@ function writeJsonl(path: string, records: readonly JsonValue[]): void {
 }
 
 async function main(): Promise<void> {
-	const referenceSha = assertCanonicalReference();
+	const referenceSha = assertExtensionCompatReference();
 	for (const required of [RUST_BINARY, EXTENSION_HOST, EXTENSION_PATH, TYPESCRIPT_CLI, AUTHORITATIVE_RPC_TYPES_PATH]) {
 		try {
 			statSync(required);
@@ -797,7 +797,7 @@ async function main(): Promise<void> {
 	}
 
 	const summary = {
-		referenceRoot: CANONICAL_REFERENCE_ROOT,
+		referenceRoot: EXTENSION_COMPAT_REFERENCE_ROOT,
 		referenceSha,
 		authoritativeCommandCount: authoritative.length,
 		authoritativeCommands: authoritative,

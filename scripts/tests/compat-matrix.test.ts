@@ -18,7 +18,7 @@ import {
 	canonicalJson,
 } from "../verification/docs-evidence.ts";
 import { RUN_MANIFEST_SCHEMA, sha256 } from "../verification/docs-evidence-runners.ts";
-import { CANONICAL_REFERENCE_SHA } from "../reference-identity.ts";
+import { EXTENSION_COMPAT_REFERENCE_SHA } from "../reference-identity.ts";
 
 function validCommand() {
 	return {
@@ -338,7 +338,7 @@ describe("captureDocsEvidence", () => {
 	}));
 	const ledger = {
 		schema: "pi.docs.evidence.v1",
-		referencePin: CANONICAL_REFERENCE_SHA,
+		referencePin: EXTENSION_COMPAT_REFERENCE_SHA,
 		rows: entries.map(({ rowId }) => ({ id: rowId })),
 	};
 
@@ -351,7 +351,7 @@ describe("captureDocsEvidence", () => {
 		const manifest = {
 			schema: RUN_MANIFEST_SCHEMA,
 			runId,
-			referencePin: CANONICAL_REFERENCE_SHA,
+			referencePin: EXTENSION_COMPAT_REFERENCE_SHA,
 			ledgerHash: sha256(canonicalJson(ledger)),
 			rowCount,
 			presentCount: rowCount,

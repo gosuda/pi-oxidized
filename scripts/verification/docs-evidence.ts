@@ -23,10 +23,9 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { isAbsolute, join, resolve } from "node:path";
 
 import {
-	CANONICAL_REFERENCE_SHA,
-	LEGACY_REFERENCE_SHA,
-	RETIRED_REFERENCE_SHA,
-	assertCanonicalReference,
+	EXTENSION_COMPAT_REFERENCE_SHA,
+	RETIRED_REFERENCE_SHAS,
+	assertExtensionCompatReference,
 } from "../reference-identity.ts";
 import {
 	DEFAULT_REPROOF_INTERVAL_MS,
@@ -169,22 +168,22 @@ export function validateLedger(ledger: Ledger): readonly ValidationProblem[] {
 	const problems: ValidationProblem[] = [];
 
 	// Reference-pin literal check
-	if (ledger.referencePin !== CANONICAL_REFERENCE_SHA) {
+	if (ledger.referencePin !== EXTENSION_COMPAT_REFERENCE_SHA) {
 		problems.push({
 			rowId: "(ledger)",
-			message: `referencePin is ${ledger.referencePin}, expected ${CANONICAL_REFERENCE_SHA}`,
+			message: `referencePin is ${ledger.referencePin}, expected ${EXTENSION_COMPAT_REFERENCE_SHA}`,
 		});
 	}
-	if (ledger.referencePin === LEGACY_REFERENCE_SHA) {
+	if (ledger.referencePin === RETIRED_REFERENCE_SHAS[0]) {
 		problems.push({
 			rowId: "(ledger)",
-			message: `referencePin is the legacy pin ${LEGACY_REFERENCE_SHA}; the legacy checkout is not an active ledger identity`,
+			message: `referencePin is the legacy pin ${RETIRED_REFERENCE_SHAS[0]}; the legacy checkout is not an active ledger identity`,
 		});
 	}
-	if (ledger.referencePin === RETIRED_REFERENCE_SHA) {
+	if (ledger.referencePin === RETIRED_REFERENCE_SHAS[1]) {
 		problems.push({
 			rowId: "(ledger)",
-			message: `referencePin is the retired pin ${RETIRED_REFERENCE_SHA}; retired identity must never reappear in an active ledger`,
+			message: `referencePin is the retired pin ${RETIRED_REFERENCE_SHAS[1]}; retired identity must never reappear in an active ledger`,
 		});
 	}
 
@@ -367,7 +366,7 @@ export function loadRunManifest(manifestPath: string): RunManifest {
 		raw["schema"] !== RUN_MANIFEST_SCHEMA ||
 		typeof raw["runId"] !== "string" ||
 		Number.isNaN(Date.parse(raw["runId"])) ||
-		raw["referencePin"] !== CANONICAL_REFERENCE_SHA ||
+		raw["referencePin"] !== EXTENSION_COMPAT_REFERENCE_SHA ||
 		typeof raw["ledgerHash"] !== "string" ||
 		!/^[0-9a-f]{64}$/.test(raw["ledgerHash"]) ||
 		raw["rowCount"] !== EXPECTED_LEDGER_ROW_COUNT ||
@@ -504,7 +503,7 @@ async function main(): Promise<void> {
 	// Fail closed before any current evidence reads: the canonical reference
 	// checkout must sit at the pinned commit.
 	try {
-		assertCanonicalReference(root);
+		assertExtensionCompatReference(root);
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
 		console.error(`docs-evidence: ${detail}`);
