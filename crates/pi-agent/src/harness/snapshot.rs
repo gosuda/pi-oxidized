@@ -699,13 +699,13 @@ fn upsert_tool(operation: &mut LaneSnapshotOperation, tool: LaneSnapshotTool) {
 fn assistant_message(message: &AgentMessage) -> Option<AssistantMessage> {
     match message.as_llm()? {
         Message::Assistant(message) => Some((**message).clone()),
-        Message::User(_) | Message::ToolResult(_) => None,
+        Message::System(_) | Message::User(_) | Message::ToolResult(_) => None,
     }
 }
 
 fn tool_result_call_id(message: &AgentMessage) -> Option<&str> {
     match message.as_llm()? {
         Message::ToolResult(tool_result) => Some(&tool_result.tool_call_id),
-        Message::User(_) | Message::Assistant(_) => None,
+        Message::System(_) | Message::User(_) | Message::Assistant(_) => None,
     }
 }

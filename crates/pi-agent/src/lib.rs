@@ -28,10 +28,10 @@ pub use bus::{
 };
 pub use config::{
     AfterToolCall, AfterToolCallContext, AfterToolCallResult, AgentContext, AgentLoopConfig,
-    AgentLoopTurnUpdate, BeforeToolCall, BeforeToolCallContext, BeforeToolCallResult, ConvertToLlm,
-    GetApiKey, GetMessages, PrepareNextTurn, PrepareNextTurnContext, ShouldStopAfterTurn,
-    ShouldStopAfterTurnContext, TransformContext, build_stream_options,
-    default_convert_to_llm_hook,
+    AgentLoopTurnUpdate, AgentRequestUpdate, AgentTurnContext, AgentTurnDecision, BeforeToolCall,
+    BeforeToolCallContext, BeforeToolCallResult, ConvertToLlm, FinishTurn, GetApiKey, GetMessages,
+    PrepareNextTurn, PrepareNextTurnContext, PrepareRequest, PrepareRequestContext,
+    TransformContext, build_stream_options, default_convert_to_llm_hook,
 };
 pub use drain::{DRAIN_EVENT_CAPACITY, DrainItem, ProviderDrain};
 pub use error::{AgentLoopError, ToolError};

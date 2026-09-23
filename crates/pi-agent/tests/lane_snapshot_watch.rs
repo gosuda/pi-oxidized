@@ -112,7 +112,10 @@ fn fixture_model() -> pi_ai::Model {
         reasoning: false,
         thinking_level_map: None,
         input: Vec::new(),
+        input_limits: None,
         cost: pi_ai::ModelCost::default(),
+        prompt_cache: None,
+        sampling_params: None,
         context_window: 8192,
         max_tokens: 1024,
         headers: None,
@@ -339,7 +342,8 @@ async fn watcher_attached_mid_operation_sees_streaming_and_running_tools()
             result = &mut run => panic!("run finished before MessageUpdate: {result:?}"),
             () = tokio::time::sleep(Duration::from_secs(3)) => panic!("no MessageUpdate within 3s"),
         }
-        let streaming = main.watch(&cx).await?.snapshot();
+        let watcher = main.watch(&cx).await?;
+        let streaming = watcher.snapshot();
         let streaming_operation = streaming
             .operation
             .as_ref()
@@ -368,7 +372,7 @@ async fn watcher_attached_mid_operation_sees_streaming_and_running_tools()
             result = &mut run => panic!("run finished before ToolStart: {result:?}"),
             () = tokio::time::sleep(Duration::from_secs(3)) => panic!("no ToolStart within 3s"),
         }
-        let running = main.watch(&cx).await?.snapshot();
+        let running = watcher.resnapshot(&cx).await?;
         let running_operation = running
             .operation
             .as_ref()

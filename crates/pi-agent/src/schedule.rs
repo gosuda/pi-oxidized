@@ -673,12 +673,17 @@ async fn prepare_tool_call(
         .await
         {
             Ok(Some(result)) if result.block => {
+                let mut blocked = error_tool_result(
+                    result
+                        .reason
+                        .unwrap_or_else(|| "Tool execution was blocked".to_owned()),
+                );
+                // A blocked call's terminate hint travels on the error result
+                // so it participates in batch early termination
+                // (`agent-loop.ts:739-742`).
+                blocked.terminate = result.terminate;
                 return Preparation::Immediate(ImmediateOutcome {
-                    result: error_tool_result(
-                        result
-                            .reason
-                            .unwrap_or_else(|| "Tool execution was blocked".to_owned()),
-                    ),
+                    result: blocked,
                     is_error: true,
                 });
             }
@@ -944,7 +949,10 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: vec![ModelInput::Text],
+            input_limits: None,
             cost: ModelCost::default(),
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 8_192,
             max_tokens: 1_024,
             headers: None,
@@ -973,7 +981,8 @@ mod tests {
             convert_to_llm: default_convert_to_llm_hook(),
             transform_context: None,
             get_api_key: None,
-            should_stop_after_turn: None,
+            finish_turn: None,
+            prepare_request: None,
             prepare_next_turn: None,
             get_steering_messages: None,
             get_follow_up_messages: None,
@@ -1430,6 +1439,7 @@ mod tests {
                 Ok(Some(BeforeToolCallResult {
                     block: true,
                     reason: Some("nope".to_owned()),
+                    terminate: None,
                 }))
             })
         }));

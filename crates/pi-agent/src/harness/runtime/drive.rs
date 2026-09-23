@@ -743,7 +743,7 @@ struct CurrentOperation<'a> {
 }
 
 enum AssistantModel {
-    Ready(pi_ai::Model),
+    Ready(Box<pi_ai::Model>),
     Settled(OperationResultRecord),
 }
 
@@ -790,7 +790,7 @@ async fn require_assistant_model(
         .await?;
         return Ok(AssistantModel::Settled(record));
     };
-    Ok(AssistantModel::Ready(model))
+    Ok(AssistantModel::Ready(Box::new(model)))
 }
 
 async fn assistant_stream_config(
@@ -862,7 +862,7 @@ async fn generation(
         _ => return Err(invariant("generation dispatcher received another state")),
     };
     let model = match require_assistant_model(lane, operation, &context, cx).await? {
-        AssistantModel::Ready(model) => model,
+        AssistantModel::Ready(model) => *model,
         AssistantModel::Settled(record) => return Ok(DriveStep::Settled(record)),
     };
     context.configuration.model.api = Some(model.api.clone());
@@ -4567,7 +4567,10 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: Vec::new(),
+            input_limits: None,
             cost: pi_ai::ModelCost::default(),
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 8192,
             max_tokens: 1024,
             headers: None,
@@ -4586,7 +4589,10 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: Vec::new(),
+            input_limits: None,
             cost: pi_ai::ModelCost::default(),
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 8192,
             max_tokens: 1024,
             headers: None,

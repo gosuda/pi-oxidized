@@ -218,6 +218,9 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
 
 fn estimate_llm_message_tokens(message: &Message) -> u64 {
     let chars = match message {
+        Message::System(message) => {
+            js_string_len(&pi_ai::transcript::get_system_message_text(message))
+        }
         Message::User(message) => estimate_text_and_image_content_chars(&message.content),
         Message::ToolResult(message) => estimate_tool_result_content_chars(&message.content),
         Message::Assistant(message) => message
@@ -1142,7 +1145,9 @@ fn is_retryable_error_text(error: &str) -> bool {
     {
         return true;
     }
-    [429_u16, 500, 502, 503, 504, 524]
+    // Numeric transient statuses mirror `RETRYABLE_PROVIDER_ERROR_PATTERN` in
+    // `.references/pi/packages/ai/src/utils/retry.ts:30-38`.
+    [429_u16, 500, 502, 503, 504, 520, 524]
         .iter()
         .any(|code| contains_status_code(&lower, *code))
 }
@@ -1393,6 +1398,26 @@ mod tests {
             timestamp: 1,
             custom_type: None,
         }
+    }
+
+    #[test]
+    fn http_520_is_retryable() {
+        let mut message = AssistantMessage::new("api", "provider", "model", 1);
+        message.stop_reason = StopReason::Error;
+        message.error_message = Some("provider returned HTTP 520".to_owned());
+        assert!(is_retryable_assistant_error(&message));
+
+        // Guards against over-matching: quota text is explicitly excluded
+        // and plain text without a listed status is not retried.
+        let mut quota = AssistantMessage::new("api", "provider", "model", 1);
+        quota.stop_reason = StopReason::Error;
+        quota.error_message = Some("quota exceeded for this project".to_owned());
+        assert!(!is_retryable_assistant_error(&quota));
+
+        let mut plain = AssistantMessage::new("api", "provider", "model", 1);
+        plain.stop_reason = StopReason::Error;
+        plain.error_message = Some("something failed".to_owned());
+        assert!(!is_retryable_assistant_error(&plain));
     }
 
     #[test]
@@ -1660,7 +1685,10 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: Vec::new(),
+            input_limits: None,
             cost: pi_ai::ModelCost::default(),
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 0,
             max_tokens: 0,
             headers: None,

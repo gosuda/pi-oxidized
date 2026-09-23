@@ -12,6 +12,13 @@ pub enum AgentLoopError {
     /// Human-readable infrastructure failure.
     #[error("{0}")]
     Message(String),
+    /// Reset was attempted while a run is active.
+    ///
+    /// Mirrors `Agent.prototype.reset` throwing
+    /// `"Agent is already processing. Wait for completion before resetting."`
+    /// in `.references/pi/packages/agent/src/agent.ts:352-355`.
+    #[error("Agent is already processing. Wait for completion before resetting.")]
+    ActiveRun,
 }
 
 impl AgentLoopError {

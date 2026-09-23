@@ -160,6 +160,7 @@ fn convert_custom_to_llm(custom: &CustomAgentMessage) -> Option<Message> {
 pub fn message_timestamp(message: &AgentMessage) -> i64 {
     match message {
         AgentMessage::Llm(message) => match message.as_ref() {
+            Message::System(message) => message.timestamp,
             Message::User(message) => message.timestamp,
             Message::Assistant(message) => message.timestamp,
             Message::ToolResult(message) => message.timestamp,

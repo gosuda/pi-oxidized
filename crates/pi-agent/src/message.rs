@@ -106,7 +106,7 @@ impl<'de> Deserialize<'de> for AgentMessage {
             .ok_or_else(|| D::Error::custom("agent message missing role"))?;
 
         match role {
-            "user" | "assistant" | "toolResult" => {
+            "system" | "user" | "assistant" | "toolResult" => {
                 let message = Message::deserialize(value).map_err(D::Error::custom)?;
                 Ok(Self::Llm(Box::new(message)))
             }
@@ -124,6 +124,7 @@ impl AgentMessage {
     pub fn role(&self) -> &str {
         match self {
             Self::Llm(message) => match message.as_ref() {
+                Message::System(_) => "system",
                 Message::User(_) => "user",
                 Message::Assistant(_) => "assistant",
                 Message::ToolResult(_) => "toolResult",
@@ -159,7 +160,8 @@ impl AgentMessage {
 
 /// Default conversion used when product code does not supply a custom mapper.
 ///
-/// Keeps user, assistant, and tool-result messages and drops custom roles.
+/// Keeps system, user, assistant, and tool-result messages and drops custom
+/// roles, so replayed system prompt and tool state stays LLM-visible.
 #[must_use]
 pub fn default_convert_to_llm(messages: &[AgentMessage]) -> Vec<Message> {
     messages
@@ -292,5 +294,37 @@ mod tests {
         });
         let result = serde_json::from_value::<AgentMessage>(raw);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn system_message_round_trips_and_stays_llm_visible() -> Result<(), serde_json::Error> {
+        let raw = json!({
+            "role": "system",
+            "content": "fresh sections",
+            "toolsAdded": [
+                { "name": "read", "description": "d", "parameters": { "type": "object" } }
+            ],
+            "toolsRemoved": [{ "name": "write" }],
+            "timestamp": 7
+        });
+
+        let message: AgentMessage = serde_json::from_value(raw.clone())?;
+        assert_eq!(message.role(), "system");
+        assert!(message.is_llm());
+        let AgentMessage::Llm(inner) = &message else {
+            return Err(serde::de::Error::custom("expected llm message"));
+        };
+        let Message::System(system) = inner.as_ref() else {
+            return Err(serde::de::Error::custom("expected system message"));
+        };
+        assert_eq!(system.timestamp, 7);
+
+        let converted = default_convert_to_llm(std::slice::from_ref(&message));
+        assert_eq!(converted.len(), 1);
+        assert!(matches!(converted[0], Message::System(_)));
+
+        let encoded = serde_json::to_value(&message)?;
+        assert_eq!(encoded, raw);
+        Ok(())
     }
 }

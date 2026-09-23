@@ -81,7 +81,8 @@ pub(crate) fn default_base_config(model: Model) -> AgentLoopConfig {
         convert_to_llm: crate::config::default_convert_to_llm_hook(),
         transform_context: None,
         get_api_key: None,
-        should_stop_after_turn: None,
+        finish_turn: None,
+        prepare_request: None,
         prepare_next_turn: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
@@ -305,19 +306,43 @@ impl Agent {
         lock(&self.inner.follow_up).clear();
     }
 
+    /// Previews the messages selected for the next turn without consuming them.
+    ///
+    /// Mirrors `Agent.prototype.peekQueuedMessages` in
+    /// `.references/pi/packages/agent/src/agent.ts:326-330`: the steering
+    /// queue's selected batch wins when non-empty; otherwise the follow-up
+    /// queue's selected batch is returned.
+    #[must_use]
+    pub fn peek_queued_messages(&self) -> Vec<AgentMessage> {
+        let steering = lock(&self.inner.steering).peek();
+        if !steering.is_empty() {
+            return steering;
+        }
+        lock(&self.inner.follow_up).peek()
+    }
+
     /// Installs the run-boundary hooks used by future prompt snapshots.
     ///
     /// Callers must serialize this operation with the prompt lifecycle. The
-    /// four fields change under one lock, so a new run cannot observe a partial
+    /// five fields change under one lock, so a new run cannot observe a partial
     /// hook set. An active run keeps its existing snapshot.
+    ///
+    /// The product `finish_turn` hook is composed with any pre-existing
+    /// config hook instead of replacing it: the product hook runs first, then
+    /// the previous hook. The previous hook's `End` decision wins, any
+    /// `Continue` decision forces `Continue`, and otherwise the decision is
+    /// `None`. Errors from either hook propagate.
     pub fn install_loop_hooks(
         &self,
         convert_to_llm: crate::config::ConvertToLlm,
         before_tool_call: crate::config::BeforeToolCall,
         after_tool_call: crate::config::AfterToolCall,
         prepare_next_turn: crate::config::PrepareNextTurn,
+        finish_turn: crate::config::FinishTurn,
     ) {
         let mut config = lock(&self.inner.base_config);
+        let previous_finish_turn = config.finish_turn.take();
+        config.finish_turn = Some(compose_finish_turn(finish_turn, previous_finish_turn));
         config.convert_to_llm = convert_to_llm;
         config.before_tool_call = Some(before_tool_call);
         config.after_tool_call = Some(after_tool_call);
@@ -414,24 +439,73 @@ impl Agent {
         }
     }
 
-    /// Aborts any active run, waits for it to finish, and clears transcript and
-    /// queues.
-    pub async fn reset(&self) {
-        self.abort();
-        self.wait_for_idle().await;
+    /// Clears transcript and queues while retaining the configured baseline.
+    ///
+    /// Mirrors `Agent.prototype.reset` in
+    /// `.references/pi/packages/agent/src/agent.ts:352-366`: the call is
+    /// rejected while a run is active instead of aborting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentLoopError::ActiveRun`] while a prompt or continuation is
+    /// streaming.
+    pub fn reset(&self) -> Result<(), AgentLoopError> {
+        // One lock order everywhere: `run` before `state`, shared with
+        // `start_run` / `begin_continue` / `finish_run`. Holding the run
+        // guard across the whole reset closes the window where a
+        // concurrent `start_run` could begin between the active check and
+        // the transcript/queue clear.
+        let mut run = lock(&self.inner.run);
+        if run.active.is_some() {
+            return Err(AgentLoopError::ActiveRun);
+        }
         lock(&self.inner.state).reset_transcript();
         lock(&self.inner.steering).clear();
         lock(&self.inner.follow_up).clear();
         let _ = self.inner.partial_tx.send(None);
-        let mut run = lock(&self.inner.run);
         run.is_streaming = false;
         run.active = None;
+        Ok(())
     }
 }
 
 enum RunMode {
     Prompt { skip_initial_steering: bool },
     Continue,
+}
+
+/// Composes the product finish-turn hook with any pre-existing config hook.
+///
+/// The product hook runs first, then the previous hook. The previous hook's
+/// `End` decision wins, any `Continue` decision forces `Continue`, and
+/// otherwise the decision is `None`. Errors from either hook propagate.
+fn compose_finish_turn(
+    product: crate::config::FinishTurn,
+    previous: Option<crate::config::FinishTurn>,
+) -> crate::config::FinishTurn {
+    Arc::new(
+        move |turn: crate::config::AgentTurnContext,
+              cancel: tokio_util::sync::CancellationToken| {
+            let product = Arc::clone(&product);
+            let previous = previous.clone();
+            Box::pin(async move {
+                let product_decision = product(turn.clone(), cancel.clone()).await?;
+                let previous_decision = match previous {
+                    Some(previous) => previous(turn, cancel).await?,
+                    None => None,
+                };
+                if previous_decision == Some(crate::config::AgentTurnDecision::End) {
+                    return Ok(Some(crate::config::AgentTurnDecision::End));
+                }
+                if product_decision == Some(crate::config::AgentTurnDecision::Continue)
+                    || previous_decision == Some(crate::config::AgentTurnDecision::Continue)
+                {
+                    return Ok(Some(crate::config::AgentTurnDecision::Continue));
+                }
+                Ok(None)
+            })
+        },
+    )
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -679,12 +753,13 @@ fn finish_run(
         }
     };
 
-    {
-        let mut state = lock(&inner.state);
-        state.finish_run();
-    }
+    // One lock scope in the shared `run` before `state` order; the run
+    // flags and the state flags clear atomically with respect to
+    // `start_run` / `begin_continue` / `reset`.
     {
         let mut run = lock(&inner.run);
+        let mut state = lock(&inner.state);
+        state.finish_run();
         run.is_streaming = false;
         run.active = None;
     }
@@ -746,7 +821,10 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: vec![ModelInput::Text],
+            input_limits: None,
             cost: ModelCost::default(),
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 0,
             max_tokens: 0,
             headers: None,
@@ -1178,10 +1256,12 @@ mod tests {
             .await?;
         agent.wait_for_idle().await;
 
-        agent.reset().await;
+        agent.reset()?;
         let state = agent.state();
         assert!(state.messages.is_empty());
         assert!(!state.is_streaming);
+        // Queues were cleared by reset; peek sees nothing on either queue.
+        assert!(agent.peek_queued_messages().is_empty());
 
         // A fresh prompt should not inject any queued messages.
         let mut rx = agent.subscribe();
@@ -1201,6 +1281,76 @@ mod tests {
             .count();
         assert_eq!(user_ends, 1);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn reset_rejected_while_run_is_active() -> Result<(), Box<dyn std::error::Error>> {
+        let provider = Arc::new(HangingProvider::after_start());
+        let agent = Agent::new(agent_options(provider));
+        let run = tokio::spawn({
+            let agent = agent.clone();
+            async move {
+                agent
+                    .prompt(vec![user_text("go", std::iter::empty())])
+                    .await
+            }
+        });
+
+        let mut waited = 0;
+        while agent.state().streaming_message.is_none() && waited < 200 {
+            sleep(Duration::from_millis(5)).await;
+            waited += 1;
+        }
+        assert!(
+            agent.state().streaming_message.is_some(),
+            "provider start was never reduced"
+        );
+
+        // Upstream `Agent.prototype.reset` throws instead of aborting
+        // (`agent.ts:352-355`); the Rust mirror rejects with `ActiveRun`.
+        let reset_result = agent.reset();
+        assert!(
+            matches!(reset_result, Err(AgentLoopError::ActiveRun)),
+            "reset during an active run must be rejected: {reset_result:?}"
+        );
+        // The run itself was not disturbed by the rejected reset.
+        assert!(agent.state().is_streaming);
+
+        agent.abort();
+        run.await??;
+        agent.wait_for_idle().await;
+        agent.reset()?;
+        assert!(!agent.state().is_streaming);
+        Ok(())
+    }
+
+    #[test]
+    fn peek_queued_messages_prefers_steering_then_follow_up() {
+        let provider = Arc::new(MockProvider(Vec::new()));
+        let agent = Agent::new(agent_options(provider));
+        assert!(agent.peek_queued_messages().is_empty());
+
+        agent.follow_up(user_text("follow", std::iter::empty()));
+        agent.steer(user_text("steer", std::iter::empty()));
+        // Steering wins when non-empty (`agent.ts:326-330`).
+        let peeked = agent.peek_queued_messages();
+        assert_eq!(peeked.len(), 1);
+        assert_eq!(user_text_of(&peeked[0]), Some("steer"));
+        // Peek is a preview: nothing was consumed.
+        assert_eq!(lock(&agent.inner.steering).len(), 1);
+        assert_eq!(lock(&agent.inner.follow_up).len(), 1);
+
+        lock(&agent.inner.steering).clear();
+        let peeked = agent.peek_queued_messages();
+        assert_eq!(user_text_of(&peeked[0]), Some("follow"));
+
+        // `All` mode peeks the whole batch without consuming.
+        agent.set_steering_mode(QueueMode::All);
+        agent.steer(user_text("s1", std::iter::empty()));
+        agent.steer(user_text("s2", std::iter::empty()));
+        let peeked = agent.peek_queued_messages();
+        assert_eq!(peeked.len(), 2);
+        assert_eq!(lock(&agent.inner.steering).len(), 2);
     }
 
     #[tokio::test]

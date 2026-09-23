@@ -203,6 +203,9 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                     ));
                 }
             }
+            // System updates replay into prompt and tool state; they are not
+            // conversation turns for summarization.
+            Message::System(_) => {}
         }
     }
     parts.join("\n\n")

@@ -34,6 +34,8 @@ pub struct BeforeToolCallResult {
     pub block: bool,
     /// Error text used when blocking; a default is used when omitted.
     pub reason: Option<String>,
+    /// Hint that the agent should stop after the current tool batch when blocked.
+    pub terminate: Option<bool>,
 }
 
 /// Partial override returned from `after_tool_call`.
@@ -79,30 +81,65 @@ pub struct AfterToolCallContext {
     pub context: AgentContext,
 }
 
-/// Context passed to turn-boundary hooks.
+/// Context passed to completed-turn callbacks.
+///
+/// Mirrors `.references/pi/packages/agent/src/types.ts:130-140`.
 #[derive(Clone)]
-pub struct ShouldStopAfterTurnContext {
+pub struct AgentTurnContext {
     /// Assistant message that completed the turn.
     pub message: AssistantMessage,
-    /// Tool results passed to the preceding `turn_end` event.
+    /// Tool results emitted for the completed turn.
     pub tool_results: Vec<ToolResultMessage>,
-    /// Context after the turn's assistant message and tool results were appended.
+    /// Context after the assistant message and tool results were appended.
     pub context: AgentContext,
     /// Messages this loop invocation will return if it exits here.
     pub new_messages: Vec<AgentMessage>,
 }
 
+/// Decision returned from [`FinishTurn`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentTurnDecision {
+    /// Guarantee at least one further provider request.
+    Continue,
+    /// End after the completed turn without draining queued messages.
+    End,
+}
+
 /// Context passed to `prepare_next_turn`.
-pub type PrepareNextTurnContext = ShouldStopAfterTurnContext;
+pub type PrepareNextTurnContext = AgentTurnContext;
 
 /// Replacement runtime state for the next provider request.
 #[derive(Clone, Default)]
 pub struct AgentLoopTurnUpdate {
     /// Context for the next provider request.
     pub context: Option<AgentContext>,
+    /// Messages appended before the next provider request.
+    pub messages: Option<Vec<AgentMessage>>,
     /// Model for the next provider request.
     pub model: Option<Model>,
     /// Thinking level for the next provider request.
+    pub thinking_level: Option<ModelThinkingLevel>,
+}
+
+/// Runtime state available immediately before a provider request.
+#[derive(Clone)]
+pub struct PrepareRequestContext {
+    /// Current context after pending messages were appended.
+    pub context: AgentContext,
+    /// Model selected for the request.
+    pub model: Model,
+    /// Thinking level selected for the request.
+    pub thinking_level: ModelThinkingLevel,
+}
+
+/// Replacement runtime state returned from [`PrepareRequest`].
+#[derive(Clone, Default)]
+pub struct AgentRequestUpdate {
+    /// Context for this and subsequent provider requests.
+    pub context: Option<AgentContext>,
+    /// Model for this and subsequent provider requests.
+    pub model: Option<Model>,
+    /// Thinking level for this and subsequent provider requests.
     pub thinking_level: Option<ModelThinkingLevel>,
 }
 
@@ -127,9 +164,22 @@ pub type TransformContext = Arc<
 pub type GetApiKey =
     Arc<dyn Fn(String) -> BoxFuture<'static, Result<Option<String>, AgentLoopError>> + Send + Sync>;
 
-/// Decides whether the loop should exit after the current turn.
-pub type ShouldStopAfterTurn = Arc<
-    dyn Fn(ShouldStopAfterTurnContext) -> BoxFuture<'static, Result<bool, AgentLoopError>>
+/// Called after a completed turn and before `turn_end`.
+pub type FinishTurn = Arc<
+    dyn Fn(
+            AgentTurnContext,
+            CancellationToken,
+        ) -> BoxFuture<'static, Result<Option<AgentTurnDecision>, AgentLoopError>>
+        + Send
+        + Sync,
+>;
+
+/// Called immediately before every conversational provider request.
+pub type PrepareRequest = Arc<
+    dyn Fn(
+            PrepareRequestContext,
+            CancellationToken,
+        ) -> BoxFuture<'static, Result<Option<AgentRequestUpdate>, AgentLoopError>>
         + Send
         + Sync,
 >;
@@ -214,8 +264,10 @@ pub struct AgentLoopConfig {
     pub transform_context: Option<TransformContext>,
     /// Optional API-key resolver.
     pub get_api_key: Option<GetApiKey>,
-    /// Optional post-turn stop predicate.
-    pub should_stop_after_turn: Option<ShouldStopAfterTurn>,
+    /// Optional completed-turn decision hook.
+    pub finish_turn: Option<FinishTurn>,
+    /// Optional provider-request preparation hook.
+    pub prepare_request: Option<PrepareRequest>,
     /// Optional next-turn state replacement.
     pub prepare_next_turn: Option<PrepareNextTurn>,
     /// Optional steering-message source.
@@ -274,6 +326,7 @@ pub fn build_stream_options(
 ) -> StreamOptions {
     let mut options = StreamOptions {
         temperature: config.temperature,
+        sampling_params: None,
         max_tokens: config.max_tokens,
         signal,
         api_key: resolved_key,
@@ -367,7 +420,10 @@ mod tests {
             reasoning: true,
             thinking_level_map: None,
             input: vec![ModelInput::Text],
+            input_limits: None,
             cost: ModelCost::default(),
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 8_192,
             max_tokens: 1_024,
             headers: None,
@@ -408,7 +464,8 @@ mod tests {
             convert_to_llm: default_convert_to_llm_hook(),
             transform_context: None,
             get_api_key: None,
-            should_stop_after_turn: None,
+            finish_turn: None,
+            prepare_request: None,
             prepare_next_turn: None,
             get_steering_messages: None,
             get_follow_up_messages: None,

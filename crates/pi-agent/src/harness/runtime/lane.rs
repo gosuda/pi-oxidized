@@ -24,7 +24,7 @@ use crate::harness::api::{
     AgentLane, DriveOptions, IdleJob, NavigateOptions, OperationRequest, PromptInput, QueueInput,
     RecordUsageOptions,
 };
-use crate::harness::bus::WatchHandle;
+use crate::harness::bus::{SnapshotCapture, WatchHandle};
 use crate::harness::event::{HarnessEvent, HarnessEventPayload};
 use crate::harness::gate::{Gate, GateControl, create_gate};
 use crate::harness::result::{
@@ -709,8 +709,27 @@ impl AgentLane for LaneRuntime {
         cx: &'a Context,
     ) -> BoxFuture<'a, Result<WatchHandle<LaneSnapshot>, HarnessError>> {
         Box::pin(async move {
-            let snapshot = self.snapshot(cx).await?;
-            self.owner.events.watch(snapshot, Arc::new(|_| true), None)
+            self.ensure_open()?;
+            let lane = self
+                .owner
+                .lanes
+                .lock()
+                .await
+                .get(&self.name)
+                .cloned()
+                .ok_or_else(|| HarnessError::InvalidLane {
+                    lane: self.name.clone(),
+                    reason: "lane_missing".to_owned(),
+                    message: "lane is no longer registered".to_owned(),
+                })?;
+            let capture: SnapshotCapture<LaneSnapshot> = Arc::new(move |context| {
+                let lane = Arc::clone(&lane);
+                Box::pin(async move { lane.snapshot(&context).await })
+            });
+            self.owner
+                .events
+                .watch_from_snapshot(capture, Arc::new(|_| true), cx)
+                .await
         })
     }
 }
