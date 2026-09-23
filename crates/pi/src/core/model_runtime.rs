@@ -461,6 +461,13 @@ impl ModelRuntimeInner {
     }
 }
 
+/// Default remaining-validity window below which a stored OAuth token
+/// refreshes before resolution (source `DEFAULT_OAUTH_MINIMUM_VALIDITY_MS`).
+const DEFAULT_OAUTH_MINIMUM_VALIDITY_MS: i64 = 5 * 60 * 1000;
+/// Upper bound on one OAuth refresh network round trip
+/// (source `DEFAULT_OAUTH_REFRESH_TIMEOUT_MS`).
+const OAUTH_REFRESH_TIMEOUT_MS: u64 = 15_000;
+
 impl ModelRuntime {
     /// Create a runtime from the given options.
     ///
@@ -699,6 +706,44 @@ impl ModelRuntime {
     ) -> Result<Option<AuthResult>, ModelRuntimeError> {
         self.resolve_auth(&model.provider, Some(model), overrides, None)
             .await
+    }
+
+    /// Composed provider ids: builtin catalog, radius, models.json, and
+    /// registered extensions. Sorted; mirrors source `Models.getProviders()`.
+    #[must_use]
+    pub fn get_provider_ids(&self) -> Vec<String> {
+        self.provider_ids().into_iter().collect()
+    }
+
+    /// Resolve request auth while enforcing the OAuth minimum-validity window.
+    ///
+    /// The source resolver refreshes stored OAuth tokens with less than five
+    /// minutes of validity remaining, honors an explicit per-request floor
+    /// (`minOAuthValidityMs`), and rejects refresh results that still expire
+    /// too soon for an explicit floor. [`Self::get_auth_for_provider`] keeps
+    /// its exact existing behavior; CLI auth commands go through here so the
+    /// check and credential-print paths observe the source validity window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelRuntimeError::Models`] when the credential store, the
+    /// forced refresh, or resolution fails.
+    pub async fn get_auth_with_options(
+        &self,
+        provider_id: &str,
+        model: Option<&Model>,
+        min_oauth_validity_ms: Option<i64>,
+        signal: Option<CancellationToken>,
+    ) -> Result<Option<AuthResult>, ModelRuntimeError> {
+        self.refresh_oauth_for_minimum_validity(provider_id, min_oauth_validity_ms, signal.clone())
+            .await?;
+        self.resolve_auth(
+            provider_id,
+            model,
+            ModelRuntimeAuthOverrides::default(),
+            signal,
+        )
+        .await
     }
 
     /// Install a process-local API key for `provider_id` and refresh availability.
@@ -1553,8 +1598,9 @@ impl ModelRuntime {
         &self,
         model: Model,
         context: Context,
-        options: StreamOptions,
+        options: impl Into<StreamOptions>,
     ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+        let options = options.into();
         let runtime = self.clone();
         let native = Arc::clone(&self.inner.stream_provider);
         Box::pin(
@@ -1923,6 +1969,110 @@ impl ModelRuntime {
             self.apply_configured_auth_projection(provider_id, model, result, &overrides)?;
         }
         Ok(result)
+    }
+
+    /// Force an OAuth refresh when the stored token lives shorter than the
+    /// validity floor: five minutes by default, an explicit floor when given.
+    ///
+    /// Mirrors source `resolveStoredOAuth` (resolve.ts): optimistic check,
+    /// double-checked refresh under the credential-store lock, bounded round
+    /// trip, and the explicit-floor post-check. pi-ai's resolver currently
+    /// refreshes only strictly expired tokens, so the floor bridge lives here
+    /// until the resolver owns it; derivation and precedence stay in pi-ai.
+    async fn refresh_oauth_for_minimum_validity(
+        &self,
+        provider_id: &str,
+        min_oauth_validity_ms: Option<i64>,
+        signal: Option<CancellationToken>,
+    ) -> Result<(), ModelRuntimeError> {
+        let minimum_validity_ms =
+            DEFAULT_OAUTH_MINIMUM_VALIDITY_MS.max(min_oauth_validity_ms.unwrap_or(0));
+        let Some(Credential::Oauth(stored)) = self
+            .inner
+            .credentials
+            .read(provider_id)
+            .await
+            .map_err(|error| ModelsError::new(ModelsErrorCode::Auth, error.to_string()))?
+        else {
+            return Ok(());
+        };
+        if auth_now_ms() + minimum_validity_ms < stored.expires {
+            return Ok(());
+        }
+        let Some(oauth) = self.provider_auth(provider_id).oauth else {
+            // No OAuth handler: resolution reports the same unresolvable state.
+            return Ok(());
+        };
+        let provider_id_owned = provider_id.to_owned();
+        let post = self
+            .inner
+            .credentials
+            .modify(
+                provider_id,
+                Box::new(move |current| {
+                    Box::pin(async move {
+                        let Some(Credential::Oauth(current)) = current else {
+                            // Logged out meanwhile — leave the entry unchanged.
+                            return Ok(None);
+                        };
+                        if auth_now_ms() + minimum_validity_ms < current.expires {
+                            // Another process/request refreshed — keep it.
+                            return Ok(None);
+                        }
+                        let refresh = oauth.refresh(&current, signal);
+                        match tokio::time::timeout(
+                            Duration::from_millis(OAUTH_REFRESH_TIMEOUT_MS),
+                            refresh,
+                        )
+                        .await
+                        {
+                            Ok(Ok(refreshed)) => Ok(Some(Credential::Oauth(refreshed))),
+                            Ok(Err(pi_ai::auth::AuthError::Cancelled)) => {
+                                Err(pi_ai::auth::AuthError::Cancelled)
+                            }
+                            Ok(Err(error)) => {
+                                Err(pi_ai::auth::AuthError::message(error.to_string()))
+                            }
+                            Err(_) => Err(pi_ai::auth::AuthError::message(format!(
+                                "refresh timed out after {OAUTH_REFRESH_TIMEOUT_MS}ms"
+                            ))),
+                        }
+                    })
+                }),
+            )
+            .await;
+        let post = match post {
+            Ok(post) => post,
+            Err(pi_ai::auth::StoreError::Auth(pi_ai::auth::AuthError::Cancelled)) => {
+                return Err(ModelRuntimeError::Models(ModelsError::cancelled()));
+            }
+            Err(pi_ai::auth::StoreError::Auth(error)) => {
+                return Err(ModelRuntimeError::Models(ModelsError::new(
+                    ModelsErrorCode::Oauth,
+                    format!("OAuth refresh failed for {provider_id_owned}: {error}"),
+                )));
+            }
+            Err(error) => {
+                return Err(ModelRuntimeError::Models(ModelsError::new(
+                    ModelsErrorCode::Auth,
+                    format!("Credential store modify failed for {provider_id_owned}: {error}"),
+                )));
+            }
+        };
+        // The default five-minute window triggers a refresh but imposes no
+        // provider contract; explicit floors (bearer-token export) do.
+        if let Some(Credential::Oauth(refreshed)) = post
+            && min_oauth_validity_ms.is_some()
+            && auth_now_ms() + minimum_validity_ms >= refreshed.expires
+        {
+            return Err(ModelRuntimeError::Models(ModelsError::new(
+                ModelsErrorCode::Oauth,
+                format!(
+                    "OAuth refresh returned a token that expires too soon for {provider_id_owned}"
+                ),
+            )));
+        }
+        Ok(())
     }
 
     fn auth_context_for(&self, overrides: &ModelRuntimeAuthOverrides) -> Arc<dyn AuthContext> {
@@ -2797,6 +2947,9 @@ fn model_from_definition(
             .thinking_level_map
             .clone()
             .or_else(|| defaults.and_then(|model| model.thinking_level_map.clone())),
+        input_limits: defaults.and_then(|model| model.input_limits.clone()),
+        prompt_cache: defaults.and_then(|model| model.prompt_cache.clone()),
+        sampling_params: defaults.and_then(|model| model.sampling_params.clone()),
         input: definition.input.clone().unwrap_or_else(|| {
             defaults.map_or_else(|| vec![ModelInput::Text], |model| model.input.clone())
         }),
@@ -2836,6 +2989,15 @@ fn merge_provider_env(base: &ProviderEnv, overlay: Option<&ProviderEnv>) -> Prov
 }
 
 fn radius_catalog_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Epoch milliseconds for OAuth expiry comparisons.
+fn auth_now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -3946,6 +4108,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn simple_tool_selection_reaches_native_http_requests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = ModelRuntime::create_in_memory().await?;
+        let choices = [
+            (pi_ai::ToolChoice::None, None, json!("none")),
+            (pi_ai::ToolChoice::Auto, None, json!("auto")),
+            (
+                pi_ai::ToolChoice::None,
+                Some(json!("required")),
+                json!("required"),
+            ),
+            (
+                pi_ai::ToolChoice::Auto,
+                Some(json!({"type": "function", "function": {"name": "lookup"}})),
+                json!({"type": "function", "function": {"name": "lookup"}}),
+            ),
+        ];
+        let (url, requests, server) = spawn_http_fixture(choices.len()).await?;
+        runtime.register_provider(
+            "selection",
+            &ProviderConfigInput {
+                base_url: Some(url),
+                api: Some("openai-completions".to_owned()),
+                api_key: Some("fixture-key".to_owned()),
+                models: Some(vec![ProviderModelDefinition {
+                    id: "model".to_owned(),
+                    name: Some("model".to_owned()),
+                    api: Some("openai-completions".to_owned()),
+                    base_url: None,
+                    reasoning: false,
+                    thinking_level_map: None,
+                    input: Some(vec![ModelInput::Text]),
+                    cost: Some(ModelCost::default()),
+                    context_window: Some(32_000),
+                    max_tokens: Some(4_096),
+                    headers: None,
+                    compat: None,
+                }]),
+                ..ProviderConfigInput::default()
+            },
+        )?;
+        let model = required(runtime.get_model("selection", "model"), "selection model")?;
+        for (choice, override_choice, expected) in choices {
+            let mut options = pi_ai::SimpleStreamOptions {
+                tool_choice: Some(choice),
+                ..pi_ai::SimpleStreamOptions::default()
+            };
+            if let Some(value) = override_choice {
+                options
+                    .base
+                    .insert_extra(StreamOptionKey::TOOL_CHOICE, value);
+            }
+            let response = runtime.stream_simple(model.clone(), Context::default(), options);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                futures::StreamExt::collect::<Vec<_>>(response),
+            )
+            .await?;
+            let captured = lock(&requests);
+            let request = captured
+                .last()
+                .ok_or("native provider sent no HTTP request")?;
+            let (_, body) = request.split_once("\r\n\r\n").ok_or("HTTP body missing")?;
+            let payload: Value = serde_json::from_str(body)?;
+            assert_eq!(payload["tool_choice"], expected);
+        }
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stream_simple_routes_matching_extension_provider() -> Result<(), ModelRuntimeError> {
         let runtime = ModelRuntime::create_in_memory().await?;
         runtime.register_provider(
@@ -4872,6 +5105,9 @@ mod tests {
                 ModelThinkingLevel::High,
                 Some("max".to_owned()),
             )])),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
             context_window: 32_000,
@@ -4943,6 +5179,9 @@ mod tests {
             base_url: "https://example.test".to_owned(),
             reasoning: true,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
             context_window: 32_000,
@@ -4981,6 +5220,9 @@ mod tests {
             base_url: "https://example.test".to_owned(),
             reasoning: true,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
             context_window: 64_000,

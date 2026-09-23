@@ -700,6 +700,7 @@ mod tests {
                 Self::User(message) => message.timestamp,
                 Self::Assistant(message) => message.timestamp,
                 Self::ToolResult(message) => message.timestamp,
+                Self::System(message) => message.timestamp,
             }
         }
     }

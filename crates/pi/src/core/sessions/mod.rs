@@ -26,9 +26,9 @@ use super::config::{
 use super::messages::{CustomMessageContent, MessageConversionError};
 
 pub use context::{
-    DEFAULT_THINKING_LEVEL, LeafRef, SessionContext, SessionModel, build_context_entries,
-    build_session_context, build_session_path, get_latest_compaction_entry,
-    session_entry_to_context_messages,
+    DEFAULT_THINKING_LEVEL, LeafRef, ProjectedSessionEntry, SessionContext, SessionModel,
+    SessionProjection, build_context_entries, build_session_context, build_session_path,
+    build_session_projection, get_latest_compaction_entry, session_entry_to_context_messages,
 };
 pub use cwd::{
     MissingSessionCwdError, SessionCwdIssue, SessionCwdSource, assert_session_cwd_exists,
@@ -36,11 +36,12 @@ pub use cwd::{
     get_missing_session_cwd_issue,
 };
 pub use entries::{
-    BranchSummaryEntry, CURRENT_SESSION_VERSION, CompactionEntry, CustomEntry, CustomMessageEntry,
-    FileEntry, LabelEntry, ModelChangeEntry, NO_MESSAGES_PLACEHOLDER, SessionEntry, SessionHeader,
-    SessionInfoEntry, SessionMessageEntry, ThinkingLevelChangeEntry, assert_valid_session_id,
-    create_session_id, generate_id, load_entries_from_file, migrate_session_entries, now_iso,
-    parse_session_entries, parse_session_entry_line, read_session_header,
+    BranchSummaryEntry, CURRENT_SESSION_VERSION, CompactionEntry, ContextEditEntry,
+    ContextEditReplacement, CustomEntry, CustomMessageEntry, FileEntry, LabelEntry,
+    ModelChangeEntry, NO_MESSAGES_PLACEHOLDER, SessionEntry, SessionHeader, SessionInfoEntry,
+    SessionMessageEntry, ThinkingLevelChangeEntry, assert_valid_session_id, create_session_id,
+    generate_id, load_entries_from_file, migrate_session_entries, now_iso, parse_session_entries,
+    parse_session_entry_line, read_session_header,
 };
 pub use list::{
     MAX_CONCURRENT_SESSION_INFO_LOADS, SessionInfo, SessionListProgress, build_session_info,
@@ -77,6 +78,9 @@ pub enum SessionError {
     /// Fork source has no session header.
     #[error("Cannot fork: source session has no header: {0}")]
     ForkSourceNoHeader(String),
+    /// Context edit targets a non-editable entry.
+    #[error("Invalid context edit: {0}")]
+    ContextEditInvalid(String),
     /// Filesystem IO failure.
     #[error("I/O error on {path}: {source}")]
     Io {
@@ -799,21 +803,40 @@ impl SessionManager {
     pub fn append_compaction(
         &mut self,
         summary: &str,
-        first_kept_entry_id: &str,
+        first_kept_entry_id: Option<&str>,
         tokens_before: i64,
         details: Option<Value>,
         from_hook: Option<bool>,
         usage: Option<pi_ai::Usage>,
     ) -> Result<String, SessionError> {
+        let timestamp = entries::now_millis();
+        let systems: Vec<_> = self
+            .build_session_context()?
+            .messages
+            .into_iter()
+            .filter_map(|message| match message {
+                AgentMessage::Llm(message)
+                    if matches!(message.as_ref(), pi_ai::Message::System(_)) =>
+                {
+                    Some(*message)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut system_message = pi_ai::transcript::get_current_system_message(&systems);
+        if let Some(system) = &mut system_message {
+            system.timestamp = timestamp;
+        }
         let id = self.next_id();
         let mut value = serde_json::json!({
             "type": "compaction",
             "id": id,
             "parentId": self.leaf_parent(),
-            "timestamp": now_iso(),
+            "timestamp": entries::iso_from_millis(timestamp),
             "summary": summary,
-            "firstKeptEntryId": first_kept_entry_id,
+            "firstKeptEntryId": first_kept_entry_id.unwrap_or(&id),
             "tokensBefore": tokens_before,
+            "systemMessage": system_message,
         });
         if let Some(d) = details
             && let Some(obj) = value.as_object_mut()
@@ -926,6 +949,75 @@ impl SessionManager {
         self.append_entry(entry)
     }
 
+    /// Append an edit to one earlier model-visible entry without rewriting history.
+    ///
+    /// # Errors
+    ///
+    /// Returns not-found when the target is absent or outside the active branch,
+    /// and JSON/IO errors when persisting the append-only entry.
+    pub fn append_context_edit(
+        &mut self,
+        target_id: &str,
+        replacement: Option<entries::ContextEditReplacement>,
+    ) -> Result<String, SessionError> {
+        if replacement.as_ref().is_some_and(|replacement| {
+            !replacement.content.is_string() && !replacement.content.is_array()
+        }) {
+            return Err(SessionError::ContextEditInvalid(
+                "Context edit replacement must be null or contain string/array content".to_owned(),
+            ));
+        }
+        let target = self
+            .get_entry(target_id)
+            .ok_or_else(|| SessionError::EntryNotFound(target_id.to_owned()))?;
+        if !self
+            .get_branch(None)
+            .iter()
+            .any(|entry| entry.id() == Some(target_id))
+        {
+            return Err(SessionError::EntryNotFound(target_id.to_owned()));
+        }
+        let editable = match target {
+            SessionEntry::CustomMessage(_) => true,
+            SessionEntry::Message(message) => {
+                matches!(message.message.role(), "user" | "assistant" | "toolResult")
+            }
+            _ => false,
+        };
+        if !editable {
+            return Err(SessionError::ContextEditInvalid(format!(
+                "Entry {target_id} does not contribute editable model content"
+            )));
+        }
+        if let Some(replacement) = &replacement {
+            for message in context::session_entry_to_context_messages(target)? {
+                context::apply_context_replacement(message, replacement)?;
+            }
+        }
+        let replacement = replacement.map(|mut replacement| {
+            if matches!(target, SessionEntry::Message(entry) if matches!(entry.message.role(), "assistant" | "toolResult"))
+                && replacement.content.is_string()
+            {
+                replacement.content = Value::Array(vec![Value::Object(serde_json::Map::from_iter([
+                    ("type".to_owned(), Value::String("text".to_owned())),
+                    ("text".to_owned(), replacement.content),
+                ]))]);
+            }
+            replacement
+        });
+        let id = self.next_id();
+        let value = serde_json::json!({
+            "type": "context_edit",
+            "targetId": target_id,
+            "replacement": replacement,
+            "id": id,
+            "parentId": self.leaf_parent(),
+            "timestamp": now_iso(),
+        });
+        let entry: SessionEntry = serde_json::from_value(value)?;
+        self.append_entry(entry)
+    }
+
     /// Set or clear a label on an entry. Empty/None clears.
     ///
     /// # Errors
@@ -1009,6 +1101,39 @@ impl SessionManager {
         let entries = self.get_entries();
         let leaf = self.leaf_ref();
         context::build_session_context(&entries, leaf)
+    }
+
+    /// Project the current branch with append-only record provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns a conversion error for malformed model-visible content.
+    pub fn build_session_projection(
+        &self,
+    ) -> Result<SessionProjection<'_>, MessageConversionError> {
+        context::build_session_projection(&self.get_entries(), self.leaf_ref())
+    }
+
+    /// Copy the active branch into a non-persisting preview.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-session error when the session header is absent.
+    pub(crate) fn preview_branch(&self) -> Result<Self, SessionError> {
+        let header = self.get_header().ok_or_else(|| {
+            SessionError::InvalidSessionFile("Session header is missing".to_owned())
+        })?;
+        let mut preview = Self::construct_empty(&self.cwd, "", false)?;
+        preview.session_id.clone_from(&self.session_id);
+        preview.file_entries.push(FileEntry::Header(header.clone()));
+        preview.file_entries.extend(
+            self.get_branch(None)
+                .into_iter()
+                .cloned()
+                .map(FileEntry::Entry),
+        );
+        preview.build_index();
+        Ok(preview)
     }
 
     /// Session as a tree (orphans become roots; children sorted by timestamp).
@@ -1347,13 +1472,7 @@ impl SessionManager {
         let most_recent =
             find_most_recent_session(Path::new(&dir), if filter_cwd { Some(cwd) } else { None });
         match most_recent {
-            Some(f) => Self::construct(
-                cwd,
-                &dir,
-                Some(f.to_string_lossy().into_owned()),
-                true,
-                None,
-            ),
+            Some(f) => Self::open(&f.to_string_lossy(), Some(&dir), None),
             None => Self::construct(cwd, &dir, None, true, None),
         }
     }
@@ -2312,7 +2431,14 @@ mod tests {
         sm.append_message(&assistant_agent("r1", 2))?;
         let id3 = sm.append_message(&user_agent("second", 3))?;
         sm.append_message(&assistant_agent("r2", 4))?;
-        sm.append_compaction("Summary of first two turns", &id3, 1000, None, None, None)?;
+        sm.append_compaction(
+            "Summary of first two turns",
+            Some(&id3),
+            1000,
+            None,
+            None,
+            None,
+        )?;
         sm.append_message(&user_agent("third", 5))?;
         sm.append_message(&assistant_agent("r3", 6))?;
 
@@ -2339,6 +2465,84 @@ mod tests {
     }
 
     #[test]
+    fn compaction_retains_replayed_system_state_after_reopen() -> TestResult {
+        let dir = tempdir()?;
+        let cwd = path_str(dir.path())?;
+        let mut session = SessionManager::create(cwd, Some(cwd), None)?;
+        let tool = pi_ai::Tool {
+            name: "old".to_owned(),
+            description: "Old tool".to_owned(),
+            parameters: serde_json::json!({"type": "object"}),
+            constrained_sampling: None,
+        };
+        let mut initial = pi_ai::SystemMessage::new("base", 1);
+        initial.tools_added = Some(vec![tool.clone()]);
+        initial.sections = Some(
+            [("policy".to_owned(), Some("discard".to_owned()))]
+                .into_iter()
+                .collect(),
+        );
+        session.append_message(&AgentMessage::Llm(Box::new(Message::System(Box::new(
+            initial,
+        )))))?;
+        let kept = session.append_message(&user_agent("question", 2))?;
+        let mut update = pi_ai::SystemMessage::new("update", 3);
+        update.tools_removed = Some(vec![pi_ai::ToolReference {
+            name: "old".to_owned(),
+        }]);
+        update.tools_added = Some(vec![pi_ai::Tool {
+            name: "new".to_owned(),
+            ..tool
+        }]);
+        update.sections = Some([("policy".to_owned(), None)].into_iter().collect());
+        session.append_message(&AgentMessage::Llm(Box::new(Message::System(Box::new(
+            update,
+        )))))?;
+        session.append_message(&assistant_agent("answer", 4))?;
+        session.append_compaction("first summary", Some(&kept), 100, None, None, None)?;
+        let messages = pi_agent::default_convert_to_llm(&session.build_session_context()?.messages);
+        assert_eq!(
+            pi_ai::transcript::get_current_system_prompt(&messages),
+            "base\n\nupdate"
+        );
+        assert_eq!(
+            pi_ai::transcript::get_current_tools(&messages)
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["new"],
+        );
+        let file = session.get_session_file().ok_or("session file")?.to_owned();
+        let prefix = fs::read(&file)?;
+        let id = session.append_compaction("self-retained summary", None, 50, None, None, None)?;
+        assert!(fs::read(&file)?.starts_with(&prefix));
+        let reopened = SessionManager::open(&file, Some(cwd), None)?;
+        let Some(SessionEntry::Compaction(compaction)) = reopened.get_entry(&id) else {
+            return Err("missing persisted compaction".into());
+        };
+        assert_eq!(compaction.first_kept_entry_id, id);
+        let context = reopened.build_session_context()?;
+        let [AgentMessage::Llm(message), AgentMessage::Custom(summary)] =
+            context.messages.as_slice()
+        else {
+            return Err("self-retaining compaction kept stale transcript entries".into());
+        };
+        let Message::System(system) = message.as_ref() else {
+            return Err("compaction lost its system state".into());
+        };
+        assert_eq!(
+            pi_ai::transcript::get_system_message_text(system),
+            "base\n\nupdate"
+        );
+        assert_eq!(
+            system.tools_added.as_ref().ok_or("lost tools")?[0].name,
+            "new"
+        );
+        assert_eq!(summary.role, "compactionSummary");
+        Ok(())
+    }
+
+    #[test]
     fn summary_entries_persist_optional_usage_and_accept_null() -> TestResult {
         let usage = Usage {
             input: 10,
@@ -2359,7 +2563,7 @@ mod tests {
         let mut sm = SessionManager::in_memory(Some("/tmp"), None)?;
         let root = sm.append_message(&user_agent("root", 1))?;
         let compaction_id =
-            sm.append_compaction("summary", &root, 18, None, None, Some(usage.clone()))?;
+            sm.append_compaction("summary", Some(&root), 18, None, None, Some(usage.clone()))?;
         let compaction = sm.get_entry(&compaction_id).ok_or("compaction entry")?;
         assert_eq!(
             serde_json::to_value(compaction)?["usage"],

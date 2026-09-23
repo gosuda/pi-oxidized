@@ -220,6 +220,7 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                     ));
                 }
             }
+            Message::System(_) => {}
         }
     }
 

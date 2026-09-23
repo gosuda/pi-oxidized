@@ -67,6 +67,7 @@ const KNOWN_SETTINGS_KEYS: &[&str] = &[
     "followUpMode",
     "theme",
     "themeMode",
+    "cacheWarming",
     "compaction",
     "branchSummary",
     "retry",
@@ -290,6 +291,39 @@ impl ThemeMode {
     }
 }
 
+/// Prompt cache warming policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CacheWarmingMode {
+    /// Do not warm prompt caches.
+    Off,
+    /// Warm while the agent streams.
+    #[default]
+    Streaming,
+    /// Warm while idle between agent runs.
+    Idle,
+}
+
+impl CacheWarmingMode {
+    /// Wire string used in settings JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Streaming => "streaming",
+            Self::Idle => "idle",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "streaming" => Some(Self::Streaming),
+            "idle" => Some(Self::Idle),
+            _ => None,
+        }
+    }
+}
+
 /// Infer the effective `themeMode` from the stored `theme` value.
 ///
 /// Used when `themeMode` is unset or invalid, and for plain theme names
@@ -488,6 +522,17 @@ impl OutputPad {
     }
 }
 
+/// Per-model compaction token overrides.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CompactionModelOverride {
+    /// Tokens reserved for prompt + response.
+    pub reserve_tokens: Option<u64>,
+    /// Recent-message tokens kept.
+    pub keep_recent_tokens: Option<u64>,
+    /// Unknown override fields preserved.
+    pub extra: Map<String, Value>,
+}
+
 /// Nested `compaction` settings object.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CompactionSettings {
@@ -495,8 +540,10 @@ pub struct CompactionSettings {
     pub enabled: Option<bool>,
     /// Tokens reserved for prompt + LLM response (default: 16384).
     pub reserve_tokens: Option<u64>,
-    /// Recent-message tokens kept (default: 20000).
+    /// Recent-message tokens kept (default 20000).
     pub keep_recent_tokens: Option<u64>,
+    /// Exact `provider/modelId` token overrides.
+    pub model_overrides: Option<BTreeMap<String, CompactionModelOverride>>,
     /// Unknown nested keys preserved from the raw document.
     pub extra: Map<String, Value>,
 }
@@ -699,6 +746,8 @@ pub struct Settings {
     pub theme: Option<String>,
     /// Theme polarity mode (`auto`, `light`, `dark`).
     pub theme_mode: Option<ThemeMode>,
+    /// Prompt cache warming policy (default: streaming).
+    pub cache_warming: Option<CacheWarmingMode>,
     /// Interactive TUI mode (`regular`, `fullscreen`; default: regular).
     pub tui_mode: Option<ScreenMode>,
     /// Fullscreen exit output (`transcript`, `resume-hint`; default: transcript).
@@ -802,6 +851,10 @@ impl Settings {
                 .get("themeMode")
                 .and_then(Value::as_str)
                 .and_then(ThemeMode::parse),
+            cache_warming: map
+                .get("cacheWarming")
+                .and_then(Value::as_str)
+                .and_then(CacheWarmingMode::parse),
             tui_mode: map
                 .get("tuiMode")
                 .and_then(Value::as_str)
@@ -917,6 +970,12 @@ impl Settings {
             map,
             "themeMode",
             self.theme_mode
+                .map(|mode| Value::String(mode.as_str().to_owned())),
+        );
+        insert_opt_value(
+            map,
+            "cacheWarming",
+            self.cache_warming
                 .map(|mode| Value::String(mode.as_str().to_owned())),
         );
         insert_opt_value(
@@ -1069,13 +1128,52 @@ impl Settings {
     }
 }
 
+impl CompactionModelOverride {
+    fn from_map(map: &Map<String, Value>) -> Self {
+        Self {
+            reserve_tokens: number_to_u64(map.get("reserveTokens")),
+            keep_recent_tokens: number_to_u64(map.get("keepRecentTokens")),
+            extra: unknown_fields(map, &["reserveTokens", "keepRecentTokens"]),
+        }
+    }
+
+    fn to_map(&self) -> Map<String, Value> {
+        let mut map = self.extra.clone();
+        insert_opt_u64(&mut map, "reserveTokens", self.reserve_tokens);
+        insert_opt_u64(&mut map, "keepRecentTokens", self.keep_recent_tokens);
+        map
+    }
+}
+
 impl CompactionSettings {
     fn from_map(map: &Map<String, Value>) -> Self {
+        let model_overrides = map
+            .get("modelOverrides")
+            .and_then(Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(model, value)| {
+                        value.as_object().map(|object| {
+                            (model.clone(), CompactionModelOverride::from_map(object))
+                        })
+                    })
+                    .collect()
+            });
         Self {
             enabled: bool_field(map, "enabled"),
             reserve_tokens: number_to_u64(map.get("reserveTokens")),
             keep_recent_tokens: number_to_u64(map.get("keepRecentTokens")),
-            extra: unknown_fields(map, &["enabled", "reserveTokens", "keepRecentTokens"]),
+            model_overrides,
+            extra: unknown_fields(
+                map,
+                &[
+                    "enabled",
+                    "reserveTokens",
+                    "keepRecentTokens",
+                    "modelOverrides",
+                ],
+            ),
         }
     }
 
@@ -1084,6 +1182,18 @@ impl CompactionSettings {
         insert_opt_bool(&mut map, "enabled", self.enabled);
         insert_opt_u64(&mut map, "reserveTokens", self.reserve_tokens);
         insert_opt_u64(&mut map, "keepRecentTokens", self.keep_recent_tokens);
+        insert_opt_value(
+            &mut map,
+            "modelOverrides",
+            self.model_overrides.as_ref().map(|entries| {
+                Value::Object(
+                    entries
+                        .iter()
+                        .map(|(model, value)| (model.clone(), Value::Object(value.to_map())))
+                        .collect(),
+                )
+            }),
+        );
         map
     }
 }
@@ -2220,6 +2330,73 @@ impl SettingsManager {
             .unwrap_or(DEFAULT_COMPACTION_KEEP_RECENT_TOKENS)
     }
 
+    fn compaction_model_override(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> Option<CompactionModelOverride> {
+        let key = format!("{provider}/{model_id}");
+        self.settings
+            .get("compaction")
+            .and_then(Value::as_object)
+            .and_then(|compaction| compaction.get("modelOverrides"))
+            .and_then(Value::as_object)
+            .and_then(|overrides| overrides.get(&key))
+            .and_then(Value::as_object)
+            .map(CompactionModelOverride::from_map)
+    }
+
+    /// Resolve reserve tokens using model override, global setting, then default.
+    #[must_use]
+    pub fn get_compaction_reserve_tokens_for_model(&self, provider: &str, model_id: &str) -> u64 {
+        self.compaction_model_override(provider, model_id)
+            .and_then(|override_| override_.reserve_tokens)
+            .or_else(|| self.merged_nested_u64("compaction", "reserveTokens"))
+            .unwrap_or(DEFAULT_COMPACTION_RESERVE_TOKENS)
+    }
+
+    /// Resolve recent tokens using model override, global setting, then default.
+    #[must_use]
+    pub fn get_compaction_keep_recent_tokens_for_model(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> u64 {
+        self.compaction_model_override(provider, model_id)
+            .and_then(|override_| override_.keep_recent_tokens)
+            .or_else(|| self.merged_nested_u64("compaction", "keepRecentTokens"))
+            .unwrap_or(DEFAULT_COMPACTION_KEEP_RECENT_TOKENS)
+    }
+
+    /// Resolve all compaction settings for a provider/model pair.
+    #[must_use]
+    pub fn get_compaction_settings_for_model(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> ResolvedCompactionSettings {
+        ResolvedCompactionSettings {
+            enabled: self.get_compaction_enabled(),
+            reserve_tokens: self.get_compaction_reserve_tokens_for_model(provider, model_id),
+            keep_recent_tokens: self
+                .get_compaction_keep_recent_tokens_for_model(provider, model_id),
+        }
+    }
+
+    /// Prompt cache warming policy (default: streaming).
+    #[must_use]
+    pub fn get_cache_warming_mode(&self) -> CacheWarmingMode {
+        self.global_settings
+            .get("cacheWarming")
+            .and_then(Value::as_str)
+            .and_then(CacheWarmingMode::parse)
+            .unwrap_or_default()
+    }
+
+    /// Set the global prompt cache warming policy.
+    pub fn set_cache_warming_mode(&mut self, mode: CacheWarmingMode) {
+        self.set_global_field("cacheWarming", Value::String(mode.as_str().to_owned()));
+    }
     /// Fully-resolved compaction settings.
     #[must_use]
     pub fn get_compaction_settings(&self) -> ResolvedCompactionSettings {
@@ -3204,16 +3381,7 @@ fn is_js_decimal(text: &str) -> bool {
 }
 
 fn parse_thinking_level(value: Option<&Value>) -> Option<ModelThinkingLevel> {
-    match value?.as_str()? {
-        "off" => Some(ModelThinkingLevel::Off),
-        "minimal" => Some(ModelThinkingLevel::Minimal),
-        "low" => Some(ModelThinkingLevel::Low),
-        "medium" => Some(ModelThinkingLevel::Medium),
-        "high" => Some(ModelThinkingLevel::High),
-        "xhigh" => Some(ModelThinkingLevel::Xhigh),
-        "max" => Some(ModelThinkingLevel::Max),
-        _ => None,
-    }
+    value?.as_str()?.parse().ok()
 }
 
 fn thinking_level_value(level: ModelThinkingLevel) -> Value {

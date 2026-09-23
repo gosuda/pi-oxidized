@@ -429,6 +429,7 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
                 ceil_div4(chars)
             }
             Message::ToolResult(result) => ceil_div4(estimate_tool_result_chars(&result.content)),
+            Message::System(_) => pi_ai::estimate::estimate_message_tokens(llm.as_ref()),
         },
         AgentMessage::Custom(custom) => match custom.role.as_str() {
             "custom" => {
@@ -1547,6 +1548,9 @@ mod tests {
             base_url: "https://example.test".into(),
             reasoning: false,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![pi_ai::ModelInput::Text],
             cost: pi_ai::ModelCost::default(),
             context_window,

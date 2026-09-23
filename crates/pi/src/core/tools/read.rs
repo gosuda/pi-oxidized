@@ -1059,6 +1059,9 @@ mod tests {
             headers: None,
             compat: None,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             extra: std::collections::BTreeMap::default(),
         }
     }

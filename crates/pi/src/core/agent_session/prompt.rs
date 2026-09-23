@@ -250,10 +250,13 @@ impl AgentSession {
                     .pending_next_turn_messages
                     .push(app_message);
             }
-            _ if self.is_session_streaming() => match deliver_as {
+            _ if self.is_session_streaming() && trigger_turn => match deliver_as {
                 Some(DeliverAs::FollowUp) => self.agent.follow_up(app_message),
                 _ => self.agent.steer(app_message),
             },
+            _ if self.is_session_streaming() => {
+                self.lock_inner().pending_custom_messages.push(app_message);
+            }
             _ if trigger_turn => {
                 self.run_agent_prompt(vec![app_message]).await?;
             }
@@ -510,12 +513,14 @@ impl AgentSession {
             .await
             .map_err(map_bash_flush_error);
         self.hooks.set_system_prompt_override(None);
+        let custom_flush = self.flush_pending_custom_messages().await;
         self.emit_agent_settled().await;
         let pending_session_error = self.take_session_error();
         if let Some(error) = pending_session_error {
             return Err(PromptError::Session(error));
         }
         flush_result?;
+        custom_flush.map_err(PromptError::Session)?;
         result
     }
 
@@ -539,6 +544,7 @@ impl AgentSession {
         // assistant is observed (TS tracks this via `_lastAssistantMessage`).
         let mut processed_count = self.assistant_count();
         let mut processed_agent_ends = self.processed_agent_end_count();
+        self.begin_agent_run();
         let run = self.agent.prompt(messages).await;
         self.observe_run_agent_end(&run, processed_agent_ends)
             .await?;
@@ -548,17 +554,29 @@ impl AgentSession {
         run?;
         processed_agent_ends = self.processed_agent_end_count();
         loop {
+            if self.lock_inner().boundary_abort_requested {
+                break;
+            }
             let current_count = self.assistant_count();
             let new_assistant = if current_count > processed_count {
                 self.agent.last_assistant()
             } else {
                 None
             };
-            if !self.handle_post_agent_run(new_assistant).await? {
+            if !self.handle_post_agent_run(new_assistant).await?
+                && !self
+                    .before_settle_boundary()
+                    .await
+                    .map_err(PromptError::Session)?
+            {
+                break;
+            }
+            if self.lock_inner().boundary_abort_requested {
                 break;
             }
             // Re-baseline after pops from prepare_retry / overflow compaction.
             processed_count = self.assistant_count();
+            self.begin_agent_run();
             let run = self.agent.continue_run().await;
             self.observe_run_agent_end(&run, processed_agent_ends)
                 .await?;
@@ -740,7 +758,7 @@ impl AgentSession {
     // Helpers
     // -----------------------------------------------------------------
 
-    fn is_session_streaming(&self) -> bool {
+    pub(super) fn is_session_streaming(&self) -> bool {
         self.lock_inner().is_agent_run_active
     }
 
@@ -787,6 +805,7 @@ fn run_emits_agent_end(run: &Result<(), pi_agent::AgentLoopError>) -> bool {
                 && message != "No messages to continue from"
                 && !message.starts_with("Cannot continue from message role")
         }
+        Err(pi_agent::AgentLoopError::ActiveRun) => false,
     }
 }
 
@@ -825,6 +844,7 @@ fn build_custom_agent_message(message: &CustomMessageInput) -> AgentMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::agent_session::extension_runner::{BoundaryPreview, BoundaryResult};
     use crate::core::agent_session::{
         AgentSessionConfig, AgentSessionEvent, ExtensionRunner, ExtensionRunnerError,
     };
@@ -834,6 +854,7 @@ mod tests {
         AssistantContent, AssistantMessageEvent, Context, DoneReason, ErrorReason, ModelCost,
         ModelInput, Provider, ProviderError, StopReason, StreamOptions, TextContent,
     };
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::fmt::Display;
     use std::sync::Mutex as StdMutex;
@@ -880,6 +901,9 @@ mod tests {
             base_url: String::new(),
             reasoning: false,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
             context_window: 8_192,
@@ -937,6 +961,7 @@ mod tests {
     struct SeqProvider {
         calls: Arc<AtomicUsize>,
         responses: Arc<StdMutex<ProviderResponses>>,
+        contexts: Arc<StdMutex<Vec<Context>>>,
     }
 
     impl SeqProvider {
@@ -944,6 +969,7 @@ mod tests {
             Self {
                 calls: Arc::new(AtomicUsize::new(0)),
                 responses: Arc::new(StdMutex::new(responses)),
+                contexts: Arc::new(StdMutex::new(Vec::new())),
             }
         }
 
@@ -956,9 +982,10 @@ mod tests {
         fn stream(
             &self,
             _model: &pi_ai::Model,
-            _context: Context,
+            context: Context,
             _options: StreamOptions,
         ) -> BoxStream<'static, ProviderEventResult> {
+            mutex_value(&self.contexts).push(context);
             let idx = self.calls.fetch_add(1, Ordering::SeqCst);
             let events = mutex_value(&self.responses)
                 .get(idx)
@@ -1555,18 +1582,31 @@ mod tests {
         Ok(())
     }
 
+    type BoundaryHandler = Arc<
+        dyn Fn(
+                Value,
+                BoundaryPreview,
+            )
+                -> BoxFuture<'static, Result<Option<BoundaryResult>, ExtensionRunnerError>>
+            + Send
+            + Sync,
+    >;
+
     #[derive(Default)]
     struct TestRunner {
         commands: Vec<String>,
         runs: Arc<StdMutex<Vec<String>>>,
         agent_end_gate: Option<Arc<Semaphore>>,
         agent_end_entered: Option<Arc<Notify>>,
+        boundaries: HashMap<&'static str, BoundaryHandler>,
+        errors: StdMutex<Vec<String>>,
     }
 
     impl ExtensionRunner for TestRunner {
         fn has_handlers(&self, event: &str) -> bool {
-            event == "agent_end"
-                && (self.agent_end_gate.is_some() || self.agent_end_entered.is_some())
+            self.boundaries.contains_key(event)
+                || (event == "agent_end"
+                    && (self.agent_end_gate.is_some() || self.agent_end_entered.is_some()))
         }
         fn emit(
             &self,
@@ -1653,6 +1693,17 @@ mod tests {
         > {
             Box::pin(async { Ok(crate::core::resources::ResourceExtensionPaths::default()) })
         }
+        fn emit_boundary<'a>(
+            &'a self,
+            event: &'a str,
+            payload: Value,
+            preview: BoundaryPreview,
+        ) -> BoxFuture<'a, Result<Option<BoundaryResult>, ExtensionRunnerError>> {
+            match self.boundaries.get(event) {
+                Some(handler) => handler(payload, preview),
+                None => Box::pin(async { Ok(None) }),
+            }
+        }
         fn get_registered_commands(&self) -> Vec<String> {
             self.commands.clone()
         }
@@ -1671,7 +1722,186 @@ mod tests {
             HashMap::new()
         }
         fn invalidate(&self) {}
-        fn emit_error(&self, _: String) {}
+        fn emit_error(&self, error: String) {
+            mutex_value(&self.errors).push(error);
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_boundary_omission_reaches_next_request_without_rewriting_history() -> TestResult {
+        let provider = Arc::new(SeqProvider::new(vec![
+            sequence(vec![
+                start_event(),
+                done_ok(assistant_text("discarded answer")),
+            ]),
+            sequence(vec![start_event(), done_ok(assistant_text("final answer"))]),
+        ]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let handler: BoundaryHandler = Arc::new(move |event, preview| {
+            let first = observed.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if !first {
+                    return Ok(None);
+                }
+                let id = event["messageEntryId"].as_str().ok_or_else(|| {
+                    ExtensionRunnerError::Failed(
+                        "assistant was not persisted before boundary".to_owned(),
+                    )
+                })?;
+                let entries = vec![json!({
+                    "type": "context_edit", "targetId": id, "replacement": null,
+                })];
+                let context = preview(entries.clone()).await?;
+                assert_eq!(context["canContinue"], true);
+                Ok(Some(BoundaryResult {
+                    entries: Some(entries),
+                    continue_after: Some(true),
+                }))
+            })
+        });
+        let runner = Arc::new(TestRunner {
+            boundaries: HashMap::from([("turn_end", handler)]),
+            ..TestRunner::default()
+        });
+        let mut config = AgentSessionConfig::test_config(provider.clone(), test_model())
+            .test_context("config")?;
+        config.extension_runner = Some(runner);
+        let session = AgentSession::new(config).test_context("session")?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.prompt("question", PromptOptions::default()),
+        )
+        .await
+        .test_context("boundary persistence barrier")?
+        .test_context("prompt")?;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.call_count(), 2);
+        {
+            let contexts = mutex_value(&provider.contexts);
+            assert!(
+                contexts[1]
+                    .messages
+                    .iter()
+                    .all(|message| !matches!(message, pi_ai::Message::Assistant(_)))
+            );
+        }
+        let manager = session.session_manager.lock().await;
+        let raw_assistants = manager.get_entries().iter().filter(|entry| {
+            matches!(entry, crate::core::sessions::SessionEntry::Message(message) if message.message.role() == "assistant")
+        }).count();
+        assert_eq!(raw_assistants, 2);
+        let projected = manager.build_session_context().test_context("projection")?;
+        let assistants: Vec<_> = projected
+            .messages
+            .iter()
+            .filter_map(|message| match message.as_llm() {
+                Some(pi_ai::Message::Assistant(message)) => Some(message.content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistants, vec![assistant_text("final answer").content]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settlement_boundary_commits_context_before_continuing() -> TestResult {
+        let provider = Arc::new(SeqProvider::new(vec![
+            sequence(vec![start_event(), done_ok(assistant_text("first"))]),
+            sequence(vec![start_event(), done_ok(assistant_text("second"))]),
+        ]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let handler: BoundaryHandler = Arc::new(move |_, _| {
+            let first = observed.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                Ok(first.then(|| BoundaryResult {
+                    entries: Some(vec![json!({
+                        "type": "custom_message", "customType": "follow-up",
+                        "content": "answer this too", "display": false,
+                    })]),
+                    continue_after: Some(true),
+                }))
+            })
+        });
+        let mut config = AgentSessionConfig::test_config(provider.clone(), test_model())
+            .test_context("config")?;
+        config.extension_runner = Some(Arc::new(TestRunner {
+            boundaries: HashMap::from([("agent_before_settle", handler)]),
+            ..TestRunner::default()
+        }));
+        let session = AgentSession::new(config).test_context("session")?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.prompt("question", PromptOptions::default()),
+        )
+        .await
+        .test_context("settlement boundary")?
+        .test_context("prompt")?;
+        assert_eq!(provider.call_count(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let contexts = mutex_value(&provider.contexts);
+        let last = contexts[1]
+            .messages
+            .last()
+            .ok_or("missing second request context")?;
+        assert!(
+            serde_json::to_string(last)
+                .test_context("message")?
+                .contains("answer this too")
+        );
+        drop(contexts);
+        assert!(!session.lock_inner().is_agent_run_active);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_boundary_batch_preserves_history_and_does_not_continue() -> TestResult {
+        let provider = Arc::new(SeqProvider::new(two(
+            start_event(),
+            done_ok(assistant_text("answer")),
+        )));
+        let handler: BoundaryHandler = Arc::new(|_, _| {
+            Box::pin(async {
+                Ok(Some(BoundaryResult {
+                    entries: Some(vec![
+                        json!({"type": "custom", "customType": "must-not-persist", "data": null}),
+                        json!({"type": "context_edit", "targetId": "missing", "replacement": null}),
+                    ]),
+                    continue_after: Some(true),
+                }))
+            })
+        });
+        let runner = Arc::new(TestRunner {
+            boundaries: HashMap::from([("turn_end", handler)]),
+            ..TestRunner::default()
+        });
+        let mut config = AgentSessionConfig::test_config(provider.clone(), test_model())
+            .test_context("config")?;
+        config.extension_runner = Some(runner.clone());
+        let session = AgentSession::new(config).test_context("session")?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.prompt("question", PromptOptions::default()),
+        )
+        .await
+        .test_context("invalid boundary")?
+        .test_context("prompt")?;
+        assert_eq!(provider.call_count(), 1);
+        let manager = session.session_manager.lock().await;
+        assert!(manager.get_entries().iter().all(|entry| {
+            !matches!(
+                entry,
+                crate::core::sessions::SessionEntry::Custom(_)
+                    | crate::core::sessions::SessionEntry::ContextEdit(_)
+            )
+        }));
+        assert!(
+            mutex_value(&runner.errors)
+                .iter()
+                .any(|error| error.contains("Entry missing not found"))
+        );
+        Ok(())
     }
 
     #[tokio::test]

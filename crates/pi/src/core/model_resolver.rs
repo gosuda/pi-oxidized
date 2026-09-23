@@ -144,16 +144,7 @@ pub fn is_valid_thinking_level(level: &str) -> bool {
 
 #[must_use]
 fn parse_thinking_level(level: &str) -> Option<ModelThinkingLevel> {
-    match level {
-        "off" => Some(ModelThinkingLevel::Off),
-        "minimal" => Some(ModelThinkingLevel::Minimal),
-        "low" => Some(ModelThinkingLevel::Low),
-        "medium" => Some(ModelThinkingLevel::Medium),
-        "high" => Some(ModelThinkingLevel::High),
-        "xhigh" => Some(ModelThinkingLevel::Xhigh),
-        "max" => Some(ModelThinkingLevel::Max),
-        _ => None,
-    }
+    level.parse().ok()
 }
 
 /// Find an exact model reference match.
@@ -876,6 +867,9 @@ mod tests {
             base_url: format!("https://{provider}.example"),
             reasoning,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![ModelInput::Text],
             cost: ModelCost {
                 input: 1.0,

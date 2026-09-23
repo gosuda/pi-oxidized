@@ -157,6 +157,10 @@ pub enum ModelSelectSource {
 /// Wire tags and field names match TypeScript `AgentSessionEvent`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "AgentSessionEvent is a wire-tagged event enum; boxing variants would churn every emitter and subscriber"
+)]
 pub enum AgentSessionEvent {
     /// Extensions may cancel a pending session switch.
     SessionBeforeSwitch {

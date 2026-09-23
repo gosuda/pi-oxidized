@@ -475,7 +475,7 @@ fn pre_render_custom_tools(
                     item.result_html_expanded = fragment.expanded;
                 }
             }
-            Message::User(_) => {}
+            Message::User(_) | Message::System(_) => {}
         }
     }
     rendered_custom_tools

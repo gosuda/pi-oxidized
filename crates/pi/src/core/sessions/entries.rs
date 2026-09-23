@@ -80,6 +80,11 @@ enum CustomMessageTag {
     #[serde(rename = "custom_message")]
     CustomMessage,
 }
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum ContextEditTag {
+    #[serde(rename = "context_edit")]
+    ContextEdit,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum LabelTag {
@@ -221,7 +226,7 @@ pub struct CompactionEntry {
     pub timestamp: String,
     /// Compaction summary text.
     pub summary: String,
-    /// First kept entry id after compaction (context reconstruction anchor).
+    /// First retained entry id; the compaction's own id retains no preceding entries.
     pub first_kept_entry_id: String,
     /// Token count observed before compaction.
     pub tokens_before: i64,
@@ -234,6 +239,9 @@ pub struct CompactionEntry {
     /// LLM usage from the summarization call(s), when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<pi_ai::Usage>,
+    /// Complete prompt and tool state at the compaction boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<pi_ai::SystemMessage>,
     /// Unknown sibling fields.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -317,6 +325,36 @@ pub struct CustomMessageEntry {
     pub extra: Map<String, Value>,
 }
 
+/// Content replacement for an earlier model-visible session entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextEditReplacement {
+    /// Replacement content, validated against the target message role at append.
+    pub content: Value,
+}
+
+/// Append-only edit to one earlier model-visible entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextEditEntry {
+    #[serde(rename = "type")]
+    kind: ContextEditTag,
+    /// ID of the entry whose projected content is changed.
+    pub target_id: String,
+    /// `None` omits the target from model context.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub replacement: Option<ContextEditReplacement>,
+    /// Short entry id.
+    pub id: String,
+    /// Parent entry id.
+    pub parent_id: Option<String>,
+    /// ISO-8601 entry timestamp.
+    pub timestamp: String,
+    /// Unknown sibling fields.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
 /// Label bookmark entry targeting another entry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -385,6 +423,8 @@ pub enum SessionEntry {
     Custom(CustomEntry),
     /// Extension custom message (in context).
     CustomMessage(CustomMessageEntry),
+    /// Append-only model-context edit.
+    ContextEdit(ContextEditEntry),
     /// Label bookmark.
     Label(LabelEntry),
     /// Session display-name metadata.
@@ -405,6 +445,7 @@ impl SessionEntry {
             Self::BranchSummary(_) => "branch_summary",
             Self::Custom(_) => "custom",
             Self::CustomMessage(_) => "custom_message",
+            Self::ContextEdit(_) => "context_edit",
             Self::Label(_) => "label",
             Self::SessionInfo(_) => "session_info",
             Self::Unknown(raw) => raw.get("type").and_then(Value::as_str).unwrap_or(""),
@@ -422,6 +463,7 @@ impl SessionEntry {
             Self::BranchSummary(e) => Some(e.id.as_str()),
             Self::Custom(e) => Some(e.id.as_str()),
             Self::CustomMessage(e) => Some(e.id.as_str()),
+            Self::ContextEdit(e) => Some(e.id.as_str()),
             Self::Label(e) => Some(e.id.as_str()),
             Self::SessionInfo(e) => Some(e.id.as_str()),
             Self::Unknown(raw) => raw.get("id").and_then(Value::as_str),
@@ -439,6 +481,7 @@ impl SessionEntry {
             Self::BranchSummary(e) => e.parent_id.as_deref(),
             Self::Custom(e) => e.parent_id.as_deref(),
             Self::CustomMessage(e) => e.parent_id.as_deref(),
+            Self::ContextEdit(e) => e.parent_id.as_deref(),
             Self::Label(e) => e.parent_id.as_deref(),
             Self::SessionInfo(e) => e.parent_id.as_deref(),
             Self::Unknown(raw) => raw.get("parentId").and_then(Value::as_str),
@@ -456,6 +499,7 @@ impl SessionEntry {
             Self::BranchSummary(e) => Some(e.timestamp.as_str()),
             Self::Custom(e) => Some(e.timestamp.as_str()),
             Self::CustomMessage(e) => Some(e.timestamp.as_str()),
+            Self::ContextEdit(e) => Some(e.timestamp.as_str()),
             Self::Label(e) => Some(e.timestamp.as_str()),
             Self::SessionInfo(e) => Some(e.timestamp.as_str()),
             Self::Unknown(raw) => raw.get("timestamp").and_then(Value::as_str),
@@ -472,6 +516,7 @@ impl SessionEntry {
             Self::BranchSummary(e) => e.id = id,
             Self::Custom(e) => e.id = id,
             Self::CustomMessage(e) => e.id = id,
+            Self::ContextEdit(e) => e.id = id,
             Self::Label(e) => e.id = id,
             Self::SessionInfo(e) => e.id = id,
             Self::Unknown(raw) => {
@@ -492,6 +537,7 @@ impl SessionEntry {
             Self::BranchSummary(e) => e.parent_id = parent_id,
             Self::Custom(e) => e.parent_id = parent_id,
             Self::CustomMessage(e) => e.parent_id = parent_id,
+            Self::ContextEdit(e) => e.parent_id = parent_id,
             Self::Label(e) => e.parent_id = parent_id,
             Self::SessionInfo(e) => e.parent_id = parent_id,
             Self::Unknown(raw) => {
@@ -568,6 +614,7 @@ impl Serialize for SessionEntry {
             Self::BranchSummary(e) => e.serialize(serializer),
             Self::Custom(e) => e.serialize(serializer),
             Self::CustomMessage(e) => e.serialize(serializer),
+            Self::ContextEdit(e) => e.serialize(serializer),
             Self::Label(e) => e.serialize(serializer),
             Self::SessionInfo(e) => e.serialize(serializer),
             Self::Unknown(raw) => raw.serialize(serializer),
@@ -587,6 +634,10 @@ impl<'de> Deserialize<'de> for SessionEntry {
 
 /// Raw file line: header or tree entry.
 #[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "FileEntry is a line-shape wire enum; boxing variants would churn every parser construction site"
+)]
 pub enum FileEntry {
     /// Typed session header.
     Header(SessionHeader),
@@ -792,6 +843,9 @@ fn parse_line(line: &str) -> Option<FileEntry> {
         "custom_message" => serde_json::from_str::<CustomMessageEntry>(line)
             .ok()
             .map(|e| FileEntry::Entry(SessionEntry::CustomMessage(e))),
+        "context_edit" => serde_json::from_str::<ContextEditEntry>(line)
+            .ok()
+            .map(|e| FileEntry::Entry(SessionEntry::ContextEdit(e))),
         "label" => serde_json::from_str::<LabelEntry>(line)
             .ok()
             .map(|e| FileEntry::Entry(SessionEntry::Label(e))),
@@ -1145,11 +1199,15 @@ fn session_entry_from_value(value: Value) -> SessionEntry {
         Some("message") => {
             let mut patched = value.clone();
             if let Some(msg) = patched.get_mut("message").and_then(Value::as_object_mut) {
-                let role = msg.get("role").and_then(Value::as_str);
-                if matches!(role, Some("user" | "assistant" | "toolResult"))
-                    && matches!(msg.get("content"), None | Some(Value::Null))
+                let empty_content = match msg.get("role").and_then(Value::as_str) {
+                    Some("system") => Some(Value::String(String::new())),
+                    Some("user" | "assistant" | "toolResult") => Some(Value::Array(Vec::new())),
+                    _ => None,
+                };
+                if matches!(msg.get("content"), None | Some(Value::Null))
+                    && let Some(content) = empty_content
                 {
-                    msg.insert("content".to_owned(), Value::Array(Vec::new()));
+                    msg.insert("content".to_owned(), content);
                 }
             }
             match serde_json::from_value::<SessionMessageEntry>(patched) {
@@ -1193,6 +1251,10 @@ fn session_entry_from_value(value: Value) -> SessionEntry {
                 Err(_) => SessionEntry::Unknown(value),
             }
         }
+        Some("context_edit") => match serde_json::from_value::<ContextEditEntry>(value.clone()) {
+            Ok(e) => SessionEntry::ContextEdit(e),
+            Err(_) => SessionEntry::Unknown(value),
+        },
         Some("label") => match serde_json::from_value::<LabelEntry>(value.clone()) {
             Ok(e) => SessionEntry::Label(e),
             Err(_) => SessionEntry::Unknown(value),

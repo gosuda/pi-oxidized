@@ -29,6 +29,7 @@
 //! Public listeners are invoked without holding any lock.
 
 pub mod bash;
+mod boundary;
 pub mod bridge_types;
 pub mod compaction;
 pub mod events;
@@ -44,9 +45,10 @@ pub mod tools;
 pub mod tree;
 
 pub use bridge_types::{
-    BridgeMethod, BridgeRequestId, CommandCatalogEntry, CompactRequest, ExtensionHostError,
-    ForkRequest, NavigateTreeRequest, NewSessionRequest, SessionCommand, SessionCommandEnvelope,
-    SessionState, SetModelRequest, SetupEntriesRequest, SwitchSessionRequest,
+    BoundaryPreviewRequest, BridgeMethod, BridgeRequestId, CommandCatalogEntry, CompactRequest,
+    ExtensionHostError, ForkRequest, NavigateTreeRequest, NewSessionRequest, SessionCommand,
+    SessionCommandEnvelope, SessionState, SetModelRequest, SetupEntriesRequest,
+    SwitchSessionRequest,
 };
 pub use events::{
     AgentSessionEvent, AgentSessionEventListener, CompactionReason, ModelSelectSource,
@@ -240,6 +242,20 @@ pub(super) struct AgentSessionInner {
     pub(super) claimed_turn_ends: u64,
     /// Wakes `TurnEnd` barrier waiters after a fully persisted `TurnEnd`.
     pub(super) turn_end_notify: Arc<Notify>,
+    /// Message-end events fully processed by the FIFO pump.
+    pub(super) processed_message_ends: usize,
+    /// Message-end count before the current low-level run.
+    pub(super) run_message_baseline: usize,
+    /// Wakes the finish hook after message persistence.
+    pub(super) message_end_notify: Arc<Notify>,
+    /// Current session turn index.
+    pub(super) boundary_turn_index: usize,
+    /// The most recent completed turn's outcome.
+    pub(super) last_activity_outcome: &'static str,
+    /// An abort request prevents pre-settlement continuation.
+    pub(super) boundary_abort_requested: bool,
+    /// Context-only custom messages waiting for tool-result persistence.
+    pub(super) pending_custom_messages: Vec<AgentMessage>,
     /// Scoped models list.
     pub(super) scoped_models: Vec<ScopedModel>,
     /// Active tool names.
@@ -376,6 +392,13 @@ impl AgentSessionInner {
             processed_turn_ends: 0,
             claimed_turn_ends: 0,
             turn_end_notify: Arc::new(Notify::new()),
+            processed_message_ends: 0,
+            run_message_baseline: 0,
+            message_end_notify: Arc::new(Notify::new()),
+            boundary_turn_index: 0,
+            last_activity_outcome: "completed",
+            boundary_abort_requested: false,
+            pending_custom_messages: Vec::new(),
             scoped_models,
             active_tool_names: Vec::new(),
             base_system_prompt,
@@ -488,7 +511,8 @@ fn default_agent_loop_config(
         convert_to_llm,
         transform_context: None,
         get_api_key: None,
-        should_stop_after_turn: None,
+        finish_turn: None,
+        prepare_request: None,
         prepare_next_turn: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
@@ -554,6 +578,7 @@ impl AgentSession {
             hooks.before_tool_call_hook(),
             hooks.after_tool_call_hook(),
             hooks.prepare_next_turn_hook(),
+            hooks.finish_turn_hook(),
         );
         let telemetry = agent.telemetry();
 
@@ -1050,6 +1075,7 @@ impl AgentSession {
 
     /// Abort every active session operation, then wait for session idle.
     pub async fn abort(&self) {
+        self.lock_inner().boundary_abort_requested = true;
         self.abort_retry();
         self.abort_compaction();
         self.abort_branch_summary();
@@ -1303,6 +1329,9 @@ mod tests {
             base_url: String::new(),
             reasoning: false,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
             context_window: 8_192,

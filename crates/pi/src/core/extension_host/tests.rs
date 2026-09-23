@@ -1,7 +1,7 @@
 //! Fake-host acceptance tests for [`HostExtensionRunner`].
 //!
 //! Drives an in-memory JSONL fake host (no real Bun) through every
-//! [`ExtensionRunner`] hook family, the full 35-event handler-presence set,
+//! [`ExtensionRunner`] hook family, the full 39-event handler-presence set,
 //! host-owned transforms/merge, non-retryable error/crash/timeout isolation
 //! with pending-close / no-replay, registry first-wins dedup, reload
 //! generation + stale-slot invalidation, the HTML renderer, and exactly-once
@@ -40,7 +40,9 @@ use super::super::agent_session::bridge_types::{BridgeRequestId, SessionCommand}
 use super::super::agent_session::events::{
     AgentSessionEvent, SessionShutdownReason as ShutdownReason,
 };
-use super::super::agent_session::extension_runner::{ExtensionRunner, SessionHooks};
+use super::super::agent_session::extension_runner::{
+    BoundaryPreview, ExtensionRunner, ExtensionRunnerError, SessionHooks,
+};
 use super::super::extension_runtime_set::{EndpointId, EndpointKind, ExtensionRuntimeSet};
 use super::super::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
 use super::{
@@ -251,7 +253,7 @@ fn dispatch(
     })
 }
 
-/// Snapshot carrying every registered surface + all 35 handler types.
+/// Snapshot carrying every registered surface + all 39 handler types.
 fn full_snapshot() -> Value {
     let handlers: Vec<&str> = ALL_EVENT_TYPES.to_vec();
     json!({
@@ -293,11 +295,11 @@ async fn next_item<T: Clone + Send + 'static>(
 }
 
 // ===========================================================================
-// Load + 35-event handler presence + trait hook families
+// Load + 39-event handler presence + trait hook families
 // ===========================================================================
 
 #[tokio::test]
-async fn load_reports_all_35_handlers_and_registry_surfaces() -> R {
+async fn load_reports_all_39_handlers_and_registry_surfaces() -> R {
     let (runner, _host) = make_runner(full_snapshot()).await?;
 
     let expected_window: &[&str] = &[
@@ -316,8 +318,8 @@ async fn load_reports_all_35_handlers_and_registry_surfaces() -> R {
     );
     assert_eq!(
         ALL_EVENT_TYPES.len(),
-        35,
-        "expected 35 lifecycle event types, got {}",
+        39,
+        "expected 39 lifecycle event types, got {}",
         ALL_EVENT_TYPES.len()
     );
 
@@ -507,6 +509,45 @@ async fn hook_tool_call_maps_typed_block_result() -> R {
     let result = runner.emit_tool_call("read", "tc1", Map::new()).await?;
     let mapped = result.map(|r| (r.block, r.reason));
     assert_eq!(mapped, Some((true, Some("denied by policy".to_owned()))));
+    Ok(())
+}
+
+fn stub_preview() -> BoundaryPreview {
+    Arc::new(|_entries| {
+        Box::pin(async { Ok(Value::Null) })
+            as futures::future::BoxFuture<'static, Result<Value, ExtensionRunnerError>>
+    })
+}
+
+#[tokio::test]
+async fn hook_boundary_maps_drafts_and_continue_hint() -> R {
+    let (runner, host) = make_runner(full_snapshot()).await?;
+    host.set_response(
+        "turn_end",
+        json!({
+            "entries": [{
+                "type": "custom",
+                "customType": "verification",
+                "data": {"ok": true}
+            }],
+            "continue": true
+        }),
+    );
+    runner
+        .emit_boundary("turn_end", json!({"type": "turn_end"}), stub_preview())
+        .await?
+        .ok_or("boundary response missing")?;
+    host.set_response("agent_before_settle", json!({"continue": true}));
+    let continue_only = runner
+        .emit_boundary(
+            "agent_before_settle",
+            json!({"type": "agent_before_settle"}),
+            stub_preview(),
+        )
+        .await?
+        .ok_or("continue-only boundary response missing")?;
+    assert_eq!(continue_only.entries, None);
+    assert_eq!(continue_only.continue_after, Some(true));
     Ok(())
 }
 

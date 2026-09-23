@@ -248,6 +248,7 @@ impl SessionRouter {
             | SessionBridgeEvent::Fork { .. }
             | SessionBridgeEvent::NavigateTree { .. }
             | SessionBridgeEvent::SwitchSession { .. }
+            | SessionBridgeEvent::PreviewBoundary { .. }
             | SessionBridgeEvent::Reload { .. } => BridgeScope::Untagged,
         };
 
@@ -432,6 +433,28 @@ impl SessionRouter {
             return Err(ExtensionHostError::NotRunning);
         };
         endpoint.runner.respond_setup_entries(local, outcome).await
+    }
+
+    /// Route a correlated boundary-preview response to its originating endpoint.
+    ///
+    /// Claiming consumes the route, so a dropped or reloaded endpoint yields
+    /// `ExtensionHostError::NotRunning` instead of answering a stale host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or missing, or its host rejects it.
+    pub(super) async fn respond_boundary_preview(
+        &self,
+        id: BridgeRequestId,
+        result: Result<Value, String>,
+    ) -> Result<(), ExtensionHostError> {
+        let Some((_lease, endpoint, local)) = self.state().claim_route(id) else {
+            return Err(ExtensionHostError::NotRunning);
+        };
+        endpoint
+            .runner
+            .respond_boundary_preview(local, result)
+            .await
     }
 
     /// Validate a replacement token and return the pending replacement target

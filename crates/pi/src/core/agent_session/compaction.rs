@@ -750,7 +750,7 @@ impl AgentSession {
             let entry_id = sm
                 .append_compaction(
                     &result.summary,
-                    &result.first_kept_entry_id,
+                    Some(&result.first_kept_entry_id),
                     tokens_before_i64,
                     details,
                     if from_hook { Some(true) } else { None },
@@ -979,9 +979,11 @@ impl AgentSession {
 
     // -- settings / session helpers --------------------------------------
 
-    /// Resolved compaction settings (enabled + reserve + keep-recent).
+    /// Resolved compaction settings for the currently selected model.
     fn compaction_settings(&self) -> ResolvedCompactionSettings {
-        self.lock_settings().get_compaction_settings()
+        let model = self.model();
+        self.lock_settings()
+            .get_compaction_settings_for_model(&model.provider, &model.id)
     }
 
     /// Snapshot the current branch entries (cloned, lock-free).
@@ -1200,7 +1202,7 @@ fn civil_to_millis(
 
 static OVERFLOW_REGEXES: std::sync::LazyLock<Vec<Regex>> = std::sync::LazyLock::new(|| {
     [
-        r"(?i)prompt is too long",
+        r"(?i)prompt (?:is )?too long",
         r"(?i)request_too_large",
         r"(?i)input is too long for requested model",
         r"(?i)exceeds the context window",
@@ -1220,15 +1222,20 @@ static OVERFLOW_REGEXES: std::sync::LazyLock<Vec<Regex>> = std::sync::LazyLock::
         r"(?i)prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?",
         r"(?i)model_context_window_exceeded",
         r"(?i)prompt too long; exceeded (?:max )?context length",
+        r"(?i)range of input length should be",
         r"(?i)context[_ ]length[_ ]exceeded",
         r"(?i)too many tokens",
         r"(?i)token limit exceeded",
-        r"(?i)^4(?:00|13)\s*(?:status code)?\s*\(no body\)",
     ]
     .into_iter()
     .filter_map(|pat| Regex::new(pat).ok())
     .collect()
 });
+
+static CEREBRAS_BODYLESS_OVERFLOW_REGEX: std::sync::LazyLock<Option<Regex>> =
+    std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)^4(?:00|13)\s*(?:status code)?\s*\(no body\)").ok()
+    });
 
 static NON_OVERFLOW_REGEXES: std::sync::LazyLock<Vec<Regex>> = std::sync::LazyLock::new(|| {
     [
@@ -1264,9 +1271,13 @@ pub(super) fn is_context_overflow(message: &AssistantMessage, context_window: u6
             .iter()
             .any(|pattern| pattern.is_match(error_message));
         if !is_non_overflow
-            && overflow_patterns()
+            && (overflow_patterns()
                 .iter()
                 .any(|pattern| pattern.is_match(error_message))
+                || (message.provider == "cerebras"
+                    && CEREBRAS_BODYLESS_OVERFLOW_REGEX
+                        .as_ref()
+                        .is_some_and(|pattern| pattern.is_match(error_message))))
         {
             return true;
         }
@@ -1328,6 +1339,9 @@ mod tests {
             base_url: String::new(),
             reasoning: false,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
             context_window,
@@ -2822,14 +2836,13 @@ mod tests {
 
         if should_stop {
             let mut base = pi_agent::AgentLoopConfig::base(model.clone());
-            base.should_stop_after_turn =
-                Some(Arc::new(|_ctx: pi_agent::ShouldStopAfterTurnContext| {
-                    Box::pin(async move { Ok(true) })
-                        as futures::future::BoxFuture<
-                            'static,
-                            Result<bool, pi_agent::AgentLoopError>,
-                        >
-                }) as pi_agent::ShouldStopAfterTurn);
+            base.finish_turn = Some(Arc::new(|_ctx: pi_agent::AgentTurnContext, _| {
+                Box::pin(async move { Ok(Some(pi_agent::AgentTurnDecision::End)) })
+                    as futures::future::BoxFuture<
+                        'static,
+                        Result<Option<pi_agent::AgentTurnDecision>, pi_agent::AgentLoopError>,
+                    >
+            }) as pi_agent::FinishTurn);
             config.base_config = Some(base);
         }
 

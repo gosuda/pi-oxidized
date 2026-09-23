@@ -67,31 +67,37 @@ fn find_most_recent_session_inner(
     let resolved_cwd = cwd.map(resolve_path);
 
     let entries = fs::read_dir(&resolved_session_dir).map_err(|_| ())?;
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
+    let mut candidates: Vec<(PathBuf, i64)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
+        let Some(mtime) = fs::metadata(&path)
+            .ok()
+            .map(|meta| mtime_millis(&meta).unwrap_or(0))
+        else {
+            continue;
+        };
+        candidates.push((path, mtime));
+    }
+    candidates.sort_by_key(|(_, mtime)| Reverse(*mtime));
+    for (path, _) in candidates {
         let Some(header) = read_session_header(&path) else {
             continue;
         };
-        if let Some(rcwd) = &resolved_cwd {
-            let header_cwd = header.cwd.as_deref();
-            if !session_cwd_matches(header_cwd, rcwd) {
-                continue;
-            }
+        if resolved_cwd
+            .as_ref()
+            .is_some_and(|rcwd| !session_cwd_matches(header.cwd.as_deref(), rcwd))
+        {
+            continue;
         }
-        candidates.push(path);
+        return Ok(Some(path));
     }
-    Ok(most_recent_candidate(candidates, |path| {
-        fs::metadata(path)
-            .ok()
-            .map(|meta| mtime_millis(&meta).unwrap_or(0))
-    }))
+    Ok(None)
 }
 
+#[cfg(test)]
 fn most_recent_candidate(
     candidates: Vec<PathBuf>,
     mut modified: impl FnMut(&Path) -> Option<i64>,

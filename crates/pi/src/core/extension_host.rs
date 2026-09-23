@@ -45,13 +45,15 @@ use serde_json::{Map, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use super::agent_session::bridge_types::{
-    BridgeMethod, BridgeRequestId, CommandCatalogEntry, CompactRequest, ExtensionHostError,
-    ForkRequest, NavigateTreeRequest, NewSessionRequest, SessionCommand, SessionCommandEnvelope,
-    SessionState, SetModelRequest, SetupEntriesRequest, SwitchSessionRequest,
+    BoundaryPreviewRequest, BridgeMethod, BridgeRequestId, CommandCatalogEntry, CompactRequest,
+    ExtensionHostError, ForkRequest, NavigateTreeRequest, NewSessionRequest, SessionCommand,
+    SessionCommandEnvelope, SessionState, SetModelRequest, SetupEntriesRequest,
+    SwitchSessionRequest,
 };
 use super::agent_session::events::AgentSessionEvent;
 use super::agent_session::extension_runner::{
-    BeforeAgentStartResult, CancelResult, ExtensionRunner, InputTransformResult,
+    BeforeAgentStartResult, BoundaryPreview, BoundaryResult, CancelResult, ExtensionRunner,
+    InputTransformResult,
 };
 use super::agent_session::tree::NavigateTreeResult;
 use super::extension_runtime_set::EndpointId;
@@ -88,9 +90,9 @@ pub const MESSAGE_UPDATE_DELTA_METHOD: &str = "message_update_delta";
 /// Open method string: render an extension tool call/result as HTML (export).
 pub const TOOL_RENDER_HTML_METHOD: &str = "tool.renderHtml";
 
-/// The 35 lifecycle event `type` discriminants mirrored from the reference
-/// `ExtensionAPI.on()` overloads. The host reports which of these have at
-/// least one handler; Rust gates IPC on that set.
+/// The 39 lifecycle event `type` discriminants mirrored from the reference
+/// `ExtensionAPI.on()` overloads (types.ts:1340-1418). The host reports which
+/// of these have at least one handler; Rust gates IPC on that set.
 pub const ALL_EVENT_TYPES: &[&str] = &[
     "project_trust",
     "resources_discover",
@@ -100,16 +102,20 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     "session_before_fork",
     "session_before_compact",
     "session_compact",
+    "session_compact_failed",
     "session_shutdown",
     "session_before_tree",
     "session_tree",
     "context",
+    "context_with_system",
+    "cache_warming_decision",
     "before_provider_request",
     "before_provider_headers",
     "after_provider_response",
     "before_agent_start",
     "agent_start",
     "agent_end",
+    "agent_before_settle",
     "agent_settled",
     "ui_prompt_start",
     "ui_prompt_end",
@@ -216,6 +222,13 @@ pub(crate) enum SessionBridgeEvent {
         request: SetupEntriesRequest,
         /// Endpoint that requested the candidate snapshot.
         origin: Option<EndpointId>,
+    },
+    /// Correlated `session.previewBoundary` request (host → Rust).
+    PreviewBoundary {
+        /// Host correlation id (echo into `respond_boundary_preview`).
+        id: BridgeRequestId,
+        /// Preview request payload.
+        request: BoundaryPreviewRequest,
     },
     /// Host completed the command that initiated a ready-gated operation.
     ReplacementReady {
@@ -395,6 +408,19 @@ impl From<pi_ext::protocol::SessionSetupEntriesRequest> for SetupEntriesRequest 
     }
 }
 
+impl From<pi_ext::protocol::SessionPreviewBoundaryRequest> for BoundaryPreviewRequest {
+    fn from(wire: pi_ext::protocol::SessionPreviewBoundaryRequest) -> Self {
+        Self {
+            boundary: wire.boundary,
+            entries: wire
+                .entries
+                .into_iter()
+                .map(|entry| serde_json::to_value(entry).unwrap_or(Value::Null))
+                .collect(),
+        }
+    }
+}
+
 /// Convert the pi-ext wire `CommandSourceInfo` into the product `SourceInfo`.
 ///
 /// Moved here from `agent_session/extension.rs:695-701` — the host adapter
@@ -429,6 +455,7 @@ fn bridge_method_to_wire(method: BridgeMethod) -> &'static str {
         BridgeMethod::SetupEntries => protocol::SESSION_SETUP_ENTRIES_METHOD,
         BridgeMethod::SetModel => protocol::SESSION_SET_MODEL_METHOD,
         BridgeMethod::Compact => protocol::SESSION_COMPACT_METHOD,
+        BridgeMethod::PreviewBoundary => protocol::SESSION_PREVIEW_BOUNDARY_METHOD,
     }
 }
 
@@ -863,6 +890,9 @@ struct BeforeToolCallWire {
     block: bool,
     #[serde(default)]
     reason: Option<String>,
+    /// Hint that the agent loop should stop after the current tool batch.
+    #[serde(default)]
+    terminate: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2129,6 +2159,28 @@ impl HostExtensionRunner {
             .map_err(ExtensionHostError::from)
     }
 
+    /// Answer a correlated `session.previewBoundary` request.
+    ///
+    /// The client serializes `Ok(context)` as the wire
+    /// [`protocol::SessionPreviewBoundaryResponse`] and sends `Err(message)`
+    /// as an `extension_error` frame, so invalid preview states surface as
+    /// named host errors instead of fake success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExtensionHostError`] if the host has already exited.
+    pub async fn respond_boundary_preview(
+        &self,
+        id: BridgeRequestId,
+        result: Result<Value, String>,
+    ) -> Result<(), ExtensionHostError> {
+        self.inner
+            .client
+            .respond_boundary_preview(id.0, result)
+            .await
+            .map_err(ExtensionHostError::from)
+    }
+
     /// Reject a ready-gated operation while another operation owns the facade slot.
     ///
     /// # Errors
@@ -2544,6 +2596,16 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                             )
                             .await;
                         }
+                        Some(HostSessionRequest::PreviewBoundary { id, request }) => {
+                            forward_session_bridge(
+                                &inner,
+                                SessionBridgeEvent::PreviewBoundary {
+                                    id: BridgeRequestId(id),
+                                    request: request.into(),
+                                },
+                            )
+                            .await;
+                        }
                         None => {
                             // Channel closed (client gone); park this class.
                             session_requests = None;
@@ -2741,6 +2803,12 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
             let _ = inner
                 .client
                 .respond_setup_entries(id.0, Err("no active session".to_owned()))
+                .await;
+        }
+        Some(SessionBridgeEvent::PreviewBoundary { id, .. }) => {
+            let _ = inner
+                .client
+                .respond_boundary_preview(id.0, Err("no active session".to_owned()))
                 .await;
         }
         Some(SessionBridgeEvent::SetModel { id, .. }) => {
@@ -3138,6 +3206,7 @@ impl ExtensionRunner for HostExtensionRunner {
                             .map(|wire| BeforeToolCallResult {
                                 block: wire.block,
                                 reason: wire.reason,
+                                terminate: wire.terminate,
                             });
                     Ok(result)
                 }
@@ -3329,6 +3398,59 @@ impl ExtensionRunner for HostExtensionRunner {
                 Err(err) => {
                     inner.report_host_error(&err);
                     Ok(ResourceExtensionPaths::default())
+                }
+            }
+        })
+    }
+
+    fn emit_boundary<'a>(
+        &'a self,
+        event: &'a str,
+        payload: Value,
+        _preview: BoundaryPreview,
+    ) -> BoxFuture<
+        'a,
+        Result<
+            Option<BoundaryResult>,
+            super::agent_session::extension_runner::ExtensionRunnerError,
+        >,
+    > {
+        let inner = Arc::clone(&self.inner);
+        let event = event.to_owned();
+        // The preview closure is driven by the runtime-set fold after every
+        // endpoint; a single endpoint only reports its own draft replacement.
+        Box::pin(async move {
+            if !inner.has_handlers(&event) {
+                return Ok(None);
+            }
+            match inner.hook_request(&event, payload).await {
+                Ok(frame) => {
+                    // `{ok:true}` and `null` are valid no-draft responses from
+                    // the pinned Mode 1 host: `Option` maps `null` to `None`
+                    // and unknown fields are ignored. Anything else that fails
+                    // to decode is a named error, never a silent `None`.
+                    let wire =
+                        serde_json::from_value::<Option<pi_ext::protocol::BoundaryResultWire>>(
+                            frame.payload,
+                        )
+                        .map_err(|error| {
+                            super::agent_session::extension_runner::ExtensionRunnerError::Failed(
+                                format!("malformed boundary result from extension host: {error}"),
+                            )
+                        })?;
+                    Ok(wire.map(|wire| BoundaryResult {
+                        entries: wire.entries.map(|entries| {
+                            entries
+                                .into_iter()
+                                .map(|entry| serde_json::to_value(entry).unwrap_or(Value::Null))
+                                .collect()
+                        }),
+                        continue_after: wire.r#continue,
+                    }))
+                }
+                Err(err) => {
+                    inner.report_host_error(&err);
+                    Ok(None)
                 }
             }
         })

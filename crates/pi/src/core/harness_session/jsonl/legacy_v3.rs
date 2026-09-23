@@ -486,7 +486,7 @@ fn usage_from_message(record: &LegacyRecord) -> Option<Usage> {
                 .get("message")
                 .and_then(|message| message.get("usage"))
                 .and_then(|usage| serde_json::from_value(usage.clone()).ok()),
-            Message::User(_) => None,
+            Message::User(_) | Message::System(_) => None,
         },
         AgentMessage::Custom(_) => None,
     }
