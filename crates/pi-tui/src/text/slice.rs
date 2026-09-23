@@ -39,9 +39,6 @@ pub struct ExtractedSegments {
 /// `true` when a line is a Kitty / iTerm2 image sequence (possibly mid-line).
 #[must_use]
 pub fn is_image_line(line: &str) -> bool {
-    if line.starts_with(KITTY_PREFIX) || line.starts_with(ITERM2_PREFIX) {
-        return true;
-    }
     line.contains(KITTY_PREFIX) || line.contains(ITERM2_PREFIX)
 }
 
@@ -53,19 +50,10 @@ fn truncate_fragment_to_width(text: &str, max_width: usize) -> SliceWithWidth {
         };
     }
     if is_printable_ascii(text) {
-        let clipped = text.chars().take(max_width).collect::<String>();
-        // For pure ASCII, char count == width and == byte length for printable.
-        let clipped = if text.is_ascii() {
-            text.get(..max_width.min(text.len()))
-                .unwrap_or("")
-                .to_owned()
-        } else {
-            clipped
-        };
-        let width = clipped.len();
+        let limit = max_width.min(text.len());
         return SliceWithWidth {
-            text: clipped,
-            width,
+            text: text[..limit].to_owned(),
+            width: limit,
         };
     }
 

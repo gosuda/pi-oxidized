@@ -6,6 +6,7 @@ use ratatui::style::{Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::component::{Component, EventResult, UiEvent};
+use crate::editor_support::{KillPushOptions, KillRing, UndoStack};
 use crate::frame::set_cursor;
 use crate::keybindings::get_keybindings;
 use crate::text::{is_whitespace_char, slice_by_column, visible_width};
@@ -15,66 +16,6 @@ use crate::text::{is_whitespace_char, slice_by_column, visible_width};
 struct InputState {
     value: String,
     cursor: usize,
-}
-
-/// Simple kill ring (single-slot accumulate for Input subset).
-#[derive(Debug, Default)]
-struct KillRing {
-    entries: Vec<String>,
-    index: usize,
-}
-
-impl KillRing {
-    fn push(&mut self, text: String, prepend: bool, accumulate: bool) {
-        if text.is_empty() {
-            return;
-        }
-        if accumulate && let Some(last) = self.entries.last_mut() {
-            if prepend {
-                *last = format!("{text}{last}");
-            } else {
-                last.push_str(&text);
-            }
-            self.index = self.entries.len() - 1;
-            return;
-        }
-        self.entries.push(text);
-        self.index = self.entries.len() - 1;
-    }
-
-    fn peek(&self) -> Option<&str> {
-        self.entries.get(self.index).map(String::as_str)
-    }
-
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    fn rotate(&mut self) {
-        if self.entries.is_empty() {
-            return;
-        }
-        if self.index == 0 {
-            self.index = self.entries.len() - 1;
-        } else {
-            self.index -= 1;
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct UndoStack {
-    stack: Vec<InputState>,
-}
-
-impl UndoStack {
-    fn push(&mut self, state: InputState) {
-        self.stack.push(state);
-    }
-
-    fn pop(&mut self) -> Option<InputState> {
-        self.stack.pop()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +37,7 @@ pub struct Input {
     cursor: usize,
     focused: bool,
     kill_ring: KillRing,
-    undo: UndoStack,
+    undo: UndoStack<InputState>,
     last_action: Option<LastAction>,
     /// Called on submit.
     pub on_submit: Option<InputSubmitCallback>,
@@ -113,7 +54,7 @@ impl Input {
             cursor: 0,
             focused: false,
             kill_ring: KillRing::default(),
-            undo: UndoStack::default(),
+            undo: UndoStack::<InputState>::new(),
             last_action: None,
             on_submit: None,
             on_escape: None,
@@ -182,7 +123,7 @@ impl Input {
     }
 
     fn push_undo(&mut self) {
-        self.undo.push(InputState {
+        self.undo.push(&InputState {
             value: self.value.clone(),
             cursor: self.cursor,
         });
@@ -251,8 +192,13 @@ impl Input {
         }
         self.push_undo();
         let deleted = self.value[..self.cursor].to_owned();
-        self.kill_ring
-            .push(deleted, true, self.last_action == Some(LastAction::Kill));
+        self.kill_ring.push(
+            &deleted,
+            KillPushOptions {
+                prepend: true,
+                accumulate: self.last_action == Some(LastAction::Kill),
+            },
+        );
         self.last_action = Some(LastAction::Kill);
         self.value = self.value[self.cursor..].to_owned();
         self.cursor = 0;
@@ -264,8 +210,13 @@ impl Input {
         }
         self.push_undo();
         let deleted = self.value[self.cursor..].to_owned();
-        self.kill_ring
-            .push(deleted, false, self.last_action == Some(LastAction::Kill));
+        self.kill_ring.push(
+            &deleted,
+            KillPushOptions {
+                prepend: false,
+                accumulate: self.last_action == Some(LastAction::Kill),
+            },
+        );
         self.last_action = Some(LastAction::Kill);
         self.value = self.value[..self.cursor].to_owned();
     }
@@ -352,7 +303,13 @@ impl Input {
         self.push_undo();
         let from = Self::find_word_backward(&self.value, self.cursor);
         let deleted = self.value[from..self.cursor].to_owned();
-        self.kill_ring.push(deleted, true, was_kill);
+        self.kill_ring.push(
+            &deleted,
+            KillPushOptions {
+                prepend: true,
+                accumulate: was_kill,
+            },
+        );
         self.last_action = Some(LastAction::Kill);
         self.value = format!("{}{}", &self.value[..from], &self.value[self.cursor..]);
         self.cursor = from;
@@ -366,7 +323,13 @@ impl Input {
         self.push_undo();
         let to = Self::find_word_forward(&self.value, self.cursor);
         let deleted = self.value[self.cursor..to].to_owned();
-        self.kill_ring.push(deleted, false, was_kill);
+        self.kill_ring.push(
+            &deleted,
+            KillPushOptions {
+                prepend: false,
+                accumulate: was_kill,
+            },
+        );
         self.last_action = Some(LastAction::Kill);
         self.value = format!("{}{}", &self.value[..self.cursor], &self.value[to..]);
     }
