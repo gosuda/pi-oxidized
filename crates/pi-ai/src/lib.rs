@@ -5,12 +5,14 @@ pub mod auth;
 pub mod catalog;
 pub mod constrained_sampling;
 pub mod estimate;
+pub mod images;
 pub mod lockfile;
 pub mod models_store;
 pub mod provider;
 pub mod providers;
 pub mod radius_config;
 pub mod simple_options;
+pub mod transcript;
 pub mod types;
 
 pub use assistant_message_frame::{
