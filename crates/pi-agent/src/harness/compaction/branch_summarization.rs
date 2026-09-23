@@ -15,6 +15,7 @@ use crate::session::{
     HarnessRetryPolicy, LIST_READ_MAX_LIMIT, ScanOrder, Session, SessionError,
 };
 
+use super::context::is_context_message;
 use super::messages::{
     create_branch_summary_message, create_compaction_summary_message, summary_user_message,
 };
@@ -240,8 +241,18 @@ async fn scan_branch_ancestry(
 }
 
 /// Selects branch entries in chronological order within `token_budget`.
+///
+/// A zero budget selects nothing, so a reserve at or above the context window
+/// yields an empty preparation rather than an unbounded one.
 #[must_use]
 pub fn prepare_branch_entries(entries: &[Entry], token_budget: u64) -> BranchPreparation {
+    if token_budget == 0 {
+        return BranchPreparation {
+            messages: Vec::new(),
+            file_ops: FileOperations::default(),
+            total_tokens: 0,
+        };
+    }
     // Selection runs newest-first; file operations are collected afterwards
     // from the selected entries only, so the metadata never covers messages or
     // inherited branch-summary details outside the prepared range.
@@ -252,7 +263,7 @@ pub fn prepare_branch_entries(entries: &[Entry], token_budget: u64) -> BranchPre
             continue;
         };
         let tokens = estimate_tokens(&message);
-        if token_budget > 0 && total_tokens.saturating_add(tokens) > token_budget {
+        if total_tokens.saturating_add(tokens) > token_budget {
             if matches!(
                 entry,
                 Entry::Compaction { .. } | Entry::BranchSummary { .. }
@@ -299,7 +310,11 @@ pub fn prepare_branch_entries(entries: &[Entry], token_budget: u64) -> BranchPre
 
 fn get_message_from_entry(entry: &Entry) -> Option<AgentMessage> {
     match entry {
-        Entry::Message { message, .. } if message.role() != "toolResult" => Some(message.clone()),
+        Entry::Message { message, .. }
+            if message.role() != "toolResult" && is_context_message(message) =>
+        {
+            Some(message.clone())
+        }
         Entry::BranchSummary {
             base,
             from_id,
@@ -482,11 +497,18 @@ pub async fn generate_branch_summary_with_request(
     })
 }
 
+#[expect(
+    clippy::panic,
+    reason = "test assertions use let-else panic for irrecoverable fixture mismatch"
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::future::BoxFuture;
-    use pi_ai::{Message, TextContent, UserMessage, UserMessageContent};
+    use pi_ai::{
+        AssistantContent, AssistantMessage, Message, StopReason, TextContent, Usage, UserMessage,
+        UserMessageContent,
+    };
 
     use crate::session::{
         LIST_READ_DEFAULT_LIMIT, LaneName, MemoryStorage, SessionMetadata, StorageBackedSession,
@@ -544,6 +566,111 @@ mod tests {
             0,
         );
         assert!(prep.messages.is_empty());
+    }
+
+    fn assistant_entry(id: &str, stop_reason: StopReason) -> Entry {
+        let mut message = AssistantMessage::new("k", "m", "p", 1);
+        message.content = vec![AssistantContent::Text(TextContent::new("hi"))];
+        message.stop_reason = stop_reason;
+        message.usage = Usage::default();
+        Entry::Message {
+            base: base(id),
+            message: AgentMessage::Llm(Box::new(Message::Assistant(Box::new(message)))),
+            terminate: false,
+        }
+    }
+
+    #[test]
+    fn zero_token_budget_selects_nothing() {
+        // A reserve at or above the context window yields a zero budget; the
+        // preparation must stay empty instead of falling back to unbounded
+        // selection, and no priced-out file metadata may leak.
+        let summary = Entry::BranchSummary {
+            base: base("summary"),
+            from_id: None,
+            summary: "s".repeat(40),
+            details: Some(serde_json::json!({
+                "readFiles": ["leaked-read.txt"],
+                "modifiedFiles": ["leaked-mod.txt"],
+            })),
+            usage: None,
+            from_hook: false,
+        };
+        let message = Entry::Message {
+            base: base("kept"),
+            message: AgentMessage::Llm(Box::new(Message::User(UserMessage::new(
+                UserMessageContent::Text("u".repeat(40)),
+                1,
+            )))),
+            terminate: false,
+        };
+        let prep = prepare_branch_entries(&[summary, message], 0);
+        assert!(prep.messages.is_empty());
+        assert_eq!(prep.total_tokens, 0);
+        assert!(prep.file_ops.read.is_empty());
+        assert!(prep.file_ops.edited.is_empty());
+    }
+
+    #[test]
+    fn zero_budget_excludes_zero_cost_entries() {
+        // Empty summaries estimate to zero tokens, so the cap comparison alone
+        // cannot reject them; the explicit zero-budget early return must.
+        let empty_summary = Entry::BranchSummary {
+            base: base("empty-summary"),
+            from_id: None,
+            summary: String::new(),
+            details: Some(serde_json::json!({
+                "readFiles": ["leaked-read.txt"],
+            })),
+            usage: None,
+            from_hook: false,
+        };
+        let empty_compaction = Entry::Compaction {
+            base: base("empty-compaction"),
+            summary: String::new(),
+            retained_tail: Vec::new(),
+            tokens_before: 0,
+            details: None,
+            usage: None,
+            from_hook: false,
+        };
+        let prep = prepare_branch_entries(&[empty_summary, empty_compaction], 0);
+        assert!(prep.messages.is_empty());
+        assert_eq!(prep.total_tokens, 0);
+        assert!(prep.file_ops.read.is_empty());
+    }
+
+    #[test]
+    fn preparation_excludes_failed_assistant_messages() {
+        // Error/Aborted/Deferred assistant turns must not be embedded into
+        // branch summaries, matching the context-eligibility filter.
+        let entries = vec![
+            Entry::Message {
+                base: base("user"),
+                message: AgentMessage::Llm(Box::new(Message::User(UserMessage::new(
+                    UserMessageContent::Text("hi".to_owned()),
+                    1,
+                )))),
+                terminate: false,
+            },
+            assistant_entry("failed", StopReason::Error),
+            assistant_entry("aborted", StopReason::Aborted),
+            assistant_entry("deferred", StopReason::Deferred),
+            assistant_entry("ok", StopReason::Stop),
+        ];
+        let prep = prepare_branch_entries(&entries, 1_000);
+        assert_eq!(prep.messages.len(), 2);
+        let AgentMessage::Llm(user) = &prep.messages[0] else {
+            panic!("expected user message");
+        };
+        assert!(matches!(user.as_ref(), Message::User(_)));
+        let AgentMessage::Llm(assistant) = &prep.messages[1] else {
+            panic!("expected assistant message");
+        };
+        let Message::Assistant(assistant) = assistant.as_ref() else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(assistant.stop_reason, StopReason::Stop);
     }
 
     /// A branch handle that clamps every scan to `page` entries, simulating a

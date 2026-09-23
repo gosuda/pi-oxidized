@@ -205,7 +205,9 @@ impl JsonlStorage {
     ///
     /// Returns an error if the file cannot be read, its header or records are
     /// invalid, its storage version is unsupported, replay or legacy normalization
-    /// fails, or a torn final record cannot be repaired.
+    /// fails, or a torn final record cannot be repaired. Torn-final-record repair
+    /// applies to the v4 path only; a torn final record in a legacy v3 file is
+    /// dropped and the source file is left untouched.
     pub fn open_sync(path: &Path) -> Result<(JsonlStorageHeader, Arc<Self>), SessionError> {
         let content = fs::read_to_string(path)
             .map_err(|error| io_failure(path, "failed to read JSONL storage", error))?;

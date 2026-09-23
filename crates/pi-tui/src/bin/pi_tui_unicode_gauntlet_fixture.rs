@@ -172,10 +172,6 @@ impl Component for LinesChild {
     fn invalidate(&mut self) {}
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "fixture binary: single-instance root; boxing would add indirection without benefit"
-)]
 enum Surface {
     None,
     Rail(Rail),

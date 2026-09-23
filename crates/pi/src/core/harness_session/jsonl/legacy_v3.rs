@@ -612,8 +612,8 @@ fn selected_configuration(
 /// # Errors
 ///
 /// Returns an error for malformed records or timestamps, duplicate ids, missing
-/// or cyclic references, invalid compaction or configuration data, identifier
-/// generation failures, serialization failures, or sequence overflow.
+/// or cyclic references, invalid compaction data, identifier generation
+/// failures, serialization failures, or sequence overflow.
 #[expect(
     clippy::too_many_lines,
     reason = "single-pass index, link, and validate over legacy records; splitting would scatter the phases"

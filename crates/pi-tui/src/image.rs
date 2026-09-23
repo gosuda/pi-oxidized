@@ -437,6 +437,9 @@ pub struct KittyImageCache {
     entries: VecDeque<CachedKittyImage>,
     transmission_bytes: usize,
     decoded_bytes: usize,
+    /// Generations already emitted as uploads during the current frame, so a
+    /// second placement of the same generation uses a placement-only command.
+    emitted: Vec<(u32, u64)>,
 }
 
 /// Maximum number of cached offscreen Kitty images.
@@ -487,12 +490,12 @@ impl KittyImageCache {
     /// Existing uploads become placement-only at the caller's paint step;
     /// unseen generations produce an upload. Entries are touched in iterator
     /// order. Only entries that are not visible count toward the C-compatible
-    /// bounds and are eligible for eviction.
     #[must_use]
     pub fn prepare_frame<'a, I>(&mut self, visible: I) -> ImageCacheOutput
     where
         I: IntoIterator<Item = &'a DocumentImage>,
     {
+        self.emitted.clear();
         let visible: Vec<&DocumentImage> = visible
             .into_iter()
             .filter(|image| image.protocol == Some(ImageProtocol::Kitty))
@@ -573,19 +576,34 @@ impl KittyImageCache {
     ///
     /// A visible image included in this output must use `Upload` even though
     /// it is now retained in cache metadata; only a prior generation may use
-    /// a placement-only command.
+    /// a placement-only command. The first placement of an uploaded generation
+    /// consumes the upload: later placements of the same generation in the
+    /// same frame use a placement-only command instead of retransmitting.
     #[must_use]
-    pub fn emission_for(&self, image: &DocumentImage, output: &ImageCacheOutput) -> ImageEmission {
-        if image.protocol != Some(ImageProtocol::Kitty)
-            || output.uploads.iter().any(|upload| {
-                Some(upload.image_id) == image.image_id
-                    && upload.transmission_generation == image.transmission_generation
-            })
-            || !self.is_uploaded(image)
-        {
-            ImageEmission::Upload
-        } else {
+    pub fn emission_for(
+        &mut self,
+        image: &DocumentImage,
+        output: &ImageCacheOutput,
+    ) -> ImageEmission {
+        if image.protocol != Some(ImageProtocol::Kitty) || !self.is_uploaded(image) {
+            return ImageEmission::Upload;
+        }
+        let Some(image_id) = image.image_id else {
+            return ImageEmission::Upload;
+        };
+        let uploaded_this_frame = output.uploads.iter().any(|upload| {
+            upload.image_id == image_id
+                && upload.transmission_generation == image.transmission_generation
+        });
+        if !uploaded_this_frame {
+            return ImageEmission::Placement;
+        }
+        let key = (image_id, image.transmission_generation);
+        if self.emitted.contains(&key) {
             ImageEmission::Placement
+        } else {
+            self.emitted.push(key);
+            ImageEmission::Upload
         }
     }
 
@@ -1887,6 +1905,35 @@ mod tests {
             .evictions;
         assert_eq!(cache.len(), MAX_CACHED_OFFSCREEN_KITTY_IMAGES);
         assert_eq!(evictions[0].deletion, delete_kitty_image(1).into_bytes());
+    }
+
+    #[test]
+    fn second_placement_of_uploaded_generation_uses_placement() {
+        let mut cache = KittyImageCache::new();
+        let image = DocumentImage::from_native(
+            "AAAA",
+            "image/png",
+            ImageDimensions {
+                width_px: 8,
+                height_px: 8,
+            },
+            &DocumentImageOptions {
+                max_width_cells: Some(2),
+                max_height_cells: Some(1),
+                image_id: Some(0x2030),
+                protocol: Some(ImageProtocol::Kitty),
+                ..DocumentImageOptions::default()
+            },
+        )
+        .expect("valid native image");
+        let output = cache.prepare_frame(std::iter::once(&image));
+        assert_eq!(output.uploads.len(), 1);
+        assert_eq!(cache.emission_for(&image, &output), ImageEmission::Upload);
+        assert_eq!(
+            cache.emission_for(&image, &output),
+            ImageEmission::Placement,
+            "the second placement of the same generation must not retransmit"
+        );
     }
 
     #[test]

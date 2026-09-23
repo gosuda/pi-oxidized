@@ -165,6 +165,11 @@ impl<W: Write> TerminalSession<W> {
     /// The pause acknowledgment is awaited before any mode bytes are written;
     /// no second event stream or probe reader is created.
     ///
+    /// Input resume is part of the screen-mode transaction: when the resume
+    /// fails after a successful mode change and the mode differs from the
+    /// previous one, the previous mode is restored so a stopped reader never
+    /// leaves the terminal switched. A failed rollback reports both errors.
+    ///
     /// # Errors
     ///
     /// Returns a string when pausing or resuming input, changing terminal
@@ -207,11 +212,7 @@ impl<W: Write> TerminalSession<W> {
             .await
             .map_err(|e| format!("resume terminal input after screen-mode switch: {e}"));
 
-        let size = lifecycle?;
-        resumed?;
-        self.guard
-            .set_viewport_bottom_row(size.height.saturating_sub(1));
-        Ok(size)
+        finish_screen_mode_transaction(&mut self.guard, previous_mode, mode, lifecycle, resumed)
     }
 
     /// Re-activate terminal modes and resume the input reader after an
@@ -288,4 +289,261 @@ impl<W: Write> TerminalSession<W> {
 
 fn fresh_terminal_size() -> io::Result<Size> {
     crossterm::terminal::size().map(|(width, height)| Size::new(width, height))
+}
+
+/// Finish the screen-mode transaction after the input resume.
+///
+/// A successful transaction records the viewport bottom row from the queried
+/// size. A failed resume is part of the transaction: when the mode changed,
+/// the screen mode is rolled back to `previous_mode` so a stopped reader
+/// never leaves the terminal switched, and a failed rollback reports both
+/// errors. A failed lifecycle wins over the resume error, and no rollback is
+/// attempted when the mode did not change.
+fn finish_screen_mode_transaction<W: Write>(
+    guard: &mut TerminalGuard<W>,
+    previous_mode: ScreenMode,
+    mode: ScreenMode,
+    lifecycle: Result<Size, String>,
+    resumed: Result<(), String>,
+) -> Result<Size, String> {
+    let size = lifecycle?;
+    let resume_error = match resumed {
+        Ok(()) => {
+            guard.set_viewport_bottom_row(size.height.saturating_sub(1));
+            return Ok(size);
+        }
+        Err(resume_error) => resume_error,
+    };
+    if previous_mode == mode {
+        return Err(resume_error);
+    }
+    if let Err(error) = guard.set_screen_mode(previous_mode) {
+        return Err(format!(
+            "{resume_error}; failed to restore {previous_mode} after the failed resume: {error}"
+        ));
+    }
+    Err(resume_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records written bytes; succeeds everywhere (headless included).
+    struct RecordingWriter(Vec<u8>);
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Fails every write, making any guard mode change fail on a tty or off.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("writer failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("writer failed"))
+        }
+    }
+
+    const RESUME_ERROR: &str = "resume terminal input after screen-mode switch: task stopped";
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test asserts transaction errors via expect"
+    )]
+    #[test]
+    fn failed_resume_rolls_back_mode_and_reports_resume_error() {
+        let mut guard = TerminalGuard::new(RecordingWriter(Vec::new()));
+        let error = finish_screen_mode_transaction(
+            &mut guard,
+            ScreenMode::Regular,
+            ScreenMode::Fullscreen,
+            Ok(Size::new(80, 24)),
+            Err(RESUME_ERROR.into()),
+        )
+        .expect_err("failed resume must fail the transaction");
+        assert_eq!(error, RESUME_ERROR);
+        assert_eq!(guard.screen_mode(), ScreenMode::Regular);
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test asserts transaction errors via expect"
+    )]
+    #[test]
+    fn failed_resume_rollback_failure_reports_both_errors() {
+        // previous_mode Fullscreen makes the rollback re-enter fullscreen,
+        // which FailingWriter deterministically fails on and off a tty.
+        let mut guard = TerminalGuard::new(FailingWriter);
+        let error = finish_screen_mode_transaction(
+            &mut guard,
+            ScreenMode::Fullscreen,
+            ScreenMode::Regular,
+            Ok(Size::new(80, 24)),
+            Err(RESUME_ERROR.into()),
+        )
+        .expect_err("double failure must report both errors");
+        let expected =
+            format!("{RESUME_ERROR}; failed to restore fullscreen after the failed resume: ");
+        assert!(error.starts_with(&expected), "unexpected error: {error}");
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test asserts transaction errors via expect"
+    )]
+    #[test]
+    fn lifecycle_failure_wins_over_resume_error() {
+        let mut guard = TerminalGuard::new(RecordingWriter(Vec::new()));
+        let error = finish_screen_mode_transaction(
+            &mut guard,
+            ScreenMode::Regular,
+            ScreenMode::Fullscreen,
+            Err("switch terminal to Fullscreen: no tty".into()),
+            Err(RESUME_ERROR.into()),
+        )
+        .expect_err("lifecycle failure must fail the transaction");
+        assert_eq!(error, "switch terminal to Fullscreen: no tty");
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test asserts transaction errors via expect"
+    )]
+    #[test]
+    fn unchanged_mode_reports_resume_error_without_rollback() {
+        // A failing writer proves the rollback is not attempted: attempting
+        // it would append the "failed to restore" composition.
+        let mut guard = TerminalGuard::new(FailingWriter);
+        let error = finish_screen_mode_transaction(
+            &mut guard,
+            ScreenMode::Fullscreen,
+            ScreenMode::Fullscreen,
+            Ok(Size::new(80, 24)),
+            Err(RESUME_ERROR.into()),
+        )
+        .expect_err("failed resume must fail the transaction");
+        assert_eq!(error, RESUME_ERROR);
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test asserts transaction errors via expect"
+    )]
+    #[test]
+    fn successful_transaction_reports_size() {
+        let mut guard = TerminalGuard::new(RecordingWriter(Vec::new()));
+        let size = finish_screen_mode_transaction(
+            &mut guard,
+            ScreenMode::Regular,
+            ScreenMode::Fullscreen,
+            Ok(Size::new(80, 24)),
+            Ok(()),
+        )
+        .expect("successful transaction");
+        assert_eq!(size, Size::new(80, 24));
+    }
+
+    /// Test-only guard writer that stops the input task at the first flush
+    /// after being armed — the fullscreen-entry flush inside the screen-mode
+    /// transaction. The Shutdown control is therefore enqueued on the FIFO
+    /// control channel strictly before the switch's own input resume send,
+    /// so the resume acknowledgment is deterministically lost: the task
+    /// processes Shutdown first and exits, and it cannot be polled in
+    /// between because the transaction has no await point there.
+    struct ResumeKillWriter {
+        input: Option<Arc<TerminalInput>>,
+        armed: bool,
+    }
+
+    impl Write for ResumeKillWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.armed {
+                self.armed = false;
+                if let Some(input) = self.input.as_ref() {
+                    input.shutdown();
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression: a failed input resume after a successful mode change is
+    /// part of the screen-mode transaction — the previous mode must be
+    /// restored so a stopped reader never leaves the terminal switched, and
+    /// the resume error must reach the caller.
+    ///
+    /// Requires a controlling terminal: the guard's raw-mode activation and
+    /// the winsize ioctl are real. Headless runs skip, matching the guard
+    /// tests' tty-gated precedent; the PTY fixture suite exercises the
+    /// real-terminal session paths.
+    #[expect(
+        clippy::expect_used,
+        reason = "live PTY test asserts terminal transaction errors via expect"
+    )]
+    #[tokio::test]
+    async fn failed_resume_after_mode_switch_restores_previous_mode() {
+        // Gate on the ioctls this test performs: raw mode needs a controlling
+        // terminal (`size()` alone also succeeds headless through the tput
+        // fallback). Probe and restore immediately; the guard below owns raw
+        // mode for the rest of the test.
+        if crossterm::terminal::enable_raw_mode().is_err() {
+            return;
+        }
+        let _ = crossterm::terminal::disable_raw_mode();
+
+        let (mut session, mut input) = TerminalSession::begin(
+            TerminalGuard::new(ResumeKillWriter {
+                input: None,
+                armed: false,
+            }),
+            false,
+            TerminalCapabilities::default(),
+        )
+        .expect("session begin with a recording writer");
+
+        session
+            .finish_probe(TerminalCapabilities::default())
+            .await
+            .expect("probe collector joins");
+        session.start_input(&mut input);
+
+        // Arm the mid-transaction kill, then share the handle between the
+        // writer and the switch call.
+        let input = Arc::new(input);
+        let writer = session.guard_mut().writer_mut();
+        writer.armed = true;
+        writer.input = Some(Arc::clone(&input));
+
+        let error = session
+            .switch_screen_mode(&input, ScreenMode::Fullscreen)
+            .await
+            .expect_err("stopped-input resume must fail the switch");
+        assert!(
+            error.contains("resume terminal input after screen-mode switch"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            session.screen_mode(),
+            ScreenMode::Regular,
+            "a failed resume must restore the previous screen mode"
+        );
+
+        session.shutdown();
+    }
 }

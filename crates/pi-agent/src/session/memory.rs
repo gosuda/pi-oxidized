@@ -202,9 +202,7 @@ impl InMemoryStorageState {
     /// [`SessionError::UnknownTarget`] for a missing ancestor;
     /// [`SessionError::Invariant`] on an ancestry cycle.
     pub fn scan_branch(&self, query: &StorageBranchScan) -> Result<Vec<Entry>, SessionError> {
-        let mut id = query.start.clone();
-        let mut output = Vec::new();
-        let mut seen = HashSet::new();
+        let order = query.order.unwrap_or(ScanOrder::Desc);
         let limit = usize::try_from(
             query
                 .limit
@@ -212,7 +210,10 @@ impl InMemoryStorageState {
                 .min(LIST_READ_MAX_LIMIT),
         )
         .unwrap_or(usize::MAX);
-        while output.len() < limit {
+        let mut id = query.start.clone();
+        let mut output = Vec::new();
+        let mut seen = HashSet::new();
+        loop {
             if !seen.insert(id.clone()) {
                 return Err(SessionError::Invariant(
                     "cycle in branch ancestry".to_owned(),
@@ -226,6 +227,12 @@ impl InMemoryStorageState {
                 || query
                     .stop_at_type
                     .is_some_and(|value| value == entry.entry_type());
+            // The cursor is exclusive in the direction of travel, mirroring
+            // the sqlite backend's scan.
+            let within_cursor = query.cursor.is_none_or(|value| match order {
+                ScanOrder::Asc => entry.seq() > value.seq,
+                ScanOrder::Desc => entry.seq() < value.seq,
+            });
             if query
                 .entry_type
                 .is_none_or(|value| value == entry.entry_type())
@@ -233,9 +240,15 @@ impl InMemoryStorageState {
                     .custom_type
                     .as_deref()
                     .is_none_or(|value| entry.custom_type() == Some(value))
-                && query.cursor.is_none_or(|value| entry.seq() < value.seq)
+                && within_cursor
             {
                 output.push(entry.clone());
+                // Descending output is final in walk order, so the walk can
+                // stop once the limit is met; ascending must reach the root
+                // before reordering and truncating.
+                if order == ScanOrder::Desc && output.len() >= limit {
+                    break;
+                }
             }
             let Some(parent) = entry.parent_id() else {
                 break;
@@ -245,20 +258,28 @@ impl InMemoryStorageState {
                 break;
             }
         }
-        if query.order.unwrap_or(ScanOrder::Desc) == ScanOrder::Asc {
+        if order == ScanOrder::Asc {
             output.reverse();
         }
+        // Truncate only after ordering so ascending scans keep the oldest
+        // matches rather than the newest.
+        output.truncate(limit);
         Ok(output)
     }
 
-    /// Clones the complete source boundary needed by a fork.
+    /// Clones the complete source boundary needed by a fork. Usage rows ride
+    /// along unconditionally because capture has no access to
+    /// [`ForkOptions`]; only tree forks copy them into the destination.
     #[must_use]
     pub fn snapshot_for_fork(&self) -> ForkSourceSnapshot {
         let mut entries: Vec<Entry> = self.entries.values().cloned().collect();
         entries.sort_by_key(Entry::seq);
+        let mut usage: Vec<UsageRow> = self.usage.values().cloned().collect();
+        usage.sort_by_key(|row| row.seq);
         ForkSourceSnapshot {
             entries,
             values: self.values.values().cloned().collect(),
+            usage,
             entries_complete: true,
         }
     }
@@ -383,6 +404,9 @@ impl Storage for MemoryStorage {
             cx.check().map_err(|_| aborted_error())?;
             self.ensure_open()?;
             let mut state = self.state.lock().await;
+            // close() may have won the race between the open check and the
+            // state lock; reject instead of writing behind a closed handle.
+            self.ensure_open()?;
             state.apply(&writes, now_millis()?)
         })
     }
@@ -1102,5 +1126,184 @@ async fn dropping_commit_observer_retains_committed_write_after_close_reopen()
         reopened.get_name(&cx).await?,
         Some("dropped-commit-observer".to_owned())
     );
+    Ok(())
+}
+
+#[cfg(test)]
+fn ancestry_state() -> InMemoryStorageState {
+    use crate::session::entry::{NewEntry, NewEntryBody};
+
+    let mut state = InMemoryStorageState::new();
+    let mut parent = None;
+    for seq in 1..=5u64 {
+        let entry = NewEntry {
+            id: EntryId::from(format!("e{seq}")),
+            parent_id: parent.clone(),
+            body: NewEntryBody::Custom {
+                custom_type: "note".to_owned(),
+                data: None,
+            },
+        }
+        .materialize(seq, 1);
+        parent = Some(entry.id().clone());
+        state.entries.insert(entry.id().clone(), entry);
+    }
+    state
+}
+
+#[cfg(test)]
+#[test]
+fn branch_scan_cursor_follows_order_and_limit_applies_after_ordering() -> Result<(), SessionError> {
+    use crate::session::scan::EntryCursor;
+
+    let state = ancestry_state();
+    // Ascending resumes strictly after the cursor and truncates from the
+    // oldest side after reordering.
+    let ascending = state.scan_branch(&StorageBranchScan {
+        start: EntryId::from("e5"),
+        stop_at_id: None,
+        stop_at_type: None,
+        entry_type: None,
+        custom_type: None,
+        order: Some(ScanOrder::Asc),
+        limit: Some(2),
+        cursor: Some(EntryCursor { seq: 2 }),
+    })?;
+    let seqs: Vec<u64> = ascending.iter().map(Entry::seq).collect();
+    assert_eq!(seqs, vec![3, 4]);
+
+    // Without a cursor the ascending limit still keeps the oldest matches.
+    let oldest = state.scan_branch(&StorageBranchScan {
+        start: EntryId::from("e5"),
+        stop_at_id: None,
+        stop_at_type: None,
+        entry_type: None,
+        custom_type: None,
+        order: Some(ScanOrder::Asc),
+        limit: Some(2),
+        cursor: None,
+    })?;
+    let seqs: Vec<u64> = oldest.iter().map(Entry::seq).collect();
+    assert_eq!(seqs, vec![1, 2]);
+
+    // Descending keeps the newest matches in newest-first order.
+    let descending = state.scan_branch(&StorageBranchScan {
+        start: EntryId::from("e5"),
+        stop_at_id: None,
+        stop_at_type: None,
+        entry_type: None,
+        custom_type: None,
+        order: Some(ScanOrder::Desc),
+        limit: Some(1),
+        cursor: Some(EntryCursor { seq: 3 }),
+    })?;
+    let seqs: Vec<u64> = descending.iter().map(Entry::seq).collect();
+    assert_eq!(seqs, vec![2]);
+    Ok(())
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn commit_rejected_when_session_closes_before_state_lock_is_acquired()
+-> Result<(), SessionError> {
+    use futures::task::noop_waker_ref;
+    use std::task::{Context as PollContext, Poll};
+
+    use crate::session::entry::{NewEntry, NewEntryBody};
+
+    let cx = Context::background();
+    let storage = MemoryStorage::new();
+    let writes = vec![Write::Entry {
+        entry: NewEntry {
+            id: EntryId::from(UuidV7Generator::new().next_string(None)?),
+            parent_id: None,
+            body: NewEntryBody::Custom {
+                custom_type: "note".to_owned(),
+                data: None,
+            },
+        },
+    }];
+
+    // Hold the state lock so the commit parks after its open check.
+    let state = storage.state();
+    let guard = state.lock().await;
+    let mut pending = Box::pin(storage.commit(writes, &cx));
+    let mut poll_cx = PollContext::from_waker(noop_waker_ref());
+    assert!(matches!(pending.as_mut().poll(&mut poll_cx), Poll::Pending));
+
+    // close() marks the handle closed while the commit still waits on the
+    // state lock, so the commit must re-check after acquiring the lock.
+    let mut closing = Box::pin(storage.close(&cx));
+    assert!(matches!(closing.as_mut().poll(&mut poll_cx), Poll::Pending));
+
+    drop(guard);
+    match pending.await {
+        Err(SessionError::Backend(StorageFailure {
+            code: StorageErrorCode::Closed,
+            ..
+        })) => {}
+        other => {
+            return Err(SessionError::Invariant(format!(
+                "commit racing close should be rejected as closed, got {other:?}"
+            )));
+        }
+    }
+    closing.await?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn tree_fork_snapshot_carries_usage_rows_through_replay() -> Result<(), SessionError> {
+    use crate::session::entry::{NewEntry, NewEntryBody};
+    use crate::session::write::NewUsageRow;
+
+    let cx = Context::background();
+    let storage = MemoryStorage::new();
+    let entry_id = EntryId::from(UuidV7Generator::new().next_string(None)?);
+    let usage_id = UsageId::from(UuidV7Generator::new().next_string(None)?);
+    storage
+        .commit(
+            vec![
+                Write::Entry {
+                    entry: NewEntry {
+                        id: entry_id.clone(),
+                        parent_id: None,
+                        body: NewEntryBody::Custom {
+                            custom_type: "note".to_owned(),
+                            data: None,
+                        },
+                    },
+                },
+                Write::Usage {
+                    row: NewUsageRow {
+                        id: usage_id.clone(),
+                        usage: pi_ai::Usage {
+                            input: 3,
+                            ..pi_ai::Usage::default()
+                        },
+                        entry_id: Some(entry_id.clone()),
+                        adjustment: false,
+                        details: None,
+                    },
+                },
+            ],
+            &cx,
+        )
+        .await?;
+
+    let source = storage.capture_fork_source(&cx).await?;
+    assert_eq!(source.usage.len(), 1);
+    let destination = create_fork_snapshot(&source, &ForkOptions::Tree { id: None })?;
+    assert_eq!(destination.usage.len(), 1);
+
+    let forked = MemoryStorage::attach(Arc::new(Mutex::new(
+        InMemoryStorageState::from_fork_snapshot(&destination)?,
+    )));
+    let rows = forked.scan_usage(&UsageScan::default(), &cx).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, usage_id);
+    assert_eq!(rows[0].usage.input, 3);
+    assert_eq!(rows[0].entry_id, Some(entry_id));
     Ok(())
 }

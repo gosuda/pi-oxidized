@@ -149,16 +149,25 @@ pub(crate) async fn await_with_lifetime<T>(
 ) -> Result<T, ServiceError> {
     tokio::pin!(future);
     let caller_cancellation = context.token().cloned();
+    // Mirror `Context::race`: an already-cancelled caller never polls the
+    // future, and cancellation wins ties against a ready transport result.
+    if caller_cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+        || lifetime.is_cancelled()
+    {
+        return Err(ServiceError::Cancelled);
+    }
     tokio::select! {
-        result = &mut future => result,
-        () = lifetime.cancelled() => Err(ServiceError::Cancelled),
+        biased;
         () = async {
-            if let Some(token) = caller_cancellation {
-                token.cancelled().await;
-            } else {
-                std::future::pending::<()>().await;
+            match &caller_cancellation {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
             }
         } => Err(ServiceError::Cancelled),
+        () = lifetime.cancelled() => Err(ServiceError::Cancelled),
+        result = &mut future => result,
     }
 }
 

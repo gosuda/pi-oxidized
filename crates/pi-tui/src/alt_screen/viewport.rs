@@ -243,7 +243,7 @@ struct ImagePaintContext<'a> {
     offset: u16,
     x: u16,
     span_width: u16,
-    image_cache: &'a KittyImageCache,
+    image_cache: &'a mut KittyImageCache,
     image_cache_output: &'a ImageCacheOutput,
     previous_image: Option<(Option<u32>, u16)>,
 }
@@ -538,7 +538,7 @@ impl FullscreenViewport {
         let mut saw_image = false;
         let content_width = self.content_width;
         let mut paint_error = None;
-        let image_cache = &self.image_cache;
+        let image_cache = &mut self.image_cache;
         self.document.visit_row(document_row, &mut |span| {
             let start = usize::from(span.column);
             let Some(end) = start.checked_add(usize::from(span.width)) else {

@@ -13,6 +13,8 @@ use futures::stream::StreamExt;
 use pi_ai::provider::{OnPayloadFn, OnResponseFn, ProviderResponse};
 use pi_ai::{AssistantMessage, AssistantMessageEvent, Model, ModelThinkingLevel, ProviderError};
 use serde_json::Value;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::context::Context;
 use crate::message::AgentMessage;
@@ -191,7 +193,8 @@ pub async fn stream_harness_assistant(
     gate: &Gate,
     cx: &Context,
 ) -> Result<SettledAssistantMessage, HarnessStreamError> {
-    let admitted_context = cx.with_cancellation(gate.token().clone());
+    let (combined, _link) = combined_cancellation(cx.token(), gate.token());
+    let admitted_context = cx.with_cancellation(combined);
 
     let mut request_context = HarnessRequestContext {
         messages: messages.to_vec(),
@@ -253,7 +256,8 @@ pub(crate) async fn stream_harness_deferred(
     gate: &Gate,
     cx: &Context,
 ) -> Result<SettledAssistantMessage, HarnessStreamError> {
-    let admitted_context = cx.with_cancellation(gate.token().clone());
+    let (combined, _link) = combined_cancellation(cx.token(), gate.token());
+    let admitted_context = cx.with_cancellation(combined);
 
     let (stream, metadata) = gate.admit(|| {
         let metadata = Arc::new(Mutex::new(AssistantResponseMetadata::default()));
@@ -280,6 +284,62 @@ pub(crate) async fn stream_harness_deferred(
         metadata,
     )
     .await
+}
+
+/// Creates a token cancelled by the caller context and the drive gate.
+///
+/// The provider signal must observe both sources: cancelling the caller
+/// context cancels the returned token through parent propagation, and an
+/// aborting drive cancels it through the link task. Cancelling the returned
+/// token does not affect either parent; dropping the returned [`CancelLink`]
+/// aborts the link task.
+fn combined_cancellation(
+    parent: Option<&CancellationToken>,
+    gate: &CancellationToken,
+) -> (CancellationToken, CancelLink) {
+    let Some(parent) = parent else {
+        return (gate.child_token(), CancelLink::none());
+    };
+
+    let combined = parent.child_token();
+    if combined.is_cancelled() {
+        return (combined, CancelLink::none());
+    }
+
+    if gate.is_cancelled() {
+        combined.cancel();
+        return (combined, CancelLink::none());
+    }
+
+    let combined_for_task = combined.clone();
+    let gate = gate.clone();
+    let handle = tokio::spawn(async move {
+        gate.cancelled().await;
+        combined_for_task.cancel();
+    });
+
+    (combined, CancelLink::some(handle))
+}
+
+/// Aborts the background cancellation-link task when the request settles.
+struct CancelLink(Option<JoinHandle<()>>);
+
+impl CancelLink {
+    fn none() -> Self {
+        Self(None)
+    }
+
+    fn some(handle: JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+}
+
+impl Drop for CancelLink {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Options for one deferred poll: a single non-waiting fetch.
@@ -719,6 +779,11 @@ pub fn reduce_persisted_frames(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
+
+    use crate::harness::gate::{SharedCancellation, create_gate};
+    use crate::message::user_text;
+    use futures::FutureExt;
 
     fn options() -> HarnessStreamOptions {
         HarnessStreamOptions {
@@ -834,6 +899,352 @@ mod tests {
         assert_eq!(
             options.extra_value(pi_ai::StreamOptionKey::WAIT),
             Some(&Value::from(0_u64))
+        );
+    }
+
+    const STARTUP: Duration = Duration::from_secs(5);
+    const SETTLE: Duration = Duration::from_secs(10);
+
+    fn fixture_model() -> pi_ai::Model {
+        pi_ai::Model {
+            id: "signal-model".to_owned(),
+            name: "Signal model".to_owned(),
+            api: "signal-api".to_owned(),
+            provider: "signal-provider".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: Vec::new(),
+            input_limits: None,
+            cost: pi_ai::ModelCost::default(),
+            prompt_cache: None,
+            sampling_params: None,
+            context_window: 8192,
+            max_tokens: 1024,
+            headers: None,
+            compat: None,
+            extra: BTreeMap::default(),
+        }
+    }
+
+    fn deferred_handle() -> pi_ai::DeferredHandle {
+        pi_ai::DeferredHandle {
+            provider: "signal-provider".to_owned(),
+            model_id: "signal-model".to_owned(),
+            api: "signal-api".to_owned(),
+            id: "response".to_owned(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: None,
+        }
+    }
+
+    /// Provider fixture that holds each request in flight until its signal
+    /// fires, then settles with a semantic aborted-error event.
+    struct SignalModels {
+        signal: Arc<Mutex<Option<CancellationToken>>>,
+    }
+
+    impl SignalModels {
+        fn hold_until_signal(
+            &self,
+            signal: Option<CancellationToken>,
+        ) -> futures::stream::BoxStream<'static, Result<AssistantMessageEvent, ProviderError>>
+        {
+            *self
+                .signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = signal.clone();
+            let mut message =
+                AssistantMessage::new("signal-api", "signal-provider", "signal-model", 1);
+            message.stop_reason = pi_ai::StopReason::Aborted;
+            futures::stream::once(async move {
+                match signal {
+                    Some(signal) => signal.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+                Ok(AssistantMessageEvent::Error {
+                    reason: pi_ai::ErrorReason::Aborted,
+                    error: message,
+                })
+            })
+            .boxed()
+        }
+    }
+
+    impl pi_ai::Provider for SignalModels {
+        fn stream(
+            &self,
+            _model: &pi_ai::Model,
+            _context: pi_ai::Context,
+            options: pi_ai::StreamOptions,
+        ) -> futures::stream::BoxStream<'static, Result<AssistantMessageEvent, ProviderError>>
+        {
+            self.hold_until_signal(options.signal)
+        }
+
+        fn fetch_deferred(
+            &self,
+            _model: &pi_ai::Model,
+            _handle: pi_ai::DeferredHandle,
+            options: pi_ai::StreamOptions,
+        ) -> futures::stream::BoxStream<'static, Result<AssistantMessageEvent, ProviderError>>
+        {
+            self.hold_until_signal(options.signal)
+        }
+    }
+
+    impl HarnessModels for SignalModels {
+        fn get_model(&self, provider: &str, model_id: &str) -> Option<pi_ai::Model> {
+            (provider == "signal-provider" && model_id == "signal-model").then(fixture_model)
+        }
+    }
+
+    struct NoopObserver;
+
+    impl AssistantStreamObserver for NoopObserver {
+        fn start<'a>(
+            &'a self,
+            _message: &'a AssistantMessage,
+            _event: &'a AssistantMessageEvent,
+            _cx: &'a Context,
+        ) -> BoxFuture<'a, Result<(), HarnessFault>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn update<'a>(
+            &'a self,
+            _message: &'a AssistantMessage,
+            _event: &'a AssistantMessageEvent,
+            _cx: &'a Context,
+        ) -> BoxFuture<'a, Result<(), HarnessFault>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn end<'a>(
+            &'a self,
+            _message: &'a SettledAssistantMessage,
+            _cx: &'a Context,
+        ) -> BoxFuture<'a, Result<(), HarnessFault>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn noop_on_response() -> OnResponseFn {
+        Arc::new(|_response: &ProviderResponse, _model: &Model| {
+            Box::pin(async { Ok(()) }) as BoxFuture<'_, Result<(), ProviderError>>
+        })
+    }
+
+    fn assistant_config(models: Arc<dyn HarnessModels>) -> HarnessAssistantStreamConfig {
+        HarnessAssistantStreamConfig {
+            models,
+            model: fixture_model(),
+            session_id: "session".to_owned(),
+            system_prompt: String::new(),
+            tools: Vec::new(),
+            thinking_level: ModelThinkingLevel::Off,
+            stream_options: HarnessStreamOptions::default(),
+            transform_context: None,
+            to_provider_messages: Arc::new(|_messages, _cx| {
+                Box::pin(async { Ok(Vec::<pi_ai::Message>::new()) })
+                    as BoxFuture<'static, Result<Vec<pi_ai::Message>, HarnessError>>
+            }),
+            on_payload: None,
+            on_response: Some(noop_on_response()),
+            after_response: None,
+            observer: Arc::new(NoopObserver),
+        }
+    }
+
+    fn deferred_config(models: Arc<dyn HarnessModels>) -> HarnessDeferredStreamConfig {
+        HarnessDeferredStreamConfig {
+            models,
+            model: fixture_model(),
+            session_id: "session".to_owned(),
+            thinking_level: ModelThinkingLevel::Off,
+            stream_options: HarnessStreamOptions::default(),
+            on_payload: None,
+            on_response: Some(noop_on_response()),
+            after_response: None,
+            observer: Arc::new(NoopObserver),
+        }
+    }
+
+    /// Waits until the fixture provider captured its cancellation signal.
+    async fn captured_signal(slot: &Arc<Mutex<Option<CancellationToken>>>) -> CancellationToken {
+        loop {
+            let captured = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(signal) = captured {
+                return signal;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    fn spawn_assistant_request(
+        slot: Arc<Mutex<Option<CancellationToken>>>,
+        gate: Gate,
+        cx: Context,
+    ) -> JoinHandle<Result<SettledAssistantMessage, HarnessStreamError>> {
+        tokio::spawn(async move {
+            let models: Arc<dyn HarnessModels> = Arc::new(SignalModels { signal: slot });
+            let config = assistant_config(models);
+            let messages = vec![user_text("hi", Vec::<pi_ai::ImageContent>::new())];
+            stream_harness_assistant(&messages, &config, &gate, &cx).await
+        })
+    }
+
+    fn spawn_deferred_request(
+        slot: Arc<Mutex<Option<CancellationToken>>>,
+        gate: Gate,
+        cx: Context,
+    ) -> JoinHandle<Result<SettledAssistantMessage, HarnessStreamError>> {
+        tokio::spawn(async move {
+            let models: Arc<dyn HarnessModels> = Arc::new(SignalModels { signal: slot });
+            let config = deferred_config(models);
+            stream_harness_deferred(&config, deferred_handle(), &gate, &cx).await
+        })
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::expect_used,
+        reason = "timeout probes need contextual failure messages"
+    )]
+    async fn caller_cancellation_terminates_an_in_flight_provider_request() {
+        let (gate, _control) = create_gate();
+        let caller = CancellationToken::new();
+        let cx = Context::background().with_cancellation(caller.clone());
+
+        let signal_slot = Arc::new(Mutex::new(None));
+        let request = spawn_assistant_request(Arc::clone(&signal_slot), gate.clone(), cx);
+
+        let signal = tokio::time::timeout(STARTUP, captured_signal(&signal_slot))
+            .await
+            .expect("provider request must start and receive a signal");
+
+        // Caller cancellation alone: the gate is never aborted.
+        caller.cancel();
+
+        let settled = tokio::time::timeout(SETTLE, request)
+            .await
+            .expect("caller cancellation must terminate the in-flight provider request")
+            .expect("request task must not fail")
+            .expect("cancelled stream settles with a semantic error event");
+
+        assert_eq!(settled.get().stop_reason, pi_ai::StopReason::Aborted);
+        assert!(signal.is_cancelled());
+        assert!(!gate.token().is_cancelled());
+        assert!(
+            gate.admit(|| ()).is_ok(),
+            "caller cancellation must not abort the gate"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::expect_used,
+        reason = "timeout probes need contextual failure messages"
+    )]
+    async fn caller_cancellation_terminates_an_in_flight_deferred_poll() {
+        let (gate, _control) = create_gate();
+        let caller = CancellationToken::new();
+        let cx = Context::background().with_cancellation(caller.clone());
+
+        let signal_slot = Arc::new(Mutex::new(None));
+        let request = spawn_deferred_request(Arc::clone(&signal_slot), gate.clone(), cx);
+
+        let signal = tokio::time::timeout(STARTUP, captured_signal(&signal_slot))
+            .await
+            .expect("deferred poll must start and receive a signal");
+
+        caller.cancel();
+
+        let settled = tokio::time::timeout(SETTLE, request)
+            .await
+            .expect("caller cancellation must terminate the in-flight deferred poll")
+            .expect("poll task must not fail")
+            .expect("cancelled stream settles with a semantic error event");
+
+        assert_eq!(settled.get().stop_reason, pi_ai::StopReason::Aborted);
+        assert!(signal.is_cancelled());
+        assert!(!gate.token().is_cancelled());
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::expect_used,
+        reason = "timeout probes need contextual failure messages"
+    )]
+    async fn gate_abort_terminates_an_in_flight_provider_request() {
+        let (gate, control) = create_gate();
+        let cx = Context::background();
+
+        let signal_slot = Arc::new(Mutex::new(None));
+        let request = spawn_assistant_request(Arc::clone(&signal_slot), gate.clone(), cx);
+
+        let signal = tokio::time::timeout(STARTUP, captured_signal(&signal_slot))
+            .await
+            .expect("provider request must start and receive a signal");
+
+        let gate_token = gate.token().clone();
+        let abort_future: BoxFuture<'static, ()> =
+            Box::pin(async move { gate_token.cancelled().await });
+        let cancellation: SharedCancellation = abort_future.shared();
+        control.begin_abort(cancellation);
+        control.signal_abort();
+
+        let settled = tokio::time::timeout(SETTLE, request)
+            .await
+            .expect("gate abort must terminate the in-flight provider request")
+            .expect("request task must not fail")
+            .expect("aborted stream settles with a semantic error event");
+
+        assert_eq!(settled.get().stop_reason, pi_ai::StopReason::Aborted);
+        assert!(signal.is_cancelled());
+        assert!(gate.token().is_cancelled());
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::expect_used,
+        reason = "timeout probes need contextual failure messages"
+    )]
+    async fn gate_abort_reaches_the_provider_signal_through_a_live_caller_context() {
+        let (gate, control) = create_gate();
+        let caller = CancellationToken::new();
+        let cx = Context::background().with_cancellation(caller.clone());
+
+        let signal_slot = Arc::new(Mutex::new(None));
+        let request = spawn_assistant_request(Arc::clone(&signal_slot), gate.clone(), cx);
+
+        let signal = tokio::time::timeout(STARTUP, captured_signal(&signal_slot))
+            .await
+            .expect("provider request must start and receive a signal");
+
+        let gate_token = gate.token().clone();
+        let abort_future: BoxFuture<'static, ()> =
+            Box::pin(async move { gate_token.cancelled().await });
+        let cancellation: SharedCancellation = abort_future.shared();
+        control.begin_abort(cancellation);
+        control.signal_abort();
+
+        let settled = tokio::time::timeout(SETTLE, request)
+            .await
+            .expect("gate abort must terminate the in-flight provider request")
+            .expect("request task must not fail")
+            .expect("aborted stream settles with a semantic error event");
+
+        assert_eq!(settled.get().stop_reason, pi_ai::StopReason::Aborted);
+        assert!(signal.is_cancelled());
+        assert!(gate.token().is_cancelled());
+        assert!(
+            !caller.is_cancelled(),
+            "gate abort must not cancel the caller context"
         );
     }
 }

@@ -1,5 +1,6 @@
 //! Durable operation driver: state dispatch, provider responses, tools, and recovery.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -610,7 +611,10 @@ async fn maybe_start_compaction(
     let entries = branch_entries(branch.as_ref(), cx)
         .await
         .map_err(map_session_error)?;
-    if !force && !compaction_threshold_met(&entries, &model, &settings) {
+    let entry_projectors = lane.owner.config_snapshot().await.entry_projectors;
+    if !force
+        && !compaction_threshold_met(&entries, &model, &settings, &entry_projectors, cx).await?
+    {
         return Ok(None);
     }
     let preparation = match crate::harness::compaction::prepare_compaction(&entries, &settings) {
@@ -673,22 +677,95 @@ async fn maybe_start_compaction(
 }
 
 /// Whether the retained context crosses the configured compaction threshold.
-fn compaction_threshold_met(
+///
+/// The estimate reads the same post-compaction projection the model requests
+/// use ([`context_messages`]), so entries folded behind the latest compaction
+/// no longer count toward the threshold.
+async fn compaction_threshold_met(
     entries: &[crate::session::Entry],
     model: &pi_ai::Model,
     settings: &crate::session::configuration::CompactionSettings,
-) -> bool {
-    let context_tokens = entries
-        .iter()
-        .filter_map(crate::session::Entry::message)
-        .map(crate::harness::compaction::estimate_tokens)
-        .fold(0_u64, u64::saturating_add);
+    entry_projectors: &HashMap<String, crate::session::EntryProjector>,
+    cx: &Context,
+) -> Result<bool, HarnessError> {
+    let context_tokens = projected_context_tokens(entries, entry_projectors, cx).await?;
     let context_window = if model.context_window == 0 {
         128_000
     } else {
         model.context_window
     };
-    crate::harness::compaction::should_compact(context_tokens, context_window, settings)
+    Ok(crate::harness::compaction::should_compact(
+        context_tokens,
+        context_window,
+        settings,
+    ))
+}
+
+/// Token estimate for the live projected context.
+///
+/// Projects entries exactly like the model-request path ([`context_messages`]),
+/// tracking which entry produced each message. Mirrors
+/// `estimateProjectedContextTokens` in `compaction.ts`: provider usage anchors
+/// the total only when its assistant message lives after the latest compaction
+/// entry. An anchor retained by the compaction itself still reflects the
+/// pre-compaction context and would re-trigger compaction on every turn, so
+/// such estimates fall back to the per-message character estimate.
+async fn projected_context_tokens(
+    entries: &[crate::session::Entry],
+    entry_projectors: &HashMap<String, crate::session::EntryProjector>,
+    cx: &Context,
+) -> Result<u64, HarnessError> {
+    let projected = crate::harness::compaction::build_context_entries(entries);
+    let mut messages = Vec::new();
+    // Message count and compaction flag per projected entry, so the usage
+    // anchor can be attributed to its owning entry.
+    let mut entry_shapes: Vec<(usize, bool)> = Vec::with_capacity(projected.len());
+    for entry in projected {
+        let start = messages.len();
+        if let crate::session::Entry::Custom { custom_type, .. } = entry {
+            if let Some(projector) = entry_projectors.get(custom_type) {
+                messages.extend(
+                    projector(entry.clone(), cx.clone())
+                        .await
+                        .map_err(map_session_error)?
+                        .unwrap_or_default(),
+                );
+            }
+        } else {
+            messages.extend(crate::harness::compaction::session_entry_to_context_messages(entry));
+        }
+        entry_shapes.push((
+            messages.len() - start,
+            matches!(entry, crate::session::Entry::Compaction { .. }),
+        ));
+    }
+    let estimate = crate::harness::compaction::estimate_context_tokens(&messages);
+    let Some(anchor_index) = estimate.last_usage_index else {
+        return Ok(estimate.tokens);
+    };
+    let latest_compaction = entry_shapes
+        .iter()
+        .rposition(|(_, is_compaction)| *is_compaction);
+    let Some(compaction_position) = latest_compaction else {
+        return Ok(estimate.tokens);
+    };
+    // Entry that produced the anchored assistant message.
+    let mut offset = 0;
+    let mut anchor_entry = None;
+    for (position, (count, _)) in entry_shapes.iter().enumerate() {
+        if anchor_index < offset + *count {
+            anchor_entry = Some(position);
+            break;
+        }
+        offset += *count;
+    }
+    if anchor_entry.is_some_and(|position| position > compaction_position) {
+        return Ok(estimate.tokens);
+    }
+    Ok(messages
+        .iter()
+        .map(crate::harness::compaction::estimate_tokens)
+        .fold(0_u64, u64::saturating_add))
 }
 
 /// Settle the operation as failed with a plain operation error.
@@ -2458,15 +2535,7 @@ async fn execute_tool(
         turn_id: batch.turn_id.clone(),
         entry_id: record.result_entry_id.clone(),
     };
-    let updates = Arc::new(Mutex::new(Vec::<AgentToolResult>::new()));
-    let updates_sink = crate::harness::tool::ToolUpdateSink::new({
-        let updates = Arc::clone(&updates);
-        move |result, _checkpoint| {
-            if let Ok(mut values) = updates.lock() {
-                values.push(result);
-            }
-        }
-    });
+    let updates_sink = crate::harness::tool::ToolUpdateSink::new(|_result, _checkpoint| {});
     lane.emit(
         HarnessEventPayload::ToolStart {
             run_id: operation.meta.operation_id.clone(),
@@ -2518,11 +2587,8 @@ async fn execute_tool(
         )
     };
     updates_sink.stop_accepting();
-    let partials = updates
-        .lock()
-        .map(|values| values.clone())
-        .unwrap_or_default();
-    for partial in partials {
+    // Quiesced above, so the drain is the complete admission-ordered record.
+    for partial in updates_sink.take_updates() {
         lane.emit(
             HarnessEventPayload::ToolUpdate {
                 run_id: operation.meta.operation_id.clone(),
@@ -5051,6 +5117,156 @@ mod tests {
         assert!(matches!(second, RunOutcome::Settled(_)));
 
         harness.close(&cx).await?;
+        Ok(())
+    }
+
+    fn threshold_settings() -> CompactionSettings {
+        CompactionSettings {
+            enabled: true,
+            reserve_tokens: 4096,
+            keep_recent_tokens: 100,
+        }
+    }
+
+    fn entry_base(id: &str) -> crate::session::EntryBase {
+        crate::session::EntryBase {
+            id: EntryId::new(id),
+            parent_id: None,
+            seq: 0,
+            timestamp: 1,
+            custom_type: None,
+        }
+    }
+
+    fn user_entry(id: &str, text: &str) -> Entry {
+        Entry::Message {
+            base: entry_base(id),
+            message: AgentMessage::Llm(Box::new(pi_ai::Message::User(pi_ai::UserMessage::new(
+                pi_ai::UserMessageContent::Text(text.to_owned()),
+                1,
+            )))),
+            terminate: false,
+        }
+    }
+
+    fn assistant_entry(id: &str, text: &str, usage: pi_ai::Usage) -> Entry {
+        let mut assistant = pi_ai::AssistantMessage::new("k", "m", "p", 1);
+        assistant.content = vec![pi_ai::AssistantContent::Text(pi_ai::TextContent::new(text))];
+        assistant.stop_reason = pi_ai::StopReason::Stop;
+        assistant.usage = usage;
+        Entry::Message {
+            base: entry_base(id),
+            message: AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(Box::new(assistant)))),
+            terminate: false,
+        }
+    }
+
+    fn compaction_entry(id: &str, summary: &str, retained_tail: Vec<AgentMessage>) -> Entry {
+        Entry::Compaction {
+            base: entry_base(id),
+            summary: summary.to_owned(),
+            retained_tail,
+            tokens_before: 0,
+            details: None,
+            usage: None,
+            from_hook: false,
+        }
+    }
+
+    fn heavy_usage() -> pi_ai::Usage {
+        pi_ai::Usage {
+            input: 8_000,
+            total_tokens: 8_000,
+            ..pi_ai::Usage::default()
+        }
+    }
+
+    /// The threshold reads the post-compaction projection the model requests
+    /// use: history folded behind a compaction no longer trips it, and the
+    /// same history keeps tripping it while it is live.
+    #[tokio::test]
+    async fn compaction_threshold_estimates_projected_context_not_raw_path()
+    -> Result<(), Box<dyn Error>> {
+        let cx = Context::background();
+        let projectors = HashMap::new();
+        let model = fixture_model();
+        let settings = threshold_settings();
+
+        // 40_000 characters (~10_000 estimated tokens) live context crosses
+        // the 8_192 - 4_096 token threshold.
+        let live = vec![user_entry("history", &"x".repeat(40_000))];
+        assert!(
+            compaction_threshold_met(&live, &model, &settings, &projectors, &cx).await?,
+            "live history above threshold must trip compaction"
+        );
+
+        // The same history folded behind a compaction leaves a tiny live
+        // context: re-checking the raw path would re-trigger compaction.
+        let compacted = vec![
+            user_entry("history", &"x".repeat(40_000)),
+            compaction_entry("compaction", "s", Vec::new()),
+            user_entry("tail", "hi"),
+        ];
+        assert!(
+            !compaction_threshold_met(&compacted, &model, &settings, &projectors, &cx).await?,
+            "post-compaction context below threshold must not re-trigger"
+        );
+        Ok(())
+    }
+
+    /// Usage retained inside a compaction entry reflects the pre-compaction
+    /// context; it must not anchor the post-compaction estimate, or every
+    /// turn after a compaction would re-trigger one.
+    #[tokio::test]
+    async fn compaction_threshold_ignores_stale_pre_compaction_usage() -> Result<(), Box<dyn Error>>
+    {
+        let cx = Context::background();
+        let projectors = HashMap::new();
+        let model = fixture_model();
+        let settings = threshold_settings();
+
+        let compacted = vec![
+            user_entry("history", &"x".repeat(40_000)),
+            compaction_entry(
+                "compaction",
+                "s",
+                vec![AgentMessage::Llm(Box::new({
+                    let mut assistant = pi_ai::AssistantMessage::new("k", "m", "p", 1);
+                    assistant.content =
+                        vec![pi_ai::AssistantContent::Text(pi_ai::TextContent::new("hi"))];
+                    assistant.stop_reason = pi_ai::StopReason::Stop;
+                    assistant.usage = heavy_usage();
+                    pi_ai::Message::Assistant(Box::new(assistant))
+                }))],
+            ),
+            user_entry("tail", "hi"),
+        ];
+        assert!(
+            !compaction_threshold_met(&compacted, &model, &settings, &projectors, &cx).await?,
+            "stale pre-compaction usage must not anchor the estimate"
+        );
+        Ok(())
+    }
+
+    /// Usage produced after the latest compaction is live and must anchor the
+    /// estimate: real provider usage trips the threshold even when character
+    /// estimates alone stay far below it.
+    #[tokio::test]
+    async fn compaction_threshold_trusts_post_compaction_usage() -> Result<(), Box<dyn Error>> {
+        let cx = Context::background();
+        let projectors = HashMap::new();
+        let model = fixture_model();
+        let settings = threshold_settings();
+
+        let fresh_usage = vec![
+            user_entry("history", &"x".repeat(40_000)),
+            compaction_entry("compaction", "s", Vec::new()),
+            assistant_entry("fresh", "hi", heavy_usage()),
+        ];
+        assert!(
+            compaction_threshold_met(&fresh_usage, &model, &settings, &projectors, &cx).await?,
+            "post-compaction usage must anchor the estimate"
+        );
         Ok(())
     }
 }

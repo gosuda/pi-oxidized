@@ -14,8 +14,7 @@
 
 use std::any::Any;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -313,7 +312,7 @@ fn parse_tool_result(frame: &Frame) -> Result<AgentToolResult, ToolError> {
 pub struct ExtensionProvider {
     provider_id: String,
     client: Arc<HostClient>,
-    timeout: Arc<AtomicU64>,
+    timeout: Arc<Mutex<Duration>>,
     capabilities: ProviderCapabilities,
     deferred: Option<DeferredCallbacks>,
     /// Test-only probe notified immediately before a bounded consumer send
@@ -334,7 +333,7 @@ impl ExtensionProvider {
         Self {
             provider_id: provider_id.into(),
             client,
-            timeout: Arc::new(AtomicU64::new(timeout_millis(DEFAULT_CALL_TIMEOUT))),
+            timeout: Arc::new(Mutex::new(DEFAULT_CALL_TIMEOUT)),
             capabilities: ProviderCapabilities {
                 stream_simple: true,
                 ..ProviderCapabilities::default()
@@ -424,10 +423,15 @@ impl ExtensionProvider {
     }
 
     /// Override the per-call deadline.
+    ///
+    /// The deadline is stored exactly; sub-millisecond values are honored
+    /// instead of truncating to whole milliseconds.
     #[must_use]
     pub fn with_timeout(self, timeout: Duration) -> Self {
-        self.timeout
-            .store(timeout_millis(timeout), Ordering::Relaxed);
+        *self
+            .timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
         self
     }
 
@@ -617,12 +621,10 @@ fn extension_context(context: Context) -> Context {
     }
 }
 
-fn timeout_millis(timeout: Duration) -> u64 {
-    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
-}
-
-fn current_timeout(timeout: &AtomicU64) -> Duration {
-    Duration::from_millis(timeout.load(Ordering::Relaxed))
+fn current_timeout(timeout: &Mutex<Duration>) -> Duration {
+    *timeout
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn callback_flags(options: &StreamOptions) -> ProviderCallbackFlags {
@@ -2299,6 +2301,55 @@ mod tests {
                 "unexpected deferred cancellation timeout: {error}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_provider_sub_millisecond_timeout_round_trips_exactly() -> R {
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let handle = DeferredHandle {
+            provider: "custom".to_owned(),
+            model_id: "m".to_owned(),
+            api: "custom".to_owned(),
+            id: "deferred-sub-ms".to_owned(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: None,
+        };
+        let capabilities = ProviderCapabilities {
+            stream_simple: false,
+            fetch_deferred: true,
+            cancel_deferred: true,
+        };
+        let (client, mut host) = make_pair().await;
+        let provider = ExtensionProvider::new("custom", Arc::new(client))
+            .with_timeout(Duration::from_millis(10))
+            .with_capabilities(capabilities)
+            .with_timeout(Duration::from_micros(500));
+        let cancel =
+            tokio::spawn(provider.cancel_deferred(&model, handle, StreamOptions::default()));
+        let _request = host
+            .require_frame(methods::PROVIDER_CANCEL_DEFERRED)
+            .await?;
+        let result = tokio::time::timeout(Duration::from_secs(1), cancel).await??;
+        let Err(error) = result else {
+            return Err("deferred cancellation unexpectedly succeeded".into());
+        };
+        let message = error.to_string();
+        assert!(
+            !message.contains("after 0ms"),
+            "sub-millisecond deadline truncated to an immediate timeout: {message}"
+        );
+        assert!(
+            message.contains("after 500µs"),
+            "sub-millisecond deadline must round-trip exactly, got: {message}"
+        );
         Ok(())
     }
 

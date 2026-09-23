@@ -240,12 +240,18 @@ fn make_properties_strict(
     };
     for (name, property) in properties {
         make_json_schema_node_strict(property)?;
-        if !required.contains(name) && !schema_allows_null(property) {
-            *property = Value::Object(Map::from_iter([(
-                "anyOf".to_owned(),
-                Value::Array(vec![property.clone(), serde_json::json!({"type": "null"})]),
-            )]));
+        if required.contains(name) || schema_allows_null(property) {
+            continue;
         }
+        if is_structured_schema(property) {
+            return Err(UnsupportedStrictJsonSchema(
+                "optional object and array properties are unsupported".into(),
+            ));
+        }
+        *property = Value::Object(Map::from_iter([(
+            "anyOf".to_owned(),
+            Value::Array(vec![property.clone(), serde_json::json!({"type": "null"})]),
+        )]));
     }
     Ok(())
 }
@@ -259,7 +265,8 @@ fn make_properties_strict(
 /// `patternProperties`, `dependentSchemas`, `dependencies`,
 /// `unevaluatedProperties`, `propertyNames`, `contains`, `prefixItems`, `not`,
 /// `if`, `then`, `else`, tuple `items`, structured `anyOf` variants,
-/// schema-valued or `true` `additionalProperties`, or a non-object root.
+/// schema-valued or `true` `additionalProperties`, optional object or array
+/// properties, or a non-object root.
 pub fn make_strict_json_schema(schema: &Value) -> Result<Value, UnsupportedStrictJsonSchema> {
     let mut cloned = schema.clone();
     if !cloned.is_object() {
@@ -752,6 +759,34 @@ mod tests {
         assert_eq!(error.to_string(), "required contains an unknown property");
     }
 
+    #[test]
+    fn strict_rejects_optional_object_and_array_properties() {
+        let error = make_strict_json_schema(&json!({
+            "type": "object",
+            "properties": {
+                "filter": {"type": "object", "properties": {"q": {"type": "string"}}}
+            },
+            "required": []
+        }))
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "optional object and array properties are unsupported"
+        );
+        let error = make_strict_json_schema(&json!({
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": []
+        }))
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "optional object and array properties are unsupported"
+        );
+    }
+
     // ----- make_strict_json_schema: V1/V2 boundary transforms -----
 
     #[test]
@@ -901,6 +936,39 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Tool \"x\" requires JSON-schema constrained sampling, but strict tools are unsupported."
+        );
+    }
+
+    #[test]
+    fn resolve_json_schema_require_rejects_optional_object_property_with_exact_message() {
+        let t = json_schema_tool(
+            "x",
+            json!({
+                "type": "object",
+                "properties": {"filter": {"type": "object", "properties": {}}},
+                "required": []
+            }),
+            StrictMode::Require,
+        );
+        let error = resolve_json_schema_strict_sampling(&t, true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Tool \"x\" requires JSON-schema constrained sampling, but optional object and array properties are unsupported."
+        );
+    }
+
+    #[test]
+    fn resolve_json_schema_prefer_falls_back_on_optional_object_property() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"filter": {"type": "object", "properties": {}}},
+            "required": []
+        });
+        let t = json_schema_tool("x", schema.clone(), StrictMode::Prefer);
+        assert_eq!(resolve_json_schema_strict_sampling(&t, true).unwrap(), None);
+        assert_eq!(
+            t.parameters, schema,
+            "schema must remain verbatim on fallback"
         );
     }
 

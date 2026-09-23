@@ -43,7 +43,7 @@ impl HarnessRuntime {
     pub(crate) async fn create(
         options: AgentHarnessOptions,
         cx: &Context,
-    ) -> Result<(Arc<dyn AgentHarness>, Vec<OpenOperation>), HarnessError> {
+    ) -> Result<(Arc<HarnessRuntime>, Vec<OpenOperation>), HarnessError> {
         let retry = options.retry.unwrap_or_default();
         retry
             .validate()
@@ -112,8 +112,7 @@ impl HarnessRuntime {
                 lanes.insert(name, lane);
             }
         }
-        let harness: Arc<dyn AgentHarness> = runtime;
-        Ok((harness, open))
+        Ok((runtime, open))
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -188,7 +187,8 @@ impl AgentHarnessBuilder {
         options: AgentHarnessOptions,
         cx: &Context,
     ) -> Result<(Arc<dyn AgentHarness>, Vec<OpenOperation>), HarnessError> {
-        HarnessRuntime::create(options, cx).await
+        let (runtime, open) = HarnessRuntime::create(options, cx).await?;
+        Ok((runtime, open))
     }
 }
 
@@ -413,6 +413,9 @@ impl AgentHarness for HarnessRuntime {
             // on harness locks or lane data.
             let lanes = self.lanes.lock().await;
             let mut config = self.config.write().await;
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             let offered: std::collections::BTreeSet<&str> =
                 tools.iter().map(|tool| tool.name()).collect();
             for name in lanes.keys() {
@@ -469,7 +472,15 @@ impl AgentHarness for HarnessRuntime {
             if self.is_closed() {
                 return Err(self.closed_error());
             }
-            self.config.write().await.resources = resources;
+            // close() seals the runtime without taking the config lock, so
+            // re-admit under the write lock: a setter that passed the
+            // pre-lock check while queued on it must not mutate a sealed
+            // runtime.
+            let mut config = self.config.write().await;
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
+            config.resources = resources;
             self.events
                 .emit(
                     HarnessEvent::global(HarnessEventPayload::ConfigUpdate {
@@ -499,6 +510,9 @@ impl AgentHarness for HarnessRuntime {
                 return Err(self.closed_error());
             }
             let mut config = self.config.write().await;
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             let previous = config.stream_options.clone();
             config.stream_options = options.clone();
             drop(config);
@@ -541,6 +555,9 @@ impl AgentHarness for HarnessRuntime {
                     message: "retry policy cannot be represented safely".to_owned(),
                 })?;
             let mut config = self.config.write().await;
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             let previous = config.retry;
             config.retry = policy;
             drop(config);
@@ -576,6 +593,9 @@ impl AgentHarness for HarnessRuntime {
                 return Err(self.closed_error());
             }
             let mut config = self.config.write().await;
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             let previous = config.compaction;
             config.compaction = settings;
             drop(config);
@@ -611,6 +631,9 @@ impl AgentHarness for HarnessRuntime {
                 return Err(self.closed_error());
             }
             let mut config = self.config.write().await;
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             let previous = config.steering_mode;
             config.steering_mode = mode;
             drop(config);
@@ -646,6 +669,9 @@ impl AgentHarness for HarnessRuntime {
                 return Err(self.closed_error());
             }
             let mut config = self.config.write().await;
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
             let previous = config.follow_up_mode;
             config.follow_up_mode = mode;
             drop(config);
@@ -791,7 +817,7 @@ mod tests {
     use futures::stream::{self, BoxStream, StreamExt};
 
     use super::*;
-    use crate::harness::api::HarnessModels;
+    use crate::harness::api::{HarnessModels, PromptTemplate};
     use crate::harness::event::{EventListener, HarnessEventType};
     use crate::session::{
         HarnessRetryPolicy, HarnessStreamOptions, MemoryStorage, SessionMetadata,
@@ -846,7 +872,7 @@ mod tests {
         }
     }
 
-    async fn build_harness(cx: &Context) -> Result<Arc<dyn AgentHarness>, Box<dyn Error>> {
+    async fn build_runtime(cx: &Context) -> Result<Arc<HarnessRuntime>, Box<dyn Error>> {
         let session = StorageBackedSession::new(
             SessionMetadata {
                 id: "retry-closed".to_owned(),
@@ -863,7 +889,7 @@ mod tests {
         let models = Arc::new(ClosedModels {
             model: fixture_model(),
         });
-        let (harness, _) = AgentHarnessBuilder::create(
+        let (runtime, _) = HarnessRuntime::create(
             AgentHarnessOptions {
                 session,
                 models: models.clone(),
@@ -886,7 +912,7 @@ mod tests {
             cx,
         )
         .await?;
-        Ok(harness)
+        Ok(runtime)
     }
 
     /// A closed harness must reject a retry-policy change with the sealed
@@ -896,7 +922,7 @@ mod tests {
     async fn closed_harness_rejects_retry_policy_change_and_emits_no_event()
     -> Result<(), Box<dyn Error>> {
         let cx = Context::background();
-        let harness = build_harness(&cx).await?;
+        let harness = build_runtime(&cx).await?;
 
         let config_updates = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&config_updates);
@@ -946,6 +972,57 @@ mod tests {
         assert_eq!(
             after, pre_close,
             "closed harness must not mutate the sealed retry policy",
+        );
+        Ok(())
+    }
+
+    /// A close that lands while a setter waits for the config write lock
+    /// must leave the configuration untouched and reject the setter with
+    /// the closed error: the pre-lock admission check alone races with
+    /// `close()`, which seals the runtime without taking the config lock.
+    #[tokio::test]
+    async fn close_during_set_resources_leaves_config_unmutated_and_returns_closed_error()
+    -> Result<(), Box<dyn Error>> {
+        let cx = Context::background();
+        let runtime = build_runtime(&cx).await?;
+
+        // Hold the config write lock so the setter parks between its
+        // pre-lock admission check and the mutation — the exact window
+        // close() races into.
+        let guard = runtime.config.write().await;
+        let pending = runtime.set_resources(
+            HarnessResources {
+                prompt_templates: vec![PromptTemplate {
+                    name: "late".to_owned(),
+                    description: None,
+                    content: "installed after seal".to_owned(),
+                }],
+                skills: Vec::new(),
+            },
+            &cx,
+        );
+        tokio::pin!(pending);
+        // Exactly one poll: the setter passes the pre-lock check and parks
+        // on the held write lock.
+        let first = pending.as_mut().now_or_never();
+        assert!(
+            first.is_none(),
+            "setter must park waiting for the config write lock",
+        );
+
+        runtime.close(&cx).await?;
+        drop(guard);
+
+        let result = pending.await;
+        assert!(
+            matches!(result, Err(HarnessError::Closed { .. })),
+            "close during set must reject the setter, got {result:?}",
+        );
+
+        let after = runtime.get_resources(&cx).await?;
+        assert!(
+            after.prompt_templates.is_empty() && after.skills.is_empty(),
+            "close during set must leave the resources untouched, got {after:?}",
         );
         Ok(())
     }

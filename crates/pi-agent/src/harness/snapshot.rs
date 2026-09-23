@@ -526,9 +526,9 @@ fn reduce_entry_queue_usage_config(
                     .running_tools
                     .retain(|tool| tool.tool_call_id() != tool_call_id);
             }
-            if entry.entry_type() == EntryType::Compaction {
-                snapshot.transcript.clear();
-            }
+            // Compaction appends a summary entry without truncating branch
+            // ancestry, and fresh snapshots load that full ancestry, so the
+            // incremental transcript appends the entry like any other.
             snapshot.transcript.push(entry.clone());
             snapshot.tip_id = Some(entry.id().clone());
             if entry.entry_type() == EntryType::Message {
@@ -707,5 +707,105 @@ fn tool_result_call_id(message: &AgentMessage) -> Option<&str> {
     match message.as_llm()? {
         Message::ToolResult(tool_result) => Some(&tool_result.tool_call_id),
         Message::System(_) | Message::User(_) | Message::Assistant(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{EntryBase, ModelIdentity};
+
+    fn base(id: &str, parent: Option<EntryId>, seq: u64) -> EntryBase {
+        EntryBase {
+            id: EntryId::from(id),
+            parent_id: parent,
+            seq,
+            timestamp: 1,
+            custom_type: None,
+        }
+    }
+
+    fn message_entry(id: &str, parent: Option<EntryId>, seq: u64, text: &str) -> Entry {
+        Entry::Message {
+            base: base(id, parent, seq),
+            message: AgentMessage::Llm(Box::new(Message::User(pi_ai::UserMessage::new(
+                pi_ai::UserMessageContent::Text(text.to_owned()),
+                1,
+            )))),
+            terminate: false,
+        }
+    }
+
+    fn compaction_entry(id: &str, parent: EntryId, seq: u64) -> Entry {
+        Entry::Compaction {
+            base: base(id, Some(parent), seq),
+            summary: "summary".to_owned(),
+            retained_tail: Vec::new(),
+            tokens_before: 10,
+            details: None,
+            usage: None,
+            from_hook: false,
+        }
+    }
+
+    fn entry_added(entry: Entry) -> HarnessEvent {
+        HarnessEvent::lane("lane-a", HarnessEventPayload::EntryAdded { entry })
+    }
+
+    fn snapshot_with_transcript(transcript: Vec<Entry>) -> LaneSnapshot {
+        LaneSnapshot {
+            lane: LaneName::from("lane-a"),
+            tip_id: transcript.last().map(|entry| entry.id().clone()),
+            transcript,
+            last_result: None,
+            configuration: LaneConfiguration {
+                model: ModelIdentity {
+                    provider: "test".to_owned(),
+                    model_id: "test-model".to_owned(),
+                    api: None,
+                },
+                thinking_level: pi_ai::ModelThinkingLevel::Off,
+                active_tool_names: Vec::new(),
+            },
+            stats: SessionStats::default(),
+            operation: None,
+            queues: Vec::new(),
+            faulted: false,
+        }
+    }
+
+    fn transcript_ids(snapshot: &LaneSnapshot) -> Vec<&str> {
+        snapshot
+            .transcript
+            .iter()
+            .map(|entry| entry.id().as_str())
+            .collect()
+    }
+
+    #[test]
+    fn compaction_entry_addition_retains_pre_compaction_history() {
+        let mut snapshot = snapshot_with_transcript(vec![
+            message_entry("u1", None, 1, "hello"),
+            message_entry("a1", Some(EntryId::from("u1")), 2, "hi"),
+        ]);
+
+        let outcome = reduce_lane_snapshot(
+            &mut snapshot,
+            &entry_added(compaction_entry("c1", EntryId::from("a1"), 3)),
+        );
+        assert_eq!(outcome, ReduceOutcome::Updated);
+        // Durable compaction appends the summary entry without truncating
+        // branch ancestry, so a fresh load (LaneRuntime::snapshot reads the
+        // whole branch) still returns every pre-compaction entry.  The
+        // incrementally reduced snapshot must match that transcript.
+        assert_eq!(transcript_ids(&snapshot), vec!["u1", "a1", "c1"]);
+        assert_eq!(snapshot.tip_id.as_ref().map(EntryId::as_str), Some("c1"));
+
+        let outcome = reduce_lane_snapshot(
+            &mut snapshot,
+            &entry_added(message_entry("u2", Some(EntryId::from("c1")), 4, "again")),
+        );
+        assert_eq!(outcome, ReduceOutcome::Updated);
+        assert_eq!(transcript_ids(&snapshot), vec!["u1", "a1", "c1", "u2"]);
     }
 }

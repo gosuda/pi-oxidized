@@ -83,6 +83,11 @@ struct ToolUpdateState {
     callback: Option<ToolUpdateCallback>,
     /// Threads with at least one in-flight callback admission on this sink.
     active_threads: HashMap<ThreadId, usize>,
+    /// Snapshots admitted so far, in admission order. Each `send` records its
+    /// snapshot under the same mutex hold that admits the callback, so this
+    /// log's order is the admission order even when callbacks run concurrently
+    /// and complete out of order.
+    recorded: Vec<AgentToolResult>,
 }
 
 /// Retires one admitted callback when the `send` that admitted it finishes:
@@ -115,7 +120,9 @@ impl Drop for InFlightGuard {
 /// Full-snapshot progress sink for one tool invocation.
 ///
 /// Updates are accepted in admission order and delivered as complete snapshots.
-/// Once [`Self::stop_accepting`] returns on the non-reentrant path, no callback
+/// [`Self::take_updates`] replays the admitted snapshots in that admission
+/// order even when concurrent callbacks complete out of order. Once
+/// [`Self::stop_accepting`] returns on the non-reentrant path, no callback
 /// can still be running, so a late tool callback cannot publish after its
 /// durable result has settled.
 pub struct ToolUpdateSink {
@@ -146,6 +153,7 @@ impl ToolUpdateSink {
                     accepting: true,
                     in_flight: 0,
                     active_threads: HashMap::new(),
+                    recorded: Vec::new(),
                     callback: Some(callback),
                 }),
                 Condvar::new(),
@@ -167,6 +175,10 @@ impl ToolUpdateSink {
                 return;
             };
             state.in_flight = state.in_flight.saturating_add(1);
+            // Recorded under the admission lock: this push is the update's
+            // admission sequence, so the recorded order is the admission order
+            // regardless of callback completion order.
+            state.recorded.push(partial.clone());
             let admitting_thread = thread::current().id();
             *state.active_threads.entry(admitting_thread).or_insert(0) += 1;
             (callback, admitting_thread)
@@ -179,6 +191,21 @@ impl ToolUpdateSink {
             admitting_thread,
         };
         callback(partial, checkpoint);
+    }
+
+    /// Drains the admitted snapshots in admission order.
+    ///
+    /// The callback delivers progress out-of-band while the tool runs; this
+    /// returns the admission-ordered record of every snapshot admitted so far.
+    /// After [`Self::stop_accepting`] returns on the non-reentrant path the
+    /// record is complete: no admitted callback can still be running.
+    #[must_use]
+    pub fn take_updates(&self) -> Vec<AgentToolResult> {
+        let (lock, _) = &*self.state;
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut state.recorded)
     }
 
     /// Stops accepting updates and waits for already-admitted callbacks.
@@ -421,5 +448,77 @@ mod tests {
             },
             false,
         );
+    }
+
+    fn snapshot(step: u64) -> AgentToolResult {
+        AgentToolResult {
+            details: json!({"step": step}),
+            ..AgentToolResult::default()
+        }
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test asserts sender thread join via expect"
+    )]
+    #[test]
+    fn concurrent_sends_drain_updates_in_admission_order() {
+        // Admission order is A then B; callback completion order is B then A.
+        // The drained record must follow admission order, not completion order.
+        let a_admitted = Arc::new(std::sync::Barrier::new(2));
+        let release_a = Arc::new(std::sync::Barrier::new(2));
+        let completion = Arc::new(Mutex::new(Vec::<u64>::new()));
+
+        let admitted = Arc::clone(&a_admitted);
+        let release = Arc::clone(&release_a);
+        let done = Arc::clone(&completion);
+        let sink = ToolUpdateSink::new(move |result, _checkpoint| {
+            let step = result.details.get("step").and_then(Value::as_u64);
+            if step == Some(1) {
+                // A: report admission, then park so B's callback completes
+                // first.
+                admitted.wait();
+                release.wait();
+            }
+            done.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(step.unwrap_or_default());
+        });
+
+        let sender = {
+            let sink = sink.clone();
+            thread::spawn(move || sink.send(snapshot(1), false))
+        };
+        // A's callback only runs after its admission, so this barrier proves
+        // A was admitted before the send below.
+        a_admitted.wait();
+
+        sink.send(snapshot(2), false);
+        release_a.wait();
+        sender.join().expect("sender thread panicked");
+
+        let completed = completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            completed,
+            vec![2, 1],
+            "callbacks must complete out of order"
+        );
+
+        let drained: Vec<Value> = sink
+            .take_updates()
+            .into_iter()
+            .map(|result| result.details)
+            .collect();
+        assert_eq!(
+            drained,
+            vec![json!({"step": 1}), json!({"step": 2})],
+            "drained updates must follow admission order"
+        );
+
+        sink.stop_accepting();
+        assert!(!sink.is_accepting());
     }
 }

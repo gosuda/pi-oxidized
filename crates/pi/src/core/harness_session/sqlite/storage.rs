@@ -362,12 +362,14 @@ impl ForkSource for SqliteStorage {
                 .map(decode_entry_row)
                 .collect::<Result<Vec<_>, _>>()?;
             let values = read_all_scalar_values(&transaction, &session_id)?;
+            let usage = read_all_usage_rows(&transaction, &session_id)?;
             transaction
                 .commit()
                 .map_err(|error| db_failure("failed to finish SQLite fork snapshot", error))?;
             Ok(ForkSourceSnapshot {
                 entries,
                 values,
+                usage,
                 entries_complete: true,
             })
         })
@@ -831,6 +833,25 @@ fn read_all_scalar_values(
     for row in rows {
         output.push(decode_scalar_row(row.map_err(|error| {
             db_failure("failed to decode SQLite scalar row", error)
+        })?)?);
+    }
+    Ok(output)
+}
+
+fn read_all_usage_rows(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Vec<UsageRow>, SessionError> {
+    let mut statement = connection
+        .prepare("SELECT id, seq, entry_id, adjustment, usage, details FROM usage_ledger WHERE session_id = ?1 ORDER BY seq ASC")
+        .map_err(|error| db_failure("failed to prepare SQLite usage scan", error))?;
+    let rows = statement
+        .query_map(params![session_id], usage_row_from_sql)
+        .map_err(|error| db_failure("failed to scan SQLite usage", error))?;
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(decode_usage_row(row.map_err(|error| {
+            db_failure("failed to decode SQLite usage row", error)
         })?)?);
     }
     Ok(output)
@@ -1903,12 +1924,14 @@ pub(crate) fn read_fork_source(
         .map(decode_entry_row)
         .collect::<Result<Vec<_>, _>>()?;
     let values = read_all_scalar_values(&transaction, session_id)?;
+    let usage = read_all_usage_rows(&transaction, session_id)?;
     transaction
         .commit()
         .map_err(|error| db_failure("failed to finish SQLite fork snapshot", error))?;
     Ok(ForkSourceSnapshot {
         entries,
         values,
+        usage,
         entries_complete: true,
     })
 }

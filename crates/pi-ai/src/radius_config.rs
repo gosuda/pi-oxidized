@@ -262,10 +262,17 @@ fn redact_and_truncate(body: &str, api_key: Option<&str>) -> String {
 /// Sanitize an untrusted Radius config value using the reference's shallow
 /// object checks. Models that cannot be represented by the typed Rust model
 /// are dropped rather than allowing a malformed catalog to reach persistence.
+/// A config whose advertised `baseUrl` is empty or not an absolute `http(s)`
+/// URL is rejected, mirroring the gateway checks in `config_url`, so an
+/// invalid base URL cannot flow into [`Model::base_url`] and fail late in the
+/// pi-messages adapter.
 #[must_use]
 pub fn sanitize_radius_gateway_config(value: &Value) -> Option<RadiusGatewayConfig> {
     let object = value.as_object()?;
     let base_url = object.get("baseUrl")?.as_str()?.to_owned();
+    if !valid_base_url(&base_url) {
+        return None;
+    }
     let models = object.get("models")?.as_array()?;
     Some(RadiusGatewayConfig {
         base_url,
@@ -274,6 +281,18 @@ pub fn sanitize_radius_gateway_config(value: &Value) -> Option<RadiusGatewayConf
             .filter_map(sanitize_radius_gateway_model)
             .collect(),
     })
+}
+
+/// Require an absolute `http(s)` URL with a host and no embedded credentials,
+/// the same checks [`config_url`] applies to the configured gateway.
+fn valid_base_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
 }
 
 fn sanitize_radius_gateway_model(value: &Value) -> Option<RadiusGatewayModel> {
@@ -531,6 +550,28 @@ mod tests {
         let config = sanitize_radius_gateway_config(&value).expect("config shape");
         assert!(config.models.is_empty());
         assert!(sanitize_radius_gateway_config(&serde_json::json!([])).is_none());
+    }
+
+    #[test]
+    fn invalid_base_url_rejects_config_and_valid_passes() {
+        for base_url in [
+            "",
+            "/v1",
+            "models.example/v1",
+            "ftp://models.example",
+            "http://user:pass@models.example",
+        ] {
+            let mut value = config_json();
+            value["baseUrl"] = serde_json::json!(base_url);
+            assert!(
+                sanitize_radius_gateway_config(&value).is_none(),
+                "baseUrl {base_url:?} must be rejected"
+            );
+        }
+        let mut value = config_json();
+        value["baseUrl"] = serde_json::json!("https://models.example/v1/");
+        let config = sanitize_radius_gateway_config(&value).expect("valid https baseUrl");
+        assert_eq!(config.base_url, "https://models.example/v1/");
     }
 
     #[test]

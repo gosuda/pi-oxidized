@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use futures::future::{BoxFuture, FutureExt, ready};
@@ -45,6 +45,8 @@ pub(crate) struct FacadeInner {
     pub(crate) address: Option<ServiceInstanceAddress>,
     pub(crate) transport: Arc<dyn RemoteServiceTransport>,
     pub(crate) lifecycle: Arc<Lifecycle>,
+    /// Shared binding revision; commits re-validate it under the members lock.
+    revision: Arc<AtomicU64>,
     active: AtomicBool,
     members: Mutex<BTreeMap<JsString, Arc<RemoteServiceMember>>>,
     descriptions: Mutex<BTreeMap<JsString, MemberKind>>,
@@ -77,6 +79,7 @@ impl RemoteServiceFacade {
         address: Option<ServiceInstanceAddress>,
         transport: Arc<dyn RemoteServiceTransport>,
         lifecycle: Arc<Lifecycle>,
+        revision: Arc<AtomicU64>,
     ) -> Self {
         Self {
             inner: Arc::new(FacadeInner {
@@ -84,6 +87,7 @@ impl RemoteServiceFacade {
                 address,
                 transport,
                 lifecycle,
+                revision,
                 active: AtomicBool::new(true),
                 members: Mutex::new(BTreeMap::new()),
                 descriptions: Mutex::new(BTreeMap::new()),
@@ -152,13 +156,19 @@ impl RemoteServiceFacade {
 
     /// Installs a complete snapshot before the subscription is activated.
     ///
+    /// The whole replacement is staged first and committed in one critical
+    /// section, so a rejected snapshot cannot leave a mixture of old and
+    /// replacement state behind on existing handles.
+    ///
     /// # Errors
     /// Returns an error if the snapshot address or member descriptions do not match the
-    /// facade, if a member slot cannot be created, or if state hydration fails.
+    /// facade, if a member slot cannot be created, if state hydration fails,
+    /// or if a binding transition invalidated `expected_revision`.
     pub(crate) fn install(
         &self,
         snapshot: &ServiceInstanceSnapshot<DeltaOp>,
         context: &Context,
+        expected_revision: u64,
     ) -> Result<(), ServiceError> {
         if !same_address(snapshot.instance.as_ref(), self.inner.address.as_ref()) {
             return Err(ServiceError::local(
@@ -166,57 +176,70 @@ impl RemoteServiceFacade {
             ));
         }
         let members = validate_members(&snapshot.members)?;
-        let existing: Vec<(JsString, Arc<RemoteServiceMember>)> = {
-            let slots = lock(&self.inner.members);
-            for name in slots.keys() {
-                if !members.iter().any(|(candidate, _, _)| candidate == name) {
-                    return Err(ServiceError::remote(
-                        RemoteServiceErrorCode::ServiceMemberNotFound,
-                        format!(
-                            "Unknown remote service member {}.{}",
-                            display_js(&self.inner.service_id),
-                            display_js(name),
-                        ),
-                    ));
-                }
+        let mut slots = lock(&self.inner.members);
+        if self.inner.revision.load(Ordering::Acquire) != expected_revision {
+            return Err(ServiceError::local(
+                "Remote service install was superseded by a binding transition",
+            ));
+        }
+        for name in slots.keys() {
+            if !members.iter().any(|(candidate, _, _)| candidate == name) {
+                return Err(ServiceError::remote(
+                    RemoteServiceErrorCode::ServiceMemberNotFound,
+                    format!(
+                        "Unknown remote service member {}.{}",
+                        display_js(&self.inner.service_id),
+                        display_js(name),
+                    ),
+                ));
             }
-            slots
-                .iter()
-                .map(|(name, member)| (name.clone(), Arc::clone(member)))
-                .collect()
-        };
-
+        }
+        // Stage every member before mutating anything: kind compatibility for
+        // existing handles and validated hydration values for state members.
+        let mut staged = Vec::with_capacity(members.len());
+        for (name, kind, snapshot_member) in &members {
+            if let Some(slot) = slots.get(name) {
+                slot.check_kind(*kind)?;
+            }
+            let hydration = match snapshot_member {
+                ServiceMemberSnapshot::State { sequence, ops, .. } => {
+                    Some((*sequence, ReplicatedState::stage_hydration(ops)?))
+                }
+                ServiceMemberSnapshot::Method { .. } => None,
+            };
+            staged.push((name.clone(), *kind, hydration));
+        }
+        // Commit: all staging has succeeded, so none of this can fail.
+        let mut deliveries = Vec::new();
         {
             let mut descriptions = lock(&self.inner.descriptions);
             descriptions.clear();
-            for (name, kind, _) in &members {
+            for (name, kind, _) in &staged {
                 descriptions.insert(name.clone(), *kind);
             }
         }
-
-        for (name, kind, snapshot_member) in members {
-            let slot = existing
-                .iter()
-                .find_map(|(candidate, member)| (candidate == &name).then(|| Arc::clone(member)))
-                .or_else(|| {
-                    let mut slots = lock(&self.inner.members);
-                    if let Some(member) = slots.get(&name) {
-                        return Some(Arc::clone(member));
-                    }
-                    let member = Arc::new(RemoteServiceMember::new(
-                        Arc::downgrade(&self.inner),
-                        name.clone(),
-                        Arc::clone(&self.inner.lifecycle.report_error),
-                    ));
-                    slots.insert(name.clone(), Arc::clone(&member));
-                    Some(member)
-                })
-                .ok_or_else(|| {
-                    ServiceError::internal("Remote service member slot was not created")
-                })?;
-            slot.set_description(kind)?;
-            if let ServiceMemberSnapshot::State { sequence, ops, .. } = snapshot_member {
-                slot.hydrate(*sequence, ops, context)?;
+        for (name, kind, hydration) in staged {
+            let slot = if let Some(slot) = slots.get(&name) {
+                Arc::clone(slot)
+            } else {
+                let slot = Arc::new(RemoteServiceMember::new(
+                    Arc::downgrade(&self.inner),
+                    name.clone(),
+                    Arc::clone(&self.inner.lifecycle.report_error),
+                ));
+                slots.insert(name.clone(), Arc::clone(&slot));
+                slot
+            };
+            slot.commit_kind(kind);
+            if let Some((sequence, value)) = hydration {
+                let drain = slot.commit_hydration(&value, sequence, context);
+                deliveries.push((slot, drain));
+            }
+        }
+        drop(slots);
+        for (slot, drain) in deliveries {
+            if drain {
+                slot.flush();
             }
         }
         self.inner.active.store(true, Ordering::Release);
@@ -229,7 +252,14 @@ impl RemoteServiceFacade {
         sequence: JsInteger,
         ops: &[DeltaOp],
         context: &Context,
+        expected_revision: u64,
     ) -> Result<(), ServiceError> {
+        let mut slots = lock(&self.inner.members);
+        if self.inner.revision.load(Ordering::Acquire) != expected_revision {
+            return Err(ServiceError::local(
+                "Remote service update was superseded by a binding transition",
+            ));
+        }
         let kind = lock(&self.inner.descriptions).get(member).copied();
         if kind != Some(MemberKind::State) {
             return Err(ServiceError::local(format!(
@@ -238,13 +268,30 @@ impl RemoteServiceFacade {
                 display_js(member),
             )));
         }
-        self.member(member.clone())?.update(sequence, ops, context)
+        let slot = if let Some(slot) = slots.get(member) {
+            Arc::clone(slot)
+        } else {
+            let slot = Arc::new(RemoteServiceMember::new(
+                Arc::downgrade(&self.inner),
+                member.clone(),
+                Arc::clone(&self.inner.lifecycle.report_error),
+            ));
+            slots.insert(member.clone(), Arc::clone(&slot));
+            slot
+        };
+        let drain = slot.apply_update(sequence, ops, context)?;
+        drop(slots);
+        if drain {
+            slot.flush();
+        }
+        Ok(())
     }
 
     pub(crate) fn clear(&self) {
-        let members: Vec<Arc<RemoteServiceMember>> =
-            lock(&self.inner.members).values().cloned().collect();
-        for member in members {
+        // Wipe under the members lock so clears serialize atomically against
+        // install and update commits revalidating their revision here.
+        let slots = lock(&self.inner.members);
+        for member in slots.values() {
             member.clear();
         }
     }
@@ -327,6 +374,10 @@ impl RemoteServiceMember {
         let lifetime = calls.cancellation();
         Box::pin(async move {
             let permit = calls.begin()?;
+            // Revalidate access and liveness inside the future so a transition
+            // between construction and polling cannot dispatch a stale call.
+            facade.lifecycle.assert_access()?;
+            facade.assert_live()?;
             let future = transport.invoke(call, context.clone());
             let result = await_with_lifetime(&context, lifetime, future).await;
             drop(permit);
@@ -364,8 +415,14 @@ impl RemoteServiceMember {
         self.state.subscribe(listener)
     }
 
-    pub(crate) fn set_description(&self, kind: MemberKind) -> Result<(), ServiceError> {
-        let mut state = lock(&self.kind);
+    /// Reports whether assigning `kind` would conflict with this member's
+    /// recorded description or prior consumer use, without mutating anything.
+    ///
+    /// # Errors
+    /// Returns an error when the snapshot kind differs from the recorded kind
+    /// or from a kind the consumer already used this member as.
+    pub(crate) fn check_kind(&self, kind: MemberKind) -> Result<(), ServiceError> {
+        let state = lock(&self.kind);
         if let Some(actual) = state.actual
             && actual != kind
         {
@@ -387,28 +444,46 @@ impl RemoteServiceMember {
                 ),
             ));
         }
-        state.actual = Some(kind);
         Ok(())
     }
 
-    pub(crate) fn hydrate(
-        &self,
-        sequence: JsInteger,
-        ops: &[DeltaOp],
-        context: &Context,
-    ) -> Result<(), ServiceError> {
-        self.set_description(MemberKind::State)?;
-        self.state.hydrate(sequence, ops, context)
+    pub(crate) fn set_description(&self, kind: MemberKind) -> Result<(), ServiceError> {
+        self.check_kind(kind)?;
+        self.commit_kind(kind);
+        Ok(())
     }
 
-    pub(crate) fn update(
+    /// Records the snapshot kind unconditionally. Used by install commits,
+    /// where staging already validated the assignment; later misuse still
+    /// surfaces through [`Self::expect`].
+    pub(crate) fn commit_kind(&self, kind: MemberKind) {
+        lock(&self.kind).actual = Some(kind);
+    }
+
+    /// Stores a staged hydration value and queues its delivery. Returns
+    /// whether queued deliveries need draining.
+    pub(crate) fn commit_hydration(
+        &self,
+        value: &Arc<JsonValue>,
+        sequence: JsInteger,
+        context: &Context,
+    ) -> bool {
+        self.state.commit_hydration(value, sequence, context)
+    }
+
+    /// Drains queued revision deliveries.
+    pub(crate) fn flush(&self) {
+        self.state.flush_deliveries();
+    }
+
+    pub(crate) fn apply_update(
         &self,
         sequence: JsInteger,
         ops: &[DeltaOp],
         context: &Context,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<bool, ServiceError> {
         self.set_description(MemberKind::State)?;
-        self.state.update(sequence, ops, context)
+        self.state.apply_update(sequence, ops, context)
     }
 
     pub(crate) fn clear(&self) {

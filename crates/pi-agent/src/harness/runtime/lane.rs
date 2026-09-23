@@ -185,14 +185,26 @@ impl LaneRuntime {
         self.data.lock().await.operation.clone()
     }
 
+    /// Returns the operation id whose drive marker is installed on this lane,
+    /// when one is actively executing. Read before the lane `data` guard so
+    /// the two locks never nest.
+    pub(crate) async fn executing_operation_id(&self) -> Option<OperationId> {
+        self.active_drive
+            .lock()
+            .await
+            .as_ref()
+            .map(|drive| drive.operation_id.clone())
+    }
+
     pub(crate) async fn info(&self, _cx: &Context) -> Result<LaneInfo, HarnessError> {
         self.ensure_open()?;
+        let executing = self.executing_operation_id().await;
         let data = self.data.lock().await;
         let operation = data.operation.as_ref().map(|operation| {
-            let status = match operation.state.scope().control {
-                crate::session::Control::CancelRequested { .. } => OperationStatus::Aborting,
-                crate::session::Control::Running => OperationStatus::Open,
-            };
+            let status = durable_operation_status(
+                operation,
+                executing.as_ref() == Some(&operation.meta.operation_id),
+            );
             CurrentOperationInfo {
                 id: operation.meta.operation_id.clone(),
                 kind: operation_kind(&operation.meta.intent),
@@ -213,6 +225,7 @@ impl LaneRuntime {
         _cx: &Context,
     ) -> Result<LaneExecutionInfo, HarnessError> {
         self.ensure_open()?;
+        let executing = self.executing_operation_id().await;
         let data = self.data.lock().await;
         let current = data
             .operation
@@ -221,10 +234,10 @@ impl LaneRuntime {
                 id: operation.meta.operation_id.clone(),
                 kind: operation_kind(&operation.meta.intent),
                 started_at: operation.meta.started_at,
-                status: match &operation.state.scope().control {
-                    crate::session::Control::CancelRequested { .. } => OperationStatus::Aborting,
-                    crate::session::Control::Running => OperationStatus::Open,
-                },
+                status: durable_operation_status(
+                    operation,
+                    executing.as_ref() == Some(&operation.meta.operation_id),
+                ),
                 captured_model: captured_model(&operation.state),
             });
         Ok(LaneExecutionInfo {
@@ -244,9 +257,17 @@ impl LaneRuntime {
             .await
             .map_err(map_session_error)?;
         let queues = read_queue_snapshot(self, &data.state.inbox, cx).await?;
+        let executing = self.executing_operation_id().await;
         let operation = match data.operation.as_ref() {
             Some(operation) => Some(
-                snapshot_operation(self.owner.session.as_ref(), operation, &transcript, cx).await?,
+                snapshot_operation(
+                    self.owner.session.as_ref(),
+                    operation,
+                    executing.as_ref() == Some(&operation.meta.operation_id),
+                    &transcript,
+                    cx,
+                )
+                .await?,
             ),
             None => None,
         };
@@ -618,7 +639,16 @@ impl AgentLane for LaneRuntime {
                 {
                     return Ok(());
                 }
-                notified.await;
+                // The idle notification only fires on a notify, so a lane
+                // that stays busy would park a cancelled caller forever.
+                // Race the wait against scope cancellation; `race` is a
+                // biased select, so cancellation wins when both resolve
+                // together.
+                if cx.race(notified).await.is_err() {
+                    return Err(HarnessError::Closed {
+                        message: "wait for idle cancelled".to_owned(),
+                    });
+                }
             }
         })
     }
@@ -1022,9 +1052,27 @@ fn captured_model(state: &crate::session::OperationState) -> Option<ModelIdentit
     }
 }
 
+/// Maps an operation's durable control state to its public status.
+///
+/// The durable record only separates cancel requests from running, so the
+/// lane's drive marker decides the open/running split: an operation whose
+/// drive is installed on the lane is actively executing and reads `Running`,
+/// while an open operation no drive currently drives stays `Open`.
+fn durable_operation_status(
+    operation: &crate::session::Operation,
+    executing: bool,
+) -> OperationStatus {
+    match operation.state.scope().control {
+        crate::session::Control::CancelRequested { .. } => OperationStatus::Aborting,
+        crate::session::Control::Running if executing => OperationStatus::Running,
+        crate::session::Control::Running => OperationStatus::Open,
+    }
+}
+
 async fn snapshot_operation(
     session: &dyn crate::session::Session,
     operation: &crate::session::Operation,
+    executing: bool,
     transcript: &[Entry],
     cx: &Context,
 ) -> Result<LaneSnapshotOperation, HarnessError> {
@@ -1104,10 +1152,7 @@ async fn snapshot_operation(
         kind: operation_kind(&operation.meta.intent),
         started_at: operation.meta.started_at,
         from_tip_id: operation.meta.source_tip_id.clone(),
-        status: match &operation.state.scope().control {
-            crate::session::Control::CancelRequested { .. } => OperationStatus::Aborting,
-            crate::session::Control::Running => OperationStatus::Open,
-        },
+        status: durable_operation_status(operation, executing),
         retry,
         deferred,
         streaming_message,
@@ -1200,4 +1245,336 @@ pub(crate) async fn read_queue_snapshot(
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+    use std::error::Error;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures::stream::{self, BoxStream, StreamExt};
+    use tokio::sync::RwLock;
+
+    use super::*;
+    use crate::harness::api::HarnessResources;
+    use crate::harness::bus::HarnessEventBus;
+    use crate::harness::hooks::HookRegistry;
+    use crate::queue::QueueMode;
+    use crate::session::{
+        CompactionSettings, Control, HarnessRetryPolicy, HarnessStreamOptions, LaneState,
+        MemoryStorage, Operation, OperationIntent, OperationMeta, OperationScope, OperationState,
+        RunSettings, Session, SessionMetadata, StorageBackedSession, UuidV7Generator,
+    };
+    use crate::tool::ToolExecutionMode;
+
+    use crate::harness::runtime::support::RuntimeConfig;
+
+    const LANE_NAME: &str = "main";
+
+    fn fixture_model() -> pi_ai::Model {
+        pi_ai::Model {
+            id: "lane-fixture-model".to_owned(),
+            name: "Lane fixture".to_owned(),
+            api: "lane-fixture-api".to_owned(),
+            provider: "lane-fixture-provider".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: Vec::new(),
+            input_limits: None,
+            cost: pi_ai::ModelCost::default(),
+            prompt_cache: None,
+            sampling_params: None,
+            context_window: 8192,
+            max_tokens: 1024,
+            headers: None,
+            compat: None,
+            extra: BTreeMap::default(),
+        }
+    }
+
+    /// A model store whose provider is never invoked here; streaming returns
+    /// an empty stream so an accidental call fails closed instead of panicking.
+    struct ClosedModels {
+        model: pi_ai::Model,
+    }
+
+    impl pi_ai::Provider for ClosedModels {
+        fn stream(
+            &self,
+            _model: &pi_ai::Model,
+            _context: pi_ai::Context,
+            _options: pi_ai::StreamOptions,
+        ) -> BoxStream<'static, Result<pi_ai::AssistantMessageEvent, pi_ai::ProviderError>>
+        {
+            stream::empty().boxed()
+        }
+    }
+
+    impl crate::harness::api::HarnessModels for ClosedModels {
+        fn get_model(&self, provider: &str, model_id: &str) -> Option<pi_ai::Model> {
+            (self.model.provider == provider && self.model.id == model_id)
+                .then(|| self.model.clone())
+        }
+    }
+
+    /// Builds a lane over a fresh in-memory session without touching the
+    /// provider; tests poke `data.operation` and the drive marker directly.
+    fn fixture_runtime() -> (Arc<HarnessRuntime>, Arc<LaneRuntime>) {
+        let session: Arc<dyn Session> = StorageBackedSession::new(
+            SessionMetadata {
+                id: "lane-fixtures".to_owned(),
+                created_at: 1,
+                storage_version: MemoryStorage::STORAGE_VERSION,
+                cwd: None,
+                parent_session_id: None,
+                legacy_parent_session_path: None,
+            },
+            Arc::new(MemoryStorage::new()),
+            Arc::new(UuidV7Generator::new()),
+            None,
+        );
+        let model = fixture_model();
+        let events = HarnessEventBus::new();
+        let hooks = HookRegistry::new({
+            let reporter = events.clone();
+            move |event, context| reporter.emit(event, &context)
+        });
+        let runtime = Arc::new(HarnessRuntime {
+            session,
+            models: Arc::new(ClosedModels {
+                model: model.clone(),
+            }),
+            hooks,
+            events,
+            config: Arc::new(RwLock::new(RuntimeConfig {
+                thinking_level: pi_ai::ModelThinkingLevel::Off,
+                active_tool_names: Vec::new(),
+                tools: Vec::new(),
+                resources: HarnessResources::default(),
+                stream_options: HarnessStreamOptions::default(),
+                retry: HarnessRetryPolicy::default(),
+                compaction: CompactionSettings::default(),
+                steering_mode: QueueMode::All,
+                follow_up_mode: QueueMode::All,
+                tool_execution: ToolExecutionMode::default(),
+                tool_context: None,
+                system_prompt: None,
+                to_provider_messages: crate::harness::runtime::support::default_provider_conversion(
+                ),
+                entry_projectors: HashMap::new(),
+                model,
+            })),
+            lanes: Arc::new(AsyncMutex::new(BTreeMap::new())),
+            closed: Arc::new(AtomicBool::new(false)),
+            fault: Arc::new(Mutex::new(None)),
+        });
+        let lane = LaneRuntime::new(
+            Arc::clone(&runtime),
+            LaneName::new(LANE_NAME),
+            LaneData::new(
+                LaneConfiguration {
+                    model: ModelIdentity {
+                        provider: "lane-fixture-provider".to_owned(),
+                        model_id: "lane-fixture-model".to_owned(),
+                        api: None,
+                    },
+                    thinking_level: pi_ai::ModelThinkingLevel::Off,
+                    active_tool_names: Vec::new(),
+                },
+                None,
+                LaneState::default(),
+            ),
+        );
+        (runtime, lane)
+    }
+
+    fn fixture_operation(operation_id: &str) -> Operation {
+        Operation {
+            meta: OperationMeta {
+                operation_id: OperationId::new(operation_id),
+                lane: LaneName::new(LANE_NAME),
+                source_tip_id: None,
+                started_at: 0,
+                intent: OperationIntent::Run {
+                    prompt_entry_ids: Vec::new(),
+                },
+            },
+            state: OperationState::Starting {
+                scope: OperationScope {
+                    control: Control::Running,
+                    settings: RunSettings {
+                        compaction: CompactionSettings::default(),
+                        steering_mode: QueueMode::All,
+                        follow_up_mode: QueueMode::All,
+                        tool_execution: ToolExecutionMode::default(),
+                    },
+                    latest_assistant_entry_id: None,
+                },
+            },
+        }
+    }
+
+    fn request_cancel(operation: &mut Operation) {
+        operation.state.scope_mut().control = Control::CancelRequested { requested_at: 7 };
+    }
+
+    /// T54: an open operation reads `Open` while no drive marker is
+    /// installed, `Running` once its drive is executing on the lane, and
+    /// `Aborting` on a cancel request — on both inspection surfaces.
+    #[tokio::test]
+    async fn inspection_reports_running_only_while_drive_marker_is_installed()
+    -> Result<(), Box<dyn Error>> {
+        let cx = Context::background();
+        let (_runtime, lane) = fixture_runtime();
+        lane.data.lock().await.operation = Some(fixture_operation("op-inspect"));
+
+        let info = lane.info(&cx).await?;
+        assert_eq!(
+            info.operation.as_ref().map(|operation| operation.status),
+            Some(OperationStatus::Open),
+            "open operation without a drive marker must not read running",
+        );
+        let execution = lane.execution_info(&cx).await?;
+        assert_eq!(
+            execution.current.as_ref().map(|current| current.status),
+            Some(OperationStatus::Open),
+        );
+
+        *lane.active_drive.lock().await =
+            Some(DriveController::new(OperationId::new("op-inspect")));
+        let info = lane.info(&cx).await?;
+        assert_eq!(
+            info.operation.as_ref().map(|operation| operation.status),
+            Some(OperationStatus::Running),
+            "installed drive marker must report an executing operation",
+        );
+        let execution = lane.execution_info(&cx).await?;
+        assert_eq!(
+            execution.current.as_ref().map(|current| current.status),
+            Some(OperationStatus::Running),
+        );
+
+        let mut guard = lane.data.lock().await;
+        if let Some(operation) = guard.operation.as_mut() {
+            request_cancel(operation);
+        }
+        drop(guard);
+        let info = lane.info(&cx).await?;
+        assert_eq!(
+            info.operation.as_ref().map(|operation| operation.status),
+            Some(OperationStatus::Aborting),
+            "cancel request preempts the running report",
+        );
+        Ok(())
+    }
+
+    /// T54: the watcher snapshot routes the same durable state through the
+    /// drive marker instead of always reporting `Open`.
+    #[tokio::test]
+    async fn snapshot_operation_status_follows_drive_marker() -> Result<(), Box<dyn Error>> {
+        let cx = Context::background();
+        let (runtime, lane) = fixture_runtime();
+        runtime
+            .session
+            .create_branch(&LaneName::new(LANE_NAME), None, &cx)
+            .await
+            .map_err(map_session_error)?;
+        lane.data.lock().await.operation = Some(fixture_operation("op-snapshot"));
+
+        let snapshot = lane.snapshot(&cx).await?;
+        assert_eq!(
+            snapshot
+                .operation
+                .as_ref()
+                .map(|operation| operation.status),
+            Some(OperationStatus::Open),
+        );
+
+        *lane.active_drive.lock().await =
+            Some(DriveController::new(OperationId::new("op-snapshot")));
+        let snapshot = lane.snapshot(&cx).await?;
+        assert_eq!(
+            snapshot
+                .operation
+                .as_ref()
+                .map(|operation| operation.status),
+            Some(OperationStatus::Running),
+        );
+
+        let mut guard = lane.data.lock().await;
+        if let Some(operation) = guard.operation.as_mut() {
+            request_cancel(operation);
+        }
+        drop(guard);
+        let snapshot = lane.snapshot(&cx).await?;
+        assert_eq!(
+            snapshot
+                .operation
+                .as_ref()
+                .map(|operation| operation.status),
+            Some(OperationStatus::Aborting),
+        );
+        Ok(())
+    }
+
+    /// T35: a caller parked on the idle notification must observe scope
+    /// cancellation promptly, even when the lane stays busy and the idle
+    /// notification never fires.
+    #[tokio::test]
+    async fn wait_for_idle_returns_cancellation_while_lane_stays_busy() -> Result<(), Box<dyn Error>>
+    {
+        let cx = Context::background();
+        let (_runtime, lane) = fixture_runtime();
+        // The marker keeps the lane busy for the whole test, so no idle
+        // notification can fire.
+        *lane.active_drive.lock().await = Some(DriveController::new(OperationId::new("op-busy")));
+
+        let (cancellable, token) = cx.with_cancel();
+        let waiter = {
+            let lane = Arc::clone(&lane);
+            tokio::spawn(async move { lane.wait_for_idle(&cancellable).await })
+        };
+        // Let the waiter park on the idle notification before cancelling.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        token.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), waiter).await??;
+        assert!(
+            matches!(result, Err(HarnessError::Closed { .. })),
+            "cancelled wait must report closed, got {result:?}",
+        );
+        Ok(())
+    }
+
+    /// The idle notification still wakes the wait: an idle lane satisfies it
+    /// immediately, and a busy lane reports idle once its marker clears and
+    /// idle fires.
+    #[tokio::test]
+    async fn wait_for_idle_wakes_on_idle_notification_and_reports_idle()
+    -> Result<(), Box<dyn Error>> {
+        let cx = Context::background();
+        let (_runtime, lane) = fixture_runtime();
+        lane.wait_for_idle(&cx).await?;
+
+        *lane.active_drive.lock().await = Some(DriveController::new(OperationId::new("op-busy")));
+        let waiter = {
+            let lane = Arc::clone(&lane);
+            let cx = Context::background();
+            tokio::spawn(async move { lane.wait_for_idle(&cx).await })
+        };
+        // Let the waiter park before releasing the lane.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        *lane.active_drive.lock().await = None;
+        lane.idle.notify_waiters();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), waiter).await??;
+        assert!(
+            result.is_ok(),
+            "released lane must satisfy the wait, got {result:?}",
+        );
+        Ok(())
+    }
 }

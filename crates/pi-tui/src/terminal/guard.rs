@@ -364,6 +364,9 @@ impl<W: Write> TerminalGuard<W> {
 
     /// Re-apply modes after resume.
     ///
+    /// A failed fullscreen re-entry keeps the requested screen mode recorded
+    /// so a later [`Self::resume`] retries the restoration.
+    ///
     /// # Errors
     ///
     /// Returns an I/O error when terminal modes cannot be re-enabled.
@@ -374,8 +377,19 @@ impl<W: Write> TerminalGuard<W> {
         self.fullscreen_applied.clear();
         self.screen_mode = ScreenMode::Regular;
         self.activate(enable_kitty)?;
-        if desired_mode == ScreenMode::Fullscreen {
-            self.enter_fullscreen()?;
+        self.reenter_screen_mode(desired_mode)
+    }
+
+    /// Re-enter the remembered screen mode after re-activation.
+    fn reenter_screen_mode(&mut self, desired_mode: ScreenMode) -> io::Result<()> {
+        if desired_mode == ScreenMode::Fullscreen
+            && let Err(error) = self.enter_fullscreen()
+        {
+            // The runtime still considers fullscreen active after SIGCONT:
+            // keep the requested mode latched so the next resume retries the
+            // fullscreen restoration instead of silently staying regular.
+            self.screen_mode = desired_mode;
+            return Err(error);
         }
         Ok(())
     }
@@ -945,4 +959,66 @@ mod tests {
     //     }
     // The discarded unwind result drops the rollback error, so the
     // `rollback ... expect` assertion fails.
+
+    #[test]
+    fn failed_resume_reentry_keeps_fullscreen_desired_for_retry() -> io::Result<()> {
+        // Resume order: the seeded RawMode step lets fullscreen entry skip
+        // real raw-mode activation (enable_raw_mode needs a tty). Budget 13
+        // accepts exactly CSI ?1049h (8) + CSI ?7l (5); the third entry write
+        // (CSI ?1000h) fails and latches, so the re-entry cannot succeed.
+        let mut guard = TerminalGuard::new(LatchingFailureWriter {
+            bytes: Vec::new(),
+            attempted: Vec::new(),
+            budget: 13,
+        });
+        guard.applied.push(RestoreStep::RawMode);
+
+        // First resume attempt: the regular modes re-applied fine, so the
+        // re-entry below runs with the reset (empty) fullscreen bookkeeping.
+        let result = guard.reenter_screen_mode(ScreenMode::Fullscreen);
+        assert!(result.is_err(), "the seeded re-entry must fail");
+        assert_eq!(
+            guard.screen_mode(),
+            ScreenMode::Fullscreen,
+            "a failed re-entry must keep the desired mode for the next retry"
+        );
+        assert_eq!(
+            guard.fullscreen_applied,
+            [
+                FullscreenStep::AlternateScreen,
+                FullscreenStep::AutowrapDisabled
+            ],
+            "failed steps stay recorded while the desired mode is latched"
+        );
+
+        // A later resume retries: it clears the bookkeeping and re-enters
+        // fullscreen from Regular with a healthy writer.
+        guard.writer_mut().budget = 100;
+        guard.fullscreen_applied.clear();
+        guard.screen_mode = ScreenMode::Regular;
+        guard.reenter_screen_mode(ScreenMode::Fullscreen)?;
+
+        let mut expected = vec![
+            FullscreenStep::AlternateScreen,
+            FullscreenStep::AutowrapDisabled,
+            FullscreenStep::MouseNormal,
+            FullscreenStep::MouseButton,
+        ];
+        if !multiplexer_detected() {
+            expected.push(FullscreenStep::MouseAll);
+        }
+        expected.push(FullscreenStep::MouseSgr);
+        assert_eq!(guard.screen_mode(), ScreenMode::Fullscreen);
+        assert_eq!(
+            guard.fullscreen_applied, expected,
+            "the retry must rebuild the complete fullscreen set"
+        );
+        Ok(())
+    }
+    // MUTATION RECIPE — reverting `resume` to the pre-fix shape
+    //     if desired_mode == ScreenMode::Fullscreen {
+    //         self.enter_fullscreen()?;
+    //     }
+    // must fail the test above: the failed re-entry leaves the guard Regular,
+    // so the "desired mode for the next retry" assertion fails.
 }

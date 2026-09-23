@@ -11,7 +11,7 @@ use super::error::{SessionError, StorageErrorCode, StorageFailure};
 use super::ids::EntryId;
 use super::lane_state::LaneState;
 use super::traits::{ForkOptions, ForkPosition, Storage};
-use super::write::{CommittedValueWrite, CommittedWrite};
+use super::write::{CommittedValueWrite, CommittedWrite, UsageRow};
 use crate::context::Context;
 type BranchTips = Vec<(String, Option<EntryId>)>;
 type SelectedEntries = HashSet<EntryId>;
@@ -19,15 +19,19 @@ type SelectedContents = (SelectedEntries, BranchTips);
 
 /// State captured from one backend at a serialized commit boundary.
 ///
-/// The snapshot deliberately contains only entries and scalar values. Lists,
-/// usage rows, operation state, and pending state are transient or derived and
-/// are not part of a fork's durable conversation history.
+/// The snapshot contains entries, scalar values, and usage rows. Lists,
+/// operation state, and pending state are transient or derived and are not
+/// part of a fork's durable conversation history. Capture has no access to
+/// [`ForkOptions`], so usage rows are always carried; only
+/// [`ForkOptions::Tree`] forks copy them into the destination.
 #[derive(Clone, Debug)]
 pub struct ForkSourceSnapshot {
     /// Entries available to the fork selector.
     pub entries: Vec<Entry>,
     /// Current scalar slots in the source session.
     pub values: Vec<RawStoredValue>,
+    /// Committed usage rows in source-sequence order.
+    pub usage: Vec<UsageRow>,
     /// Whether `entries` is the complete source tree. A branch-only backend
     /// may set this to `false` when it supplies only the requested ancestry.
     pub entries_complete: bool,
@@ -36,15 +40,19 @@ pub struct ForkSourceSnapshot {
 /// Materialized state for a destination session.
 ///
 /// Entry sequence numbers are retained from the source. Reconstructed scalar
-/// values receive fresh sequence numbers after the largest copied entry so a
-/// destination can replay the result without inventing a second entry order.
+/// values receive fresh sequence numbers above every source sequence, and
+/// copied usage rows retain their source sequences, so a tree fork's usage
+/// history stays aligned with its copied entries.
 #[derive(Clone, Debug)]
 pub struct ForkDestinationSnapshot {
     /// Selected entries in ascending source-sequence order.
     pub entries: Vec<Entry>,
     /// Reconstructed and copied scalar values in destination-sequence order.
     pub values: Vec<RawStoredValue>,
-    /// High-water mark after all destination values.
+    /// Copied usage rows in source-sequence order, verbatim. Empty for
+    /// branch forks; [`ForkOptions::Tree`] forks carry every source row.
+    pub usage: Vec<UsageRow>,
+    /// High-water mark above every destination sequence.
     pub next_seq: u64,
 }
 
@@ -320,17 +328,25 @@ pub fn create_fork_snapshot(
             )));
         }
     }
+    let scope = match options {
+        ForkOptions::Branch { .. } => ForkScope::Branch,
+        ForkOptions::Tree { .. } => ForkScope::Tree,
+    };
+    // Copied usage rows keep their source sequences, so the fresh-sequence
+    // space for reconstructed values must start above them too.
+    let max_usage_seq = if matches!(scope, ForkScope::Tree) {
+        source.usage.iter().map(|row| row.seq).max().unwrap_or(0)
+    } else {
+        0
+    };
     let mut next_seq = entries
         .iter()
         .map(Entry::seq)
         .max()
         .unwrap_or(0)
+        .max(max_usage_seq)
         .checked_add(1)
         .ok_or_else(|| SessionError::Invariant("sequence overflow".to_owned()))?;
-    let scope = match options {
-        ForkOptions::Branch { .. } => ForkScope::Branch,
-        ForkOptions::Tree { .. } => ForkScope::Tree,
-    };
     let mut values = Vec::new();
 
     for (branch, tip) in destination_tips {
@@ -374,16 +390,26 @@ pub fn create_fork_snapshot(
         }
     }
 
+    // Usage rows are event history attributed to copied entries: a tree fork
+    // copies every row verbatim — id, source sequence, and payload — while a
+    // branch fork takes none.
+    let mut usage = Vec::new();
+    if matches!(scope, ForkScope::Tree) {
+        usage.extend(source.usage.iter().cloned());
+    }
+
     Ok(ForkDestinationSnapshot {
         entries,
         values,
+        usage,
         next_seq,
     })
 }
 
 /// Converts a destination snapshot into replayable committed writes.
 pub fn fork_snapshot_writes(snapshot: &ForkDestinationSnapshot) -> Vec<CommittedWrite> {
-    let mut writes = Vec::with_capacity(snapshot.entries.len() + snapshot.values.len());
+    let mut writes =
+        Vec::with_capacity(snapshot.entries.len() + snapshot.values.len() + snapshot.usage.len());
     writes.extend(snapshot.entries.iter().cloned().map(CommittedWrite::Entry));
     writes.extend(snapshot.values.iter().cloned().map(|stored| {
         CommittedWrite::Value(CommittedValueWrite::Set {
@@ -393,6 +419,124 @@ pub fn fork_snapshot_writes(snapshot: &ForkDestinationSnapshot) -> Vec<Committed
             value: stored.value,
         })
     }));
+    writes.extend(snapshot.usage.iter().cloned().map(CommittedWrite::Usage));
     writes.sort_by_key(CommittedWrite::seq);
     writes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::entry::{NewEntry, NewEntryBody};
+    use crate::session::ids::{LaneName, UsageId};
+
+    fn entry(id: &str, seq: u64) -> Entry {
+        NewEntry {
+            id: EntryId::from(id.to_owned()),
+            parent_id: None,
+            body: NewEntryBody::Custom {
+                custom_type: "note".to_owned(),
+                data: None,
+            },
+        }
+        .materialize(seq, 1)
+    }
+
+    fn scalar(namespace: &str, key: &str, value: serde_json::Value, seq: u64) -> RawStoredValue {
+        RawStoredValue {
+            namespace: namespace.to_owned(),
+            key: key.to_owned(),
+            kind: AddressKind::Value,
+            value,
+            seq,
+        }
+    }
+
+    fn usage_row(id: &str, seq: u64) -> UsageRow {
+        UsageRow {
+            id: UsageId::from(id.to_owned()),
+            seq,
+            usage: pi_ai::Usage {
+                input: 3,
+                ..pi_ai::Usage::default()
+            },
+            entry_id: Some(EntryId::from("e1".to_owned())),
+            adjustment: false,
+            details: None,
+        }
+    }
+
+    /// One entry on branch `main`, its lane values, and one usage row.
+    #[expect(clippy::expect_used, reason = "test fixture serialization cannot fail")]
+    fn source_snapshot() -> ForkSourceSnapshot {
+        let tip = serde_json::to_value(Some(EntryId::from("e1".to_owned())))
+            .expect("branch tip serialization cannot fail");
+        ForkSourceSnapshot {
+            entries: vec![entry("e1", 1)],
+            values: vec![
+                scalar("pi.branch.tip", "main", tip, 2),
+                scalar("pi.lane.config", "main", serde_json::json!({}), 3),
+                scalar("pi.lane.state", "main", serde_json::json!({}), 4),
+            ],
+            usage: vec![usage_row("u1", 5)],
+            entries_complete: true,
+        }
+    }
+
+    #[test]
+    fn tree_fork_copies_usage_rows_verbatim() -> Result<(), SessionError> {
+        let destination =
+            create_fork_snapshot(&source_snapshot(), &ForkOptions::Tree { id: None })?;
+        assert_eq!(destination.usage.len(), 1);
+        let row = &destination.usage[0];
+        assert_eq!(row.id.as_str(), "u1");
+        assert_eq!(row.usage.input, 3);
+        assert_eq!(row.entry_id.as_ref().map(EntryId::as_str), Some("e1"));
+        // The row keeps its source sequence (5), which sits above the largest
+        // copied entry (1) — reconstructed values must start above it instead
+        // of colliding with it on replay.
+        assert_eq!(row.seq, 5);
+        assert!(
+            !destination
+                .values
+                .iter()
+                .any(|stored| stored.seq == row.seq)
+        );
+        let max_value_seq = destination
+            .values
+            .iter()
+            .map(|stored| stored.seq)
+            .max()
+            .unwrap_or_default();
+        assert!(row.seq < max_value_seq);
+        assert_eq!(max_value_seq + 1, destination.next_seq);
+        let writes = fork_snapshot_writes(&destination);
+        assert!(
+            writes.iter().any(
+                |write| matches!(write, CommittedWrite::Usage(row) if row.id.as_str() == "u1")
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn branch_fork_drops_usage_rows() -> Result<(), SessionError> {
+        let destination = create_fork_snapshot(
+            &source_snapshot(),
+            &ForkOptions::Branch {
+                branch: LaneName::from("main"),
+                entry_id: None,
+                position: ForkPosition::At,
+                id: None,
+            },
+        )?;
+        assert!(destination.usage.is_empty());
+        let writes = fork_snapshot_writes(&destination);
+        assert!(
+            writes
+                .iter()
+                .all(|write| !matches!(write, CommittedWrite::Usage(_)))
+        );
+        Ok(())
+    }
 }

@@ -218,25 +218,28 @@ pub fn js_string_len(text: &str) -> u64 {
 }
 
 /// Truncates by UTF-16 code-unit count and records omitted units.
+///
+/// A character is retained only when all of its UTF-16 code units fit within
+/// `max_chars`; a surrogate pair straddling the boundary is dropped whole so
+/// the result never contains a lone surrogate or U+FFFD.
 #[must_use]
 pub fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     let length = text.encode_utf16().count();
     if length <= max_chars {
         return text.to_owned();
     }
-    let truncated_chars = length.saturating_sub(max_chars);
-    let mut units = Vec::with_capacity(max_chars);
-    'characters: for character in text.chars() {
-        let mut buffer = [0_u16; 2];
-        for unit in character.encode_utf16(&mut buffer) {
-            if units.len() == max_chars {
-                break 'characters;
-            }
-            units.push(*unit);
+    let mut prefix = String::with_capacity(max_chars);
+    let mut retained_units = 0_usize;
+    for character in text.chars() {
+        let width = character.len_utf16();
+        if retained_units + width > max_chars {
+            break;
         }
+        prefix.push(character);
+        retained_units += width;
     }
-    let prefix = String::from_utf16_lossy(&units);
-    format!("{prefix}\n\n[... {truncated_chars} more characters truncated]")
+    let omitted_units = length - retained_units;
+    format!("{prefix}\n\n[... {omitted_units} more characters truncated]")
 }
 
 /// Text from user content blocks, with a caller-selected separator.
@@ -416,6 +419,22 @@ mod tests {
         assert_eq!(js_string_len("😀"), 2);
         let truncated = truncate_for_summary("😀abc", 2);
         assert!(truncated.starts_with("😀"));
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test asserts omitted-count suffix via expect"
+    )]
+    #[test]
+    fn truncate_drops_straddling_surrogate_pair_whole() {
+        let text = format!("{}😀", "a".repeat(1_999));
+        let truncated = truncate_for_summary(&text, 2_000);
+        assert!(!truncated.contains('\u{FFFD}'));
+        let suffix = "\n\n[... 2 more characters truncated]";
+        let prefix = truncated
+            .strip_suffix(suffix)
+            .expect("omitted count reflects the dropped emoji pair");
+        assert_eq!(prefix, "a".repeat(1_999));
     }
 
     #[test]

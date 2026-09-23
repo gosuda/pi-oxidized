@@ -584,12 +584,15 @@ impl Session for StorageBackedSession {
         })
     }
     fn close<'a>(&'a self, cx: &'a Context) -> BoxFuture<'a, Result<(), SessionError>> {
-        // Seal admission synchronously. The owned task below is deliberately
-        // independent of the caller's waiter: dropping one close future does
-        // not cancel backend draining or the repository callback.
-        self.closed.store(true, Ordering::Release);
-        let operation = self.close_state.start(cx);
-        Box::pin(async move { operation.wait().await })
+        Box::pin(async move {
+            cx.check().map_err(|_| aborted_error())?;
+            // Seal admission synchronously. The owned task below is deliberately
+            // independent of the caller's waiter: dropping one close future does
+            // not cancel backend draining or the repository callback.
+            self.closed.store(true, Ordering::Release);
+            let operation = self.close_state.start(cx);
+            operation.wait().await
+        })
     }
 }
 
@@ -785,5 +788,58 @@ impl Branch for StorageBackedBranch {
                 )
                 .await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio_util::sync::CancellationToken;
+
+    use crate::session::{MemoryStorage, UuidV7Generator};
+
+    use super::*;
+
+    fn open_session() -> Arc<StorageBackedSession> {
+        let metadata = SessionMetadata {
+            id: "close-cancel-aborts".to_owned(),
+            created_at: 1,
+            storage_version: MemoryStorage::STORAGE_VERSION,
+            cwd: None,
+            parent_session_id: None,
+            legacy_parent_session_path: None,
+        };
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let id_generator: Arc<dyn IdGenerator> = Arc::new(UuidV7Generator::new());
+        StorageBackedSession::new(metadata, storage, id_generator, None)
+    }
+
+    #[tokio::test]
+    async fn close_with_cancelled_context_aborts_without_sealing() {
+        let session = open_session();
+        let token = CancellationToken::new();
+        token.cancel();
+        let cancelled = Context::background().with_cancellation(token);
+
+        let result = session.close(&cancelled).await;
+        assert!(
+            matches!(&result, Err(SessionError::Backend(failure)) if failure.code == StorageErrorCode::Aborted),
+            "cancelled close must abort before sealing: {result:?}"
+        );
+
+        // The seal never happened: reads still work with a live context and a
+        // later close succeeds instead of observing the aborted attempt.
+        let live = Context::background();
+        let stats = session.get_stats(&live).await;
+        assert!(
+            stats.is_ok(),
+            "unsealed session must still serve reads: {stats:?}"
+        );
+        let closed = session.close(&live).await;
+        assert!(
+            closed.is_ok(),
+            "close with a live context must succeed after the aborted close: {closed:?}"
+        );
     }
 }

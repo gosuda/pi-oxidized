@@ -519,7 +519,7 @@ async fn branch_forks_at_root_before_and_at_preserve_the_expected_ancestry() {
 }
 
 #[tokio::test]
-async fn tree_fork_rebuilds_lane_state_and_excludes_transient_values_lists_and_usage() {
+async fn tree_fork_rebuilds_lane_state_and_copies_usage_but_excludes_transients() {
     let repo = MemorySessionRepo::new();
     let cx = Context::background();
     let fixture = seed_fork_fixture(&repo, &cx).await;
@@ -601,7 +601,14 @@ async fn tree_fork_rebuilds_lane_state_and_excludes_transient_values_lists_and_u
         );
     }
     let stats = tree.get_stats(&cx).await.expect("tree stats should read");
-    assert_eq!(stats.usage, pi_agent::pi_ai::Usage::default());
+    assert_eq!(
+        stats.usage,
+        pi_agent::pi_ai::Usage {
+            total_tokens: 7,
+            ..pi_agent::pi_ai::Usage::default()
+        },
+        "tree fork must carry the source usage row per the ForkOptions::Tree contract"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

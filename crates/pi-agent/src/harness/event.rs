@@ -710,9 +710,18 @@ impl HarnessEvent {
     }
 
     /// Constructs a lane-scoped event.
+    ///
+    /// Usage payloads carry their lane inside the record and deliberately
+    /// ship without an outer envelope lane, so the supplied lane is ignored
+    /// for them; every other payload receives the envelope lane.
     pub fn lane(lane: impl Into<LaneName>, payload: HarnessEventPayload) -> Self {
+        let lane = if matches!(payload, HarnessEventPayload::Usage { .. }) {
+            None
+        } else {
+            Some(lane.into())
+        };
         Self {
-            lane: Some(lane.into()),
+            lane,
             recovery: false,
             payload,
         }
@@ -880,3 +889,59 @@ pub type EventListener = Arc<
 
 /// A filter used by a watcher to select events.
 pub type EventFilter = Arc<dyn Fn(&HarnessEvent) -> bool + Send + Sync>;
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions use expect for concise failure"
+)]
+mod tests {
+    use super::*;
+    use crate::session::UsageId;
+
+    fn usage_event() -> HarnessEvent {
+        HarnessEvent::lane(
+            "lane-a",
+            HarnessEventPayload::Usage {
+                lane: LaneName::from("lane-a"),
+                row: UsageRow {
+                    id: UsageId::from("usage-1"),
+                    seq: 1,
+                    usage: pi_ai::Usage::default(),
+                    entry_id: None,
+                    adjustment: false,
+                    details: None,
+                },
+                totals: pi_ai::Usage::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn lane_forwards_envelope_lane_for_lane_scoped_payloads() {
+        let event = HarnessEvent::lane("lane-a", HarnessEventPayload::LaneCreated { at: None });
+        assert_eq!(event.lane.as_ref(), Some(&LaneName::from("lane-a")));
+        event.validate().expect("lane-scoped envelope validates");
+    }
+
+    #[test]
+    fn usage_events_carry_a_single_inner_lane() {
+        let event = usage_event();
+        assert!(
+            event.lane.is_none(),
+            "usage payloads keep their lane inside the payload"
+        );
+        event.validate().expect("usage envelope validates");
+
+        let wire = serde_json::to_string(&event).expect("usage event serializes");
+        assert_eq!(
+            wire.matches("\"lane\":").count(),
+            1,
+            "usage wire record must carry exactly one lane key: {wire}"
+        );
+
+        let round_tripped: HarnessEvent =
+            serde_json::from_str(&wire).expect("usage event round-trips");
+        assert_eq!(round_tripped, event, "round-trip preserves the usage event");
+    }
+}

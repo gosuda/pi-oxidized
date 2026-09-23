@@ -8,11 +8,15 @@
 //! queueing behind itself, so nested events overtake earlier batches that are
 //! admitted but not yet in delivery.  Outside any Tokio runtime, admission
 //! drives the drain synchronously so a dropped future cannot strand an
-//! admitted event.
+//! admitted event.  Watchers follow the same rule: without a runtime — or
+//! inside a transient admission runtime whose spawned tasks die with it — the
+//! watcher worker is driven inline, and a boundary barrier enqueued from the
+//! drain's poll chain is delivered by the awaiter's own chain rather than
+//! queued behind the suspended worker.
 
 use futures::future::{BoxFuture, FutureExt, ready};
 use std::any::Any;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -99,6 +103,12 @@ struct ListenerRegistration {
 
 trait WatcherRecipient: Send + Sync {
     fn push(&self, event: HarnessEvent, context: Context);
+
+    /// Drives this watcher's serialized worker inline until its queue
+    /// empties.  No-op when an ancestor worker for the same watcher is
+    /// already running on this thread; that worker picks the event up when
+    /// its current callback returns.
+    fn drive_inline(&self) -> BoxFuture<'static, ()>;
 }
 
 struct WatcherRegistration {
@@ -111,7 +121,10 @@ enum DeliveryItem {
         events: Vec<BoundEvent>,
         done: Option<oneshot::Sender<()>>,
     },
-    Barrier(Option<Box<dyn FnOnce() + Send>>),
+    Barrier {
+        action: Option<Box<dyn FnOnce() + Send>>,
+        done: Option<oneshot::Sender<()>>,
+    },
 }
 
 struct BoundEvent {
@@ -436,9 +449,34 @@ impl HarnessEventBus {
         })
     }
 
-    fn enqueue_barrier(&self, barrier: Box<dyn FnOnce() + Send>) {
+    /// Enqueues a stream-boundary barrier at the bus tail and returns how its
+    /// completion is observed.
+    ///
+    /// The barrier's queue position is the resnapshot boundary: everything
+    /// already queued is processed through the watcher phase machine before
+    /// it fires, and later admissions land behind it.  When the caller is a
+    /// delivered listener suspended on the drain's poll chain
+    /// (`reentrant_from_drain`), that suspended worker owns the queue — no
+    /// second worker may be scheduled — so the caller observes completion by
+    /// driving the queue inline from its own chain (`Some`): the awaiting
+    /// resnapshot delivers pre-mark items first, preserving the tail
+    /// boundary.  `None` means the barrier resolves through the caller's
+    /// ordinary boundary receiver once a spawned worker drains to it.
+    fn enqueue_barrier(&self, barrier: Box<dyn FnOnce() + Send>) -> Option<oneshot::Receiver<()>> {
+        let (done, observation) = oneshot::channel();
         let mut state = lock_unpoisoned(&self.core.state);
-        state.queue.push_back(DeliveryItem::Barrier(Some(barrier)));
+        if reentrant_from_drain(&self.core) {
+            state.queue.push_back(DeliveryItem::Barrier {
+                action: Some(barrier),
+                done: Some(done),
+            });
+            drop(state);
+            return Some(observation);
+        }
+        state.queue.push_back(DeliveryItem::Barrier {
+            action: Some(barrier),
+            done: Some(done),
+        });
         state.running = true;
         let should_schedule = !state.worker_scheduled;
         if should_schedule {
@@ -449,6 +487,7 @@ impl HarnessEventBus {
             let mut state = lock_unpoisoned(&self.core.state);
             state.worker_scheduled = false;
         }
+        None
     }
 }
 
@@ -516,11 +555,14 @@ async fn drain(core: Arc<BusCore>) {
                     let _ = done.send(());
                 }
             }
-            DeliveryItem::Barrier(mut barrier) => {
-                if let Some(barrier) = barrier.take() {
+            DeliveryItem::Barrier { mut action, done } => {
+                if let Some(barrier) = action.take() {
                     let _ = AssertUnwindSafe(async move { barrier() })
                         .catch_unwind()
                         .await;
+                }
+                if let Some(done) = done {
+                    let _ = done.send(());
                 }
             }
         }
@@ -542,16 +584,36 @@ async fn deliver_bound(core: &Arc<BusCore>, bound: BoundEvent) {
                 }
             }
             Recipient::Watcher(watcher) => {
-                watcher.push(bound.event.clone(), bound.context.clone());
+                deliver_to_watcher(watcher, bound.event.clone(), bound.context.clone()).await;
             }
         }
     }
 }
 
+/// Hands one event to a watcher and, inside a transient inline delivery
+/// window, drives the watcher's serialized worker on this poll chain.
+///
+/// A worker spawned inside `emit_batch`'s one-shot runtime would be dropped
+/// when that runtime shuts down at the end of the admission, stranding the
+/// watcher queue; awaiting the drain inline is what preserves the
+/// no-runtime delivery guarantee.
+async fn deliver_to_watcher(
+    watcher: Arc<dyn WatcherRecipient>,
+    event: HarnessEvent,
+    context: Context,
+) {
+    watcher.push(event, context);
+    if watcher_inline_window() {
+        watcher.drive_inline().await;
+    }
+}
+
 thread_local! {
-    /// Whether this thread is driving a no-runtime inline [`drain`] via
-    /// `emit_batch`.  Inside such a drain the thread only ever executes the
-    /// drain's poll chain, so the flag identifies reentrant emits exactly.
+    /// Whether this thread is inside a transient inline delivery window:
+    /// driving a no-runtime inline [`drain`] via `emit_batch`, or an inline
+    /// watcher worker.  Inside such a window the thread only ever executes
+    /// the owner's poll chain, so the flag identifies reentrant admissions
+    /// exactly and marks every runtime alive on the thread as transient.
     static INLINE_DRAIN: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -561,6 +623,48 @@ struct InlineDrainGuard;
 impl Drop for InlineDrainGuard {
     fn drop(&mut self) {
         INLINE_DRAIN.with(|active| active.set(false));
+    }
+}
+
+thread_local! {
+    /// Watcher addresses whose inline workers are currently driving on this
+    /// thread.  A watcher on this stack is drained by an ancestor worker on
+    /// the same poll chain, so a push reaching it from inside a callback
+    /// must not schedule a second concurrent worker.
+    static INLINE_WATCHER_WORKERS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Whether the current thread is inside a transient inline delivery window
+/// ([`INLINE_DRAIN`]), where delivery is guaranteed only by the caller's own
+/// poll chain and spawned tasks die with the transient runtime.
+fn watcher_inline_window() -> bool {
+    INLINE_DRAIN.with(Cell::get)
+}
+
+/// Whether a watcher's inline worker is already active on this thread.
+fn watcher_worker_inline(key: usize) -> bool {
+    INLINE_WATCHER_WORKERS.with(|workers| workers.borrow().contains(&key))
+}
+
+/// Registers and unregisters one inline watcher worker on this thread,
+/// including through unwinding.
+struct WatcherInlineGuard(usize);
+
+impl WatcherInlineGuard {
+    fn enter(key: usize) -> Self {
+        INLINE_WATCHER_WORKERS.with(|workers| workers.borrow_mut().push(key));
+        Self(key)
+    }
+}
+
+impl Drop for WatcherInlineGuard {
+    fn drop(&mut self) {
+        INLINE_WATCHER_WORKERS.with(|workers| {
+            let mut workers = workers.borrow_mut();
+            if let Some(position) = workers.iter().rposition(|&worker| worker == self.0) {
+                workers.remove(position);
+            }
+        });
     }
 }
 
@@ -616,11 +720,14 @@ async fn deliver_reentrant_batch(core: Arc<BusCore>, observation: oneshot::Recei
                     let _ = done.send(());
                 }
             }
-            DeliveryItem::Barrier(mut barrier) => {
-                if let Some(barrier) = barrier.take() {
+            DeliveryItem::Barrier { mut action, done } => {
+                if let Some(barrier) = action.take() {
                     let _ = AssertUnwindSafe(async move { barrier() })
                         .catch_unwind()
                         .await;
+                }
+                if let Some(done) = done {
+                    let _ = done.send(());
                 }
             }
         }
@@ -680,7 +787,7 @@ async fn report_handler_error(
                     .await;
             }
             Recipient::Watcher(watcher) => {
-                watcher.push(handler_error.clone(), context.clone());
+                deliver_to_watcher(watcher, handler_error.clone(), context.clone()).await;
             }
         }
     }
@@ -766,9 +873,8 @@ impl<T: Clone + Send + Sync + 'static> WatchHandle<T> {
             }
             should_schedule
         };
-        if should_schedule && !self.lease.inner.spawn_worker() {
-            let mut state = lock_unpoisoned(&self.lease.inner.state);
-            state.worker.scheduled = false;
+        if should_schedule {
+            self.lease.inner.dispatch_worker();
         }
         Ok(())
     }
@@ -784,13 +890,22 @@ impl<T: Clone + Send + Sync + 'static> WatchHandle<T> {
     pub async fn resnapshot(&self, cx: &Context) -> Result<Arc<T>, HarnessError> {
         let capture = self.begin_resnapshot()?;
         let (mark_boundary, mut boundary) = self.resnapshot_boundary();
+        // Held across both awaits: cancellation drops the guard, whose
+        // `Drop` restores acceptance exactly like a failed commit would.
+        let cancel_guard = ResnapshotCancelGuard {
+            inner: Arc::clone(&self.lease.inner),
+            mark: Arc::clone(&boundary.state),
+            armed: Cell::new(true),
+        };
         let capture_result =
             AssertUnwindSafe(async move { (capture)(cx.clone(), mark_boundary).await })
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|panic| Err(closed_from_panic(panic_message(&panic))));
         boundary.wait_if_marked().await;
-        self.commit_resnapshot(capture_result, &boundary)
+        let result = self.commit_resnapshot(capture_result, &boundary);
+        cancel_guard.disarm();
+        result
     }
 
     /// Opens a resnapshot: validates the handle, bumps the epoch so queued
@@ -823,11 +938,14 @@ impl<T: Clone + Send + Sync + 'static> WatchHandle<T> {
     fn resnapshot_boundary(&self) -> (MarkBoundary, ResnapshotMark) {
         let (reached_sender, reached) = oneshot::channel();
         let reached_sender = Arc::new(Mutex::new(Some(reached_sender)));
+        let reentrant = Arc::new(Mutex::new(None));
+        let reentrant_for_mark = Arc::clone(&reentrant);
         let weak_inner = Arc::downgrade(&self.lease.inner);
         let weak_core = self.lease.inner.core.clone();
         let on_mark = Box::new(move || {
             let reached_sender_for_barrier = Arc::clone(&reached_sender);
             let weak_inner = weak_inner.clone();
+            let reentrant = Arc::clone(&reentrant_for_mark);
             let barrier = Box::new(move || {
                 if let Some(inner) = weak_inner.upgrade() {
                     inner.mark_holding();
@@ -837,7 +955,9 @@ impl<T: Clone + Send + Sync + 'static> WatchHandle<T> {
                 }
             });
             if let Some(core) = weak_core.upgrade() {
-                HarnessEventBus { core }.enqueue_barrier(barrier);
+                if let Some(observation) = (HarnessEventBus { core }).enqueue_barrier(barrier) {
+                    *lock_unpoisoned(&reentrant) = Some(observation);
+                }
             } else if let Some(sender) = lock_unpoisoned(&reached_sender).take() {
                 let _ = sender.send(());
             }
@@ -849,7 +969,15 @@ impl<T: Clone + Send + Sync + 'static> WatchHandle<T> {
         });
         let callback_state = Arc::clone(&state);
         let mark_boundary = MarkBoundary::from_callback(Arc::new(move || callback_state.mark()));
-        (mark_boundary, ResnapshotMark { state, reached })
+        (
+            mark_boundary,
+            ResnapshotMark {
+                state,
+                reached,
+                reentrant,
+                core: self.lease.inner.core.clone(),
+            },
+        )
     }
 
     /// Commits a finished capture: installs the snapshot or the failure and
@@ -904,6 +1032,57 @@ impl<T: Clone + Send + Sync + 'static> WatchHandle<T> {
     /// Stops future watcher deliveries and unregisters this handle.
     pub fn unsubscribe(&self) {
         self.lease.inner.teardown(&self.lease.unregister);
+    }
+}
+
+/// Restores watcher acceptance when a resnapshot is cancelled before commit.
+///
+/// Held across the capture await and the boundary wait inside
+/// [`WatchHandle::resnapshot`].  Dropping the future at either await runs
+/// this `Drop`, which undoes `begin_resnapshot` exactly like the failure
+/// arms of `commit_resnapshot`: acceptance is restored, and a marked
+/// boundary keeps the phase at [`WatchPhase::Holding`] until
+/// `finish_resnapshot` can atomically place the held events ahead of
+/// anything newly admitted.
+struct ResnapshotCancelGuard<T: Clone + Send + Sync + 'static> {
+    inner: Arc<WatcherInner<T>>,
+    mark: Arc<MarkState>,
+    armed: Cell<bool>,
+}
+
+impl<T: Clone + Send + Sync + 'static> ResnapshotCancelGuard<T> {
+    fn disarm(self) {
+        self.armed.set(false);
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> Drop for ResnapshotCancelGuard<T> {
+    fn drop(&mut self) {
+        if !self.armed.get() {
+            return;
+        }
+        let marked = self.mark.marked();
+        let mut held = Vec::new();
+        let release_held = {
+            let mut state = lock_unpoisoned(&self.inner.state);
+            if state.unsubscribed() {
+                state.resnapshot_active = false;
+                state.phase = WatchPhase::Accepting;
+                state.held.clear();
+                false
+            } else if marked {
+                held.append(&mut state.held);
+                true
+            } else {
+                state.resnapshot_active = false;
+                state.phase = WatchPhase::Accepting;
+                state.held.clear();
+                false
+            }
+        };
+        if release_held {
+            self.inner.finish_resnapshot(held);
+        }
     }
 }
 
@@ -990,6 +1169,10 @@ impl<T: Clone + Send + Sync + 'static> WatcherRecipient for WatcherInner<T> {
         }
         self.push_accepted(QueuedEventNoEpoch { event, context });
     }
+
+    fn drive_inline(&self) -> BoxFuture<'static, ()> {
+        WatcherInner::drive_inline(self)
+    }
 }
 
 impl<T: Clone + Send + Sync + 'static> WatcherInner<T> {
@@ -1039,9 +1222,8 @@ impl<T: Clone + Send + Sync + 'static> WatcherInner<T> {
                 false
             }
         };
-        if should_schedule && !self.spawn_worker() {
-            let mut state = lock_unpoisoned(&self.state);
-            state.worker.scheduled = false;
+        if should_schedule {
+            self.dispatch_worker();
         }
     }
 
@@ -1095,12 +1277,14 @@ impl<T: Clone + Send + Sync + 'static> WatcherInner<T> {
                 should_schedule
             }
         };
-        if should_schedule && !self.spawn_worker() {
-            let mut state = lock_unpoisoned(&self.state);
-            state.worker.scheduled = false;
+        if should_schedule {
+            self.dispatch_worker();
         }
     }
 
+    /// Spawns the serialized worker on the ambient runtime.  A `false`
+    /// return must be routed through [`Self::dispatch_worker`]'s inline
+    /// fallbacks rather than silently dropping the schedule.
     fn spawn_worker(&self) -> bool {
         let Ok(handle) = Handle::try_current() else {
             return false;
@@ -1110,6 +1294,62 @@ impl<T: Clone + Send + Sync + 'static> WatcherInner<T> {
         };
         drop(handle.spawn(drain_watcher(inner)));
         true
+    }
+
+    /// Address key matching this watcher's inline workers on one thread.
+    fn inline_key(&self) -> usize {
+        std::ptr::from_ref::<WatcherInner<T>>(self) as usize
+    }
+
+    fn drive_inline(&self) -> BoxFuture<'static, ()> {
+        let key = self.inline_key();
+        if watcher_worker_inline(key) {
+            return ready(()).boxed();
+        }
+        let Some(inner) = self.self_ref.get().and_then(Weak::upgrade) else {
+            return ready(()).boxed();
+        };
+        async move {
+            let _worker_guard = WatcherInlineGuard::enter(key);
+            drain_watcher(inner).await;
+        }
+        .boxed()
+    }
+
+    /// Starts this watcher's serialized worker for newly queued events.
+    ///
+    /// Inside a transient inline delivery window the awaiting deliverer owns
+    /// the queue via [`Self::drive_inline`]: a task spawned here would be
+    /// dropped when the transient runtime shuts down at the end of the
+    /// admission.  Without any runtime the worker is driven inline on a
+    /// one-shot current-thread runtime, mirroring `emit_batch`'s delivery
+    /// guarantee.
+    fn dispatch_worker(&self) {
+        if watcher_inline_window() {
+            return;
+        }
+        if self.spawn_worker() {
+            return;
+        }
+        self.run_worker_inline();
+    }
+
+    /// Drives this watcher's worker inline when no runtime exists to host a
+    /// spawned task, so queued events cannot strand.
+    #[allow(
+        clippy::panic,
+        reason = "fail loudly on executor collapse rather than strand queued events"
+    )]
+    fn run_worker_inline(&self) {
+        INLINE_DRAIN.with(|active| active.set(true));
+        let _inline_guard = InlineDrainGuard;
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(self.drive_inline()),
+            Err(error) => panic!("transient watcher worker runtime failed to build: {error}"),
+        }
     }
 
     fn unsubscribe(&self) {
@@ -1197,6 +1437,11 @@ struct MarkState {
 }
 
 impl MarkState {
+    /// Whether the capture marked its boundary.
+    fn marked(&self) -> bool {
+        self.marked.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn mark(&self) -> Result<(), HarnessError> {
         use std::sync::atomic::Ordering;
 
@@ -1219,24 +1464,40 @@ impl MarkState {
     }
 }
 
-/// One resnapshot's boundary outcome: the exactly-once mark flags and the
-/// receiver that resolves once the bus drains to the marked barrier.
+/// One resnapshot's boundary outcome: the exactly-once mark flags, the
+/// receiver that resolves once the bus drains to the marked barrier, and —
+/// when the mark ran on the drain's poll chain — the inline observation that
+/// lets the caller deliver the barrier on its own chain.
 struct ResnapshotMark {
     state: Arc<MarkState>,
     reached: oneshot::Receiver<()>,
+    reentrant: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    core: Weak<BusCore>,
 }
 
 impl ResnapshotMark {
     /// Whether the capture marked its boundary.
     fn marked(&self) -> bool {
-        self.state.marked.load(std::sync::atomic::Ordering::Acquire)
+        self.state.marked()
     }
 
     /// Waits for the boundary barrier to drain when the capture marked it.
+    ///
+    /// A barrier enqueued from the drain's poll chain carries its own inline
+    /// observation; driving it here delivers the barrier on this chain
+    /// instead of waiting for a worker that is suspended inside the caller.
     async fn wait_if_marked(&mut self) {
-        if self.marked() {
-            let _ = (&mut self.reached).await;
+        if !self.marked() {
+            return;
         }
+        let observation = lock_unpoisoned(&self.reentrant).take();
+        if let Some(core) = self.core.upgrade()
+            && let Some(observation) = observation
+        {
+            deliver_reentrant_batch(core, observation).await;
+            return;
+        }
+        let _ = (&mut self.reached).await;
     }
 
     /// Returns the boundary violation when the capture misused its mark.
@@ -1304,13 +1565,14 @@ fn panic_message(panic: &(dyn Any + Send)) -> String {
     reason = "bus tests use contextual fixture failures"
 )]
 mod tests {
-    use super::{Arc, EventFilter, HarnessError, HarnessEventBus};
+    use super::{Arc, EventFilter, HarnessError, HarnessEventBus, ResnapshotCapture};
     use crate::context::Context;
     use crate::harness::event::{
         EventListener, HandlerErrorKind, HarnessEvent, HarnessEventPayload, HarnessEventType,
+        MarkBoundary,
     };
-    use futures::future::FutureExt;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use futures::future::{FutureExt, pending};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     fn fault_event(code: &str) -> HarnessEvent {
@@ -1412,5 +1674,261 @@ mod tests {
             delivered.load(Ordering::Acquire),
             "dropping the future must not strand the admitted event"
         );
+    }
+
+    fn counting_listener(counter: &Arc<AtomicUsize>) -> EventListener {
+        let counter = Arc::clone(counter);
+        Arc::new(move |_event: HarnessEvent, _context: Context| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::AcqRel);
+            }
+            .boxed()
+        })
+    }
+
+    #[test]
+    fn emit_outside_runtime_delivers_to_started_watcher() {
+        let bus = HarnessEventBus::new();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let filter: EventFilter = Arc::new(|_| true);
+        let handle = bus.watch((), filter, None).expect("watch registration");
+        handle
+            .start(counting_listener(&delivered))
+            .expect("watch start");
+
+        drop(bus.emit(fault_event("watched"), &Context::background()));
+        assert_eq!(
+            delivered.load(Ordering::Acquire),
+            1,
+            "the transient admission runtime must not strand the watcher queue"
+        );
+    }
+
+    #[test]
+    fn watcher_start_outside_runtime_drains_buffered_events() {
+        let bus = HarnessEventBus::new();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let filter: EventFilter = Arc::new(|_| true);
+        let handle = bus.watch((), filter, None).expect("watch registration");
+        // Buffer one event while the watcher has no listener yet.
+        drop(bus.emit(fault_event("buffered"), &Context::background()));
+
+        handle
+            .start(counting_listener(&delivered))
+            .expect("watch start");
+        assert_eq!(
+            delivered.load(Ordering::Acquire),
+            1,
+            "starting outside a runtime must drain the flushed buffer inline"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_resnapshot_restores_acceptance() {
+        let bus = HarnessEventBus::new();
+        let context = Context::background();
+        let filter: EventFilter = Arc::new(|_| true);
+        let attempt = Arc::new(AtomicUsize::new(0));
+        let capture: ResnapshotCapture<u32> = {
+            let attempt = Arc::clone(&attempt);
+            Arc::new(move |_context: Context, boundary: MarkBoundary| {
+                let attempt = Arc::clone(&attempt);
+                async move {
+                    if attempt.fetch_add(1, Ordering::AcqRel) == 0 {
+                        pending::<Result<u32, HarnessError>>().await
+                    } else {
+                        boundary.mark()?;
+                        Ok(2)
+                    }
+                }
+                .boxed()
+            })
+        };
+        let handle = bus
+            .watch(1, filter, Some(capture))
+            .expect("watch registration");
+
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(50), handle.resnapshot(&context)).await;
+        assert!(cancelled.is_err(), "the first capture must be cancellable");
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), handle.resnapshot(&context))
+            .await
+            .expect("a cancelled resnapshot must not block the next one")
+            .expect("second resnapshot succeeds");
+        assert_eq!(*snapshot, 2);
+        assert_eq!(attempt.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_after_boundary_mark_restores_acceptance() {
+        let bus = HarnessEventBus::new();
+        let context = Context::background();
+        let filter: EventFilter = Arc::new(|_| true);
+        let marked = Arc::new(AtomicBool::new(false));
+        let capture: ResnapshotCapture<u32> = {
+            let marked = Arc::clone(&marked);
+            Arc::new(move |_context: Context, boundary: MarkBoundary| {
+                let marked = Arc::clone(&marked);
+                async move {
+                    boundary.mark()?;
+                    marked.store(true, Ordering::Release);
+                    pending::<Result<u32, HarnessError>>().await
+                }
+                .boxed()
+            })
+        };
+        let handle = bus
+            .watch(1, filter, Some(capture))
+            .expect("watch registration");
+        let delivered = Arc::new(AtomicUsize::new(0));
+        handle
+            .start(counting_listener(&delivered))
+            .expect("watch start");
+
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(50), handle.resnapshot(&context)).await;
+        assert!(
+            cancelled.is_err(),
+            "capture must stay cancellable after marking"
+        );
+        assert!(
+            marked.load(Ordering::Acquire),
+            "the boundary must have been marked before cancellation"
+        );
+
+        // Let the marked barrier drain, then prove the watcher accepts and
+        // delivers again instead of staying in Dropping/Holding.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            bus.emit(fault_event("after-cancel"), &context),
+        )
+        .await
+        .expect("post-cancel emit must not be held behind the cancelled resnapshot");
+        assert_eq!(
+            delivered.load(Ordering::Acquire),
+            1,
+            "a cancelled resnapshot must restore Accepting"
+        );
+
+        // A second resnapshot must start rather than fail with
+        // "already in progress": its capture pends, so only a timeout means
+        // the guard cleared `resnapshot_active`.
+        let second =
+            tokio::time::timeout(Duration::from_millis(50), handle.resnapshot(&context)).await;
+        assert!(
+            second.is_err(),
+            "the guard must clear resnapshot_active; got {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_resnapshot_does_not_deadlock_on_its_own_barrier() {
+        let bus = HarnessEventBus::new();
+        let context = Context::background();
+        let filter: EventFilter =
+            Arc::new(|event: &HarnessEvent| event.event_type() == HarnessEventType::Fault);
+        let capture: ResnapshotCapture<u32> =
+            Arc::new(|_context: Context, boundary: MarkBoundary| {
+                async move {
+                    boundary.mark()?;
+                    Ok(2)
+                }
+                .boxed()
+            });
+        let handle = std::sync::Arc::new(
+            bus.watch(1, filter, Some(capture))
+                .expect("watch registration"),
+        );
+        let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let watcher_log = Arc::clone(&log);
+        handle
+            .start(Arc::new(move |event: HarnessEvent, _context: Context| {
+                let watcher_log = Arc::clone(&watcher_log);
+                async move {
+                    let code = match event.payload {
+                        HarnessEventPayload::Fault { code, .. } => code,
+                        _ => String::from("other"),
+                    };
+                    let entry: &'static str = match code.as_str() {
+                        "outer" => "watcher-outer",
+                        "post-boundary" => "watcher-post",
+                        _ => "watcher-other",
+                    };
+                    watcher_log.lock().expect("log").push(entry);
+                }
+                .boxed()
+            }))
+            .expect("watch start");
+
+        let listener_bus = bus.clone();
+        let listener_handle = std::sync::Arc::clone(&handle);
+        let listener_log = Arc::clone(&log);
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_for_listener = Arc::clone(&fired);
+        let _listener_guard = bus
+            .on(
+                HarnessEventType::Fault,
+                Arc::new(move |_event: HarnessEvent, context: Context| {
+                    let bus = listener_bus.clone();
+                    let handle = std::sync::Arc::clone(&listener_handle);
+                    let log = Arc::clone(&listener_log);
+                    let fired = Arc::clone(&fired_for_listener);
+                    async move {
+                        // The post-boundary emit also carries Fault; only the
+                        // first listener run drives the resnapshot.
+                        if fired.swap(true, Ordering::AcqRel) {
+                            return;
+                        }
+                        // Admitted on the drain chain before the mark; the
+                        // barrier must not overtake it out of existence.
+                        bus.emit(handler_error_event(), &context).await;
+                        let snapshot = handle.resnapshot(&context).await.expect("resnapshot");
+                        assert_eq!(*snapshot, 2);
+                        log.lock().expect("log").push("resnapshot-done");
+                    }
+                    .boxed()
+                }),
+            )
+            .expect("listener registration");
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            bus.emit(fault_event("outer"), &context),
+        )
+        .await
+        .expect("a listener resnapshot must not deadlock on its own barrier");
+        assert!(
+            fired.load(Ordering::Acquire),
+            "the first Fault must drive the listener: {log:?}"
+        );
+
+        // Delivered after the resnapshot completed: the watcher holds it
+        // behind the boundary and replays it once acceptance is restored.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            bus.emit(fault_event("post-boundary"), &context),
+        )
+        .await
+        .expect("post-boundary delivery must not strand");
+
+        // Emission resolution proves only the push; wait for the watcher's
+        // serialized callbacks to run both deliveries.
+        for _ in 0..1000 {
+            if log.lock().expect("log").len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        let log = log.lock().expect("log").clone();
+        assert_eq!(
+            log,
+            vec!["resnapshot-done", "watcher-outer", "watcher-post"],
+            "exact delivery order proves the boundary held and nothing leaked"
+        );
+        assert_eq!(*handle.snapshot(), 2);
     }
 }

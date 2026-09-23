@@ -4,6 +4,7 @@ mod facade;
 mod lifecycle;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -82,7 +83,8 @@ struct SingletonBinding {
     service_id: JsString,
     facade: Arc<RemoteServiceFacade>,
     active: AtomicBool,
-    revision: AtomicU64,
+    /// Shared with the facade so commits re-validate under the members lock.
+    revision: Arc<AtomicU64>,
     subscription: Mutex<Option<Arc<dyn ServiceSubscription>>>,
     starting: Mutex<Option<JoinHandle<Result<(), ServiceError>>>>,
     start_cancel: Mutex<Option<CancellationToken>>,
@@ -98,7 +100,10 @@ struct KeyedBinding {
     subscription: Mutex<Option<Arc<dyn ServiceSubscription>>>,
     starting: Mutex<Option<JoinHandle<Result<(), ServiceError>>>>,
     start_cancel: Mutex<Option<CancellationToken>>,
-    revision: AtomicU64,
+    /// Shared with every instance facade so commits re-validate under the members lock.
+    revision: Arc<AtomicU64>,
+    /// Runtime captured at startup; update listeners may run off-runtime.
+    runtime: Mutex<Option<tokio::runtime::Handle>>,
     ready: AtomicBool,
     closed: AtomicBool,
 }
@@ -114,10 +119,20 @@ struct Observer {
     tasks: Mutex<Vec<ObserverTask>>,
 }
 
+/// Monotonic identity source for spawned observer callbacks.
+static NEXT_OBSERVER_TASK: AtomicU64 = AtomicU64::new(1);
+
 struct ObserverTask {
+    /// Identity of the spawned handler, used to exclude a self-close.
+    id: u64,
     address: ServiceInstanceAddress,
     cancel: CancellationToken,
     join: JoinHandle<()>,
+}
+
+tokio::task_local! {
+    /// Identity of the running observer callback, visible to self-closes.
+    static OBSERVER_TASK: u64;
 }
 
 /// Registration returned by [`RemoteServiceBinding::observe_keyed`].
@@ -158,6 +173,8 @@ impl ServiceObservation {
 
     /// Cancels this observer and waits until every callback task has settled.
     ///
+    /// A callback closing its own observation never awaits its own task.
+    ///
     /// # Errors
     /// Returns an error if the binding is disposed, the context is cancelled,
     /// or awaiting the keyed binding stop fails.
@@ -169,7 +186,8 @@ impl ServiceObservation {
             return Ok(());
         };
         let tasks = binding.remove_observer(self.observer_id);
-        cancel_and_drain(tasks).await;
+        let self_task = OBSERVER_TASK.try_with(|id| *id).ok();
+        cancel_and_drain(tasks, self_task).await;
         binding.stop_if_empty(context).await
     }
 }
@@ -219,25 +237,35 @@ impl RemoteServiceBinding {
         service_id: &JsString,
     ) -> Result<Arc<RemoteServiceFacade>, ServiceError> {
         self.assert_available(service_id, ServiceMode::Singleton)?;
-        if let Some(binding) = lock(&self.inner.singletons).get(service_id).cloned() {
+        let singletons = lock(&self.inner.singletons);
+        if self.inner.lifecycle.is_disposed() {
+            return Err(ServiceError::disposed("Remote service binding is disposed"));
+        }
+        if let Some(binding) = singletons.get(service_id).cloned() {
             return Ok(Arc::clone(&binding.facade));
         }
-        let facade = RemoteServiceFacade::new(
+        drop(singletons);
+        let revision = Arc::new(AtomicU64::new(0));
+        let facade = Arc::new(RemoteServiceFacade::new(
             service_id.clone(),
             None,
             Arc::clone(&self.inner.transport),
             Arc::clone(&self.inner.lifecycle),
-        );
+            Arc::clone(&revision),
+        ));
         let binding = Arc::new(SingletonBinding {
             service_id: service_id.clone(),
-            facade: Arc::new(facade),
+            facade: Arc::clone(&facade),
             active: AtomicBool::new(true),
-            revision: AtomicU64::new(0),
+            revision,
             subscription: Mutex::new(None),
             starting: Mutex::new(None),
             start_cancel: Mutex::new(None),
         });
         let mut singletons = lock(&self.inner.singletons);
+        if self.inner.lifecycle.is_disposed() {
+            return Err(ServiceError::disposed("Remote service binding is disposed"));
+        }
         if let Some(existing) = singletons.get(service_id).cloned() {
             return Ok(Arc::clone(&existing.facade));
         }
@@ -247,7 +275,7 @@ impl RemoteServiceBinding {
         if self.inner.lifecycle.is_bound() {
             self.spawn_singleton_start(&binding)?;
         }
-        Ok(Arc::clone(&binding.facade))
+        Ok(facade)
     }
 
     /// Observes every live generation of a keyed service.
@@ -263,6 +291,9 @@ impl RemoteServiceBinding {
         self.assert_available(service_id, ServiceMode::Keyed)?;
         let binding = {
             let mut keyed = lock(&self.inner.keyed);
+            if self.inner.lifecycle.is_disposed() {
+                return Err(ServiceError::disposed("Remote service binding is disposed"));
+            }
             if let Some(binding) = keyed.get(service_id) {
                 Arc::clone(binding)
             } else {
@@ -279,6 +310,10 @@ impl RemoteServiceBinding {
         let (observer_id, was_empty) = binding.add_observer(handler)?;
         if was_empty && self.inner.lifecycle.is_bound() {
             binding.spawn_start()?;
+        } else if !was_empty {
+            // A late observer on a ready binding must still see the live
+            // instances the first observer's subscription already stored.
+            binding.start_tasks_for_observer(observer_id)?;
         }
         Ok(ServiceObservation {
             binding: Arc::downgrade(&binding),
@@ -299,10 +334,10 @@ impl RemoteServiceBinding {
             let keyed_starts: Vec<Arc<KeyedBinding>> =
                 lock(&self.inner.keyed).values().cloned().collect();
             for binding in singleton_starts {
-                binding.wait_start().await?;
+                binding.wait_start(context).await?;
             }
             for binding in keyed_starts {
-                binding.wait_start().await?;
+                binding.wait_start(context).await?;
             }
             context.check()?;
             if revision == self.inner.readiness_revision.load(Ordering::Acquire) {
@@ -337,12 +372,12 @@ impl RemoteServiceBinding {
             for binding in singletons {
                 binding.active.store(true, Ordering::Release);
                 self.spawn_singleton_start(&binding)?;
-                binding.wait_start().await?;
+                binding.wait_start(&context).await?;
             }
             for binding in keyed {
                 if binding.observer_count() > 0 {
                     binding.spawn_start()?;
-                    binding.wait_start().await?;
+                    binding.wait_start(&context).await?;
                 }
             }
         }
@@ -422,11 +457,12 @@ impl RemoteServiceBinding {
     }
 
     fn spawn_singleton_start(&self, binding: &Arc<SingletonBinding>) -> Result<(), ServiceError> {
-        if binding.starting_is_set() {
-            return Ok(());
-        }
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| ServiceError::local("Remote service binding requires a Tokio runtime"))?;
+        let mut starting = lock(&binding.starting);
+        if starting.is_some() {
+            return Ok(());
+        }
         let revision = binding.revision.load(Ordering::Acquire);
         let token = CancellationToken::new();
         *lock(&binding.start_cancel) = Some(token.clone());
@@ -436,28 +472,27 @@ impl RemoteServiceBinding {
         let task = handle.spawn(async move {
             start_singleton(task_binding, transport, lifecycle, revision, token).await
         });
-        *lock(&binding.starting) = Some(task);
+        *starting = Some(task);
         Ok(())
     }
 }
 
 impl SingletonBinding {
-    fn starting_is_set(&self) -> bool {
-        lock(&self.starting).is_some()
-    }
-
-    async fn wait_start(&self) -> Result<(), ServiceError> {
+    async fn wait_start(&self, context: &Context) -> Result<(), ServiceError> {
         let task = lock(&self.starting).take();
         let Some(task) = task else {
             return Ok(());
         };
-        match task.await {
-            Ok(result) => result,
-            Err(error) => Err(ServiceError::internal_with_source(
-                "Remote service start task failed",
-                error,
-            )),
+        let (restore, result) = join_start_or_cancel(
+            task,
+            context.token().cloned(),
+            "Remote service start task failed",
+        )
+        .await;
+        if let Some(task) = restore {
+            *lock(&self.starting) = Some(task);
         }
+        result
     }
 
     async fn stop(&self, context: Context) -> Result<(), ServiceError> {
@@ -491,7 +526,7 @@ impl SingletonBinding {
                         "Singleton replacement has an instance address",
                     ))
                 } else {
-                    self.facade.install(snapshot, context)
+                    self.facade.install(snapshot, context, revision)
                 }
             }
             ServiceProviderUpdate::State {
@@ -499,7 +534,9 @@ impl SingletonBinding {
                 member,
                 sequence,
                 ops,
-            } => self.facade.update(member, *sequence, ops, context),
+            } => self
+                .facade
+                .update(member, *sequence, ops, context, revision),
             ServiceProviderUpdate::State {
                 instance: Some(_), ..
             }
@@ -508,7 +545,10 @@ impl SingletonBinding {
                 "Singleton received a keyed lifecycle update",
             )),
         };
-        if let Err(error) = result {
+        if let Err(error) = result
+            && self.active.load(Ordering::Acquire)
+            && self.revision.load(Ordering::Acquire) == revision
+        {
             self.facade.inner.lifecycle.report(error);
         }
     }
@@ -557,10 +597,16 @@ async fn start_singleton(
             display_js(&binding.service_id)
         )));
     }
-    if let Err(error) = binding
-        .facade
-        .install(&snapshot.instances[0], &Context::background())
+    if let Err(error) =
+        binding
+            .facade
+            .install(&snapshot.instances[0], &Context::background(), revision)
     {
+        if binding.revision.load(Ordering::Acquire) != revision {
+            // Superseded by a lifecycle transition; nothing was recorded yet.
+            subscription.close(Context::background()).await?;
+            return Ok(());
+        }
         binding.facade.deactivate();
         if let Err(cleanup_error) = subscription.close(Context::background()).await {
             *lock(&binding.subscription) = Some(Arc::clone(&subscription));
@@ -570,6 +616,18 @@ async fn start_singleton(
     }
     *lock(&binding.subscription) = Some(Arc::clone(&subscription));
     subscription.activate();
+    // Revalidate after recording and activating: a concurrent rebind or
+    // dispose must not leave this subscription tracked and live.
+    if !binding.active.load(Ordering::Acquire)
+        || !lifecycle.is_bound()
+        || lifecycle.is_disposed()
+        || binding.revision.load(Ordering::Acquire) != revision
+    {
+        lock(&binding.subscription).take();
+        binding.facade.deactivate();
+        subscription.close(Context::background()).await?;
+        return Ok(());
+    }
     Ok(())
 }
 
@@ -589,7 +647,8 @@ impl KeyedBinding {
             subscription: Mutex::new(None),
             starting: Mutex::new(None),
             start_cancel: Mutex::new(None),
-            revision: AtomicU64::new(0),
+            revision: Arc::new(AtomicU64::new(0)),
+            runtime: Mutex::new(None),
             ready: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         }
@@ -628,47 +687,58 @@ impl KeyedBinding {
         std::mem::take(&mut *lock(&observer.tasks))
     }
 
-    async fn stop_if_empty(&self, context: Context) -> Result<(), ServiceError> {
+    async fn stop_if_empty(self: &Arc<Self>, context: Context) -> Result<(), ServiceError> {
         if self.observer_count() != 0 {
             return Ok(());
         }
-        self.reset(context, false).await
+        self.reset(context, false).await?;
+        // The reset awaited teardown, so an observer may have registered in
+        // the meantime; restart startup so it is not left behind a shutdown.
+        if !self.closed.load(Ordering::Acquire)
+            && self.lifecycle.is_bound()
+            && self.observer_count() > 0
+        {
+            self.spawn_start()?;
+        }
+        Ok(())
     }
 
     fn spawn_start(self: &Arc<Self>) -> Result<(), ServiceError> {
-        if self.closed.load(Ordering::Acquire)
-            || !self.lifecycle.is_bound()
-            || self.starting_is_set()
-        {
+        if self.closed.load(Ordering::Acquire) || !self.lifecycle.is_bound() {
             return Ok(());
         }
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| ServiceError::local("Remote service binding requires a Tokio runtime"))?;
+        // Update listeners may run off-runtime; capture the handle for them.
+        *lock(&self.runtime) = Some(handle.clone());
+        let mut starting = lock(&self.starting);
+        if starting.is_some() {
+            return Ok(());
+        }
         let revision = self.revision.load(Ordering::Acquire);
         let token = CancellationToken::new();
         *lock(&self.start_cancel) = Some(token.clone());
         let binding = Arc::clone(self);
         let task = handle.spawn(async move { binding.start(revision, token).await });
-        *lock(&self.starting) = Some(task);
+        *starting = Some(task);
         Ok(())
     }
 
-    fn starting_is_set(&self) -> bool {
-        lock(&self.starting).is_some()
-    }
-
-    async fn wait_start(&self) -> Result<(), ServiceError> {
+    async fn wait_start(&self, context: &Context) -> Result<(), ServiceError> {
         let task = lock(&self.starting).take();
         let Some(task) = task else {
             return Ok(());
         };
-        match task.await {
-            Ok(result) => result,
-            Err(error) => Err(ServiceError::internal_with_source(
-                "Remote keyed service start task failed",
-                error,
-            )),
+        let (restore, result) = join_start_or_cancel(
+            task,
+            context.token().cloned(),
+            "Remote keyed service start task failed",
+        )
+        .await;
+        if let Some(task) = restore {
+            *lock(&self.starting) = Some(task);
         }
+        result
     }
 
     async fn start(
@@ -709,30 +779,51 @@ impl KeyedBinding {
             )));
         }
         for instance in &snapshot.instances {
-            if let Err(error) = self.spawn_instance(instance, &Context::background()) {
+            if let Err(error) = self.spawn_instance(instance, &Context::background(), revision) {
                 let tasks = self.deactivate_instances();
-                cancel_and_drain(tasks).await;
+                cancel_and_drain(tasks, None).await;
                 subscription.close(Context::background()).await?;
+                if self.revision.load(Ordering::Acquire) != revision {
+                    // Superseded by a lifecycle transition; treat as graceful.
+                    return Ok(());
+                }
                 return Err(error);
             }
         }
         *lock(&self.subscription) = Some(Arc::clone(&subscription));
         subscription.activate();
+        // Revalidate after recording and activating: a concurrent rebind,
+        // reset, or dispose must not leave this subscription tracked and live.
+        if self.closed.load(Ordering::Acquire)
+            || !self.lifecycle.is_bound()
+            || self.lifecycle.is_disposed()
+            || self.revision.load(Ordering::Acquire) != revision
+        {
+            lock(&self.subscription).take();
+            self.ready.store(false, Ordering::Release);
+            let tasks = self.deactivate_instances();
+            subscription.close(Context::background()).await?;
+            cancel_and_drain(tasks, None).await;
+            return Ok(());
+        }
         self.ready.store(true, Ordering::Release);
         let instances: Vec<Arc<KeyedInstance>> = lock(&self.instances).values().cloned().collect();
-        for instance in instances {
-            self.start_observer_tasks(&instance, &Context::background());
+        for instance in &instances {
+            self.start_observer_tasks(instance, &Context::background())?;
         }
         Ok(())
     }
 
     async fn reset(&self, context: Context, permanent: bool) -> Result<(), ServiceError> {
+        // Invalidate callbacks from the subscription being closed before any
+        // teardown: an in-flight Spawned update must not repopulate the map.
+        self.revision.fetch_add(1, Ordering::AcqRel);
         self.ready.store(false, Ordering::Release);
         if permanent {
             self.closed.store(true, Ordering::Release);
         }
         let instance_tasks = self.deactivate_instances();
-        cancel_and_drain(instance_tasks).await;
+        cancel_and_drain(instance_tasks, None).await;
         if let Some(token) = lock(&self.start_cancel).take() {
             token.cancel();
         }
@@ -754,7 +845,7 @@ impl KeyedBinding {
                 observer.active.store(false, Ordering::Release);
                 tasks.extend(std::mem::take(&mut *lock(&observer.tasks)));
             }
-            cancel_and_drain(tasks).await;
+            cancel_and_drain(tasks, None).await;
         }
         Ok(())
     }
@@ -808,6 +899,7 @@ impl KeyedBinding {
         &self,
         snapshot: &ServiceInstanceSnapshot<DeltaOp>,
         context: &Context,
+        revision: u64,
     ) -> Result<(), ServiceError> {
         let address = snapshot
             .instance
@@ -818,14 +910,22 @@ impl KeyedBinding {
             Some(address.clone()),
             Arc::clone(&self.transport),
             Arc::clone(&self.lifecycle),
+            Arc::clone(&self.revision),
         ));
-        facade.install(snapshot, context)?;
+        facade.install(snapshot, context, revision)?;
         let instance = Arc::new(KeyedInstance {
             address: address.clone(),
             facade,
         });
         let previous = {
             let mut instances = lock(&self.instances);
+            // Serialize with reset: once a reset invalidates this revision the
+            // instance must not re-enter the supposedly emptied map.
+            if self.revision.load(Ordering::Acquire) != revision {
+                return Err(ServiceError::local(
+                    "Keyed instance install was superseded by a binding transition",
+                ));
+            }
             if let Some(existing) = instances.get(&address.key)
                 && existing.address.generation == address.generation
             {
@@ -840,37 +940,83 @@ impl KeyedBinding {
             self.cancel_tasks_for(&previous.address);
         }
         if self.ready.load(Ordering::Acquire) {
-            self.start_observer_tasks(&instance, context);
+            self.start_observer_tasks(&instance, context)?;
         }
         Ok(())
     }
 
-    fn start_observer_tasks(&self, instance: &Arc<KeyedInstance>, context: &Context) {
+    fn start_observer_tasks(
+        &self,
+        instance: &Arc<KeyedInstance>,
+        context: &Context,
+    ) -> Result<(), ServiceError> {
         let observers: Vec<Arc<Observer>> = lock(&self.observers).values().cloned().collect();
         for observer in observers {
-            if !observer.active.load(Ordering::Acquire) {
-                continue;
-            }
-            let (task_context, cancel) = context.with_cancel();
-            let handler = Arc::clone(&observer.handler);
-            let facade = Arc::clone(&instance.facade);
-            let lifecycle = Arc::clone(&self.lifecycle);
-            let task_cancel = cancel.clone();
-            let address = instance.address.clone();
-            let join = tokio::spawn(async move {
-                if let Err(error) = handler(facade, task_context).await
-                    && !task_cancel.is_cancelled()
-                    && !lifecycle.is_disposed()
-                {
-                    lifecycle.report(error);
-                }
-            });
-            lock(&observer.tasks).push(ObserverTask {
-                address,
-                cancel,
-                join,
-            });
+            self.spawn_observer_task(&observer, instance, context)?;
         }
+        Ok(())
+    }
+
+    /// Schedules a newly registered observer against every live instance of a
+    /// ready binding, so late observers see the instances they missed.
+    fn start_tasks_for_observer(&self, observer_id: u64) -> Result<(), ServiceError> {
+        if !self.ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let observer = lock(&self.observers).get(&observer_id).cloned();
+        let Some(observer) = observer else {
+            return Ok(());
+        };
+        let instances: Vec<Arc<KeyedInstance>> = lock(&self.instances).values().cloned().collect();
+        for instance in &instances {
+            self.spawn_observer_task(&observer, instance, &Context::background())?;
+        }
+        Ok(())
+    }
+
+    fn spawn_observer_task(
+        &self,
+        observer: &Arc<Observer>,
+        instance: &Arc<KeyedInstance>,
+        context: &Context,
+    ) -> Result<(), ServiceError> {
+        // Update listeners may fire off-runtime; use the handle captured at
+        // startup, falling back to the current runtime when available.
+        let handle = match lock(&self.runtime).clone() {
+            Some(handle) => handle,
+            None => tokio::runtime::Handle::try_current().map_err(|_| {
+                ServiceError::local("Remote service binding requires a Tokio runtime")
+            })?,
+        };
+        let (task_context, cancel) = context.with_cancel();
+        let handler = Arc::clone(&observer.handler);
+        let facade = Arc::clone(&instance.facade);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let task_cancel = cancel.clone();
+        let address = instance.address.clone();
+        let task_id = NEXT_OBSERVER_TASK.fetch_add(1, Ordering::AcqRel);
+        // Record the task under the observer's task lock, and skip spawning
+        // once the observer is disabled: a stop either observes the recorded
+        // task or disables the observer before the callback can start.
+        let mut tasks = lock(&observer.tasks);
+        if !observer.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let join = handle.spawn(OBSERVER_TASK.scope(task_id, async move {
+            if let Err(error) = handler(facade, task_context).await
+                && !task_cancel.is_cancelled()
+                && !lifecycle.is_disposed()
+            {
+                lifecycle.report(error);
+            }
+        }));
+        tasks.push(ObserverTask {
+            id: task_id,
+            address,
+            cancel,
+            join,
+        });
+        Ok(())
     }
 
     fn update(&self, update: &ServiceProviderUpdate<DeltaOp>, context: &Context, revision: u64) {
@@ -882,7 +1028,9 @@ impl KeyedBinding {
             ServiceProviderUpdate::Unavailable | ServiceProviderUpdate::Replaced { .. } => Err(
                 ServiceError::local("Keyed service received a singleton lifecycle update"),
             ),
-            ServiceProviderUpdate::Spawned { instance } => self.spawn_instance(instance, context),
+            ServiceProviderUpdate::Spawned { instance } => {
+                self.spawn_instance(instance, context, revision)
+            }
             ServiceProviderUpdate::Closed { instance } => {
                 let current = lock(&self.instances).get(&instance.key).cloned();
                 if current
@@ -909,7 +1057,9 @@ impl KeyedBinding {
                         if instance.address.generation == address.generation
                             && instance.facade.inner.is_active() =>
                     {
-                        instance.facade.update(member, *sequence, ops, context)
+                        instance
+                            .facade
+                            .update(member, *sequence, ops, context, revision)
                     }
                     _ => Ok(()),
                 }
@@ -918,7 +1068,10 @@ impl KeyedBinding {
                 "Keyed state update has no instance address",
             )),
         };
-        if let Err(error) = result {
+        if let Err(error) = result
+            && !self.closed.load(Ordering::Acquire)
+            && self.revision.load(Ordering::Acquire) == revision
+        {
             self.lifecycle.report(error);
         }
     }
@@ -935,11 +1088,60 @@ fn cancel_and_detach(tasks: Vec<ObserverTask>) {
     }
 }
 
-async fn cancel_and_drain(tasks: Vec<ObserverTask>) {
+async fn cancel_and_drain(tasks: Vec<ObserverTask>, exclude: Option<u64>) {
     for task in tasks {
         task.cancel.cancel();
+        if exclude.is_some_and(|id| task.id == id) {
+            // A handler closing its own observation: awaiting its join would
+            // wait for the close itself, so cancel it and detach instead.
+            continue;
+        }
         let _ = task.join.await;
     }
+}
+
+/// Awaits a start task, racing it against the caller's cancellation. Returns
+/// the still-pending handle on cancellation so the caller can restore it for
+/// later lifecycle cleanup; never abandons a started task.
+async fn join_start_or_cancel(
+    task: JoinHandle<Result<(), ServiceError>>,
+    caller_cancellation: Option<CancellationToken>,
+    failure_message: &'static str,
+) -> (
+    Option<JoinHandle<Result<(), ServiceError>>>,
+    Result<(), ServiceError>,
+) {
+    let mut join = Some(task);
+    let cancelled = caller_cancellation;
+    std::future::poll_fn(move |cx| {
+        // Cancellation wins ties over a ready start result. A fresh waiter is
+        // created and polled on every pass so the caller's waker stays
+        // registered with the token between polls.
+        if let Some(token) = cancelled.as_ref() {
+            if token.is_cancelled() {
+                return std::task::Poll::Ready((join.take(), Err(ServiceError::Cancelled)));
+            }
+            let mut waiter = std::pin::pin!(token.cancelled());
+            if waiter.as_mut().poll(cx).is_ready() {
+                return std::task::Poll::Ready((join.take(), Err(ServiceError::Cancelled)));
+            }
+        }
+        let Some(task) = join.as_mut() else {
+            return std::task::Poll::Ready((None, Ok(())));
+        };
+        match Pin::new(task).poll(cx) {
+            std::task::Poll::Ready(joined) => {
+                let result = match joined {
+                    Ok(result) => result,
+                    Err(error) => Err(ServiceError::internal_with_source(failure_message, error)),
+                };
+                join = None;
+                std::task::Poll::Ready((None, result))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
 }
 
 fn display_js(value: &JsString) -> String {
@@ -1028,6 +1230,7 @@ mod tests {
     struct TrackingTransport {
         snapshot: Arc<ServiceSubscriptionSnapshot<DeltaOp>>,
         closes: Arc<AtomicUsize>,
+        invokes: Arc<AtomicUsize>,
     }
 
     impl RemoteServiceTransport for TrackingTransport {
@@ -1036,6 +1239,7 @@ mod tests {
             _call: ServiceCall,
             _context: Context,
         ) -> BoxFuture<'_, Result<Option<JsonValue>, ServiceError>> {
+            self.invokes.fetch_add(1, Ordering::AcqRel);
             async { Err(ServiceError::local("test transport does not invoke")) }.boxed()
         }
 
@@ -1057,12 +1261,25 @@ mod tests {
     fn tracking_transport(
         snapshot: ServiceSubscriptionSnapshot<DeltaOp>,
     ) -> (Arc<dyn RemoteServiceTransport>, Arc<AtomicUsize>) {
+        let (transport, closes, _invokes) = tracking_transport_with_invokes(snapshot);
+        (transport, closes)
+    }
+
+    fn tracking_transport_with_invokes(
+        snapshot: ServiceSubscriptionSnapshot<DeltaOp>,
+    ) -> (
+        Arc<dyn RemoteServiceTransport>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
         let closes = Arc::new(AtomicUsize::new(0));
+        let invokes = Arc::new(AtomicUsize::new(0));
         let transport = Arc::new(TrackingTransport {
             snapshot: Arc::new(snapshot),
             closes: Arc::clone(&closes),
+            invokes: Arc::clone(&invokes),
         });
-        (transport, closes)
+        (transport, closes, invokes)
     }
 
     #[tokio::test]
@@ -1433,5 +1650,239 @@ mod tests {
             task.await.expect("call task"),
             Err(ServiceError::Cancelled)
         ));
+    }
+
+    fn keyed_snapshot_with_method_instance(
+        service_id: &JsString,
+        key: &str,
+    ) -> ServiceSubscriptionSnapshot<DeltaOp> {
+        ServiceSubscriptionSnapshot {
+            service_id: service_id.clone(),
+            mode: ServiceMode::Keyed,
+            instances: vec![ServiceInstanceSnapshot {
+                instance: Some(ServiceInstanceAddress {
+                    key: JsString::from_utf8(key),
+                    generation: JsInteger::one(),
+                }),
+                members: vec![ServiceMemberSnapshot::Method {
+                    name: JsString::from_utf8("member"),
+                }],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn late_observer_receives_existing_instances() {
+        let service_id = JsString::from_utf8("keyed");
+        let (transport, _closes) =
+            tracking_transport(keyed_snapshot_with_method_instance(&service_id, "room"));
+        let binding =
+            RemoteServiceBinding::new(BindingOptions::new(vec![service_id.clone()], transport))
+                .expect("binding");
+        let first_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&first_seen);
+        let first = binding
+            .observe_keyed(
+                &service_id,
+                Arc::new(move |facade, _context| {
+                    let record = Arc::clone(&record);
+                    async move {
+                        record.lock().expect("lock").push(facade);
+                        Ok(())
+                    }
+                    .boxed()
+                }),
+            )
+            .expect("observe");
+        binding.ready(&Context::background()).await.expect("ready");
+        assert_eq!(first_seen.lock().expect("lock").len(), 1);
+
+        let second_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&second_seen);
+        let second = binding
+            .observe_keyed(
+                &service_id,
+                Arc::new(move |facade, _context| {
+                    let record = Arc::clone(&record);
+                    async move {
+                        record.lock().expect("lock").push(facade);
+                        Ok(())
+                    }
+                    .boxed()
+                }),
+            )
+            .expect("late observe");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            second_seen.lock().expect("lock").len(),
+            1,
+            "late observer must be scheduled against the live instance"
+        );
+
+        second
+            .close(Context::background())
+            .await
+            .expect("close second");
+        first
+            .close(Context::background())
+            .await
+            .expect("close first");
+        binding
+            .dispose(Context::background())
+            .await
+            .expect("dispose");
+    }
+
+    #[tokio::test]
+    async fn invoke_rechecks_facade_liveness_before_dispatch() {
+        let service_id = JsString::from_utf8("singleton");
+        let snapshot = ServiceSubscriptionSnapshot {
+            service_id: service_id.clone(),
+            mode: ServiceMode::Singleton,
+            instances: vec![ServiceInstanceSnapshot {
+                instance: None,
+                members: vec![ServiceMemberSnapshot::Method {
+                    name: JsString::from_utf8("member"),
+                }],
+            }],
+        };
+        let (transport, _closes, invokes) = tracking_transport_with_invokes(snapshot);
+        let binding =
+            RemoteServiceBinding::new(BindingOptions::new(vec![service_id.clone()], transport))
+                .expect("binding");
+        let facade = binding.use_service(&service_id).expect("facade");
+        binding.ready(&Context::background()).await.expect("ready");
+        let member = facade.member("member").expect("member");
+
+        // Construct the lazy invocation future, then invalidate the facade
+        // before the future is ever polled.
+        let pending = member.invoke(Vec::new(), Context::background());
+        binding
+            .rebind(false, Context::background())
+            .await
+            .expect("unbind");
+        let error = pending.await.expect_err("stale invoke");
+        assert!(matches!(
+            error,
+            ServiceError::Remote(remote)
+                if remote.code == RemoteServiceErrorCode::ServiceStaleInstance
+        ));
+        assert_eq!(
+            invokes.load(Ordering::Acquire),
+            0,
+            "a stale facade must not reach the transport"
+        );
+        binding
+            .dispose(Context::background())
+            .await
+            .expect("dispose");
+    }
+
+    #[tokio::test]
+    async fn observer_close_does_not_await_own_callback() {
+        let service_id = JsString::from_utf8("keyed");
+        let (transport, _closes) =
+            tracking_transport(keyed_snapshot_with_method_instance(&service_id, "room"));
+        let binding =
+            RemoteServiceBinding::new(BindingOptions::new(vec![service_id.clone()], transport))
+                .expect("binding");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let observation_slot: Arc<std::sync::Mutex<Option<Arc<ServiceObservation>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        let handler = {
+            let gate = Arc::clone(&gate);
+            let slot = Arc::clone(&observation_slot);
+            let entered = Arc::clone(&entered);
+            let finished = Arc::clone(&finished);
+            Arc::new(move |_facade, _context| {
+                let gate = Arc::clone(&gate);
+                let slot = Arc::clone(&slot);
+                let entered = Arc::clone(&entered);
+                let finished = Arc::clone(&finished);
+                async move {
+                    entered.fetch_add(1, Ordering::AcqRel);
+                    gate.notified().await;
+                    let observation = slot.lock().expect("lock").clone().expect("observation");
+                    observation
+                        .close(Context::background())
+                        .await
+                        .expect("self close");
+                    finished.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                }
+                .boxed()
+            })
+        };
+        let observation = Arc::new(
+            binding
+                .observe_keyed(&service_id, handler)
+                .expect("observe"),
+        );
+        *observation_slot.lock().expect("lock") = Some(Arc::clone(&observation));
+        binding.ready(&Context::background()).await.expect("ready");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            if entered.load(Ordering::Acquire) != 0 {
+                break;
+            }
+        }
+        assert_eq!(entered.load(Ordering::Acquire), 1, "callback running");
+
+        gate.notify_one();
+        let wait = async {
+            while finished.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .expect("self-close must not await its own task");
+        binding
+            .dispose(Context::background())
+            .await
+            .expect("dispose");
+    }
+
+    #[tokio::test]
+    async fn use_service_rejects_binding_disposed_during_acquisition() {
+        let service_id = JsString::from_utf8("singleton");
+        let snapshot = ServiceSubscriptionSnapshot {
+            service_id: service_id.clone(),
+            mode: ServiceMode::Singleton,
+            instances: vec![ServiceInstanceSnapshot {
+                instance: None,
+                members: vec![ServiceMemberSnapshot::Method {
+                    name: JsString::from_utf8("member"),
+                }],
+            }],
+        };
+        let (transport, _closes) = tracking_transport(snapshot);
+        let lifecycle_slot: Arc<std::sync::Mutex<Option<Arc<Lifecycle>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot = Arc::clone(&lifecycle_slot);
+        let mut options = BindingOptions::new(vec![service_id.clone()], transport);
+        options.bound = false;
+        options.assert_access = Some(Arc::new(move || {
+            if let Some(lifecycle) = slot.lock().expect("lock").as_ref() {
+                lifecycle.dispose();
+            }
+            Ok(())
+        }));
+        let binding = RemoteServiceBinding::new(options).expect("binding");
+        *lifecycle_slot.lock().expect("lock") = Some(Arc::clone(&binding.inner.lifecycle));
+
+        // The access checker disposes the binding between the entry check and
+        // the map insertion, so acquisition must still fail closed.
+        let result = binding.use_service(&service_id);
+        assert!(matches!(result, Err(ServiceError::Disposed(_))));
+        assert!(
+            lock(&binding.inner.singletons).is_empty(),
+            "a disposed binding must not gain an untracked singleton entry"
+        );
     }
 }

@@ -756,11 +756,16 @@ impl Drop for ProviderCallbackRoute<'_> {
 }
 
 /// Callback request context tied to one originating provider frame id.
+///
+/// Carries the per-callback flags advertised for the originating call:
+/// each callback method rejects locally unless its own flag was
+/// advertised, even when the other flag was.
 #[derive(Clone, Debug)]
 pub struct ProviderCallbackContext {
     router: Arc<ProviderCallbackRouter>,
     out_tx: mpsc::Sender<OutboundFrame>,
     origin_id: FrameId,
+    flags: ProviderCallbackFlags,
     deadline: Duration,
     cancel: CancellationToken,
 }
@@ -770,10 +775,17 @@ impl ProviderCallbackContext {
     ///
     /// # Errors
     ///
-    /// Returns [`ExtensionFault`] when the payload fails to encode, when the
+    /// Returns [`ExtensionFault`] when `beforePayload` was not advertised
+    /// for the originating call, when the payload fails to encode, when the
     /// host answers with an error, or when the request times out or the
     /// endpoint closes.
     pub async fn before_payload(&self, payload: &mut Value) -> Result<(), ExtensionFault> {
+        if !self.flags.before_payload {
+            return Err(ExtensionFault::new(
+                "extension_error",
+                "provider beforePayload callback is not advertised",
+            ));
+        }
         let request = ProviderBeforePayloadRequest {
             call_id: self.origin_id.to_string(),
             payload: payload.clone(),
@@ -799,10 +811,17 @@ impl ProviderCallbackContext {
     ///
     /// # Errors
     ///
-    /// Returns [`ExtensionFault`] when the request fails to encode, when the
+    /// Returns [`ExtensionFault`] when `onResponse` was not advertised for
+    /// the originating call, when the request fails to encode, when the
     /// host answers with an error, or when the request times out or the
     /// endpoint closes.
     pub async fn on_response(&self, response: &ProviderResponse) -> Result<(), ExtensionFault> {
+        if !self.flags.on_response {
+            return Err(ExtensionFault::new(
+                "extension_error",
+                "provider onResponse callback is not advertised",
+            ));
+        }
         let request = ProviderOnResponseRequest {
             call_id: self.origin_id.to_string(),
             response: ProviderResponseWire {
@@ -2401,6 +2420,7 @@ fn provider_callback_context<E: NativeExtension>(
         router: Arc::clone(&runtime.callback_router),
         out_tx: runtime.out_tx.clone(),
         origin_id,
+        flags,
         deadline: runtime.lifecycle_deadline,
         cancel,
     })
@@ -6567,6 +6587,212 @@ mod tests {
                 .clone()
                 .ok_or("missing callback result")?,
             json!({ "mutated": true })
+        );
+
+        drop(client);
+        let result = tokio::time::timeout(TIMEOUT, server).await??;
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// Provider whose `fetchDeferred` first attempts the callback the host
+    /// did not advertise — expecting a local rejection — then exercises the
+    /// advertised callback, proving per-flag enforcement without any
+    /// un-advertised callback frame reaching the host.
+    struct SingleFlagCallbackExtension {
+        started: Arc<Notify>,
+    }
+
+    impl SingleFlagCallbackExtension {
+        fn new() -> (Self, Arc<Notify>) {
+            let started = Arc::new(Notify::new());
+            (
+                Self {
+                    started: Arc::clone(&started),
+                },
+                started,
+            )
+        }
+    }
+
+    impl NativeExtension for SingleFlagCallbackExtension {
+        fn snapshot(&self) -> RegistrySnapshot {
+            RegistrySnapshot {
+                providers: vec![ProviderSnapshotEntry {
+                    name: "singleFlagProv".to_owned(),
+                    fetch_deferred: true,
+                    ..ProviderSnapshotEntry::default()
+                }],
+                ..RegistrySnapshot::default()
+            }
+        }
+
+        fn prepare_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            name: String,
+            _args: Value,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(name)) })
+        }
+
+        fn validate_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            name: String,
+            _args: Value,
+            _tool_call_id: Option<String>,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(name)) })
+        }
+
+        fn execute_tool(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            call: ToolCall,
+            _updates: ToolUpdateSink,
+            _cancel: CancellationToken,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            Box::pin(async move { Err(ExtensionFault::not_found(call.name)) })
+        }
+
+        fn fetch_deferred(
+            &self,
+            _context: Arc<NativeExtensionContext>,
+            call: ProviderDeferredCall,
+            _events: ProviderEventSink,
+            _cancel: CancellationToken,
+        ) -> NativeFuture<Result<Value, ExtensionFault>> {
+            let started = Arc::clone(&self.started);
+            Box::pin(async move {
+                started.notify_one();
+                let response = ProviderResponse {
+                    status: 200,
+                    headers: BTreeMap::new(),
+                };
+                // Attempt the callback the host did not advertise: it must
+                // be rejected locally, never emitted as a host frame.
+                let unadvertised = if call.callbacks.before_payload {
+                    call.on_response(&response).await
+                } else {
+                    let mut payload = call
+                        .options
+                        .get("testPayload")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    call.before_payload(&mut payload).await
+                };
+                if unadvertised.is_ok() {
+                    return Err(ExtensionFault::new(
+                        "extension_error",
+                        "un-advertised provider callback unexpectedly succeeded",
+                    ));
+                }
+                // The advertised callback still round-trips with the host.
+                if call.callbacks.before_payload {
+                    let mut payload = call
+                        .options
+                        .get("testPayload")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    call.before_payload(&mut payload).await?;
+                    Ok(payload)
+                } else {
+                    call.on_response(&response).await?;
+                    Ok(Value::Null)
+                }
+            })
+        }
+    }
+
+    /// A request advertising only one provider callback must reject the
+    /// other callback locally — no callback frame reaches the host — while
+    /// the advertised callback still round-trips, in both flag directions.
+    #[tokio::test]
+    async fn provider_single_flag_advertisement_rejects_other_callback_locally() -> R {
+        let (ext, started) = SingleFlagCallbackExtension::new();
+        let (mut client, server) = spawn_raw(ext, ServerConfig::default());
+        client.hello(PROTOCOL_VERSION, "anything").await?;
+        let _ack = client.recv().await?;
+        client.load_context().await?;
+
+        for (id, callbacks) in [
+            (2u64, json!({ "beforePayload": true, "onResponse": false })),
+            (3u64, json!({ "beforePayload": false, "onResponse": true })),
+        ] {
+            client
+                .send(&Frame {
+                    id,
+                    kind: FrameKind::Req,
+                    method: methods::PROVIDER_FETCH_DEFERRED.to_owned(),
+                    payload: json!({
+                        "providerId": "singleFlagProv",
+                        "model": {
+                            "id": "m",
+                            "name": "m",
+                            "api": "openai",
+                            "provider": "test",
+                            "baseUrl": "",
+                            "reasoning": false,
+                            "input": ["text"],
+                            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                            "contextWindow": 1,
+                            "maxTokens": 1,
+                        },
+                        "handle": { "provider": "test", "modelId": "m", "api": "openai", "id": "h1" },
+                        "options": { "wait": 0, "testPayload": { "original": true } },
+                        "callbacks": callbacks,
+                    }),
+                })
+                .await?;
+            tokio::time::timeout(TIMEOUT, started.notified()).await?;
+
+            if id == 2 {
+                // The only callback frame must be the advertised
+                // beforePayload; the attempted onResponse never reaches us.
+                let before_req = client.recv().await?;
+                assert_eq!(before_req.kind, FrameKind::Req);
+                assert_eq!(before_req.method, PROVIDER_BEFORE_PAYLOAD_METHOD);
+                let before = from_payload::<ProviderBeforePayloadRequest>(&before_req.payload)?;
+                assert_eq!(before.call_id, id.to_string());
+                client
+                    .send(&Frame {
+                        id: before_req.id,
+                        kind: FrameKind::Res,
+                        method: before_req.method.clone(),
+                        payload: json!({ "payload": { "mutated": true } }),
+                    })
+                    .await?;
+                let terminal = client.recv().await?;
+                assert_eq!(terminal.id, id);
+                assert_eq!(terminal.kind, FrameKind::Res);
+                assert_eq!(terminal.payload, json!({ "mutated": true }));
+            } else {
+                // Mirror image: only onResponse may reach the host.
+                let on_req = client.recv().await?;
+                assert_eq!(on_req.kind, FrameKind::Req);
+                assert_eq!(on_req.method, PROVIDER_ON_RESPONSE_METHOD);
+                let on = from_payload::<ProviderOnResponseRequest>(&on_req.payload)?;
+                assert_eq!(on.call_id, id.to_string());
+                client
+                    .send(&Frame {
+                        id: on_req.id,
+                        kind: FrameKind::Res,
+                        method: on_req.method.clone(),
+                        payload: json!({}),
+                    })
+                    .await?;
+                let terminal = client.recv().await?;
+                assert_eq!(terminal.id, id);
+                assert_eq!(terminal.kind, FrameKind::Res);
+            }
+        }
+
+        // No stray callback frame may follow the terminal responses.
+        let quiet = tokio::time::timeout(Duration::from_millis(300), client.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "host received an unexpected frame after the terminals"
         );
 
         drop(client);

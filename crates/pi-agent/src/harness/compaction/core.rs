@@ -563,7 +563,10 @@ fn extract_file_operations(
 
 fn get_message_from_entry(entry: &Entry) -> Option<AgentMessage> {
     match entry {
-        Entry::Message { message, .. } => Some(message.clone()),
+        // Mirror the live projection: assistant terminations that never
+        // entered context (Error/Aborted/Deferred) are neither summarized nor
+        // retained; tool results and custom messages stay included.
+        Entry::Message { message, .. } => is_context_message(message).then(|| message.clone()),
         Entry::BranchSummary {
             base,
             from_id,
@@ -998,6 +1001,13 @@ fn classify_summary_response(
                 .error_message
                 .unwrap_or_else(|| "Unknown error".to_owned())
         ))),
+        // A truncated response must not replace real history with a partial
+        // summary. Deferred stays on the wildcard: deferred-capable providers
+        // legitimately pend summary requests, and failing them here derails
+        // structural summaries mid-drive (see deferred_poll_abort).
+        StopReason::Length => Err(CompactionError::SummarizationFailed(format!(
+            "{label} failed: response truncated by the output limit"
+        ))),
         _ => Ok(GeneratedSummary {
             text: assistant_content_text(&response.content, "\n"),
             usage: response.usage,
@@ -1005,12 +1015,14 @@ fn classify_summary_response(
     }
 }
 
-/// Applies summary-owned request options: cancellation, cache isolation, and
-/// a fresh request/session id when the caller has not supplied one.
+/// Applies summary-owned request options: cancellation (an explicitly
+/// supplied caller token wins; the ambient context token is the fallback),
+/// cache isolation, and a fresh request/session id when the caller has not
+/// supplied one.
 #[must_use]
 pub fn create_summary_request_options(options: &StreamOptions, cx: &Context) -> StreamOptions {
     let mut options = options.clone();
-    options.signal = cx.token().cloned();
+    options.signal = options.signal.clone().or_else(|| cx.token().cloned());
     options.cache_retention = Some(CacheRetention::None);
     if options.session_id.is_none() {
         options.session_id = Some(uuid::Uuid::now_v7().to_string());
@@ -1592,6 +1604,145 @@ mod tests {
         assert_eq!(cut.first_kept_entry_index, entries.len());
         assert_eq!(cut.turn_start_index, None);
         assert!(!cut.is_split_turn);
+    }
+
+    #[test]
+    fn prepare_compaction_excludes_failed_assistants_like_live_context() {
+        let tool_result = AgentMessage::Llm(Box::new(Message::ToolResult(
+            pi_ai::ToolResultMessage::new(
+                "c",
+                "x",
+                vec![pi_ai::ToolResultContent::Text(TextContent::new(
+                    "tool output",
+                ))],
+                false,
+                1,
+            ),
+        )));
+        let entries = vec![
+            Entry::Message {
+                base: base("u1"),
+                message: user("head user"),
+                terminate: false,
+            },
+            Entry::Message {
+                base: base("a1"),
+                message: assistant("done", StopReason::Stop, Usage::default()),
+                terminate: false,
+            },
+            Entry::Message {
+                base: base("t1"),
+                message: tool_result,
+                terminate: false,
+            },
+            Entry::Message {
+                base: base("a2"),
+                message: assistant("failed", StopReason::Error, Usage::default()),
+                terminate: false,
+            },
+            Entry::Message {
+                base: base("u2"),
+                message: user("tail user"),
+                terminate: false,
+            },
+            Entry::Message {
+                base: base("a3"),
+                message: assistant("deferred", StopReason::Deferred, Usage::default()),
+                terminate: false,
+            },
+            Entry::Message {
+                base: base("a4"),
+                message: assistant("kept", StopReason::Stop, Usage::default()),
+                terminate: false,
+            },
+        ];
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 10,
+            keep_recent_tokens: 2,
+        };
+        let preparation = match prepare_compaction(&entries, &settings) {
+            Ok(Some(prep)) => prep,
+            other => panic!("expected preparation, got {other:?}"),
+        };
+        assert!(preparation.is_split_turn);
+
+        // Error assistants never enter the summarized history; the tool
+        // result they responded to is retained.
+        assert_eq!(preparation.messages_to_summarize.len(), 3);
+        assert!(matches!(
+            &preparation.messages_to_summarize[2],
+            AgentMessage::Llm(message) if matches!(message.as_ref(), Message::ToolResult(_))
+        ));
+        assert!(
+            preparation
+                .messages_to_summarize
+                .iter()
+                .all(|message| !matches!(
+                    message,
+                    AgentMessage::Llm(m) if matches!(m.as_ref(), Message::Assistant(a)
+                        if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted | StopReason::Deferred))
+                ))
+        );
+
+        // The split-turn prefix keeps its user turn start.
+        assert_eq!(preparation.turn_prefix_messages.len(), 1);
+
+        // Deferred assistants are dropped from the retained tail.
+        assert_eq!(preparation.retained_tail.len(), 1);
+        assert!(matches!(
+            &preparation.retained_tail[0],
+            AgentMessage::Llm(message)
+                if matches!(message.as_ref(), Message::Assistant(a) if a.stop_reason == StopReason::Stop)
+        ));
+    }
+
+    #[test]
+    fn classify_summary_response_rejects_truncated_but_accepts_deferred() {
+        let mut truncated = AssistantMessage::new("api", "provider", "model", 1);
+        truncated.content = vec![AssistantContent::Text(TextContent::new("partial summary"))];
+        truncated.stop_reason = StopReason::Length;
+        match classify_summary_response(truncated, "Summarization", "compaction") {
+            Err(CompactionError::SummarizationFailed(message)) => {
+                assert!(
+                    message.contains("truncated"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected summarization failure, got {other:?}"),
+        }
+
+        // Deferred stays accepted: deferred-capable providers legitimately pend
+        // summary requests, and failing them derails structural summaries
+        // mid-drive (see deferred_poll_abort). Only truncation is terminal.
+        let mut deferred = AssistantMessage::new("api", "provider", "model", 1);
+        deferred.content = vec![AssistantContent::Text(TextContent::new("settling"))];
+        deferred.stop_reason = StopReason::Deferred;
+        assert!(matches!(
+            classify_summary_response(deferred, "Turn prefix summarization", "turn prefix"),
+            Ok(_)
+        ));
+
+        let mut complete = AssistantMessage::new("api", "provider", "model", 1);
+        complete.content = vec![AssistantContent::Text(TextContent::new("## Goal\ndone"))];
+        complete.stop_reason = StopReason::Stop;
+        assert!(classify_summary_response(complete, "Summarization", "compaction").is_ok());
+    }
+
+    #[test]
+    fn create_summary_request_options_preserves_caller_signal() {
+        let caller = CancellationToken::new();
+        let caller_options = StreamOptions {
+            signal: Some(caller.clone()),
+            ..StreamOptions::default()
+        };
+        let preserved = create_summary_request_options(&caller_options, &Context::background());
+        assert_eq!(preserved.signal, Some(caller));
+
+        let ambient = CancellationToken::new();
+        let cx = Context::background().with_cancellation(ambient.clone());
+        let fallback = create_summary_request_options(&StreamOptions::default(), &cx);
+        assert_eq!(fallback.signal, Some(ambient));
     }
 
     #[tokio::test]

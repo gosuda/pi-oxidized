@@ -127,7 +127,21 @@ impl ReplicatedState {
         ops: &[DeltaOp],
         context: &Context,
     ) -> Result<(), ServiceError> {
-        let transition = lock(&self.transition_gate);
+        let value = Self::stage_hydration(ops)?;
+        if self.commit_hydration(&value, sequence, context) {
+            self.flush_deliveries();
+        }
+        Ok(())
+    }
+
+    /// Validates a complete base batch and returns the resulting value without
+    /// mutating state, so a multi-member install can be staged atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::State`] under the same conditions as
+    /// [`Self::hydrate`].
+    pub(crate) fn stage_hydration(ops: &[DeltaOp]) -> Result<Arc<JsonValue>, ServiceError> {
         if !is_base(ops) {
             return Err(ServiceError::State(ServiceStateError::NotBaseBatch));
         }
@@ -140,14 +154,27 @@ impl ReplicatedState {
                 "replicated state hydration must be strict JSON",
             ));
         }
-        let value = Arc::new(value);
+        Ok(Arc::new(value))
+    }
+
+    /// Stores a staged hydration value and queues its delivery. The
+    /// transition gate is held across the store and enqueue so concurrent
+    /// subscribes and updates observe a consistent revision order. Returns
+    /// whether queued deliveries need draining.
+    pub(crate) fn commit_hydration(
+        &self,
+        value: &Arc<JsonValue>,
+        sequence: JsInteger,
+        context: &Context,
+    ) -> bool {
+        let transition = lock(&self.transition_gate);
         {
             let mut inner = lock(&self.inner);
-            inner.value = Some(Arc::clone(&value));
+            inner.value = Some(Arc::clone(value));
             inner.sequence = Some(sequence);
         }
         let drain = self.enqueue_delivery(
-            &value,
+            value,
             context,
             ReplicatedStateDelivery {
                 kind: ReplicatedStateDeliveryKind::Hydrate,
@@ -155,10 +182,12 @@ impl ReplicatedState {
             },
         );
         drop(transition);
-        if drain {
-            self.drain_deliveries();
-        }
-        Ok(())
+        drain
+    }
+
+    /// Drains queued revision deliveries.
+    pub(crate) fn flush_deliveries(&self) {
+        self.drain_deliveries();
     }
     /// Installs a contiguous incremental batch and delivers an update revision.
     ///
@@ -173,6 +202,25 @@ impl ReplicatedState {
         ops: &[DeltaOp],
         context: &Context,
     ) -> Result<(), ServiceError> {
+        if self.apply_update(sequence, ops, context)? {
+            self.flush_deliveries();
+        }
+        Ok(())
+    }
+
+    /// Validates and applies one contiguous batch without draining queued
+    /// deliveries. Returns whether deliveries need draining afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::State`] under the same conditions as
+    /// [`Self::update`].
+    pub(crate) fn apply_update(
+        &self,
+        sequence: JsInteger,
+        ops: &[DeltaOp],
+        context: &Context,
+    ) -> Result<bool, ServiceError> {
         let transition = lock(&self.transition_gate);
         let (previous_sequence, previous_value) = {
             let inner = lock(&self.inner);
@@ -211,10 +259,7 @@ impl ReplicatedState {
             },
         );
         drop(transition);
-        if drain {
-            self.drain_deliveries();
-        }
-        Ok(())
+        Ok(drain)
     }
     /// Discards the hydrated revision and sequence without notifying listeners.
     pub fn clear(&self) {

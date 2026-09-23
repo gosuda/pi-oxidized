@@ -310,13 +310,14 @@ async fn reject_navigation_operation_id_reuse(
     Ok(())
 }
 
-/// Commit admission writes with the run path's fault contract: the lane
-/// guard is released across the durable commit because fault broadcast
-/// re-locks lane data, a commit failure seals every lane against one shared
-/// fault, and the guard is re-acquired to re-verify idle before publishing.
+/// Commit admission writes with the run path's fault contract: the durable
+/// commit runs without the lane data guard because the fault broadcast
+/// re-locks lane data and a commit failure seals every lane against one
+/// shared fault, and the guard is only re-acquired once the commit future has
+/// resolved — the storage task releases the mutation permit before that, so
+/// the re-lock never queues behind a live mutation.
 async fn commit_admission_writes<'a, Fut>(
     lane: &'a LaneRuntime,
-    data: tokio::sync::MutexGuard<'a, LaneData>,
     commit: Fut,
     cx: &'a Context,
 ) -> Result<tokio::sync::MutexGuard<'a, LaneData>, HarnessError>
@@ -325,7 +326,6 @@ where
             Output = Result<crate::session::CommitResult, crate::session::SessionError>,
         >,
 {
-    drop(data);
     if let Err(error) = commit.await {
         lane.owner
             .fault(
@@ -346,109 +346,198 @@ where
     if let Some(fault) = lane.sealed_fault() {
         return Err(sealed_rejection(&fault));
     }
-    if data.state.current_operation_id.is_some() {
-        return Err(lane.owner.closed_error());
-    }
     Ok(data)
+}
+
+/// Drop an admission reservation whose durable commit never ran. Only the
+/// owning reservation is cleared; idle waiters are woken so they re-check.
+async fn undo_pending_admission(lane: &LaneRuntime, operation_id: &OperationId) {
+    let mut data = lane.data.lock().await;
+    if data
+        .operation
+        .as_ref()
+        .is_some_and(|current| current.meta.operation_id == *operation_id)
+    {
+        data.operation = None;
+    }
+    drop(data);
+    lane.state_changed.notify_waiters();
 }
 
 /// Materialize the selected inbox entries and the new prompt messages onto the
 /// branch, then commit the run's durable operation and lane state and publish
 /// both to the in-memory lane data.
+///
+/// Lock order: the admission reservation is published under the lane data
+/// guard, which is then dropped for the whole mutation phase — the session
+/// mutation permit is never acquired while lane data is held, and lane data
+/// is only re-locked after the commit future resolves, by which point the
+/// storage task has released the permit. The published reservation is what
+/// competing admissions observe as busy until the durable commit lands;
+/// failures before the commit undo it, while a commit failure seals the whole
+/// harness anyway.
+#[allow(clippy::too_many_lines)]
 async fn commit_run(
     lane: &LaneRuntime,
     config: &RuntimeConfig,
-    data: tokio::sync::MutexGuard<'_, LaneData>,
+    mut data: tokio::sync::MutexGuard<'_, LaneData>,
     admission: RunAdmission,
     cx: &Context,
 ) -> Result<(), HarnessError> {
-    let mutator = lane
-        .owner
-        .session
-        .begin_mutation(cx)
-        .await
-        .map_err(map_session_error)?;
-    reject_operation_id_reuse(&*mutator, &lane.name, &admission.operation_id, cx).await?;
-    let pending = read_pending(&*mutator, &admission.selected, cx)
-        .await
-        .map_err(map_session_error)?;
-    let mut parent = data.tip.clone();
-    let mut entry_ids = Vec::new();
-    let mut writes = Vec::new();
-    for (item, pending) in pending {
-        let id = item.entry_id.clone();
-        match pending {
-            PendingEntry::Message { payload } => {
-                entry_ids.push(id.clone());
-                writes.push(entry_write(id.clone(), parent.clone(), payload, false));
-            }
-            PendingEntry::Custom {
-                custom_type,
-                payload,
-            } => writes.push(custom_entry_write(
-                id.clone(),
-                parent.clone(),
-                custom_type,
-                payload,
-            )),
-        }
-        parent = Some(id.clone());
-        writes.push(crate::session::delete_value(&pending_entry(&id)));
-    }
-    for message in admission.messages {
-        let id = new_entry_id(lane.owner.session.as_ref()).map_err(map_session_error)?;
-        entry_ids.push(id.clone());
-        writes.push(entry_write(id.clone(), parent.clone(), message, false));
-        parent = Some(id);
-    }
-    let operation = Operation {
+    let source_tip = data.tip.clone();
+    // Reservation. The intent's prompt entry ids are only known after the
+    // pending payload reads below, so the provisional operation carries an
+    // empty list until the commit publishes the final one.
+    data.operation = Some(Operation {
         meta: super::support::operation_meta(
             &admission.operation_id,
             lane.name.clone(),
-            data.tip.clone(),
+            source_tip.clone(),
             admission.started_at,
             OperationIntent::Run {
-                prompt_entry_ids: entry_ids,
+                prompt_entry_ids: Vec::new(),
             },
         ),
         state: OperationState::Starting {
             scope: operation_scope(config),
         },
-    };
-    let next_state = LaneState {
-        current_operation_id: Some(admission.operation_id.clone()),
-        last_operation_id: data.state.last_operation_id.clone(),
-        inbox: data
-            .state
-            .inbox
+    });
+    drop(data);
+    let RunAdmission {
+        operation_id,
+        messages,
+        selected,
+        started_at,
+    } = admission;
+    let prepared = async {
+        let mutator = lane
+            .owner
+            .session
+            .begin_mutation(cx)
+            .await
+            .map_err(map_session_error)?;
+        reject_operation_id_reuse(&*mutator, &lane.name, &operation_id, cx).await?;
+        // The durable lane state is the write base: the mutation guard
+        // serializes every lane_state writer, so a queue write that landed
+        // while this admission was in flight survives the commit.
+        let base_state = mutator
+            .get_value(&lane_state(&lane.name), cx)
+            .await
+            .map_err(map_session_error)?
+            .map(|stored| stored.value)
+            .unwrap_or_default();
+        // Selection ran against the memory snapshot; keep only entries still
+        // queued durably — a concurrent cancel may have consumed one.
+        let selected: Vec<InboxItem> = selected
             .iter()
             .filter(|item| {
-                !admission
-                    .selected
+                base_state
+                    .inbox
                     .iter()
-                    .any(|chosen| chosen.entry_id == item.entry_id)
+                    .any(|kept| kept.entry_id == item.entry_id)
             })
             .cloned()
-            .collect(),
+            .collect();
+        let pending = read_pending(&*mutator, &selected, cx)
+            .await
+            .map_err(map_session_error)?;
+        let mut parent = source_tip.clone();
+        let mut entry_ids = Vec::new();
+        let mut writes = Vec::new();
+        for (item, pending) in pending {
+            let id = item.entry_id.clone();
+            match pending {
+                PendingEntry::Message { payload } => {
+                    entry_ids.push(id.clone());
+                    writes.push(entry_write(id.clone(), parent.clone(), payload, false));
+                }
+                PendingEntry::Custom {
+                    custom_type,
+                    payload,
+                } => writes.push(custom_entry_write(
+                    id.clone(),
+                    parent.clone(),
+                    custom_type,
+                    payload,
+                )),
+            }
+            parent = Some(id.clone());
+            writes.push(crate::session::delete_value(&pending_entry(&id)));
+        }
+        for message in messages {
+            let id = new_entry_id(lane.owner.session.as_ref()).map_err(map_session_error)?;
+            entry_ids.push(id.clone());
+            writes.push(entry_write(id.clone(), parent.clone(), message, false));
+            parent = Some(id);
+        }
+        let operation = Operation {
+            meta: super::support::operation_meta(
+                &operation_id,
+                lane.name.clone(),
+                source_tip,
+                started_at,
+                OperationIntent::Run {
+                    prompt_entry_ids: entry_ids,
+                },
+            ),
+            state: OperationState::Starting {
+                scope: operation_scope(config),
+            },
+        };
+        let next_state = LaneState {
+            current_operation_id: Some(operation_id.clone()),
+            last_operation_id: base_state.last_operation_id.clone(),
+            inbox: base_state
+                .inbox
+                .iter()
+                .filter(|item| {
+                    !selected
+                        .iter()
+                        .any(|chosen| chosen.entry_id == item.entry_id)
+                })
+                .cloned()
+                .collect(),
+        };
+        writes.push(
+            set_json(&operation_meta(&operation_id), &operation.meta).map_err(map_session_error)?,
+        );
+        writes.push(
+            set_json(&operation_state(&operation_id), &operation.state)
+                .map_err(map_session_error)?,
+        );
+        writes.push(set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?);
+        writes.push(set_json(&branch_tip(lane.name.as_str()), &parent).map_err(map_session_error)?);
+        Ok((mutator, writes, operation, next_state, base_state, parent))
+    }
+    .await;
+    let (mutator, writes, operation, next_state, base_state, parent) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            undo_pending_admission(lane, &operation_id).await;
+            return Err(error);
+        }
     };
-    writes.push(
-        set_json(&operation_meta(&admission.operation_id), &operation.meta)
-            .map_err(map_session_error)?,
-    );
-    writes.push(
-        set_json(&operation_state(&admission.operation_id), &operation.state)
-            .map_err(map_session_error)?,
-    );
-    writes.push(set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?);
-    writes.push(set_json(&branch_tip(lane.name.as_str()), &parent).map_err(map_session_error)?);
-    let mut data = commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
+    let mut data = commit_admission_writes(lane, mutator.commit(writes, cx), cx).await?;
+    if data
+        .operation
+        .as_ref()
+        .is_none_or(|current| current.meta.operation_id != operation_id)
+    {
+        return Err(lane.owner.closed_error());
+    }
+    // Memory converges on the committed state only while it still matches the
+    // base the commit chained onto; a later writer's apply already includes
+    // this operation.
+    if data.state == base_state {
+        data.state = next_state;
+    }
     data.tip = parent;
-    data.state = next_state;
     data.operation = Some(operation);
     data.last_result = None;
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn accept_compaction(
     lane: &LaneRuntime,
     requested_id: Option<OperationId>,
@@ -456,7 +545,7 @@ async fn accept_compaction(
     cx: &Context,
 ) -> OperationAdmissionResult {
     let config = lane.owner.config_snapshot().await;
-    let data = lane.data.lock().await;
+    let mut data = lane.data.lock().await;
     ensure_idle(lane, &data)?;
     let branch = lane.branch(cx).await?;
     let entries = super::support::branch_entries(branch.as_ref(), cx)
@@ -503,28 +592,62 @@ async fn accept_compaction(
             },
         },
     };
-    let next_state = LaneState {
-        current_operation_id: Some(operation_id.clone()),
-        last_operation_id: data.state.last_operation_id.clone(),
-        inbox: data.state.inbox.clone(),
-    };
+    // Reserve before the guard drops: the whole operation is known here, so
+    // the reservation carries it directly.
+    data.operation = Some(operation.clone());
+    drop(data);
     let durable = preparation.to_durable();
-    let writes = vec![
-        set_json(&operation_meta(&operation_id), &operation.meta).map_err(map_session_error)?,
-        set_json(&operation_state(&operation_id), &operation.state).map_err(map_session_error)?,
-        set_json(&operation_preparation(&operation_id, &task_id), &durable)
-            .map_err(map_session_error)?,
-        set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?,
-    ];
-    let mutator = lane
-        .owner
-        .session
-        .begin_mutation(cx)
-        .await
-        .map_err(map_session_error)?;
-    reject_operation_id_reuse(&*mutator, &lane.name, &operation_id, cx).await?;
-    let mut data = commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
-    data.state = next_state;
+    let prepared = async {
+        let mutator = lane
+            .owner
+            .session
+            .begin_mutation(cx)
+            .await
+            .map_err(map_session_error)?;
+        reject_operation_id_reuse(&*mutator, &lane.name, &operation_id, cx).await?;
+        // The durable lane state is the write base: the mutation guard
+        // serializes every lane_state writer, so a queue write that landed
+        // while this admission was in flight survives the commit.
+        let base_state = mutator
+            .get_value(&lane_state(&lane.name), cx)
+            .await
+            .map_err(map_session_error)?
+            .map(|stored| stored.value)
+            .unwrap_or_default();
+        let next_state = LaneState {
+            current_operation_id: Some(operation_id.clone()),
+            last_operation_id: base_state.last_operation_id.clone(),
+            inbox: base_state.inbox.clone(),
+        };
+        let writes = vec![
+            set_json(&operation_meta(&operation_id), &operation.meta).map_err(map_session_error)?,
+            set_json(&operation_state(&operation_id), &operation.state)
+                .map_err(map_session_error)?,
+            set_json(&operation_preparation(&operation_id, &task_id), &durable)
+                .map_err(map_session_error)?,
+            set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?,
+        ];
+        Ok((mutator, writes, next_state, base_state))
+    }
+    .await;
+    let (mutator, writes, next_state, base_state) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            undo_pending_admission(lane, &operation_id).await;
+            return Err(error);
+        }
+    };
+    let mut data = commit_admission_writes(lane, mutator.commit(writes, cx), cx).await?;
+    if data
+        .operation
+        .as_ref()
+        .is_none_or(|current| current.meta.operation_id != operation_id)
+    {
+        return Err(lane.owner.closed_error());
+    }
+    if data.state == base_state {
+        data.state = next_state;
+    }
     data.operation = Some(operation);
     drop(data);
     lane.state_changed.notify_waiters();
@@ -621,10 +744,15 @@ struct NavigationAdmission {
 /// Build the navigation operation — preparing the branch summary when the
 /// navigation summarizes its detached span — then commit the durable state and
 /// publish it to the in-memory lane data.
+///
+/// Lock order matches `commit_run`: the reservation is published under the
+/// lane data guard, the guard drops before the mutation phase, and lane data
+/// is re-locked only after the commit future has resolved.
+#[allow(clippy::too_many_lines)]
 async fn commit_navigation(
     lane: &LaneRuntime,
     config: &RuntimeConfig,
-    data: tokio::sync::MutexGuard<'_, LaneData>,
+    mut data: tokio::sync::MutexGuard<'_, LaneData>,
     admission: NavigationAdmission,
     cx: &Context,
 ) -> Result<(), HarnessError> {
@@ -684,37 +812,69 @@ async fn commit_navigation(
         }
     };
     let operation = Operation { meta, state };
-    let next_state = LaneState {
-        current_operation_id: Some(admission.operation_id.clone()),
-        last_operation_id: data.state.last_operation_id.clone(),
-        inbox: data.state.inbox.clone(),
-    };
-    let mut writes = vec![
-        set_json(&operation_meta(&admission.operation_id), &operation.meta)
-            .map_err(map_session_error)?,
-        set_json(&operation_state(&admission.operation_id), &operation.state)
-            .map_err(map_session_error)?,
-        set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?,
-    ];
-    if let Some(preparation) = preparation {
-        writes.push(
-            set_json(
-                &operation_preparation(&admission.operation_id, &task_id),
-                &preparation.to_durable(),
-            )
-            .map_err(map_session_error)?,
-        );
+    // Reserve before the guard drops; the whole operation is known here.
+    data.operation = Some(operation.clone());
+    drop(data);
+    let prepared = async {
+        let mutator = lane
+            .owner
+            .session
+            .begin_mutation(cx)
+            .await
+            .map_err(map_session_error)?;
+        reject_navigation_operation_id_reuse(&*mutator, &lane.name, &admission.operation_id, cx)
+            .await?;
+        // The durable lane state is the write base: the mutation guard
+        // serializes every lane_state writer, so a queue write that landed
+        // while this admission was in flight survives the commit.
+        let base_state = mutator
+            .get_value(&lane_state(&lane.name), cx)
+            .await
+            .map_err(map_session_error)?
+            .map(|stored| stored.value)
+            .unwrap_or_default();
+        let next_state = LaneState {
+            current_operation_id: Some(admission.operation_id.clone()),
+            last_operation_id: base_state.last_operation_id.clone(),
+            inbox: base_state.inbox.clone(),
+        };
+        let mut writes = vec![
+            set_json(&operation_meta(&admission.operation_id), &operation.meta)
+                .map_err(map_session_error)?,
+            set_json(&operation_state(&admission.operation_id), &operation.state)
+                .map_err(map_session_error)?,
+            set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?,
+        ];
+        if let Some(preparation) = preparation {
+            writes.push(
+                set_json(
+                    &operation_preparation(&admission.operation_id, &task_id),
+                    &preparation.to_durable(),
+                )
+                .map_err(map_session_error)?,
+            );
+        }
+        Ok((mutator, writes, next_state, base_state))
     }
-    let mutator = lane
-        .owner
-        .session
-        .begin_mutation(cx)
-        .await
-        .map_err(map_session_error)?;
-    reject_navigation_operation_id_reuse(&*mutator, &lane.name, &admission.operation_id, cx)
-        .await?;
-    let mut data = commit_admission_writes(lane, data, mutator.commit(writes, cx), cx).await?;
-    data.state = next_state;
+    .await;
+    let (mutator, writes, next_state, base_state) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            undo_pending_admission(lane, &admission.operation_id).await;
+            return Err(error);
+        }
+    };
+    let mut data = commit_admission_writes(lane, mutator.commit(writes, cx), cx).await?;
+    if data
+        .operation
+        .as_ref()
+        .is_none_or(|current| current.meta.operation_id != admission.operation_id)
+    {
+        return Err(lane.owner.closed_error());
+    }
+    if data.state == base_state {
+        data.state = next_state;
+    }
     data.operation = Some(operation);
     Ok(())
 }
@@ -757,6 +917,12 @@ async fn navigation_branch_entries(
 }
 
 /// Queue one message without allowing it to bypass durable admission.
+///
+/// Lock order: the lane data guard is never held across the mutation. The
+/// durable lane state read under the mutation guard is the write base — the
+/// guard serializes every `lane_state` writer, so the commit chains onto the
+/// latest state instead of clobbering a write that landed while this enqueue
+/// waited.
 pub(crate) async fn enqueue(
     lane: &LaneRuntime,
     input: QueueInput,
@@ -771,14 +937,36 @@ pub(crate) async fn enqueue(
     })?;
     let id = new_entry_id(lane.owner.session.as_ref()).map_err(map_session_error)?;
     let pending = PendingEntry::Message { payload: message };
-    let mut data = lane.data.lock().await;
     let pending_value_write = pending_entry_write(&id, &pending).map_err(map_session_error)?;
-    let mut next_state = data.state.clone();
+    let mutator = lane
+        .owner
+        .session
+        .begin_mutation(cx)
+        .await
+        .map_err(map_session_error)?;
+    let base_state = mutator
+        .get_value(&lane_state(&lane.name), cx)
+        .await
+        .map_err(map_session_error)?
+        .map(|stored| stored.value)
+        .unwrap_or_default();
+    let mut next_state = base_state.clone();
     next_state.inbox.push(pending_write(id.clone(), kind));
     let state_write = set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?;
-    lane.commit(vec![pending_value_write, state_write], cx)
-        .await?;
-    data.state = next_state;
+    let commit = mutator
+        .commit(vec![pending_value_write, state_write], cx)
+        .await;
+    // The storage task releases the mutation permit before this future
+    // resolves, so re-locking lane data below cannot queue behind it.
+    if let Err(error) = commit {
+        return Err(lane.commit_fault(error, cx).await);
+    }
+    let mut data = lane.data.lock().await;
+    // Converge memory only while it still matches the base the commit chained
+    // onto; a later writer's apply already carries this item.
+    if data.state == base_state {
+        data.state = next_state;
+    }
     let queues = data.state.inbox.clone();
     drop(data);
     lane.state_changed.notify_waiters();
@@ -789,19 +977,29 @@ pub(crate) async fn enqueue(
 }
 
 /// Cancel one queued item, distinguishing consumed and unknown ids.
+///
+/// Lock order matches `enqueue`: no lane data guard across the mutation, and
+/// the durable lane state read under the mutation guard decides membership.
 pub(crate) async fn cancel_queued(
     lane: &LaneRuntime,
     entry: &EntryId,
     cx: &Context,
 ) -> CancelQueuedResult {
     lane.ensure_open()?;
-    let mut data = lane.data.lock().await;
-    let Some(index) = data
-        .state
-        .inbox
-        .iter()
-        .position(|item| &item.entry_id == entry)
-    else {
+    let mutator = lane
+        .owner
+        .session
+        .begin_mutation(cx)
+        .await
+        .map_err(map_session_error)?;
+    let base_state = mutator
+        .get_value(&lane_state(&lane.name), cx)
+        .await
+        .map_err(map_session_error)?
+        .map(|stored| stored.value)
+        .unwrap_or_default();
+    if !base_state.inbox.iter().any(|item| item.entry_id == *entry) {
+        drop(mutator);
         let known = lane
             .owner
             .session
@@ -814,13 +1012,23 @@ pub(crate) async fn cancel_queued(
         } else {
             CancelQueuedKind::NotFound
         });
-    };
-    let mut next_state = data.state.clone();
-    next_state.inbox.remove(index);
-    let state_write = set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?;
+    }
+    let mut next_state = base_state.clone();
+    next_state.inbox.retain(|item| item.entry_id != *entry);
     let delete_write = crate::session::delete_value(&pending_entry(entry));
-    lane.commit(vec![delete_write, state_write], cx).await?;
-    data.state = next_state;
+    let state_write = set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?;
+    let commit = mutator.commit(vec![delete_write, state_write], cx).await;
+    // The storage task releases the mutation permit before this future
+    // resolves, so re-locking lane data below cannot queue behind it.
+    if let Err(error) = commit {
+        return Err(lane.commit_fault(error, cx).await);
+    }
+    let mut data = lane.data.lock().await;
+    // Converge memory only while it still matches the base the commit chained
+    // onto; a later writer's apply already dropped this item.
+    if data.state == base_state {
+        data.state = next_state;
+    }
     let queues = data.state.inbox.clone();
     drop(data);
     lane.state_changed.notify_waiters();
@@ -835,6 +1043,11 @@ pub(crate) async fn cancel_queued(
 }
 
 /// Durably mark an operation for cancellation and drain steering/follow-up.
+///
+/// Lock order: the current-operation snapshot is taken under the lane data
+/// guard, which is dropped before the mutation phase; the durable control
+/// state re-read under the mutation guard keeps concurrent aborts idempotent
+/// now that they no longer serialize on the lane data guard.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn request_abort(
     lane: &LaneRuntime,
@@ -842,20 +1055,20 @@ pub(crate) async fn request_abort(
     cx: &Context,
 ) -> AbortRequestResult {
     lane.ensure_open()?;
-    let mut data = lane.data.lock().await;
-    let operation = data
-        .operation
-        .clone()
-        .ok_or_else(|| HarnessError::NoActiveOperation {
-            lane: lane.name.clone(),
-            message: "lane has no active operation".to_owned(),
-        })?;
+    let (current, last_operation_id) = {
+        let data = lane.data.lock().await;
+        (data.operation.clone(), data.state.last_operation_id.clone())
+    };
+    let operation = current.ok_or_else(|| HarnessError::NoActiveOperation {
+        lane: lane.name.clone(),
+        message: "lane has no active operation".to_owned(),
+    })?;
     if operation.meta.operation_id != *operation_id {
         return Err(HarnessError::OperationMismatch {
             lane: lane.name.clone(),
             expected_operation_id: operation_id.clone(),
             current_operation_id: Some(operation.meta.operation_id),
-            last_operation_id: data.state.last_operation_id.clone(),
+            last_operation_id,
             message: "abort request does not name the current operation".to_owned(),
         });
     }
@@ -870,19 +1083,48 @@ pub(crate) async fn request_abort(
             follow_up: Vec::new(),
         });
     }
-    let drained_items: Vec<InboxItem> = data
-        .state
-        .inbox
-        .iter()
-        .filter(|item| matches!(item.kind, InboxItemKind::Steer | InboxItemKind::FollowUp))
-        .cloned()
-        .collect();
     let mutator = lane
         .owner
         .session
         .begin_mutation(cx)
         .await
         .map_err(map_session_error)?;
+    // The durable operation state is authoritative: an abort that committed
+    // while this call waited for the mutation guard already drained the
+    // queue, and a finished operation has had its state cleaned up.
+    let durable_state = mutator
+        .get_value(&operation_state(operation_id), cx)
+        .await
+        .map_err(map_session_error)?;
+    let already_requested = durable_state.is_none_or(|stored| {
+        matches!(
+            stored.value.scope().control,
+            Control::CancelRequested { .. }
+        )
+    });
+    if already_requested {
+        return Ok(AbortRequestOutcome {
+            operation_id: operation_id.clone(),
+            newly_requested: false,
+            steer: Vec::new(),
+            follow_up: Vec::new(),
+        });
+    }
+    // The durable lane state is the write base: the mutation guard
+    // serializes every lane_state writer, so the drain lands on the latest
+    // queued state instead of clobbering a concurrent write.
+    let base_state = mutator
+        .get_value(&lane_state(&lane.name), cx)
+        .await
+        .map_err(map_session_error)?
+        .map(|stored| stored.value)
+        .unwrap_or_default();
+    let drained_items: Vec<InboxItem> = base_state
+        .inbox
+        .iter()
+        .filter(|item| matches!(item.kind, InboxItemKind::Steer | InboxItemKind::FollowUp))
+        .cloned()
+        .collect();
     let pending = read_pending(&*mutator, &drained_items, cx)
         .await
         .map_err(map_session_error)?;
@@ -905,9 +1147,8 @@ pub(crate) async fn request_abort(
     };
     let next_state = LaneState {
         current_operation_id: Some(operation_id.clone()),
-        last_operation_id: data.state.last_operation_id.clone(),
-        inbox: data
-            .state
+        last_operation_id: base_state.last_operation_id.clone(),
+        inbox: base_state
             .inbox
             .iter()
             .filter(|item| {
@@ -923,11 +1164,26 @@ pub(crate) async fn request_abort(
             .map_err(map_session_error)?,
     );
     writes.push(set_json(&lane_state(&lane.name), &next_state).map_err(map_session_error)?);
-    if let Err(error) = mutator.commit(writes, cx).await {
+    let commit = mutator.commit(writes, cx).await;
+    // The storage task releases the mutation permit before this future
+    // resolves, so re-locking lane data below cannot queue behind it.
+    if let Err(error) = commit {
         return Err(lane.commit_fault(error, cx).await);
     }
-    data.state = next_state;
-    data.operation = Some(next_operation);
+    let mut data = lane.data.lock().await;
+    // Converge memory only while it still matches the base the commit chained
+    // onto, and only replace the operation while it is still the current one —
+    // the drive may have settled it while the commit was in flight.
+    if data.state == base_state {
+        data.state = next_state;
+    }
+    if data
+        .operation
+        .as_ref()
+        .is_some_and(|current| current.meta.operation_id == *operation_id)
+    {
+        data.operation = Some(next_operation);
+    }
     drop(data);
     if let Some(drive) = lane.active_drive.lock().await.as_ref()
         && drive.operation_id == *operation_id
@@ -982,7 +1238,7 @@ pub(crate) async fn record_usage(
     let row = crate::session::UsageRow {
         id: id.clone(),
         seq,
-        usage: usage.clone(),
+        usage,
         entry_id,
         adjustment: false,
         details,
@@ -991,7 +1247,10 @@ pub(crate) async fn record_usage(
         HarnessEventPayload::Usage {
             lane: lane.name.clone(),
             row,
-            totals: usage,
+            // The event contract defines `totals` as the cumulative session
+            // usage after applying this row; the commit result reports
+            // exactly that aggregate, not the submitted row.
+            totals: commit.stats.usage,
         },
         cx,
     )
