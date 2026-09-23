@@ -45,10 +45,10 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { AssistantMessage, Message, Model, UserMessage } from "@earendil-works/pi-ai";
 import {
-	CANONICAL_REFERENCE_ROOT,
-	CANONICAL_REFERENCE_SHA,
-	assertCanonicalReference,
-	canonicalReferenceRoot,
+	NATIVE_REFERENCE_ROOT,
+	NATIVE_REFERENCE_SHA,
+	assertNativeReference,
+	nativeReferenceRoot,
 } from "./reference-identity.ts";
 import {
 	NOISE_EXIT_CODE,
@@ -167,7 +167,7 @@ export type Implementation = "rust" | "typescript";
 export const IMPLEMENTATIONS: readonly Implementation[] = ["rust", "typescript"];
 
 export const RUST_BIN = resolve(import.meta.dirname, "../target/release/pi_tool_dispatch_bench");
-export const UPSTREAM_PIN = CANONICAL_REFERENCE_SHA;
+export const UPSTREAM_PIN = NATIVE_REFERENCE_SHA;
 
 /** Argument payloads are byte-identical on both implementations. */
 export const VALID_ARGUMENTS: Record<string, unknown> = {
@@ -337,8 +337,8 @@ interface UpstreamBindings {
 let upstream: UpstreamBindings;
 
 async function loadUpstream(): Promise<UpstreamBindings> {
-	assertCanonicalReference();
-	const root = canonicalReferenceRoot();
+	assertNativeReference();
+	const root = nativeReferenceRoot();
 	const [aiModule, agentModule, codingAgentModule]: unknown[] = await Promise.all([
 		import(pathToFileURL(join(root, "packages/ai/dist/index.js")).href),
 		import(pathToFileURL(join(root, "packages/agent/dist/index.js")).href),
@@ -895,7 +895,7 @@ async function main(): Promise<number> {
 			warmupCalls: warmup,
 			blocks: 1,
 			noiseLimit: NOISE_RELATIVE_SPREAD_LIMIT,
-			upstream: `${CANONICAL_REFERENCE_ROOT}@${UPSTREAM_PIN}`,
+			upstream: `${NATIVE_REFERENCE_ROOT}@${UPSTREAM_PIN}`,
 			rustEntry: "pi_agent::execute_tool_calls",
 			typescriptEntry: "runAgentLoop (upstream agent-loop, executeToolCalls is module-private)",
 			boundary:

@@ -50,7 +50,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { assertCanonicalReference, canonicalReferenceRoot } from "./reference-identity.ts";
+import { assertNativeReference, nativeReferenceRoot } from "./reference-identity.ts";
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -58,7 +58,7 @@ import { assertCanonicalReference, canonicalReferenceRoot } from "./reference-id
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
-const REF_ROOT = canonicalReferenceRoot(REPO_ROOT);
+const REF_ROOT = nativeReferenceRoot(REPO_ROOT);
 const REF_SESSION_MANAGER = join(
 	REF_ROOT,
 	"packages/coding-agent/src/core/session-manager.ts",
@@ -255,7 +255,7 @@ let ref: ReferenceSessionModule;
 
 async function loadReference(): Promise<void> {
 	// Fail closed before the reference SessionManager module is read.
-	assertCanonicalReference(REPO_ROOT);
+	assertNativeReference(REPO_ROOT);
 	await assertPathReadable(REF_SESSION_MANAGER, "reference SessionManager");
 	await assertPathReadable(REF_UUID, "reference uuidv7");
 

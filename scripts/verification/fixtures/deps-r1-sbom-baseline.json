@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
-	"capturedAt": "2026-09-06",
-	"captureHead": "68b684b3e7799353bd8446e17f32c4efd0c6c034",
-	"contentSha256": "9950adce9ef7e0f44c7c705fd2beaf9772a37f2905fca5b957282600eb37ccf2",
+	"capturedAt": "2026-09-22",
+	"captureHead": "fcf695be3348a175e9366573f2a6e0588e27f37c",
+	"contentSha256": "082f3fa8b5f8faa3a09a8ef77689be6b4194485291f3d9796e76f5c20f0cb024",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.98.0",
@@ -961,6 +961,22 @@
 					"devOnly": false
 				},
 				{
+					"name": "fallible-iterator",
+					"version": "0.3.0",
+					"license": "MIT/Apache-2.0",
+					"source": "registry",
+					"direct": false,
+					"devOnly": false
+				},
+				{
+					"name": "fallible-streaming-iterator",
+					"version": "0.1.9",
+					"license": "MIT/Apache-2.0",
+					"source": "registry",
+					"direct": false,
+					"devOnly": false
+				},
+				{
 					"name": "fancy-regex",
 					"version": "0.11.0",
 					"license": "MIT",
@@ -1705,6 +1721,14 @@
 					"devOnly": false
 				},
 				{
+					"name": "libsqlite3-sys",
+					"version": "0.38.2",
+					"license": "MIT",
+					"source": "registry",
+					"direct": false,
+					"devOnly": false
+				},
+				{
 					"name": "line-clipping",
 					"version": "0.3.7",
 					"license": "MIT OR Apache-2.0",
@@ -2013,7 +2037,7 @@
 					"version": "2.3.2",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
-					"direct": false,
+					"direct": true,
 					"devOnly": false
 				},
 				{
@@ -2542,6 +2566,14 @@
 					"license": "Apache-2.0 AND ISC",
 					"source": "registry",
 					"direct": false,
+					"devOnly": false
+				},
+				{
+					"name": "rusqlite",
+					"version": "0.40.2",
+					"license": "MIT",
+					"source": "registry",
+					"direct": true,
 					"devOnly": false
 				},
 				{
@@ -3457,6 +3489,14 @@
 					"devOnly": false
 				},
 				{
+					"name": "vcpkg",
+					"version": "0.2.15",
+					"license": "MIT/Apache-2.0",
+					"source": "registry",
+					"direct": false,
+					"devOnly": false
+				},
+				{
 					"name": "version_check",
 					"version": "0.9.5",
 					"license": "MIT/Apache-2.0",
@@ -4031,6 +4071,10 @@
 					"sha256": "c36e7cbcffc6c12772c1e6f9205c9eeb139af7d9dd702f9dcdb266e8f03d43ad"
 				},
 				{
+					"path": "vendor/crossterm-0.29.0/Cargo.lock",
+					"sha256": "c05ea83405bfb2e4238460213ccd3e8a4c793b1bdaec3405fbcff894093e9243"
+				},
+				{
 					"path": "vendor/crossterm-0.29.0/Cargo.toml",
 					"sha256": "fe17aaa5081f4d433222e8668723baa1a031ad23996db73f25db5b374741b6b5"
 				},
@@ -4044,7 +4088,7 @@
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/VENDORED.txt",
-					"sha256": "a98e6d26acb0d3ee02198a1732658fda57bfbfd6be335a90e43e98d449160fb0"
+					"sha256": "e2e58bf7bd88fc2a26af0c6f0e3d2f625ca557d0a18f4bcd3011b9fd3de82a3e"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/ansi_support.rs",
@@ -4088,7 +4132,7 @@
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/reply.rs",
-					"sha256": "a8b377c7144029df470ef374a683e267756fd21ced3e5c33a24beac4777e460c"
+					"sha256": "172d252936d3a725761cb5fbeff01633e5d272d4ba07b05796dbdb0e02a1381f"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/source.rs",
@@ -4100,7 +4144,7 @@
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/source/unix/mio.rs",
-					"sha256": "c1bbf72d800b37bce3ad7d4e8c43ff3dcb262afe588a277bb36e6d7557f5cb78"
+					"sha256": "3cd45649957570be389054b41f3aa695e392770840fd81ef9b7313789b9902dc"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/source/unix/parser.rs",
@@ -4108,7 +4152,7 @@
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/source/unix/tty.rs",
-					"sha256": "c7c269b7da493057c4d95f06392c216f7fffefad85f1efaf2a13d83217a2b833"
+					"sha256": "f34c1b82e762e8ce9c4a0155b31e38d8ebfdc9f514518d53c4d5ad06d81b5a5f"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/source/windows.rs",
@@ -4128,7 +4172,7 @@
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/sys/unix/parse.rs",
-					"sha256": "d20567f6ddd092767021f63ce8737b096c6f37ea3591f7acf7038ad3652c1275"
+					"sha256": "8804461072b3af08245e026e684ebc7a39e7e46b6380cb91aaada46f5c774acd"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker.rs",
@@ -4232,7 +4276,7 @@
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/terminal/sys/unix.rs",
-					"sha256": "2afd2359fd2d047a682a3cb664fb656cd4b6a0c39567ddb8dd49dca6779d45f3"
+					"sha256": "d96ffbbfc5a4fe5923c66d956a21a407dda3037cd7f8d9dd7bd3bd5dd89821b5"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/terminal/sys/windows.rs",
@@ -4261,6 +4305,7 @@
 				{
 					"path": "packages/extension-host/package.json",
 					"dependencies": {
+						"@earendil-works/chord": "0.85.1",
 						"@earendil-works/pi-tui-protocol": "file:../pi-tui-protocol",
 						"jiti": "2.7.0",
 						"typebox": "1.3.19"
@@ -4422,6 +4467,10 @@
 							"version": "1.0.2"
 						},
 						{
+							"name": "@earendil-works/chord",
+							"version": "0.85.1"
+						},
+						{
 							"name": "@earendil-works/pi-agent-core",
 							"version": "0.84.4"
 						},
@@ -4488,6 +4537,110 @@
 						{
 							"name": "@emnapi/wasi-threads",
 							"version": "1.2.2"
+						},
+						{
+							"name": "@esbuild/aix-ppc64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/android-arm",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/android-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/android-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/darwin-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/darwin-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/freebsd-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/freebsd-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-arm",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-ia32",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-loong64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-mips64el",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-ppc64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-riscv64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-s390x",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/netbsd-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/netbsd-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/openbsd-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/openbsd-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/openharmony-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/sunos-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/win32-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/win32-ia32",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/win32-x64",
+							"version": "0.28.1"
 						},
 						{
 							"name": "@google/genai",
@@ -5016,6 +5169,10 @@
 						{
 							"name": "es-module-lexer",
 							"version": "2.3.1"
+						},
+						{
+							"name": "esbuild",
+							"version": "0.28.1"
 						},
 						{
 							"name": "estree-walker",
@@ -5697,7 +5854,7 @@
 				},
 				{
 					"path": "packages/extension-host/bun.lock",
-					"lockfileVersion": 1,
+					"lockfileVersion": 2,
 					"packages": [
 						{
 							"name": "@anthropic-ai/sdk",
@@ -5725,59 +5882,59 @@
 						},
 						{
 							"name": "@aws-sdk/core",
-							"version": "3.975.3"
+							"version": "3.977.9"
 						},
 						{
 							"name": "@aws-sdk/credential-provider-env",
-							"version": "3.972.59"
-						},
-						{
-							"name": "@aws-sdk/credential-provider-http",
-							"version": "3.972.61"
-						},
-						{
-							"name": "@aws-sdk/credential-provider-ini",
-							"version": "3.973.4"
-						},
-						{
-							"name": "@aws-sdk/credential-provider-login",
-							"version": "3.972.66"
-						},
-						{
-							"name": "@aws-sdk/credential-provider-node",
 							"version": "3.972.70"
 						},
 						{
+							"name": "@aws-sdk/credential-provider-http",
+							"version": "3.972.72"
+						},
+						{
+							"name": "@aws-sdk/credential-provider-ini",
+							"version": "3.973.15"
+						},
+						{
+							"name": "@aws-sdk/credential-provider-login",
+							"version": "3.972.77"
+						},
+						{
+							"name": "@aws-sdk/credential-provider-node",
+							"version": "3.972.82"
+						},
+						{
 							"name": "@aws-sdk/credential-provider-process",
-							"version": "3.972.59"
+							"version": "3.972.70"
 						},
 						{
 							"name": "@aws-sdk/credential-provider-sso",
-							"version": "3.973.3"
+							"version": "3.973.14"
 						},
 						{
 							"name": "@aws-sdk/credential-provider-web-identity",
-							"version": "3.972.65"
+							"version": "3.972.76"
 						},
 						{
 							"name": "@aws-sdk/eventstream-handler-node",
-							"version": "3.972.29"
+							"version": "3.972.34"
 						},
 						{
 							"name": "@aws-sdk/middleware-eventstream",
-							"version": "3.972.24"
+							"version": "3.972.29"
 						},
 						{
 							"name": "@aws-sdk/middleware-websocket",
-							"version": "3.972.41"
+							"version": "3.972.52"
 						},
 						{
 							"name": "@aws-sdk/nested-clients",
-							"version": "3.997.33"
+							"version": "3.997.44"
 						},
 						{
 							"name": "@aws-sdk/signature-v4-multi-region",
-							"version": "3.996.41"
+							"version": "3.996.46"
 						},
 						{
 							"name": "@aws-sdk/token-providers",
@@ -5785,19 +5942,19 @@
 						},
 						{
 							"name": "@aws-sdk/token-providers",
-							"version": "3.1088.0"
+							"version": "3.1116.0"
 						},
 						{
 							"name": "@aws-sdk/types",
-							"version": "3.974.2"
+							"version": "3.974.5"
 						},
 						{
 							"name": "@aws-sdk/util-locate-window",
-							"version": "3.965.8"
+							"version": "3.965.10"
 						},
 						{
 							"name": "@aws-sdk/xml-builder",
-							"version": "3.972.36"
+							"version": "3.972.40"
 						},
 						{
 							"name": "@aws/lambda-invoke-store",
@@ -5813,7 +5970,7 @@
 						},
 						{
 							"name": "@babel/parser",
-							"version": "7.29.7"
+							"version": "7.29.8"
 						},
 						{
 							"name": "@babel/runtime",
@@ -5821,11 +5978,15 @@
 						},
 						{
 							"name": "@babel/types",
-							"version": "7.29.7"
+							"version": "7.29.8"
 						},
 						{
 							"name": "@bcoe/v8-coverage",
 							"version": "1.0.2"
+						},
+						{
+							"name": "@earendil-works/chord",
+							"version": "0.85.1"
 						},
 						{
 							"name": "@earendil-works/pi-agent-core",
@@ -5876,16 +6037,108 @@
 							"version": "file:../pi-tui-protocol"
 						},
 						{
-							"name": "@emnapi/core",
-							"version": "1.11.1"
+							"name": "@esbuild/aix-ppc64",
+							"version": "0.28.1"
 						},
 						{
-							"name": "@emnapi/runtime",
-							"version": "1.11.1"
+							"name": "@esbuild/android-arm",
+							"version": "0.28.1"
 						},
 						{
-							"name": "@emnapi/wasi-threads",
-							"version": "1.2.2"
+							"name": "@esbuild/android-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/android-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/darwin-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/darwin-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/freebsd-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/freebsd-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-arm",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-ia32",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-loong64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-mips64el",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-ppc64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-riscv64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-s390x",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/linux-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/netbsd-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/netbsd-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/openbsd-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/openbsd-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/openharmony-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/sunos-x64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/win32-arm64",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/win32-ia32",
+							"version": "0.28.1"
+						},
+						{
+							"name": "@esbuild/win32-x64",
+							"version": "0.28.1"
 						},
 						{
 							"name": "@google/genai",
@@ -5897,7 +6150,7 @@
 						},
 						{
 							"name": "@jridgewell/sourcemap-codec",
-							"version": "1.5.5"
+							"version": "1.6.0"
 						},
 						{
 							"name": "@jridgewell/trace-mapping",
@@ -5948,10 +6201,6 @@
 							"version": "0.3.9"
 						},
 						{
-							"name": "@napi-rs/wasm-runtime",
-							"version": "1.1.6"
-						},
-						{
 							"name": "@nodelib/fs.scandir",
 							"version": "2.1.5"
 						},
@@ -5965,7 +6214,7 @@
 						},
 						{
 							"name": "@oxc-project/types",
-							"version": "0.139.0"
+							"version": "0.149.0"
 						},
 						{
 							"name": "@protobufjs/aspromise",
@@ -6004,64 +6253,60 @@
 							"version": "1.1.2"
 						},
 						{
+							"name": "@rolldown/binding-android-arm-eabi",
+							"version": "1.2.8"
+						},
+						{
 							"name": "@rolldown/binding-android-arm64",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/binding-darwin-arm64",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/binding-darwin-x64",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/binding-freebsd-x64",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/binding-linux-arm-gnueabihf",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/binding-linux-arm64-gnu",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/binding-linux-arm64-musl",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/binding-linux-ppc64-gnu",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/binding-linux-s390x-gnu",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/binding-linux-x64-gnu",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/binding-linux-x64-musl",
-							"version": "1.1.5"
-						},
-						{
-							"name": "@rolldown/binding-openharmony-arm64",
-							"version": "1.1.5"
-						},
-						{
-							"name": "@rolldown/binding-wasm32-wasi",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/binding-win32-arm64-msvc",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/binding-win32-x64-msvc",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "@rolldown/pluginutils",
@@ -6073,15 +6318,15 @@
 						},
 						{
 							"name": "@smithy/core",
-							"version": "3.29.5"
+							"version": "3.33.3"
 						},
 						{
 							"name": "@smithy/credential-provider-imds",
-							"version": "4.4.10"
+							"version": "4.5.2"
 						},
 						{
 							"name": "@smithy/fetch-http-handler",
-							"version": "5.6.7"
+							"version": "5.8.0"
 						},
 						{
 							"name": "@smithy/is-array-buffer",
@@ -6089,23 +6334,23 @@
 						},
 						{
 							"name": "@smithy/node-http-handler",
+							"version": "4.12.1"
+						},
+						{
+							"name": "@smithy/node-http-handler",
+							"version": "4.12.1"
+						},
+						{
+							"name": "@smithy/node-http-handler",
 							"version": "4.7.3"
 						},
 						{
-							"name": "@smithy/node-http-handler",
-							"version": "4.9.7"
-						},
-						{
-							"name": "@smithy/node-http-handler",
-							"version": "4.9.7"
-						},
-						{
 							"name": "@smithy/signature-v4",
-							"version": "5.6.6"
+							"version": "5.7.3"
 						},
 						{
 							"name": "@smithy/types",
-							"version": "4.16.1"
+							"version": "4.18.0"
 						},
 						{
 							"name": "@smithy/util-buffer-from",
@@ -6118,10 +6363,6 @@
 						{
 							"name": "@standard-schema/spec",
 							"version": "1.1.0"
-						},
-						{
-							"name": "@tybys/wasm-util",
-							"version": "0.10.3"
 						},
 						{
 							"name": "@types/bun",
@@ -6150,18 +6391,6 @@
 						{
 							"name": "@types/node",
 							"version": "22.19.19"
-						},
-						{
-							"name": "@types/node",
-							"version": "24.12.4"
-						},
-						{
-							"name": "@types/node",
-							"version": "24.12.4"
-						},
-						{
-							"name": "@types/node",
-							"version": "24.12.4"
 						},
 						{
 							"name": "@types/proper-lockfile",
@@ -6305,7 +6534,7 @@
 						},
 						{
 							"name": "ast-v8-to-istanbul",
-							"version": "1.0.5"
+							"version": "1.0.6"
 						},
 						{
 							"name": "balanced-match",
@@ -6329,7 +6558,7 @@
 						},
 						{
 							"name": "brace-expansion",
-							"version": "5.0.7"
+							"version": "5.0.9"
 						},
 						{
 							"name": "braces",
@@ -6413,7 +6642,11 @@
 						},
 						{
 							"name": "es-module-lexer",
-							"version": "2.3.1"
+							"version": "2.3.2"
+						},
+						{
+							"name": "esbuild",
+							"version": "0.28.1"
 						},
 						{
 							"name": "estree-walker",
@@ -6441,7 +6674,7 @@
 						},
 						{
 							"name": "fastq",
-							"version": "1.20.1"
+							"version": "1.20.3"
 						},
 						{
 							"name": "fdir",
@@ -6473,7 +6706,7 @@
 						},
 						{
 							"name": "gaxios",
-							"version": "7.2.0"
+							"version": "7.3.1"
 						},
 						{
 							"name": "gcp-metadata",
@@ -6497,7 +6730,7 @@
 						},
 						{
 							"name": "google-auth-library",
-							"version": "10.9.0"
+							"version": "10.9.1"
 						},
 						{
 							"name": "google-logging-utils",
@@ -6621,51 +6854,51 @@
 						},
 						{
 							"name": "lightningcss",
-							"version": "1.32.0"
+							"version": "1.33.0"
 						},
 						{
 							"name": "lightningcss-android-arm64",
-							"version": "1.32.0"
+							"version": "1.33.0"
 						},
 						{
 							"name": "lightningcss-darwin-arm64",
-							"version": "1.32.0"
+							"version": "1.33.0"
 						},
 						{
 							"name": "lightningcss-darwin-x64",
-							"version": "1.32.0"
+							"version": "1.33.0"
 						},
 						{
 							"name": "lightningcss-freebsd-x64",
-							"version": "1.32.0"
+							"version": "1.33.0"
 						},
 						{
 							"name": "lightningcss-linux-arm-gnueabihf",
-							"version": "1.32.0"
+							"version": "1.33.0"
 						},
 						{
 							"name": "lightningcss-linux-arm64-gnu",
-							"version": "1.32.0"
+							"version": "1.33.0"
 						},
 						{
 							"name": "lightningcss-linux-arm64-musl",
-							"version": "1.32.0"
+							"version": "1.33.0"
 						},
 						{
 							"name": "lightningcss-linux-x64-gnu",
-							"version": "1.32.0"
+							"version": "1.33.0"
 						},
 						{
 							"name": "lightningcss-linux-x64-musl",
-							"version": "1.32.0"
+							"version": "1.33.0"
 						},
 						{
 							"name": "lightningcss-win32-arm64-msvc",
-							"version": "1.32.0"
+							"version": "1.33.0"
 						},
 						{
 							"name": "lightningcss-win32-x64-msvc",
-							"version": "1.32.0"
+							"version": "1.33.0"
 						},
 						{
 							"name": "long",
@@ -6681,7 +6914,7 @@
 						},
 						{
 							"name": "magicast",
-							"version": "0.5.3"
+							"version": "0.5.4"
 						},
 						{
 							"name": "make-dir",
@@ -6721,7 +6954,7 @@
 						},
 						{
 							"name": "nanoid",
-							"version": "3.3.16"
+							"version": "3.3.18"
 						},
 						{
 							"name": "napi-build-utils",
@@ -6733,7 +6966,7 @@
 						},
 						{
 							"name": "node-abi",
-							"version": "3.94.0"
+							"version": "3.96.0"
 						},
 						{
 							"name": "node-addon-api",
@@ -6753,7 +6986,7 @@
 						},
 						{
 							"name": "obug",
-							"version": "2.1.4"
+							"version": "2.2.1"
 						},
 						{
 							"name": "once",
@@ -6805,11 +7038,11 @@
 						},
 						{
 							"name": "picomatch",
-							"version": "4.0.5"
+							"version": "4.0.7"
 						},
 						{
 							"name": "postcss",
-							"version": "8.5.19"
+							"version": "8.5.28"
 						},
 						{
 							"name": "prebuild-install",
@@ -6821,7 +7054,7 @@
 						},
 						{
 							"name": "protobufjs",
-							"version": "7.6.5"
+							"version": "7.6.6"
 						},
 						{
 							"name": "pump",
@@ -6861,7 +7094,7 @@
 						},
 						{
 							"name": "rolldown",
-							"version": "1.1.5"
+							"version": "1.2.8"
 						},
 						{
 							"name": "run-parallel",
@@ -6965,7 +7198,7 @@
 						},
 						{
 							"name": "tinyexec",
-							"version": "1.2.4"
+							"version": "1.3.1"
 						},
 						{
 							"name": "tinyglobby",
@@ -6973,7 +7206,7 @@
 						},
 						{
 							"name": "tinyrainbow",
-							"version": "3.1.0"
+							"version": "3.1.1"
 						},
 						{
 							"name": "to-regex-range",
@@ -7021,10 +7254,6 @@
 						},
 						{
 							"name": "typescript",
-							"version": "5.9.3"
-						},
-						{
-							"name": "typescript",
 							"version": "7.0.2"
 						},
 						{
@@ -7036,24 +7265,12 @@
 							"version": "6.21.0"
 						},
 						{
-							"name": "undici-types",
-							"version": "7.16.0"
-						},
-						{
-							"name": "undici-types",
-							"version": "7.16.0"
-						},
-						{
-							"name": "undici-types",
-							"version": "7.16.0"
-						},
-						{
 							"name": "util-deprecate",
 							"version": "1.0.2"
 						},
 						{
 							"name": "vite",
-							"version": "8.1.5"
+							"version": "8.2.2"
 						},
 						{
 							"name": "vitest",
@@ -7081,7 +7298,7 @@
 						},
 						{
 							"name": "ws",
-							"version": "8.21.1"
+							"version": "8.21.3"
 						},
 						{
 							"name": "yaml",
@@ -7141,413 +7358,5 @@
 				"x86_64-pc-windows-msvc"
 			]
 		}
-	},
-	"stagedInputProvenance": {
-		"schema": "pi.deps.staged-inputs.v1",
-		"mode": "staged",
-		"baseHead": "68b684b3e7799353bd8446e17f32c4efd0c6c034",
-		"objectFormat": "sha1",
-		"pathspecs": [
-			".cargo/config",
-			".cargo/config.toml",
-			".gitattributes",
-			".github/workflows/release-verification.yml",
-			"Cargo.lock",
-			"Cargo.toml",
-			"bun.lock",
-			"crates/pi-agent/Cargo.toml",
-			"crates/pi-ai/Cargo.toml",
-			"crates/pi-ext/Cargo.toml",
-			"crates/pi-tui/Cargo.toml",
-			"crates/pi/Cargo.toml",
-			"package.json",
-			"packages/extension-host/bun.lock",
-			"packages/extension-host/package.json",
-			"packages/pi-tui-protocol/package.json",
-			"rust-toolchain.toml",
-			"scripts/release/runtime.ts",
-			"scripts/release/targets.ts",
-			"scripts/verification/capture-inputs.ts",
-			"scripts/verification/deps-sbom.ts",
-			"scripts/verification/vendor-provenance.ts",
-			"vendor/*/.cargo_vcs_info.json",
-			"vendor/*/Cargo.toml",
-			"vendor/*/Cargo.toml.orig",
-			"vendor/*/LICENSE",
-			"vendor/*/VENDORED.txt",
-			"vendor/*/src/**"
-		],
-		"entries": [
-			{
-				"path": ".gitattributes",
-				"mode": "100644",
-				"blob": "eb96df24e9085424e37e7b373b597b2c076ce236"
-			},
-			{
-				"path": ".github/workflows/release-verification.yml",
-				"mode": "100644",
-				"blob": "c4003e97a0b67796232124c6fb1cfd3a219d3255"
-			},
-			{
-				"path": "Cargo.lock",
-				"mode": "100644",
-				"blob": "9333ac98336c46f81aa8403d81f2f1ac960a14dc"
-			},
-			{
-				"path": "Cargo.toml",
-				"mode": "100644",
-				"blob": "c0e6de4d99ab5107a1da12f519ac5c9ad8c8ea52"
-			},
-			{
-				"path": "bun.lock",
-				"mode": "100644",
-				"blob": "e822c661d810b9e80b9e8828f23c5f229d7e0b78"
-			},
-			{
-				"path": "crates/pi-agent/Cargo.toml",
-				"mode": "100644",
-				"blob": "f4e4d8996c3237e3ed53e7df7db5dc83d41f642f"
-			},
-			{
-				"path": "crates/pi-ai/Cargo.toml",
-				"mode": "100644",
-				"blob": "b570a34245f834068d37e4376c4745ebd511a2f6"
-			},
-			{
-				"path": "crates/pi-ext/Cargo.toml",
-				"mode": "100644",
-				"blob": "c5d897145de7d25924914a501938197022c6adac"
-			},
-			{
-				"path": "crates/pi-tui/Cargo.toml",
-				"mode": "100644",
-				"blob": "4c84cd072a48d37bbac43ea42831cd582beeb9b1"
-			},
-			{
-				"path": "crates/pi/Cargo.toml",
-				"mode": "100644",
-				"blob": "1df2a6cd10941d1201b37c82ce553b18523f00ba"
-			},
-			{
-				"path": "package.json",
-				"mode": "100644",
-				"blob": "fb13e61d1e73a3939974609322284ed61c80ebba"
-			},
-			{
-				"path": "packages/extension-host/bun.lock",
-				"mode": "100644",
-				"blob": "8b6718961e3117bdfcb818f15db79985802557d9"
-			},
-			{
-				"path": "packages/extension-host/package.json",
-				"mode": "100644",
-				"blob": "0816c493f840e6b7655d9d0e6a87938fb2fa1296"
-			},
-			{
-				"path": "packages/pi-tui-protocol/package.json",
-				"mode": "100644",
-				"blob": "d660aa05561e638bcbdf89d4ed5b1c9141db3aab"
-			},
-			{
-				"path": "rust-toolchain.toml",
-				"mode": "100644",
-				"blob": "aa20bc990d6f843fffb559d502c73c74132111d0"
-			},
-			{
-				"path": "scripts/release/runtime.ts",
-				"mode": "100644",
-				"blob": "1c81245fc7bbfb83b4699d9fb4aceaa6ebef8254"
-			},
-			{
-				"path": "scripts/release/targets.ts",
-				"mode": "100644",
-				"blob": "6cd0c5fdc5858f64767653c07d44a7afcd848089"
-			},
-			{
-				"path": "scripts/verification/capture-inputs.ts",
-				"mode": "100755",
-				"blob": "d8e64837354b3c88059100a2a77a86a6bf44b21a"
-			},
-			{
-				"path": "scripts/verification/deps-sbom.ts",
-				"mode": "100755",
-				"blob": "15134e9db2186e95e8b083d6dbc2a36c4afba553"
-			},
-			{
-				"path": "scripts/verification/vendor-provenance.ts",
-				"mode": "100644",
-				"blob": "1ef194ad86a5088a07b175ee90cb6119aa552035"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/.cargo_vcs_info.json",
-				"mode": "100644",
-				"blob": "a421cb9dbe09d2052e12bc77903f2aba495fee31"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/Cargo.toml",
-				"mode": "100644",
-				"blob": "8eaf70543ef9775a234d34ba0feae422ea8c2a84"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/Cargo.toml.orig",
-				"mode": "100644",
-				"blob": "41c3797dd9ebdc751273ee5d0554f58d76b7e9d0"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/LICENSE",
-				"mode": "100644",
-				"blob": "8b02a7fcef9fa4f7b7c5782e85ac25de76643235"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/VENDORED.txt",
-				"mode": "100644",
-				"blob": "4aa29fe9282d869232676dc438553ced4838159f"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/ansi_support.rs",
-				"mode": "100644",
-				"blob": "fc2f6f14473bbac5a29ef5337889be6e7b60a483"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/clipboard.rs",
-				"mode": "100644",
-				"blob": "75913112d71d128febbea1e928e9419f47c0757f"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/command.rs",
-				"mode": "100644",
-				"blob": "0a04fc5fbc6308c9021fd7356369eac4d59597f8"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/cursor.rs",
-				"mode": "100644",
-				"blob": "24796dc4506c43c80a7b2cf5e48ccf3134b6add5"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/cursor/sys.rs",
-				"mode": "100644",
-				"blob": "1623740a74bf4e40987338542ce64e0352b5b4a9"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/cursor/sys/unix.rs",
-				"mode": "100644",
-				"blob": "473421207ecf8442d410b556276189c645a77459"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/cursor/sys/windows.rs",
-				"mode": "100644",
-				"blob": "575346d48826a3fd02988847c1e471a2bcfeb869"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event.rs",
-				"mode": "100644",
-				"blob": "0df62d9d7c7a8d151d30b8e5508529d97932a73f"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/filter.rs",
-				"mode": "100644",
-				"blob": "cd7abce2b995c808449f573715ec2800fdd403b3"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/read.rs",
-				"mode": "100644",
-				"blob": "827c59b28304d62291de2abd9edda57d401b561f"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/reply.rs",
-				"mode": "100644",
-				"blob": "7f3f017b15c2e52657ac1e65f8a493cfec0a1693"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/source.rs",
-				"mode": "100644",
-				"blob": "0a26dd3ebebb96903de34d603570fec7cfddedd3"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/source/unix.rs",
-				"mode": "100644",
-				"blob": "3e36b62f5d2343666934626a60018da0b9a83ecf"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/source/unix/mio.rs",
-				"mode": "100644",
-				"blob": "4b6d0ee2253d25b8e52edb2c21ab95d69b553fba"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/source/unix/parser.rs",
-				"mode": "100644",
-				"blob": "d5d8cc12e5920f2d9d6a3e6829776918d8ab8f3d"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/source/unix/tty.rs",
-				"mode": "100644",
-				"blob": "307187eaf11d964ca2c1f623cd07ca8418db2a26"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/source/windows.rs",
-				"mode": "100644",
-				"blob": "fa40cc5027773d0e2f825ac955237d1ae289debf"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/stream.rs",
-				"mode": "100644",
-				"blob": "54c552a1e21b326ee7816b5e4ed1be80661b30dc"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/sys.rs",
-				"mode": "100644",
-				"blob": "bd79307351ad9e3179df7371d7ac56524b0c696f"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/sys/unix.rs",
-				"mode": "100644",
-				"blob": "2106ca0cc5bf09073efc4da7fc148372c2005e44"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/sys/unix/parse.rs",
-				"mode": "100644",
-				"blob": "14da692d35e731e7dec1b79d282aa5bd89feacf6"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker.rs",
-				"mode": "100644",
-				"blob": "1c55f3b801ae307ca8e1b6231f6a9005d1664e86"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker/mio.rs",
-				"mode": "100644",
-				"blob": "025db73d27b576138036a7ea5b58a9c3d28008ee"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker/tty.rs",
-				"mode": "100644",
-				"blob": "8fda30b64f442e043bf7116c5e860d6e3a8d2d36"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/sys/windows.rs",
-				"mode": "100644",
-				"blob": "d405ae821818ffbbda04e7a09d9ca977c2477680"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/sys/windows/parse.rs",
-				"mode": "100644",
-				"blob": "97677ecf6fce2ee5a78d29ec060c343d1d9637dd"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/sys/windows/poll.rs",
-				"mode": "100644",
-				"blob": "84d9bf76bb4e5fde6d9991061a3656f51dea2549"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/sys/windows/waker.rs",
-				"mode": "100644",
-				"blob": "9ec582bf4b06e1a31c14e0c488c856e600c3b7fa"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/event/timeout.rs",
-				"mode": "100644",
-				"blob": "f266d28dcc907f7bf27d6a9fe4899c89bbe6a3b6"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/lib.rs",
-				"mode": "100644",
-				"blob": "96818291d72fe1b5e5a29e769a58308206d49a19"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/macros.rs",
-				"mode": "100644",
-				"blob": "47ded98594abcd396d684948655472f268cc52a0"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/style.rs",
-				"mode": "100644",
-				"blob": "034b54ad69e4d6482f8c13c0615c411b688a8e67"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/style/attributes.rs",
-				"mode": "100644",
-				"blob": "83dea3edc5586dcb784be3891a2f339d1d808625"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/style/content_style.rs",
-				"mode": "100644",
-				"blob": "6e99bb6665a2cfde27a9134a88987559b7dbdd6d"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/style/styled_content.rs",
-				"mode": "100644",
-				"blob": "39ebe0dbef8d1f1b5f6f0ede7085453b5a0c9aa4"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/style/stylize.rs",
-				"mode": "100644",
-				"blob": "fcb12da5c4265fece31e991ec3bed3d6dca7735d"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/style/sys.rs",
-				"mode": "100644",
-				"blob": "5a5427620ee0e1c39db943259d9a27fc2373ca7f"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/style/sys/windows.rs",
-				"mode": "100644",
-				"blob": "f5e48b77db12f414308d5e00942c104809f85bbb"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/style/types.rs",
-				"mode": "100644",
-				"blob": "7cd7d6eec7e99750f601d6e1be98aaa559634759"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/style/types/attribute.rs",
-				"mode": "100644",
-				"blob": "d2f57f607a788d5560018ea85177461d94b927ec"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/style/types/color.rs",
-				"mode": "100644",
-				"blob": "00d50a65649c10e3736157e0338ebd49185c118d"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/style/types/colored.rs",
-				"mode": "100644",
-				"blob": "47f35666895f6875c43743f07df5c037b0f03129"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/style/types/colors.rs",
-				"mode": "100644",
-				"blob": "0b4afbf0cc43f73d76521e6073295cf9a303f6cd"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/terminal.rs",
-				"mode": "100644",
-				"blob": "3aebc1f8ef1f52595d636d65c5b20cc0e4b37dc5"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/terminal/sys.rs",
-				"mode": "100644",
-				"blob": "9dde47d0e98e42ba18bb68ff4331e848ec105581"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/terminal/sys/file_descriptor.rs",
-				"mode": "100644",
-				"blob": "baff266c67cbd0e90f3a3d7ad2c0bc9ecdee124f"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/terminal/sys/unix.rs",
-				"mode": "100644",
-				"blob": "f4ada1569b9d4d5b9c86a76a3f12d02fa6cfe58e"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/terminal/sys/windows.rs",
-				"mode": "100644",
-				"blob": "cd71fab8c239a388d40693953ae4375f24003890"
-			},
-			{
-				"path": "vendor/crossterm-0.29.0/src/tty.rs",
-				"mode": "100644",
-				"blob": "5a710b4abd4f2a106f52b1054eac8ca469d53367"
-			}
-		]
 	}
 }

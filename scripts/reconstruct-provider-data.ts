@@ -27,12 +27,12 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertCanonicalReference, canonicalReferenceRoot } from "./reference-identity.ts";
+import { assertNativeReference, nativeReferenceRoot } from "./reference-identity.ts";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_CATALOG_PATH = join(REPO_ROOT, "crates/pi-ai/data/builtin-models.json");
 const DEFAULT_PROVIDERS_DIR = join(
-	canonicalReferenceRoot(REPO_ROOT),
+	nativeReferenceRoot(REPO_ROOT),
 	"packages/ai/src/providers",
 );
 const DEFAULT_DATA_DIR = join(DEFAULT_PROVIDERS_DIR, "data");
@@ -924,7 +924,7 @@ export async function reconstructProviderData(
 	if (providersDir === DEFAULT_PROVIDERS_DIR) {
 		// Gate every read of the live reference providers tree on the exact
 		// canonical pin; custom fixture paths are already excluded above.
-		assertCanonicalReference();
+		assertNativeReference();
 	}
 	const proofCtx: ReconstructProofContext = {
 		repoRoot,

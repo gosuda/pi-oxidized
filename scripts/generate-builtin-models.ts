@@ -34,15 +34,15 @@ import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-	assertCanonicalReference,
-	canonicalReferenceRoot,
+	assertNativeReference,
+	nativeReferenceRoot,
 	readReferenceHead,
 } from "./reference-identity.ts";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
 const REFERENCE_MODELS_PATH = join(
-	canonicalReferenceRoot(),
+	nativeReferenceRoot(),
 	"packages/ai/src/models.generated.ts",
 );
 const OUTPUT_PATH = join(REPO_ROOT, "crates/pi-ai/data/builtin-models.json");
@@ -65,6 +65,7 @@ export const EXPECTED_PROVIDER_IDS = [
 	"groq",
 	"huggingface",
 	"kimi-coding",
+	"meta",
 	"minimax",
 	"minimax-cn",
 	"mistral",
@@ -79,6 +80,7 @@ export const EXPECTED_PROVIDER_IDS = [
 	"qwen-token-plan",
 	"qwen-token-plan-cn",
 	"qwen-token-plan-individual",
+	"radius",
 	"together",
 	"vercel-ai-gateway",
 	"xai",
@@ -631,7 +633,7 @@ async function main(): Promise<void> {
 	}
 
 	// Fail closed before the reference catalog is imported or read.
-	assertCanonicalReference();
+	assertNativeReference();
 	assertBunRuntime();
 	const catalog = await loadReferenceModels();
 	validateProviderSet(catalog);

@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { assertCanonicalReference, canonicalReferenceRoot } from "./reference-identity.ts";
+import { assertNativeReference, nativeReferenceRoot } from "./reference-identity.ts";
 import {
 	NOISE_EXIT_CODE,
 	NoiseRejection,
@@ -249,7 +249,7 @@ function registerReferenceResolver(): void {
 	Bun.plugin({
 		name: "pi-reference-resolver-t4",
 		setup(build) {
-			const refRoot = canonicalReferenceRoot(REPOSITORY_ROOT);
+			const refRoot = nativeReferenceRoot(REPOSITORY_ROOT);
 			const refUuid = resolve(refRoot, "packages/ai/src/utils/uuid.ts");
 			build.onResolve({ filter: /^@earendil-works\/pi-ai$/ }, () => ({
 				path: refUuid,
@@ -279,9 +279,9 @@ async function loadReferenceSessionManager(): Promise<{
 		open(path: string, sessionDir?: string): TsSessionManager;
 	};
 }> {
-	assertCanonicalReference();
+	assertNativeReference();
 	registerReferenceResolver();
-	const refPath = resolve(canonicalReferenceRoot(REPOSITORY_ROOT), "packages/coding-agent/src/core/session-manager.ts");
+	const refPath = resolve(nativeReferenceRoot(REPOSITORY_ROOT), "packages/coding-agent/src/core/session-manager.ts");
 	return await import(refPath);
 }
 
