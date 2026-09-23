@@ -2,7 +2,7 @@
  * XC-6 hook-dispatch semantics lattice witnesses (issue #55).
  *
  * Static witnesses that verify the TypeScript reference code implements the
- * hook-dispatch semantics for all 35 lifecycle discriminants, classifying each
+ * hook-dispatch semantics for all 39 lifecycle discriminants, classifying each
  * into one or more of: notification, chain, fold, cancellable, in-place.
  *
  * Mutations:
@@ -22,7 +22,7 @@ import { join, resolve } from "node:path";
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
 // ============================================================================
-// 35-discriminant dispatch-semantics lattice
+// 39-discriminant dispatch-semantics lattice
 // ============================================================================
 
 /** Dispatch semantics classes for lifecycle hooks. */
@@ -41,7 +41,7 @@ export interface DiscriminantClassification {
 }
 
 /**
- * The canonical classification of all 35 lifecycle discriminants.
+ * The canonical classification of all 39 lifecycle discriminants.
  *
  * - **notification**: handlers fire, results discarded, response `{ ok: true }`
  * - **chain**: last non-null result wins (session_before_* without cancel)
@@ -59,16 +59,20 @@ export const DISCRIMINANT_LATTICE: DiscriminantClassification[] = [
 	{ discriminant: "session_before_fork", classes: ["chain", "cancellable"] },
 	{ discriminant: "session_before_compact", classes: ["chain", "cancellable"] },
 	{ discriminant: "session_compact", classes: ["notification"] },
+	{ discriminant: "session_compact_failed", classes: ["notification"] },
 	{ discriminant: "session_shutdown", classes: ["notification"] },
 	{ discriminant: "session_before_tree", classes: ["chain", "cancellable"] },
 	{ discriminant: "session_tree", classes: ["notification"] },
 	{ discriminant: "context", classes: ["fold"] },
+	{ discriminant: "context_with_system", classes: ["notification"] },
+	{ discriminant: "cache_warming_decision", classes: ["notification"] },
 	{ discriminant: "before_provider_request", classes: ["chain"] },
 	{ discriminant: "before_provider_headers", classes: ["in-place"] },
 	{ discriminant: "after_provider_response", classes: ["notification"] },
 	{ discriminant: "before_agent_start", classes: ["fold"] },
 	{ discriminant: "agent_start", classes: ["notification"] },
 	{ discriminant: "agent_end", classes: ["notification"] },
+	{ discriminant: "agent_before_settle", classes: ["notification"] },
 	{ discriminant: "agent_settled", classes: ["notification"] },
 	{ discriminant: "ui_prompt_start", classes: ["notification"] },
 	{ discriminant: "ui_prompt_end", classes: ["notification"] },
@@ -88,7 +92,7 @@ export const DISCRIMINANT_LATTICE: DiscriminantClassification[] = [
 	{ discriminant: "input", classes: ["fold", "cancellable"] },
 ];
 
-/** All 35 discriminant names in canonical order. */
+/** All 39 discriminant names in canonical order. */
 export const ALL_DISCRIMINANTS = DISCRIMINANT_LATTICE.map((d) => d.discriminant);
 
 /** Discriminants belonging to a given class. */
@@ -193,11 +197,11 @@ export function compareDiscriminantList(label: string, list: string[]): string[]
 }
 
 // ============================================================================
-// Lattice completeness witness: all 35 discriminants classified
+// Lattice completeness witness: all 39 discriminants classified
 // ============================================================================
 
 /**
- * The lattice must classify exactly 35 discriminants matching ALL_EVENT_TYPES.
+ * The lattice must classify exactly 39 discriminants matching ALL_EVENT_TYPES.
  */
 export function verifyLatticeCompleteness(
 	hostSource: string,
@@ -210,12 +214,12 @@ export function verifyLatticeCompleteness(
 }
 
 // ============================================================================
-// Event-type mirror parity witness (35-entry three-list)
+// Event-type mirror parity witness (39-entry three-list)
 // ============================================================================
 
 /**
  * host.ts ALL_EVENT_TYPES, lean-api.ts LEAN_EVENT_TYPES, and the Rust
- * `pub const ALL_EVENT_TYPES` must each be exact 35-entry ordered mirrors of
+ * `pub const ALL_EVENT_TYPES` must each be exact 39-entry ordered mirrors of
  * ALL_DISCRIMINANTS. Fails closed when a named array cannot be found.
  */
 export function verifyEventMirrorParity(

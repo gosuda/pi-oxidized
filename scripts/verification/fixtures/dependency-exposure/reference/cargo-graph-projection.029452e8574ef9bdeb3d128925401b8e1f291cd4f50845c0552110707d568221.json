@@ -5992,6 +5992,13 @@
 		},
 		{
 			"from": "pi-ai",
+			"to": "indexmap",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-ai",
 			"to": "nix",
 			"kinds": [
 				"normal"

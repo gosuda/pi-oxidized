@@ -301,13 +301,30 @@ pub fn publish_file_atomically(path: &Path, content: &str) -> Result<(), Session
 ///
 /// `std::fs::rename` refuses to replace an existing destination on Windows,
 /// which breaks torn-v4 repair and legacy-v3 migration there (both publish
-/// over a present file). Remove first on Windows (a documented non-atomic
-/// window, strictly better than a hard I/O error) and rename directly
-/// elsewhere.
+/// over a present file). Rotate through a sibling backup instead of deleting
+/// first: a crash leaves either the previous file or the backup behind, so
+/// no valid session is ever destroyed to install the new one. The backup is
+/// removed on success and reclaimed on the next publish when one lingers.
 #[cfg(windows)]
 fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
-    let _ = fs::remove_file(path);
-    fs::rename(temp_path, path)
+    let mut backup_path = path.as_os_str().to_os_string();
+    backup_path.push(".bak");
+    let backup_path = PathBuf::from(backup_path);
+    // A lingering backup means a previous publish died mid-rotation; its
+    // content predates `path`, so drop it before rotating.
+    let _ = fs::remove_file(&backup_path);
+    match fs::rename(path, &backup_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if let Err(error) = fs::rename(temp_path, path) {
+        // Best effort: put the previous file back before reporting.
+        let _ = fs::rename(&backup_path, path);
+        return Err(error);
+    }
+    let _ = fs::remove_file(&backup_path);
+    Ok(())
 }
 
 /// Replaces `path` with `temp_path`, including when `path` already exists.

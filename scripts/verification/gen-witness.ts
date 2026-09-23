@@ -485,7 +485,7 @@ const LIFECYCLE_RES_REPS: readonly string[] = [
  * (callback_timeout_frame: code "timeout", not retryable). */
 const LIFECYCLE_ERROR_REP = "message_update";
 
-/** First id of the 35 lifecycle req frames (after the last gap-surface id). */
+/** First id of the 39 lifecycle req frames (after the last gap-surface id). */
 const FIRST_LIFECYCLE_ID = 55;
 
 function lifecycleFrames(lifecycle: readonly string[]): readonly FrameSpec[] {

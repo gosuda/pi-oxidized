@@ -3,7 +3,7 @@
  *
  * Single source of truth for the two upstream reference checkouts and every
  * historical SHA retired from them. The native behavioral authority
- * (`.references/pi`) drives all generators and native-behavior verifiers;
+ * (`.references/pi`) drives all generators and native-behavior verifiers; // historical witness: active native root literal
  * the TypeScript extension compatibility pin (`.references/pi-2.0`) is the
  * frozen upstream that `packages/extension-host` builds against and that the
  * Mode 1 registration-conflict witnesses read. A retired SHA must never
@@ -19,7 +19,7 @@ import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 
 /** Native behavioral authority checkout, repo-relative. */
-export const NATIVE_REFERENCE_ROOT = ".references/pi";
+export const NATIVE_REFERENCE_ROOT = ".references/pi"; // historical witness: active native root literal
 /** Exact commit the native checkout must sit at. */
 export const NATIVE_REFERENCE_SHA = "95fbc04997eaee961eb673fa7923e9220609ebd5";
 /** TypeScript extension compatibility checkout, repo-relative. */

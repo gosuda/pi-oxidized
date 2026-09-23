@@ -719,6 +719,10 @@ fn deferred_fetch_stream(
         callbacks: callback_flags(&options),
     };
     let payload = serde_json::to_value(request).unwrap_or(Value::Null);
+    // The per-call deadline bounds the whole fetch: a handler that neither
+    // emits nor returns must not stall the event loop past it. The terminal
+    // finish below draws its remaining budget from the same instant.
+    let deadline = tokio::time::Instant::now() + timeout;
     let model = model.clone();
     let (tx, rx) = mpsc::channel::<Result<AssistantMessageEvent, ProviderError>>(64);
     tokio::spawn(async move {
@@ -745,6 +749,11 @@ fn deferred_fetch_stream(
                     let _ = tx.try_send(Err(ProviderError::new("provider deferred fetch cancelled")));
                     return;
                 }
+                () = tokio::time::sleep_until(deadline) => {
+                    let _ = stream.cancel(methods::PROVIDER_CANCEL);
+                    let _ = tx.try_send(Err(ProviderError::new("provider deferred fetch timed out")));
+                    return;
+                }
                 event = stream.next_event() => match event {
                     Some(frame) => {
                         if let Some(event) = decode_provider_stream_event(&frame.payload)
@@ -764,7 +773,7 @@ fn deferred_fetch_stream(
                 let _ = tx.try_send(Err(ProviderError::new("provider deferred fetch cancelled")));
                 return;
             }
-            result = stream.finish(timeout) => result,
+            result = stream.finish(deadline.saturating_duration_since(tokio::time::Instant::now())) => result,
         };
         if let Err(error) = terminal {
             let item = deferred_terminal_result(&model, error);
@@ -2256,6 +2265,63 @@ mod tests {
         );
         Ok(())
     }
+    #[tokio::test]
+    async fn extension_provider_deferred_fetch_times_out_on_stalled_handler() -> R {
+        let model = Model {
+            id: "m".to_owned(),
+            name: "M".to_owned(),
+            api: "custom".to_owned(),
+            provider: "custom".to_owned(),
+            ..base_model_defaults()
+        };
+        let handle = DeferredHandle {
+            provider: "custom".to_owned(),
+            model_id: "m".to_owned(),
+            api: "custom".to_owned(),
+            id: "deferred-stall".to_owned(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: None,
+        };
+        let capabilities = ProviderCapabilities {
+            stream_simple: false,
+            fetch_deferred: true,
+            cancel_deferred: false,
+        };
+        let (client, mut host) = make_pair().await;
+        let provider = ExtensionProvider::new("custom", Arc::new(client))
+            .with_capabilities(capabilities)
+            .with_timeout(Duration::from_millis(50));
+        let fetch = provider
+            .deferred()
+            .and_then(|callbacks| callbacks.fetch.clone())
+            .ok_or("deferred fetch callback missing")?;
+        let mut stream = fetch(&model, handle, StreamOptions::default());
+        // The handler stalls: it neither emits an event nor returns, so the
+        // host sends nothing after the fetch frame. The per-call deadline
+        // must still terminate the event loop.
+        let request = host.require_frame(methods::PROVIDER_FETCH_DEFERRED).await?;
+        let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .map_err(|_| "stalled deferred fetch did not terminate within 2s")?
+            .ok_or("stalled deferred fetch ended without an error item")?;
+        let Err(error) = item else {
+            return Err("stalled deferred fetch unexpectedly yielded an event".into());
+        };
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected stalled-fetch error: {error}"
+        );
+        let cancel_frame = tokio::time::timeout(
+            Duration::from_millis(500),
+            host.require_frame(methods::PROVIDER_CANCEL),
+        )
+        .await
+        .map_err(|_| "provider.cancel did not arrive after the fetch timeout")??;
+        assert_eq!(cancel_frame.payload["id"], request.id);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn extension_provider_deferred_cancel_uses_timeout_set_after_capabilities() -> R {
         let model = Model {

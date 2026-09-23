@@ -26,8 +26,8 @@ describe("XC-6 hook-dispatch semantics lattice witnesses", () => {
 
 	// --- Lattice completeness ---
 
-	test("lattice classifies exactly 35 discriminants", () => {
-		expect(ALL_DISCRIMINANTS).toHaveLength(35);
+	test("lattice classifies exactly 39 discriminants", () => {
+		expect(ALL_DISCRIMINANTS).toHaveLength(39);
 	});
 
 	test("lattice discriminants match ALL_EVENT_TYPES in host.ts", () => {
@@ -246,8 +246,8 @@ describe("XC-6 hook-dispatch semantics lattice witnesses", () => {
 	});
 });
 
-describe("XC-6 event-type mirror parity (35-entry lattice)", () => {
-	test("host.ts, lean-api.ts, and Rust ALL_EVENT_TYPES are 35-entry mirrors", () => {
+describe("XC-6 event-type mirror parity (39-entry lattice)", () => {
+	test("host.ts, lean-api.ts, and Rust ALL_EVENT_TYPES are 39-entry mirrors", () => {
 		expect(
 			verifyEventMirrorParity(INPUTS.hostSource, INPUTS.leanApiSource, INPUTS.rustHostSource),
 		).toEqual([]);
