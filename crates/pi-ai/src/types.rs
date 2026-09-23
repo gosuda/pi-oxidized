@@ -1,8 +1,11 @@
 //! Wire-compatible model, message, tool, and streaming event contracts.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use serde::de::{self, Unexpected};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Number, Value};
@@ -49,6 +52,44 @@ pub enum ModelThinkingLevel {
     Xhigh,
     /// Maximum reasoning effort.
     Max,
+}
+
+/// Error returned when parsing an unsupported model thinking level.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelThinkingLevelParseError {
+    /// The input that was not a supported model thinking level.
+    pub input: String,
+}
+
+impl fmt::Display for ModelThinkingLevelParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid model thinking level {:?}; expected off, minimal, low, medium, high, xhigh, or max",
+            self.input
+        )
+    }
+}
+
+impl std::error::Error for ModelThinkingLevelParseError {}
+
+impl FromStr for ModelThinkingLevel {
+    type Err = ModelThinkingLevelParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            "max" => Ok(Self::Max),
+            _ => Err(ModelThinkingLevelParseError {
+                input: value.to_owned(),
+            }),
+        }
+    }
 }
 
 /// Provider-specific values for model thinking levels.
@@ -443,6 +484,82 @@ pub enum ToolResultContent {
     Image(ImageContent),
 }
 
+/// Text accepted by a system message.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum SystemMessageContent {
+    /// Plain system text.
+    Text(String),
+    /// Structured text blocks.
+    Blocks(Vec<TextContent>),
+}
+
+impl From<String> for SystemMessageContent {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<&str> for SystemMessageContent {
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_owned())
+    }
+}
+
+impl From<Vec<TextContent>> for SystemMessageContent {
+    fn from(blocks: Vec<TextContent>) -> Self {
+        Self::Blocks(blocks)
+    }
+}
+
+/// A tool name referenced by a transcript removal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolReference {
+    /// The declared tool name.
+    pub name: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum SystemRole {
+    #[serde(rename = "system")]
+    System,
+}
+
+/// An ordered update to the prompt and available tool declarations.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemMessage {
+    role: SystemRole,
+    /// Text appended to the current system prompt.
+    pub content: SystemMessageContent,
+    /// Named section replacements; null removes a section.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sections: Option<IndexMap<String, Option<String>>>,
+    /// Added or replaced tool declarations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_added: Option<Vec<Tool>>,
+    /// Tool names removed before additions in this update.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_removed: Option<Vec<ToolReference>>,
+    /// Unix timestamp in milliseconds.
+    pub timestamp: i64,
+}
+
+impl SystemMessage {
+    /// Create an update with text and no section or tool changes.
+    #[must_use]
+    pub fn new(content: impl Into<SystemMessageContent>, timestamp: i64) -> Self {
+        Self {
+            role: SystemRole::System,
+            content: content.into(),
+            sections: None,
+            tools_added: None,
+            tools_removed: None,
+            timestamp,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum UserRole {
     #[serde(rename = "user")]
@@ -631,6 +748,8 @@ impl ToolResultMessage {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Message {
+    /// Ordered prompt and tool-state update.
+    System(Box<SystemMessage>),
     /// User-authored message.
     User(UserMessage),
     /// Provider-produced assistant message.
@@ -799,6 +918,54 @@ pub struct ModelCost {
     pub tiers: Option<Vec<ModelCostTier>>,
 }
 
+/// Cache-safe image resize settings for model input limits.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelImageResizeOptions {
+    /// Maximum resized image width in pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_width: Option<u64>,
+    /// Maximum resized image height in pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<u64>,
+    /// Maximum base64-encoded payload size in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// JPEG quality used when resizing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jpeg_quality: Option<u64>,
+}
+
+/// Per-message and per-request image limits for a model.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelImageInputLimits {
+    /// Cache-safe resize profile applied to new conversation images.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resize: Option<ModelImageResizeOptions>,
+    /// Maximum images accepted in one provider message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_per_message: Option<u64>,
+    /// Maximum images accepted across one provider request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_per_request: Option<u64>,
+}
+
+/// Provider input-size and image limits.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInputLimits {
+    /// Maximum serialized provider request size in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_request_bytes: Option<u64>,
+    /// Image limits for this model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<ModelImageInputLimits>,
+}
+
+/// Prompt-cache lifetime in seconds by retention tier.
+pub type ModelPromptCache = BTreeMap<String, u64>;
+
 /// Provider model metadata, including preserved compatibility extensions.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -820,8 +987,17 @@ pub struct Model {
     pub thinking_level_map: Option<ThinkingLevelMap>,
     /// Accepted input modalities.
     pub input: Vec<ModelInput>,
+    /// Provider input limits and cache-safe image preprocessing metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_limits: Option<ModelInputLimits>,
     /// Model pricing.
     pub cost: ModelCost,
+    /// Prompt-cache lifetimes in seconds by retention tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<ModelPromptCache>,
+    /// Default arbitrary sampling parameters for OpenAI-compatible adapters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_params: Option<Map<String, Value>>,
     /// Context-window size in tokens.
     pub context_window: u64,
     /// Maximum output tokens.
@@ -1143,6 +1319,67 @@ mod tests {
         assert_eq!(
             serde_json::to_value(map)?,
             json!({"off": null, "high": "high"})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_thinking_level_from_str_accepts_all_wire_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let values = [
+            ("off", ModelThinkingLevel::Off),
+            ("minimal", ModelThinkingLevel::Minimal),
+            ("low", ModelThinkingLevel::Low),
+            ("medium", ModelThinkingLevel::Medium),
+            ("high", ModelThinkingLevel::High),
+            ("xhigh", ModelThinkingLevel::Xhigh),
+            ("max", ModelThinkingLevel::Max),
+        ];
+        for (raw, expected) in values {
+            assert_eq!(raw.parse::<ModelThinkingLevel>(), Ok(expected));
+        }
+        let Err(error) = "invalid".parse::<ModelThinkingLevel>() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "expected parse error",
+            )
+            .into());
+        };
+        assert_eq!(error.input, "invalid");
+        Ok(())
+    }
+
+    #[test]
+    fn model_input_limits_use_upstream_camel_case_fields() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let limits = ModelInputLimits {
+            max_request_bytes: Some(10_000),
+            images: Some(ModelImageInputLimits {
+                resize: Some(ModelImageResizeOptions {
+                    max_width: Some(1024),
+                    max_height: Some(768),
+                    max_bytes: Some(2_000_000),
+                    jpeg_quality: Some(85),
+                }),
+                max_per_message: Some(4),
+                max_per_request: Some(8),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(limits)?,
+            json!({
+                "maxRequestBytes": 10_000,
+                "images": {
+                    "resize": {
+                        "maxWidth": 1024,
+                        "maxHeight": 768,
+                        "maxBytes": 2_000_000,
+                        "jpegQuality": 85
+                    },
+                    "maxPerMessage": 4,
+                    "maxPerRequest": 8
+                }
+            })
         );
         Ok(())
     }

@@ -10,10 +10,13 @@ use serde_json::{Map, Value, json};
 
 use crate::constrained_sampling::{ConstrainedSamplingError, resolve_json_schema_strict_sampling};
 use crate::provider::{StreamOptionKey, StreamOptions};
+use crate::transcript::{
+    TranscriptContext, get_current_tools, get_initial_system_message, get_system_message_text,
+};
 use crate::types::{
-    AssistantContent, AssistantMessage, AssistantMessageEvent, Context, DoneReason, ErrorReason,
-    Message, Model, ModelInput, StopReason, TextContent, ThinkingContent, Tool, ToolCall,
-    ToolResultContent, Usage, UsageCost, UserContent, UserMessageContent,
+    AssistantContent, AssistantMessage, AssistantMessageEvent, DoneReason, ErrorReason, Message,
+    Model, ModelInput, StopReason, TextContent, ThinkingContent, Tool, ToolCall, ToolResultContent,
+    Usage, UsageCost, UserContent, UserMessageContent,
 };
 
 use super::{calculate_cost, sanitize_surrogates, transform_messages, truncate_error_body};
@@ -83,7 +86,7 @@ impl GoogleThinkingLevel {
 /// Build the `GenerateContent` wire body shared by Gemini API and Vertex AI.
 pub(crate) fn build_request_body(
     model: &Model,
-    context: &Context,
+    context: &TranscriptContext,
     options: &StreamOptions,
     thinking_config: Option<Value>,
 ) -> Result<Value, GoogleFailure> {
@@ -110,21 +113,21 @@ pub(crate) fn build_request_body(
         Value::Object(generation_config),
     );
 
-    if let Some(system_prompt) = context
-        .system_prompt
-        .as_deref()
-        .filter(|prompt| !prompt.is_empty())
+    if let Some(system) = get_initial_system_message(&context.messages)
+        .map(get_system_message_text)
+        .filter(|text| !text.is_empty())
     {
         body.insert(
             "systemInstruction".to_owned(),
             json!({
                 "role": "user",
-                "parts": [{"text": sanitize_surrogates(system_prompt)}],
+                "parts": [{"text": sanitize_surrogates(&system)}],
             }),
         );
     }
 
-    if let Some(tools) = context.tools.as_deref().filter(|tools| !tools.is_empty()) {
+    let tools = get_current_tools(&context.messages);
+    if !tools.is_empty() {
         let supports_strict_mode = supports_google_strict_tool_sampling(&model.id);
         let choice = options
             .extra_value(StreamOptionKey::TOOL_CHOICE)
@@ -135,9 +138,9 @@ pub(crate) fn build_request_body(
                     .and_then(Value::as_str)
             });
         let function_calling_mode =
-            resolve_google_function_calling_mode(tools, choice, supports_strict_mode)
+            resolve_google_function_calling_mode(&tools, choice, supports_strict_mode)
                 .map_err(|error| GoogleFailure::error(error.to_string()))?;
-        if let Some(converted) = convert_tools(tools, false, supports_strict_mode)
+        if let Some(converted) = convert_tools(&tools, false, supports_strict_mode)
             .map_err(|error| GoogleFailure::error(error.to_string()))?
         {
             body.insert("tools".to_owned(), converted);
@@ -154,7 +157,7 @@ pub(crate) fn build_request_body(
 }
 
 /// Convert pi conversation messages to Google `GenerateContent` contents.
-pub(crate) fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
+pub(crate) fn convert_messages(model: &Model, context: &TranscriptContext) -> Vec<Value> {
     let transformed = transform_messages(&context.messages, model, |id, target, _source| {
         normalize_tool_call_id(id, target)
     });
@@ -163,6 +166,7 @@ pub(crate) fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
 
     for message in transformed {
         match message {
+            Message::System(_) => {}
             Message::User(message) => {
                 if let Some(content) = convert_user_message(message) {
                     contents.push(content);
@@ -1016,9 +1020,10 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
+    use crate::transcript::{normalize_context, resolve_transcript};
     use crate::types::{
-        ConstrainedSampling, ConstrainedSamplingConfig, ImageContent, ModelCost, StrictMode,
-        ToolResultMessage, UserMessage,
+        ConstrainedSampling, ConstrainedSamplingConfig, Context, ImageContent, ModelCost,
+        StrictMode, ToolResultMessage, UserMessage,
     };
 
     fn model(id: &str) -> Model {
@@ -1038,6 +1043,9 @@ mod tests {
                 cache_write: 0.0,
                 tiers: None,
             },
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 1_000,
             max_tokens: 100,
             headers: None,
@@ -1166,6 +1174,7 @@ mod tests {
             tools: Some(vec![tool]),
             ..Context::default()
         };
+        let context = resolve_transcript(normalize_context(context), false);
         let strict_model = model("gemini-3-pro-preview");
         let payload = build_request_body(&strict_model, &context, &StreamOptions::default(), None)
             .expect("strict Google payload should succeed");
@@ -1231,6 +1240,7 @@ mod tests {
             }]),
             ..Context::default()
         };
+        let context = resolve_transcript(normalize_context(context), false);
         let error = build_request_body(
             &model("gemini-3-pro-preview"),
             &context,
@@ -1270,6 +1280,7 @@ mod tests {
             ],
             tools: None,
         };
+        let context = resolve_transcript(normalize_context(context), false);
 
         let gemini3 = convert_messages(&model("gemini-3-pro-preview"), &context);
         assert_eq!(
@@ -1380,6 +1391,7 @@ mod tests {
             ))],
             tools: None,
         };
+        let context = resolve_transcript(normalize_context(context), false);
         assert_eq!(
             convert_messages(&model("gemini-2.5-flash"), &context),
             vec![json!({"role": "user", "parts": [{"text": "hello"}]})]

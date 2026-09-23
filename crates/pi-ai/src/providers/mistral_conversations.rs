@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 
 use crate::constrained_sampling::resolve_json_schema_strict_sampling;
 use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
+use crate::transcript::{get_system_message_text, render_system_message_update};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DoneReason,
     ErrorReason, Message, Model, ModelInput, StopReason, TextContent, ThinkingContent, ToolCall,
@@ -353,8 +354,18 @@ fn uses_reasoning_effort(model_id: &str) -> bool {
 
 fn to_chat_messages(messages: &[Message], supports_images: bool) -> Vec<Value> {
     let mut result = Vec::new();
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
         match message {
+            Message::System(system) => {
+                let text = if index == 0 {
+                    get_system_message_text(system)
+                } else {
+                    render_system_message_update(system)
+                };
+                if !text.is_empty() {
+                    result.push(json!({"role": "system", "content": sanitize_surrogates(&text)}));
+                }
+            }
             Message::User(user) => push_user_message(&mut result, user, supports_images),
             Message::Assistant(assistant) => push_assistant_message(&mut result, assistant),
             Message::ToolResult(tool_result) => {
@@ -1059,6 +1070,9 @@ mod tests {
                 cache_write: 0.0,
                 tiers: None,
             },
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 128_000,
             max_tokens: 8_192,
             headers: None,

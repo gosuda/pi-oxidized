@@ -412,7 +412,10 @@ fn build_payload(
     if let Some(session_id) = options.session_id.as_deref() {
         payload["prompt_cache_key"] = Value::String(session_id.chars().take(64).collect());
     }
-    if let Some(max_tokens) = options.max_tokens {
+    if let Some(max_tokens) = options
+        .max_tokens
+        .filter(|_| compat_bool(model, "supportsMaxOutputTokens", true))
+    {
         payload["max_output_tokens"] = Value::from(max_tokens.max(MIN_OUTPUT_TOKENS));
     }
     if let Some(temperature) = options.temperature {
@@ -435,6 +438,16 @@ fn build_payload(
         payload["tool_choice"] = tool_choice.clone();
     }
     apply_reasoning(model, options, &mut payload);
+    if let Some(params) = model.sampling_params.as_ref()
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.extend(params.clone());
+    }
+    if let Some(params) = options.sampling_params.as_ref()
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.extend(params.clone());
+    }
     Ok(payload)
 }
 
@@ -588,6 +601,7 @@ impl AdapterFailure {
 mod tests {
     use super::*;
     use crate::types::{ModelCost, ModelInput};
+    use serde_json::Map;
 
     fn model(base_url: &str) -> Model {
         Model {
@@ -600,6 +614,9 @@ mod tests {
             thinking_level_map: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 128_000,
             max_tokens: 8_192,
             headers: None,
@@ -653,6 +670,31 @@ mod tests {
         assert_eq!(payload["prompt_cache_key"], "session");
         assert!(payload.get("prompt_cache_retention").is_none());
         assert_eq!(payload["store"], false);
+    }
+
+    #[test]
+    fn max_output_tokens_and_sampling_params_follow_azure_compatibility() {
+        let mut model = model("https://x.openai.azure.com");
+        model.compat = Some(json!({"supportsMaxOutputTokens": false}));
+        model.sampling_params = Some(Map::from_iter([
+            ("temperature".to_owned(), Value::from(0.1)),
+            ("top_k".to_owned(), Value::from(8)),
+        ]));
+        let options = StreamOptions {
+            max_tokens: Some(32),
+            temperature: Some(0.8),
+            sampling_params: Some(Map::from_iter([
+                ("top_k".to_owned(), Value::from(16)),
+                ("min_p".to_owned(), Value::from(0.2)),
+            ])),
+            ..StreamOptions::default()
+        };
+        let payload = build_payload(&model, &Context::default(), &options, "gpt-5")
+            .expect("Azure compatibility payload builds");
+        assert!(payload.get("max_output_tokens").is_none());
+        assert_eq!(payload["temperature"], 0.1);
+        assert_eq!(payload["top_k"], 16);
+        assert_eq!(payload["min_p"], 0.2);
     }
 
     #[test]

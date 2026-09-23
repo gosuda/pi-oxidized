@@ -49,6 +49,7 @@ fn exposes_exact_builtin_api_and_provider_tables() {
             "groq",
             "huggingface",
             "kimi-coding",
+            "meta",
             "minimax",
             "minimax-cn",
             "mistral",

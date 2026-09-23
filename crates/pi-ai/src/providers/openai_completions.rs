@@ -817,6 +817,16 @@ fn build_payload(
             payload["providerOptions"] = json!({"gateway": gateway});
         }
     }
+    if let Some(params) = model.sampling_params.as_ref()
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.extend(params.clone());
+    }
+    if let Some(params) = options.sampling_params.as_ref()
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.extend(params.clone());
+    }
     Ok(payload)
 }
 fn convert_messages(
@@ -875,6 +885,7 @@ fn convert_messages(
                     &mut messages,
                 )?;
             }
+            Message::System(_) => {}
         }
         index += 1;
     }
@@ -889,14 +900,15 @@ fn convert_user_message(user: &crate::types::UserMessage, messages: &mut Vec<Val
         UserMessageContent::Blocks(blocks) => {
             let parts: Vec<Value> = blocks
                 .iter()
-                .map(|block| match block {
-                    UserContent::Text(text) => json!({
+                .filter_map(|block| match block {
+                    UserContent::Text(text) if !text.text.is_empty() => Some(json!({
                         "type":"text", "text": sanitize_surrogates(&text.text)
-                    }),
-                    UserContent::Image(image) => json!({
+                    })),
+                    UserContent::Text(_) => None,
+                    UserContent::Image(image) => Some(json!({
                         "type":"image_url",
                         "image_url":{"url":format!("data:{};base64,{}",image.mime_type,image.data)}
-                    }),
+                    })),
                 })
                 .collect();
             if !parts.is_empty() {
@@ -1527,6 +1539,12 @@ impl Compat {
         let base = model.base_url.as_str();
         let detection = detect_provider(provider, base, model.id.as_str());
         let compat = model.compat.as_ref();
+        let strict_by_default = !(provider_is_moonshot(provider, base)
+            || provider_is_together(provider, base)
+            || provider == "cloudflare-ai-gateway"
+            || base.contains("gateway.ai.cloudflare.com")
+            || provider == "nvidia"
+            || base.contains("integrate.api.nvidia.com"));
         Self {
             store: CompatStore {
                 supports_store: compat_bool(
@@ -1539,11 +1557,7 @@ impl Compat {
                     "supportsLongCacheRetention",
                     detection.limits.supports_long_cache_retention,
                 ),
-                supports_strict_mode: compat_bool(
-                    compat,
-                    "supportsStrictMode",
-                    detection.limits.supports_strict_mode,
-                ),
+                supports_strict_mode: compat_bool(compat, "supportsStrictMode", strict_by_default),
                 supports_openai_grammar_tools: compat_bool(
                     compat,
                     "supportsOpenAIGrammarTools",
@@ -1634,7 +1648,6 @@ struct ProviderIdentity {
 struct ProviderLimits {
     use_max_tokens: bool,
     supports_long_cache_retention: bool,
-    supports_strict_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1702,7 +1715,6 @@ fn detect_provider(provider: &str, base: &str, model_id: &str) -> ProviderDetect
                 || is_gateway
                 || is_nvidia
                 || is_ant_ling),
-            supports_strict_mode: !(is_moonshot || is_together || is_gateway || is_nvidia),
         },
         features: ProviderFeatures {
             supports_reasoning_effort: !(is_grok
@@ -1764,7 +1776,7 @@ fn has_tool_history(messages: &[Message]) -> bool {
             .content
             .iter()
             .any(|block| matches!(block, AssistantContent::ToolCall(_))),
-        Message::User(_) => false,
+        Message::User(_) | Message::System(_) => false,
     })
 }
 
@@ -1908,8 +1920,9 @@ impl AdapterFailure {
 mod tests {
     use super::*;
     use crate::types::{
-        ConstrainedSampling, ConstrainedSamplingConfig, DoneReason, GrammarVariants, ModelCost,
-        ModelInput, StopReason,
+        ConstrainedSampling, ConstrainedSamplingConfig, DoneReason, GrammarVariants, ImageContent,
+        ModelCost, ModelInput, StopReason, TextContent, UserContent, UserMessage,
+        UserMessageContent,
     };
 
     fn model(provider: &str) -> Model {
@@ -1923,12 +1936,96 @@ mod tests {
             thinking_level_map: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 128_000,
             max_tokens: 8_192,
             headers: None,
             compat: None,
             extra: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn image_only_user_messages_drop_empty_text_parts() {
+        let user = UserMessage::new(
+            UserMessageContent::Blocks(vec![
+                UserContent::Text(TextContent::new("")),
+                UserContent::Image(ImageContent::new("aGVsbG8=", "image/png")),
+            ]),
+            1,
+        );
+        let mut messages = Vec::new();
+        convert_user_message(&user, &mut messages);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0]["content"],
+            json!([{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,aGVsbG8="}
+            }])
+        );
+    }
+
+    #[test]
+    fn sampling_params_override_named_and_model_defaults() {
+        let mut model = model("openai");
+        model.sampling_params = Some(Map::from_iter([
+            ("top_k".to_owned(), Value::from(8)),
+            ("temperature".to_owned(), Value::from(0.1)),
+        ]));
+        let options = StreamOptions {
+            temperature: Some(0.8),
+            sampling_params: Some(Map::from_iter([
+                ("top_k".to_owned(), Value::from(16)),
+                ("min_p".to_owned(), Value::from(0.2)),
+            ])),
+            ..StreamOptions::default()
+        };
+        let payload = build_payload(
+            &model,
+            &Context::default(),
+            &options,
+            &Compat::resolve(&model),
+            CacheRetention::Short,
+            &BTreeMap::new(),
+        )
+        .expect("sampling payload builds");
+        assert_eq!(payload["top_k"], 16);
+        assert_eq!(payload["min_p"], 0.2);
+        assert_eq!(payload["temperature"], 0.1);
+    }
+
+    #[test]
+    fn strict_mode_emitted_unless_explicitly_disabled() {
+        let tool = Tool {
+            name: "read".into(),
+            description: "Read".into(),
+            parameters: json!({"type":"object"}),
+            constrained_sampling: None,
+        };
+        let default = convert_tools(
+            std::slice::from_ref(&tool),
+            &Compat::resolve(&model("custom")),
+        )
+        .expect("default tool conversion succeeds");
+        assert_eq!(default[0]["function"]["strict"], false);
+
+        let mut disabled_model = model("custom");
+        disabled_model.compat = Some(json!({"supportsStrictMode": false}));
+        let disabled = convert_tools(
+            std::slice::from_ref(&tool),
+            &Compat::resolve(&disabled_model),
+        )
+        .expect("disabled strict conversion succeeds");
+        assert!(disabled[0]["function"].get("strict").is_none());
+
+        let mut enabled_model = model("custom");
+        enabled_model.compat = Some(json!({"supportsStrictMode": true}));
+        let enabled = convert_tools(&[tool], &Compat::resolve(&enabled_model))
+            .expect("strict tool conversion succeeds");
+        assert_eq!(enabled[0]["function"]["strict"], false);
     }
 
     fn event_capacity() -> NonZeroUsize {

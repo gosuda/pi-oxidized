@@ -27,7 +27,7 @@ const NO_TOOL_OUTPUT: &str = "(no tool output)";
 /// Options controlling conversion of conversation history to Responses input items.
 #[derive(Clone, Debug)]
 pub(crate) struct ConvertMessagesOptions {
-    /// Include the context system prompt as the first input item.
+    /// Include the leading transcript system message as the first input item.
     pub(crate) include_system_prompt: bool,
     /// Tools that are replayed through Responses' deferred tool-search items.
     pub(crate) deferred_tools: BTreeMap<String, Tool>,
@@ -141,6 +141,7 @@ pub(crate) fn convert_messages(
                 &mut loaded_tool_names,
                 &mut input,
             )?,
+            Message::System(_) => {}
         }
     }
     Ok(input)
@@ -1852,6 +1853,9 @@ mod tests {
             thinking_level_map: None,
             input: vec![ModelInput::Text, ModelInput::Image],
             cost: ModelCost::default(),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 128_000,
             max_tokens: 16_384,
             headers: None,

@@ -20,6 +20,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName
 use serde_json::{Map, Value, json};
 
 use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
+use crate::transcript::{TranscriptContext, normalize_context, resolve_transcript};
 use crate::types::{AssistantMessage, AssistantMessageEvent, Context, Model, ModelThinkingLevel};
 
 use super::shared::google::{
@@ -380,6 +381,7 @@ impl Provider for GoogleVertex {
         options: StreamOptions,
     ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
         let model = model.clone();
+        let context = resolve_transcript(normalize_context(context), false);
         let transport = self.transport.clone();
         let token_provider = self.token_provider.clone();
         let tool_call_counter = Arc::clone(&self.tool_call_counter);
@@ -420,7 +422,7 @@ impl Provider for GoogleVertex {
 struct VertexRequestInput {
     token_provider: Option<Arc<dyn VertexTokenProvider>>,
     model: Model,
-    context: Context,
+    context: TranscriptContext,
     options: StreamOptions,
 }
 
@@ -1033,6 +1035,9 @@ mod tests {
             thinking_level_map: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 1_000,
             max_tokens: 100,
             headers: None,

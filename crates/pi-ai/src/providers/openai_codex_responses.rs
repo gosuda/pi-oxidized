@@ -1235,6 +1235,19 @@ fn apply_codex_optional_request_fields(
                     .unwrap_or_else(|| "auto".into()),
             }),
         );
+    } else if model.reasoning {
+        let off = model
+            .thinking_level_map
+            .as_ref()
+            .and_then(|mapping| mapping.get(&ModelThinkingLevel::Off));
+        if !matches!(off, Some(None)) {
+            body.insert(
+                "reasoning".into(),
+                json!({
+                    "effort": off.and_then(Clone::clone).unwrap_or_else(|| "none".into()),
+                }),
+            );
+        }
     }
     Ok(())
 }
@@ -1273,7 +1286,7 @@ fn split_deferred_tools(
                     }
                 }
             }
-            Message::User(_) => {}
+            Message::User(_) | Message::System(_) => {}
         }
     }
 
@@ -1950,8 +1963,13 @@ fn unix_millis() -> i64 {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
 mod tests {
     use super::*;
+    use crate::types::{Context, ModelCost, ModelInput};
 
     fn token_with_claim(account_id: &str) -> String {
         let payload = json!({
@@ -1976,6 +1994,9 @@ mod tests {
             thinking_level_map: Some(BTreeMap::from([(ModelThinkingLevel::Off, None)])),
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 128_000,
             max_tokens: 16_384,
             headers: None,
@@ -1992,6 +2013,39 @@ mod tests {
             Some("very-high".to_owned()),
         )]));
         assert_eq!(map_reasoning_effort(&model, "high"), "very-high".to_owned());
+    }
+
+    #[test]
+    fn reasoning_models_emit_off_effort_when_option_is_omitted() {
+        let mut model = Model {
+            id: "gpt-5.5".into(),
+            name: "GPT-5.5".into(),
+            api: API.into(),
+            provider: "openai-codex".into(),
+            base_url: DEFAULT_CODEX_BASE_URL.into(),
+            reasoning: true,
+            thinking_level_map: Some(BTreeMap::from([(
+                ModelThinkingLevel::Off,
+                Some("none".to_owned()),
+            )])),
+            input: vec![ModelInput::Text],
+            cost: ModelCost::default(),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
+            context_window: 128_000,
+            max_tokens: 16_384,
+            headers: None,
+            compat: None,
+            extra: BTreeMap::new(),
+        };
+        let body = build_request_body(&model, &Context::default(), &StreamOptions::default())
+            .expect("Codex request body builds");
+        assert_eq!(body["reasoning"]["effort"], "none");
+        model.thinking_level_map = Some(BTreeMap::from([(ModelThinkingLevel::Off, None)]));
+        let body = build_request_body(&model, &Context::default(), &StreamOptions::default())
+            .expect("Codex request body builds with unsupported off");
+        assert!(body.get("reasoning").is_none());
     }
     #[test]
     fn extracts_chatgpt_account_id_from_base64url_jwt() -> Result<(), CodexFailure> {

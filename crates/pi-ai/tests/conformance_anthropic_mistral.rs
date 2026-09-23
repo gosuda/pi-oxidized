@@ -447,6 +447,7 @@ fn stream_options_from_case(
 ) -> Result<StreamOptions, String> {
     Ok(StreamOptions {
         temperature: options.temperature,
+        sampling_params: None,
         max_tokens: options.max_tokens,
         signal: abort_after_start.then(CancellationToken::new),
         api_key: options.api_key.clone(),
@@ -607,6 +608,9 @@ fn live_anthropic_model() -> Model {
         thinking_level_map: None,
         input: vec![pi_ai::types::ModelInput::Text],
         cost: pi_ai::types::ModelCost::default(),
+        input_limits: None,
+        prompt_cache: None,
+        sampling_params: None,
         context_window: 200_000,
         max_tokens: 64,
         headers: None,

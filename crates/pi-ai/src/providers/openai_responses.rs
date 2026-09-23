@@ -370,17 +370,22 @@ fn build_payload(
     {
         payload["prompt_cache_key"] = Value::String(clamp_cache_key(session_id));
     }
-    if cache_retention == CacheRetention::Long
-        && compat_bool(model, "supportsLongCacheRetention", true)
-    {
+    let supports_long = compat_bool(model, "supportsLongCacheRetention", true);
+    let supports_explicit = compat_bool(model, "supportsExplicitPromptCacheMode", false);
+    if cache_retention == CacheRetention::Long && supports_long && !supports_explicit {
         payload["prompt_cache_retention"] = Value::String("24h".into());
     }
-    if cache_retention == CacheRetention::None
-        && compat_bool(model, "supportsExplicitPromptCacheMode", false)
-    {
-        payload["prompt_cache_options"] = json!({"mode": "explicit"});
+    if supports_explicit {
+        if cache_retention == CacheRetention::None {
+            payload["prompt_cache_options"] = json!({"mode": "explicit"});
+        } else if cache_retention == CacheRetention::Long && supports_long {
+            payload["prompt_cache_options"] = json!({"ttl": "30m"});
+        }
     }
-    if let Some(max_tokens) = options.max_tokens {
+    if let Some(max_tokens) = options
+        .max_tokens
+        .filter(|_| compat_bool(model, "supportsMaxOutputTokens", true))
+    {
         payload["max_output_tokens"] = Value::from(max_tokens.max(MIN_OUTPUT_TOKENS));
     }
     if let Some(temperature) = options.temperature {
@@ -406,6 +411,16 @@ fn build_payload(
         payload["tool_choice"] = tool_choice.clone();
     }
     apply_reasoning(model, options, &mut payload, true);
+    if let Some(params) = model.sampling_params.as_ref()
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.extend(params.clone());
+    }
+    if let Some(params) = options.sampling_params.as_ref()
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.extend(params.clone());
+    }
     Ok(payload)
 }
 
@@ -474,7 +489,7 @@ fn split_deferred_tools(context: &Context, enabled: bool) -> (Vec<Tool>, BTreeMa
                     }
                 }
             }
-            Message::User(_) => {}
+            Message::User(_) | Message::System(_) => {}
         }
     }
     let mut immediate = Vec::new();
@@ -679,6 +694,9 @@ mod tests {
             thinking_level_map: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 128_000,
             max_tokens: 8_192,
             headers: None,
@@ -735,7 +753,7 @@ mod tests {
             CacheRetention::Long,
         )
         .expect("default request payload conversion succeeds");
-        assert_eq!(payload.get("prompt_cache_options"), None);
+        assert_eq!(payload["prompt_cache_options"], json!({"ttl": "30m"}));
         // Retention none without the flag: no marker either.
         let payload = build_payload(
             &model(),
@@ -745,6 +763,32 @@ mod tests {
         )
         .expect("default request payload conversion succeeds");
         assert_eq!(payload.get("prompt_cache_options"), None);
+    }
+
+    #[test]
+    fn max_output_tokens_and_sampling_params_follow_compatibility() {
+        let context = Context::default();
+        let mut model = model();
+        model.compat = Some(json!({"supportsMaxOutputTokens": false}));
+        model.sampling_params = Some(serde_json::Map::from_iter([
+            ("temperature".to_owned(), Value::from(0.1)),
+            ("top_k".to_owned(), Value::from(8)),
+        ]));
+        let options = StreamOptions {
+            max_tokens: Some(32),
+            temperature: Some(0.8),
+            sampling_params: Some(serde_json::Map::from_iter([
+                ("top_k".to_owned(), Value::from(16)),
+                ("min_p".to_owned(), Value::from(0.2)),
+            ])),
+            ..StreamOptions::default()
+        };
+        let payload = build_payload(&model, &context, &options, CacheRetention::Short)
+            .expect("compatibility payload builds");
+        assert!(payload.get("max_output_tokens").is_none());
+        assert_eq!(payload["temperature"], 0.1);
+        assert_eq!(payload["top_k"], 16);
+        assert_eq!(payload["min_p"], 0.2);
     }
     #[test]
     fn reasoning_defaults_and_provider_overrides_are_exact() {

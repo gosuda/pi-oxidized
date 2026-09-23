@@ -608,6 +608,7 @@ fn convert_messages(
                 result.push(entry);
                 index = next.saturating_sub(1);
             }
+            Message::System(_) => {}
         }
         index += 1;
     }
@@ -1961,6 +1962,9 @@ mod tests {
                 cache_write: 1.25,
                 tiers: None,
             },
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 200_000,
             max_tokens: 8_192,
             headers: None,

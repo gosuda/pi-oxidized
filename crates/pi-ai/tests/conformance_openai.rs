@@ -170,6 +170,9 @@ async fn live_openai_completions_smoke() -> Result<(), String> {
         thinking_level_map: None,
         input: vec![pi_ai::types::ModelInput::Text],
         cost: pi_ai::types::ModelCost::default(),
+        input_limits: None,
+        prompt_cache: None,
+        sampling_params: None,
         context_window: 128_000,
         max_tokens: 64,
         headers: None,
@@ -488,6 +491,7 @@ fn stream_options_from_case(
     };
     Ok(StreamOptions {
         temperature: options.temperature,
+        sampling_params: None,
         max_tokens: options.max_tokens,
         signal: abort_after_start.then(CancellationToken::new),
         api_key: options.api_key.clone(),

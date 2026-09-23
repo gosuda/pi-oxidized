@@ -111,6 +111,8 @@ pub enum KnownProvider {
     Huggingface,
     /// Kimi Coding.
     KimiCoding,
+    /// Meta Model API.
+    Meta,
     /// `MiniMax`.
     Minimax,
     /// `MiniMax` China.
@@ -163,7 +165,7 @@ pub enum KnownProvider {
 
 impl KnownProvider {
     /// Every built-in provider in stable catalog order.
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 41] = [
         Self::AmazonBedrock,
         Self::AntLing,
         Self::Anthropic,
@@ -180,6 +182,7 @@ impl KnownProvider {
         Self::Groq,
         Self::Huggingface,
         Self::KimiCoding,
+        Self::Meta,
         Self::Minimax,
         Self::MinimaxCn,
         Self::Mistral,
@@ -226,6 +229,7 @@ impl KnownProvider {
             Self::Groq => "groq",
             Self::Huggingface => "huggingface",
             Self::KimiCoding => "kimi-coding",
+            Self::Meta => "meta",
             Self::Minimax => "minimax",
             Self::MinimaxCn => "minimax-cn",
             Self::Mistral => "mistral",
@@ -298,7 +302,7 @@ const COMPLETIONS_RESPONSES: &[KnownApi] =
     &[KnownApi::OpenAiCompletions, KnownApi::OpenAiResponses];
 
 /// Every built-in chat provider in catalog order with its allowed native APIs.
-pub const BUILTIN_PROVIDERS: [BuiltinProviderSpec; 40] = [
+pub const BUILTIN_PROVIDERS: [BuiltinProviderSpec; 41] = [
     BuiltinProviderSpec {
         id: KnownProvider::AmazonBedrock,
         apis: BEDROCK,
@@ -362,6 +366,10 @@ pub const BUILTIN_PROVIDERS: [BuiltinProviderSpec; 40] = [
     BuiltinProviderSpec {
         id: KnownProvider::KimiCoding,
         apis: ANTHROPIC,
+    },
+    BuiltinProviderSpec {
+        id: KnownProvider::Meta,
+        apis: RESPONSES,
     },
     BuiltinProviderSpec {
         id: KnownProvider::Minimax,
@@ -492,8 +500,19 @@ impl Provider for ProviderRegistry {
         &self,
         model: &Model,
         context: Context,
-        options: StreamOptions,
+        mut options: StreamOptions,
     ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
+        if matches!(model.provider.as_str(), "opencode" | "opencode-go")
+            && let Some(session_id) = options.session_id.as_deref()
+        {
+            let headers = options.headers.get_or_insert_default();
+            if !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("x-opencode-session"))
+            {
+                headers.insert("x-opencode-session".to_owned(), Some(session_id.to_owned()));
+            }
+        }
         match route_adapter(&self.adapters, model) {
             Ok(adapter) => adapter.stream(model, context, options),
             Err(message) => error_event_stream(model, message),
@@ -618,6 +637,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingProvider {
         calls: Mutex<Vec<(String, String)>>,
+        options: Mutex<Vec<StreamOptions>>,
     }
 
     impl Provider for RecordingProvider {
@@ -625,10 +645,13 @@ mod tests {
             &self,
             model: &Model,
             _context: Context,
-            _options: StreamOptions,
+            options: StreamOptions,
         ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
             if let Ok(mut calls) = self.calls.lock() {
                 calls.push((model.api.clone(), model.base_url.clone()));
+            }
+            if let Ok(mut recorded_options) = self.options.lock() {
+                recorded_options.push(options.clone());
             }
             futures::stream::empty().boxed()
         }
@@ -645,6 +668,9 @@ mod tests {
             thinking_level_map: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 32_000,
             max_tokens: 4_096,
             headers: None,
@@ -715,6 +741,7 @@ mod tests {
                 "groq",
                 "huggingface",
                 "kimi-coding",
+                "meta",
                 "minimax",
                 "minimax-cn",
                 "mistral",
@@ -741,7 +768,7 @@ mod tests {
                 "zai-coding-cn",
             ]
         );
-        assert_eq!(ids.into_iter().collect::<BTreeSet<_>>().len(), 40);
+        assert_eq!(ids.into_iter().collect::<BTreeSet<_>>().len(), 41);
         assert_eq!(BUILTIN_PROVIDERS.map(|spec| spec.id), KnownProvider::ALL);
         assert_eq!(
             BUILTIN_PROVIDERS.map(|spec| spec.apis),
@@ -762,6 +789,7 @@ mod tests {
                 COMPLETIONS,
                 COMPLETIONS,
                 ANTHROPIC,
+                RESPONSES,
                 ANTHROPIC,
                 ANTHROPIC,
                 MISTRAL,
@@ -853,6 +881,54 @@ mod tests {
                     .is_ok_and(|calls| calls.len() == expected_calls)
             );
         }
+    }
+
+    #[test]
+    fn opencode_stream_injects_session_header_without_overwriting_callers() {
+        let recorders = recorders();
+        let registry = registry_with(&recorders);
+        let test_model = model("opencode", "openai-responses", "https://example.test");
+
+        drop(registry.stream(
+            &test_model,
+            Context::default(),
+            StreamOptions {
+                session_id: Some("session-1".to_owned()),
+                ..StreamOptions::default()
+            },
+        ));
+        let mut caller_headers = BTreeMap::new();
+        caller_headers.insert(
+            "X-OpenCode-Session".to_owned(),
+            Some("caller-session".to_owned()),
+        );
+        drop(registry.stream(
+            &test_model,
+            Context::default(),
+            StreamOptions {
+                session_id: Some("session-2".to_owned()),
+                headers: Some(caller_headers),
+                ..StreamOptions::default()
+            },
+        ));
+
+        let options = recorders[1].options.lock().expect("options lock");
+        assert_eq!(
+            options[0]
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("x-opencode-session"))
+                .and_then(Option::as_deref),
+            Some("session-1")
+        );
+        assert_eq!(
+            options[1]
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("X-OpenCode-Session"))
+                .and_then(Option::as_deref),
+            Some("caller-session")
+        );
     }
 
     #[tokio::test]
