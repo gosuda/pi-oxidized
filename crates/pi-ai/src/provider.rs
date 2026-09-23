@@ -262,6 +262,9 @@ pub struct StreamOptions {
     /// Sampling temperature.
     pub temperature: Option<f64>,
 
+    /// Arbitrary sampling parameters merged over model defaults.
+    pub sampling_params: Option<Map<String, Value>>,
+
     /// Maximum tokens to generate.
     pub max_tokens: Option<u64>,
 
@@ -451,6 +454,9 @@ mod tests {
             thinking_level_map: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 32_000,
             max_tokens: 4_096,
             headers: None,
