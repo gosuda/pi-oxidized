@@ -4,9 +4,9 @@
 //! against the remaining context window and to size thinking budgets.
 
 use crate::estimate::estimate_context_tokens;
-use crate::provider::StreamOptions;
+use crate::provider::{StreamOptionKey, StreamOptions};
 use crate::types::{Context, Model, ThinkingLevel, ToolChoice};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Safety margin reserved between context usage and the output budget.
 pub const CONTEXT_SAFETY_TOKENS: u64 = 4_096;
@@ -41,15 +41,19 @@ pub const DEFAULT_CACHE_RETENTION: crate::types::CacheRetention =
 ///
 /// Mirrors TypeScript `ThinkingBudgets`. Missing fields fall back to the
 /// defaults in [`default_thinking_budgets`].
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ThinkingBudgets {
     /// Budget for [`ThinkingLevel::Minimal`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub minimal: Option<u64>,
     /// Budget for [`ThinkingLevel::Low`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub low: Option<u64>,
     /// Budget for [`ThinkingLevel::Medium`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub medium: Option<u64>,
     /// Budget for [`ThinkingLevel::High`] (and xhigh/max after clamp).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub high: Option<u64>,
 }
 
@@ -128,6 +132,33 @@ pub struct SimpleStreamOptions {
     pub tool_choice: Option<ToolChoice>,
 }
 
+impl From<SimpleStreamOptions> for StreamOptions {
+    fn from(options: SimpleStreamOptions) -> Self {
+        let SimpleStreamOptions {
+            mut base,
+            reasoning,
+            thinking_budgets,
+            tool_choice,
+        } = options;
+        if let Some(choice) = tool_choice {
+            base.insert_extra_if_absent_with(StreamOptionKey::TOOL_CHOICE, || {
+                serde_json::json!(choice)
+            });
+        }
+        if let Some(level) = reasoning {
+            base.insert_extra_if_absent_with(StreamOptionKey::REASONING, || {
+                serde_json::json!(level)
+            });
+        }
+        if let Some(budgets) = thinking_budgets {
+            base.insert_extra_if_absent_with(StreamOptionKey::THINKING_BUDGETS, || {
+                serde_json::json!(budgets)
+            });
+        }
+        base
+    }
+}
+
 /// Build transport stream options from simple options, clamping max tokens.
 ///
 /// Mirrors `buildBaseOptions`: uses `options.max_tokens ?? model.max_tokens`,
@@ -144,8 +175,19 @@ pub fn build_base_options(
     let empty = StreamOptions::default();
     let options = options.unwrap_or(&empty);
     let requested_max = options.max_tokens.unwrap_or(model.max_tokens);
+    let sampling_params = match (&model.sampling_params, &options.sampling_params) {
+        (Some(model_params), Some(request_params)) => {
+            let mut merged = model_params.clone();
+            merged.extend(request_params.clone());
+            Some(merged)
+        }
+        (Some(model_params), None) => Some(model_params.clone()),
+        (None, Some(request_params)) => Some(request_params.clone()),
+        (None, None) => None,
+    };
     StreamOptions {
         temperature: options.temperature,
+        sampling_params,
         max_tokens: Some(clamp_max_tokens_to_context(model, context, requested_max)),
         signal: options.signal.clone(),
         api_key: api_key.or_else(|| options.api_key.clone()),
@@ -273,6 +315,9 @@ mod tests {
             thinking_level_map: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window,
             max_tokens,
             headers: None,
@@ -380,9 +425,17 @@ mod tests {
 
     #[test]
     fn build_base_options_clamps_and_preserves_headers() {
-        let model = sample_model(10_000, 4_096);
+        let mut model = sample_model(10_000, 4_096);
+        model.sampling_params = Some(serde_json::Map::from_iter([(
+            "top_k".to_owned(),
+            serde_json::Value::from(8),
+        )]));
         let context = empty_context();
         let mut options = StreamOptions {
+            sampling_params: Some(serde_json::Map::from_iter([(
+                "top_k".to_owned(),
+                serde_json::Value::from(16),
+            )])),
             max_tokens: Some(50_000),
             cache_retention: None,
             max_retry_delay_ms: None,
@@ -395,6 +448,13 @@ mod tests {
         let built = build_base_options(&model, &context, Some(&options), Some("key".into()));
         assert_eq!(built.max_tokens, Some(10_000 - CONTEXT_SAFETY_TOKENS));
         assert_eq!(built.api_key.as_deref(), Some("key"));
+        assert_eq!(
+            built
+                .sampling_params
+                .as_ref()
+                .and_then(|params| params.get("top_k")),
+            Some(&serde_json::Value::from(16))
+        );
         assert_eq!(
             built
                 .headers
