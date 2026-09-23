@@ -21,6 +21,7 @@ use futures::future::BoxFuture;
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::api_registry::ImagesApiDispatch;
@@ -226,13 +227,18 @@ async fn run_with_retries(
     let mut retries_remaining = max_retries;
 
     loop {
-        let failure = match attempt_send(&url, &headers, &body, timeout, signal).await {
-            Ok(response) => match consume_response(model, options, response, signal, timeout).await
-            {
-                Ok(data) => return Ok(data),
-                Err(AttemptFailure::Aborted) => return Err(FinalFailure::Aborted),
-                Err(AttemptFailure::Http(failure)) => failure,
-            },
+        // One deadline spans header and body processing: each phase draws
+        // its remaining budget from this instant, so a single attempt can
+        // never run for twice the configured timeout.
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let failure = match attempt_send(&url, &headers, &body, deadline, signal).await {
+            Ok(response) => {
+                match consume_response(model, options, response, signal, deadline).await {
+                    Ok(data) => return Ok(data),
+                    Err(AttemptFailure::Aborted) => return Err(FinalFailure::Aborted),
+                    Err(AttemptFailure::Http(failure)) => failure,
+                }
+            }
             Err(AttemptFailure::Aborted) => return Err(FinalFailure::Aborted),
             Err(AttemptFailure::Http(failure)) => failure,
         };
@@ -273,12 +279,20 @@ async fn attempt_send(
     url: &str,
     headers: &HeaderMap,
     body: &[u8],
-    timeout: Option<Duration>,
+    deadline: Option<Instant>,
     signal: Option<&CancellationToken>,
 ) -> Result<reqwest::Response, AttemptFailure> {
     if signal.is_some_and(CancellationToken::is_cancelled) {
         return Err(AttemptFailure::Aborted);
     }
+    // Draw the send budget from the attempt deadline: an already-exhausted
+    // budget surfaces the SDK connection-timeout error without any I/O.
+    if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+        return Err(AttemptFailure::Http(HttpFailure::Connection {
+            timed_out: true,
+        }));
+    }
+    let timeout = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
 
     let request = IMAGE_HTTP_CLIENT
         .post(url)
@@ -335,8 +349,16 @@ async fn consume_response(
     options: &ImagesOptions,
     response: reqwest::Response,
     signal: Option<&CancellationToken>,
-    timeout: Option<Duration>,
+    deadline: Option<Instant>,
 ) -> Result<SuccessData, AttemptFailure> {
+    // The body phase draws its remaining budget from the same attempt
+    // deadline the send phase used: one timeout per attempt, not per phase.
+    if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+        return Err(AttemptFailure::Http(HttpFailure::Connection {
+            timed_out: true,
+        }));
+    }
+    let timeout = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
     let status = response.status();
     let response_headers = headers_to_record(response.headers());
     if !status.is_success() {
@@ -1312,5 +1334,27 @@ mod tests {
     fn image_only_models_omit_text_modality() {
         let model = model();
         assert!(!model.outputs_text());
+    }
+
+    #[tokio::test]
+    async fn exhausted_deadline_fails_send_without_io() {
+        let deadline = Instant::now() - Duration::from_secs(1);
+        let result = attempt_send(
+            "https://example.test/dead",
+            &HeaderMap::new(),
+            b"{}",
+            Some(deadline),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(AttemptFailure::Http(HttpFailure::Connection {
+                    timed_out: true
+                }))
+            ),
+            "an exhausted attempt deadline must surface the SDK timeout before any I/O"
+        );
     }
 }

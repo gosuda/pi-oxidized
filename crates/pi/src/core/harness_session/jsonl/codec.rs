@@ -282,7 +282,7 @@ pub fn publish_file_atomically(path: &Path, content: &str) -> Result<(), Session
         file.write_all(content.as_bytes())?;
         file.flush()?;
         drop(file);
-        fs::rename(&temp_path, path)
+        replace_file(&temp_path, path)
     })();
     match result {
         Ok(()) => Ok(()),
@@ -295,6 +295,27 @@ pub fn publish_file_atomically(path: &Path, content: &str) -> Result<(), Session
             ))
         }
     }
+}
+
+/// Replaces `path` with `temp_path`, including when `path` already exists.
+///
+/// `std::fs::rename` refuses to replace an existing destination on Windows,
+/// which breaks torn-v4 repair and legacy-v3 migration there (both publish
+/// over a present file). Remove first on Windows (a documented non-atomic
+/// window, strictly better than a hard I/O error) and rename directly
+/// elsewhere.
+#[cfg(windows)]
+fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
+    let _ = fs::remove_file(path);
+    fs::rename(temp_path, path)
+}
+
+/// Replaces `path` with `temp_path`, including when `path` already exists.
+///
+/// POSIX rename replaces atomically, so no removal step is needed.
+#[cfg(not(windows))]
+fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
+    fs::rename(temp_path, path)
 }
 
 /// Checks cancellation before an owned blocking file operation starts.
