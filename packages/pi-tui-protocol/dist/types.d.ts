@@ -196,13 +196,13 @@ export interface ProviderDeferredOptions {
 }
 /** Native callbacks requested for one provider operation. */
 export interface ProviderCallbackFlags {
-    beforePayload: boolean;
-    onResponse: boolean;
+    beforePayload?: boolean;
+    onResponse?: boolean;
 }
 /** HTTP response metadata passed to the native response callback. */
 export interface ProviderResponseWire {
     status: number;
-    headers: Record<string, string>;
+    headers?: Record<string, string>;
 }
 /** Correlated deferred fetch request (Rust → extension host). */
 export interface ProviderFetchDeferredRequest {
@@ -342,6 +342,67 @@ export type NotifyLevel = "info" | "warning" | "error";
 export interface NotifyRequest {
     message: string;
     type?: NotifyLevel;
+}
+/** One boundary-entry draft from a `turn_end` / `agent_before_settle` handler. */
+export type SessionBoundaryDraftWire = {
+    type: "custom";
+    customType: string;
+    data?: unknown;
+} | {
+    type: "custom_message";
+    customType: string;
+    content: unknown;
+    display: boolean;
+    details?: unknown;
+} | {
+    type: "context_edit";
+    targetId: string;
+    replacement: unknown;
+} | {
+    type: "compaction";
+    summary: string;
+    firstKeptEntryId: string | null;
+    details?: unknown;
+    usage?: {
+        input: number;
+        output: number;
+        cacheRead: number;
+        cacheWrite: number;
+        cacheWrite1h?: number;
+        reasoning?: number;
+        totalTokens: number;
+        cost: {
+            input: number;
+            output: number;
+            cacheRead: number;
+            cacheWrite: number;
+            total: number;
+        };
+    };
+};
+/** Result from a boundary lifecycle handler. */
+export interface BoundaryResultWire {
+    entries?: SessionBoundaryDraftWire[];
+    continue?: boolean;
+}
+/** Open method string: correlated `session.previewBoundary` request (host → Rust). */
+export declare const SESSION_PREVIEW_BOUNDARY_METHOD = "session.previewBoundary";
+/**
+ * `session.previewBoundary` request payload (host → Rust, correlated).
+ *
+ * The host sends the boundary's current draft entries; Rust validates them
+ * against the projected session and returns the preview. `boundary` is
+ * validated at the Rust decoder: only `turn_end` and `agent_before_settle`
+ * are accepted.
+ */
+export interface SessionPreviewBoundaryRequest {
+    boundary: string;
+    entries: SessionBoundaryDraftWire[];
+}
+/** `session.previewBoundary` response payload (Rust → host). */
+export interface SessionPreviewBoundaryResponse {
+    /** Validated projection preview context. */
+    context: unknown;
 }
 /** Measure/render request shared fields. */
 export interface SlotRenderRequest {

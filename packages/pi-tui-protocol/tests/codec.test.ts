@@ -13,6 +13,7 @@ import {
 } from "../src/codec.ts";
 import {
 	COMPATIBILITY_VERSION,
+	type BoundaryResultWire,
 	isMethod,
 	localHello,
 	MAX_FRAME_BYTES,
@@ -71,6 +72,36 @@ describe("encode/decode", () => {
 		expect(decoded).toEqual(frame);
 	});
 
+
+	test("boundary result with drafts roundtrips through frames", () => {
+		const boundary: BoundaryResultWire = {
+			entries: [
+				{ type: "custom", customType: "note", data: { ok: true } },
+				{
+					type: "custom_message",
+					customType: "notice",
+					content: "hello",
+					display: true,
+					details: { source: "test" },
+				},
+				{ type: "context_edit", targetId: "entry-1", replacement: null },
+				{
+					type: "compaction",
+					summary: "summary",
+					firstKeptEntryId: null,
+					details: {},
+				},
+			],
+			continue: true,
+		};
+		const frame = {
+			id: 0,
+			kind: "event" as const,
+			method: "turn_end",
+			payload: boundary,
+		};
+		expect(JSON.parse(new TextDecoder().decode(encodeFrame(frame)))).toEqual(frame);
+	});
 	test("id rules", () => {
 		expect(() => encodeFrame({ id: 0, kind: "req", method: "hello", payload: {} })).toThrow(
 			ProtocolError,

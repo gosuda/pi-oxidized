@@ -1,9 +1,13 @@
 {
 	"generator": "scripts/verification/gen-witness.ts",
-	"totalLines": 155,
+	"totalLines": 159,
 	"methodKindPairs": [
 		[
 			"after_provider_response",
+			"req"
+		],
+		[
+			"agent_before_settle",
 			"req"
 		],
 		[
@@ -31,6 +35,10 @@
 			"req"
 		],
 		[
+			"cache_warming_decision",
+			"req"
+		],
+		[
 			"command.execute",
 			"req"
 		],
@@ -48,6 +56,10 @@
 		],
 		[
 			"context",
+			"req"
+		],
+		[
+			"context_with_system",
 			"req"
 		],
 		[
@@ -367,6 +379,10 @@
 			"req"
 		],
 		[
+			"session_compact_failed",
+			"req"
+		],
+		[
 			"session_info_changed",
 			"req"
 		],
@@ -524,16 +540,20 @@
 		"session_before_fork",
 		"session_before_compact",
 		"session_compact",
+		"session_compact_failed",
 		"session_shutdown",
 		"session_before_tree",
 		"session_tree",
 		"context",
+		"context_with_system",
+		"cache_warming_decision",
 		"before_provider_request",
 		"before_provider_headers",
 		"after_provider_response",
 		"before_agent_start",
 		"agent_start",
 		"agent_end",
+		"agent_before_settle",
 		"agent_settled",
 		"ui_prompt_start",
 		"ui_prompt_end",
@@ -590,5 +610,5 @@
 			"kind": "release"
 		}
 	],
-	"fixtureSha256": "bf28968d05201dbb270f2e2d507d7a35764dfef3fa6fc5e01f30ca5910c7f311"
+	"fixtureSha256": "0af0f09b101458b293c7304f6f3241f18c3abcaec831bd6f543eed10557ca9c7"
 }
