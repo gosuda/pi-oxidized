@@ -179,7 +179,7 @@ fn assistant_of(message: &AgentMessage) -> Option<&AssistantMessage> {
     match message {
         AgentMessage::Llm(boxed) => match boxed.as_ref() {
             Message::Assistant(assistant) => Some(assistant),
-            Message::User(_) | Message::ToolResult(_) => None,
+            Message::User(_) | Message::ToolResult(_) | Message::System(_) => None,
         },
         AgentMessage::Custom(_) => None,
     }

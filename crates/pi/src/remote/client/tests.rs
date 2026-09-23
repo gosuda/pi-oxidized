@@ -8,7 +8,10 @@
 //! `$chord.service`, and repeat in the opposite direction with the upstream
 //! server. The in-memory cases below exercise the same framed byte seam.
 
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use pi_agent::context::Context;
 use pi_agent::service::binding::{BindingOptions, RemoteServiceBinding};
@@ -799,5 +802,367 @@ async fn malformed_wire_update_fails_connection() -> TestResult {
     })
     .await??;
     assert!(matches!(change.error, Some(ClientError::Protocol(_))));
+    Ok(())
+}
+
+// A frame decoded from a failed connection races the disconnect that clears
+// the route: the failed connection is still the registered connection until
+// a reconnect replaces it, so currency must be re-checked against the
+// connection lifecycle under the write lock.
+#[tokio::test]
+async fn stale_connection_attachment_never_resurrects_route() -> TestResult {
+    let (listener, endpoint) = InMemoryListener::new();
+    let client = make_client(endpoint, SERVER_ID)?;
+    let (changes, mut change_rx) = mpsc::unbounded_channel();
+    let _change_listener = client.on_attachment_change(Arc::new(move |attachment| {
+        let _ = changes.send(attachment.clone());
+    }))?;
+    let (connected, server) = tokio::join!(client.connect(), accept_hello(&listener, SERVER_ID));
+    connected?;
+    let server = server?;
+    let attachment = SessionTarget {
+        server_id: server_id(SERVER_ID)?,
+        session_id: "session-1".to_owned(),
+        attachment_id: "attachment-1".to_owned(),
+    };
+    server
+        .send(ServerMessage::Attachment {
+            attachment: Some(attachment.clone()),
+        })
+        .await?;
+    assert_eq!(change_rx.recv().await, Some(Some(attachment.clone())));
+    assert_eq!(client.attachment(), Some(attachment.clone()));
+
+    client.disconnect("stale attachment test");
+    assert_eq!(change_rx.recv().await, Some(None));
+    assert!(client.attachment().is_none());
+
+    let stale = SessionTarget {
+        server_id: server_id(SERVER_ID)?,
+        session_id: "session-1".to_owned(),
+        attachment_id: "attachment-2".to_owned(),
+    };
+    client.core.on_message(
+        1,
+        ServerMessage::Attachment {
+            attachment: Some(stale),
+        },
+    );
+    assert!(client.attachment().is_none());
+    assert!(
+        change_rx.try_recv().is_err(),
+        "a superseded connection must not notify"
+    );
+
+    let second_accept = accept_hello(&listener, SERVER_ID);
+    let (connected, server) = tokio::join!(client.reconnect(), second_accept);
+    connected?;
+    let server = server?;
+    assert!(client.attachment().is_none());
+    server
+        .send(ServerMessage::Attachment {
+            attachment: Some(attachment.clone()),
+        })
+        .await?;
+    assert_eq!(change_rx.recv().await, Some(Some(attachment.clone())));
+    assert_eq!(client.attachment(), Some(attachment));
+    Ok(())
+}
+
+// A live update published while `start` is still delivering the queued
+// backlog must wait behind it: listeners observe wire order, and a
+// listener that parks inside the first delivery holds the drain open
+// while the rest of the backlog and the later update queue behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[expect(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "scripted drain-ordering scenario; JsInteger magnitudes are range-checked before conversion"
+)]
+async fn start_drain_orders_queued_updates_before_live_publication() -> TestResult {
+    let (client, mut server) = connected_pair().await?;
+    let (sequences, mut sequence_rx) = mpsc::unbounded_channel::<i64>();
+    let (parked_tx, mut parked_rx) = mpsc::unbounded_channel::<()>();
+    let release = Arc::new(AtomicBool::new(false));
+    let listener: ServiceUpdateListener = {
+        let release = Arc::clone(&release);
+        Arc::new(move |update| {
+            let sequence = match update {
+                ServiceProviderUpdate::State { sequence, .. } => {
+                    // JsInteger validates nonnegative integral binary64, so
+                    // the only failure is an absurd magnitude; -1 marks it.
+                    let value = sequence.as_f64();
+                    if value >= 0.0 && value < i64::MAX as f64 {
+                        value as i64
+                    } else {
+                        -1
+                    }
+                }
+                _ => -1,
+            };
+            let _ = sequences.send(sequence);
+            if sequence == 1 {
+                let _ = parked_tx.send(());
+                while !release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }
+        })
+    };
+    let mut encoder = ServiceStateEncoder::new();
+    let snapshot = ServiceSubscriptionSnapshot {
+        service_id: JsString::from_utf8("demo"),
+        mode: ServiceMode::Singleton,
+        instances: vec![ServiceInstanceSnapshot {
+            instance: None,
+            members: vec![ServiceMemberSnapshot::State {
+                name: JsString::from_utf8("state"),
+                sequence: JsInteger::zero(),
+                ops: vec![DeltaOp::replace(value("0")?)],
+            }],
+        }],
+    };
+    let wire_snapshot = encoder.encode_snapshot(&snapshot)?.into_json();
+    let mut encode = |sequence: f64| -> TestResult<JsonValue> {
+        Ok(encoder
+            .encode_update(&ServiceProviderUpdate::State {
+                instance: None,
+                member: JsString::from_utf8("state"),
+                sequence: JsInteger::new(sequence)?,
+                ops: vec![DeltaOp::replace(value(format!("{sequence}").as_str())?)],
+            })?
+            .into_json())
+    };
+    let target = server_target()?;
+    let subscribe_task = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .subscribe_service(
+                    target,
+                    JsString::from_utf8("demo"),
+                    ServiceMode::Singleton,
+                    listener,
+                    None,
+                )
+                .await
+        }
+    });
+    let request = server.next().await?;
+    let (request_id, subscription_id) = match request {
+        ClientMessage::Request { id, call, .. } => {
+            let call = pi_agent::service::wire::parse_service_call(&call)?;
+            let subscription_id = match call.args.first() {
+                Some(JsonValue::String(value)) => value.try_to_utf8()?,
+                Some(_) => return Err(test_error("subscription id must be a string")),
+                None => return Err(test_error("subscription id argument is missing")),
+            };
+            (id, subscription_id)
+        }
+        other => {
+            return Err(test_error(format!(
+                "expected subscribe request, got {other:?}"
+            )));
+        }
+    };
+    server
+        .send(ServerMessage::Response {
+            id: request_id,
+            result: Some(wire_snapshot),
+        })
+        .await?;
+    let subscription = Arc::new(subscribe_task.await??);
+    server
+        .send(ServerMessage::ServiceUpdate {
+            subscription_id: subscription_id.clone(),
+            update: encode(1.0)?,
+        })
+        .await?;
+    server
+        .send(ServerMessage::ServiceUpdate {
+            subscription_id: subscription_id.clone(),
+            update: encode(2.0)?,
+        })
+        .await?;
+    // In-order reader proof: the flush response resolves only after both
+    // queued updates have been processed, so `start` observes them.
+    flush_reader(&client, &mut server, "flush-backlog").await?;
+
+    let start_task = tokio::spawn({
+        let subscription = Arc::clone(&subscription);
+        async move { subscription.start() }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), parked_rx.recv())
+        .await
+        .map_err(|_| test_error("drain never parked in the first delivery"))?
+        .ok_or_else(|| test_error("parked channel closed"))?;
+    server
+        .send(ServerMessage::ServiceUpdate {
+            subscription_id: subscription_id.clone(),
+            update: encode(3.0)?,
+        })
+        .await?;
+    flush_reader(&client, &mut server, "flush-live").await?;
+    assert_eq!(sequence_rx.try_recv().ok(), Some(1));
+    assert!(
+        sequence_rx.try_recv().is_err(),
+        "a live update overtook the queued backlog: only [1] may be delivered so far"
+    );
+
+    release.store(true, Ordering::Release);
+    let second = tokio::time::timeout(std::time::Duration::from_secs(1), sequence_rx.recv())
+        .await
+        .map_err(|_| test_error("backlog delivery stalled"))?
+        .ok_or_else(|| test_error("backlog delivery stalled"))?;
+    let third = tokio::time::timeout(std::time::Duration::from_secs(1), sequence_rx.recv())
+        .await
+        .map_err(|_| test_error("queued live update was lost"))?
+        .ok_or_else(|| test_error("queued live update was lost"))?;
+    assert_eq!(
+        (second, third),
+        (2, 3),
+        "delivery order must match wire order"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), start_task)
+        .await
+        .map_err(|_| test_error("start never completed"))??;
+    subscription.start();
+    assert!(
+        sequence_rx.try_recv().is_err(),
+        "restart must stay idempotent"
+    );
+    Ok(())
+}
+
+/// Sends one request and resolves its response, proving the reader has
+/// processed every frame sent before it.
+async fn flush_reader(
+    client: &Client,
+    server: &mut ScriptedServer,
+    member: &str,
+) -> TestResult<()> {
+    let request_task = tokio::spawn({
+        let client = client.clone();
+        let target = server_target()?;
+        let call = service_call("demo", member);
+        async move { client.request(target, call, None).await }
+    });
+    let request = server.next().await?;
+    let id = match request {
+        ClientMessage::Request { id, .. } => id,
+        other => return Err(test_error(format!("expected flush request, got {other:?}"))),
+    };
+    server
+        .send(ServerMessage::Response {
+            id,
+            result: Some(JsonValue::Null),
+        })
+        .await?;
+    let _response = tokio::time::timeout(std::time::Duration::from_secs(1), request_task)
+        .await
+        .map_err(|_| test_error("flush response never arrived"))?
+        .map_err(|error| test_error(error.to_string()))?;
+    Ok(())
+}
+
+// A listener may re-enter client APIs from inside its own delivery: the
+// disconnect it triggers must complete and publish its own None transition
+// without deadlocking or losing the notification.
+#[tokio::test]
+async fn attachment_listener_may_reenter_client_during_delivery() -> TestResult {
+    let (listener, endpoint) = InMemoryListener::new();
+    let client = Arc::new(make_client(endpoint, SERVER_ID)?);
+    let (changes, mut change_rx) = mpsc::unbounded_channel();
+    let disconnecting = Arc::clone(&client);
+    let _change_listener = client.on_attachment_change(Arc::new(move |attachment| {
+        let _ = changes.send(attachment.clone());
+        if attachment.is_some() {
+            disconnecting.disconnect("reentrant disconnect");
+        }
+    }))?;
+    let (connected, server) = tokio::join!(client.connect(), accept_hello(&listener, SERVER_ID));
+    connected?;
+    let server = server?;
+    let attachment = SessionTarget {
+        server_id: server_id(SERVER_ID)?,
+        session_id: "session-1".to_owned(),
+        attachment_id: "attachment-1".to_owned(),
+    };
+    server
+        .send(ServerMessage::Attachment {
+            attachment: Some(attachment.clone()),
+        })
+        .await?;
+    assert_eq!(
+        change_rx.recv().await,
+        Some(Some(attachment)),
+        "delivery must reach the listener"
+    );
+    assert_eq!(change_rx.recv().await, Some(None));
+    assert_eq!(client.connection_state(), ConnectionState::Disconnected);
+    assert!(client.attachment().is_none());
+    Ok(())
+}
+
+// The stale-attachment window is SMP-only: a racer installs stale
+// attachments for the failed connection id from a plain thread while the
+// main thread reconnects and installs the fresh one. Post-fix the id and
+// Connected gates under one acquisition reject every racer win; the final
+// route stays the fresh attachment on every iteration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[expect(
+    clippy::expect_used,
+    reason = "thread-racer test uses contextual failure messages"
+)]
+async fn stale_attachment_racer_cannot_wins_reconnect_route() -> TestResult {
+    let (listener, endpoint) = InMemoryListener::new();
+    let client = Arc::new(make_client(endpoint, SERVER_ID)?);
+    let (connected, server) = tokio::join!(client.connect(), accept_hello(&listener, SERVER_ID));
+    connected?;
+    let server = server?;
+    client.disconnect("racer setup");
+    server.transport.close();
+
+    let fresh = SessionTarget {
+        server_id: server_id(SERVER_ID)?,
+        session_id: "session-2".to_owned(),
+        attachment_id: "attachment-2".to_owned(),
+    };
+    let stale = SessionTarget {
+        server_id: server_id(SERVER_ID)?,
+        session_id: "session-1".to_owned(),
+        attachment_id: "attachment-1".to_owned(),
+    };
+    let (sync_tx, sync_rx) = tokio::sync::oneshot::channel::<()>();
+    let racer_client = Arc::clone(&client);
+    let racer = std::thread::spawn(move || {
+        sync_rx.blocking_recv().expect("sync channel dropped");
+        for _ in 0..4096 {
+            racer_client.core.on_message(
+                1,
+                ServerMessage::Attachment {
+                    attachment: Some(stale.clone()),
+                },
+            );
+            std::thread::yield_now();
+        }
+    });
+    sync_tx.send(()).expect("sync channel closed");
+    let second_accept = accept_hello(&listener, SERVER_ID);
+    let (connected, server) = tokio::join!(client.reconnect(), second_accept);
+    connected?;
+    let server = server?;
+    server
+        .send(ServerMessage::Attachment {
+            attachment: Some(fresh.clone()),
+        })
+        .await?;
+    racer.join().expect("racer panicked");
+    assert_eq!(
+        client.attachment().as_ref(),
+        Some(&fresh),
+        "a superseded connection won the route"
+    );
     Ok(())
 }

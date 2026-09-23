@@ -19,7 +19,7 @@ use pi_agent::service::provider::{
 use pi_agent::service::replicated::MutableReplicatedState;
 use pi_agent::service::value::{JsInteger, JsString, JsonValue};
 use pi_agent::service::wire::ServiceMode;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 use crate::remote::product::providers::attachment::ProviderAttachment;
 use crate::remote::product::services::ProductJsonConvert;
@@ -92,11 +92,38 @@ pub struct PreparedSessionPlugins {
     pub presentation_plugins: JsonValue,
 }
 
+/// Lifecycle state guarding attachment admission against disposal.
+struct DisposeCompletion {
+    result: Mutex<Option<Result<(), Arc<HostError>>>>,
+    done: Notify,
+}
+
+impl DisposeCompletion {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            result: Mutex::new(None),
+            done: Notify::new(),
+        })
+    }
+
+    fn finish(&self, result: Result<(), HostError>) {
+        let shared = result.map_err(Arc::new);
+        *lock(&self.result) = Some(shared);
+        self.done.notify_waiters();
+    }
+}
+
+/// Lifecycle state guarding attachment admission against disposal.
+enum AttachmentState {
+    Open(Vec<Arc<ProviderAttachment>>),
+    Disposing(Arc<DisposeCompletion>),
+    Disposed(Arc<DisposeCompletion>),
+}
 /// The server-scoped service composition used by `ExperimentalServerHost`.
 pub struct ExperimentalServerServices {
     callbacks: Arc<ServerServiceCallbacks>,
     directory: Arc<MutableReplicatedState>,
-    attachments: Arc<Mutex<Vec<Arc<ProviderAttachment>>>>,
+    attachments: Arc<Mutex<AttachmentState>>,
     mutation_tail: MutationTail,
     revision: Arc<Mutex<JsInteger>>,
 }
@@ -126,7 +153,7 @@ impl ExperimentalServerServices {
         Arc::new(Self {
             callbacks: Arc::new(callbacks),
             directory: MutableReplicatedState::new(initial_state),
-            attachments: Arc::new(Mutex::new(Vec::new())),
+            attachments: Arc::new(Mutex::new(AttachmentState::Open(Vec::new()))),
             mutation_tail: MutationTail::new(),
             revision: Arc::new(Mutex::new(JsInteger::one())),
         })
@@ -159,26 +186,48 @@ impl ExperimentalServerServices {
     ///
     /// Returns [`HostError`] if one or more attachments fail to release.
     pub async fn dispose(&self) -> Result<(), HostError> {
-        let attachments = {
+        let (attachments, completion) = {
             let mut guard = lock(&self.attachments);
-            std::mem::take(&mut *guard)
+            match &mut *guard {
+                AttachmentState::Open(attachments) => {
+                    let attachments = std::mem::take(attachments);
+                    let completion = DisposeCompletion::new();
+                    *guard = AttachmentState::Disposing(Arc::clone(&completion));
+                    (Some(attachments), completion)
+                }
+                AttachmentState::Disposing(completion) | AttachmentState::Disposed(completion) => {
+                    (None, Arc::clone(completion))
+                }
+            }
+        };
+        let Some(attachments) = attachments else {
+            return wait_dispose(completion).await;
         };
 
-        let cx = Context::background();
-        let mut errors = Vec::new();
-        for attachment in attachments {
-            if let Err(error) = attachment.release(cx.clone()).await {
-                errors.push(error);
+        let mutation_tail = self.mutation_tail.clone();
+        let state = Arc::clone(&self.attachments);
+        let completion_for_task = Arc::clone(&completion);
+        tokio::spawn(async move {
+            let cx = Context::background();
+            let mut errors = Vec::new();
+            for attachment in attachments {
+                if let Err(error) = attachment.release(cx.clone()).await {
+                    errors.push(error);
+                }
             }
-        }
 
-        self.mutation_tail.drain().await;
+            mutation_tail.drain().await;
 
-        match errors.len() {
-            0 => Ok(()),
-            1 => Err(duplicate_host_error(&errors[0])),
-            _ => Err(HostError::Other(Box::new(AggregateReleaseError(errors)))),
-        }
+            let result = match errors.len() {
+                0 => Ok(()),
+                1 => Err(duplicate_host_error(&errors[0])),
+                _ => Err(HostError::Other(Box::new(AggregateReleaseError(errors)))),
+            };
+            completion_for_task.finish(result);
+            *lock(&state) = AttachmentState::Disposed(completion_for_task);
+        });
+
+        wait_dispose(completion).await
     }
 }
 
@@ -460,16 +509,29 @@ impl RoutedServerServiceHost for ExperimentalServerServices {
                     move || {
                         if let Some(arc) = weak.upgrade() {
                             let mut guard = lock(&attachments);
-                            guard.retain(|a| !Arc::ptr_eq(a, &arc));
+                            if let AttachmentState::Open(items) = &mut *guard {
+                                items.retain(|a| !Arc::ptr_eq(a, &arc));
+                            }
                         }
                     }
                 };
                 ProviderAttachment::new_unwrapped(provider, on_release)
             });
-
-            {
+            let late_attachment = {
                 let mut guard = lock(&attachments);
-                guard.push(Arc::clone(&attachment));
+                match &mut *guard {
+                    AttachmentState::Open(items) => {
+                        items.push(Arc::clone(&attachment));
+                        false
+                    }
+                    AttachmentState::Disposing(_) | AttachmentState::Disposed(_) => true,
+                }
+            };
+            if late_attachment {
+                attachment.release(Context::background()).await?;
+                return Err(HostError::Service(ServiceError::disposed(
+                    "Server service host is disposed",
+                )));
             }
 
             let attachment: Arc<dyn RoutedServerServiceAttachment> = attachment;
@@ -627,6 +689,15 @@ impl fmt::Display for AggregateReleaseError {
 
 impl std::error::Error for AggregateReleaseError {}
 
+async fn wait_dispose(completion: Arc<DisposeCompletion>) -> Result<(), HostError> {
+    loop {
+        let notified = completion.done.notified();
+        if let Some(result) = lock(&completion.result).clone() {
+            return result.map_err(|error| duplicate_host_error(error.as_ref()));
+        }
+        notified.await;
+    }
+}
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

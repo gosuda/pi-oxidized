@@ -38,7 +38,7 @@ pub trait PluginPackageBuilder: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`HostError`] if the host build fails or produces no artifacts.
+    /// Returns [`HostError`] if the host build fails.
     fn build(&self, package_path: &str) -> BoxFuture<'_, Result<Vec<JsonValue>, HostError>>;
 }
 
@@ -83,11 +83,6 @@ impl PluginPackageBuilder for RemotePluginPackageBuilder {
             .join(FACET_BUNDLE_MANIFEST_FILE)
     }
 
-    /// Builds the package through the configured host request.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HostError`] if the host build fails or produces no artifacts.
     fn build(&self, package_path: &str) -> BoxFuture<'_, Result<Vec<JsonValue>, HostError>> {
         let request = FacetBundleBuildRequest {
             package_path: package_path.to_owned(),

@@ -143,8 +143,9 @@ impl RadiusRelayAuthResolver {
     /// Returns [`RadiusRelayAuthError::Offline`] when the user is in offline mode
     /// and credentials are required; [`RadiusRelayAuthError::TokenFile`] when an
     /// explicit token file cannot be read; [`RadiusRelayAuthError::EmptyToken`]
-    /// when the resolved token is empty; [`RadiusRelayAuthError::Required`] when
-    /// no stored credential is available and credentials are required;
+    /// when an explicit token or token file contains only whitespace;
+    /// [`RadiusRelayAuthError::Required`] when no stored credential is available
+    /// and credentials are required;
     /// [`RadiusRelayAuthError::Cancelled`] when the resolution signal is fired;
     /// or [`RadiusRelayAuthError::Runtime`] when the native auth runtime fails.
     pub async fn resolve(

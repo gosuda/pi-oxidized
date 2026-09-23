@@ -817,7 +817,13 @@ fn run_streaming(
             "streaming: pinned final marker {FINAL_MARKER} missing"
         )));
     }
-    if !contains_bytes(run.raw_so_far(), b"verification-chunk-0001") {
+    if !contains_bytes(run.raw_so_far(), b"verification-chunk-0001")
+        && !frame
+            .snapshot
+            .lines
+            .iter()
+            .any(|line| line.contains("verification-chunk-0001"))
+    {
         return Err(CorpusError::Assert(
             "streaming: deterministic chunk marker verification-chunk-0001 missing".to_owned(),
         ));

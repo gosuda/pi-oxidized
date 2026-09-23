@@ -699,16 +699,7 @@ fn thinking_level_description(level: ModelThinkingLevel) -> &'static str {
 }
 
 fn parse_thinking_level(value: &str) -> Option<ModelThinkingLevel> {
-    match value {
-        "off" => Some(ModelThinkingLevel::Off),
-        "minimal" => Some(ModelThinkingLevel::Minimal),
-        "low" => Some(ModelThinkingLevel::Low),
-        "medium" => Some(ModelThinkingLevel::Medium),
-        "high" => Some(ModelThinkingLevel::High),
-        "xhigh" => Some(ModelThinkingLevel::Xhigh),
-        "max" => Some(ModelThinkingLevel::Max),
-        _ => None,
-    }
+    value.parse().ok()
 }
 
 /// Footer hint naming the configurable save chord (reference selector footer:

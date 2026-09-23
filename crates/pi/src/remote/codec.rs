@@ -837,7 +837,7 @@ fn decode_server_payload(
     Ok(message)
 }
 
-/// Returns whether a client-offered version is the supported v8 version.
+/// Returns whether a client-offered version is the supported native version.
 #[must_use]
 pub fn is_supported_protocol_version(version: u64) -> bool {
     version == PROTOCOL_VERSION
@@ -1136,7 +1136,7 @@ mod tests {
         )?;
         assert!(matches!(
             decode_client_message(&hello, None)?,
-            ClientMessage::Hello { version: 8 }
+            ClientMessage::Hello { version: 1 }
         ));
 
         let request = request()?;
@@ -1287,22 +1287,22 @@ mod tests {
         ]);
         let mut decoder = ClientMessageDecoder::new(None)?;
         assert!(decoder.push(&invalid).is_err());
-        let hello = encode_client_message(&ClientMessage::Hello { version: 8 }, None)?;
+        let hello = encode_client_message(&ClientMessage::Hello { version: 1 }, None)?;
         assert!(decoder.push(&hello).is_err());
         Ok(())
     }
 
     #[test]
-    fn server_hello_requires_v8_and_canonical_server_id() -> TestResult {
+    fn server_hello_requires_native_version_and_canonical_server_id() -> TestResult {
         let wrong_version = ServerMessage::Hello {
-            version: 7,
+            version: 8,
             server_id: server_id()?,
         };
         assert!(matches!(
             encode_server_message(&wrong_version, None),
             Err(CodecError::VersionMismatch {
-                expected: 8,
-                got: 7
+                expected: PROTOCOL_VERSION,
+                got: 8
             })
         ));
         Ok(())

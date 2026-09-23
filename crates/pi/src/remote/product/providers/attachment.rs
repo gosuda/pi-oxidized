@@ -36,11 +36,43 @@ pub struct ProviderAttachment {
     release_state: Arc<Mutex<ReleaseState>>,
 }
 
-#[derive(Clone)]
 enum ReleaseState {
-    Idle,
-    Releasing(Arc<Notify>),
+    Idle {
+        in_flight: usize,
+        idle: Arc<Notify>,
+    },
+    Releasing {
+        notify: Arc<Notify>,
+        in_flight: usize,
+        idle: Arc<Notify>,
+    },
     Done(Result<(), Arc<HostError>>),
+}
+
+/// Keeps a service invocation admitted until its returned future is dropped.
+struct InvocationGuard {
+    state: Arc<Mutex<ReleaseState>>,
+}
+
+impl Drop for InvocationGuard {
+    fn drop(&mut self) {
+        let idle = {
+            let mut state = lock(&self.state);
+            let (in_flight, notify) = match &mut *state {
+                ReleaseState::Idle { in_flight, idle }
+                | ReleaseState::Releasing {
+                    in_flight, idle, ..
+                } => (in_flight, idle),
+                ReleaseState::Done(_) => return,
+            };
+            debug_assert!(*in_flight > 0);
+            *in_flight = in_flight.saturating_sub(1);
+            (*in_flight == 0).then(|| Arc::clone(notify))
+        };
+        if let Some(idle) = idle {
+            idle.notify_waiters();
+        }
+    }
 }
 
 impl ProviderAttachment {
@@ -66,63 +98,96 @@ impl ProviderAttachment {
             endpoint: RemoteServiceEndpoint::new(provider.clone()),
             provider,
             on_release: Arc::new(Mutex::new(Some(Box::new(on_release)))),
-            release_state: Arc::new(Mutex::new(ReleaseState::Idle)),
+            release_state: Arc::new(Mutex::new(ReleaseState::Idle {
+                in_flight: 0,
+                idle: Arc::new(Notify::new()),
+            })),
         }
     }
 
     async fn release_impl(&self, cx: Context) -> Result<(), HostError> {
-        let notify = {
-            let mut guard = lock(&self.release_state);
-            match std::mem::replace(&mut *guard, ReleaseState::Idle) {
+        let mut start_release = None;
+        let notified = {
+            let mut state = lock(&self.release_state);
+            match &mut *state {
                 ReleaseState::Done(result) => {
-                    *guard = ReleaseState::Done(result.clone());
-                    return result.map_err(|error| duplicate_host_error(&error));
+                    return result
+                        .clone()
+                        .map_err(|error| duplicate_host_error(error.as_ref()));
                 }
-                ReleaseState::Releasing(notify) => {
-                    *guard = ReleaseState::Releasing(notify.clone());
-                    notify
-                }
-                ReleaseState::Idle => {
+                ReleaseState::Releasing { notify, .. } => notify.clone().notified_owned(),
+                ReleaseState::Idle { in_flight, idle } => {
                     let notify = Arc::new(Notify::new());
-                    *guard = ReleaseState::Releasing(notify.clone());
-
+                    let notified = notify.clone().notified_owned();
                     let endpoint = Arc::clone(&self.endpoint);
                     let provider = Arc::clone(&self.provider);
                     let on_release = {
-                        let mut guard = lock(&self.on_release);
-                        guard.take()
+                        let mut callback = lock(&self.on_release);
+                        callback.take()
                     };
-                    let state = Arc::clone(&self.release_state);
-                    let notify_done = Arc::clone(&notify);
-
-                    tokio::spawn(async move {
-                        let mut guard = ReleaseGuard::new(state, notify_done);
-
-                        let mut first_error: Option<HostError> = None;
-                        if let Err(error) = endpoint.dispose(cx).await {
-                            first_error.get_or_insert(HostError::from(error));
-                        }
-                        provider.dispose();
-                        if let Some(on_release) = on_release {
-                            on_release();
-                        }
-
-                        let result = match first_error {
-                            Some(error) => Err(Arc::new(error)),
-                            None => Ok(()),
-                        };
-                        guard.complete(result);
-                    });
-
-                    notify
+                    let release_state = Arc::clone(&self.release_state);
+                    let in_flight_notify = Arc::clone(idle);
+                    let active_calls = *in_flight;
+                    *state = ReleaseState::Releasing {
+                        notify: Arc::clone(&notify),
+                        in_flight: active_calls,
+                        idle: in_flight_notify.clone(),
+                    };
+                    start_release = Some((
+                        endpoint,
+                        provider,
+                        on_release,
+                        release_state,
+                        notify,
+                        in_flight_notify,
+                    ));
+                    notified
                 }
             }
         };
 
-        notify.notified().await;
+        if let Some((endpoint, provider, on_release, release_state, notify, in_flight_notify)) =
+            start_release
+        {
+            tokio::spawn(async move {
+                loop {
+                    let wait = {
+                        let state = lock(&release_state);
+                        match &*state {
+                            ReleaseState::Releasing { in_flight, .. } if *in_flight > 0 => {
+                                Some(in_flight_notify.clone().notified_owned())
+                            }
+                            _ => None,
+                        }
+                    };
+                    let Some(wait) = wait else {
+                        break;
+                    };
+                    wait.await;
+                }
 
-        let guard = lock(&self.release_state);
-        if let ReleaseState::Done(result) = &*guard {
+                let mut guard = ReleaseGuard::new(release_state, notify);
+                let mut first_error: Option<HostError> = None;
+                if let Err(error) = endpoint.dispose(cx).await {
+                    first_error.get_or_insert(HostError::from(error));
+                }
+                provider.dispose();
+                if let Some(on_release) = on_release {
+                    on_release();
+                }
+
+                let result = match first_error {
+                    Some(error) => Err(Arc::new(error)),
+                    None => Ok(()),
+                };
+                guard.complete(result);
+            });
+        }
+
+        notified.await;
+
+        let state = lock(&self.release_state);
+        if let ReleaseState::Done(result) = &*state {
             return result
                 .as_ref()
                 .copied()
@@ -139,19 +204,23 @@ impl RoutedServerServiceAttachment for ProviderAttachment {
         publish: PublishUpdate,
         cx: Context,
     ) -> BoxFuture<'_, Result<Option<JsonValue>, HostError>> {
-        {
-            let guard = lock(&self.release_state);
-            if !matches!(&*guard, ReleaseState::Idle) {
+        let admission = {
+            let mut state = lock(&self.release_state);
+            let ReleaseState::Idle { in_flight, .. } = &mut *state else {
                 return Box::pin(std::future::ready(Err(HostError::Service(
                     ServiceError::disposed("Server service attachment is released"),
                 ))));
+            };
+            *in_flight += 1;
+            InvocationGuard {
+                state: Arc::clone(&self.release_state),
             }
-        }
-
+        };
         let endpoint = Arc::clone(&self.endpoint);
         let publisher = adapt_publisher(publish);
 
         Box::pin(async move {
+            let _admission = admission;
             endpoint
                 .invoke(call, publisher, cx)
                 .await
@@ -261,4 +330,88 @@ impl Error for PanicError {}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
+mod tests {
+    use super::*;
+    use pi_agent::service::provider::{
+        RemoteServiceProvider, ServiceDefinition, ServiceImplementation, ServiceMember,
+    };
+    use pi_agent::service::wire::ServiceMode;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn release_waits_for_an_admitted_invocation() {
+        let service_id = JsString::from_utf8("test.service");
+        let member = JsString::from_utf8("wait");
+        let provider = Arc::new(
+            RemoteServiceProvider::new(vec![ServiceDefinition {
+                id: service_id.clone(),
+                local: false,
+                mode: ServiceMode::Singleton,
+            }])
+            .expect("provider"),
+        );
+
+        let (started_sender, started_receiver) = oneshot::channel();
+        let (finish_sender, finish_receiver) = oneshot::channel();
+        let started = Arc::new(Mutex::new(Some(started_sender)));
+        let finish = Arc::new(Mutex::new(Some(finish_receiver)));
+        let mut implementation = ServiceImplementation::new();
+        implementation.insert(
+            member.clone(),
+            ServiceMember::Method(Arc::new(move |_, _| {
+                let started = lock(&started).take().expect("single invocation");
+                let finish = lock(&finish).take().expect("single invocation");
+                Box::pin(async move {
+                    let _ = started.send(());
+                    let _ = finish.await;
+                    Ok(Some(JsonValue::Null))
+                })
+            })),
+        );
+        provider
+            .provide(&service_id, implementation)
+            .expect("provide method");
+
+        let attachment = ProviderAttachment::new(Arc::clone(&provider), || {});
+        let publish: PublishUpdate = Arc::new(|_, _, _| Box::pin(async {}));
+        let call = ServiceCall {
+            service_id,
+            instance: None,
+            member,
+            args: Vec::new(),
+        };
+        let invoke_attachment = Arc::clone(&attachment);
+        let invoke = tokio::spawn(async move {
+            invoke_attachment
+                .invoke_service(call, publish, Context::background())
+                .await
+        });
+        started_receiver.await.expect("invocation started");
+
+        let release_attachment = Arc::clone(&attachment);
+        let release =
+            tokio::spawn(async move { release_attachment.release(Context::background()).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !release.is_finished(),
+            "release passed endpoint disposal while invocation was admitted"
+        );
+
+        finish_sender.send(()).expect("finish invocation");
+        invoke
+            .await
+            .expect("invoke task")
+            .expect("invocation result");
+        release
+            .await
+            .expect("release task")
+            .expect("release result");
+    }
 }

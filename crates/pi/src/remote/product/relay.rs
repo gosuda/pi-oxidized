@@ -973,15 +973,18 @@ impl OrderedWebSocketWriter {
         };
         Box::pin(async move {
             let _reservation = reservation;
-            let mut maybe_sink = writer.sink.lock().await;
+            // The sink stays installed across the awaited send: taking it out
+            // here would leave every later send on a live socket failing with
+            // `Closed`.  Holding the lock across the write also serializes
+            // frames, which is what keeps this writer ordered.
+            let mut sink_guard = writer.sink.lock().await;
             if writer.closed.load(Ordering::Acquire) {
-                maybe_sink.take();
+                sink_guard.take();
                 return Err(TransportError::Closed);
             }
-            let Some(mut sink) = maybe_sink.take() else {
+            let Some(sink) = sink_guard.as_mut() else {
                 return Err(TransportError::Closed);
             };
-            drop(maybe_sink);
             sink.send(message).await.map_err(|error| {
                 TransportError::Message(format!("Radius relay WebSocket write failed: {error}"))
             })
@@ -1477,9 +1480,14 @@ fn lock_std<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
 
-    use super::{RadiusRelayHostStatus, invoke_status_callback, lock_std};
+    use futures::StreamExt;
+    use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
+
+    use super::{OrderedWebSocketWriter, RadiusRelayHostStatus, invoke_status_callback, lock_std};
 
     #[test]
     #[expect(
@@ -1511,6 +1519,63 @@ mod tests {
         assert_eq!(
             lock_std(&observed).clone(),
             Some(RadiusRelayHostStatus::Connected)
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions use expect for concise failure messages"
+    )]
+    #[expect(
+        clippy::panic,
+        reason = "a non-text relay frame is a hard test failure"
+    )]
+    async fn ordered_writer_delivers_every_send_on_one_live_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("relay client");
+            accept_async(stream)
+                .await
+                .expect("server websocket handshake")
+        });
+        let (client, _response) = connect_async(format!("ws://{address}"))
+            .await
+            .expect("client websocket handshake");
+        let server_socket = server.await.expect("server relay task");
+        let (_server_sink, mut server_stream) = server_socket.split();
+        let (client_sink, _client_stream) = client.split();
+        let writer = Arc::new(OrderedWebSocketWriter::new(client_sink));
+
+        // The regression: the first send used to consume the sink, so every
+        // later send on the same live websocket returned `Closed`.
+        writer
+            .send_text("first".to_owned())
+            .await
+            .expect("first send");
+        writer
+            .send_text("second".to_owned())
+            .await
+            .expect("second send on the live socket");
+
+        for expected in ["first", "second"] {
+            let frame = tokio::time::timeout(Duration::from_secs(5), server_stream.next())
+                .await
+                .expect("frame deadline")
+                .expect("open server stream")
+                .expect("websocket frame");
+            let Message::Text(text) = frame else {
+                panic!("expected a text relay frame");
+            };
+            assert_eq!(text.as_str(), expected);
+        }
+        assert_eq!(
+            writer.pending_bytes.load(Ordering::Acquire),
+            0,
+            "successful sends must release their byte reservation"
         );
     }
 }

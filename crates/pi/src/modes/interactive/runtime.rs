@@ -815,16 +815,7 @@ fn parse_slash_command(text: &str) -> Option<(&str, &str)> {
 /// Parse a thinking-level wire value, accepting the case-insensitive command
 /// spelling used by `/thinking`.
 fn parse_thinking_level(value: &str) -> Option<pi_ai::ModelThinkingLevel> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "off" => Some(pi_ai::ModelThinkingLevel::Off),
-        "minimal" => Some(pi_ai::ModelThinkingLevel::Minimal),
-        "low" => Some(pi_ai::ModelThinkingLevel::Low),
-        "medium" => Some(pi_ai::ModelThinkingLevel::Medium),
-        "high" => Some(pi_ai::ModelThinkingLevel::High),
-        "xhigh" => Some(pi_ai::ModelThinkingLevel::Xhigh),
-        "max" => Some(pi_ai::ModelThinkingLevel::Max),
-        _ => None,
-    }
+    value.trim().to_ascii_lowercase().parse().ok()
 }
 
 /// Extract the first path argument (`getPathCommandArgument` semantics): the
@@ -7997,7 +7988,7 @@ fn message_view_from_agent(message: &pi_agent::AgentMessage) -> Option<MessageVi
                     streaming: false,
                 },
             )),
-            pi_ai::Message::ToolResult(_) => None,
+            pi_ai::Message::ToolResult(_) | pi_ai::Message::System(_) => None,
         },
         pi_agent::AgentMessage::Custom(custom) => Some(message_view_from_custom(custom)),
     }
@@ -9511,6 +9502,7 @@ fn tree_entry_label(entry: &crate::core::sessions::SessionEntry) -> String {
         }
         SessionEntry::Label(label) => format!("label:{}", label.id),
         SessionEntry::SessionInfo(info) => format!("session_info:{}", info.id),
+        SessionEntry::ContextEdit(edit) => format!("context_edit:{}", edit.target_id),
         SessionEntry::ThinkingLevelChange(change) => {
             format!("thinking:{}", change.thinking_level)
         }

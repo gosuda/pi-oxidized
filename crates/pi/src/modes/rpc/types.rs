@@ -2332,6 +2332,9 @@ mod tests {
             base_url: "https://api.openai.com/v1".into(),
             reasoning: false,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![ModelInput::Text],
             cost: ModelCost {
                 input: 0.0,

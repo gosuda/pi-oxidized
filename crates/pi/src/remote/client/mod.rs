@@ -237,6 +237,7 @@ struct PendingRequest {
 struct ActiveServiceState {
     hydrated: bool,
     ready: bool,
+    delivering: bool,
     decoder: ServiceStateDecoder,
     queued_wire: Vec<JsonValue>,
     queued: Vec<ServiceProviderUpdate<DeltaOp>>,
@@ -260,6 +261,7 @@ struct Inner {
     attachment_listeners: HashMap<u64, AttachmentChangeListener>,
     hello: Option<ServerHello>,
     attachment: Option<SessionTarget>,
+    attachment_generation: u64,
     disposed: bool,
 }
 
@@ -857,11 +859,24 @@ impl ClientCore {
             .is_some_and(|connection| connection.id == connection_id)
     }
 
+    /// Records the accepted handshake for the identified connection.
+    ///
+    /// Generation validation and mutation are atomic: the handshake is
+    /// accepted only while the identified connection is still the registered
+    /// connection and has completed its hello, so a handshake completing
+    /// around a disconnect or reconnect can never record a superseded
+    /// server identity.
     pub(crate) fn on_handshake(&self, connection_id: u64, hello: ServerHello) {
-        if !self.is_current(connection_id) {
-            return;
+        {
+            let mut inner = lock(&self.inner);
+            let live = inner.connection.as_ref().is_some_and(|connection| {
+                connection.id == connection_id && connection.state() == ConnectionState::Connected
+            });
+            if !live || inner.disposed {
+                return;
+            }
+            inner.hello = Some(hello);
         }
-        lock(&self.inner).hello = Some(hello);
         self.fire_connection_state(&ConnectionStateChange {
             state: ConnectionState::Connected,
             error: None,
@@ -939,7 +954,7 @@ impl ClientCore {
                         return;
                     }
                 }
-                self.set_attachment(attachment.as_ref());
+                self.set_attachment(connection_id, attachment.as_ref());
             }
             ServerMessage::Hello { .. } | ServerMessage::HelloError { .. } => {
                 self.fail_connection(
@@ -951,7 +966,7 @@ impl ClientCore {
     }
 
     pub(crate) fn on_disconnected(&self, connection_id: u64, error: ClientError) {
-        let (pending, attachment_changed) = {
+        let (pending, attachment_generation) = {
             let mut inner = lock(&self.inner);
             if inner
                 .connection
@@ -961,16 +976,23 @@ impl ClientCore {
                 return;
             }
             inner.hello = None;
-            let attachment_changed = inner.attachment.take().is_some();
+            let attachment_generation = if inner.attachment.take().is_some() {
+                inner.attachment_generation = inner.attachment_generation.wrapping_add(1);
+                Some(inner.attachment_generation)
+            } else {
+                None
+            };
             let pending = inner
                 .pending
                 .drain()
                 .map(|(_, pending)| pending.sender)
                 .collect::<Vec<_>>();
             inner.service_listeners.clear();
-            (pending, attachment_changed)
+            (pending, attachment_generation)
         };
-        if attachment_changed {
+        if attachment_generation
+            .is_some_and(|generation| self.attachment_generation_is_current(generation))
+        {
             self.fire_attachment(&None);
         }
         for sender in pending {
@@ -1009,7 +1031,7 @@ impl ClientCore {
                     }
                 };
             match state.decoder.decode_update(&wire_update) {
-                Ok(update) if state.ready => Some(update),
+                Ok(update) if state.ready && !state.delivering => Some(update),
                 Ok(update) => {
                     state.queued.push(update);
                     None
@@ -1048,20 +1070,38 @@ impl ClientCore {
         }
     }
 
-    fn set_attachment(&self, attachment: Option<&SessionTarget>) {
-        let changed = {
+    /// Installs an attachment route delivered by the identified connection.
+    ///
+    /// Currency and disposal are re-checked under the same lock that performs
+    /// the write, so a frame decoded around a disconnect or reconnect can
+    /// never reinstall a superseded route. Listeners observe the exact value
+    /// this call installed, unless a concurrent transition already superseded
+    /// it; the superseding path fires its own value.
+    fn set_attachment(&self, connection_id: u64, attachment: Option<&SessionTarget>) {
+        let (generation, value) = {
             let mut inner = lock(&self.inner);
-            if inner.attachment.as_ref() == attachment {
-                false
-            } else {
-                inner.attachment = attachment.cloned();
-                true
+            let live = inner.connection.as_ref().is_some_and(|connection| {
+                connection.id == connection_id && connection.state() == ConnectionState::Connected
+            });
+            if !live || inner.disposed || inner.attachment.as_ref() == attachment {
+                return;
             }
+            let value = attachment.cloned();
+            inner.attachment.clone_from(&value);
+            inner.attachment_generation = inner.attachment_generation.wrapping_add(1);
+            (inner.attachment_generation, value)
         };
-        if changed {
-            let current = lock(&self.inner).attachment.clone();
-            self.fire_attachment(&current);
+        if !self.attachment_generation_is_current(generation) {
+            return;
         }
+        self.fire_attachment(&value);
+    }
+
+    /// Returns whether `generation` still describes the attachment route and
+    /// the client has not been disposed since the transition was recorded.
+    fn attachment_generation_is_current(&self, generation: u64) -> bool {
+        let inner = lock(&self.inner);
+        !inner.disposed && inner.attachment_generation == generation
     }
 
     fn target_is_current(&self, target: &RpcTarget) -> bool {
@@ -1157,24 +1197,47 @@ impl ServiceSubscription {
         &self.snapshot
     }
 
-    /// Starts ordered delivery of updates queued before the snapshot was ready.
+    /// Starts ordered delivery of updates queued before the snapshot was
+    /// ready, then drains everything that arrives while the backlog drains.
+    ///
+    /// Live updates are captured behind the in-flight drain until it
+    /// quiesces, so listeners observe wire order instead of task scheduling
+    /// order. Callbacks still run with no lock held, keeping listener
+    /// re-entry (including `start` itself, which is idempotent) deadlock
+    /// free.
     pub fn start(&self) {
         if self.disposed.load(Ordering::SeqCst) {
             return;
         }
-        let queued = {
+        let Some(core) = self.core.upgrade() else {
+            return;
+        };
+        let mut batch = {
             let mut state = lock(&self.active.state);
             if state.ready {
                 return;
             }
             state.ready = true;
+            state.delivering = true;
             std::mem::take(&mut state.queued)
         };
-        let Some(core) = self.core.upgrade() else {
-            return;
-        };
-        for update in queued {
-            core.deliver_service_update(&self.active, &update);
+        loop {
+            for update in batch {
+                core.deliver_service_update(&self.active, &update);
+            }
+            let next = {
+                let mut state = lock(&self.active.state);
+                if state.queued.is_empty() {
+                    state.delivering = false;
+                    None
+                } else {
+                    Some(std::mem::take(&mut state.queued))
+                }
+            };
+            let Some(queued) = next else {
+                break;
+            };
+            batch = queued;
         }
     }
 

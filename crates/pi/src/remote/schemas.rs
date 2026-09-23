@@ -16,7 +16,10 @@ use pi_agent::service::value::JsonValue;
 use crate::remote::serde_cbor::{CborValue, CborValueDeserializer, OpaqueJson, opaque_json};
 
 /// Protocol version implemented by the native remote wire.
-pub const PROTOCOL_VERSION: u64 = 8;
+///
+/// Native wire v1 carries the upstream v8 message family unchanged; only the
+/// version number diverges from upstream `packages/protocol`.
+pub const PROTOCOL_VERSION: u64 = 1;
 
 /// Protocol error codes are open, non-empty strings.
 ///

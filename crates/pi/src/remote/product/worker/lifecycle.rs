@@ -720,8 +720,8 @@ pub fn lifecycle_delay(
 ///
 /// # Errors
 ///
-/// Returns [`WorkerLifecycleError`] when the variable holds a non-unicode,
-/// empty, or out-of-range delay.
+/// Returns [`WorkerLifecycleError`] when the variable holds a non-Unicode,
+/// invalid, or out-of-range delay.
 pub fn lifecycle_delay_from_env(
     name: &str,
     fallback_ms: u64,

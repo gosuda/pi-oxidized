@@ -27,6 +27,7 @@ use pi_ext::facet::{
     FACET_SERVICE_INVOKE_METHOD, FacetHostEntry, FacetHostLoadResponse, FacetServiceInvokeRequest,
     FacetServiceInvokeResult, FacetServiceUpdateEvent, catalogue_into_json,
 };
+use tokio::sync::Notify;
 
 /// Request/response seam implemented by the extension-runtime owner.
 ///
@@ -73,13 +74,32 @@ pub trait PluginFacetHost: Send + Sync {
     /// Closes subscriptions and disposes the host generation.
     fn dispose(&self) -> BoxFuture<'static, Result<(), ServiceError>>;
 }
-
 /// A loaded host generation backed by an extension-host transport.
 pub struct RemotePluginFacetHost {
     host_id: String,
     transport: Arc<dyn FacetHostTransport>,
     state: Arc<Mutex<PluginHostState>>,
     disposed: Arc<AtomicBool>,
+    dispose_completion: Arc<DisposeCompletion>,
+}
+
+struct DisposeCompletion {
+    result: Mutex<Option<Result<(), Arc<ServiceError>>>>,
+    done: Notify,
+}
+
+impl DisposeCompletion {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            result: Mutex::new(None),
+            done: Notify::new(),
+        })
+    }
+
+    fn finish(&self, result: Result<(), ServiceError>) {
+        *lock_unpoisoned(&self.result) = Some(result.map_err(Arc::new));
+        self.done.notify_waiters();
+    }
 }
 
 struct PluginHostState {
@@ -126,14 +146,26 @@ impl RemotePluginFacetHost {
                     slash_commands: Vec::new(),
                 })),
                 disposed: Arc::new(AtomicBool::new(false)),
+                dispose_completion: DisposeCompletion::new(),
             });
-            let response = host.request_load(&options, context).await?;
-            host.prime_services(
-                &response.catalogue,
-                response.slash_commands.clone(),
-                Context::background(),
-            )
-            .await?;
+            let response = match host.request_load(&options, context).await {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = host.dispose().await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = host
+                .prime_services(
+                    &response.catalogue,
+                    response.slash_commands.clone(),
+                    Context::background(),
+                )
+                .await
+            {
+                let _ = host.dispose().await;
+                return Err(error);
+            }
             Ok((host, response))
         })
     }
@@ -229,35 +261,73 @@ impl RemotePluginFacetHost {
         slash_commands: Vec<JsonValue>,
         context: Context,
     ) -> Result<(), ServiceError> {
-        let mut next_state = PluginHostState {
-            services: Vec::with_capacity(catalogue.len()),
-            routes: Vec::new(),
-            subscriptions: Vec::with_capacity(catalogue.len()),
-            slash_commands,
-        };
-        for (index, entry) in catalogue.iter().enumerate() {
-            let subscription_id =
-                JsString::from_utf8(format!("{}:native:{}", self.host_id, index).as_str());
-            let snapshot = self
-                .subscribe_shape(entry, &subscription_id, context.clone())
-                .await?;
-            if snapshot.service_id != entry.service_id || snapshot.mode != entry.mode {
-                return Err(ServiceError::local(
-                    "facet service returned a mismatched subscription shape",
-                ));
+        let mut opened_subscriptions = Vec::with_capacity(catalogue.len());
+        let result = async {
+            let mut next_state = PluginHostState {
+                services: Vec::with_capacity(catalogue.len()),
+                routes: Vec::new(),
+                subscriptions: Vec::with_capacity(catalogue.len()),
+                slash_commands,
+            };
+            for (index, entry) in catalogue.iter().enumerate() {
+                let subscription_id =
+                    JsString::from_utf8(format!("{}:native:{}", self.host_id, index).as_str());
+                // The host may have accepted the subscription before a malformed
+                // response reaches us, so cleanup includes the id on every
+                // fallible path after the request is sent.
+                opened_subscriptions.push(subscription_id.clone());
+                let snapshot = self
+                    .subscribe_shape(entry, &subscription_id, context.clone())
+                    .await?;
+                if snapshot.service_id != entry.service_id || snapshot.mode != entry.mode {
+                    return Err(ServiceError::local(
+                        "facet service returned a mismatched subscription shape",
+                    ));
+                }
+                let registration = registration_from_snapshot(
+                    entry,
+                    &snapshot.instances,
+                    &subscription_id,
+                    &self.transport,
+                    &self.host_id,
+                    &mut next_state.routes,
+                )?;
+                next_state.services.push(registration);
+                next_state.subscriptions.push(subscription_id);
             }
-            let registration = registration_from_snapshot(
-                entry,
-                &snapshot.instances,
-                &subscription_id,
-                &self.transport,
-                &self.host_id,
-                &mut next_state.routes,
-            )?;
-            next_state.services.push(registration);
-            next_state.subscriptions.push(subscription_id);
+            *lock_checked(&self.state)? = next_state;
+            Ok(())
         }
-        *lock_checked(&self.state)? = next_state;
+        .await;
+
+        if result.is_err() {
+            for subscription_id in opened_subscriptions {
+                let _ = self
+                    .unsubscribe_subscription(subscription_id, Context::background())
+                    .await;
+            }
+        }
+        result
+    }
+
+    async fn unsubscribe_subscription(
+        &self,
+        subscription_id: JsString,
+        context: Context,
+    ) -> Result<(), ServiceError> {
+        let call = ServiceCall {
+            service_id: JsString::from_utf8("$chord.service"),
+            instance: None,
+            member: JsString::from_utf8("unsubscribe"),
+            args: vec![JsonValue::String(subscription_id)],
+        };
+        let request = FacetServiceInvokeRequest {
+            host_id: JsString::from_utf8(&self.host_id),
+            call,
+        };
+        self.transport
+            .request(FACET_SERVICE_INVOKE_METHOD, request.into_json(), context)
+            .await?;
         Ok(())
     }
 
@@ -455,59 +525,98 @@ impl PluginFacetHost for RemotePluginFacetHost {
         let host_id = self.host_id.clone();
         let transport = Arc::clone(&self.transport);
         let state = Arc::clone(&self.state);
-        let was_disposed = self.disposed.swap(true, Ordering::AcqRel);
+        let disposed = Arc::clone(&self.disposed);
+        let completion = Arc::clone(&self.dispose_completion);
         Box::pin(async move {
-            if was_disposed {
-                return Ok(());
-            }
-            let subscriptions = {
-                let mut state = lock_checked(&state)?;
-                std::mem::take(&mut state.subscriptions)
-            };
-            let mut errors = Vec::new();
-            for subscription_id in subscriptions {
-                let call = ServiceCall {
-                    service_id: JsString::from_utf8("$chord.service"),
-                    instance: None,
-                    member: JsString::from_utf8("unsubscribe"),
-                    args: vec![JsonValue::String(subscription_id)],
-                };
-                let request = FacetServiceInvokeRequest {
-                    host_id: JsString::from_utf8(&host_id),
-                    call,
-                };
-                if let Err(error) = transport
-                    .request(
-                        FACET_SERVICE_INVOKE_METHOD,
-                        request.into_json(),
-                        Context::background(),
-                    )
-                    .await
-                {
-                    errors.push(error);
+            let task = tokio::spawn(async move {
+                if disposed.swap(true, Ordering::AcqRel) {
+                    return wait_plugin_dispose(completion).await;
                 }
+                let result = async {
+                    let subscriptions = {
+                        let mut state = lock_checked(&state)?;
+                        std::mem::take(&mut state.subscriptions)
+                    };
+                    let mut errors = Vec::new();
+                    for subscription_id in subscriptions {
+                        let call = ServiceCall {
+                            service_id: JsString::from_utf8("$chord.service"),
+                            instance: None,
+                            member: JsString::from_utf8("unsubscribe"),
+                            args: vec![JsonValue::String(subscription_id)],
+                        };
+                        let request = FacetServiceInvokeRequest {
+                            host_id: JsString::from_utf8(&host_id),
+                            call,
+                        };
+                        if let Err(error) = transport
+                            .request(
+                                FACET_SERVICE_INVOKE_METHOD,
+                                request.into_json(),
+                                Context::background(),
+                            )
+                            .await
+                        {
+                            errors.push(error);
+                        }
+                    }
+                    if let Err(error) = transport
+                        .request(
+                            FACET_HOST_DISPOSE_METHOD,
+                            object_value([(
+                                string_key("hostId"),
+                                JsonValue::String(host_id.into()),
+                            )]),
+                            Context::background(),
+                        )
+                        .await
+                    {
+                        errors.push(error);
+                    }
+                    if errors.len() == 1 {
+                        return Err(errors.remove(0));
+                    }
+                    if !errors.is_empty() {
+                        return Err(ServiceError::internal(format!(
+                            "facet host disposal failed in {} operations",
+                            errors.len()
+                        )));
+                    }
+                    Ok(())
+                }
+                .await;
+                completion.finish(result);
+                wait_plugin_dispose(completion).await
+            });
+            match task.await {
+                Ok(result) => result,
+                Err(error) => Err(ServiceError::handler(error)),
             }
-            if let Err(error) = transport
-                .request(
-                    FACET_HOST_DISPOSE_METHOD,
-                    object_value([(string_key("hostId"), JsonValue::String(host_id.into()))]),
-                    Context::background(),
-                )
-                .await
-            {
-                errors.push(error);
-            }
-            if errors.len() == 1 {
-                return Err(errors.remove(0));
-            }
-            if !errors.is_empty() {
-                return Err(ServiceError::internal(format!(
-                    "facet host disposal failed in {} operations",
-                    errors.len()
-                )));
-            }
-            Ok(())
         })
+    }
+}
+async fn wait_plugin_dispose(completion: Arc<DisposeCompletion>) -> Result<(), ServiceError> {
+    loop {
+        let notified = completion.done.notified();
+        if let Some(result) = lock_unpoisoned(&completion.result).clone() {
+            return result.map_err(|error| ServiceError::handler(SharedPluginError(error)));
+        }
+        notified.await;
+    }
+}
+
+#[derive(Debug)]
+struct SharedPluginError(Arc<ServiceError>);
+
+impl std::fmt::Display for SharedPluginError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SharedPluginError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
     }
 }
 
@@ -693,4 +802,136 @@ fn lock_unpoisoned<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pi_agent::service::value::JsObject;
+    use pi_agent::service::wire::{ServiceInstanceSnapshot, ServiceSubscriptionSnapshot};
+    use pi_ext::facet::FacetServiceInvokeRequest;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PartialTransport {
+        subscriptions: AtomicUsize,
+        unsubscribed: Mutex<Vec<JsString>>,
+        disposed: AtomicUsize,
+    }
+
+    impl PartialTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                subscriptions: AtomicUsize::new(0),
+                unsubscribed: Mutex::new(Vec::new()),
+                disposed: AtomicUsize::new(0),
+            })
+        }
+
+        fn load_response() -> JsonValue {
+            JsonValue::Object(JsObject::from([
+                (
+                    JsString::from_utf8("catalogue"),
+                    JsonValue::Array(vec![
+                        ServiceCatalogueEntry {
+                            service_id: JsString::from_utf8("one"),
+                            mode: ServiceMode::Singleton,
+                        }
+                        .into_json(),
+                        ServiceCatalogueEntry {
+                            service_id: JsString::from_utf8("two"),
+                            mode: ServiceMode::Singleton,
+                        }
+                        .into_json(),
+                    ]),
+                ),
+                (
+                    JsString::from_utf8("slashCommands"),
+                    JsonValue::Array(Vec::new()),
+                ),
+            ]))
+        }
+
+        fn subscription_response(service_id: JsString) -> JsonValue {
+            FacetServiceInvokeResult::Present(
+                ServiceSubscriptionSnapshot::<DeltaOp> {
+                    service_id,
+                    mode: ServiceMode::Singleton,
+                    instances: vec![ServiceInstanceSnapshot {
+                        instance: None,
+                        members: Vec::new(),
+                    }],
+                }
+                .into_json(),
+            )
+            .into_json()
+        }
+    }
+
+    impl FacetHostTransport for PartialTransport {
+        fn request(
+            &self,
+            method: &'static str,
+            payload: JsonValue,
+            _context: Context,
+        ) -> BoxFuture<'static, Result<Option<JsonValue>, ServiceError>> {
+            let outcome = if method == FACET_HOST_LOAD_METHOD {
+                Ok(Some(Self::load_response()))
+            } else if method == FACET_SERVICE_INVOKE_METHOD {
+                let request = match FacetServiceInvokeRequest::from_json(&payload) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return Box::pin(
+                            async move { Err(ServiceError::local(error.to_string())) },
+                        );
+                    }
+                };
+                if request.call.member == JsString::from_utf8("unsubscribe") {
+                    if let Some(JsonValue::String(subscription_id)) = request.call.args.first() {
+                        lock_unpoisoned(&self.unsubscribed).push(subscription_id.clone());
+                    }
+                    Ok(Some(FacetServiceInvokeResult::Absent.into_json()))
+                } else {
+                    let index = self.subscriptions.fetch_add(1, Ordering::AcqRel);
+                    if index == 0 {
+                        let Some(JsonValue::String(service_id)) = request.call.args.get(1) else {
+                            return Box::pin(async {
+                                Err(ServiceError::local("missing service id"))
+                            });
+                        };
+                        Ok(Some(Self::subscription_response(service_id.clone())))
+                    } else {
+                        Err(ServiceError::local("second subscription failed"))
+                    }
+                }
+            } else if method == FACET_HOST_DISPOSE_METHOD {
+                self.disposed.fetch_add(1, Ordering::AcqRel);
+                Ok(Some(JsonValue::Null))
+            } else {
+                Err(ServiceError::local("unexpected facet request"))
+            };
+            Box::pin(async move { outcome })
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_load_unsubscribes_every_open_subscription() {
+        let transport = PartialTransport::new();
+        let options = PluginFacetHostOptions {
+            host_id: String::from("host"),
+            entry: FacetHostEntry::Tui,
+            manifest_paths: None,
+            artifacts: None,
+            builtin_catalogue: Vec::new(),
+        };
+
+        let result =
+            RemotePluginFacetHost::load(transport.clone(), options, Context::background()).await;
+        assert!(result.is_err(), "second subscription must fail");
+        assert_eq!(
+            lock_unpoisoned(&transport.unsubscribed).len(),
+            2,
+            "both admitted subscriptions must be closed"
+        );
+        assert_eq!(transport.disposed.load(Ordering::Acquire), 1);
+    }
 }

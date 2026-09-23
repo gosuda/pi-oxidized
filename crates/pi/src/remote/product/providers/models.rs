@@ -201,46 +201,55 @@ impl ModelsService {
     async fn refresh(&self, context: Context) -> Result<(), ServiceError> {
         self.update_refresh(ModelsRefreshState::Refreshing, context.clone())?;
 
-        let Some(model_runtime) = self.model_runtime.as_ref() else {
+        let result = async {
+            let Some(model_runtime) = self.model_runtime.as_ref() else {
+                let (catalog, configuration) = tokio::try_join!(
+                    self.read_catalog(&context),
+                    self.read_configuration(&context),
+                )?;
+                return self.publish_state(
+                    ModelsState {
+                        catalog,
+                        configuration,
+                        refresh: ModelsRefreshState::Done,
+                    },
+                    context.clone(),
+                );
+            };
+
+            let result = model_runtime
+                .refresh(ModelsRefreshOptions {
+                    signal: context.token().cloned(),
+                    ..ModelsRefreshOptions::default()
+                })
+                .await
+                .map_err(ServiceError::handler)?;
+            let errors = result.errors;
             let (catalog, configuration) = tokio::try_join!(
                 self.read_catalog(&context),
                 self.read_configuration(&context),
             )?;
-            return self.publish_state(
+            let refresh = if errors.is_empty() {
+                ModelsRefreshState::Done
+            } else {
+                ModelsRefreshState::Warning { errors }
+            };
+            self.publish_state(
                 ModelsState {
                     catalog,
                     configuration,
-                    refresh: ModelsRefreshState::Done,
+                    refresh,
                 },
-                context,
-            );
-        };
+                context.clone(),
+            )
+        }
+        .await;
 
-        let result = model_runtime
-            .refresh(ModelsRefreshOptions {
-                signal: context.token().cloned(),
-                ..ModelsRefreshOptions::default()
-            })
-            .await
-            .map_err(ServiceError::handler)?;
-        let errors = result.errors;
-        let (catalog, configuration) = tokio::try_join!(
-            self.read_catalog(&context),
-            self.read_configuration(&context),
-        )?;
-        let refresh = if errors.is_empty() {
-            ModelsRefreshState::Done
-        } else {
-            ModelsRefreshState::Warning { errors }
-        };
-        self.publish_state(
-            ModelsState {
-                catalog,
-                configuration,
-                refresh,
-            },
-            context,
-        )
+        if let Err(error) = result {
+            self.update_refresh(ModelsRefreshState::Idle, context)?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn select(&self, model: ModelRef, context: Context) -> Result<(), ServiceError> {
@@ -469,18 +478,9 @@ fn parse_thinking_level(value: &JsonValue) -> Result<ModelThinkingLevel, Service
                 "selectThinking argument is not valid UTF-8: {error}"
             ))
         })?;
-    match value.as_str() {
-        "off" => Ok(ModelThinkingLevel::Off),
-        "minimal" => Ok(ModelThinkingLevel::Minimal),
-        "low" => Ok(ModelThinkingLevel::Low),
-        "medium" => Ok(ModelThinkingLevel::Medium),
-        "high" => Ok(ModelThinkingLevel::High),
-        "xhigh" => Ok(ModelThinkingLevel::Xhigh),
-        "max" => Ok(ModelThinkingLevel::Max),
-        _ => Err(invalid_value(
-            "selectThinking expects a known thinking level",
-        )),
-    }
+    value
+        .parse()
+        .map_err(|_| invalid_value("selectThinking expects a known thinking level"))
 }
 
 fn thinking_level_name(level: ModelThinkingLevel) -> &'static str {

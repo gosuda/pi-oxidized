@@ -66,6 +66,10 @@ fn launch_offline_pi_session() -> Result<(TempDir, PosixPtySession), DriverError
     );
     env.insert("PI_OFFLINE".to_owned(), "1".to_owned());
     env.insert("PI_SKIP_VERSION_CHECK".to_owned(), "1".to_owned());
+    // Declare a DEC 2026 terminal: capability detection grants synchronized
+    // output only to known terminals, and both tests settle on the first
+    // balanced 2026 transaction.
+    env.insert("TERM_PROGRAM".to_owned(), "kitty".to_owned());
 
     let spec = LaunchSpec {
         argv: vec![

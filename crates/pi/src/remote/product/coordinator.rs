@@ -8,6 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -37,6 +39,13 @@ const COORDINATOR_START_TIMEOUT: Duration = Duration::from_secs(10);
 const COORDINATOR_RETRY: Duration = Duration::from_millis(10);
 const EMPTY_STARTUP_GRACE: Duration = Duration::from_secs(30);
 const EMPTY_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+/// Maximum number of frames queued for one control connection.
+const MAX_QUEUED_CONTROL_FRAMES: usize = 256;
+/// Maximum queued frame bytes per control connection.  This matches the
+/// wire's own line bound, so any control line the protocol accepts can still
+/// be queued, while a reader that stops draining cannot accumulate frames
+/// without end.
+const MAX_QUEUED_CONTROL_BYTES: usize = MAX_CONTROL_LINE_BYTES;
 
 /// Messages delivered by the coordinator to a registered server.
 #[derive(Clone, Debug, PartialEq)]
@@ -876,43 +885,51 @@ impl CoordinatorStartupLease {
 
 #[cfg(unix)]
 struct CoordinatorChildGuard {
-    child: Child,
-    disarmed: bool,
+    child: Option<Child>,
 }
 
 #[cfg(unix)]
 impl CoordinatorChildGuard {
     fn new(child: Child) -> Self {
-        Self {
-            child,
-            disarmed: false,
-        }
+        Self { child: Some(child) }
     }
 
-    fn child_mut(&mut self) -> &mut Child {
+    fn child_slot(&mut self) -> &mut Option<Child> {
         &mut self.child
     }
 
+    /// Releases the child without killing it: a successfully started
+    /// coordinator outlives this guard.
     fn disarm(&mut self) {
-        self.disarmed = true;
+        self.child = None;
     }
 
     async fn terminate(mut self) -> io::Result<()> {
-        let result = terminate_internal_process(&mut self.child).await;
-        if result.is_ok() {
-            self.disarmed = true;
+        match self.child.take() {
+            Some(mut child) => terminate_internal_process(&mut child).await,
+            None => Ok(()),
         }
-        result
     }
 }
 
 #[cfg(unix)]
 impl Drop for CoordinatorChildGuard {
     fn drop(&mut self) {
-        if !self.disarmed {
-            // Drop cannot await the documented terminate-and-reap helper.
-            // Start termination synchronously so cancellation cannot orphan it.
-            let _ = self.child.start_kill();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        // Kill synchronously so a cancelled startup cannot leave the role
+        // running, then finish the reap off-thread because Drop cannot await.
+        // Waiting here is what keeps a killed child from lingering as a
+        // zombie under this process.
+        let _ = child.start_kill();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => drop(handle.spawn(async move {
+                let _ = child.wait().await;
+            })),
+            // No runtime owns this drop; tokio's orphan reaper drains the
+            // already-killed child when the handle is released.
+            Err(_) => drop(child),
         }
     }
 }
@@ -947,7 +964,7 @@ pub async fn ensure_coordinator(
             &InternalProcessSpawnOptions { env: Vec::new() },
         )?;
         let mut child = CoordinatorChildGuard::new(child);
-        let startup = wait_for_coordinator_startup(&control_path, child.child_mut()).await;
+        let startup = wait_for_coordinator_startup(&control_path, child.child_slot()).await;
         match startup {
             Ok(lease) => {
                 child.disarm();
@@ -969,7 +986,7 @@ pub async fn ensure_coordinator(
 #[cfg(unix)]
 async fn wait_for_coordinator_startup(
     control_path: &Path,
-    child: &mut Child,
+    child: &mut Option<Child>,
 ) -> Result<CoordinatorStartupLease, CoordinatorError> {
     let deadline = tokio::time::Instant::now() + COORDINATOR_START_TIMEOUT;
     loop {
@@ -978,7 +995,9 @@ async fn wait_for_coordinator_startup(
                 socket: Some(socket),
             });
         }
-        if child.try_wait()?.is_some() {
+        if let Some(child) = child.as_mut()
+            && child.try_wait()?.is_some()
+        {
             return Err(CoordinatorError::ProcessExited);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -1027,10 +1046,63 @@ pub async fn run_coordinator_process(args: &[String]) -> Result<(), CoordinatorE
     }
 }
 
+/// Outbound queue for one control connection.
+///
+/// The queue is bounded in frames and in queued bytes.  When a send would
+/// exceed a bound, or the transport is gone, the connection is closed through
+/// its cancellation token: a peer that stops draining its socket cannot grow
+/// coordinator memory without end.
+#[cfg(unix)]
+#[derive(Clone)]
+struct ControlWriter {
+    tx: mpsc::Sender<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
+    cancel: CancellationToken,
+}
+
+#[cfg(unix)]
+impl ControlWriter {
+    fn send(&self, bytes: Vec<u8>) {
+        let length = bytes.len();
+        if !reserve_queued(&self.queued, length) {
+            self.cancel.cancel();
+            return;
+        }
+        if self.tx.try_send(bytes).is_err() {
+            // Full or closed: the frame never reaches the transport, so give
+            // the reserved bytes back and shed the connection.
+            self.queued.fetch_sub(length, Ordering::AcqRel);
+            self.cancel.cancel();
+        }
+    }
+}
+
+/// Reserves `bytes` against the queue bound, returning whether the reserve
+/// fit.  The caller releases the reservation once the bytes leave the queue.
+#[cfg(unix)]
+fn reserve_queued(queued: &AtomicUsize, bytes: usize) -> bool {
+    if bytes > MAX_QUEUED_CONTROL_BYTES {
+        return false;
+    }
+    let mut current = queued.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(bytes) else {
+            return false;
+        };
+        if next > MAX_QUEUED_CONTROL_BYTES {
+            return false;
+        }
+        match queued.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 #[cfg(unix)]
 #[derive(Clone)]
 struct ControlState {
-    writer: mpsc::UnboundedSender<Vec<u8>>,
+    writer: ControlWriter,
     cancel: CancellationToken,
     role: ControlRole,
 }
@@ -1049,21 +1121,21 @@ struct ServerState {
     connection_id: u64,
     server_connection_id: String,
     endpoint: PathBuf,
-    writer: mpsc::UnboundedSender<Vec<u8>>,
+    writer: ControlWriter,
 }
 
 #[cfg(unix)]
 #[derive(Clone)]
 struct PeerState {
     connection_id: u64,
-    writer: mpsc::UnboundedSender<Vec<u8>>,
+    writer: ControlWriter,
 }
 
 #[cfg(unix)]
 enum ProcessEvent {
     ControlAccepted {
         connection_id: u64,
-        writer: mpsc::UnboundedSender<Vec<u8>>,
+        writer: ControlWriter,
         cancel: CancellationToken,
     },
     ControlLine {
@@ -1142,7 +1214,7 @@ impl CoordinatorProcess {
     fn accept_control(
         &mut self,
         connection_id: u64,
-        writer: mpsc::UnboundedSender<Vec<u8>>,
+        writer: ControlWriter,
         cancel: CancellationToken,
     ) {
         if self.shutting_down {
@@ -1214,6 +1286,12 @@ impl CoordinatorProcess {
     }
 
     fn register_server(&mut self, connection_id: u64, value: &JsonValue) -> Result<(), String> {
+        // Reject before any state moves: a registration for another protocol
+        // version must leave the current server and its public connections
+        // exactly as they are.
+        if !protocol_is_supported(value) {
+            return Err("Unsupported coordinator protocol".to_owned());
+        }
         let server_connection_id = string_field(value, "serverConnectionId")
             .ok_or_else(|| "Coordinator serverConnectionId must be a string".to_owned())?;
         if server_connection_id.is_empty() {
@@ -1384,9 +1462,9 @@ impl CoordinatorProcess {
         }
     }
 
-    fn send_value(writer: &mpsc::UnboundedSender<Vec<u8>>, value: &JsonValue) {
+    fn send_value(writer: &ControlWriter, value: &JsonValue) {
         if let Ok(bytes) = encode_json_line(value) {
-            let _ = writer.send(bytes);
+            writer.send(bytes);
         }
     }
 
@@ -1420,6 +1498,9 @@ impl CoordinatorProcess {
                         .take()
                         .map(|server| server.server_connection_id);
                     if let Some(server_connection_id) = server_connection_id {
+                        // The serving generation is gone; proxied public
+                        // connections must not keep flowing to its endpoint.
+                        self.close_public_connections();
                         self.notify_peers(&json_object([
                             ("type", json_string("server_disconnected")),
                             ("serverConnectionId", json_string(server_connection_id)),
@@ -1501,8 +1582,14 @@ async fn control_connection(
     event_tx: mpsc::UnboundedSender<ProcessEvent>,
 ) {
     let (reader, writer) = stream.into_split();
-    let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let cancel = CancellationToken::new();
+    let (writer_tx, mut writer_rx) = mpsc::channel(MAX_QUEUED_CONTROL_FRAMES);
+    let queued = Arc::new(AtomicUsize::new(0));
+    let writer_state = ControlWriter {
+        tx: writer_tx,
+        queued: Arc::clone(&queued),
+        cancel: cancel.clone(),
+    };
     let writer_cancel = cancel.clone();
     tokio::spawn(async move {
         let mut writer = writer;
@@ -1511,6 +1598,7 @@ async fn control_connection(
                 () = writer_cancel.cancelled() => break,
                 message = writer_rx.recv() => {
                     let Some(message) = message else { break };
+                    queued.fetch_sub(message.len(), Ordering::AcqRel);
                     if writer.write_all(&message).await.is_err() {
                         writer_cancel.cancel();
                         break;
@@ -1518,11 +1606,16 @@ async fn control_connection(
                 }
             }
         }
+        // Frames still queued when the connection ends are never written;
+        // release their reservation so a closed connection leaves no debt.
+        while let Ok(message) = writer_rx.try_recv() {
+            queued.fetch_sub(message.len(), Ordering::AcqRel);
+        }
     });
     if event_tx
         .send(ProcessEvent::ControlAccepted {
             connection_id,
-            writer: writer_tx,
+            writer: writer_state,
             cancel: cancel.clone(),
         })
         .is_err()
@@ -1754,6 +1847,7 @@ async fn cleanup_socket(path: &Path) -> Result<(), CoordinatorError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
     #[test]
     #[expect(
@@ -1851,5 +1945,506 @@ mod tests {
         assert!(!connection.was_replaced());
         let _ = release_tx.send(());
         server_task.await.expect("server task");
+    }
+
+    /// How one delivered [`ProcessEvent`] presented to the tests.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Pumped {
+        ControlAccepted(u64),
+        ControlLine(u64),
+        ControlClosed(u64),
+        PublicClosed(u64),
+        EmptyTimer,
+    }
+
+    #[cfg(unix)]
+    impl Pumped {
+        fn of(event: &ProcessEvent) -> Self {
+            match event {
+                ProcessEvent::ControlAccepted { connection_id, .. } => {
+                    Self::ControlAccepted(*connection_id)
+                }
+                ProcessEvent::ControlLine { connection_id, .. } => {
+                    Self::ControlLine(*connection_id)
+                }
+                ProcessEvent::ControlClosed { connection_id } => {
+                    Self::ControlClosed(*connection_id)
+                }
+                ProcessEvent::PublicClosed { connection_id } => Self::PublicClosed(*connection_id),
+                ProcessEvent::EmptyTimer => Self::EmptyTimer,
+            }
+        }
+    }
+
+    /// Drives the real [`CoordinatorProcess`] state machine against real
+    /// control sockets: each connection runs the production
+    /// [`control_connection`] loop over one end of a socket pair.
+    #[cfg(unix)]
+    struct Harness {
+        process: CoordinatorProcess,
+        event_tx: mpsc::UnboundedSender<ProcessEvent>,
+        event_rx: mpsc::UnboundedReceiver<ProcessEvent>,
+        next_connection_id: u64,
+    }
+
+    #[cfg(unix)]
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions use expect for concise failure messages"
+    )]
+    impl Harness {
+        fn new() -> Self {
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            Self {
+                process: CoordinatorProcess::new(event_tx.clone()),
+                event_tx,
+                event_rx,
+                next_connection_id: 1,
+            }
+        }
+
+        fn connect(&mut self) -> (tokio::net::UnixStream, u64) {
+            let (client, server_side) = tokio::net::UnixStream::pair().expect("socket pair");
+            let connection_id = self.next_connection_id;
+            self.next_connection_id += 1;
+            tokio::spawn(control_connection(
+                server_side,
+                connection_id,
+                self.event_tx.clone(),
+            ));
+            (client, connection_id)
+        }
+
+        async fn pump(&mut self) -> Pumped {
+            let event = tokio::time::timeout(Duration::from_secs(5), self.event_rx.recv())
+                .await
+                .expect("coordinator event deadline")
+                .expect("coordinator event channel");
+            let pumped = Pumped::of(&event);
+            self.process.handle_event(event);
+            pumped
+        }
+
+        async fn pump_until(&mut self, wanted: Pumped) -> Pumped {
+            loop {
+                let pumped = self.pump().await;
+                if pumped == wanted {
+                    return pumped;
+                }
+            }
+        }
+
+        /// Delivers pending events until `wanted` arrives or the queue runs
+        /// dry for a moment, reporting whether `wanted` was seen.
+        async fn pump_available_until(&mut self, wanted: Pumped) -> bool {
+            loop {
+                match tokio::time::timeout(Duration::from_millis(100), self.event_rx.recv()).await {
+                    Ok(Some(event)) => {
+                        let pumped = Pumped::of(&event);
+                        self.process.handle_event(event);
+                        if pumped == wanted {
+                            return true;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions use expect for concise failure messages"
+    )]
+    async fn send_line(writer: &mut tokio::net::unix::OwnedWriteHalf, value: &JsonValue) {
+        let line = encode_json_line(value).expect("control line");
+        writer.write_all(&line).await.expect("control write");
+    }
+
+    #[cfg(unix)]
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions use expect for concise failure messages"
+    )]
+    async fn read_line<R>(reader: &mut R) -> Option<String>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        let mut line = Vec::new();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .await
+            .expect("control read");
+        if read == 0 {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&line).into_owned())
+    }
+
+    /// Reads buffered frames until the peer closes the connection.
+    #[cfg(unix)]
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions use expect for concise failure messages"
+    )]
+    async fn read_until_eof<R>(reader: &mut R)
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        loop {
+            let mut line = Vec::new();
+            let read = reader
+                .read_until(b'\n', &mut line)
+                .await
+                .expect("control read");
+            if read == 0 {
+                return;
+            }
+        }
+    }
+
+    /// Asserts no frame arrives within a short window.
+    #[cfg(unix)]
+    async fn assert_quiet<R>(reader: &mut R)
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        let mut line = Vec::new();
+        let result = tokio::time::timeout(
+            Duration::from_millis(150),
+            reader.read_until(b'\n', &mut line),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "unexpected control frame while quiet: {}",
+            String::from_utf8_lossy(&line)
+        );
+    }
+
+    #[cfg(unix)]
+    fn server_registration(protocol: u32) -> JsonValue {
+        json_object([
+            ("type", json_string("register_server")),
+            ("protocol", JsonValue::Number(f64::from(protocol))),
+            ("serverConnectionId", json_string("srv-A")),
+            ("endpoint", json_string("/unused-coordinator-endpoint.sock")),
+        ])
+    }
+
+    #[cfg(unix)]
+    fn peer_registration(peer_id: &str) -> JsonValue {
+        json_object([
+            ("type", json_string("register_peer")),
+            (
+                "protocol",
+                JsonValue::Number(f64::from(COORDINATOR_PROTOCOL_VERSION)),
+            ),
+            ("peerId", json_string(peer_id)),
+        ])
+    }
+
+    /// Regression for the coordinator protocol gate: a registration with a
+    /// foreign protocol version must be rejected before any server state
+    /// moves, leaving the current server untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions use expect for concise failure messages"
+    )]
+    async fn register_server_rejects_unsupported_protocol_without_replacing_server() {
+        let mut harness = Harness::new();
+
+        let (server, server_id) = harness.connect();
+        let (server_read, mut server_writer) = server.into_split();
+        let mut server_reader = BufReader::new(server_read);
+        harness.pump_until(Pumped::ControlAccepted(server_id)).await;
+        send_line(
+            &mut server_writer,
+            &server_registration(COORDINATOR_PROTOCOL_VERSION),
+        )
+        .await;
+        harness.pump_until(Pumped::ControlLine(server_id)).await;
+        let registered = read_line(&mut server_reader)
+            .await
+            .expect("server registration ack");
+        assert!(registered.contains("server_registered"), "{registered}");
+
+        let (peer, peer_id) = harness.connect();
+        let (peer_read, mut peer_writer) = peer.into_split();
+        let mut peer_reader = BufReader::new(peer_read);
+        harness.pump_until(Pumped::ControlAccepted(peer_id)).await;
+        send_line(&mut peer_writer, &peer_registration("peer-1")).await;
+        harness.pump_until(Pumped::ControlLine(peer_id)).await;
+        let peer_registered = read_line(&mut peer_reader)
+            .await
+            .expect("peer registration ack");
+        assert!(
+            peer_registered.contains("srv-A"),
+            "peer must learn the current server: {peer_registered}"
+        );
+        let peer_connected = read_line(&mut server_reader)
+            .await
+            .expect("server peer notice");
+        assert!(
+            peer_connected.contains("peer_connected"),
+            "{peer_connected}"
+        );
+
+        // A second server registers with an unsupported protocol version.
+        let (intruder, intruder_id) = harness.connect();
+        let (intruder_read, mut intruder_writer) = intruder.into_split();
+        harness
+            .pump_until(Pumped::ControlAccepted(intruder_id))
+            .await;
+        send_line(
+            &mut intruder_writer,
+            &server_registration(COORDINATOR_PROTOCOL_VERSION + 1),
+        )
+        .await;
+        harness.pump_until(Pumped::ControlLine(intruder_id)).await;
+
+        let mut intruder_reader = BufReader::new(intruder_read);
+        let closed =
+            tokio::time::timeout(Duration::from_secs(5), read_until_eof(&mut intruder_reader))
+                .await;
+        assert!(
+            closed.is_ok(),
+            "rejected registration must close the offending connection"
+        );
+        assert_quiet(&mut server_reader).await;
+
+        // The original server is still current: a fresh peer learns srv-A.
+        let (second, second_id) = harness.connect();
+        let (second_read, mut second_writer) = second.into_split();
+        let mut second_reader = BufReader::new(second_read);
+        harness.pump_until(Pumped::ControlAccepted(second_id)).await;
+        send_line(&mut second_writer, &peer_registration("peer-2")).await;
+        harness.pump_until(Pumped::ControlLine(second_id)).await;
+        let second_registered = read_line(&mut second_reader)
+            .await
+            .expect("second peer registration ack");
+        assert!(
+            second_registered.contains("srv-A"),
+            "existing server must survive the rejected registration: {second_registered}"
+        );
+    }
+
+    /// Regression for public connection cleanup: when the server control
+    /// socket disconnects, its proxied public connections must be closed.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions use expect for concise failure messages"
+    )]
+    async fn server_disconnect_closes_proxied_public_connections() {
+        let temporary_directory = tempfile::tempdir().expect("temporary directory");
+        let endpoint_path = temporary_directory.path().join("generation.sock");
+        let endpoint_listener =
+            tokio::net::UnixListener::bind(&endpoint_path).expect("endpoint listener");
+        let mut harness = Harness::new();
+
+        let (server, server_id) = harness.connect();
+        let (server_read, mut server_writer) = server.into_split();
+        let mut server_reader = BufReader::new(server_read);
+        harness.pump_until(Pumped::ControlAccepted(server_id)).await;
+        let registration = json_object([
+            ("type", json_string("register_server")),
+            (
+                "protocol",
+                JsonValue::Number(f64::from(COORDINATOR_PROTOCOL_VERSION)),
+            ),
+            ("serverConnectionId", json_string("srv-A")),
+            (
+                "endpoint",
+                json_string(endpoint_path.to_string_lossy().as_ref()),
+            ),
+        ]);
+        send_line(&mut server_writer, &registration).await;
+        harness.pump_until(Pumped::ControlLine(server_id)).await;
+        let registered = read_line(&mut server_reader)
+            .await
+            .expect("server registration ack");
+        assert!(registered.contains("server_registered"), "{registered}");
+
+        // One public client proxied to the live generation endpoint.
+        let (mut public_client, coordinator_side) =
+            tokio::net::UnixStream::pair().expect("public socket pair");
+        harness.process.accept_public(coordinator_side, 9001);
+        let (mut upstream, _) = endpoint_listener
+            .accept()
+            .await
+            .expect("proxied upstream connection");
+        public_client
+            .write_all(b"ping")
+            .await
+            .expect("public write");
+        let mut echoed = [0_u8; 4];
+        upstream
+            .read_exact(&mut echoed)
+            .await
+            .expect("proxied read");
+        assert_eq!(&echoed, b"ping", "proxy must pass bytes while live");
+
+        // The server control socket dies; the proxy must follow.
+        drop(server_writer);
+        drop(server_reader);
+        harness.pump_until(Pumped::ControlClosed(server_id)).await;
+
+        let mut end = [0_u8; 1];
+        let upstream_eof = upstream.read(&mut end).await.expect("upstream read");
+        assert_eq!(upstream_eof, 0, "upstream must observe the disconnect");
+        let client_eof = public_client.read(&mut end).await.expect("public read");
+        assert_eq!(client_eof, 0, "public client must observe the disconnect");
+        harness.pump_until(Pumped::PublicClosed(9001)).await;
+    }
+
+    /// Regression for cancellation-owned cleanup: dropping a startup guard
+    /// without disarming must kill the child AND reap it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions use expect for concise failure messages"
+    )]
+    async fn cancelled_startup_guard_kills_and_reaps_child() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep child");
+        let pid = child.id().expect("child pid");
+        let guard = CoordinatorChildGuard::new(child);
+
+        // Simulates `ensure_coordinator` being cancelled mid-startup: the
+        // guard drops without `disarm` or `terminate`.
+        drop(guard);
+
+        // A killed-but-unreaped child lingers as a zombie in /proc because
+        // this test process is the child's parent; reaping removes the entry.
+        let stat_path = std::path::PathBuf::from(format!("/proc/{pid}/stat"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while stat_path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancelled startup left child {pid} unreaped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Regression for the bounded write queue: a peer that stops reading its
+    /// socket is closed at the queue bound instead of growing memory, while
+    /// the rest of the coordinator stays healthy.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test assertions use expect for concise failure messages"
+    )]
+    async fn stalled_reader_is_closed_at_the_queue_bound() {
+        let mut harness = Harness::new();
+
+        let (server, server_id) = harness.connect();
+        let (server_read, mut server_writer) = server.into_split();
+        let mut server_reader = BufReader::new(server_read);
+        harness.pump_until(Pumped::ControlAccepted(server_id)).await;
+        send_line(
+            &mut server_writer,
+            &server_registration(COORDINATOR_PROTOCOL_VERSION),
+        )
+        .await;
+        harness.pump_until(Pumped::ControlLine(server_id)).await;
+        let registered = read_line(&mut server_reader)
+            .await
+            .expect("server registration ack");
+        assert!(registered.contains("server_registered"), "{registered}");
+
+        // The peer never reads its socket, so its writer queue is the only
+        // place routed frames can pile up.
+        let (stalled, stalled_id) = harness.connect();
+        let (stalled_read, mut stalled_writer) = stalled.into_split();
+        let mut stalled_reader = BufReader::new(stalled_read);
+        harness
+            .pump_until(Pumped::ControlAccepted(stalled_id))
+            .await;
+        send_line(&mut stalled_writer, &peer_registration("slow")).await;
+        harness.pump_until(Pumped::ControlLine(stalled_id)).await;
+
+        // ~17 MiB of routed frames: enough to saturate any reasonable socket
+        // buffer and then overflow the bounded writer queue.
+        let payload = "x".repeat(4096);
+        for _ in 0..4096 {
+            send_line(
+                &mut server_writer,
+                &json_object([
+                    ("type", json_string("broadcast")),
+                    ("payload", json_string(&payload)),
+                ]),
+            )
+            .await;
+        }
+
+        let mut closed = false;
+        for _ in 0..200 {
+            if harness
+                .pump_available_until(Pumped::ControlClosed(stalled_id))
+                .await
+            {
+                closed = true;
+                break;
+            }
+        }
+        assert!(
+            closed,
+            "the stalled connection was never closed at the queue bound"
+        );
+
+        // The offending connection closes cleanly: buffered frames drain and
+        // the client observes EOF afterwards.
+        let drained =
+            tokio::time::timeout(Duration::from_secs(5), read_until_eof(&mut stalled_reader)).await;
+        assert!(drained.is_ok(), "stalled socket never reached EOF");
+
+        let saw_disconnect = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut seen = false;
+            while let Some(notice) = read_line(&mut server_reader).await {
+                if notice.contains("peer_disconnected") {
+                    seen = true;
+                    break;
+                }
+            }
+            seen
+        })
+        .await
+        .expect("server notice deadline");
+        assert!(
+            saw_disconnect,
+            "server must learn the stalled peer disconnected"
+        );
+    }
+
+    /// The queue reservation bounds single frames and cumulative bytes.
+    #[cfg(unix)]
+    #[test]
+    fn queue_reservation_bounds_bytes() {
+        let queued = Arc::new(AtomicUsize::new(0));
+        assert!(
+            !reserve_queued(&queued, MAX_QUEUED_CONTROL_BYTES + 1),
+            "a single over-limit frame must be refused"
+        );
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        assert!(reserve_queued(&queued, MAX_QUEUED_CONTROL_BYTES));
+        assert_eq!(queued.load(Ordering::Acquire), MAX_QUEUED_CONTROL_BYTES);
+        assert!(
+            !reserve_queued(&queued, 1),
+            "the bound must shed once the cap is reached"
+        );
+        assert_eq!(queued.load(Ordering::Acquire), MAX_QUEUED_CONTROL_BYTES);
+        queued.fetch_sub(MAX_QUEUED_CONTROL_BYTES, Ordering::AcqRel);
+        assert!(reserve_queued(&queued, 0));
     }
 }
