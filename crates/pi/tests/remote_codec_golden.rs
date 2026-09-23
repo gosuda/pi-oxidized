@@ -351,7 +351,7 @@ fn server_hello_version_mismatch_errors() {
         error,
         CodecError::VersionMismatch {
             expected: PROTOCOL_VERSION,
-            got: 9,
+            got: 2,
         }
     ));
 }
