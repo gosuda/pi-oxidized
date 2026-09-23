@@ -14,7 +14,9 @@ use tokio_util::sync::CancellationToken;
 use crate::auth::http::{AuthHttpClient, AuthHttpError};
 use crate::auth::oauth::radius::normalize_radius_gateway_url;
 use crate::auth::types::OAuthCredential;
-use crate::types::{Model, ModelCost, ModelInput, ThinkingLevelMap};
+use crate::types::{
+    Model, ModelCost, ModelInput, ModelInputLimits, ModelPromptCache, ThinkingLevelMap,
+};
 
 const CONFIG_PATH: &str = "/v1/config";
 const MAX_ERROR_BODY_CHARS: usize = 512;
@@ -44,6 +46,15 @@ pub struct RadiusGatewayModel {
     /// Optional provider-specific thinking-level mapping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level_map: Option<ThinkingLevelMap>,
+    /// Provider input limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_limits: Option<ModelInputLimits>,
+    /// Prompt-cache lifetimes in seconds by retention tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<ModelPromptCache>,
+    /// Default arbitrary sampling parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_params: Option<serde_json::Map<String, Value>>,
     /// Forward-compatible fields returned by the gateway.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -300,8 +311,9 @@ pub fn get_radius_credential_config(credential: &OAuthCredential) -> Option<Radi
 ///
 /// Each model uses the `pi-messages` API, the supplied `provider_id`, and the
 /// config's advertised `baseUrl`. Empty required strings, empty modality lists,
-/// and values rejected by the typed model contract are omitted; this is the
-/// necessary typed boundary after the reference's shallow filter.
+/// and values rejected by the typed model contract are omitted. Privileged
+/// typed fields (`headers`, `compat`) are stripped from gateway extras so they
+/// cannot rehydrate into [`Model`] overrides on a persisted round trip.
 #[must_use]
 pub fn get_radius_models_from_config(
     provider_id: &str,
@@ -316,9 +328,14 @@ pub fn get_radius_models_from_config(
         "reasoning",
         "thinkingLevelMap",
         "input",
+        "inputLimits",
         "cost",
+        "promptCache",
+        "samplingParams",
         "contextWindow",
         "maxTokens",
+        "headers",
+        "compat",
     ]
     .into_iter()
     .collect();
@@ -341,7 +358,10 @@ pub fn get_radius_models_from_config(
                 reasoning: model.reasoning,
                 thinking_level_map: model.thinking_level_map.clone(),
                 input: model.input.clone(),
+                input_limits: model.input_limits.clone(),
                 cost: model.cost.clone(),
+                prompt_cache: model.prompt_cache.clone(),
+                sampling_params: model.sampling_params.clone(),
                 context_window: model.context_window,
                 max_tokens: model.max_tokens,
                 headers: None,
@@ -520,5 +540,39 @@ mod tests {
         assert_eq!(models[0].api, "pi-messages");
         assert_eq!(models[0].provider, "radius-dev");
         assert_eq!(models[0].base_url, "http://models.example/v1");
+    }
+
+    #[test]
+    fn untrusted_gateway_headers_and_compat_cannot_rehydrate() {
+        let mut value = config_json();
+        value["models"][0]["headers"] = serde_json::json!({"authorization": "Bearer injected"});
+        value["models"][0]["compat"] = serde_json::json!({"thinking": true});
+
+        let config = sanitize_radius_gateway_config(&value).expect("config shape");
+        let models = get_radius_models_from_config("radius-dev", &config);
+        assert_eq!(models.len(), 1);
+        let model = &models[0];
+        assert_eq!(model.headers, None, "gateway headers must not convert");
+        assert_eq!(model.compat, None, "gateway compat must not convert");
+        assert!(!model.extra.contains_key("headers"));
+        assert!(!model.extra.contains_key("compat"));
+        assert_eq!(
+            model.extra.get("metadata"),
+            Some(&serde_json::json!({"vendor": "radius"}))
+        );
+
+        let persisted = serde_json::to_string(model).expect("model serializes");
+        assert!(!persisted.contains("Bearer injected"));
+        let persisted: Value = serde_json::from_str(&persisted).expect("persisted json");
+        assert!(persisted.get("headers").is_none());
+        assert!(persisted.get("compat").is_none());
+        let restored: Model = serde_json::from_value(persisted).expect("model deserializes");
+        assert_eq!(restored.headers, None);
+        assert_eq!(restored.compat, None);
+        assert_eq!(
+            restored.extra.get("metadata"),
+            Some(&serde_json::json!({"vendor": "radius"}))
+        );
+        assert_eq!(&restored, model);
     }
 }
