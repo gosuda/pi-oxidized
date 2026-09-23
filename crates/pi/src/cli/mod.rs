@@ -1,6 +1,7 @@
 //! Command-line parsing and metadata output.
 
 pub mod args;
+pub mod auth_command;
 pub mod bootstrap;
 pub mod config_selector;
 pub mod entry;

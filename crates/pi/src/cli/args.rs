@@ -163,6 +163,8 @@ pub struct Args {
     pub thinking: Option<ModelThinkingLevel>,
     /// `--mode`.
     pub mode: Option<Mode>,
+    /// `--use-theme <name>`.
+    pub use_theme: Option<String>,
     /// `--tui-mode` (`regular` default; explicit value overrides settings).
     pub tui_mode: Option<ScreenMode>,
     /// `--name` / `-n`.
@@ -292,15 +294,24 @@ fn parse_general_arg(arg: &str, args: &[String], i: &mut usize, result: &mut Arg
         "--offline" => result.offline = true,
         "--approve" | "-a" => result.project_trust_override = Some(true),
         "--no-approve" | "-na" => result.project_trust_override = Some(false),
-        "--mode" if *i + 1 < args.len() => {
-            *i += 1;
-            match args[*i].as_str() {
-                "text" => result.mode = Some(Mode::Text),
-                "json" => result.mode = Some(Mode::Json),
-                "rpc" => result.mode = Some(Mode::Rpc),
-                _ => {}
+        "--mode" => match args.get(*i + 1) {
+            Some(value) if !value.starts_with('-') => {
+                *i += 1;
+                match value.as_str() {
+                    "text" => result.mode = Some(Mode::Text),
+                    "json" => result.mode = Some(Mode::Json),
+                    "rpc" => result.mode = Some(Mode::Rpc),
+                    _ => result.diagnostics.push(Diagnostic {
+                        level: DiagnosticLevel::Error,
+                        message: format!("Invalid mode \"{value}\". Valid values: text, json, rpc"),
+                    }),
+                }
             }
-        }
+            _ => result.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "--mode requires text, json, or rpc".to_owned(),
+            }),
+        },
         "--tui-mode" => match args.get(*i + 1) {
             // A dash-prefixed or missing value is a usage error; the flag
             // itself is consumed by the loop, the next token is not.
@@ -450,6 +461,16 @@ fn parse_resource_arg(arg: &str, args: &[String], i: &mut usize, result: &mut Ar
             *i += 1;
             result.themes.push(args[*i].clone());
         }
+        "--use-theme" => match args.get(*i + 1) {
+            Some(value) if !value.starts_with('-') => {
+                *i += 1;
+                result.use_theme = Some(value.clone());
+            }
+            _ => result.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "--use-theme requires a theme name".to_owned(),
+            }),
+        },
         "--no-skills" | "-ns" => result.no_skills = true,
         "--no-prompt-templates" | "-np" => result.no_prompt_templates = true,
         "--no-themes" => result.no_themes = true,
@@ -472,16 +493,7 @@ fn split_comma_list(raw: &str, filter_empty: bool) -> Vec<String> {
 }
 
 fn parse_thinking_level(level: &str) -> Option<ModelThinkingLevel> {
-    match level {
-        "off" => Some(ModelThinkingLevel::Off),
-        "minimal" => Some(ModelThinkingLevel::Minimal),
-        "low" => Some(ModelThinkingLevel::Low),
-        "medium" => Some(ModelThinkingLevel::Medium),
-        "high" => Some(ModelThinkingLevel::High),
-        "xhigh" => Some(ModelThinkingLevel::Xhigh),
-        "max" => Some(ModelThinkingLevel::Max),
-        _ => None,
-    }
+    level.parse().ok()
 }
 
 #[cfg(test)]
@@ -609,6 +621,37 @@ mod tests {
                 "claude-sonnet".to_owned(),
                 "gemini-pro".to_owned()
             ]
+        );
+    }
+
+    #[test]
+    fn mode_requires_valid_value_and_use_theme_is_captured() {
+        let missing = parse_args(&args(&["--mode"]));
+        assert_eq!(missing.diagnostics[0].level, DiagnosticLevel::Error);
+        assert_eq!(
+            missing.diagnostics[0].message,
+            "--mode requires text, json, or rpc"
+        );
+
+        let invalid = parse_args(&args(&["--mode", "yaml"]));
+        assert_eq!(invalid.diagnostics[0].level, DiagnosticLevel::Error);
+        assert_eq!(
+            invalid.diagnostics[0].message,
+            "Invalid mode \"yaml\". Valid values: text, json, rpc"
+        );
+
+        let flag_value = parse_args(&args(&["--mode", "--print"]));
+        assert_eq!(
+            flag_value.diagnostics[0].message,
+            "--mode requires text, json, or rpc"
+        );
+
+        let themed = parse_args(&args(&["--use-theme", "solarized"]));
+        assert_eq!(themed.use_theme.as_deref(), Some("solarized"));
+        let missing_theme = parse_args(&args(&["--use-theme"]));
+        assert_eq!(
+            missing_theme.diagnostics[0].message,
+            "--use-theme requires a theme name"
         );
     }
 
@@ -895,11 +938,22 @@ mod tests {
     }
 
     #[test]
-    fn invalid_mode_is_ignored_and_bare_mode_is_unknown() {
-        assert_eq!(parse_args(&args(&["--mode", "xml"])).mode, None);
+    fn invalid_mode_reports_diagnostic_and_bare_mode_errors() {
+        let invalid = parse_args(&args(&["--mode", "xml"]));
+        assert_eq!(invalid.mode, None);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("Invalid mode \"xml\"") })
+        );
         let bare = parse_args(&args(&["--mode"]));
         assert_eq!(bare.mode, None);
-        assert_eq!(bare.unknown_flags.get("mode"), Some(&FlagValue::Bool));
+        assert!(bare.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("--mode requires text, json, or rpc")
+        }));
     }
 
     #[test]

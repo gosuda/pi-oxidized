@@ -23,7 +23,7 @@
 //!     pi::cli::entry::run(std::env::args().skip(1).collect(), pi::cli::entry::Io::real())
 //! }
 //! ```
-
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -221,6 +221,20 @@ impl Io {
     reason = "public entry-point signature: owned args are the stable contract since first release"
 )]
 pub fn run(args: Vec<String>, io: Io) -> ExitCode {
+    // Early auth dispatch: `pi auth …` never reaches the bootstrap pipeline.
+    let args = match crate::cli::auth_command::dispatch_auth_args(&args, io.bootstrap_io.as_ref()) {
+        crate::cli::auth_command::AuthDispatch::Handled(exit_code) => {
+            return ExitCode::from(exit_code);
+        }
+        crate::cli::auth_command::AuthDispatch::Continue(args) => args,
+    };
+    // Early internal-process dispatch: an internally spawned role runs its own
+    // process body before any bootstrap pipeline runs. Coordinator serves its
+    // control socket; unsupported roles fail fast here.
+    let args = match dispatch_internal_process_role(args) {
+        Ok(args) => args,
+        Err(exit_code) => return ExitCode::from(exit_code),
+    };
     let inputs = BootstrapInputs {
         args,
         io: io.bootstrap_io.as_ref(),
@@ -249,6 +263,72 @@ pub fn run(args: Vec<String>, io: Io) -> ExitCode {
     });
     drop(runtime);
     result
+}
+
+/// Early dispatch for internally spawned process roles.
+///
+/// The Coordinator role blocks on [`run_coordinator_process`] with the
+/// public/control socket arguments. Server and `SessionWorker` roles have no
+/// native process body yet and fail fast before the bootstrap pipeline.
+/// Malformed role values fail fast as well.
+///
+/// # Errors
+///
+/// Returns the process exit code when the role dispatch consumed the process.
+fn dispatch_internal_process_role(args: Vec<String>) -> Result<Vec<String>, u8> {
+    use crate::remote::product::process::ProcessError;
+    use crate::remote::product::{coordinator as coordinator_process, process as internal_process};
+
+    let role = match internal_process::internal_process_role() {
+        Ok(Some(role)) => role,
+        Ok(None) => return Ok(args),
+        Err(ProcessError::UnsupportedRole { role }) => {
+            crate::core::output_guard::ProductOutput::writeln(&format!(
+                "Error: unsupported internal process role: {role}"
+            ));
+            return Err(1);
+        }
+        Err(error) => {
+            crate::core::output_guard::ProductOutput::writeln(&format!(
+                "Error: failed to read internal process role: {error}"
+            ));
+            return Err(1);
+        }
+    };
+    match role {
+        internal_process::InternalProcessRole::Coordinator => {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    crate::core::output_guard::ProductOutput::writeln(&format!(
+                        "Error: failed to start runtime: {err}"
+                    ));
+                    return Err(1);
+                }
+            };
+            let result = runtime.block_on(coordinator_process::run_coordinator_process(&args));
+            drop(runtime);
+            match result {
+                Ok(()) => Err(0),
+                Err(error) => {
+                    crate::core::output_guard::ProductOutput::writeln(&format!(
+                        "Error: coordinator process failed: {error}"
+                    ));
+                    Err(1)
+                }
+            }
+        }
+        internal_process::InternalProcessRole::Server
+        | internal_process::InternalProcessRole::SessionWorker => {
+            crate::core::output_guard::ProductOutput::writeln(&format!(
+                "Error: internal process role \"{role}\" has no executable implementation"
+            ));
+            Err(1)
+        }
+    }
 }
 
 /// Async pipeline: bootstrap → dispatch. Public so tests with their own tokio
@@ -332,6 +412,22 @@ impl BootstrapIo for RealBootstrapIo {
         let _ = stderr.write_all(line.as_bytes());
         let _ = stderr.write_all(b"\n");
     }
+    fn select_missing_session_cwd(
+        &self,
+        issue: &crate::core::sessions::SessionCwdIssue,
+    ) -> Option<PathBuf> {
+        self.write_stderr(&crate::core::sessions::format_missing_session_cwd_prompt(
+            issue,
+        ));
+        self.write_stderr("Continue in the current working directory? [y/N]");
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).ok()?;
+        if answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes") {
+            Some(PathBuf::from(&issue.fallback_cwd))
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +462,8 @@ fn build_builtin_tools(
         write::WriteTool,
     };
 
-    vec![
+    #[allow(unused_mut, reason = "extended under cfg(windows) below")]
+    let mut tools: Vec<Arc<dyn pi_agent::AgentTool>> = vec![
         Arc::new(ReadTool::with_options(ReadToolOptions {
             cwd: cwd.to_path_buf(),
             auto_resize_images: settings.get_image_auto_resize(),
@@ -378,19 +475,15 @@ fn build_builtin_tools(
         Arc::new(GrepTool::new(cwd)),
         Arc::new(FindTool::new(cwd)),
         Arc::new(LsTool::new(cwd)),
-    ]
+    ];
+    #[cfg(windows)]
+    tools.push(Arc::new(
+        crate::core::tools::powershell::PowerShellTool::new(cwd),
+    ));
+    tools
 }
-
 fn thinking_level_from_str(level: &str) -> Option<pi_ai::ModelThinkingLevel> {
-    match level {
-        "off" => Some(pi_ai::ModelThinkingLevel::Off),
-        "minimal" => Some(pi_ai::ModelThinkingLevel::Minimal),
-        "low" => Some(pi_ai::ModelThinkingLevel::Low),
-        "medium" => Some(pi_ai::ModelThinkingLevel::Medium),
-        "high" => Some(pi_ai::ModelThinkingLevel::High),
-        "xhigh" => Some(pi_ai::ModelThinkingLevel::Xhigh),
-        _ => None,
-    }
+    level.parse().ok()
 }
 
 struct SessionBuildOptions {
@@ -528,7 +621,7 @@ async fn create_runtime_services(
     agent_dir: &str,
     args: &crate::cli::args::Args,
 ) -> Result<AgentSessionServices, String> {
-    create_agent_session_services_with_trust(
+    let mut services = create_agent_session_services_with_trust(
         CreateAgentSessionServicesOptions {
             cwd: PathBuf::from(cwd),
             agent_dir: Some(PathBuf::from(agent_dir)),
@@ -539,7 +632,13 @@ async fn create_runtime_services(
         args.project_trust_override,
     )
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    if let Some(theme) = args.use_theme.as_deref() {
+        let mut overrides = Map::new();
+        overrides.insert("theme".to_owned(), Value::String(theme.to_owned()));
+        services.settings_manager.apply_overrides(&overrides);
+    }
+    Ok(services)
 }
 
 struct ResolvedModels {
