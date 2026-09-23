@@ -1632,6 +1632,125 @@ pub const UI_CONTROL_METHOD: &str = "ui.control";
 /// expansion) so the host can serve `getEditorText` / `getToolsExpanded`.
 pub const UI_STATE_METHOD: &str = "ui.state";
 
+/// Open method string: correlated `session.previewBoundary` request
+/// (host → Rust). The host asks Rust to validate boundary drafts and return
+/// the projection preview; the decoder accepts only `turn_end` /
+/// `agent_before_settle` boundary names.
+pub const SESSION_PREVIEW_BOUNDARY_METHOD: &str = "session.previewBoundary";
+
+// ---------------------------------------------------------------------------
+// Boundary lifecycle wire types
+// ---------------------------------------------------------------------------
+
+/// One boundary-entry draft from a `turn_end` / `agent_before_settle`
+/// extension handler.
+///
+/// Mirrors `SessionBoundaryDraft` in the upstream extension API
+/// (`types.ts:762-795`). Variant tags remain `snake_case` while fields use the
+/// `camelCase` wire spelling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum SessionBoundaryDraftWire {
+    /// Arbitrary extension-authored entry.
+    Custom {
+        /// Extension-defined entry type.
+        custom_type: String,
+        /// Arbitrary extension payload.
+        #[serde(
+            default,
+            deserialize_with = "present_boundary_value",
+            skip_serializing_if = "Option::is_none"
+        )]
+        data: Option<Value>,
+    },
+    /// User-facing message entry.
+    CustomMessage {
+        /// Extension-defined message type.
+        custom_type: String,
+        /// Message text or content blocks.
+        content: Value,
+        /// Whether the message is shown to the user.
+        display: bool,
+        /// Optional extension details.
+        #[serde(
+            default,
+            deserialize_with = "present_boundary_value",
+            skip_serializing_if = "Option::is_none"
+        )]
+        details: Option<Value>,
+    },
+    /// Replace or remove a projected context entry.
+    ContextEdit {
+        /// Projected entry id being edited.
+        target_id: String,
+        /// Replacement content, or null to remove the entry.
+        #[serde(deserialize_with = "Option::deserialize")]
+        replacement: Option<Value>,
+    },
+    /// Compaction summary entry.
+    Compaction {
+        /// Compaction summary text.
+        summary: String,
+        /// First retained entry id, or null to retain no preceding entries.
+        #[serde(deserialize_with = "Option::deserialize")]
+        first_kept_entry_id: Option<String>,
+        /// Optional extension details.
+        #[serde(
+            default,
+            deserialize_with = "present_boundary_value",
+            skip_serializing_if = "Option::is_none"
+        )]
+        details: Option<Value>,
+        /// Usage recorded by the compaction request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<pi_ai::Usage>,
+    },
+}
+
+fn present_boundary_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
+/// Result returned from a boundary lifecycle handler.
+///
+/// Mirrors `BoundaryResult` in the upstream extension API
+/// (`types.ts:812-815`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundaryResultWire {
+    /// Draft entries returned by the handler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<Vec<SessionBoundaryDraftWire>>,
+    /// Whether the agent loop should continue after the boundary.
+    #[serde(default, rename = "continue", skip_serializing_if = "Option::is_none")]
+    pub r#continue: Option<bool>,
+}
+
+/// `session.previewBoundary` request payload (host → Rust, correlated).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPreviewBoundaryRequest {
+    /// Boundary name: `turn_end` or `agent_before_settle`
+    pub boundary: String,
+    /// Draft entries to validate
+    pub entries: Vec<SessionBoundaryDraftWire>,
+}
+
+/// `session.previewBoundary` response payload (Rust → host).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPreviewBoundaryResponse {
+    /// Validated projection preview context
+    pub context: Value,
+}
+
 /// One registered tool as extensions observe it via `pi.getAllTools()`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2382,6 +2501,81 @@ mod tests {
         assert_eq!(
             from_payload::<HelloAck>(&decoded_ack.payload)?,
             HelloAck::local()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn boundary_result_with_drafts_roundtrips() -> TestResult {
+        let wire = BoundaryResultWire {
+            entries: Some(vec![
+                SessionBoundaryDraftWire::Custom {
+                    custom_type: "note".to_owned(),
+                    data: Some(Value::Bool(true)),
+                },
+                SessionBoundaryDraftWire::CustomMessage {
+                    custom_type: "notice".to_owned(),
+                    content: Value::String("hello".to_owned()),
+                    display: true,
+                    details: None,
+                },
+                SessionBoundaryDraftWire::ContextEdit {
+                    target_id: "entry-1".to_owned(),
+                    replacement: None,
+                },
+                SessionBoundaryDraftWire::Compaction {
+                    summary: "summary".to_owned(),
+                    first_kept_entry_id: None,
+                    details: None,
+                    usage: None,
+                },
+            ]),
+            r#continue: Some(true),
+        };
+        let value = to_payload(&wire)?;
+        assert_eq!(value["entries"][0]["type"], "custom");
+        assert_eq!(value["entries"][0]["customType"], "note");
+        assert_eq!(value["entries"][2]["targetId"], "entry-1");
+        assert_eq!(value["entries"][3]["firstKeptEntryId"], Value::Null);
+        assert_eq!(from_payload::<BoundaryResultWire>(&value)?, wire);
+        Ok(())
+    }
+
+    #[test]
+    fn boundary_drafts_preserve_null_and_reject_implicit_deletion() -> TestResult {
+        let value = serde_json::json!({
+            "entries": [
+                {"type": "custom", "customType": "absent"},
+                {"type": "custom", "customType": "explicit", "data": null},
+                {
+                    "type": "custom_message", "customType": "message",
+                    "content": "notice", "display": true, "details": null
+                },
+                {"type": "context_edit", "targetId": "entry", "replacement": null},
+                {
+                    "type": "compaction", "summary": "summary", "firstKeptEntryId": null,
+                    "usage": pi_ai::Usage {
+                        input: 17,
+                        output: 3,
+                        total_tokens: 20,
+                        ..pi_ai::Usage::default()
+                    }
+                }
+            ]
+        });
+        let decoded: BoundaryResultWire = from_payload(&value)?;
+        assert_eq!(to_payload(&decoded)?, value);
+        assert!(
+            from_payload::<SessionBoundaryDraftWire>(&serde_json::json!({
+                "type": "context_edit", "targetId": "entry"
+            }))
+            .is_err()
+        );
+        assert!(
+            from_payload::<SessionBoundaryDraftWire>(&serde_json::json!({
+                "type": "compaction", "summary": "summary"
+            }))
+            .is_err()
         );
         Ok(())
     }

@@ -408,6 +408,13 @@ pub enum HostSessionRequest {
         /// Setup-entries request payload.
         request: crate::protocol::SessionSetupEntriesRequest,
     },
+    /// Correlated `session.previewBoundary` request.
+    PreviewBoundary {
+        /// Original host correlation id.
+        id: FrameId,
+        /// Preview request payload.
+        request: crate::protocol::SessionPreviewBoundaryRequest,
+    },
 }
 
 impl HostSessionRequest {
@@ -422,7 +429,8 @@ impl HostSessionRequest {
             | Self::NavigateTree { id, .. }
             | Self::SwitchSession { id, .. }
             | Self::Reload { id }
-            | Self::SetupEntries { id, .. } => *id,
+            | Self::SetupEntries { id, .. }
+            | Self::PreviewBoundary { id, .. } => *id,
         }
     }
 }
@@ -446,6 +454,7 @@ struct Shared {
     next_pending_generation: AtomicU64,
     stderr: StdMutex<String>,
     running: AtomicBool,
+    shutdown: CancellationToken,
     #[cfg(test)]
     cancel_cleanup_done: Notify,
 }
@@ -643,6 +652,7 @@ impl HostClient {
             next_pending_generation: AtomicU64::new(1),
             stderr: StdMutex::new(String::new()),
             running: AtomicBool::new(true),
+            shutdown: CancellationToken::new(),
             #[cfg(test)]
             cancel_cleanup_done: Notify::new(),
         });
@@ -1176,6 +1186,45 @@ impl HostClient {
         }
     }
 
+    /// Answer a correlated `session.previewBoundary` request from the host.
+    ///
+    /// Success serializes the validated projection preview as
+    /// `{ context: <preview object> }`; failure (invalid boundary drafts) sends
+    /// an `extension_error` frame carrying the validation message, so the host
+    /// can retain its previous preview and let a later handler replace the
+    /// drafts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload or transport error when the response cannot be
+    /// encoded or sent.
+    pub async fn respond_boundary_preview(
+        &self,
+        id: FrameId,
+        outcome: Result<serde_json::Value, String>,
+    ) -> HostResult<()> {
+        match outcome {
+            Ok(context) => {
+                self.send_typed_response(
+                    id,
+                    crate::protocol::SESSION_PREVIEW_BOUNDARY_METHOD,
+                    &crate::protocol::SessionPreviewBoundaryResponse { context },
+                    "previewBoundary response",
+                )
+                .await
+            }
+            Err(message) => {
+                self.send_error_frame(
+                    id,
+                    crate::protocol::SESSION_PREVIEW_BOUNDARY_METHOD,
+                    crate::protocol::ErrorPayload::new("extension_error", &message),
+                    "previewBoundary error",
+                )
+                .await
+            }
+        }
+    }
+
     /// Reject a correlated replacement request because another is pending.
     ///
     /// # Errors
@@ -1416,6 +1465,7 @@ impl HostClient {
     /// Returns [`HostClientError::Closed`] only if the child cannot be reaped.
     pub async fn shutdown(&self) -> HostResult<()> {
         self.shared.running.store(false, Ordering::Relaxed);
+        self.shared.shutdown.cancel();
         // Drop the outbound sender so the writer EOFs stdin.
         drop(self.cmd_tx.lock().await.take());
         drop(
@@ -1698,6 +1748,7 @@ fn fail_one(shared: &Shared, id: FrameId, err: HostClientError) {
 }
 
 fn fail_all(shared: &Shared, err: &HostClientError) {
+    shared.shutdown.cancel();
     let entries: Vec<PendingEntry> = if let Ok(mut pending) = shared.pending.lock() {
         pending.drain().map(|(_, v)| v).collect()
     } else {
@@ -1862,7 +1913,7 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
                 forward_stream_event(shared, frame);
             }
         }
-        FrameKind::Req => return dispatch_request(shared, frame),
+        FrameKind::Req => return dispatch_request(shared, frame).await,
     }
     true
 }
@@ -1888,7 +1939,7 @@ async fn dispatch(shared: &Shared, frame: Frame) -> bool {
     clippy::too_many_lines,
     reason = "callback dispatch decodes, re-checks scope, and spawns per-kind tasks"
 )]
-fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
+async fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
     let is_before = frame.method == PROVIDER_BEFORE_PAYLOAD_METHOD;
     let is_response = frame.method == PROVIDER_ON_RESPONSE_METHOD;
     if !is_before && !is_response {
@@ -1900,8 +1951,7 @@ fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
             Ok(request) => request,
             Err(error) => {
                 let message = format!("malformed provider callback request: {error}");
-                send_callback_error(shared, frame.id, &frame.method, &message);
-                return Some(true);
+                return Some(send_callback_error(shared, frame.id, &frame.method, &message).await);
             }
         };
         request.call_id
@@ -1910,8 +1960,7 @@ fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
             Ok(request) => request,
             Err(error) => {
                 let message = format!("malformed provider callback request: {error}");
-                send_callback_error(shared, frame.id, &frame.method, &message);
-                return Some(true);
+                return Some(send_callback_error(shared, frame.id, &frame.method, &message).await);
             }
         };
         request.call_id
@@ -1922,13 +1971,15 @@ fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
         .ok()
         .filter(|id| callback_registration_id(*id) == call_id)
     else {
-        send_callback_error(
-            shared,
-            frame.id,
-            &frame.method,
-            "unknown provider callback callId",
+        return Some(
+            send_callback_error(
+                shared,
+                frame.id,
+                &frame.method,
+                "unknown provider callback callId",
+            )
+            .await,
         );
-        return Some(true);
     };
     let Some((model, on_payload, on_response, scope_generation)) =
         shared.pending.lock().ok().and_then(|pending| {
@@ -1943,13 +1994,15 @@ fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
                 })
         })
     else {
-        send_callback_error(
-            shared,
-            frame.id,
-            &frame.method,
-            "provider callback scope is unavailable",
+        return Some(
+            send_callback_error(
+                shared,
+                frame.id,
+                &frame.method,
+                "provider callback scope is unavailable",
+            )
+            .await,
         );
-        return Some(true);
     };
 
     let Some(outbound) = shared
@@ -1966,13 +2019,15 @@ fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
     let payload = frame.payload.clone();
     if is_before {
         let Some(callback) = on_payload else {
-            send_callback_error(
-                shared,
-                callback_frame_id,
-                &callback_method,
-                "provider beforePayload callback is not registered",
+            return Some(
+                send_callback_error(
+                    shared,
+                    callback_frame_id,
+                    &callback_method,
+                    "provider beforePayload callback is not registered",
+                )
+                .await,
             );
-            return Some(true);
         };
         shared.runtime.spawn(async move {
             let mut request = match serde_json::from_value::<ProviderBeforePayloadRequest>(payload)
@@ -2024,13 +2079,15 @@ fn dispatch_provider_callback(shared: &Shared, frame: &Frame) -> Option<bool> {
         });
     } else {
         let Some(callback) = on_response else {
-            send_callback_error(
-                shared,
-                callback_frame_id,
-                &callback_method,
-                "provider onResponse callback is not registered",
+            return Some(
+                send_callback_error(
+                    shared,
+                    callback_frame_id,
+                    &callback_method,
+                    "provider onResponse callback is not registered",
+                )
+                .await,
             );
-            return Some(true);
         };
         shared.runtime.spawn(async move {
             let request = match serde_json::from_value::<ProviderOnResponseRequest>(payload) {
@@ -2117,12 +2174,42 @@ fn callback_scope_live(
     })
 }
 
-fn send_callback_error(shared: &Shared, id: FrameId, method: &str, message: &str) {
-    try_send_outbound(shared, callback_error_frame(id, method, message));
+async fn send_callback_error(shared: &Shared, id: FrameId, method: &str, message: &str) -> bool {
+    let outbound = shared
+        .outbound
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(tx) = outbound {
+        let delivered = tokio::select! {
+            biased;
+            () = shared.shutdown.cancelled() => return false,
+            result = tokio::time::timeout(
+                Duration::from_secs(30),
+                tx.send(callback_error_frame(id, method, message)),
+            ) => matches!(result, Ok(Ok(()))),
+        };
+        if delivered {
+            return true;
+        }
+    }
+    let message = "provider callback error delivery failed".to_owned();
+    fail_all(
+        shared,
+        &HostClientError::Closed {
+            message: message.clone(),
+            stderr: stderr_of(shared),
+        },
+    );
+    shared.running.store(false, Ordering::Relaxed);
+    let _ = shared
+        .notifications
+        .send(HostNotification::ProtocolError(message));
+    false
 }
 
-fn dispatch_request(shared: &Shared, frame: Frame) -> bool {
-    if let Some(result) = dispatch_provider_callback(shared, &frame) {
+async fn dispatch_request(shared: &Shared, frame: Frame) -> bool {
+    if let Some(result) = dispatch_provider_callback(shared, &frame).await {
         return result;
     }
     match decode_session_request(&frame) {
@@ -2130,13 +2217,8 @@ fn dispatch_request(shared: &Shared, frame: Frame) -> bool {
             forward_session_request(shared, request, &frame.method);
             return true;
         }
-        Decoded::Malformed => {
-            send_correlated_error(
-                shared,
-                frame.id,
-                &frame.method,
-                "malformed correlated request",
-            );
+        Decoded::Malformed(reason) => {
+            send_correlated_error(shared, frame.id, &frame.method, reason);
             return true;
         }
         Decoded::Unrecognized => {}
@@ -2146,8 +2228,8 @@ fn dispatch_request(shared: &Shared, frame: Frame) -> bool {
             forward_ui_request(shared, request);
             true
         }
-        Decoded::Malformed => {
-            send_correlated_error(shared, frame.id, &frame.method, "malformed UI request");
+        Decoded::Malformed(reason) => {
+            send_correlated_error(shared, frame.id, &frame.method, reason);
             true
         }
         Decoded::Unrecognized => {
@@ -2439,8 +2521,17 @@ fn send_correlated_error(shared: &Shared, id: FrameId, method: &str, message: &s
 
 enum Decoded<T> {
     Valid(T),
-    Malformed,
+    /// Payload rejected before forwarding; the diagnostic is sent to the host
+    /// as the correlated error message.
+    Malformed(&'static str),
     Unrecognized,
+}
+
+/// Boundary names accepted by the correlated `session.previewBoundary`
+/// request. Anything else fails at decode so the request never reaches the
+/// session and the host receives an explicit error.
+fn is_valid_preview_boundary(boundary: &str) -> bool {
+    boundary == "turn_end" || boundary == "agent_before_settle"
 }
 
 fn decode_session_request(frame: &Frame) -> Decoded<HostSessionRequest> {
@@ -2451,7 +2542,7 @@ fn decode_session_request(frame: &Frame) -> Decoded<HostSessionRequest> {
                     id: frame.id,
                     request,
                 }),
-                Err(_) => Decoded::Malformed,
+                Err(_) => Decoded::Malformed("malformed correlated request"),
             }
         };
     }
@@ -2475,14 +2566,32 @@ fn decode_session_request(frame: &Frame) -> Decoded<HostSessionRequest> {
         crate::protocol::SESSION_RELOAD_METHOD => {
             match from_payload::<crate::protocol::SessionReloadRequest>(&frame.payload) {
                 Ok(_) => Decoded::Valid(HostSessionRequest::Reload { id: frame.id }),
-                Err(_) => Decoded::Malformed,
+                Err(_) => Decoded::Malformed("malformed correlated request"),
             }
         }
         crate::protocol::SESSION_SETUP_ENTRIES_METHOD => {
             decode!(crate::protocol::SessionSetupEntriesRequest, SetupEntries)
         }
+        crate::protocol::SESSION_PREVIEW_BOUNDARY_METHOD => decode_preview_boundary(frame),
         _ => Decoded::Unrecognized,
     }
+}
+
+fn decode_preview_boundary(frame: &Frame) -> Decoded<HostSessionRequest> {
+    let Ok(request) =
+        from_payload::<crate::protocol::SessionPreviewBoundaryRequest>(&frame.payload)
+    else {
+        return Decoded::Malformed("malformed previewBoundary request");
+    };
+    if !is_valid_preview_boundary(&request.boundary) {
+        return Decoded::Malformed(
+            "previewBoundary boundary must be turn_end or agent_before_settle",
+        );
+    }
+    Decoded::Valid(HostSessionRequest::PreviewBoundary {
+        id: frame.id,
+        request,
+    })
 }
 
 fn decode_ui_request(frame: &Frame) -> Decoded<HostUiRequest> {
@@ -2496,7 +2605,7 @@ fn decode_ui_request(frame: &Frame) -> Decoded<HostUiRequest> {
                     id: frame.id,
                     request,
                 }),
-                Err(_) => Decoded::Malformed,
+                Err(_) => Decoded::Malformed("malformed UI request"),
             }
         };
     }
@@ -4598,7 +4707,10 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: Vec::new(),
+            input_limits: None,
             cost: ModelCost::default(),
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 0,
             max_tokens: 0,
             headers: None,
@@ -4663,6 +4775,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_error_waits_for_outbound_capacity() -> R {
+        let (client, _host) = make_pair().await;
+        let (outbound, mut receiver) = mpsc::channel(1);
+        outbound.send(before_payload_frame(9199)).await?;
+        *client
+            .shared
+            .outbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outbound);
+        let frame = Frame {
+            id: 9200,
+            kind: FrameKind::Req,
+            method: PROVIDER_BEFORE_PAYLOAD_METHOD.to_owned(),
+            payload: serde_json::json!({ "callId": "9001" }),
+        };
+        let delivery = dispatch_provider_callback(&client.shared, &frame);
+        tokio::pin!(delivery);
+        assert!(futures::poll!(delivery.as_mut()).is_pending());
+        assert_eq!(
+            receiver.recv().await.ok_or("missing queued frame")?.id,
+            9199
+        );
+        assert_eq!(delivery.await, Some(true));
+        let error = receiver.recv().await.ok_or("missing callback error")?;
+        assert_eq!(error.id, frame.id);
+        assert_eq!(error.kind, FrameKind::Error);
+        assert_eq!(error.method, frame.method);
+        assert!(client.is_running());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callback_error_fails_transport_when_outbound_closes() -> R {
+        let (client, _host) = make_pair().await;
+        let mut notifications = client.subscribe_notifications();
+        let (outbound, receiver) = mpsc::channel(1);
+        *client
+            .shared
+            .outbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outbound);
+        drop(receiver);
+        let frame = before_payload_frame(9201);
+        assert_eq!(
+            dispatch_provider_callback(&client.shared, &frame).await,
+            Some(false)
+        );
+        assert!(!client.is_running());
+        assert!(matches!(
+            notifications.recv().await?,
+            HostNotification::ProtocolError(_)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_callback_error_waiting_for_capacity() -> R {
+        let (client, _host) = make_pair().await;
+        let (outbound, mut receiver) = mpsc::channel(1);
+        outbound.send(before_payload_frame(9199)).await?;
+        *client
+            .shared
+            .outbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outbound);
+        let frame = before_payload_frame(9202);
+        let delivery = dispatch_provider_callback(&client.shared, &frame);
+        tokio::pin!(delivery);
+        assert!(futures::poll!(delivery.as_mut()).is_pending());
+        client.shutdown().await?;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), delivery).await?,
+            Some(false)
+        );
+        assert_eq!(
+            receiver.recv().await.ok_or("missing queued frame")?.id,
+            9199
+        );
+        assert!(receiver.recv().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn malformed_before_payload_callback_gets_correlated_error() -> R {
         let (client, mut host) = make_pair().await;
         let frame = Frame {
@@ -4673,7 +4868,7 @@ mod tests {
         };
 
         assert_eq!(
-            dispatch_provider_callback(&client.shared, &frame),
+            dispatch_provider_callback(&client.shared, &frame).await,
             Some(true)
         );
 
@@ -4702,7 +4897,7 @@ mod tests {
         };
 
         assert_eq!(
-            dispatch_provider_callback(&client.shared, &frame),
+            dispatch_provider_callback(&client.shared, &frame).await,
             Some(true)
         );
 
@@ -4736,7 +4931,7 @@ mod tests {
         let (id, generation) = insert_callback_scope(&client, Some(on_payload), None);
 
         assert_eq!(
-            dispatch_provider_callback(&client.shared, &before_payload_frame(9100)),
+            dispatch_provider_callback(&client.shared, &before_payload_frame(9100)).await,
             Some(true)
         );
 
@@ -4776,7 +4971,7 @@ mod tests {
         let (id, generation) = insert_callback_scope(&client, None, Some(on_response));
 
         assert_eq!(
-            dispatch_provider_callback(&client.shared, &on_response_frame(9101)),
+            dispatch_provider_callback(&client.shared, &on_response_frame(9101)).await,
             Some(true)
         );
         assert!(matches!(
@@ -4808,7 +5003,7 @@ mod tests {
         let _ = insert_callback_scope(&client, Some(on_payload), None);
 
         assert_eq!(
-            dispatch_provider_callback(&client.shared, &before_payload_frame(9100)),
+            dispatch_provider_callback(&client.shared, &before_payload_frame(9100)).await,
             Some(true)
         );
 
@@ -4836,7 +5031,7 @@ mod tests {
         let _ = insert_callback_scope(&client, None, Some(on_response));
 
         assert_eq!(
-            dispatch_provider_callback(&client.shared, &on_response_frame(9101)),
+            dispatch_provider_callback(&client.shared, &on_response_frame(9101)).await,
             Some(true)
         );
 

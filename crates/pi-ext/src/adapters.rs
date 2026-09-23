@@ -471,6 +471,7 @@ impl Provider for ExtensionProvider {
         // Serialize model/context/options before spawning so no lock is held
         // across the host await (prepare_request already completed upstream).
         let model_value = serde_json::to_value(model).unwrap_or(Value::Null);
+        let context = extension_context(context);
         let context_value = serde_json::to_value(&context).unwrap_or(Value::Null);
         let options_value = stream_options_wire(&options);
         let mut payload = Map::new();
@@ -592,6 +593,27 @@ impl Provider for ExtensionProvider {
 
     fn deferred(&self) -> Option<&DeferredCallbacks> {
         self.deferred.as_ref()
+    }
+}
+
+fn extension_context(context: Context) -> Context {
+    if !context
+        .messages
+        .iter()
+        .any(|message| matches!(message, pi_ai::Message::System(_)))
+    {
+        return context;
+    }
+    let mut transcript = pi_ai::transcript::normalize_context(context);
+    let prompt = pi_ai::transcript::get_current_system_prompt(&transcript.messages);
+    let tools = pi_ai::transcript::get_current_tools(&transcript.messages);
+    transcript
+        .messages
+        .retain(|message| !matches!(message, pi_ai::Message::System(_)));
+    Context {
+        system_prompt: (!prompt.is_empty()).then_some(prompt),
+        messages: transcript.messages,
+        tools: (!tools.is_empty()).then_some(tools),
     }
 }
 
@@ -1976,6 +1998,67 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn extension_provider_replays_system_changes_into_pinned_context() -> R {
+        let (client, mut host) = make_pair().await;
+        let provider = ExtensionProvider::new("custom", Arc::new(client));
+        let tool = pi_ai::Tool {
+            name: "old_tool".to_owned(),
+            description: "Old tool".to_owned(),
+            parameters: serde_json::json!({"type": "object"}),
+            constrained_sampling: None,
+        };
+        let mut update = pi_ai::SystemMessage::new("new policy", 2);
+        update.tools_removed = Some(vec![pi_ai::ToolReference {
+            name: tool.name.clone(),
+        }]);
+        update.tools_added = Some(vec![pi_ai::Tool {
+            name: "new_tool".to_owned(),
+            description: "New tool".to_owned(),
+            ..tool.clone()
+        }]);
+        let context = Context {
+            system_prompt: Some("old policy".to_owned()),
+            tools: Some(vec![tool]),
+            messages: vec![
+                pi_ai::Message::User(pi_ai::UserMessage::new(
+                    pi_ai::UserMessageContent::Text("question".to_owned()),
+                    1,
+                )),
+                pi_ai::Message::System(Box::new(update)),
+            ],
+        };
+        let mut stream = provider.stream(&base_model_defaults(), context, StreamOptions::default());
+        let request = host.require_frame("provider.stream").await?;
+        let wire = &request.payload["context"];
+        assert_eq!(wire["systemPrompt"], "old policy\n\nnew policy");
+        assert_eq!(
+            wire["tools"],
+            serde_json::json!([{
+                "name": "new_tool", "description": "New tool",
+                "parameters": {"type": "object"}
+            }])
+        );
+        assert_eq!(
+            wire["messages"],
+            serde_json::json!([{
+                "role": "user", "content": "question", "timestamp": 1
+            }])
+        );
+        host.write_frame(&Frame::response(
+            request.id,
+            Method::Notify,
+            serde_json::json!({}),
+        ))
+        .await?;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn real_host_source_provider_streams_start_text_done_and_tears_down() -> R {
@@ -2439,7 +2522,10 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: Vec::new(),
+            input_limits: None,
             cost: ModelCost::default(),
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 0,
             max_tokens: 0,
             headers: None,
