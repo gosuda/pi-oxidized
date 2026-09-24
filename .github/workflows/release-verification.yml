@@ -168,6 +168,13 @@ jobs:
       - name: Install reference dependencies
         run: npm ci --ignore-scripts --prefix .references/pi-2.0
 
+      # JS checks import the native reference's TypeScript sources directly
+      # (session-interop, bench workers); a bare checkout has no node_modules.
+      # Musl legs only link reference source into the sidecar build.
+      - name: Install native reference dependencies
+        if: matrix.musl != 'true'
+        run: npm ci --ignore-scripts --prefix .references/pi
+
       # Bench workers and compat generators import reference dist bundles
       # (gitignored; absent after a bare checkout). Non-musl legs run those
       # suites; musl legs only link reference source into the sidecar build.
