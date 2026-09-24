@@ -1,6 +1,6 @@
 /**
  * Acceptance tests: widget slots, stale generation, crash isolation,
- * all 35 lifecycle methods, runtime extension loading, and compiled artifacts.
+ * all 39 lifecycle methods, runtime extension loading, and compiled artifacts.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -507,13 +507,13 @@ describe("acceptance: crash isolation", () => {
 });
 
 // ===========================================================================
-// 4. All 35 lifecycle methods
+// 4. All 39 lifecycle methods
 // ===========================================================================
 
-describe("acceptance: all 35 lifecycle events", () => {
-	test("runner recognizes handlers for all 35 event types", async () => {
+describe("acceptance: all 39 lifecycle events", () => {
+	test("runner recognizes handlers for all 39 event types", async () => {
 		const { runner } = await makeRunner(allEventsFactory, "all-events.ts");
-		expect(ALL_EVENTS).toHaveLength(35);
+		expect(ALL_EVENTS).toHaveLength(39);
 		expect(ALL_EVENT_TYPES).toEqual(ALL_EVENTS);
 		expect(LEAN_EVENT_TYPES).toEqual(ALL_EVENTS);
 		for (const event of ALL_EVENTS) {
@@ -521,7 +521,7 @@ describe("acceptance: all 35 lifecycle events", () => {
 		}
 	});
 
-	test("host reports all 35 registered handlers", async () => {
+	test("host reports all 39 registered handlers", async () => {
 		const { collector, stdin, host, runPromise } = await connectHost([allEventsFactory]);
 		stdin.push(Buffer.from(encodeFrameString({
 			id: 199,
@@ -536,7 +536,7 @@ describe("acceptance: all 35 lifecycle events", () => {
 		await runPromise.catch(() => void 0);
 	});
 
-	test("all 35 events can be emitted without error and exactly once", async () => {
+	test("all 39 events can be emitted without error and exactly once", async () => {
 		const calls = new Map<string, number>();
 		const recordingFactory: ExtensionFactory = (pi) => {
 			for (const event of ALL_EVENTS) {
