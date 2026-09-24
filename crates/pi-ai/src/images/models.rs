@@ -9,7 +9,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, join_all};
+use indexmap::IndexMap;
 
 use super::provider::ImagesProvider;
 use super::types::{AssistantImages, ImagesContext, ImagesModel, ImagesOptions};
@@ -104,7 +105,7 @@ pub trait MutableImagesModels: ImagesModels {
 }
 
 struct ImagesModelsImpl {
-    providers: Mutex<BTreeMap<String, Arc<dyn ImagesProvider>>>,
+    providers: Mutex<IndexMap<String, Arc<dyn ImagesProvider>>>,
     credentials: Arc<dyn CredentialStore>,
     auth_context: Arc<dyn AuthContext>,
 }
@@ -153,11 +154,8 @@ impl ImagesModels for ImagesModelsImpl {
                 // The frozen all-providers path never rejects: every
                 // per-provider failure is captured by the fan-out.
                 let entries = self.get_providers();
-                for entry in entries {
-                    if let Some(refresh) = entry.refresh_models() {
-                        let _ignored = refresh.await;
-                    }
-                }
+                let refreshes = entries.iter().filter_map(|entry| entry.refresh_models());
+                drop(join_all(refreshes).await);
                 return Ok(());
             };
 
@@ -227,7 +225,7 @@ impl MutableImagesModels for ImagesModelsImpl {
         self.providers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(id);
+            .shift_remove(id);
     }
 
     fn clear_providers(&self) {
@@ -349,7 +347,7 @@ fn merge_optional_env(
 #[must_use]
 pub fn create_images_models(options: ImagesModelsOptions) -> Arc<dyn MutableImagesModels> {
     Arc::new(ImagesModelsImpl {
-        providers: Mutex::new(BTreeMap::new()),
+        providers: Mutex::new(IndexMap::new()),
         credentials: options
             .credentials
             .unwrap_or_else(|| Arc::new(InMemoryCredentialStore::default())),

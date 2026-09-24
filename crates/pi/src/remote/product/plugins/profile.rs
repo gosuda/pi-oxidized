@@ -263,7 +263,7 @@ async fn write_profile(
     let bytes = serde_json::to_vec_pretty(profile)?;
     fs::write(&temporary, bytes).await?;
     set_private_permissions(&temporary).await?;
-    fs::rename(&temporary, path).await?;
+    replace_file(&temporary, path).await?;
     set_private_permissions(path).await?;
     Ok(())
 }
@@ -287,6 +287,41 @@ async fn set_private_permissions(path: &Path) -> Result<(), PluginProfileError> 
         let _ = path;
     }
     Ok(())
+}
+
+/// Replaces `path` with `temporary`, including when `path` already exists.
+///
+/// `tokio::fs::rename` refuses to replace an existing destination on Windows,
+/// which would fail every profile update after the first write. Rotate through
+/// a sibling backup instead of deleting first: a crash leaves either the
+/// previous profile or the backup behind, so no valid profile is destroyed to
+/// install the new one. The backup is removed on success and reclaimed on the
+/// next write when one lingers.
+#[cfg(windows)]
+async fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".bak");
+    let backup = PathBuf::from(backup);
+    let _ = fs::remove_file(&backup).await;
+    match fs::rename(path, &backup).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if let Err(error) = fs::rename(temporary, path).await {
+        let _ = fs::rename(&backup, path).await;
+        return Err(error);
+    }
+    let _ = fs::remove_file(&backup).await;
+    Ok(())
+}
+
+/// Replaces `path` with `temporary`, including when `path` already exists.
+///
+/// POSIX rename replaces atomically, so no rotation is needed.
+#[cfg(not(windows))]
+async fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, path).await
 }
 
 fn normalize_paths(paths: &[String]) -> Result<Vec<String>, PluginProfileError> {
