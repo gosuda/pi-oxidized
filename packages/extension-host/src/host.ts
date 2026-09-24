@@ -78,16 +78,20 @@ export const ALL_EVENT_TYPES = [
 	"session_before_fork",
 	"session_before_compact",
 	"session_compact",
+	"session_compact_failed",
 	"session_shutdown",
 	"session_before_tree",
 	"session_tree",
 	"context",
+	"context_with_system",
+	"cache_warming_decision",
 	"before_provider_request",
 	"before_provider_headers",
 	"after_provider_response",
 	"before_agent_start",
 	"agent_start",
 	"agent_end",
+	"agent_before_settle",
 	"agent_settled",
 	"ui_prompt_start",
 	"ui_prompt_end",
@@ -1963,6 +1967,37 @@ export class ExtensionHost {
 		};
 	}
 
+	/**
+	 * Reconstruct `onPayload`/`onResponse` on a provider options object from
+	 * the request's `callbacks` flags. Rust serializes callback availability
+	 * there; each installed proxy issues the correlated `provider.*` request
+	 * back with the originating frame id as `callId`.
+	 */
+	private installProviderWireCallbacks(
+		id: number,
+		p: Record<string, unknown>,
+		options: Record<string, unknown>,
+	): void {
+		const callbacks = isRecord(p["callbacks"]) ? p["callbacks"] : undefined;
+		if (callbacks?.["beforePayload"] === true) {
+			options["onPayload"] = async (payload: unknown) => {
+				const frame = await this.client.request("provider.beforePayload" as Method, {
+					callId: String(id),
+					payload,
+				});
+				return isRecord(frame.payload) ? frame.payload["payload"] : undefined;
+			};
+		}
+		if (callbacks?.["onResponse"] === true) {
+			options["onResponse"] = async (response: unknown) => {
+				await this.client.request("provider.onResponse" as Method, {
+					callId: String(id),
+					response,
+				});
+			};
+		}
+	}
+
 	private applyProviderOperation(operation: ProviderRegistrationOperation): void {
 		if (operation.kind === "native") {
 			const id = operation.provider["id"];
@@ -2560,6 +2595,7 @@ export class ExtensionHost {
 			...(rawOptions ?? {}),
 			signal: controller.signal,
 		};
+		this.installProviderWireCallbacks(id, p, options);
 		try {
 			const stream = config.streamSimple(p["model"] as Model<string>, p["context"] as Context, options as SimpleStreamOptions);
 			for await (const event of stream) {
@@ -2628,6 +2664,7 @@ export class ExtensionHost {
 			wait: 0,
 			signal: controller.signal,
 		};
+		this.installProviderWireCallbacks(id, p, options);
 		try {
 			const stream = config.fetchDeferred(p["model"] as Model<string>, rawHandle, options as SimpleStreamOptions);
 			for await (const event of stream) {

@@ -1479,6 +1479,7 @@ export class LeanRunner {
 			...(rawOptions ?? {}),
 			signal: controller.signal,
 		};
+		this.installProviderWireCallbacks(id, p, options);
 		try {
 			const stream = registered.provider.streamSimple(p["model"], p["context"], options);
 			for await (const event of stream) {
@@ -1504,6 +1505,37 @@ export class LeanRunner {
 			});
 		} finally {
 			this.inFlightProviders.delete(id);
+		}
+	}
+
+	/**
+	 * Reconstruct `onPayload`/`onResponse` on a provider options object from
+	 * the request's `callbacks` flags. Rust serializes callback availability
+	 * there; each installed proxy issues the correlated `provider.*` request
+	 * back with the originating frame id as `callId`.
+	 */
+	private installProviderWireCallbacks(
+		id: number,
+		p: Record<string, unknown>,
+		options: Record<string, unknown>,
+	): void {
+		const callbacks = isRecord(p["callbacks"]) ? p["callbacks"] : undefined;
+		if (callbacks?.["beforePayload"] === true) {
+			options["onPayload"] = async (payload: unknown) => {
+				const frame = await this.client.request("provider.beforePayload" as Method, {
+					callId: String(id),
+					payload,
+				});
+				return isRecord(frame.payload) ? frame.payload["payload"] : undefined;
+			};
+		}
+		if (callbacks?.["onResponse"] === true) {
+			options["onResponse"] = async (response: unknown) => {
+				await this.client.request("provider.onResponse" as Method, {
+					callId: String(id),
+					response,
+				});
+			};
 		}
 	}
 	private async handleProviderFetchDeferred(id: number, p: Record<string, unknown>): Promise<void> {
@@ -1541,6 +1573,7 @@ export class LeanRunner {
 			wait: 0,
 			signal: controller.signal,
 		};
+		this.installProviderWireCallbacks(id, p, options);
 		try {
 			const stream = registered.provider.fetchDeferred(model, rawHandle, options);
 			for await (const event of stream) {
