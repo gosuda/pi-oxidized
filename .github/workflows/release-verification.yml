@@ -101,9 +101,10 @@ jobs:
 
       # Generators and native-behavior verifiers read the native authority at
       # .references/pi (reference-identity.ts NATIVE_REFERENCE_ROOT); without
-      # it assertNativeReference fails closed on every non-musl leg.
+      # it assertNativeReference fails closed. Musl legs need it too: the
+      # reconstruct step below runs unconditionally and the musl sidecar links
+      # reference source.
       - name: Checkout native reference (pinned)
-        if: matrix.musl != 'true'
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           repository: earendil-works/pi
@@ -112,7 +113,6 @@ jobs:
           persist-credentials: false
 
       - name: Verify native reference pin
-        if: matrix.musl != 'true'
         shell: bash
         run: |
           test "$(git -C .references/pi rev-parse HEAD)" = "95fbc04997eaee961eb673fa7923e9220609ebd5"
