@@ -1872,6 +1872,9 @@ export async function captureReference(
 		const metafile = parseJson(metafileText, "metafile.json");
 		const inputsRaw = metafile["inputs"];
 		const inputsRecord = asRecord(inputsRaw, "metafile inputs");
+		const trackedFiles = new Set(
+			gitOutput(root, ["ls-files", "-z"]).split("\0").filter((entry) => entry !== ""),
+		);
 		const inputs: Record<string, string> = {};
 		for (const path of Object.keys(inputsRecord)) {
 			// The provider-data manifest embeds its own generation timestamp
@@ -1886,7 +1889,17 @@ export async function captureReference(
 			// and can never reproduce a capture either. They carry model-list
 			// data, not staged code, so skipping them loses no exposure signal.
 			if (path.includes("packages/ai/src/providers/data/") && path.endsWith(".json")) continue;
-			inputs[path] = sha256FileAt(resolve(hostDir, path));
+			// Bun resolves `file:` devDependencies (the .references checkout)
+			// to absolute machine-local paths. Only git-tracked inputs can be
+			// hashed on another checkout, so untracked or out-of-repo inputs
+			// are skipped rather than recorded as machine-local absolutes.
+			const resolved = resolve(hostDir, path);
+			const repoRelative = relative(root, resolved).split("\\").join("/");
+			if (repoRelative === "" || repoRelative.startsWith("..") || isAbsolute(repoRelative)) {
+				continue;
+			}
+			if (!trackedFiles.has(repoRelative)) continue;
+			inputs[relative(hostDir, resolved)] = sha256FileAt(resolved);
 		}
 		const metafileProjection: MetafileProjection = {
 			schema: METAFILE_PROJECTION_SCHEMA,
