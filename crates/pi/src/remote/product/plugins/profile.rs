@@ -219,6 +219,7 @@ pub fn session_profile_path(directory: &Path, server_id: &ServerId, session_path
 }
 
 async fn read_profile(path: &Path) -> Result<PluginPackageProfile, PluginProfileError> {
+    restore_stranded_backup(path).await;
     let contents = fs::read_to_string(path).await?;
     let profile: PluginPackageProfile = serde_json::from_str(&contents)?;
     if profile.version != PLUGIN_PACKAGE_PROFILE_VERSION {
@@ -269,10 +270,31 @@ async fn write_profile(
 }
 
 async fn remove_profile(path: &Path) -> Result<(), PluginProfileError> {
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".bak");
+    let _ = fs::remove_file(PathBuf::from(backup)).await;
     match fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Restores a sibling `.bak` left behind by a publish that died between
+/// `path -> .bak` and `.tmp -> path` (Windows rotation in `replace_file`).
+/// When `path` is absent and the backup exists, the backup is the only
+/// recoverable profile, so it is renamed back before the read reports the
+/// profile missing. Best-effort: a failed restore leaves the backup in
+/// place for the next attempt.
+async fn restore_stranded_backup(path: &Path) {
+    if fs::metadata(path).await.is_ok() {
+        return;
+    }
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".bak");
+    let backup = PathBuf::from(backup);
+    if fs::metadata(&backup).await.is_ok() {
+        let _ = fs::rename(&backup, path).await;
     }
 }
 
@@ -316,6 +338,12 @@ async fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
     let mut backup = path.as_os_str().to_os_string();
     backup.push(".bak");
     let backup = PathBuf::from(backup);
+    // A crash between `path -> .bak` and `.tmp -> path` leaves the only valid
+    // profile under the backup name. Restore it before rotating so the write
+    // cannot silently discard it.
+    if fs::metadata(path).await.is_err() && fs::metadata(&backup).await.is_ok() {
+        let _ = fs::rename(&backup, path).await;
+    }
     let _ = fs::remove_file(&backup).await;
     match fs::rename(path, &backup).await {
         Ok(()) => {}
@@ -404,4 +432,80 @@ fn hex_prefix(bytes: &[u8], digits: usize) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn profile_with(path: &Path) -> PluginPackageProfile {
+        PluginPackageProfile {
+            version: PLUGIN_PACKAGE_PROFILE_VERSION,
+            session_path: None,
+            package_paths: vec![path.to_string_lossy().into_owned()],
+        }
+    }
+
+    #[tokio::test]
+    async fn read_profile_restores_stranded_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".bak");
+        let backup = PathBuf::from(backup);
+        let package = directory.path().join("pkg");
+        let profile = profile_with(&package);
+        fs::write(&backup, serde_json::to_vec(&profile).unwrap())
+            .await
+            .unwrap();
+
+        let restored = read_profile(&path).await.unwrap();
+        assert_eq!(restored.package_paths, profile.package_paths);
+        assert!(path.exists());
+        assert!(!backup.exists());
+    }
+
+    #[tokio::test]
+    async fn read_profile_keeps_primary_over_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".bak");
+        let backup = PathBuf::from(backup);
+        let primary_pkg = directory.path().join("primary");
+        let backup_pkg = directory.path().join("backup");
+        fs::write(
+            &path,
+            serde_json::to_vec(&profile_with(&primary_pkg)).unwrap(),
+        )
+        .await
+        .unwrap();
+        fs::write(
+            &backup,
+            serde_json::to_vec(&profile_with(&backup_pkg)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let restored = read_profile(&path).await.unwrap();
+        assert_eq!(
+            restored.package_paths,
+            vec![primary_pkg.to_string_lossy().into_owned()]
+        );
+        assert!(backup.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_profile_clears_stranded_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".bak");
+        let backup = PathBuf::from(backup);
+        fs::write(&backup, b"{}").await.unwrap();
+
+        remove_profile(&path).await.unwrap();
+        assert!(!backup.exists());
+    }
 }
