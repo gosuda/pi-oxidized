@@ -1093,4 +1093,35 @@ mod tests {
             "a deleted session must not resurrect from its backup"
         );
     }
+
+    #[expect(clippy::expect_used, reason = "test assertions use expect")]
+    #[tokio::test]
+    async fn list_deduplicates_primary_with_stale_backup() {
+        let cx = Context::background();
+        let root = tempdir().expect("root tempdir");
+        let cwd_dir = tempdir().expect("cwd tempdir");
+        let cwd = cwd_dir.path().to_string_lossy().into_owned();
+        let repo = JsonlSessionRepo::new(root.path());
+        let metadata = create_closed_metadata(&repo, &cwd, "dedup-list").await;
+        // A crashed Windows publish can leave both the primary and a stale
+        // backup; whichever order read_dir yields them, the session lists once.
+        let mut backup = metadata.path.as_os_str().to_os_string();
+        backup.push(".bak");
+        fs::copy(&metadata.path, PathBuf::from(backup)).expect("seed stale backup");
+
+        let listed = repo
+            .list(
+                Some(JsonlSessionListOptions {
+                    cwd: Some(cwd.clone()),
+                }),
+                &cx,
+            )
+            .await
+            .expect("list sessions");
+        let matches = listed
+            .iter()
+            .filter(|entry| entry.id == "dedup-list")
+            .count();
+        assert_eq!(matches, 1, "primary plus stale backup lists once");
+    }
 }

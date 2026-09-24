@@ -180,7 +180,9 @@ pub(super) async fn list_session_files(
             directories
         };
 
-        let mut files = Vec::new();
+        // A set, not a vec: a `.jsonl.bak` observed before its primary adds the
+        // canonical path, and the later `.jsonl` entry must not add it twice.
+        let mut files = std::collections::BTreeSet::new();
         for directory in directories {
             let entries = match fs::read_dir(&directory) {
                 Ok(entries) => entries,
@@ -209,7 +211,7 @@ pub(super) async fn list_session_files(
                 let file_name = entry.file_name();
                 let file_name = file_name.to_string_lossy();
                 if file_name.ends_with(".jsonl") {
-                    files.push(entry.path());
+                    files.insert(entry.path());
                     continue;
                 }
                 // A `.jsonl.bak` sibling is the only recoverable session after
@@ -219,14 +221,13 @@ pub(super) async fn list_session_files(
                 if file_name.ends_with(".jsonl.bak") {
                     let primary = entry.path().with_extension("");
                     super::storage::restore_stranded_backup(&primary);
-                    if primary.exists() && !files.contains(&primary) {
-                        files.push(primary);
+                    if primary.exists() {
+                        files.insert(primary);
                     }
                 }
             }
         }
-        files.sort();
-        Ok(files)
+        Ok(files.into_iter().collect())
     })
     .await
     .map_err(|source| {

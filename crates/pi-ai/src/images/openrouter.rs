@@ -576,10 +576,12 @@ fn request_headers(model: &ImagesModel, options: &ImagesOptions, api_key: &str) 
     }
     if let Some(option_headers) = options.headers.as_ref() {
         for (name, value) in option_headers {
-            let Some(value) = value else { continue };
-            // JS object spread replaces exact (case-sensitive) keys.
+            // JS object spread replaces exact (case-sensitive) keys; a null
+            // suppresses the model default with the same name.
             record.retain(|(existing, _)| existing != name);
-            record.push((name.clone(), value.clone()));
+            if let Some(value) = value {
+                record.push((name.clone(), value.clone()));
+            }
         }
     }
 
@@ -1263,12 +1265,14 @@ mod tests {
         let mut model = model();
         model.headers = Some(BTreeMap::from([
             ("X-Title".to_owned(), "pi".to_owned()),
+            ("X-Session".to_owned(), "affinity".to_owned()),
             ("Authorization".to_owned(), "Bearer stale".to_owned()),
         ]));
         let options = ImagesOptions {
             headers: Some(BTreeMap::from([
                 ("X-Title".to_owned(), Some("override".to_owned())),
                 ("X-Drop".to_owned(), None),
+                ("X-Session".to_owned(), None),
                 ("Authorization".to_owned(), Some("Bearer option".to_owned())),
             ])),
             ..ImagesOptions::default()
@@ -1289,6 +1293,8 @@ mod tests {
             .expect("ascii");
         assert_eq!(authorization, "Bearer sk-live");
         assert!(headers.get("X-Drop").is_none());
+        // A None option value suppresses the model default with the same name.
+        assert!(headers.get("X-Session").is_none());
     }
 
     #[test]

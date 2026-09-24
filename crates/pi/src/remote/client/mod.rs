@@ -998,10 +998,20 @@ impl ClientCore {
         for sender in pending {
             let _ = sender.send(Err(error.clone()));
         }
-        self.fire_connection_state(&ConnectionStateChange {
-            state: ConnectionState::Disconnected,
-            error: Some(error),
-        });
+        // A connect() that raced in after the lock was released has already
+        // installed a new generation and fired Connecting; firing Disconnected
+        // for the superseded connection would publish a state the client no
+        // longer holds.
+        let still_current = lock(&self.inner)
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.id == connection_id);
+        if still_current {
+            self.fire_connection_state(&ConnectionStateChange {
+                state: ConnectionState::Disconnected,
+                error: Some(error),
+            });
+        }
     }
 
     fn on_service_update(&self, connection_id: u64, subscription_id: &str, update: &JsonValue) {

@@ -756,11 +756,31 @@ fn deferred_fetch_stream(
                 }
                 event = stream.next_event() => match event {
                     Some(frame) => {
-                        if let Some(event) = decode_provider_stream_event(&frame.payload)
-                            && tx.send(Ok(event)).await.is_err()
-                        {
-                            let _ = stream.cancel(methods::PROVIDER_CANCEL);
-                            return;
+                        let Some(event) = decode_provider_stream_event(&frame.payload) else {
+                            continue;
+                        };
+                        // A full channel must not park the loop: race the
+                        // delivery against cancellation and the deadline so a
+                        // stalled consumer cannot keep the host request alive.
+                        let delivered = tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => None,
+                            () = tokio::time::sleep_until(deadline) => None,
+                            result = tx.send(Ok(event)) => Some(result),
+                        };
+                        match delivered {
+                            Some(Ok(())) => {}
+                            Some(Err(_)) => {
+                                let _ = stream.cancel(methods::PROVIDER_CANCEL);
+                                return;
+                            }
+                            None => {
+                                let _ = stream.cancel(methods::PROVIDER_CANCEL);
+                                let _ = tx.try_send(Err(ProviderError::new(
+                                    "provider deferred fetch cancelled or timed out",
+                                )));
+                                return;
+                            }
                         }
                     }
                     None => break,
