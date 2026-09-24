@@ -206,8 +206,22 @@ pub(super) async fn list_session_files(
                 {
                     continue;
                 }
-                if entry.file_name().to_string_lossy().ends_with(".jsonl") {
+                let file_name = entry.file_name();
+                let file_name = file_name.to_string_lossy();
+                if file_name.ends_with(".jsonl") {
                     files.push(entry.path());
+                    continue;
+                }
+                // A `.jsonl.bak` sibling is the only recoverable session after
+                // a crashed Windows publish; restore it so the session is
+                // listed under its canonical name. When the primary exists the
+                // backup is stale and stays out of the listing.
+                if file_name.ends_with(".jsonl.bak") {
+                    let primary = entry.path().with_extension("");
+                    super::storage::restore_stranded_backup(&primary);
+                    if primary.exists() && !files.contains(&primary) {
+                        files.push(primary);
+                    }
                 }
             }
         }
@@ -230,6 +244,11 @@ pub(super) async fn remove_session_file(path: &Path) -> Result<(), SessionError>
     let path_for_error = path.clone();
     let path_for_worker_error = path.clone();
     tokio::task::spawn_blocking(move || {
+        // A stranded `.bak` must go first: once the primary is gone the next
+        // listing would restore the backup and resurrect the deleted session.
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".bak");
+        let _ = fs::remove_file(PathBuf::from(backup));
         fs::remove_file(&path)
             .map_err(|source| io_failure(&path_for_error, "failed to remove session", source))
     })

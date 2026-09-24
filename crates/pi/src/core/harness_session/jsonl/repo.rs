@@ -20,7 +20,7 @@ use super::paths::{
     discard_session_file, io_failure, list_session_files, remove_session_file,
     resolve_new_session_path, session_directory_name, verify_owned_session_path,
 };
-use super::storage::JsonlStorage;
+use super::storage::{JsonlStorage, restore_stranded_backup};
 
 /// Metadata returned by the JSONL session repository.
 ///
@@ -251,6 +251,7 @@ impl JsonlSessionRepo {
         cx: &Context,
     ) -> Result<(JsonlStorageHeader, Arc<JsonlStorage>), SessionError> {
         cx.check().map_err(|_| aborted_error())?;
+        restore_stranded_backup_async(&metadata.path).await;
         if !path_exists(&metadata.path).await? {
             return Err(not_found(format!(
                 "session file does not exist: {}",
@@ -489,6 +490,7 @@ impl SessionRepo for JsonlSessionRepo {
                 }
             }
             let _reservation = self.reserve_id(&key, &metadata.id)?;
+            restore_stranded_backup_async(&metadata.path).await;
             if !path_exists(&metadata.path).await? {
                 return Err(not_found(format!(
                     "session file does not exist: {}",
@@ -711,6 +713,15 @@ async fn resolve_cwd(input: &str) -> Result<String, SessionError> {
     })
     .await
     .map_err(|source| io_failure(&path_for_error, "session cwd worker failed", source))?
+}
+
+/// Restores a stranded `.bak` sibling before an existence check so a session
+/// that survived a crashed Windows publish is not reported missing. The
+/// restore is best-effort: a failed rename leaves the backup for the next
+/// attempt and the check still reports the file absent.
+async fn restore_stranded_backup_async(path: &Path) {
+    let path = path.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || restore_stranded_backup(&path)).await;
 }
 
 async fn path_exists(path: &Path) -> Result<bool, SessionError> {
@@ -991,5 +1002,95 @@ mod tests {
             .expect_err("delete must reject a filename-only ownership match");
         assert!(matches!(error, SessionError::Invariant(_)), "{error:?}");
         assert!(colliding.exists(), "foreign session file remains");
+    }
+    /// Renames a session file to its `.bak` sibling, simulating a crashed
+    /// Windows publish between `path -> .bak` and `.tmp -> path`.
+    #[expect(clippy::expect_used, reason = "test setup")]
+    fn strand_as_backup(path: &Path) -> PathBuf {
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".bak");
+        let backup = PathBuf::from(backup);
+        fs::rename(path, &backup).expect("rename session to backup");
+        backup
+    }
+
+    #[expect(clippy::expect_used, reason = "test assertions use expect")]
+    #[tokio::test]
+    async fn open_restores_stranded_backup() {
+        let cx = Context::background();
+        let root = tempdir().expect("root tempdir");
+        let cwd_dir = tempdir().expect("cwd tempdir");
+        let cwd = cwd_dir.path().to_string_lossy().into_owned();
+        let repo = JsonlSessionRepo::new(root.path());
+        let metadata = create_closed_metadata(&repo, &cwd, "stranded-open").await;
+        let backup = strand_as_backup(&metadata.path);
+
+        let session = repo
+            .open(&metadata, &cx)
+            .await
+            .expect("open must restore the stranded backup");
+        assert!(metadata.path.exists(), "backup renamed back to primary");
+        assert!(!backup.exists(), "backup consumed by the restore");
+        session.close(&cx).await.expect("close restored session");
+    }
+
+    #[expect(clippy::expect_used, reason = "test assertions use expect")]
+    #[tokio::test]
+    async fn list_restores_stranded_backup() {
+        let cx = Context::background();
+        let root = tempdir().expect("root tempdir");
+        let cwd_dir = tempdir().expect("cwd tempdir");
+        let cwd = cwd_dir.path().to_string_lossy().into_owned();
+        let repo = JsonlSessionRepo::new(root.path());
+        let metadata = create_closed_metadata(&repo, &cwd, "stranded-list").await;
+        strand_as_backup(&metadata.path);
+
+        let listed = repo
+            .list(
+                Some(JsonlSessionListOptions {
+                    cwd: Some(cwd.clone()),
+                }),
+                &cx,
+            )
+            .await
+            .expect("list sessions");
+        assert!(
+            listed.iter().any(|entry| entry.id == "stranded-list"),
+            "stranded backup must surface in the listing"
+        );
+        assert!(metadata.path.exists(), "backup renamed back to primary");
+    }
+
+    #[expect(clippy::expect_used, reason = "test assertions use expect")]
+    #[tokio::test]
+    async fn delete_clears_backup_and_does_not_resurrect() {
+        let cx = Context::background();
+        let root = tempdir().expect("root tempdir");
+        let cwd_dir = tempdir().expect("cwd tempdir");
+        let cwd = cwd_dir.path().to_string_lossy().into_owned();
+        let repo = JsonlSessionRepo::new(root.path());
+        let metadata = create_closed_metadata(&repo, &cwd, "stranded-delete").await;
+        let mut backup = metadata.path.as_os_str().to_os_string();
+        backup.push(".bak");
+        let backup = PathBuf::from(backup);
+        fs::copy(&metadata.path, &backup).expect("seed backup sibling");
+
+        repo.delete(&metadata, &cx).await.expect("delete session");
+        assert!(!metadata.path.exists(), "primary removed");
+        assert!(!backup.exists(), "backup removed with the session");
+
+        let listed = repo
+            .list(
+                Some(JsonlSessionListOptions {
+                    cwd: Some(cwd.clone()),
+                }),
+                &cx,
+            )
+            .await
+            .expect("list sessions");
+        assert!(
+            !listed.iter().any(|entry| entry.id == "stranded-delete"),
+            "a deleted session must not resurrect from its backup"
+        );
     }
 }

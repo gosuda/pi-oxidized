@@ -313,6 +313,7 @@ impl<W: Write> TerminalGuard<W> {
         // only the steps that successfully restore. Failed steps stay on the
         // applied list so the caller can retry.
         let mut i = self.fullscreen_applied.len();
+        let mut left_alternate = false;
         while i > 0 {
             i -= 1;
             let step = self.fullscreen_applied[i];
@@ -330,6 +331,9 @@ impl<W: Write> TerminalGuard<W> {
                 }
                 continue;
             }
+            if step == FullscreenStep::AlternateScreen {
+                left_alternate = true;
+            }
             self.fullscreen_applied.remove(i);
         }
         // Show after leaving 1049 so a hot switch never emits inline cursor
@@ -339,7 +343,14 @@ impl<W: Write> TerminalGuard<W> {
         {
             first_error = Some(error);
         }
-        if let Err(error) = self.writer.flush()
+        let flush_result = self.writer.flush();
+        // The leave is only durable once the flush lands; clearing the latch
+        // earlier would let a later panic skip the 1049 exit while the
+        // terminal may still own the alternate screen.
+        if left_alternate && flush_result.is_ok() {
+            ENTERED_ALTERNATE_SCREEN.store(false, Ordering::Release);
+        }
+        if let Err(error) = flush_result
             && first_error.is_none()
         {
             first_error = Some(error);
@@ -930,6 +941,45 @@ mod tests {
             guard.fullscreen_applied, expected,
             "re-entry must not duplicate or lose fullscreen steps"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn leave_fullscreen_clears_alternate_screen_latch_only_after_flush() -> io::Result<()> {
+        // A successful leave must clear the process-global latch so a later
+        // panic in regular mode does not emit CSI ? 1049 l into a screen this
+        // process no longer owns.
+        let mut guard = TerminalGuard::new(Cursor::new(Vec::new()));
+        guard.applied.push(RestoreStep::RawMode);
+        guard.enter_fullscreen()?;
+        assert!(ENTERED_ALTERNATE_SCREEN.load(Ordering::Acquire));
+
+        guard.leave_fullscreen()?;
+        assert!(
+            !ENTERED_ALTERNATE_SCREEN.load(Ordering::Acquire),
+            "flushed leave must clear the latch"
+        );
+
+        // A leave whose writes never reach the terminal keeps the latch: the
+        // alternate screen may still be active, so emergency restore must
+        // still emit the 1049 exit.
+        let mut guard = TerminalGuard::new(LatchingFailureWriter {
+            bytes: Vec::new(),
+            attempted: Vec::new(),
+            budget: 0,
+        });
+        guard.applied.push(RestoreStep::RawMode);
+        guard.fullscreen_applied = vec![FullscreenStep::AlternateScreen];
+        guard.screen_mode = ScreenMode::Fullscreen;
+        ENTERED_ALTERNATE_SCREEN.store(true, Ordering::Release);
+
+        let result = guard.leave_fullscreen();
+        assert!(result.is_err(), "failed teardown must report an error");
+        assert!(
+            ENTERED_ALTERNATE_SCREEN.load(Ordering::Acquire),
+            "unflushed leave must keep the latch"
+        );
+        ENTERED_ALTERNATE_SCREEN.store(false, Ordering::Release);
         Ok(())
     }
 

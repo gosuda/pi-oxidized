@@ -44,7 +44,7 @@ pub struct JsonlStorage {
 /// backup is the only recoverable session, so it is renamed back before the
 /// open reports the session missing. Best-effort: a failed restore leaves
 /// the backup in place for the next attempt.
-fn restore_stranded_backup(path: &Path) {
+pub(super) fn restore_stranded_backup(path: &Path) {
     if path.exists() {
         return;
     }
