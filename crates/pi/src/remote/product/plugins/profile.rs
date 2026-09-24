@@ -259,7 +259,7 @@ async fn write_profile(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
-    let temporary = path.with_extension("json.tmp");
+    let temporary = unique_temporary_path(path);
     let bytes = serde_json::to_vec_pretty(profile)?;
     fs::write(&temporary, bytes).await?;
     set_private_permissions(&temporary).await?;
@@ -287,6 +287,20 @@ async fn set_private_permissions(path: &Path) -> Result<(), PluginProfileError> 
         let _ = path;
     }
     Ok(())
+}
+
+/// Allocates a sibling temporary path unique to this write.
+///
+/// Two concurrent writes to the same profile must never share a temp name:
+/// a deterministic `*.json.tmp` lets one task rename the other's bytes and
+/// report success for the wrong profile. Process id plus a per-process
+/// counter keeps every invocation's temp distinct.
+fn unique_temporary_path(path: &Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".tmp.{}.{}", std::process::id(), sequence));
+    PathBuf::from(name)
 }
 
 /// Replaces `path` with `temporary`, including when `path` already exists.

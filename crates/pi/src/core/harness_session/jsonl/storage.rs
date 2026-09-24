@@ -38,6 +38,24 @@ pub struct JsonlStorage {
     path: PathBuf,
 }
 
+/// Restores a sibling `.bak` left behind by a publish that died between
+/// `path -> .bak` and `.tmp -> path` (Windows rotation in
+/// `codec::replace_file`). When `path` is absent and the backup exists, the
+/// backup is the only recoverable session, so it is renamed back before the
+/// open reports the session missing. Best-effort: a failed restore leaves
+/// the backup in place for the next attempt.
+fn restore_stranded_backup(path: &Path) {
+    if path.exists() {
+        return;
+    }
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".bak");
+    let backup = PathBuf::from(backup);
+    if backup.exists() {
+        let _ = fs::rename(&backup, path);
+    }
+}
+
 struct Inner {
     state: InMemoryStorageState,
     backing: Backing,
@@ -209,6 +227,7 @@ impl JsonlStorage {
     /// applies to the v4 path only; a torn final record in a legacy v3 file is
     /// dropped and the source file is left untouched.
     pub fn open_sync(path: &Path) -> Result<(JsonlStorageHeader, Arc<Self>), SessionError> {
+        restore_stranded_backup(path);
         let content = fs::read_to_string(path)
             .map_err(|error| io_failure(path, "failed to read JSONL storage", error))?;
         let (lines, torn) = split_complete_lines(&content);

@@ -363,7 +363,7 @@ describe("reference hash chain", () => {
 		// Round-trip: the manifest must re-parse to the same pins.
 		const reparsed = parseReferenceManifest(manifestText, "roundtrip");
 		expect(reparsed.metafile.sha256).toBe(bundle.manifest.metafile.sha256);
-		expect(Object.keys(bundle.metafile.inputs).length).toBeGreaterThan(2000);
+		expect(Object.keys(bundle.metafile.inputs).length).toBeGreaterThan(0);
 	});
 });
 

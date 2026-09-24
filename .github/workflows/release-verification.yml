@@ -99,6 +99,24 @@ jobs:
         run: |
           test "$(git -C .references/pi-2.0 rev-parse HEAD)" = "853a80d26c90a14c1886f0ebb8ffaae133ca2185"
 
+      # Generators and native-behavior verifiers read the native authority at
+      # .references/pi (reference-identity.ts NATIVE_REFERENCE_ROOT); without
+      # it assertNativeReference fails closed on every non-musl leg.
+      - name: Checkout native reference (pinned)
+        if: matrix.musl != 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: earendil-works/pi
+          ref: 95fbc04997eaee961eb673fa7923e9220609ebd5
+          path: .references/pi
+          persist-credentials: false
+
+      - name: Verify native reference pin
+        if: matrix.musl != 'true'
+        shell: bash
+        run: |
+          test "$(git -C .references/pi rev-parse HEAD)" = "95fbc04997eaee961eb673fa7923e9220609ebd5"
+
       # REL-T4: aarch64 legs run natively (ubuntu-24.04-arm) — no QEMU, no
       # cross-compiler. The verification fails loudly if the runner is not a
       # native arm64 image or if a qemu-aarch64 binfmt handler is registered.
