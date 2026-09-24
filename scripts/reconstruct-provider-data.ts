@@ -43,8 +43,8 @@ const LOCK_OWNER_FILE = "owner.json";
 const DATA_MANIFEST_FILE = ".manifest.json";
 const MANIFEST_SCHEMA_VERSION = 3;
 // UTC time of the newest provider snapshot commit in the canonical reference
-// checkout pinned by scripts/reference-identity.ts (commit e8c632ef6).
-const PINNED_PROVIDER_DATA_GENERATED_AT = "2026-08-25T09:03:13.000Z";
+// checkout pinned by scripts/reference-identity.ts (commit f5c94648).
+const PINNED_PROVIDER_DATA_GENERATED_AT = "2026-09-20T20:59:16.000Z";
 const LOCK_OWNER_VERSION = 2;
 /**
  * Heartbeat freshness contract: while an owner holds the lock it atomically
