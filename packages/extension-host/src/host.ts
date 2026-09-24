@@ -2726,20 +2726,34 @@ export class ExtensionHost {
 			return;
 		}
 
+		const controller = new AbortController();
+		this.inFlightProviders.set(id, controller);
 		const options = {
 			...(rawOptions ?? {}),
+			signal: controller.signal,
 		};
+		this.installProviderWireCallbacks(id, p, options);
 		try {
 			await config.cancelDeferred(p["model"] as Model<string>, rawHandle, options as SimpleStreamOptions);
+			if (controller.signal.aborted) {
+				await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
+					code: "cancelled",
+					message: "provider deferred cancellation cancelled",
+					retryable: false,
+				});
+				return;
+			}
 			await this.client.respond(id, PROVIDER_CANCEL_DEFERRED_METHOD, {});
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
-			const cancelled = isStructuredAbortError(err);
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
 			await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
 				code: cancelled ? "cancelled" : "extension_error",
 				message: cancelled ? "provider deferred cancellation cancelled" : message,
 				retryable: false,
 			});
+		} finally {
+			this.inFlightProviders.delete(id);
 		}
 	}
 

@@ -412,10 +412,14 @@ The full registry snapshot (`RegistrySnapshotWire` consumed by Rust
 - `flags`: `{ name, description, type, extensionPath, default?, value? }` from
   `runner.getFlags()` plus effective values from `runner.getFlagValues()`.
 - `renderers`: `{ type: "message" | "widget", name }`, deduplicated.
-- `providers`: entries from `::buildProviderSnapshot` (lines 2068-2085):
-  `{ name, streamSimple (boolean), baseUrl?, api?, displayName?, apiKey?, headers?,
-  authHeader?, models? }` — matching `SessionToolWire` / `SessionCommandInfoWire`
-  / `ProvidersUpdate` mirror fields on the Rust side
+- `providers`: entries from `::buildProviderSnapshot` (lines 2155-2174):
+  `{ name, streamSimple (boolean), fetchDeferred? (boolean), cancelDeferred?
+  (boolean), baseUrl?, api?, displayName?, apiKey?, headers?,
+  authHeader?, models? }` — `fetchDeferred`/`cancelDeferred` are emitted only
+  when the extension registers the corresponding deferred operation, so their
+  absence means "not supported" and is backward-compatible with readers that
+  predate the deferred methods — matching `SessionToolWire` /
+  `SessionCommandInfoWire` / `ProvidersUpdate` mirror fields on the Rust side
   (`crates/pi-ext/src/protocol.rs` typed wire structs, session-action and theme
   open-method sections at lines 1339, 1429).
 - `handlers`: the canonical 35 discriminants with at least one registered handler.

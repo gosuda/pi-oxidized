@@ -1718,10 +1718,9 @@ mod tests {
         let mut deferred = AssistantMessage::new("api", "provider", "model", 1);
         deferred.content = vec![AssistantContent::Text(TextContent::new("settling"))];
         deferred.stop_reason = StopReason::Deferred;
-        assert!(matches!(
-            classify_summary_response(deferred, "Turn prefix summarization", "turn prefix"),
-            Ok(_)
-        ));
+        assert!(
+            classify_summary_response(deferred, "Turn prefix summarization", "turn prefix").is_ok()
+        );
 
         let mut complete = AssistantMessage::new("api", "provider", "model", 1);
         complete.content = vec![AssistantContent::Text(TextContent::new("## Goal\ndone"))];

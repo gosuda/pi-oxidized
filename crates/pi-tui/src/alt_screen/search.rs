@@ -5,6 +5,7 @@ use std::any::Any;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
+use unicode_casefold::UnicodeCaseFold;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::component::{Component, EventResult, UiEvent};
@@ -559,7 +560,7 @@ fn normalize_query(query: &str) -> String {
             normalized.push(' ');
             pending_space = false;
         }
-        normalized.extend(grapheme.chars().flat_map(char::to_lowercase));
+        normalized.extend(grapheme.case_fold());
     }
     normalized.trim().to_owned()
 }
@@ -598,10 +599,7 @@ fn build_search_corpus(lines: &[String]) -> SearchCorpus {
                     corpus.text.push(' ');
                     pending_separator = false;
                 }
-                let folded = grapheme
-                    .chars()
-                    .flat_map(char::to_lowercase)
-                    .collect::<String>();
+                let folded = grapheme.case_fold().collect::<String>();
                 let text_start = corpus.text.len();
                 corpus.text.push_str(&folded);
                 let text_end = corpus.text.len();

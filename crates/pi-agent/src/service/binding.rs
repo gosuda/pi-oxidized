@@ -162,8 +162,13 @@ impl ServiceObservation {
         };
         let tasks = binding.remove_observer(self.observer_id);
         cancel_and_detach(tasks);
+        // Spawn on the runtime captured at startup: the final observer may be
+        // dropped from a thread without a Tokio context, where
+        // `Handle::try_current` would silently skip the subscription teardown
+        // and leak it until the binding is disposed.
+        let runtime = lock(&binding.runtime).clone();
         if binding.observer_count() == 0
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
+            && let Some(handle) = runtime
         {
             handle.spawn(async move {
                 let _ = binding.stop_if_empty(Context::background()).await;

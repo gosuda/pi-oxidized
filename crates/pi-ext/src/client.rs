@@ -2712,7 +2712,9 @@ fn remote_error(frame: &Frame) -> HostClientError {
 fn cancel_method_for(method: &str) -> Option<&'static str> {
     match method {
         "tool.execute" => Some("tool.cancel"),
-        "provider.stream" => Some("provider.cancel"),
+        "provider.stream" | "provider.fetchDeferred" | "provider.cancelDeferred" => {
+            Some("provider.cancel")
+        }
         _ => None,
     }
 }
