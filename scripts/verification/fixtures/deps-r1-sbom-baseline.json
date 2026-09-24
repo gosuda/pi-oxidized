@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
-	"capturedAt": "2026-09-23",
-	"captureHead": "a4bd3cc616122223405e85ec6fce6ddb773e1f49",
-	"contentSha256": "59df0b1b6e5d8573786c954fa877743e13263b06872ce86b0abdad7052090526",
+	"capturedAt": "2026-09-24",
+	"captureHead": "b08583361c3c94b57e53575c32ec5e4a1d48d370",
+	"contentSha256": "82c0b0b84c62cebc6fd6aef8b4eb7363101e959f9c860c20eff05c15778f2c00",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.98.0",
@@ -3382,6 +3382,14 @@
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
+					"devOnly": false
+				},
+				{
+					"name": "unicode-casefold",
+					"version": "0.2.0",
+					"license": "MIT/Apache-2.0",
+					"source": "registry",
+					"direct": true,
 					"devOnly": false
 				},
 				{
