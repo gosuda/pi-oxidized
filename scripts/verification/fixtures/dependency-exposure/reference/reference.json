@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-09-24T00:21:40.327Z",
-	"captureHead": "c9e5b10b2a9a803cee5d5956659666785c2cd4b3",
+	"capturedAt": "2026-09-24T21:51:31.932Z",
+	"captureHead": "b70a391082c8ddacfb72b60cf60415c910cc9152",
 	"metafile": {
-		"projectionPath": "metafile-projection.273355886b222a008631b8efaaaa8f19a15667df9115e17e09a12bcf368e11b5.json",
-		"sha256": "273355886b222a008631b8efaaaa8f19a15667df9115e17e09a12bcf368e11b5",
+		"projectionPath": "metafile-projection.1bf664f793b1f0f2f46756fb733e991b2ec85293d6152cceacde85a81a9127e7.json",
+		"sha256": "1bf664f793b1f0f2f46756fb733e991b2ec85293d6152cceacde85a81a9127e7",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -17,14 +17,14 @@
 			"--target",
 			"bun-linux-x64-baseline",
 			"--outfile",
-			"/tmp/exposure-capture-3s9lwI/pi-extension-host",
-			"--metafile=/tmp/exposure-capture-3s9lwI/metafile.json"
+			"/tmp/exposure-capture-jMf0aa/pi-extension-host",
+			"--metafile=/tmp/exposure-capture-jMf0aa/metafile.json"
 		],
-		"metafileSha256": "dfd1c2fa912959c434c34b4886d6a092eff8e41410d5fcbac658bd7993a03e6c"
+		"metafileSha256": "e97f1b1884bfb2105b27fbea498ced6419c059674ca7a8102252ce61ae3590a8"
 	},
 	"cargo": {
-		"projectionPath": "cargo-graph-projection.029452e8574ef9bdeb3d128925401b8e1f291cd4f50845c0552110707d568221.json",
-		"sha256": "029452e8574ef9bdeb3d128925401b8e1f291cd4f50845c0552110707d568221",
+		"projectionPath": "cargo-graph-projection.e2fbe241d5a1223b9033f95509ab4ab052cad3480d9b765fe062f56ae4357023.json",
+		"sha256": "e2fbe241d5a1223b9033f95509ab4ab052cad3480d9b765fe062f56ae4357023",
 		"argv": [
 			"metadata",
 			"--format-version",
@@ -93,7 +93,7 @@
 	"cargoFiles": [
 		{
 			"path": "Cargo.lock",
-			"sha256": "c96a482a612bd0d6cdd6654457c08792846b56d8ef793aaf29afc84ae6bfcbb0"
+			"sha256": "7b81308195e7ba67476fbf6ba8922801234c54b84b33a1712c30ed6590c8aa11"
 		},
 		{
 			"path": "Cargo.toml",
@@ -113,7 +113,7 @@
 		},
 		{
 			"path": "crates/pi-tui/Cargo.toml",
-			"sha256": "1def06b1684d5b75f8ad2c7eaa6d20fce14163ee6557d637cdf4ccbba4f1c0ad"
+			"sha256": "b22a5e87d49b721240050ad2d64845d8405b9a1d1c51cd0000cda811c369b770"
 		},
 		{
 			"path": "crates/pi/Cargo.toml",

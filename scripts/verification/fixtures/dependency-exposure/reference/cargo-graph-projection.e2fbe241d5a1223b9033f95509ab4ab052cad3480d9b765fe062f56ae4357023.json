@@ -6332,6 +6332,13 @@
 		},
 		{
 			"from": "pi-tui",
+			"to": "unicode-casefold",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "pi-tui",
 			"to": "unicode-segmentation",
 			"kinds": [
 				"normal"
