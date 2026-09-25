@@ -91,9 +91,9 @@ carry no status; the manifest is the only status-bearing artifact.
 When the required `docs-evidence` compatibility row passes,
 `target/verification/compat-matrix/result.json` embeds this validated manifest
 as `docsEvidence`. The release workflow retains that file in the
-`compatibility-performance-x86_64-unknown-linux-gnu` artifact. The artifact
-therefore binds its Git commit to the run ID and all 77 row hashes without a
-second CI upload path.
+`compat-matrix-unit` shard artifact (the unit tier owns the docs-evidence
+row). The artifact therefore binds its Git commit to the run ID and all 77
+row hashes without a second CI upload path.
 
 ## sync-docs Policy
 
