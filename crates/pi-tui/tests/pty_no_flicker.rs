@@ -1501,6 +1501,14 @@ mod windows_raw_record {
                 ready = true;
                 break;
             }
+            // The evidence file is authoritative when the console channel
+            // drops bytes: readiness observed there is still readiness.
+            if let Ok(evidence) = std::fs::read(&stage_log_path)
+                && find_subslice(&evidence, &ready_pat).is_some()
+            {
+                ready = true;
+                break;
+            }
             if child.try_wait().ok().flatten().is_some() {
                 break;
             }
@@ -1600,17 +1608,26 @@ mod windows_raw_record {
         if raw.len() > TRANSCRIPT_LIMIT {
             report.transcript_limit_exceeded = true;
         }
-        report.transcript_tail = Some(String::from_utf8_lossy(&raw[tail_start..]).into_owned());
-        if let Ok(stage_log) = std::fs::read_to_string(&stage_log_path)
-            && !stage_log.is_empty()
+
+        let evidence_bytes = std::fs::read(&stage_log_path).unwrap_or_default();
+        if let Some(tail) = report.transcript_tail.as_mut()
+            && !evidence_bytes.is_empty()
         {
-            let tail = report.transcript_tail.get_or_insert_default();
             tail.push_str("\nstage-log: ");
-            tail.push_str(&stage_log);
+            tail.push_str(&String::from_utf8_lossy(&evidence_bytes));
         }
         let _ = std::fs::remove_file(&stage_log_path);
 
-        let (events, parse_failure) = parse_events(&raw);
+        // The evidence file is authoritative when the console channel dropped
+        // the child's bytes: parse it only when the transcript carried no
+        // events, so a live console still supplies the same payloads.
+        let transcript_has_events = find_subslice(&raw, RECORD_PREFIX).is_some();
+        let evidence_source = if !transcript_has_events && !evidence_bytes.is_empty() {
+            evidence_bytes.as_slice()
+        } else {
+            raw.as_slice()
+        };
+        let (events, parse_failure) = parse_events(evidence_source);
         let mut lifecycles: Vec<LifecycleEntry> = Vec::new();
         let mut records: Vec<RecordEntry> = Vec::new();
         let mut termination: Option<TerminationEntry> = None;

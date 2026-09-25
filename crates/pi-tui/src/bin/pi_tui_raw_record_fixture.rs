@@ -220,9 +220,11 @@ mod imp {
         })
     }
 
-    /// Stage-marker side channel the parent reads out of band. It survives a
-    /// completely dead console-output channel, which is exactly the failure
-    /// mode this fixture exists to make diagnosable.
+    /// The evidence file is the authoritative channel: every emitted line —
+    /// stage markers and OSC-999 event payloads alike — lands here before it
+    /// is mirrored to the console. The parent parses this file when the
+    /// transcript carries no event bytes, so a completely dead console
+    /// channel still yields a complete arm report.
     fn stage_log() -> Option<&'static Mutex<File>> {
         static LOG: OnceLock<Option<Mutex<File>>> = OnceLock::new();
         LOG.get_or_init(|| {
@@ -232,7 +234,16 @@ mod imp {
         .as_ref()
     }
 
-    fn write_console_line(body: &[u8]) {
+    /// Emit one line to the evidence file, then mirror it to the console.
+    /// Both writes are best-effort: a broken console channel must never
+    /// panic the witness before its evidence reaches disk.
+    fn emit_line(body: &[u8]) {
+        if let Some(log) = stage_log()
+            && let Ok(mut f) = log.lock()
+        {
+            let _ = f.write_all(body);
+            let _ = f.flush();
+        }
         if let Ok(mut out) = console_writer().lock() {
             let _ = out.write_all(body);
             let _ = out.flush();
@@ -244,19 +255,15 @@ mod imp {
         line.extend_from_slice(prefix);
         line.extend_from_slice(body);
         line.push(0x07);
-        write_console_line(&line);
+        emit_line(&line);
     }
 
     fn stage(name: &str) {
-        write_console_line(b"PI_TUI_RAW_RECORD_STAGE=");
-        write_console_line(name.as_bytes());
-        write_console_line(b"\n");
-        if let Some(log) = stage_log()
-            && let Ok(mut f) = log.lock()
-        {
-            let _ = writeln!(f, "{name}");
-            let _ = f.flush();
-        }
+        let mut line = Vec::with_capacity(name.len() + 26);
+        line.extend_from_slice(b"PI_TUI_RAW_RECORD_STAGE=");
+        line.extend_from_slice(name.as_bytes());
+        line.push(b'\n');
+        emit_line(&line);
     }
 
     fn emit_event(event: &Event, prefix: &[u8]) {
