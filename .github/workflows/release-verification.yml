@@ -185,6 +185,15 @@ jobs:
         if: matrix.musl != 'true'
         run: npm run build:offline --prefix .references/pi-2.0
 
+      # Bench workers import the native reference's dist bundles
+      # (packages/ai/dist/index.js under the native root), which are
+      # gitignored and absent after a bare checkout. Same offline variant:
+      # the reconstruct step above already populated the source data
+      # deterministically.
+      - name: Build native reference packages
+        if: matrix.musl != 'true'
+        run: npm run build:offline --prefix .references/pi # historical witness: native root literal
+
       - name: Dependency exposure predicate self-check
         if: matrix.musl != 'true'
         run: bun run verify:dependency-exposure self-check
