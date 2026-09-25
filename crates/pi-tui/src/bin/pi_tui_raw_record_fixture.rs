@@ -420,6 +420,13 @@ mod imp {
             message: None,
         };
 
+        // The parent's ConPTY handshake bytes (its DSR answer lands as key
+        // INPUT_RECORDs) must never reach arm evidence: drain whatever the
+        // queue already holds before the mode change, then after READY give
+        // the reply a settle window and drain once more before the read
+        // loop opens.
+        let _ = console.read_console_input();
+
         stage("set_mode");
         if let Err(e) = guard.set(requested) {
             termination.cause = "error".into();
@@ -483,6 +490,12 @@ mod imp {
             }),
             RECORD_PREFIX,
         );
+
+        // Handshake settle: the parent's DSR answer arrives around READY;
+        // a short wait plus a final drain clears it before evidence starts.
+        stage("drain_handshake");
+        thread::sleep(Duration::from_millis(120));
+        let _ = console.read_console_input();
 
         stage("read_loop");
         let started = Instant::now();

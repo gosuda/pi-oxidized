@@ -1474,6 +1474,14 @@ mod windows_raw_record {
         let mut writer = pair.master.take_writer().expect("take writer");
         let mut reader = pair.master.try_clone_reader().expect("clone reader");
 
+        // Conhost parks the registered child until the terminal answers its
+        // DSR (\x1b[6n) probe: every unread arm transcript on the runner was
+        // a child parked before Rust main. Answer it exactly like
+        // drive_fixture does for the pty fixture; the fixture drains these
+        // handshake records before its evidence loop opens.
+        writer.write_all(b"\x1b[1;1R").expect("write DSR answer");
+        writer.flush().expect("flush DSR answer");
+
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let reader_thread = thread::spawn(move || {
             let mut buf = [0u8; 8192];
@@ -1906,6 +1914,12 @@ mod windows_raw_record {
                 cmd.env("PI_TUI_RAW_RECORD_STAGE_LOG", &pty_selftest_path);
                 match pair.slave.spawn_command(cmd) {
                     Ok(mut child) => {
+                        // Answer conhost's DSR so the registered child is
+                        // not parked before main; see run_arm.
+                        if let Ok(mut w) = pair.master.take_writer() {
+                            let _ = w.write_all(b"\x1b[1;1R");
+                            let _ = w.flush();
+                        }
                         let deadline = Instant::now() + Duration::from_secs(10);
                         let mut exited = false;
                         while Instant::now() < deadline {
@@ -1953,6 +1967,10 @@ mod windows_raw_record {
                 cmd.env("PI_TUI_RAW_RECORD_STAGE_LOG", &cmd_selftest_path);
                 match pair.slave.spawn_command(cmd) {
                     Ok(mut child) => {
+                        if let Ok(mut w) = pair.master.take_writer() {
+                            let _ = w.write_all(b"\x1b[1;1R");
+                            let _ = w.flush();
+                        }
                         let deadline = Instant::now() + Duration::from_secs(10);
                         let mut exited = false;
                         while Instant::now() < deadline {
