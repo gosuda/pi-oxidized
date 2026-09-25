@@ -64,6 +64,7 @@ describe("VER-ALIGN reference identity", () => {
 			[
 				ALIGNMENT_POLICY_PATH,
 				CLASSIFIER_FIXTURE_PATH,
+				".github/workflows/release-verification.yml",
 				"docs/PERF-R2-workload-surface-ranking.md",
 				"docs/PERF-R8-paired-baselines.md",
 				"docs/performance/floors/memory-resource-units.md",

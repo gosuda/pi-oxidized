@@ -100,7 +100,7 @@ jobs:
           test "$(git -C .references/pi-2.0 rev-parse HEAD)" = "853a80d26c90a14c1886f0ebb8ffaae133ca2185"
 
       # Generators and native-behavior verifiers read the native authority at
-      # .references/pi (reference-identity.ts NATIVE_REFERENCE_ROOT); without
+      # .references/pi (reference-identity.ts NATIVE_REFERENCE_ROOT); without # historical witness: native root literal
       # it assertNativeReference fails closed. Musl legs need it too: the
       # reconstruct step below runs unconditionally and the musl sidecar links
       # reference source.
@@ -109,13 +109,13 @@ jobs:
         with:
           repository: earendil-works/pi
           ref: 95fbc04997eaee961eb673fa7923e9220609ebd5
-          path: .references/pi
+          path: .references/pi # historical witness: native root literal
           persist-credentials: false
 
       - name: Verify native reference pin
         shell: bash
         run: |
-          test "$(git -C .references/pi rev-parse HEAD)" = "95fbc04997eaee961eb673fa7923e9220609ebd5"
+          test "$(git -C .references/pi rev-parse HEAD)" = "95fbc04997eaee961eb673fa7923e9220609ebd5" # historical witness: native root literal
 
       # REL-T4: aarch64 legs run natively (ubuntu-24.04-arm) — no QEMU, no
       # cross-compiler. The verification fails loudly if the runner is not a
@@ -173,7 +173,7 @@ jobs:
       # Musl legs only link reference source into the sidecar build.
       - name: Install native reference dependencies
         if: matrix.musl != 'true'
-        run: npm ci --ignore-scripts --prefix .references/pi
+        run: npm ci --ignore-scripts --prefix .references/pi # historical witness: native root literal
 
       # Bench workers and compat generators import reference dist bundles
       # (gitignored; absent after a bare checkout). Non-musl legs run those

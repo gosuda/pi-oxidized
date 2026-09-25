@@ -308,6 +308,15 @@ export const LEGACY_ALLOWANCES: Readonly<Record<string, LegacyAllowance>> = {
 			"legacy-root-direct": 1,
 		},
 	},
+	".github/workflows/release-verification.yml": {
+		label: "native reference checkout pin",
+		reason:
+			"the workflow must name the native reference checkout path literally; YAML cannot import the reference-identity constant",
+		closureEligible: false,
+		counts: {
+			"legacy-root-direct": 5,
+		},
+	},
 };
 
 /** Current workstream sources that must never consume a legacy witness. */

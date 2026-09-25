@@ -3,7 +3,7 @@
  * Offline deterministic generator for crates/pi-ai/data/builtin-image-models.json.
  *
  * Source of truth: the frozen native reference catalog at
- * `.references/pi/packages/ai/src/image-models.generated.ts` (the
+ * `nativeReferenceRoot()/packages/ai/src/image-models.generated.ts` (the
  * `IMAGE_MODELS` export, shaped `{provider: {modelId: {camelCase model}}}`).
  * Network fetches are intentionally forbidden; runtime never needs Bun.
  *
@@ -108,8 +108,8 @@ async function loadReferenceImageModels(): Promise<
 
 	let imported: unknown;
 	// Dynamic import is load-bearing: the frozen reference checkout lives
-	// outside the package graph (.references/pi) and is selected at runtime by
-	// nativeReferenceRoot(); a static specifier cannot reach it.
+	// outside the package graph (the native reference root) and is selected at
+	// runtime by nativeReferenceRoot(); a static specifier cannot reach it.
 	try {
 		imported = await import(pathToFileURL(REFERENCE_IMAGE_MODELS_PATH).href);
 	} catch (error) {
