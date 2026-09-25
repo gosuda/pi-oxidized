@@ -1,6 +1,7 @@
 //! Native endpoint that adapts Chord service control calls to one provider.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::context::Context;
@@ -175,6 +176,17 @@ impl EndpointInner {
             .map(|entry| entry.subscription)
     }
 
+    /// Whether the subscription registered under `id` is still the one the
+    /// captured `token` was issued for.  False once `unsubscribe` removed it,
+    /// a delivery failure evicted it, or a replacement subscription reused
+    /// the ID with a fresh token.
+    fn subscription_is_current(&self, id: &JsString, token: Option<&Arc<()>>) -> bool {
+        lock(&self.state)
+            .subscriptions
+            .get(id)
+            .is_some_and(|entry| token.is_some_and(|token| Arc::ptr_eq(&entry.token, token)))
+    }
+
     fn admit_delivery(self: &Arc<Self>) -> Option<PendingOperation> {
         let mut state = lock(&self.state);
         if state.disposed {
@@ -334,9 +346,12 @@ impl RemoteServiceEndpoint {
         let mut pending = self.admit_subscribe(subscription_id.clone())?;
         tokio::runtime::Handle::try_current()
             .map_err(|_| ServiceError::local("Remote service endpoint requires a Tokio runtime"))?;
-        let (sender, receiver) =
-            mpsc::unbounded_channel::<(ServiceProviderUpdate<DeltaOp>, Context)>();
-        let listener = update_listener(sender);
+        let (sender, receiver) = mpsc::unbounded_channel::<QueuedUpdate>();
+        let queue = Arc::new(UpdateQueue {
+            sender,
+            queued: AtomicUsize::new(0),
+        });
+        let listener = update_listener(Arc::clone(&queue));
         let subscription = match self
             .provider
             .subscribe(service_id, mode, listener, context.clone())
@@ -360,7 +375,13 @@ impl RemoteServiceEndpoint {
         }
         subscription.activate();
         let snapshot = subscription.snapshot().clone().into_json();
-        spawn_update_worker(subscription_id, receiver, publish, Arc::clone(&self.inner));
+        spawn_update_worker(
+            subscription_id,
+            receiver,
+            queue,
+            publish,
+            Arc::clone(&self.inner),
+        );
         pending.finish();
         Ok(Some(snapshot))
     }
@@ -418,6 +439,27 @@ async fn wait_for_idle(inner: Arc<EndpointInner>) {
     }
 }
 
+/// Maximum provider updates queued for one subscription's delivery worker.
+///
+/// A stalled transport owner must not retain unbounded deltas: crossing the
+/// limit terminates the subscription like any other delivery failure.
+const UPDATE_QUEUE_LIMIT: usize = 1024;
+
+/// Per-subscription update queue with its shared depth counter.
+struct UpdateQueue {
+    sender: mpsc::UnboundedSender<QueuedUpdate>,
+    queued: AtomicUsize,
+}
+
+/// One entry in a subscription's update queue.
+enum QueuedUpdate {
+    /// A provider update awaiting ordered delivery.
+    Delivery(ServiceProviderUpdate<DeltaOp>, Context),
+    /// The queue crossed [`UPDATE_QUEUE_LIMIT`]; carries the offending
+    /// delivery's context so subscription teardown can reuse it.
+    Overflow(Context),
+}
+
 /// Queues provider updates for one subscription's ordered delivery worker.
 ///
 /// The provider invokes the listener in publication order, so the listener
@@ -426,12 +468,20 @@ async fn wait_for_idle(inner: Arc<EndpointInner>) {
 /// starts — including entries drained by activation — cannot reach the
 /// consumer before the subscription snapshot is established, because the
 /// endpoint starts the worker only after capturing it.
-fn update_listener(
-    sender: mpsc::UnboundedSender<(ServiceProviderUpdate<DeltaOp>, Context)>,
-) -> ServiceUpdateListener {
+///
+/// The queue depth is capped at [`UPDATE_QUEUE_LIMIT`]; a provider that
+/// outruns delivery enqueues a [`QueuedUpdate::Overflow`] marker and the
+/// worker terminates the subscription instead of retaining unbounded deltas.
+fn update_listener(queue: Arc<UpdateQueue>) -> ServiceUpdateListener {
     Arc::new(
         move |update: &ServiceProviderUpdate<DeltaOp>, context: &Context| {
-            let _ = sender.send((update.clone(), context.clone()));
+            if queue.queued.fetch_add(1, Ordering::Relaxed) + 1 > UPDATE_QUEUE_LIMIT {
+                let _ = queue.sender.send(QueuedUpdate::Overflow(context.clone()));
+                return;
+            }
+            let _ = queue
+                .sender
+                .send(QueuedUpdate::Delivery(update.clone(), context.clone()));
         },
     )
 }
@@ -440,9 +490,16 @@ fn update_listener(
 /// publishes each sequentially.  A failed or panicking publish terminates the
 /// subscription and records the delivery error for the next control call
 /// rather than leaving the subscription active and silently missing updates.
+///
+/// The worker also terminates without publishing when the subscription is no
+/// longer current — unsubscribed, replaced, or failed — so deltas queued
+/// before `unsubscribe` returned are dropped instead of leaking into a
+/// replacement subscription that reuses the ID.  Crossing the queue limit
+/// terminates the subscription the same way.
 fn spawn_update_worker(
     subscription_id: JsString,
-    mut receiver: mpsc::UnboundedReceiver<(ServiceProviderUpdate<DeltaOp>, Context)>,
+    mut receiver: mpsc::UnboundedReceiver<QueuedUpdate>,
+    queue: Arc<UpdateQueue>,
     publish: ServiceUpdatePublisher,
     inner: Arc<EndpointInner>,
 ) {
@@ -451,7 +508,26 @@ fn spawn_update_worker(
         .get(&subscription_id)
         .map(|entry| Arc::clone(&entry.token));
     tokio::spawn(async move {
-        while let Some((update, context)) = receiver.recv().await {
+        while let Some(queued) = receiver.recv().await {
+            let (update, context) = match queued {
+                QueuedUpdate::Delivery(update, context) => {
+                    queue.queued.fetch_sub(1, Ordering::Relaxed);
+                    (update, context)
+                }
+                QueuedUpdate::Overflow(context) => {
+                    let error =
+                        ServiceError::internal("service update delivery queue overflowed");
+                    if let Some(subscription) =
+                        inner.fail_subscription(&subscription_id, token.as_ref(), error)
+                    {
+                        let _ = subscription.close(context).await;
+                    }
+                    return;
+                }
+            };
+            if !inner.subscription_is_current(&subscription_id, token.as_ref()) {
+                return;
+            }
             let Some(_pending) = inner.admit_delivery() else {
                 return;
             };
@@ -487,8 +563,8 @@ mod tests {
     use super::super::provider::{ServiceDefinition, ServiceImplementation, ServiceMember};
     use super::super::replicated::MutableReplicatedState;
     use super::super::wire::{
-        ServiceMode, ServiceProviderUpdate, create_service_subscribe_call,
-        create_service_unsubscribe_call,
+        ServiceMode, ServiceProviderUpdate, ServiceSubscriptionSnapshot,
+        create_service_subscribe_call, create_service_unsubscribe_call,
     };
     use super::*;
     use tokio::sync::oneshot;
@@ -652,13 +728,65 @@ mod tests {
         })
     }
 
+    /// Registered subscription standing in for the provider side so the
+    /// delivery worker's token guard sees a current subscription.
+    struct StubSubscription {
+        snapshot: ServiceSubscriptionSnapshot<DeltaOp>,
+    }
+
+    impl ServiceSubscription for StubSubscription {
+        fn snapshot(&self) -> &ServiceSubscriptionSnapshot<DeltaOp> {
+            &self.snapshot
+        }
+
+        fn activate(&self) {}
+
+        fn close(&self, _cx: Context) -> BoxFuture<'_, Result<(), ServiceError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn register_stub_subscription(inner: &EndpointInner, id: &str) {
+        inner.register_subscription(
+            &JsString::from_utf8(id),
+            Arc::new(StubSubscription {
+                snapshot: ServiceSubscriptionSnapshot {
+                    service_id: JsString::from_utf8("svc"),
+                    mode: ServiceMode::Singleton,
+                    instances: Vec::new(),
+                },
+            }),
+        );
+    }
+
+    fn spawn_registered_worker(
+        inner: &Arc<EndpointInner>,
+        id: &str,
+        queue: Arc<UpdateQueue>,
+        receiver: mpsc::UnboundedReceiver<QueuedUpdate>,
+        publish: ServiceUpdatePublisher,
+    ) {
+        register_stub_subscription(inner, id);
+        spawn_update_worker(
+            JsString::from_utf8(id),
+            receiver,
+            queue,
+            publish,
+            Arc::clone(inner),
+        );
+    }
+
     #[tokio::test]
     async fn buffered_updates_publish_only_after_the_worker_starts() {
         let updates = Arc::new(Mutex::new(Vec::new()));
         let publish = publisher(Arc::clone(&updates));
         let inner = Arc::new(EndpointInner::new());
         let (sender, receiver) = mpsc::unbounded_channel();
-        let listener = update_listener(sender);
+        let queue = Arc::new(UpdateQueue {
+            sender,
+            queued: AtomicUsize::new(0),
+        });
+        let listener = update_listener(Arc::clone(&queue));
         let update = ServiceProviderUpdate::Unavailable;
         listener(&update, &Context::background());
         listener(&update, &Context::background());
@@ -669,12 +797,7 @@ mod tests {
             lock(&updates).is_empty(),
             "updates must not publish before the delivery worker starts"
         );
-        spawn_update_worker(
-            JsString::from_utf8("subscription"),
-            receiver,
-            publish,
-            inner,
-        );
+        spawn_registered_worker(&inner, "subscription", queue, receiver, publish);
         timeout(Duration::from_secs(1), async {
             while lock(&updates).len() < 2 {
                 tokio::task::yield_now().await;
@@ -924,6 +1047,162 @@ mod tests {
             .dispose(Context::background())
             .await
             .expect("dispose");
+    }
+
+    /// Updates queued while `unsubscribe` ran must not reach a replacement
+    /// subscription that reuses the ID.
+    #[tokio::test]
+    async fn unsubscribe_drops_queued_updates_for_a_reused_subscription_id() {
+        let (endpoint, state) = endpoint_with_state();
+        let (started, started_rx) = oneshot::channel::<()>();
+        let (release, released) = oneshot::channel::<()>();
+        let started = Arc::new(Mutex::new(Some(started)));
+        let released = Arc::new(Mutex::new(Some(released)));
+        let first_log: UpdateLog = Vec::new();
+        let first_updates = Arc::new(Mutex::new(first_log));
+        let blocking: ServiceUpdatePublisher = {
+            let first_updates = Arc::clone(&first_updates);
+            let started = Arc::clone(&started);
+            let released = Arc::clone(&released);
+            Arc::new(move |subscription_id, update, _context| {
+                let first_updates = Arc::clone(&first_updates);
+                let started = Arc::clone(&started);
+                let released = Arc::clone(&released);
+                Box::pin(async move {
+                    lock(&first_updates).push((subscription_id, update));
+                    if let Some(started) = lock(&started).take() {
+                        let _ = started.send(());
+                    }
+                    let released = lock(&released).take();
+                    if let Some(released) = released {
+                        let _ = released.await;
+                    }
+                    Ok(())
+                })
+            })
+        };
+        endpoint
+            .invoke(
+                create_service_subscribe_call("subscription", "svc", ServiceMode::Singleton),
+                blocking,
+                Context::background(),
+            )
+            .await
+            .expect("subscribe");
+        state.with_state_mut(|value| *value = object(1.0));
+        state.publish(Context::background()).expect("first publish");
+        started_rx.await.expect("first delivery started");
+        // Queued while the worker is still blocked inside the first publish.
+        state.with_state_mut(|value| *value = object(2.0));
+        state.publish(Context::background()).expect("queued publish");
+
+        endpoint
+            .invoke(
+                create_service_unsubscribe_call("subscription"),
+                publisher(Arc::new(Mutex::new(Vec::new()))),
+                Context::background(),
+            )
+            .await
+            .expect("unsubscribe first generation");
+
+        let second_log: UpdateLog = Vec::new();
+        let second_updates = Arc::new(Mutex::new(second_log));
+        endpoint
+            .invoke(
+                create_service_subscribe_call("subscription", "svc", ServiceMode::Singleton),
+                publisher(Arc::clone(&second_updates)),
+                Context::background(),
+            )
+            .await
+            .expect("re-subscribe reuses the id");
+        release.send(()).expect("release blocked delivery");
+        timeout(Duration::from_secs(1), async {
+            while lock(&first_updates).len() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first delivery completed");
+        state.with_state_mut(|value| *value = object(3.0));
+        state.publish(Context::background()).expect("post publish");
+        timeout(Duration::from_secs(1), async {
+            while lock(&second_updates).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement subscription delivers");
+        assert_eq!(
+            lock(&first_updates).len(),
+            1,
+            "stale worker must not publish the queued update"
+        );
+    }
+
+    /// Crossing the queue limit terminates the subscription with a recorded
+    /// delivery error, and the shed update is never published.
+    #[tokio::test]
+    async fn queue_overflow_terminates_the_subscription() {
+        let inner = Arc::new(EndpointInner::new());
+        let (release, released) = oneshot::channel::<()>();
+        let released = Arc::new(Mutex::new(Some(released)));
+        let published = Arc::new(Mutex::new(0usize));
+        let publish: ServiceUpdatePublisher = {
+            let released = Arc::clone(&released);
+            let published = Arc::clone(&published);
+            Arc::new(move |_subscription_id, _update, _context| {
+                let released = Arc::clone(&released);
+                let published = Arc::clone(&published);
+                Box::pin(async move {
+                    let count = {
+                        let mut count = lock(&published);
+                        *count += 1;
+                        *count
+                    };
+                    if count == 1 {
+                        let released = lock(&released).take();
+                        if let Some(released) = released {
+                            let _ = released.await;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+        };
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let queue = Arc::new(UpdateQueue {
+            sender,
+            queued: AtomicUsize::new(0),
+        });
+        let listener = update_listener(Arc::clone(&queue));
+        let update = ServiceProviderUpdate::Unavailable;
+        // One update occupies the worker; the next UPDATE_QUEUE_LIMIT fill the
+        // queue; the one after crosses the limit and sheds.
+        for _ in 0..UPDATE_QUEUE_LIMIT + 2 {
+            listener(&update, &Context::background());
+        }
+        spawn_registered_worker(&inner, "subscription", queue, receiver, publish);
+        timeout(Duration::from_secs(1), async {
+            while *lock(&published) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker entered the first publish");
+        release.send(()).expect("release worker");
+        let id = JsString::from_utf8("subscription");
+        timeout(Duration::from_secs(5), async {
+            while inner.take_delivery_error(&id).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("overflow terminates the subscription with a delivery error");
+        assert_eq!(
+            *lock(&published),
+            UPDATE_QUEUE_LIMIT,
+            "worker publishes exactly the admitted updates; the shed one never publishes"
+        );
     }
 
     #[tokio::test]

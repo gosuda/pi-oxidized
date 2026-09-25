@@ -50,12 +50,18 @@ struct ReplicaDelivery {
     value: Arc<JsonValue>,
     context: Context,
     delivery: ReplicatedStateDelivery,
+    /// Hydration epoch the revision belongs to; assigned by
+    /// [`ReplicatedState::enqueue`] and bumped by [`ReplicatedState::clear`].
+    epoch: u64,
 }
 
 #[derive(Default)]
 struct ReplicaDeliveries {
     pending: VecDeque<ReplicaDelivery>,
     draining: bool,
+    /// Incremented by `clear` so queued deliveries of prior hydrations are
+    /// recognized as stale and skipped by the drain.
+    epoch: u64,
 }
 
 /// A cold consumer replica that validates hydration and contiguous updates.
@@ -261,11 +267,15 @@ impl ReplicatedState {
         drop(transition);
         Ok(drain)
     }
-    /// Discards the hydrated revision and sequence without notifying listeners.
+    /// Discards the hydrated revision and sequence without notifying
+    /// listeners.  Queued deliveries of prior hydration epochs are stale
+    /// revisions of the discarded state and are skipped by the next drain.
     pub fn clear(&self) {
         let mut inner = lock(&self.inner);
         inner.value = None;
         inner.sequence = None;
+        let mut deliveries = lock(&self.deliveries);
+        deliveries.epoch = deliveries.epoch.wrapping_add(1);
     }
 
     /// Subscribes to immutable revisions and reports registration failures.
@@ -301,6 +311,7 @@ impl ReplicatedState {
                     kind: ReplicatedStateDeliveryKind::Hydrate,
                     sequence,
                 },
+                epoch: 0,
             })
         } else {
             false
@@ -324,13 +335,15 @@ impl ReplicatedState {
             value: Arc::clone(value),
             context: context.clone(),
             delivery,
+            epoch: 0,
         })
     }
 
     // Reserve delivery order under the transition gate, but never hold it
     // across callbacks: reentrant transitions append behind this revision.
-    fn enqueue(&self, delivery: ReplicaDelivery) -> bool {
+    fn enqueue(&self, mut delivery: ReplicaDelivery) -> bool {
         let mut deliveries = lock(&self.deliveries);
+        delivery.epoch = deliveries.epoch;
         deliveries.pending.push_back(delivery);
         if deliveries.draining {
             return false;
@@ -343,11 +356,17 @@ impl ReplicatedState {
         loop {
             let next = {
                 let mut deliveries = lock(&self.deliveries);
-                let next = deliveries.pending.pop_front();
-                if next.is_none() {
-                    deliveries.draining = false;
+                loop {
+                    match deliveries.pending.pop_front() {
+                        Some(entry) if entry.epoch == deliveries.epoch => break Some(entry),
+                        // A `clear` discarded this revision's hydration epoch.
+                        Some(_) => continue,
+                        None => {
+                            deliveries.draining = false;
+                            break None;
+                        }
+                    }
                 }
-                next
             };
             let Some(next) = next else {
                 return;
