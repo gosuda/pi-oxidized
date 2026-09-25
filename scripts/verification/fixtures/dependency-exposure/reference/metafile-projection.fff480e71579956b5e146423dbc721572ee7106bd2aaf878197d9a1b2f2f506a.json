@@ -12,10 +12,10 @@
 		"--target",
 		"bun-linux-x64-baseline",
 		"--outfile",
-		"/tmp/exposure-capture-jMf0aa/pi-extension-host",
-		"--metafile=/tmp/exposure-capture-jMf0aa/metafile.json"
+		"/tmp/exposure-capture-eZZTBn/pi-extension-host",
+		"--metafile=/tmp/exposure-capture-eZZTBn/metafile.json"
 	],
-	"metafileSha256": "e97f1b1884bfb2105b27fbea498ced6419c059674ca7a8102252ce61ae3590a8",
+	"metafileSha256": "789f318381e4a9777d9721c9864ec8484f72a0b2ecc34f5940af86a11a976837",
 	"inputs": {
 		"src/main.ts": "1f85830ccbda5a75ac46f03db1605d35a24551c2a16b104fa01151236dee54fe",
 		"src/host.ts": "2e9b3db409e25f75c9fae108d05e506e4e8d955b0b11283c631c76e9f3137023",
