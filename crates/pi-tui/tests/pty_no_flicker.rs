@@ -1610,11 +1610,17 @@ mod windows_raw_record {
         }
 
         let evidence_bytes = std::fs::read(&stage_log_path).unwrap_or_default();
-        if let Some(tail) = report.transcript_tail.as_mut()
-            && !evidence_bytes.is_empty()
-        {
+        if let Some(tail) = report.transcript_tail.as_mut() {
             tail.push_str("\nstage-log: ");
-            tail.push_str(&String::from_utf8_lossy(&evidence_bytes));
+            if evidence_bytes.is_empty() {
+                tail.push_str(if stage_log_path.exists() {
+                    "<empty>"
+                } else {
+                    "<missing>"
+                });
+            } else {
+                tail.push_str(&String::from_utf8_lossy(&evidence_bytes));
+            }
         }
         let _ = std::fs::remove_file(&stage_log_path);
 
