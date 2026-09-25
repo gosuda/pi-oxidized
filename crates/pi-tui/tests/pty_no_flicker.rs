@@ -1150,6 +1150,7 @@ mod windows_raw_record {
         pub record_count: usize,
         pub records: Vec<RecordEntry>,
         pub transcript_bytes: usize,
+        pub transcript_tail: Option<String>,
         pub transcript_limit_exceeded: bool,
         pub record_limit_exceeded: bool,
         pub child_deadline_exceeded: bool,
@@ -1345,6 +1346,14 @@ mod windows_raw_record {
         out.flush().expect("flush");
     }
 
+    fn stage(name: &str) {
+        let mut out = stdout().lock();
+        out.write_all(b"PI_TUI_RAW_RECORD_STAGE=").expect("stage");
+        out.write_all(name.as_bytes()).expect("stage name");
+        out.write_all(b"\n").expect("stage nl");
+        out.flush().expect("stage flush");
+    }
+
     fn emit_event(event: &Event, prefix: &[u8]) {
         let json = serde_json::to_string(event).expect("serialize event");
         write_osc999_line(prefix, json.as_bytes());
@@ -1420,6 +1429,10 @@ mod windows_raw_record {
     }
 
     pub fn run_child() {
+        // Plain-text stage markers: unlike the OSC 999 event channel these
+        // always pass ConPTY untransformed, so the last marker in the
+        // transcript localizes any child stall to a single stage.
+        stage("entry");
         let arm = std::env::var("PI_TUI_RAW_RECORD_ARM")
             .unwrap_or_else(|e| panic!("PI_TUI_RAW_RECORD_ARM must be set to A, B, or IDLE: {e}"));
 
@@ -1437,6 +1450,7 @@ mod windows_raw_record {
         };
         let deadline = Duration::from_millis(deadline_ms);
 
+        stage("in_handle");
         let in_handle = match Handle::current_in_handle() {
             Ok(h) => h,
             Err(e) => {
@@ -1452,6 +1466,7 @@ mod windows_raw_record {
             }
         };
 
+        stage("mode_read");
         let cm = ConsoleMode::from(in_handle.clone());
         let console = Console::from(in_handle);
 
@@ -1484,6 +1499,7 @@ mod windows_raw_record {
             message: None,
         };
 
+        stage("set_mode");
         if let Err(e) = guard.set(requested) {
             termination.cause = "error".into();
             termination.message = Some(format!("set_mode({requested:#06x}) failed: {e}"));
@@ -1501,6 +1517,7 @@ mod windows_raw_record {
             }
         };
 
+        stage("setup_emit");
         emit_event(
             &Event::Lifecycle(LifecycleEntry {
                 stage: "setup".into(),
@@ -1530,6 +1547,7 @@ mod windows_raw_record {
             return;
         }
 
+        stage("ready_emit");
         emit_ready(&arm, active);
         emit_event(
             &Event::Lifecycle(LifecycleEntry {
@@ -1545,6 +1563,7 @@ mod windows_raw_record {
             RECORD_PREFIX,
         );
 
+        stage("read_loop");
         let started = Instant::now();
         let mut record_count: usize = 0;
         while started.elapsed() < deadline {
@@ -1610,7 +1629,9 @@ mod windows_raw_record {
         }
         termination.record_count = record_count;
 
+        stage("finish");
         emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
+        stage("done");
     }
 
     fn drain_pending(rx: &mpsc::Receiver<Vec<u8>>, raw: &mut Vec<u8>) {
@@ -1926,6 +1947,10 @@ mod windows_raw_record {
         drain_pending(&rx, &mut raw);
 
         report.transcript_bytes = raw.len();
+        // The tail carries the plain-text stage markers and any panic text,
+        // which localize a child stall that the structured events cannot.
+        let tail_start = raw.len().saturating_sub(2048);
+        report.transcript_tail = Some(String::from_utf8_lossy(&raw[tail_start..]).into_owned());
         if raw.len() > TRANSCRIPT_LIMIT {
             report.transcript_limit_exceeded = true;
         }
