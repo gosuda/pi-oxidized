@@ -1041,6 +1041,48 @@ fn fixture_binary() -> PathBuf {
     path
 }
 
+/// Resolve the Windows raw-record witness child binary. Unlike
+/// `fixture_binary`, this target is feature-gated on `testkit`, so the
+/// cargo build fallback must pass `--features testkit`.
+#[cfg(windows)]
+fn raw_record_fixture_binary() -> PathBuf {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_pi_tui_raw_record_fixture") {
+        return PathBuf::from(path);
+    }
+    let name = format!("pi_tui_raw_record_fixture{}", std::env::consts::EXE_SUFFIX);
+    let mut candidates = Vec::new();
+    if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {
+        candidates.push(PathBuf::from(target));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+    candidates.push(PathBuf::from("target"));
+    for root in candidates {
+        for profile in ["debug", "release"] {
+            let path = root.join(profile).join(&name);
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "pi-tui",
+            "--features",
+            "testkit",
+            "--bin",
+            "pi_tui_raw_record_fixture",
+            "--quiet",
+        ])
+        .status()
+        .unwrap_or_else(|err| panic!("failed to build raw-record fixture: {err}"));
+    assert!(status.success(), "raw-record fixture build failed");
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug")
+        .join(name)
+}
+
 fn fixture_bin_name() -> &'static str {
     if cfg!(windows) {
         "pi_tui_pty_fixture.exe"
@@ -1051,15 +1093,11 @@ fn fixture_bin_name() -> &'static str {
 
 #[cfg(windows)]
 mod windows_raw_record {
-    use std::cell::Cell;
-    use std::io::{self, Write, stdout};
+    use std::io::{Write, stdout};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use crossterm_winapi::{
-        Console, ConsoleMode, ControlKeyState, EventFlags, Handle, InputRecord,
-    };
     use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
     use serde::{Deserialize, Serialize};
 
@@ -1067,15 +1105,10 @@ mod windows_raw_record {
         HARD_TIMEOUT, INITIAL_COLS, INITIAL_ROWS, READ_IDLE, find_subslice, write_stimulus,
     };
 
-    const NOT_RAW_MASK: u32 = 0x0007;
     const VT_INPUT: u32 = 0x0200;
-    const CHILD_RECORD_LIMIT: usize = 4096;
     const TRANSCRIPT_LIMIT: usize = 1_048_576;
-    const CHILD_POLL_INTERVAL_MS: u64 = 5;
-    const DEFAULT_CHILD_DEADLINE_MS: u64 = 15000;
 
     const RECORD_PREFIX: &[u8] = b"\x1b]999;PI_TUI_RAW_RECORD=";
-    const READY_PREFIX: &[u8] = b"\x1b]999;PI_TUI_RAW_RECORD_READY";
 
     // crossterm_winapi 0.9.1's From<INPUT_RECORD> impl discards the raw
     // WINDOW_BUFFER_SIZE_RECORD dwSize and substitutes the live screen-buffer
@@ -1224,416 +1257,6 @@ mod windows_raw_record {
         (80, 24),
     ];
 
-    struct ModeGuard {
-        cm: ConsoleMode,
-        original: u32,
-        restored: Cell<bool>,
-    }
-
-    impl ModeGuard {
-        fn new(cm: ConsoleMode, original: u32) -> Self {
-            Self {
-                cm,
-                original,
-                restored: Cell::new(false),
-            }
-        }
-
-        fn set(&self, mode: u32) -> io::Result<()> {
-            self.cm.set_mode(mode)
-        }
-
-        fn mode(&self) -> io::Result<u32> {
-            self.cm.mode()
-        }
-
-        fn restore(&self) -> io::Result<u32> {
-            if self.restored.get() {
-                return self.cm.mode();
-            }
-            self.cm.set_mode(self.original)?;
-            let m = self.cm.mode()?;
-            self.restored.set(true);
-            Ok(m)
-        }
-    }
-
-    impl Drop for ModeGuard {
-        fn drop(&mut self) {
-            let _ = self.restore();
-        }
-    }
-
-    fn control_key_state_value(state: ControlKeyState) -> u32 {
-        (0..32).fold(0u32, |acc, bit| {
-            let mask = 1u32 << bit;
-            if state.has_state(mask) {
-                acc | mask
-            } else {
-                acc
-            }
-        })
-    }
-
-    fn event_flags_value(flags: EventFlags) -> u32 {
-        match flags {
-            EventFlags::PressOrRelease => 0x0000,
-            EventFlags::MouseMoved => 0x0001,
-            EventFlags::DoubleClick => 0x0002,
-            EventFlags::MouseWheeled => 0x0004,
-            EventFlags::MouseHwheeled => 0x0008,
-            EventFlags::Unknown => 0x0021,
-        }
-    }
-
-    fn convert_record(record: InputRecord, idx: usize) -> RecordEntry {
-        match record {
-            InputRecord::KeyEvent(k) => RecordEntry {
-                idx,
-                variant: "KeyEvent".into(),
-                key_down: Some(k.key_down),
-                repeat_count: Some(k.repeat_count),
-                virtual_key_code: Some(k.virtual_key_code),
-                virtual_scan_code: Some(k.virtual_scan_code),
-                u_char: Some(k.u_char),
-                control_key_state: Some(control_key_state_value(k.control_key_state)),
-                ..RecordEntry::default()
-            },
-            InputRecord::MouseEvent(m) => RecordEntry {
-                idx,
-                variant: "MouseEvent".into(),
-                mouse_x: Some(m.mouse_position.x),
-                mouse_y: Some(m.mouse_position.y),
-                button_state: Some(m.button_state.state()),
-                mouse_control_key_state: Some(control_key_state_value(m.control_key_state)),
-                event_flags: Some(event_flags_value(m.event_flags)),
-                ..RecordEntry::default()
-            },
-            InputRecord::WindowBufferSizeEvent(w) => RecordEntry {
-                idx,
-                variant: "WindowBufferSizeEvent".into(),
-                // crossterm_winapi 0.9.1 overwrites the record's dwSize with
-                // the live screen-buffer size at read time; these are observed
-                // screen values, not the record's original coordinates.
-                observed_screen_x: Some(w.size.x),
-                observed_screen_y: Some(w.size.y),
-                ..RecordEntry::default()
-            },
-            InputRecord::FocusEvent(f) => RecordEntry {
-                idx,
-                variant: "FocusEvent".into(),
-                focus_set: Some(f.set_focus),
-                ..RecordEntry::default()
-            },
-            InputRecord::MenuEvent(m) => RecordEntry {
-                idx,
-                variant: "MenuEvent".into(),
-                menu_command_id: Some(m.command_id),
-                ..RecordEntry::default()
-            },
-        }
-    }
-
-    fn is_terminator(entry: &RecordEntry) -> bool {
-        entry.variant == "KeyEvent" && entry.key_down == Some(true) && entry.u_char == Some(0x0004)
-    }
-
-    fn write_osc999_line(prefix: &[u8], body: &[u8]) {
-        let mut out = stdout().lock();
-        out.write_all(prefix).expect("write prefix");
-        out.write_all(body).expect("write body");
-        out.write_all(b"\x07").expect("write bel");
-        out.flush().expect("flush");
-    }
-
-    fn stage(name: &str) {
-        let mut out = stdout().lock();
-        out.write_all(b"PI_TUI_RAW_RECORD_STAGE=").expect("stage");
-        out.write_all(name.as_bytes()).expect("stage name");
-        out.write_all(b"\n").expect("stage nl");
-        out.flush().expect("stage flush");
-    }
-
-    fn emit_event(event: &Event, prefix: &[u8]) {
-        let json = serde_json::to_string(event).expect("serialize event");
-        write_osc999_line(prefix, json.as_bytes());
-    }
-
-    fn emit_ready(arm: &str, active: u32) {
-        let body = format!("=1;arm={arm};active={active}");
-        write_osc999_line(READY_PREFIX, body.as_bytes());
-    }
-
-    fn emit_lifecycle_and_finish(
-        arm: &str,
-        original: u32,
-        baseline: u32,
-        requested: u32,
-        guard: &ModeGuard,
-        termination: TerminationEntry,
-    ) {
-        let mut termination = termination;
-        let mut errors: Vec<String> = Vec::new();
-
-        let restored = match guard.restore() {
-            Ok(m) => Some(m),
-            Err(e) => {
-                errors.push(format!("restore failed: {e}"));
-                None
-            }
-        };
-
-        // The post-restore mode is observed evidence: a failed read is
-        // recorded as an error and reported as `None`, never fabricated
-        // as a mode word.
-        let active = match guard.mode() {
-            Ok(m) => Some(m),
-            Err(e) => {
-                errors.push(format!("read post-restore mode failed: {e}"));
-                None
-            }
-        };
-
-        if let Some(m) = restored
-            && m != original
-        {
-            errors.push(format!("restored {m:#06x} != original {original:#06x}"));
-        }
-
-        let error = if errors.is_empty() {
-            None
-        } else {
-            Some(errors.join("; "))
-        };
-        if let Some(e) = &error {
-            termination.message = Some(match termination.message.take() {
-                Some(prev) => format!("{prev}; {e}"),
-                None => e.clone(),
-            });
-        }
-
-        emit_event(
-            &Event::Lifecycle(LifecycleEntry {
-                stage: "teardown".into(),
-                arm: arm.into(),
-                original,
-                baseline,
-                requested,
-                active,
-                restored,
-                error,
-            }),
-            RECORD_PREFIX,
-        );
-        emit_event(&Event::Termination(termination), RECORD_PREFIX);
-    }
-
-    pub fn run_child() {
-        // Plain-text stage markers: unlike the OSC 999 event channel these
-        // always pass ConPTY untransformed, so the last marker in the
-        // transcript localizes any child stall to a single stage.
-        stage("entry");
-        let arm = std::env::var("PI_TUI_RAW_RECORD_ARM")
-            .unwrap_or_else(|e| panic!("PI_TUI_RAW_RECORD_ARM must be set to A, B, or IDLE: {e}"));
-
-        assert!(
-            matches!(arm.as_str(), "A" | "B" | "IDLE"),
-            "PI_TUI_RAW_RECORD_ARM must be A, B, or IDLE, got {arm}"
-        );
-
-        let deadline_ms: u64 = match std::env::var("PI_TUI_RAW_RECORD_DEADLINE_MS") {
-            Ok(s) => s.parse().unwrap_or_else(|e| {
-                panic!("PI_TUI_RAW_RECORD_DEADLINE_MS {s:?} is not a u64: {e}")
-            }),
-            Err(std::env::VarError::NotPresent) => DEFAULT_CHILD_DEADLINE_MS,
-            Err(e) => panic!("PI_TUI_RAW_RECORD_DEADLINE_MS is not readable: {e}"),
-        };
-        let deadline = Duration::from_millis(deadline_ms);
-
-        stage("in_handle");
-        let in_handle = match Handle::current_in_handle() {
-            Ok(h) => h,
-            Err(e) => {
-                emit_event(
-                    &Event::Termination(TerminationEntry {
-                        cause: "error".into(),
-                        record_count: 0,
-                        message: Some(format!("current_in_handle failed: {e}")),
-                    }),
-                    RECORD_PREFIX,
-                );
-                return;
-            }
-        };
-
-        stage("mode_read");
-        let cm = ConsoleMode::from(in_handle.clone());
-        let console = Console::from(in_handle);
-
-        let original = match cm.mode() {
-            Ok(m) => m,
-            Err(e) => {
-                emit_event(
-                    &Event::Termination(TerminationEntry {
-                        cause: "error".into(),
-                        record_count: 0,
-                        message: Some(format!("read original mode failed: {e}")),
-                    }),
-                    RECORD_PREFIX,
-                );
-                return;
-            }
-        };
-
-        let baseline = original & !NOT_RAW_MASK;
-        let requested = match arm.as_str() {
-            "B" => baseline | VT_INPUT,
-            _ => baseline,
-        };
-
-        let guard = ModeGuard::new(cm, original);
-
-        let mut termination = TerminationEntry {
-            cause: "inconclusive".into(),
-            record_count: 0,
-            message: None,
-        };
-
-        stage("set_mode");
-        if let Err(e) = guard.set(requested) {
-            termination.cause = "error".into();
-            termination.message = Some(format!("set_mode({requested:#06x}) failed: {e}"));
-            emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
-            return;
-        }
-
-        let active = match guard.mode() {
-            Ok(m) => m,
-            Err(e) => {
-                termination.cause = "error".into();
-                termination.message = Some(format!("read active mode failed: {e}"));
-                emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
-                return;
-            }
-        };
-
-        stage("setup_emit");
-        emit_event(
-            &Event::Lifecycle(LifecycleEntry {
-                stage: "setup".into(),
-                arm: arm.clone(),
-                original,
-                baseline,
-                requested,
-                active: Some(active),
-                restored: None,
-                error: if active == requested {
-                    None
-                } else {
-                    Some(format!(
-                        "active {active:#06x} != requested {requested:#06x}"
-                    ))
-                },
-            }),
-            RECORD_PREFIX,
-        );
-
-        if active != requested {
-            termination.cause = "inconclusive".into();
-            termination.message = Some(format!(
-                "mode setup mismatch: active {active:#06x} != requested {requested:#06x}"
-            ));
-            emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
-            return;
-        }
-
-        stage("ready_emit");
-        emit_ready(&arm, active);
-        emit_event(
-            &Event::Lifecycle(LifecycleEntry {
-                stage: "ready".into(),
-                arm: arm.clone(),
-                original,
-                baseline,
-                requested,
-                active: Some(active),
-                restored: None,
-                error: None,
-            }),
-            RECORD_PREFIX,
-        );
-
-        stage("read_loop");
-        let started = Instant::now();
-        let mut record_count: usize = 0;
-        while started.elapsed() < deadline {
-            let count = match console.number_of_console_input_events() {
-                Ok(0) => {
-                    thread::sleep(Duration::from_millis(CHILD_POLL_INTERVAL_MS));
-                    continue;
-                }
-                Ok(c) => c,
-                Err(e) => {
-                    termination.cause = "error".into();
-                    termination.message =
-                        Some(format!("number_of_console_input_events failed: {e}"));
-                    break;
-                }
-            };
-
-            for _ in 0..count {
-                if started.elapsed() >= deadline {
-                    break;
-                }
-                if record_count >= CHILD_RECORD_LIMIT {
-                    termination.cause = "record_limit".into();
-                    termination.message =
-                        Some(format!("reached record limit {CHILD_RECORD_LIMIT}"));
-                    break;
-                }
-
-                match console.read_single_input_event() {
-                    Ok(record) => {
-                        record_count += 1;
-                        let entry = convert_record(record, record_count);
-                        let term = is_terminator(&entry);
-                        emit_event(&Event::Record(entry), RECORD_PREFIX);
-                        if term {
-                            termination.cause = "normal".into();
-                            termination.message =
-                                Some(format!("saw Ctrl+D terminator at record {record_count}"));
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        termination.cause = "error".into();
-                        termination.message = Some(format!("read_single_input_event failed: {e}"));
-                        break;
-                    }
-                }
-            }
-
-            if !matches!(termination.cause.as_str(), "inconclusive") {
-                break;
-            }
-
-            thread::sleep(Duration::from_millis(CHILD_POLL_INTERVAL_MS));
-        }
-
-        if termination.cause == "inconclusive" {
-            termination.cause = "deadline".into();
-            termination.message = Some(format!(
-                "reached child deadline {} ms",
-                deadline.as_millis()
-            ));
-        }
-        termination.record_count = record_count;
-
-        stage("finish");
-        emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
-        stage("done");
-    }
-
     fn drain_pending(rx: &mpsc::Receiver<Vec<u8>>, raw: &mut Vec<u8>) {
         while let Ok(chunk) = rx.try_recv() {
             raw.extend_from_slice(&chunk);
@@ -1710,6 +1333,11 @@ mod windows_raw_record {
             line_break,
             navigation_identified,
         }
+    }
+
+    /// The fixture child terminates its record loop on a Ctrl+D key event.
+    fn is_terminator(entry: &RecordEntry) -> bool {
+        entry.variant == "KeyEvent" && entry.key_down == Some(true) && entry.u_char == Some(0x0004)
     }
 
     /// Parses the delimited record stream. Every prefixed record must be
@@ -1809,13 +1437,12 @@ mod windows_raw_record {
             }
         };
 
-        let exe = std::env::current_exe().expect("current_exe");
+        // A plain fixture binary, not this test executable: a libtest
+        // binary spawned under ConPTY never reached the test body on the
+        // CI runner (the transcript carried only console-mode noise), so
+        // the witness child lives in src/bin/pi_tui_raw_record_fixture.rs.
+        let exe = raw_record_fixture_binary();
         let mut cmd = CommandBuilder::new(&exe);
-        cmd.arg("--exact");
-        cmd.arg("windows_raw_input_record_child");
-        cmd.arg("--ignored");
-        cmd.arg("--nocapture");
-        cmd.arg("--test-threads=1");
         cmd.env("PI_TUI_RAW_RECORD_ARM", arm);
         cmd.env(
             "PI_TUI_RAW_RECORD_DEADLINE_MS",
@@ -2250,12 +1877,4 @@ mod windows_raw_record {
 #[test]
 fn windows_raw_input_records_vt_mode_ab() {
     windows_raw_record::run_parent();
-}
-
-#[cfg(windows)]
-#[test]
-#[ignore = "helper entry point: the parent test `windows_raw_input_records_vt_mode_ab` spawns this \
- by name under a private ConPTY environment and reserved env contract"]
-fn windows_raw_input_record_child() {
-    windows_raw_record::run_child();
 }

@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [features]
-testkit = ["dep:avt", "dep:portable-pty", "dep:serde_json", "dep:sha2"]
+testkit = ["dep:avt", "dep:portable-pty", "dep:serde_json", "dep:sha2", "dep:crossterm_winapi"]
 bench = ["dep:pi-bench-alloc"]
 
 [dependencies]
@@ -81,7 +81,15 @@ path = "src/bin/pi_tui_unicode_gauntlet_fixture.rs"
 name = "pi_tui_osc11_handoff_fixture"
 path = "src/bin/pi_tui_osc11_handoff_fixture.rs"
 
+[[bin]]
+name = "pi_tui_raw_record_fixture"
+path = "src/bin/pi_tui_raw_record_fixture.rs"
+required-features = ["testkit"]
 
+
+
+[target.'cfg(windows)'.dependencies]
+crossterm_winapi = { version = "=0.9.1", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dev-dependencies]
 crossterm_winapi = { version = "=0.9.1", default-features = false }
