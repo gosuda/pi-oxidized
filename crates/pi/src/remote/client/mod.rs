@@ -1188,7 +1188,9 @@ impl ClientCore {
         connection_id: u64,
         change: ConnectionStateChange,
     ) -> bool {
-        inner.pending_state_events.push_back((connection_id, change));
+        inner
+            .pending_state_events
+            .push_back((connection_id, change));
         if inner.publishing {
             return false;
         }

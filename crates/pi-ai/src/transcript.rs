@@ -391,12 +391,9 @@ mod tests {
     fn effective_prompt_folds_shorthand_and_updates() {
         let mut update = SystemMessage::new("policy: refuse harm", 3);
         update.sections = Some(
-            [(
-                "tone".to_owned(),
-                Some("be terse".to_owned()),
-            )]
-            .into_iter()
-            .collect(),
+            [("tone".to_owned(), Some("be terse".to_owned()))]
+                .into_iter()
+                .collect(),
         );
         let context = Context {
             system_prompt: Some("base".to_owned()),
@@ -440,7 +437,10 @@ mod tests {
             messages: Vec::new(),
             tools: None,
         };
-        assert_eq!(get_effective_system_prompt(&context).as_deref(), Some("base"));
+        assert_eq!(
+            get_effective_system_prompt(&context).as_deref(),
+            Some("base")
+        );
     }
 
     #[test]

@@ -307,7 +307,10 @@ async fn lingering_backups(path: &Path) -> Vec<PathBuf> {
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
-        if name.as_encoded_bytes().starts_with(prefix.as_encoded_bytes()) {
+        if name
+            .as_encoded_bytes()
+            .starts_with(prefix.as_encoded_bytes())
+        {
             backups.push(entry.path());
         }
     }

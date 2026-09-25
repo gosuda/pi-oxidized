@@ -420,8 +420,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listing_reports_the_canonical_session_once_alongside_its_backup(
-    ) -> Result<(), Box<dyn Error>> {
+    async fn listing_reports_the_canonical_session_once_alongside_its_backup()
+    -> Result<(), Box<dyn Error>> {
         let root = tempdir()?;
         let directory = root.path().join(session_directory_name("/cwd"));
         fs::create_dir_all(&directory)?;
@@ -437,17 +437,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listing_restores_a_stranded_backup_under_its_canonical_name_once(
-    ) -> Result<(), Box<dyn Error>> {
+    async fn listing_restores_a_stranded_backup_under_its_canonical_name_once()
+    -> Result<(), Box<dyn Error>> {
         let root = tempdir()?;
         let directory = root.path().join(session_directory_name("/cwd"));
         fs::create_dir_all(&directory)?;
         let restored = directory.join(session_file_name(0, "stranded"));
-        fs::write(directory.join(format!("{}.bak", session_file_name(0, "stranded"))), "{}")?;
-        assert_eq!(
-            list_session_files(root.path(), None).await?,
-            vec![restored]
-        );
+        fs::write(
+            directory.join(format!("{}.bak", session_file_name(0, "stranded"))),
+            "{}",
+        )?;
+        assert_eq!(list_session_files(root.path(), None).await?, vec![restored]);
         Ok(())
     }
 }

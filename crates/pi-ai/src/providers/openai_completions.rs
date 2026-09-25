@@ -1957,12 +1957,9 @@ mod tests {
         let model = model("openai");
         let mut update = crate::types::SystemMessage::new("policy: refuse harm", 3);
         update.sections = Some(
-            [(
-                "tone".to_owned(),
-                Some("be terse".to_owned()),
-            )]
-            .into_iter()
-            .collect(),
+            [("tone".to_owned(), Some("be terse".to_owned()))]
+                .into_iter()
+                .collect(),
         );
         let context = Context {
             system_prompt: Some("base prompt".into()),

@@ -515,8 +515,7 @@ fn spawn_update_worker(
                     (update, context)
                 }
                 QueuedUpdate::Overflow(context) => {
-                    let error =
-                        ServiceError::internal("service update delivery queue overflowed");
+                    let error = ServiceError::internal("service update delivery queue overflowed");
                     if let Some(subscription) =
                         inner.fail_subscription(&subscription_id, token.as_ref(), error)
                     {
@@ -1094,7 +1093,9 @@ mod tests {
         started_rx.await.expect("first delivery started");
         // Queued while the worker is still blocked inside the first publish.
         state.with_state_mut(|value| *value = object(2.0));
-        state.publish(Context::background()).expect("queued publish");
+        state
+            .publish(Context::background())
+            .expect("queued publish");
 
         endpoint
             .invoke(

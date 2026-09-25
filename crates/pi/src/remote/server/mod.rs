@@ -1552,10 +1552,7 @@ impl PendingUpdates {
     /// worker role, so a live update can never overtake an older buffered
     /// delta. The empty check and the worker release happen under one lock,
     /// so no queued publication is ever stranded.
-    fn enqueue(
-        &self,
-        update: ServiceProviderUpdate<DeltaOp>,
-    ) -> EnqueuedPublication {
+    fn enqueue(&self, update: ServiceProviderUpdate<DeltaOp>) -> EnqueuedPublication {
         let mut state = lock(&self.state);
         if !state.active {
             if state.queue.len() >= MAX_QUEUED_SUBSCRIPTION_UPDATES {

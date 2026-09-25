@@ -1692,7 +1692,9 @@ async fn control_connection(
         }
     }
     cancel.cancel();
-    let _ = event_tx.send(ProcessEvent::ControlClosed { connection_id }).await;
+    let _ = event_tx
+        .send(ProcessEvent::ControlClosed { connection_id })
+        .await;
 }
 
 #[cfg(unix)]
@@ -1714,7 +1716,9 @@ async fn proxy_public(
         }
     }
     cancel.cancel();
-    let _ = event_tx.send(ProcessEvent::PublicClosed { connection_id }).await;
+    let _ = event_tx
+        .send(ProcessEvent::PublicClosed { connection_id })
+        .await;
 }
 
 #[cfg(unix)]

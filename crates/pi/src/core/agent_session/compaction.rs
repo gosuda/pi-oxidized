@@ -481,14 +481,8 @@ impl AgentSession {
                 })
                 .await;
                 let runner = self.hooks.runner();
-                self.extension_compact_failed(
-                    &runner,
-                    reason,
-                    Some(message),
-                    false,
-                    will_retry,
-                )
-                .await;
+                self.extension_compact_failed(&runner, reason, Some(message), false, will_retry)
+                    .await;
                 false
             }
         };

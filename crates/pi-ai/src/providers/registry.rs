@@ -902,7 +902,10 @@ mod tests {
             .clone();
         assert_eq!(
             anthropic_calls.last(),
-            Some(&("anthropic-messages".to_owned(), "https://example.test".to_owned()))
+            Some(&(
+                "anthropic-messages".to_owned(),
+                "https://example.test".to_owned()
+            ))
         );
     }
 
