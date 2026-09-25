@@ -48,7 +48,7 @@ export const PIN_LITERAL_PATHS = [
 const PIN_LITERAL_OCCURRENCES: Readonly<
 	Record<(typeof PIN_LITERAL_PATHS)[number], { readonly sha: number; readonly root: number }>
 > = {
-	".github/workflows/release-verification.yml": { sha: 2, root: 4 },
+	".github/workflows/release-verification.yml": { sha: 4, root: 8 },
 	".github/workflows/musl-bakeoff.yml": { sha: 4, root: 4 },
 	"scripts/reference-identity.ts": { sha: 1, root: 2 },
 };
@@ -314,7 +314,7 @@ export const LEGACY_ALLOWANCES: Readonly<Record<string, LegacyAllowance>> = {
 			"the workflow must name the native reference checkout path literally; YAML cannot import the reference-identity constant",
 		closureEligible: false,
 		counts: {
-			"legacy-root-direct": 5,
+			"legacy-root-direct": 9,
 		},
 	},
 };

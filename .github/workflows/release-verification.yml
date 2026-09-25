@@ -900,12 +900,18 @@ jobs:
         run: npm run build:offline --prefix .references/pi # historical witness: native root literal
 
       # Product/performance/release rows spawn the compiled extension host
-      # and the pi binary; unit/host rows keep the workspace pure.
+      # and the pi binary; unit/host rows keep the workspace pure. The
+      # release build also runs here for the performance shard: the
+      # performance row's 1200s command timeout counts cold release
+      # compilation, which pushed the row past its budget on a cold cache.
       - name: Prepare product prerequisites
         if: matrix.shard != 'unit' && matrix.shard != 'host'
         shell: bash
         run: |
           cargo build -p pi --locked
+          if [ "${{ matrix.shard }}" = "performance" ] || [ "${{ matrix.shard }}" = "release" ]; then
+            cargo build -p pi --release --locked
+          fi
           (
             cd packages/extension-host
             bun install --frozen-lockfile
