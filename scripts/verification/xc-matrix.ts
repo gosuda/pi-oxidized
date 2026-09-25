@@ -9,7 +9,7 @@
 
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { assertCanonicalReference, canonicalReferenceRoot } from "../reference-identity.ts";
+import { assertExtensionCompatReference, extensionCompatReferenceRoot } from "../reference-identity.ts";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
@@ -19,9 +19,9 @@ export interface XcWitnessInputs {
 }
 
 export function loadXcWitnessInputs(root: string): XcWitnessInputs {
-	assertCanonicalReference(root);
+	assertExtensionCompatReference(root);
 	const runnerSource = readFileSync(
-		join(canonicalReferenceRoot(root), "packages/coding-agent/src/core/extensions/runner.ts"),
+		join(extensionCompatReferenceRoot(root), "packages/coding-agent/src/core/extensions/runner.ts"),
 		"utf8",
 	);
 	return { runnerSource };

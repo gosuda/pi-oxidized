@@ -447,7 +447,7 @@ mod tests {
         let assistant = pi_ai::AssistantMessage::new("api", "provider", format!("m{n}"), timestamp);
         AgentEvent::MessageUpdate {
             message: Arc::new(crate::message::AgentMessage::Llm(Box::new(
-                pi_ai::Message::Assistant(assistant.clone()),
+                pi_ai::Message::Assistant(Box::new(assistant.clone())),
             ))),
             assistant_message_event: Box::new(pi_ai::AssistantMessageEvent::Start {
                 partial: Arc::new(assistant),

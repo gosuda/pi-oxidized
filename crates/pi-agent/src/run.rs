@@ -16,8 +16,8 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
-    AgentContext, AgentLoopConfig, AgentLoopTurnUpdate, PrepareNextTurnContext,
-    ShouldStopAfterTurnContext,
+    AgentContext, AgentLoopConfig, AgentLoopTurnUpdate, AgentTurnContext, AgentTurnDecision,
+    PrepareNextTurnContext, PrepareRequestContext,
 };
 use crate::drain::{DRAIN_EVENT_CAPACITY, DrainItem, ProviderDrain};
 use crate::error::AgentLoopError;
@@ -55,12 +55,13 @@ pub async fn run_agent_loop(
     io: RunIo<'_>,
     cancel: CancellationToken,
 ) -> Result<Vec<AgentMessage>, AgentLoopError> {
-    let mut new_messages = prompts.clone();
+    let initial_messages = prompts;
+    let mut new_messages = initial_messages.clone();
     let mut current_context = AgentContext {
         system_prompt: context.system_prompt,
         messages: {
             let mut messages = context.messages;
-            messages.extend(prompts.iter().cloned());
+            messages.extend(initial_messages.iter().cloned());
             messages
         },
         tools: context.tools,
@@ -68,8 +69,8 @@ pub async fn run_agent_loop(
 
     io.sink.emit(AgentEvent::AgentStart);
     io.sink.emit(AgentEvent::TurnStart);
-    for prompt in &prompts {
-        emit_message_pair(io.sink, prompt.clone());
+    for message in &initial_messages {
+        emit_message_pair(io.sink, message.clone());
     }
 
     run_loop(&mut current_context, &mut new_messages, config, &io, cancel).await?;
@@ -126,9 +127,14 @@ async fn run_loop(
     cancel: CancellationToken,
 ) -> Result<(), AgentLoopError> {
     let mut last_completed_turn: Option<PrepareNextTurnContext> = None;
+    // Set by a `Continue` decision when no natural request (tool batch,
+    // steering, or follow-up) satisfies it; fulfilled with one context-only
+    // request. Mirrors `explicitContinuation` in `agent-loop.ts:314-336`.
+    let mut explicit_continuation = false;
     let mut pending_messages = poll_messages(config.get_steering_messages.as_ref()).await?;
 
-    // Outer loop: re-enters when follow-up messages arrive after tools finish.
+    // Outer loop: re-enters when follow-up messages arrive after tools finish
+    // or a `Continue` decision needs a context-only request.
     loop {
         let mut has_more_tool_calls = true;
 
@@ -137,8 +143,9 @@ async fn run_loop(
             // A saved completed turn means the caller-emitted first turn is
             // over and this iteration starts a real subsequent provider
             // request; decide continuation before touching provider state.
+            let mut turn_messages = Vec::new();
             if let Some(completed_turn) = last_completed_turn.take() {
-                if prepare_continuation(
+                let Some(prepared_messages) = prepare_continuation(
                     current_context,
                     &mut config,
                     &mut pending_messages,
@@ -146,78 +153,52 @@ async fn run_loop(
                     cancel.clone(),
                 )
                 .await?
-                {
+                else {
                     emit_agent_end(io.sink, new_messages);
                     return Ok(());
-                }
-
+                };
                 io.sink.emit(AgentEvent::TurnStart);
+                turn_messages.extend(prepared_messages);
             }
 
-            if !pending_messages.is_empty() {
-                for message in pending_messages.drain(..) {
-                    emit_message_pair(io.sink, message.clone());
-                    current_context.messages.push(message.clone());
-                    new_messages.push(message);
-                }
-            }
+            turn_messages.append(&mut pending_messages);
+            append_messages(io.sink, current_context, new_messages, turn_messages);
+
+            apply_prepare_request(current_context, &mut config, cancel.clone()).await?;
 
             let message =
                 stream_assistant_response(current_context, &config, io, cancel.clone()).await?;
-            new_messages.push(assistant_agent_message(message.clone()));
+            let Some(CompletedTurn {
+                context: completed_turn,
+                has_more_tool_calls: next_has_more_tool_calls,
+                decision,
+            }) = complete_turn(
+                current_context,
+                new_messages,
+                &config,
+                io,
+                cancel.clone(),
+                message,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            has_more_tool_calls = next_has_more_tool_calls;
 
-            if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
-                io.sink.emit(AgentEvent::TurnEnd {
-                    message: assistant_agent_message(message),
-                    tool_results: Vec::new(),
-                });
+            if decision == Some(AgentTurnDecision::End) {
+                // End after `turn_end`; steering and follow-up queues are left
+                // untouched (`agent-loop.ts:313-316`).
                 emit_agent_end(io.sink, new_messages);
                 return Ok(());
             }
-
-            let tool_results;
-            has_more_tool_calls = false;
-            if message_has_tool_calls(&message) {
-                let emit = SinkEmit(io.sink);
-                let batch = if message.stop_reason == StopReason::Length {
-                    fail_tool_calls_from_truncated_message(&message, &emit)
-                } else {
-                    execute_tool_calls(current_context, &message, &config, &cancel, &emit).await?
-                };
-                tool_results = batch.messages;
-                has_more_tool_calls = !batch.terminate;
-
-                for result in &tool_results {
-                    let agent_result = tool_result_agent_message(result.clone());
-                    current_context.messages.push(agent_result.clone());
-                    new_messages.push(agent_result);
-                }
-            } else {
-                tool_results = Vec::new();
-            }
-
-            io.sink.emit(AgentEvent::TurnEnd {
-                message: assistant_agent_message(message.clone()),
-                tool_results: tool_results.clone(),
-            });
 
             if cancel.is_cancelled() {
                 emit_agent_end(io.sink, new_messages);
                 return Ok(());
             }
 
-            let completed_turn = PrepareNextTurnContext {
-                message: message.clone(),
-                tool_results: tool_results.clone(),
-                context: current_context.clone(),
-                new_messages: new_messages.clone(),
-            };
-
-            if should_stop_after_turn(&config, &completed_turn).await? {
-                emit_agent_end(io.sink, new_messages);
-                return Ok(());
-            }
-
+            explicit_continuation = decision == Some(AgentTurnDecision::Continue);
             pending_messages = poll_messages(config.get_steering_messages.as_ref()).await?;
 
             if cancel.is_cancelled() {
@@ -225,13 +206,25 @@ async fn run_loop(
                 return Ok(());
             }
 
+            if has_more_tool_calls || !pending_messages.is_empty() {
+                explicit_continuation = false;
+            }
+
             last_completed_turn = Some(completed_turn);
         }
 
         let follow_up = poll_messages(config.get_follow_up_messages.as_ref()).await?;
         if follow_up.is_empty() {
+            // No natural request was selected, so fulfill a `Continue`
+            // decision with one context-only turn
+            // (`agent-loop.ts:330-333`).
+            if explicit_continuation {
+                explicit_continuation = false;
+                continue;
+            }
             break;
         }
+        explicit_continuation = false;
         pending_messages = follow_up;
     }
 
@@ -239,11 +232,133 @@ async fn run_loop(
     Ok(())
 }
 
+/// Completed-turn outcome of one inner-loop iteration.
+///
+/// `None` from [`complete_turn`] means the turn terminalized (error or
+/// aborted); the terminal path has already emitted `TurnEnd` and `AgentEnd`
+/// and the caller must return.
+struct CompletedTurn {
+    /// Turn context saved for the next iteration's `prepare_next_turn`.
+    context: AgentTurnContext,
+    /// Whether the batch left tool calls that schedule another request.
+    has_more_tool_calls: bool,
+    /// Decision returned by the `finish_turn` hook.
+    decision: Option<AgentTurnDecision>,
+}
+
+/// Finalizes one streamed assistant message: appends it, executes its tool
+/// batch, runs the `finish_turn` hook before `TurnEnd`
+/// (`agent-loop.ts:285-286`), and emits the turn's `TurnEnd`.
+async fn complete_turn(
+    current_context: &mut AgentContext,
+    new_messages: &mut Vec<AgentMessage>,
+    config: &AgentLoopConfig,
+    io: &RunIo<'_>,
+    cancel: CancellationToken,
+    message: AssistantMessage,
+) -> Result<Option<CompletedTurn>, AgentLoopError> {
+    new_messages.push(assistant_agent_message(message.clone()));
+    if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+        finish_terminal_turn(current_context, new_messages, config, io, cancel, message).await?;
+        return Ok(None);
+    }
+
+    let (tool_results, has_more_tool_calls) = if message_has_tool_calls(&message) {
+        let emit = SinkEmit(io.sink);
+        let batch = if message.stop_reason == StopReason::Length {
+            fail_tool_calls_from_truncated_message(&message, &emit)
+        } else {
+            execute_tool_calls(current_context, &message, config, &cancel, &emit).await?
+        };
+        (batch.messages, !batch.terminate)
+    } else {
+        (Vec::new(), false)
+    };
+    append_tool_results(current_context, new_messages, &tool_results);
+
+    let completed_turn = AgentTurnContext {
+        message: message.clone(),
+        tool_results: tool_results.clone(),
+        context: current_context.clone(),
+        new_messages: new_messages.clone(),
+    };
+    let decision = finish_turn(config, completed_turn.clone(), cancel).await?;
+    io.sink.emit(AgentEvent::TurnEnd {
+        message: assistant_agent_message(message),
+        tool_results,
+    });
+    Ok(Some(CompletedTurn {
+        context: completed_turn,
+        has_more_tool_calls,
+        decision,
+    }))
+}
+
+/// Appends finalized tool results to the transcript and run delta. Their
+/// `message_start` / `message_end` lifecycle events were already emitted by
+/// the scheduler, so this appends without emitting.
+fn append_tool_results(
+    current_context: &mut AgentContext,
+    new_messages: &mut Vec<AgentMessage>,
+    tool_results: &[ToolResultMessage],
+) {
+    for result in tool_results {
+        let agent_result = tool_result_agent_message(result.clone());
+        current_context.messages.push(agent_result.clone());
+        new_messages.push(agent_result);
+    }
+}
+
+/// Emits each message's `message_start` / `message_end` pair and appends it
+/// to the transcript and run delta.
+fn append_messages<I>(
+    sink: &dyn crate::bus::EventSink,
+    current_context: &mut AgentContext,
+    new_messages: &mut Vec<AgentMessage>,
+    messages: I,
+) where
+    I: IntoIterator<Item = AgentMessage>,
+{
+    for message in messages {
+        emit_message_pair(sink, message.clone());
+        current_context.messages.push(message.clone());
+        new_messages.push(message);
+    }
+}
+
+/// Runs `finish_turn` for an error or aborted turn. The hook observes the
+/// completed turn with empty tool results and its decision is ignored; the
+/// terminal `TurnEnd` and `AgentEnd` still emit
+/// (`agent-loop.ts:245-254`).
+async fn finish_terminal_turn(
+    current_context: &AgentContext,
+    new_messages: &[AgentMessage],
+    config: &AgentLoopConfig,
+    io: &RunIo<'_>,
+    cancel: CancellationToken,
+    message: AssistantMessage,
+) -> Result<(), AgentLoopError> {
+    let completed_turn = AgentTurnContext {
+        message: message.clone(),
+        tool_results: Vec::new(),
+        context: current_context.clone(),
+        new_messages: new_messages.to_vec(),
+    };
+    let _decision = finish_turn(config, completed_turn, cancel).await?;
+    io.sink.emit(AgentEvent::TurnEnd {
+        message: assistant_agent_message(message),
+        tool_results: Vec::new(),
+    });
+    emit_agent_end(io.sink, new_messages);
+    Ok(())
+}
+
 /// Applies `prepare_next_turn` for a completed turn and re-polls steering
 /// messages if none were queued during preparation.
 ///
-/// Returns `true` when the run was cancelled (caller should emit `AgentEnd`
-/// and return), `false` to continue the inner loop.
+/// Returns `None` when cancellation wins before the next request. Otherwise
+/// the prepared messages are appended by the caller after `TurnStart` and
+/// before any queued messages.
 ///
 /// # Errors
 ///
@@ -255,15 +370,16 @@ async fn prepare_continuation(
     pending_messages: &mut Vec<AgentMessage>,
     completed_turn: PrepareNextTurnContext,
     cancel: CancellationToken,
-) -> Result<bool, AgentLoopError> {
+) -> Result<Option<Vec<AgentMessage>>, AgentLoopError> {
     if cancel.is_cancelled() {
-        return Ok(true);
+        return Ok(None);
     }
 
-    apply_prepare_next_turn(current_context, config, completed_turn, cancel.clone()).await?;
+    let prepared_messages =
+        apply_prepare_next_turn(current_context, config, completed_turn, cancel.clone()).await?;
 
     if cancel.is_cancelled() {
-        return Ok(true);
+        return Ok(None);
     }
 
     // Messages queued while preparation ran join this same next request;
@@ -272,10 +388,10 @@ async fn prepare_continuation(
     if pending_messages.is_empty() {
         *pending_messages = poll_messages(config.get_steering_messages.as_ref()).await?;
         if cancel.is_cancelled() {
-            return Ok(true);
+            return Ok(None);
         }
     }
-    Ok(false)
+    Ok(Some(prepared_messages))
 }
 
 async fn stream_assistant_response(
@@ -519,22 +635,53 @@ async fn apply_prepare_next_turn(
     config: &mut AgentLoopConfig,
     completed_turn: PrepareNextTurnContext,
     cancel: CancellationToken,
-) -> Result<(), AgentLoopError> {
+) -> Result<Vec<AgentMessage>, AgentLoopError> {
     let Some(prepare) = config.prepare_next_turn.clone() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
-    let update = prepare(completed_turn, cancel).await?;
-    apply_turn_update(current_context, config, update);
-    Ok(())
+    let Some(update) = prepare(completed_turn, cancel).await? else {
+        return Ok(Vec::new());
+    };
+    let AgentLoopTurnUpdate {
+        context,
+        messages,
+        model,
+        thinking_level,
+    } = update;
+    if let Some(context) = context {
+        *current_context = context;
+    }
+    if let Some(model) = model {
+        config.model = model;
+    }
+    if let Some(level) = thinking_level {
+        config.reasoning = if level == ModelThinkingLevel::Off {
+            None
+        } else {
+            Some(level)
+        };
+    }
+    Ok(messages.unwrap_or_default())
 }
 
-fn apply_turn_update(
+/// Invokes `prepare_request` immediately before a provider request and applies
+/// the returned state for this and subsequent requests
+/// (`agent-loop.ts:241-257`).
+async fn apply_prepare_request(
     current_context: &mut AgentContext,
     config: &mut AgentLoopConfig,
-    update: Option<AgentLoopTurnUpdate>,
-) {
-    let Some(update) = update else {
-        return;
+    cancel: CancellationToken,
+) -> Result<(), AgentLoopError> {
+    let Some(prepare) = config.prepare_request.clone() else {
+        return Ok(());
+    };
+    let request = PrepareRequestContext {
+        context: current_context.clone(),
+        model: config.model.clone(),
+        thinking_level: config.reasoning.unwrap_or(ModelThinkingLevel::Off),
+    };
+    let Some(update) = prepare(request, cancel).await? else {
+        return Ok(());
     };
     if let Some(context) = update.context {
         *current_context = context;
@@ -549,16 +696,20 @@ fn apply_turn_update(
             Some(level)
         };
     }
+    Ok(())
 }
 
-async fn should_stop_after_turn(
+/// Invokes `finish_turn` for a completed turn. Without a hook the decision is
+/// `None`, preserving normal scheduling.
+async fn finish_turn(
     config: &AgentLoopConfig,
-    completed_turn: &ShouldStopAfterTurnContext,
-) -> Result<bool, AgentLoopError> {
-    let Some(should_stop) = config.should_stop_after_turn.as_ref() else {
-        return Ok(false);
-    };
-    should_stop(completed_turn.clone()).await
+    completed_turn: AgentTurnContext,
+    cancel: CancellationToken,
+) -> Result<Option<AgentTurnDecision>, AgentLoopError> {
+    match config.finish_turn.as_ref() {
+        Some(finish) => finish(completed_turn, cancel).await,
+        None => Ok(None),
+    }
 }
 
 fn message_has_tool_calls(message: &AssistantMessage) -> bool {
@@ -575,7 +726,7 @@ fn replace_last_assistant(context: &mut AgentContext, message: AssistantMessage)
 }
 
 fn assistant_agent_message(message: AssistantMessage) -> AgentMessage {
-    AgentMessage::Llm(Box::new(Message::Assistant(message)))
+    AgentMessage::Llm(Box::new(Message::Assistant(Box::new(message))))
 }
 
 fn tool_result_agent_message(message: ToolResultMessage) -> AgentMessage {
@@ -617,6 +768,15 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use crate::bus::{AgentEventSink, EventSink, ExtensionEvent};
+    use crate::config::{
+        AgentLoopTurnUpdate, AgentRequestUpdate, BeforeToolCallResult, default_convert_to_llm_hook,
+        text_user_message,
+    };
+    use crate::error::ToolError;
+    use crate::message::{CustomAgentMessage, default_convert_to_llm};
+    use crate::state::AgentState;
+    use crate::tool::{AgentTool, AgentToolResult, ToolExecutionMode, ToolUpdates};
     use futures::future::BoxFuture;
     use futures::stream::{self, BoxStream, StreamExt};
     use pi_ai::{
@@ -627,15 +787,7 @@ mod tests {
     use tokio::sync::watch;
     use tokio::time::sleep;
 
-    use crate::bus::{AgentEventSink, EventSink, ExtensionEvent};
-    use crate::config::{AgentLoopTurnUpdate, default_convert_to_llm_hook, text_user_message};
-    use crate::error::ToolError;
-    use crate::message::{CustomAgentMessage, default_convert_to_llm};
-    use crate::state::AgentState;
-    use crate::tool::{AgentTool, AgentToolResult, ToolExecutionMode, ToolUpdates};
-
     type TestResult = Result<(), String>;
-
     static EMPTY_OBJECT_SCHEMA: LazyLock<Value> =
         LazyLock::new(|| json!({"type":"object","properties":{}}));
 
@@ -841,6 +993,22 @@ mod tests {
         }
     }
 
+    struct OrderedSink {
+        events: Arc<Mutex<Vec<AgentEvent>>>,
+        order: OrderLog,
+    }
+
+    impl EventSink for OrderedSink {
+        fn emit(&self, event: AgentEvent) {
+            if matches!(&event, AgentEvent::TurnEnd { .. }) {
+                record_order(&self.order, "turn_end");
+            }
+            if let Ok(mut guard) = self.events.lock() {
+                guard.push(event);
+            }
+        }
+    }
+
     struct RecordingTool {
         name: String,
         executed: Arc<AtomicUsize>,
@@ -931,7 +1099,10 @@ mod tests {
             reasoning: false,
             thinking_level_map: None,
             input: vec![ModelInput::Text],
+            input_limits: None,
             cost: ModelCost::default(),
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 8_192,
             max_tokens: 1_024,
             headers: None,
@@ -944,6 +1115,7 @@ mod tests {
         AgentLoopConfig {
             model: sample_model(),
             reasoning: None,
+            tool_choice: None,
             temperature: None,
             max_tokens: None,
             session_id: None,
@@ -959,7 +1131,8 @@ mod tests {
             convert_to_llm: default_convert_to_llm_hook(),
             transform_context: None,
             get_api_key: None,
-            should_stop_after_turn: None,
+            finish_turn: None,
+            prepare_request: None,
             prepare_next_turn: None,
             get_steering_messages: None,
             get_follow_up_messages: None,
@@ -1157,6 +1330,20 @@ mod tests {
         }
     }
 
+    fn context_has_user_text(context: &Context, needle: &str) -> bool {
+        context.messages.iter().any(|message| {
+            let Message::User(user) = message else {
+                return false;
+            };
+            match &user.content {
+                pi_ai::UserMessageContent::Text(text) => text.contains(needle),
+                pi_ai::UserMessageContent::Blocks(blocks) => blocks.iter().any(|block| {
+                    matches!(block, pi_ai::UserContent::Text(text) if text.text.contains(needle))
+                }),
+            }
+        })
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn text_turn_event_order() -> TestResult {
         let provider = ScriptedProvider::new(vec![text_script("hello")]);
@@ -1300,7 +1487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_after_tools_ends_without_another_turn_or_hooks() -> TestResult {
+    async fn cancellation_after_tools_runs_finish_hook_without_another_turn() -> TestResult {
         let tool = Arc::new(RecordingTool::new("cancel-me"));
         let provider = ScriptedProvider::new(vec![
             vec![
@@ -1336,11 +1523,11 @@ mod tests {
             })
         }));
         let stop_calls_hook = Arc::clone(&stop_calls);
-        config.should_stop_after_turn = Some(Arc::new(move |_| {
+        config.finish_turn = Some(Arc::new(move |_, _| {
             let stop_calls_hook = Arc::clone(&stop_calls_hook);
             Box::pin(async move {
                 stop_calls_hook.fetch_add(1, Ordering::SeqCst);
-                Ok(false)
+                Ok(None)
             })
         }));
         let steering_polls_hook = Arc::clone(&steering_polls);
@@ -1381,7 +1568,11 @@ mod tests {
         assert_eq!(result_ids, Some(vec!["c1"]));
         assert_eq!(provider.call_count(), 1);
         assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            stop_calls.load(Ordering::SeqCst),
+            1,
+            "finish_turn still runs for a completed turn after cancellation"
+        );
         assert_eq!(steering_polls.load(Ordering::SeqCst), 1);
         assert_eq!(follow_up_polls.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -1483,20 +1674,6 @@ mod tests {
         Ok(())
     }
 
-    fn context_has_user_text(context: &Context, needle: &str) -> bool {
-        context.messages.iter().any(|message| {
-            match message {
-            Message::User(user) => match &user.content {
-                pi_ai::UserMessageContent::Text(text) => text.contains(needle),
-                pi_ai::UserMessageContent::Blocks(blocks) => blocks.iter().any(|block| {
-                    matches!(block, pi_ai::UserContent::Text(text) if text.text.contains(needle))
-                }),
-            },
-            _ => false,
-        }
-        })
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn prepare_next_turn_updates_model_and_reasoning() -> TestResult {
         let tool = Arc::new(RecordingTool::new("read"));
@@ -1515,6 +1692,7 @@ mod tests {
                 record_order(&order, "prepare");
                 Ok(Some(AgentLoopTurnUpdate {
                     context: None,
+                    messages: None,
                     model: Some(next_model),
                     thinking_level: Some(ModelThinkingLevel::High),
                 }))
@@ -1563,7 +1741,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stop_after_turn_precedes_prepare_next_turn() -> TestResult {
+    async fn finish_turn_end_precedes_prepare_next_turn() -> TestResult {
         let tool = Arc::new(RecordingTool::new("read"));
         let provider =
             ScriptedProvider::new(vec![tool_script("c1", "read"), text_script("unused")]);
@@ -1581,13 +1759,13 @@ mod tests {
         }));
         let stop_calls_hook = Arc::clone(&stop_calls);
         let order_for_stop = Arc::clone(&order);
-        config.should_stop_after_turn = Some(Arc::new(move |_| {
+        config.finish_turn = Some(Arc::new(move |_, _| {
             let stop_calls_hook = Arc::clone(&stop_calls_hook);
             let order = Arc::clone(&order_for_stop);
             Box::pin(async move {
                 stop_calls_hook.fetch_add(1, Ordering::SeqCst);
-                record_order(&order, "stop");
-                Ok(true)
+                record_order(&order, "finish");
+                Ok(Some(AgentTurnDecision::End))
             })
         }));
 
@@ -1604,16 +1782,21 @@ mod tests {
         assert_eq!(
             prepare_calls.load(Ordering::SeqCst),
             0,
-            "a stopped turn must never reach prepare_next_turn"
+            "a turn ended by finish_turn must never reach prepare_next_turn"
         );
         assert_eq!(provider.call_count(), 1);
         assert_eq!(count_type(&events, "turn_start"), 1);
         assert_eq!(count_type(&events, "agent_end"), 1);
+        // `End` still emits `turn_end` before `agent_end`.
+        assert_eq!(
+            &event_types(&events)[events.len() - 2..],
+            ["turn_end", "agent_end"]
+        );
         let order = order
             .lock()
             .map_err(|_| "order mutex poisoned".to_owned())?;
         assert_eq!(order.len(), 1);
-        assert_eq!(order[0], "stop");
+        assert_eq!(order[0], "finish");
         Ok(())
     }
 
@@ -1865,17 +2048,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stop_after_turn_skips_steering_and_follow_up() -> TestResult {
+    async fn finish_turn_end_skips_steering_and_follow_up() -> TestResult {
         let steer_polls = Arc::new(AtomicUsize::new(0));
         let follow_polls = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(Mutex::new(vec![text_user_message("queued")]));
         let provider = ScriptedProvider::new(vec![text_script("stop")]);
         let mut config = sample_config();
         let steer_polls_hook = Arc::clone(&steer_polls);
+        let queued_hook = Arc::clone(&queued);
         config.get_steering_messages = Some(Arc::new(move || {
             let steer_polls_hook = Arc::clone(&steer_polls_hook);
+            let queued_hook = Arc::clone(&queued_hook);
             Box::pin(async move {
-                steer_polls_hook.fetch_add(1, Ordering::SeqCst);
-                Ok(Vec::new())
+                let poll = steer_polls_hook.fetch_add(1, Ordering::SeqCst);
+                if poll == 0 {
+                    return Ok(Vec::new());
+                }
+                Ok(queued_hook
+                    .lock()
+                    .map(|mut guard| std::mem::take(&mut *guard))
+                    .unwrap_or_default())
             })
         }));
         let follow_polls_hook = Arc::clone(&follow_polls);
@@ -1886,7 +2078,9 @@ mod tests {
                 Ok(vec![text_user_message("should-not-run")])
             })
         }));
-        config.should_stop_after_turn = Some(Arc::new(|_| Box::pin(async { Ok(true) })));
+        config.finish_turn = Some(Arc::new(|_, _| {
+            Box::pin(async { Ok(Some(AgentTurnDecision::End)) })
+        }));
 
         let (_messages, events, _) = run_prompt(
             vec![text_user_message("prompt")],
@@ -1901,6 +2095,14 @@ mod tests {
         assert_eq!(follow_polls.load(Ordering::SeqCst), 0);
         assert_eq!(provider.call_count(), 1);
         assert_eq!(count_type(&events, "agent_end"), 1);
+        assert_eq!(
+            queued
+                .lock()
+                .map(|guard| guard.len())
+                .map_err(|_| "queued mutex poisoned".to_owned())?,
+            1,
+            "End must leave queued steering messages untouched"
+        );
         Ok(())
     }
 
@@ -2162,7 +2364,10 @@ mod tests {
             ctx.messages.iter().all(|message| {
                 matches!(
                     message,
-                    Message::User(_) | Message::Assistant(_) | Message::ToolResult(_)
+                    Message::System(_)
+                        | Message::User(_)
+                        | Message::Assistant(_)
+                        | Message::ToolResult(_)
                 )
             }),
             "only LLM messages reach provider"
@@ -2390,6 +2595,315 @@ mod tests {
             })
             .ok_or("missing assistant")?;
         assert_eq!(last.stop_reason, StopReason::Aborted);
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_turn_runs_before_turn_end_on_normal_turn() -> TestResult {
+        let provider = ScriptedProvider::new(vec![text_script("done")]);
+        let order: OrderLog = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = OrderedSink {
+            events: Arc::clone(&events),
+            order: Arc::clone(&order),
+        };
+        let (partial_tx, _) = watch::channel(None);
+        let mut config = sample_config();
+        let hook_order = Arc::clone(&order);
+        config.finish_turn = Some(Arc::new(move |_, _| {
+            let hook_order = Arc::clone(&hook_order);
+            Box::pin(async move {
+                record_order(&hook_order, "finish");
+                Ok(None)
+            })
+        }));
+        let io = RunIo {
+            sink: &sink,
+            provider: &provider,
+            partial: partial_tx,
+        };
+        run_agent_loop(
+            vec![text_user_message("prompt")],
+            base_context(Vec::new()),
+            config,
+            io,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let order = order
+            .lock()
+            .map_err(|_| "order mutex poisoned".to_owned())?
+            .clone();
+        assert_eq!(order, ["finish", "turn_end"]);
+        let events = snapshot(&events)?;
+        assert_eq!(count_type(&events, "turn_end"), 1);
+        assert_eq!(count_type(&events, "agent_end"), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_turn_runs_on_error_with_empty_tool_results() -> TestResult {
+        let provider = ScriptedProvider::new(vec![vec![Ok(start("")), Ok(error_event("boom"))]]);
+        let order: OrderLog = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = OrderedSink {
+            events: Arc::clone(&events),
+            order: Arc::clone(&order),
+        };
+        let mut config = sample_config();
+        let hook_order = Arc::clone(&order);
+        let observed = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let observed_hook = Arc::clone(&observed);
+        config.finish_turn = Some(Arc::new(move |turn, _| {
+            let hook_order = Arc::clone(&hook_order);
+            let observed_hook = Arc::clone(&observed_hook);
+            Box::pin(async move {
+                record_order(&hook_order, "finish");
+                if let Ok(mut guard) = observed_hook.lock() {
+                    guard.push(turn.tool_results.len());
+                }
+                Ok(None)
+            })
+        }));
+        let (partial_tx, _) = watch::channel(None);
+        let io = RunIo {
+            sink: &sink,
+            provider: &provider,
+            partial: partial_tx,
+        };
+        run_agent_loop(
+            vec![text_user_message("prompt")],
+            base_context(Vec::new()),
+            config,
+            io,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let order = order
+            .lock()
+            .map_err(|_| "order mutex poisoned".to_owned())?
+            .clone();
+        assert_eq!(order, ["finish", "turn_end"]);
+        let observed = observed
+            .lock()
+            .map_err(|_| "observed mutex poisoned".to_owned())?
+            .clone();
+        assert_eq!(observed, [0]);
+        let events = snapshot(&events)?;
+        assert_eq!(
+            &event_types(&events)[events.len() - 2..],
+            ["turn_end", "agent_end"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_turn_runs_on_aborted_with_empty_tool_results() -> TestResult {
+        let provider =
+            ScriptedProvider::new(vec![vec![Ok(start("")), Ok(aborted_event("aborted"))]]);
+        let order: OrderLog = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = OrderedSink {
+            events: Arc::clone(&events),
+            order: Arc::clone(&order),
+        };
+        let mut config = sample_config();
+        let hook_order = Arc::clone(&order);
+        let observed = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let observed_hook = Arc::clone(&observed);
+        config.finish_turn = Some(Arc::new(move |turn, _| {
+            let hook_order = Arc::clone(&hook_order);
+            let observed_hook = Arc::clone(&observed_hook);
+            Box::pin(async move {
+                record_order(&hook_order, "finish");
+                if let Ok(mut guard) = observed_hook.lock() {
+                    guard.push(turn.tool_results.len());
+                }
+                Ok(None)
+            })
+        }));
+        let (partial_tx, _) = watch::channel(None);
+        let io = RunIo {
+            sink: &sink,
+            provider: &provider,
+            partial: partial_tx,
+        };
+        run_agent_loop(
+            vec![text_user_message("prompt")],
+            base_context(Vec::new()),
+            config,
+            io,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let order = order
+            .lock()
+            .map_err(|_| "order mutex poisoned".to_owned())?
+            .clone();
+        assert_eq!(order, ["finish", "turn_end"]);
+        let observed = observed
+            .lock()
+            .map_err(|_| "observed mutex poisoned".to_owned())?
+            .clone();
+        assert_eq!(observed, [0]);
+        let events = snapshot(&events)?;
+        assert_eq!(
+            &event_types(&events)[events.len() - 2..],
+            ["turn_end", "agent_end"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_turn_continue_forces_another_provider_request() -> TestResult {
+        let provider = ScriptedProvider::new(vec![text_script("first"), text_script("second")]);
+        let decisions = Arc::new(AtomicUsize::new(0));
+        let mut config = sample_config();
+        let decisions_hook = Arc::clone(&decisions);
+        config.finish_turn = Some(Arc::new(move |_, _| {
+            let index = decisions_hook.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if index == 0 {
+                    Ok(Some(AgentTurnDecision::Continue))
+                } else {
+                    Ok(None)
+                }
+            })
+        }));
+        let (_messages, events, _) = run_prompt(
+            vec![text_user_message("prompt")],
+            base_context(Vec::new()),
+            config,
+            &provider,
+            CancellationToken::new(),
+        )
+        .await?;
+
+        assert_eq!(decisions.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.call_count(), 2);
+        assert_eq!(count_type(&events, "turn_start"), 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepare_request_replaces_model_and_thinking_level() -> TestResult {
+        let provider = ScriptedProvider::new(vec![text_script("prepared")]);
+        let mut next_model = sample_model();
+        next_model.id = "prepared-model".to_owned();
+        let mut config = sample_config();
+        config.prepare_request = Some(Arc::new(move |_, _| {
+            let next_model = next_model.clone();
+            Box::pin(async move {
+                Ok(Some(AgentRequestUpdate {
+                    context: None,
+                    model: Some(next_model),
+                    thinking_level: Some(ModelThinkingLevel::High),
+                }))
+            })
+        }));
+        let (_messages, _events, _) = run_prompt(
+            vec![text_user_message("prompt")],
+            base_context(Vec::new()),
+            config,
+            &provider,
+            CancellationToken::new(),
+        )
+        .await?;
+
+        assert_eq!(provider.model_ids(), ["prepared-model"]);
+        assert_eq!(provider.reasoning_values(), [Some("high".to_owned())]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepare_next_turn_messages_reach_next_request() -> TestResult {
+        let tool = Arc::new(RecordingTool::new("read"));
+        let provider =
+            ScriptedProvider::new(vec![tool_script("c1", "read"), text_script("second")]);
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let mut config = sample_config();
+        let prepare_calls_hook = Arc::clone(&prepare_calls);
+        config.prepare_next_turn = Some(Arc::new(move |_, _| {
+            let index = prepare_calls_hook.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if index == 0 {
+                    Ok(Some(AgentLoopTurnUpdate {
+                        context: None,
+                        messages: Some(vec![text_user_message("injected")]),
+                        model: None,
+                        thinking_level: None,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            })
+        }));
+        let (messages, events, _) = run_prompt(
+            vec![text_user_message("prompt")],
+            base_context(vec![tool]),
+            config,
+            &provider,
+            CancellationToken::new(),
+        )
+        .await?;
+
+        assert_eq!(provider.call_count(), 2);
+        let context = provider.last_context().ok_or("missing second context")?;
+        assert!(context_has_user_text(&context, "injected"));
+        assert!(
+            messages
+                .iter()
+                .any(|message| user_text_contains(message, "injected"))
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::MessageEnd { message } if user_text_contains(message, "injected")
+            )
+        }));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminating_blocked_batch_short_circuits_next_request() -> TestResult {
+        let tool_calls = vec![
+            ToolCall::new("c1", "first", Map::new()),
+            ToolCall::new("c2", "second", Map::new()),
+        ];
+        let first = vec![Ok(start("")), Ok(done_tool(tool_calls))];
+        let provider = ScriptedProvider::new(vec![first, text_script("should-not-run")]);
+        let mut config = sample_config();
+        config.before_tool_call = Some(Arc::new(|_, _| {
+            Box::pin(async {
+                Ok(Some(BeforeToolCallResult {
+                    block: true,
+                    reason: Some("blocked".to_owned()),
+                    terminate: Some(true),
+                }))
+            })
+        }));
+        let (_messages, _events, _) = run_prompt(
+            vec![text_user_message("prompt")],
+            base_context(vec![
+                Arc::new(RecordingTool::new("first")),
+                Arc::new(RecordingTool::new("second")),
+            ]),
+            config,
+            &provider,
+            CancellationToken::new(),
+        )
+        .await?;
+
+        assert_eq!(
+            provider.call_count(),
+            1,
+            "all blocked results with terminate=true must end the batch"
+        );
         Ok(())
     }
 }

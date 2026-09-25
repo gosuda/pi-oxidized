@@ -9,3 +9,8 @@
 # fixture cannot be silently corrupted (blobs under this tree are LF-clean
 # today, so this changes nothing checked in).
 scripts/verification/fixtures/** -text
+# Vendored upstream trees carry binary assets: no conversion ever, so a
+# byte-exact copy survives staging (an upstream PNG is silently corrupted
+# the moment its bytes are line-normalized). Everything else under vendor/
+# stays under the LF rule above.
+vendor/**/*.png -text

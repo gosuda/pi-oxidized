@@ -289,9 +289,9 @@ because those rules are resolved in the TypeScript host before the snapshot
 reaches Rust, and the product layer uses `raw_shortcuts` (not `Registry`)
 for shortcut dispatch. No semantic change is required.
 
-## 7. Canonical 35-hook classification
+## 7. Canonical 39-hook classification
 
-The canonical lifecycle event set contains the following 35 discriminants in
+The canonical lifecycle event set contains the following 39 discriminants in
 this exact order. These three arrays must contain the same values in the same
 order:
 
@@ -312,16 +312,20 @@ session_before_switch
 session_before_fork
 session_before_compact
 session_compact
+session_compact_failed
 session_shutdown
 session_before_tree
 session_tree
 context
+context_with_system
+cache_warming_decision
 before_provider_request
 before_provider_headers
 after_provider_response
 before_agent_start
 agent_start
 agent_end
+agent_before_settle
 agent_settled
 ui_prompt_start
 ui_prompt_end
@@ -359,11 +363,11 @@ completes, rejects, or throws before it returns a promise. Lean mode receives
 both events through generic notification dispatch. Rust only validates and
 routes the event names; it does not emit a second copy.
 
-`witness: packages/extension-host/tests/acceptance.test.ts::acceptance: all 35
-lifecycle events` — asserts the canonical list carries exactly 35
+`witness: packages/extension-host/tests/acceptance.test.ts::acceptance: all 39
+lifecycle events` — asserts the canonical list carries exactly 39
 discriminants and that handlers for each are recognized by the runner;
 `scripts/verification/xc-dispatch.ts::DISCRIMINANT_LATTICE` (verified by
-`xc-dispatch.test.ts`) classifies exactly 35 discriminants matching
+`xc-dispatch.test.ts`) classifies exactly 39 discriminants matching
 `ALL_EVENT_TYPES`. Exact event-name order is checked across host
 `ALL_EVENT_TYPES`, lean `LEAN_EVENT_TYPES`, and Rust `ALL_EVENT_TYPES` by
 `scripts/verification/xc-dispatch.ts`; `frames.jsonl` and
@@ -373,7 +377,7 @@ xc-dispatch lattice and deletion mutation checks.
 
 ### 7.1 Dispatch-semantics lattice (XC-6, issue #55)
 
-Each of the 35 discriminants belongs to one or more dispatch-semantics
+Each of the 39 discriminants belongs to one or more dispatch-semantics
 classes. The lattice is defined in
 `scripts/verification/xc-dispatch.ts::DISCRIMINANT_LATTICE` and verified by
 `scripts/verification/xc-dispatch.test.ts`:
@@ -412,13 +416,17 @@ The full registry snapshot (`RegistrySnapshotWire` consumed by Rust
 - `flags`: `{ name, description, type, extensionPath, default?, value? }` from
   `runner.getFlags()` plus effective values from `runner.getFlagValues()`.
 - `renderers`: `{ type: "message" | "widget", name }`, deduplicated.
-- `providers`: entries from `::buildProviderSnapshot` (lines 2068-2085):
-  `{ name, streamSimple (boolean), baseUrl?, api?, displayName?, apiKey?, headers?,
-  authHeader?, models? }` — matching `SessionToolWire` / `SessionCommandInfoWire`
-  / `ProvidersUpdate` mirror fields on the Rust side
+- `providers`: entries from `::buildProviderSnapshot` (lines 2155-2174):
+  `{ name, streamSimple (boolean), fetchDeferred? (boolean), cancelDeferred?
+  (boolean), baseUrl?, api?, displayName?, apiKey?, headers?,
+  authHeader?, models? }` — `fetchDeferred`/`cancelDeferred` are emitted only
+  when the extension registers the corresponding deferred operation, so their
+  absence means "not supported" and is backward-compatible with readers that
+  predate the deferred methods — matching `SessionToolWire` /
+  `SessionCommandInfoWire` / `ProvidersUpdate` mirror fields on the Rust side
   (`crates/pi-ext/src/protocol.rs` typed wire structs, session-action and theme
   open-method sections at lines 1339, 1429).
-- `handlers`: the canonical 35 discriminants with at least one registered handler.
+- `handlers`: the canonical 39 discriminants with at least one registered handler.
 - `terminalInput`: boolean, whether an active terminal-input handler exists.
 
 `witness: packages/extension-host/tests/acceptance.test.ts::acceptance:

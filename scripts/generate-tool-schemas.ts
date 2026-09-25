@@ -43,11 +43,11 @@ import { access, mkdir, readdir, readFile, rename, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { assertCanonicalReference, canonicalReferenceRoot } from "./reference-identity.ts";
+import { assertNativeReference, nativeReferenceRoot } from "./reference-identity.ts";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
-const REFERENCE_ROOT = canonicalReferenceRoot(REPO_ROOT);
+const REFERENCE_ROOT = nativeReferenceRoot(REPO_ROOT);
 const REFERENCE_PACKAGE_MANIFEST = join(REFERENCE_ROOT, "packages/coding-agent/package.json");
 const REFERENCE_PACKAGE_LOCK = join(REFERENCE_ROOT, "package-lock.json");
 const REFERENCE_TOOLS_INDEX = join(REFERENCE_ROOT, "packages/coding-agent/src/core/tools/index.ts");
@@ -298,7 +298,7 @@ export interface LoadedToolRegistry {
 export async function loadCanonicalToolRegistry(): Promise<LoadedToolRegistry> {
 	assertBunRuntime();
 	// Fail closed before any reference manifest, lockfile, or registry is read.
-	assertCanonicalReference(REPO_ROOT);
+	assertNativeReference(REPO_ROOT);
 	const typeboxPin = await readPinnedTypeboxVersion();
 	const typeboxEntry = await resolvePinnedTypeboxEntry(typeboxPin);
 	registerTypeboxPin(typeboxEntry);

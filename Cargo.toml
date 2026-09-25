@@ -7,7 +7,7 @@ members = [
     "crates/pi-ext",
     "crates/pi-tui",
 ]
-exclude = [".agent-tasks/pi-rust-rewrite"]
+exclude = [".agent-tasks/pi-rust-rewrite", "vendor/crossterm-0.29.0", "bench/pi-bench-alloc"]
 
 [workspace.package]
 version = "0.1.0"
@@ -34,3 +34,6 @@ panic = "warn"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm-0.29.0" }

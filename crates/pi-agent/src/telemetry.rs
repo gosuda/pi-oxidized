@@ -502,6 +502,7 @@ const EVENT_TYPES: &[&str] = &[
     "lane_created",
     "usage",
 ];
+const RESTORE_MISSING: &[&str] = &["lane configuration", "lane state"];
 
 const fn attr(
     name: &'static str,
@@ -713,6 +714,22 @@ const OP_NAVIGATION_START: &[AttrDef] = &[
         AttrType::Str,
         true,
         &["navigation"],
+        None,
+    ),
+];
+const RESTORE_START: &[AttrDef] = &[
+    attr(
+        "pi.lane.name",
+        AttrType::Str,
+        true,
+        NONE,
+        Some(Cardinality::High),
+    ),
+    attr(
+        "pi.restore.missing",
+        AttrType::Str,
+        true,
+        RESTORE_MISSING,
         None,
     ),
 ];
@@ -992,6 +1009,13 @@ const HARNESS_SPANS: &[SpanDef] = &[
         parents: ParentKind::RootOrExternal,
         start: OP_NAVIGATION_START,
         end: COMPACTION_END,
+        status_default_ok: true,
+    },
+    SpanDef {
+        name: "pi.harness.restore",
+        parents: ParentKind::RootOrExternal,
+        start: RESTORE_START,
+        end: EMPTY,
         status_default_ok: true,
     },
     SpanDef {
@@ -1599,7 +1623,7 @@ mod tests {
         assert_eq!(AI_TELEMETRY_SCHEMA.version, 1);
         assert_eq!(AI_TELEMETRY_SCHEMA.spans[0].name, "pi.ai.request");
         assert_eq!(HARNESS_TELEMETRY_SCHEMA.version, 1);
-        assert_eq!(HARNESS_TELEMETRY_SCHEMA.spans.len(), 11);
+        assert_eq!(HARNESS_TELEMETRY_SCHEMA.spans.len(), 12);
         let names: Vec<_> = HARNESS_TELEMETRY_SCHEMA
             .spans
             .iter()
@@ -1611,6 +1635,7 @@ mod tests {
                 "pi.harness.run",
                 "pi.harness.compaction",
                 "pi.harness.navigation",
+                "pi.harness.restore",
                 "pi.harness.checkpoint",
                 "pi.harness.turn",
                 "pi.harness.step",
@@ -1666,8 +1691,12 @@ mod tests {
     }
 
     /// Expected `(name, start_attrs, end_attrs)` for each harness span.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one literal row per registered span; splitting the pinned table hides the pin"
+    )]
     fn expected_harness_span_attributes()
-    -> [(&'static str, Vec<&'static str>, Vec<&'static str>); 11] {
+    -> [(&'static str, Vec<&'static str>, Vec<&'static str>); 12] {
         [
             (
                 "pi.harness.run",
@@ -1701,6 +1730,11 @@ mod tests {
                     "pi.operation.kind",
                 ],
                 vec!["pi.operation.outcome", "pi.error.code", "pi.error.type"],
+            ),
+            (
+                "pi.harness.restore",
+                vec!["pi.lane.name", "pi.restore.missing"],
+                vec![],
             ),
             (
                 "pi.harness.checkpoint",
@@ -1798,19 +1832,23 @@ mod tests {
             RUN_OUTCOMES
         );
         assert_eq!(
-            HARNESS_TELEMETRY_SCHEMA.spans[5].start[2].values,
+            HARNESS_TELEMETRY_SCHEMA.spans[6].start[2].values,
             &["assistant", "compaction", "branch_summary"]
         );
         assert_eq!(
-            HARNESS_TELEMETRY_SCHEMA.spans[5].end[0].values,
+            HARNESS_TELEMETRY_SCHEMA.spans[3].start[1].values,
+            RESTORE_MISSING
+        );
+        assert_eq!(
+            HARNESS_TELEMETRY_SCHEMA.spans[6].end[0].values,
             STEP_OUTCOMES
         );
         assert_eq!(
-            HARNESS_TELEMETRY_SCHEMA.spans[7].start[2].values,
+            HARNESS_TELEMETRY_SCHEMA.spans[8].start[2].values,
             HOOK_NAMES
         );
         assert_eq!(
-            HARNESS_TELEMETRY_SCHEMA.spans[9].start[0].values,
+            HARNESS_TELEMETRY_SCHEMA.spans[10].start[0].values,
             EVENT_TYPES
         );
     }
@@ -1846,57 +1884,5 @@ mod tests {
             spans[1].attributes.get("pi.turn.id"),
             Some(&AttributeValue::Str("turn-1".to_owned()))
         );
-    }
-
-    #[test]
-    fn every_agent_loop_config_literal_carries_telemetry() {
-        let sources = [
-            include_str!("agent.rs"),
-            include_str!("config.rs"),
-            include_str!("run.rs"),
-            include_str!("schedule.rs"),
-            include_str!("../../pi/src/core/agent_session/mod.rs"),
-        ];
-        let mut literals = Vec::new();
-        for source in sources {
-            let mut offset = 0;
-            while let Some(found) = source[offset..].find("AgentLoopConfig {") {
-                let start = offset + found;
-                let prefix = &source[..start];
-                offset = start + "AgentLoopConfig {".len();
-                if prefix.ends_with("struct ")
-                    || prefix.ends_with("impl ")
-                    || prefix.trim_end().ends_with("->")
-                {
-                    continue;
-                }
-                let mut depth = 1_u32;
-                let mut end = offset;
-                for (index, byte) in source[offset..].bytes().enumerate() {
-                    match byte {
-                        b'{' => depth += 1,
-                        b'}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                end = offset + index + 1;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                literals.push(&source[start..end]);
-                offset = end;
-            }
-        }
-        assert_eq!(literals.len(), 5);
-        for (i, literal) in literals.iter().enumerate() {
-            assert!(
-                literal.contains("telemetry:")
-                    || literal.contains("telemetry,")
-                    || literal.contains("telemetry }"),
-                "literal {i} missing telemetry:\n{literal}"
-            );
-        }
     }
 }

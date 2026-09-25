@@ -18,9 +18,6 @@
 //! aggressive resizes / paste / cursor input, parses the byte stream with
 //! `avt`, and asserts the no-clear / single-write / probe-before-sync contract.
 //!
-//! Platform key-matrix coverage documents the intentional legacy
-//! `modifyOtherKeys` omission (see test name and
-//! [`pi_tui::keys::MODIFY_OTHER_KEYS_OMISSION`]).
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -30,12 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use avt::Vt;
-use crossterm::event::{KeyCode, KeyEventState, KeyModifiers};
-use pi_tui::keys::{
-    KeyId, MODIFY_OTHER_KEYS_OMISSION, is_kitty_protocol_active, key_matches, key_press,
-    key_press_state, set_kitty_protocol_active,
-};
-use pi_tui::terminal::guard::EMERGENCY_RESTORE_BYTES;
+use pi_tui::terminal::guard::{EMERGENCY_REGULAR_RESTORE_BYTES, EMERGENCY_RESTORE_BYTES};
 use pi_tui::terminal::{audit_bytes, probe_query_batch};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
@@ -88,17 +80,22 @@ fn pty_cursor_restore_after_success_abort_provider_error_panic_and_sigint() {
         if !BYTE_TRANSPARENT_MASTER {
             continue;
         }
-        if exit == "panic" {
+        if exit == "panic" || exit == "sigint" {
             assert_eq!(
-                report.emergency_restore_count,
+                report.emergency_regular_restore_count,
                 1,
-                "exit=panic: expected exactly one complete emergency restore sequence; got {} in {} output bytes",
-                report.emergency_restore_count,
+                "exit={exit}: expected exactly one regular-mode emergency restore sequence; got {} regular / {} alternate-screen in {} output bytes",
+                report.emergency_regular_restore_count,
+                report.emergency_alternate_screen_restore_count,
                 report.raw.len()
+            );
+            assert_eq!(
+                report.emergency_alternate_screen_restore_count, 0,
+                "exit={exit}: alternate-screen emergency restore emitted although the fixture never entered the alternate screen"
             );
         } else {
             assert!(
-                report.saw_cursor_show || report.emergency_restore_count > 0,
+                report.saw_cursor_show || report.emergency_regular_restore_count > 0,
                 "exit={exit}: expected cursor restoration bytes; got {} output bytes",
                 report.raw.len()
             );
@@ -139,113 +136,6 @@ fn pty_final_snapshots_narrow_normal_wide() {
             non_empty > 0,
             "width={width}: blank frame detected in snapshot"
         );
-    }
-}
-
-/// Key matrix is OS-aware. On every host we assert structured Kitty/crossterm
-/// matching works and document that legacy `modifyOtherKeys` is intentionally
-/// omitted so modified-Enter cannot be distinguished without Kitty.
-#[test]
-fn key_matrix_linux_macos_windows_legacy_modifyotherkeys_omission() {
-    let host = std::env::consts::OS;
-    assert!(
-        matches!(host, "linux" | "macos" | "windows")
-            || cfg!(target_os = "linux")
-            || cfg!(target_os = "macos")
-            || cfg!(target_os = "windows"),
-        "unexpected host OS for key matrix: {host}"
-    );
-
-    let cases: &[(&str, crossterm::event::KeyEvent, bool)] = &[
-        (
-            "ctrl+c",
-            key_press(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            true,
-        ),
-        (
-            "enter",
-            key_press(KeyCode::Enter, KeyModifiers::empty()),
-            true,
-        ),
-        (
-            "shift+enter",
-            key_press(KeyCode::Enter, KeyModifiers::SHIFT),
-            true,
-        ),
-        (
-            "alt+enter",
-            key_press(KeyCode::Enter, KeyModifiers::ALT),
-            true,
-        ),
-        (
-            "ctrl+enter",
-            key_press(KeyCode::Enter, KeyModifiers::CONTROL),
-            true,
-        ),
-        (
-            "left",
-            key_press(KeyCode::Left, KeyModifiers::empty()),
-            true,
-        ),
-        (
-            "ctrl+right",
-            key_press(KeyCode::Right, KeyModifiers::CONTROL),
-            true,
-        ),
-        (
-            "1",
-            key_press_state(
-                KeyCode::Char('1'),
-                KeyModifiers::empty(),
-                KeyEventState::KEYPAD,
-            ),
-            true,
-        ),
-    ];
-
-    for (id, event, expected) in cases {
-        assert_eq!(
-            key_matches(event, &KeyId::from(*id)),
-            *expected,
-            "os={host} key_id={id}"
-        );
-    }
-
-    set_kitty_protocol_active(false);
-    assert!(!is_kitty_protocol_active());
-    let plain = key_press(KeyCode::Enter, KeyModifiers::empty());
-    assert!(key_matches(&plain, &KeyId::from("enter")));
-    assert!(
-        !key_matches(&plain, &KeyId::from("shift+enter")),
-        "legacy plain Enter must not satisfy shift+enter without Kitty/modifyOtherKeys"
-    );
-    assert!(
-        MODIFY_OTHER_KEYS_OMISSION.contains("modifyOtherKeys"),
-        "omission marker must name modifyOtherKeys"
-    );
-    assert!(
-        MODIFY_OTHER_KEYS_OMISSION.contains("never emitted or parsed"),
-        "omission marker must state never emitted/parsed"
-    );
-    assert!(
-        MODIFY_OTHER_KEYS_OMISSION.contains("backslash-Enter"),
-        "omission marker must document backslash-Enter workaround"
-    );
-
-    match host {
-        "linux" => assert!(
-            MODIFY_OTHER_KEYS_OMISSION.contains("Legacy non-Kitty"),
-            "linux key-matrix omission docs"
-        ),
-        "macos" => assert!(
-            MODIFY_OTHER_KEYS_OMISSION.contains("Legacy non-Kitty"),
-            "macos key-matrix omission docs"
-        ),
-        "windows" => assert!(
-            MODIFY_OTHER_KEYS_OMISSION.contains("Legacy non-Kitty"),
-            "windows key-matrix omission docs (console modifiers via crossterm, no modifyOtherKeys)"
-        ),
-        _ => {}
     }
 }
 
@@ -397,7 +287,8 @@ struct DriveReport {
     finished_within_timeout: bool,
     sole_stdout_owner: bool,
     saw_cursor_show: bool,
-    emergency_restore_count: usize,
+    emergency_regular_restore_count: usize,
+    emergency_alternate_screen_restore_count: usize,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -747,7 +638,17 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
         && !txns.is_empty();
 
     let saw_cursor_show = find_subslice(&raw, b"\x1b[?25h").is_some();
-    let emergency_restore_count = raw
+    // The full alternate-screen sequence contains the regular-mode bytes as a
+    // subsequence (it inserts CSI ? 1049 l between CSI ? 7 h and CSI < u), so
+    // a subsequence search for one variant would conflate them. Exact-window
+    // equality keeps the counts disjoint: neither sequence is a contiguous
+    // window of the other, so each emitted restore registers in exactly one
+    // counter.
+    let emergency_regular_restore_count = raw
+        .windows(EMERGENCY_REGULAR_RESTORE_BYTES.len())
+        .filter(|window| *window == EMERGENCY_REGULAR_RESTORE_BYTES)
+        .count();
+    let emergency_alternate_screen_restore_count = raw
         .windows(EMERGENCY_RESTORE_BYTES.len())
         .filter(|window| *window == EMERGENCY_RESTORE_BYTES)
         .count();
@@ -807,7 +708,8 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
         finished_within_timeout,
         sole_stdout_owner,
         saw_cursor_show,
-        emergency_restore_count,
+        emergency_regular_restore_count,
+        emergency_alternate_screen_restore_count,
     }
 }
 
@@ -974,7 +876,7 @@ fn parse_sidechannel_text(raw: &[u8], key: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+fn find_subslice<T: PartialEq>(haystack: &[T], needle: &[T]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
@@ -1024,10 +926,1033 @@ fn fixture_binary() -> PathBuf {
     path
 }
 
+/// Resolve the Windows raw-record witness child binary. Unlike
+/// `fixture_binary`, this target is feature-gated on `testkit`, so the
+/// cargo build fallback must pass `--features testkit`.
+#[cfg(windows)]
+fn raw_record_fixture_binary() -> PathBuf {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_pi_tui_raw_record_fixture") {
+        return PathBuf::from(path);
+    }
+    let name = format!("pi_tui_raw_record_fixture{}", std::env::consts::EXE_SUFFIX);
+    let mut candidates = Vec::new();
+    if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {
+        candidates.push(PathBuf::from(target));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+    candidates.push(PathBuf::from("target"));
+    for root in candidates {
+        for profile in ["debug", "release"] {
+            let path = root.join(profile).join(&name);
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "pi-tui",
+            "--features",
+            "testkit",
+            "--bin",
+            "pi_tui_raw_record_fixture",
+            "--quiet",
+        ])
+        .status()
+        .unwrap_or_else(|err| panic!("failed to build raw-record fixture: {err}"));
+    assert!(status.success(), "raw-record fixture build failed");
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug")
+        .join(name)
+}
+
 fn fixture_bin_name() -> &'static str {
     if cfg!(windows) {
         "pi_tui_pty_fixture.exe"
     } else {
         "pi_tui_pty_fixture"
     }
+}
+
+#[cfg(windows)]
+mod windows_raw_record {
+    use std::io::{Write, stdout};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+    use serde::{Deserialize, Serialize};
+    use std::process::Command;
+
+    use super::{
+        HARD_TIMEOUT, INITIAL_COLS, INITIAL_ROWS, READ_IDLE, find_subslice,
+        raw_record_fixture_binary, write_stimulus,
+    };
+
+    const VT_INPUT: u32 = 0x0200;
+    const TRANSCRIPT_LIMIT: usize = 1_048_576;
+
+    const RECORD_PREFIX: &[u8] = b"\x1b]999;PI_TUI_RAW_RECORD=";
+
+    // crossterm_winapi 0.9.1's From<INPUT_RECORD> impl discards the raw
+    // WINDOW_BUFFER_SIZE_RECORD dwSize and substitutes the live screen-buffer
+    // size at read time, so resize coordinates cannot be captured verbatim
+    // through the approved safe wrapper. These notes keep the report honest
+    // about that derived provenance instead of claiming raw fidelity.
+    const RESIZE_FIDELITY_NOTE: &str = "unavailable: crossterm_winapi 0.9.1 replaces WindowBufferSizeEvent dwSize with the live screen-buffer size at read time; observed_screen_x/y are read-time screen values, not the record's original coordinates";
+    const STIMULUS_INJECTION_NOTE: &str = "direct master-writer injection; bypasses the Windows Terminal clipboard-paste relay that an outward \x1b[?2004h would arm; no manual-clipboard-paste claim";
+    const FULL_LOSSLESS_NOTE: &str = "unproven: raw resize coordinate fidelity is unavailable through the approved safe wrapper (see resize_coordinate_fidelity); a demonstrated verdict covers raw key-record paste-delimiter retention only, not full lossless-record feasibility";
+    const NEGOTIATION_NOTE: &str = "no \x1b[?2004h or \x1b[?9001h was emitted by the child and none was observed from the host; a teardown \x1b[?9001l would not prove \x1b[?9001h was negotiated; no negotiation is invented";
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+    pub struct RecordEntry {
+        pub idx: usize,
+        pub variant: String,
+        pub key_down: Option<bool>,
+        pub repeat_count: Option<u16>,
+        pub virtual_key_code: Option<u16>,
+        pub virtual_scan_code: Option<u16>,
+        pub u_char: Option<u16>,
+        pub control_key_state: Option<u32>,
+        pub mouse_x: Option<i16>,
+        pub mouse_y: Option<i16>,
+        pub button_state: Option<i32>,
+        pub mouse_control_key_state: Option<u32>,
+        pub event_flags: Option<u32>,
+        pub observed_screen_x: Option<i16>,
+        pub observed_screen_y: Option<i16>,
+        pub focus_set: Option<bool>,
+        pub menu_command_id: Option<u32>,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct LifecycleEntry {
+        pub stage: String,
+        pub arm: String,
+        pub original: u32,
+        pub baseline: u32,
+        pub requested: u32,
+        pub active: Option<u32>,
+        pub restored: Option<u32>,
+        pub error: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub struct TerminationEntry {
+        pub cause: String,
+        pub record_count: usize,
+        pub message: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    pub enum Event {
+        #[serde(rename = "record")]
+        Record(RecordEntry),
+        #[serde(rename = "lifecycle")]
+        Lifecycle(LifecycleEntry),
+        #[serde(rename = "termination")]
+        Termination(TerminationEntry),
+    }
+
+    #[derive(Clone, Debug, Serialize)]
+    pub struct ArmReport {
+        pub arm: String,
+        pub completed: bool,
+        pub original: Option<u32>,
+        pub baseline: Option<u32>,
+        pub requested: Option<u32>,
+        pub active: Option<u32>,
+        pub restored: Option<u32>,
+        pub record_count: usize,
+        pub records: Vec<RecordEntry>,
+        pub transcript_bytes: usize,
+        pub transcript_tail: Option<String>,
+        pub transcript_limit_exceeded: bool,
+        pub record_limit_exceeded: bool,
+        pub child_deadline_exceeded: bool,
+        pub child_terminated_normally: bool,
+        pub termination_cause: Option<String>,
+        pub termination_message: Option<String>,
+        pub opener_found: bool,
+        pub closer_found: bool,
+        pub payload_found: bool,
+        pub opener_position: Option<usize>,
+        pub payload_position: Option<usize>,
+        pub closer_position: Option<usize>,
+        pub delimiter_order_verified: bool,
+        pub navigation_inputs_identified: usize,
+        pub resize_requests_sent: usize,
+        pub resize_records_observed: usize,
+        pub resize_coordinate_fidelity: &'static str,
+        pub bracketed_paste_2004_observed: bool,
+        pub mode_9001_observed: bool,
+        pub line_break_codepoint: Option<String>,
+        pub stop_cause: Option<String>,
+        // Full lossless-record feasibility: never above "inconclusive"
+        // because raw resize-coordinate fidelity is unavailable.
+        pub feasibility: String,
+        // Separately gated exact key-record evidence: "demonstrated" only
+        // when every key-boundary check passed; never a stand-in for the
+        // full feasibility verdict.
+        pub exact_key_evidence: String,
+        // Explicit answer to "is the raw record stream proven lossless?":
+        // "refuted" when information loss was demonstrated, "inconclusive"
+        // when fully assessed but raw resize-coordinate fidelity is
+        // unavailable, "not_applicable" for the idle arm, "not_reached" when
+        // environmental/setup failures prevented assessment.
+        pub full_lossless_feasibility: String,
+    }
+
+    #[derive(Clone, Debug, Serialize)]
+    pub struct FinalReport {
+        pub arms: Vec<ArmReport>,
+        pub fixture_selftest: String,
+        pub fixture_pty_selftest: String,
+        pub fixture_cmd_selftest: String,
+        pub cross_arm_baseline_consistent: Option<bool>,
+        pub bracketed_paste_2004_emitted: bool,
+        pub mode_9001_emitted: bool,
+        pub negotiation_note: &'static str,
+        pub limitations: Vec<&'static str>,
+    }
+
+    const RESIZE_PLAN: [(u16, u16); 24] = [
+        (80, 24),
+        (40, 12),
+        (20, 8),
+        (12, 6),
+        (10, 5),
+        (8, 4),
+        (16, 10),
+        (32, 14),
+        (64, 20),
+        (100, 30),
+        (120, 40),
+        (200, 50),
+        (24, 8),
+        (18, 7),
+        (14, 6),
+        (11, 5),
+        (9, 4),
+        (28, 12),
+        (48, 16),
+        (72, 22),
+        (96, 28),
+        (160, 36),
+        (60, 18),
+        (80, 24),
+    ];
+
+    fn drain_pending(rx: &mpsc::Receiver<Vec<u8>>, raw: &mut Vec<u8>) {
+        while let Ok(chunk) = rx.try_recv() {
+            raw.extend_from_slice(&chunk);
+        }
+    }
+
+    const NAV_VK_CODES: [u16; 6] = [0x25, 0x27, 0x26, 0x28, 0x24, 0x23];
+    const NAV_CSI_FINALS: [u16; 6] = [0x44, 0x43, 0x41, 0x42, 0x48, 0x46];
+
+    struct KeyEvidence {
+        opener_pos: Option<usize>,
+        payload_pos: Option<usize>,
+        closer_pos: Option<usize>,
+        line_break: Option<String>,
+        navigation_identified: usize,
+    }
+
+    fn analyze_key_records(records: &[RecordEntry]) -> KeyEvidence {
+        let key_chars: Vec<u16> = records
+            .iter()
+            .filter(|r| r.variant == "KeyEvent" && r.key_down == Some(true))
+            .filter_map(|r| r.u_char)
+            .collect();
+
+        let opener = [0x001Bu16, 0x005B, 0x0032, 0x0030, 0x0030, 0x007E];
+        let closer = [0x001B, 0x005B, 0x0032, 0x0030, 0x0031, 0x007E];
+
+        let opener_pos = find_subslice(&key_chars, &opener);
+        let closer_pos = find_subslice(&key_chars, &closer);
+
+        let payload_lf: Vec<u16> = b"PASTED-BLOCK-line1\nline2"
+            .iter()
+            .map(|&b| u16::from(b))
+            .collect();
+        let payload_cr: Vec<u16> = b"PASTED-BLOCK-line1\rline2"
+            .iter()
+            .map(|&b| u16::from(b))
+            .collect();
+        let payload_crlf: Vec<u16> = b"PASTED-BLOCK-line1\r\nline2"
+            .iter()
+            .map(|&b| u16::from(b))
+            .collect();
+
+        let (payload_pos, line_break) = if let Some(p) = find_subslice(&key_chars, &payload_lf) {
+            (Some(p), Some("LF".into()))
+        } else if let Some(p) = find_subslice(&key_chars, &payload_cr) {
+            (Some(p), Some("CR".into()))
+        } else if let Some(p) = find_subslice(&key_chars, &payload_crlf) {
+            (Some(p), Some("CRLF".into()))
+        } else {
+            (None, None)
+        };
+
+        // A navigation input is identifiable either as a translated VK
+        // key-down record or as its raw CSI final in the u_char stream;
+        // which form arrives is itself evidence, so neither is prescribed.
+        let mut navigation_identified = 0usize;
+        for (vk, final_byte) in NAV_VK_CODES.iter().zip(NAV_CSI_FINALS.iter()) {
+            let by_vk = records.iter().any(|r| {
+                r.variant == "KeyEvent"
+                    && r.key_down == Some(true)
+                    && r.virtual_key_code == Some(*vk)
+            });
+            let by_csi = find_subslice(&key_chars, &[0x001B, 0x005B, *final_byte]).is_some();
+            if by_vk || by_csi {
+                navigation_identified += 1;
+            }
+        }
+
+        KeyEvidence {
+            opener_pos,
+            payload_pos,
+            closer_pos,
+            line_break,
+            navigation_identified,
+        }
+    }
+
+    /// The fixture child terminates its record loop on a Ctrl+D key event.
+    fn is_terminator(entry: &RecordEntry) -> bool {
+        entry.variant == "KeyEvent" && entry.key_down == Some(true) && entry.u_char == Some(0x0004)
+    }
+
+    /// Parses the delimited record stream. Every prefixed record must be
+    /// well-formed: a truncated record, invalid UTF-8, or invalid JSON is
+    /// a named failure, never a silent skip, because a skipped record is
+    /// indistinguishable from dropped evidence. Events parsed before a
+    /// failure are retained for the report alongside the failure.
+    fn parse_events(raw: &[u8]) -> (Vec<Event>, Option<String>) {
+        let mut events = Vec::new();
+        let mut idx = 0;
+        while let Some(rel) = find_subslice(&raw[idx..], RECORD_PREFIX) {
+            let start = idx + rel + RECORD_PREFIX.len();
+            let Some(end_rel) = raw
+                .get(start..)
+                .and_then(|tail| tail.iter().position(|&b| b == 0x07))
+            else {
+                return (
+                    events,
+                    Some(format!(
+                        "truncated record at byte {start}: prefix without BEL terminator"
+                    )),
+                );
+            };
+            let end = start + end_rel;
+            let s = match std::str::from_utf8(&raw[start..end]) {
+                Ok(s) => s,
+                Err(e) => {
+                    return (
+                        events,
+                        Some(format!("record at byte {start} is not valid UTF-8: {e}")),
+                    );
+                }
+            };
+            match serde_json::from_str::<Event>(s) {
+                Ok(ev) => events.push(ev),
+                Err(e) => {
+                    return (
+                        events,
+                        Some(format!("record at byte {start} is not valid JSON: {e}")),
+                    );
+                }
+            }
+            idx = end + 1;
+        }
+        (events, None)
+    }
+
+    fn run_arm(pty_system: &NativePtySystem, arm: &str, has_stimulus: bool) -> ArmReport {
+        let mut report = ArmReport {
+            arm: arm.into(),
+            completed: false,
+            original: None,
+            baseline: None,
+            requested: None,
+            active: None,
+            restored: None,
+            record_count: 0,
+            records: Vec::new(),
+            transcript_bytes: 0,
+            transcript_tail: None,
+            transcript_limit_exceeded: false,
+            record_limit_exceeded: false,
+            child_deadline_exceeded: false,
+            child_terminated_normally: false,
+            termination_cause: None,
+            termination_message: None,
+            opener_found: false,
+            closer_found: false,
+            payload_found: false,
+            opener_position: None,
+            payload_position: None,
+            closer_position: None,
+            delimiter_order_verified: false,
+            navigation_inputs_identified: 0,
+            resize_requests_sent: 0,
+            resize_records_observed: 0,
+            resize_coordinate_fidelity: RESIZE_FIDELITY_NOTE,
+            bracketed_paste_2004_observed: false,
+            mode_9001_observed: false,
+            line_break_codepoint: None,
+            stop_cause: None,
+            feasibility: "inconclusive".into(),
+            exact_key_evidence: "not_reached".into(),
+            full_lossless_feasibility: "not_reached".into(),
+        };
+
+        let pair = match pty_system.openpty(PtySize {
+            rows: INITIAL_ROWS,
+            cols: INITIAL_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                report.stop_cause = Some(format!("openpty failed: {e}"));
+                return report;
+            }
+        };
+
+        // A plain fixture binary, not this test executable: a libtest
+        // binary spawned under ConPTY never reached the test body on the
+        // CI runner (the transcript carried only console-mode noise), so
+        let exe = raw_record_fixture_binary();
+        let mut cmd = CommandBuilder::new(&exe);
+        cmd.env("PI_TUI_RAW_RECORD_ARM", arm);
+        cmd.env(
+            "PI_TUI_RAW_RECORD_DEADLINE_MS",
+            if has_stimulus { "15000" } else { "3000" },
+        );
+        cmd.env("NO_COLOR", "1");
+        // Filesystem witness of the child's progress. The 2026-09-25 CI leg
+        // observed a child whose console writes never reached the master
+        // (blank transcript, mode toggles only); the stage log survives any
+        // console-channel fault and records the last completed stage.
+        let stage_log_path =
+            std::env::temp_dir().join(format!("pi_tui_raw_record_{arm}.stage.log"));
+        cmd.env("PI_TUI_RAW_RECORD_STAGE_LOG", &stage_log_path);
+        let _ = std::fs::remove_file(&stage_log_path);
+
+        let mut child = match pair.slave.spawn_command(cmd) {
+            Ok(c) => c,
+            Err(e) => {
+                report.stop_cause = Some(format!("spawn_command failed: {e}"));
+                return report;
+            }
+        };
+        drop(pair.slave);
+
+        let mut writer = pair.master.take_writer().expect("take writer");
+        let mut reader = pair.master.try_clone_reader().expect("clone reader");
+
+        // Conhost parks the registered child until the terminal answers its
+        // DSR (\x1b[6n) probe: every unread arm transcript on the runner was
+        // a child parked before Rust main. Answer it exactly like
+        // drive_fixture does for the pty fixture; the fixture drains these
+        // handshake records before its evidence loop opens.
+        writer.write_all(b"\x1b[1;1R").expect("write DSR answer");
+        writer.flush().expect("flush DSR answer");
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let reader_thread = thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let mut raw: Vec<u8> = Vec::new();
+        let mut ready = false;
+
+        let ready_pat = format!("\x1b]999;PI_TUI_RAW_RECORD_READY=1;arm={arm}").into_bytes();
+
+        while started.elapsed() < HARD_TIMEOUT && !ready {
+            drain_pending(&rx, &mut raw);
+            if raw.len() > TRANSCRIPT_LIMIT {
+                report.transcript_limit_exceeded = true;
+                break;
+            }
+            if find_subslice(&raw, &ready_pat).is_some() {
+                ready = true;
+                break;
+            }
+            // The evidence file is authoritative when the console channel
+            // drops bytes: readiness observed there is still readiness.
+            if let Ok(evidence) = std::fs::read(&stage_log_path)
+                && find_subslice(&evidence, &ready_pat).is_some()
+            {
+                ready = true;
+                break;
+            }
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            // A finished reader thread means the master closed: the child is
+            // gone even if try_wait has not observed it yet.
+            if reader_thread.is_finished() {
+                break;
+            }
+            // Throttles both the CPU spin and the evidence-file poll; 5ms
+            // granularity still lands readiness well inside HARD_TIMEOUT.
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        if ready && has_stimulus {
+            write_stimulus(
+                &mut writer,
+                child.as_mut(),
+                b"\x1b[200~PASTED-BLOCK-line1\nline2\x1b[201~",
+                "paste",
+            );
+            write_stimulus(
+                &mut writer,
+                child.as_mut(),
+                b"\x1b[D\x1b[C\x1b[A\x1b[B\x1b[H\x1b[F",
+                "cursor",
+            );
+
+            for (cols, rows) in RESIZE_PLAN {
+                if started.elapsed() > HARD_TIMEOUT {
+                    break;
+                }
+                if let Err(e) = pair.master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                }) {
+                    report.stop_cause = Some(format!("resize failed: {e}"));
+                    break;
+                }
+                report.resize_requests_sent += 1;
+                let slice_deadline = Instant::now() + Duration::from_millis(50);
+                while Instant::now() < slice_deadline {
+                    drain_pending(&rx, &mut raw);
+                    if raw.len() > TRANSCRIPT_LIMIT {
+                        report.transcript_limit_exceeded = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                if report.transcript_limit_exceeded {
+                    break;
+                }
+            }
+
+            if !report.transcript_limit_exceeded {
+                write_stimulus(&mut writer, child.as_mut(), b"\x04", "ctrl+d");
+            }
+        }
+
+        let mut child_exited = false;
+        while started.elapsed() < HARD_TIMEOUT {
+            drain_pending(&rx, &mut raw);
+            if raw.len() > TRANSCRIPT_LIMIT {
+                report.transcript_limit_exceeded = true;
+                break;
+            }
+            if child.try_wait().ok().flatten().is_some() {
+                child_exited = true;
+                let drain_until = Instant::now() + READ_IDLE;
+                while Instant::now() < drain_until {
+                    drain_pending(&rx, &mut raw);
+                    thread::sleep(Duration::from_millis(10));
+                }
+                break;
+            }
+            if reader_thread.is_finished() {
+                // Master EOF: the child exited without try_wait observing
+                // it (portable-pty reaps lazily); drain what arrived and
+                // let kill() settle the zombie state below.
+                break;
+            }
+            thread::sleep(Duration::from_millis(15));
+        }
+
+        if !child_exited {
+            let _ = child.kill();
+            let _ = child.wait();
+            report.stop_cause = Some("child did not exit before HARD_TIMEOUT".into());
+        }
+        drop(writer);
+        let _ = reader_thread.join();
+        drain_pending(&rx, &mut raw);
+
+        report.transcript_bytes = raw.len();
+        // The tail carries the plain-text stage markers and any panic text,
+        // which localize a child stall that the structured events cannot.
+        let tail_start = raw.len().saturating_sub(2048);
+        report.transcript_tail = Some(String::from_utf8_lossy(&raw[tail_start..]).into_owned());
+        if raw.len() > TRANSCRIPT_LIMIT {
+            report.transcript_limit_exceeded = true;
+        }
+
+        let evidence_bytes = std::fs::read(&stage_log_path).unwrap_or_default();
+        if let Some(tail) = report.transcript_tail.as_mut() {
+            tail.push_str("\nstage-log: ");
+            if evidence_bytes.is_empty() {
+                tail.push_str(if stage_log_path.exists() {
+                    "<empty>"
+                } else {
+                    "<missing>"
+                });
+            } else {
+                tail.push_str(&String::from_utf8_lossy(&evidence_bytes));
+            }
+        }
+        let _ = std::fs::remove_file(&stage_log_path);
+
+        // The fixture writes each event to the file before the console, so
+        // a non-empty evidence stream is always a superset of whatever the
+        // console delivered. Prefer it whenever it carries records; a partly
+        // dropped transcript must not shadow the complete channel.
+        let evidence_has_events = find_subslice(&evidence_bytes, RECORD_PREFIX).is_some();
+        let evidence_source = if evidence_has_events {
+            evidence_bytes.as_slice()
+        } else {
+            raw.as_slice()
+        };
+        let (events, parse_failure) = parse_events(evidence_source);
+        let mut lifecycles: Vec<LifecycleEntry> = Vec::new();
+        let mut records: Vec<RecordEntry> = Vec::new();
+        let mut termination: Option<TerminationEntry> = None;
+
+        for ev in events {
+            match ev {
+                Event::Lifecycle(l) => lifecycles.push(l),
+                Event::Record(r) => records.push(r),
+                Event::Termination(t) => termination = Some(t),
+            }
+        }
+
+        let setup = lifecycles.iter().find(|l| l.stage == "setup");
+        let teardown = lifecycles.iter().find(|l| l.stage == "teardown");
+
+        if let Some(s) = setup {
+            report.original = Some(s.original);
+            report.baseline = Some(s.baseline);
+            report.requested = Some(s.requested);
+            report.active = s.active;
+        }
+
+        if let Some(t) = teardown {
+            report.restored = t.restored;
+        }
+
+        if let Some(t) = &termination {
+            report.record_count = t.record_count;
+            report.child_terminated_normally = t.cause == "normal";
+            report.termination_cause = Some(t.cause.clone());
+            report.termination_message.clone_from(&t.message);
+            report.record_limit_exceeded = t.cause == "record_limit";
+            report.child_deadline_exceeded = t.cause == "deadline";
+        }
+
+        // Record indexes are a contiguous 1-based sequence assigned by the
+        // child, and the termination entry carries the child's own record
+        // count. A gap or a disagreement means records were dropped between
+        // child and parent, in which case no evidence-based verdict may
+        // stand.
+        let record_evidence_error = if records.iter().enumerate().any(|(pos, r)| r.idx != pos + 1) {
+            Some("record index sequence is not contiguous from 1; records were dropped".to_string())
+        } else {
+            match termination.as_ref().map(|t| t.record_count) {
+                Some(n) if n == records.len() => None,
+                Some(n) => Some(format!(
+                    "termination record_count {n} != {} parsed records; records were dropped",
+                    records.len()
+                )),
+                None => Some(
+                    "termination record missing; child record count cannot be cross-checked".into(),
+                ),
+            }
+        };
+        let evidence_failures: Vec<String> = [parse_failure, record_evidence_error]
+            .into_iter()
+            .flatten()
+            .collect();
+
+        let evidence = analyze_key_records(&records);
+        report.opener_found = evidence.opener_pos.is_some();
+        report.closer_found = evidence.closer_pos.is_some();
+        report.payload_found = evidence.payload_pos.is_some();
+        report.opener_position = evidence.opener_pos;
+        report.payload_position = evidence.payload_pos;
+        report.closer_position = evidence.closer_pos;
+        report.delimiter_order_verified = matches!(
+            (evidence.opener_pos, evidence.payload_pos, evidence.closer_pos),
+            (Some(o), Some(p), Some(c)) if o < p && p < c
+        );
+        report.navigation_inputs_identified = evidence.navigation_identified;
+        report.line_break_codepoint = evidence.line_break;
+        // The observed resize count is recorded as-is: the OS may coalesce
+        // the 24 resize requests, so no one-record-per-request correspondence
+        // is assumed.
+        report.resize_records_observed = records
+            .iter()
+            .filter(|r| r.variant == "WindowBufferSizeEvent")
+            .count();
+        report.bracketed_paste_2004_observed = find_subslice(&raw, b"\x1b[?2004h").is_some()
+            || find_subslice(&raw, b"\x1b[?2004l").is_some();
+        report.mode_9001_observed = find_subslice(&raw, b"\x1b[?9001h").is_some()
+            || find_subslice(&raw, b"\x1b[?9001l").is_some();
+        let last_record_is_terminator = records.last().is_some_and(is_terminator);
+        let lifecycle_errors: Vec<String> =
+            lifecycles.iter().filter_map(|l| l.error.clone()).collect();
+        report.records = records;
+
+        report.completed = child_exited && !report.transcript_limit_exceeded;
+
+        if !report.completed {
+            report.feasibility = "failed".into();
+            if report.stop_cause.is_none() {
+                report.stop_cause = Some("child did not complete".into());
+            }
+        } else if !evidence_failures.is_empty() {
+            // A rejected record or a broken record-index sequence means
+            // evidence was dropped in transit; dropped evidence can never
+            // produce a verdict.
+            report.feasibility = "failed".into();
+            let failure = evidence_failures.join("; ");
+            report.stop_cause = Some(match report.stop_cause.take() {
+                Some(prev) => format!("{prev}; {failure}"),
+                None => failure,
+            });
+        } else if report.record_limit_exceeded {
+            report.feasibility = "failed".into();
+            report.stop_cause = Some("record count exceeded 4096".into());
+        } else if report.active != report.requested {
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+            if report.stop_cause.is_none() {
+                report.stop_cause = Some("active mode did not match requested".into());
+            }
+        } else if report.stop_cause.is_some() {
+            // A retained mid-plan cause (for example a resize failure) is an
+            // environmental/delivery defect; never clobber it with a verdict.
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+        } else if arm == "IDLE" {
+            report.feasibility = "nonblocking_idle".into();
+            report.exact_key_evidence = "not_applicable".into();
+        } else if report.original.is_some_and(|o| o & VT_INPUT != 0) {
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+            report.stop_cause = Some(
+                "baseline already has ENABLE_VIRTUAL_TERMINAL_INPUT (0x0200); no A/B contrast"
+                    .into(),
+            );
+        } else if !report.child_terminated_normally {
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+            report.stop_cause = Some(format!(
+                "child did not stop on a recorded Ctrl+D terminator (termination cause: {})",
+                report
+                    .termination_cause
+                    .as_deref()
+                    .unwrap_or("none recorded")
+            ));
+        } else if !last_record_is_terminator {
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+            report.stop_cause =
+                Some("ordered Ctrl+D terminator record not retained as final record".into());
+        } else if !matches!((report.original, report.restored), (Some(o), Some(r)) if o == r) {
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+            report.stop_cause = Some("exact original input mode restore not observed".into());
+        } else if !lifecycle_errors.is_empty() {
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "inconclusive".into();
+            report.stop_cause = Some(format!(
+                "lifecycle errors retained: {}",
+                lifecycle_errors.join("; ")
+            ));
+        } else if evidence.opener_pos.is_none() || evidence.closer_pos.is_none() {
+            // Setup, delivery, and termination are verified, so a missing
+            // delimiter is verified information loss, not an environmental
+            // failure.
+            report.feasibility = "incomplete".into();
+            report.exact_key_evidence = "incomplete".into();
+            let missing = match (evidence.opener_pos.is_none(), evidence.closer_pos.is_none()) {
+                (true, true) => "ESC[200~ opener and ESC[201~ closer",
+                (true, false) => "ESC[200~ opener",
+                _ => "ESC[201~ closer",
+            };
+            report.stop_cause = Some(format!("missing genuine {missing} delimiter"));
+        } else if evidence.payload_pos.is_none() {
+            report.feasibility = "incomplete".into();
+            report.exact_key_evidence = "incomplete".into();
+            report.stop_cause = Some("exact paste payload not found in raw key records".into());
+        } else if !report.delimiter_order_verified {
+            report.feasibility = "incomplete".into();
+            report.exact_key_evidence = "incomplete".into();
+            report.stop_cause = Some(format!(
+                "delimiter/payload ordering not retained: opener@{:?} payload@{:?} closer@{:?}",
+                evidence.opener_pos, evidence.payload_pos, evidence.closer_pos
+            ));
+        } else if evidence.navigation_identified < 6 {
+            report.feasibility = "incomplete".into();
+            report.exact_key_evidence = "incomplete".into();
+            report.stop_cause = Some(format!(
+                "only {} of six navigation inputs identifiable in raw records",
+                evidence.navigation_identified
+            ));
+        } else if report.resize_records_observed == 0 {
+            report.feasibility = "incomplete".into();
+            report.exact_key_evidence = "incomplete".into();
+            report.stop_cause = Some("no WindowBufferSizeEvent records retained".into());
+        } else {
+            // Every key-boundary check passed: exact key evidence is
+            // demonstrated. Full lossless-record feasibility remains
+            // inconclusive because raw resize-coordinate fidelity is
+            // unavailable through the approved safe wrapper; the narrower
+            // result is never substituted for it.
+            report.feasibility = "inconclusive".into();
+            report.exact_key_evidence = "demonstrated".into();
+            report.stop_cause = Some(FULL_LOSSLESS_NOTE.into());
+        }
+
+        report.full_lossless_feasibility = match report.feasibility.as_str() {
+            // Verified information loss refutes full lossless-record
+            // feasibility outright.
+            "incomplete" => "refuted".into(),
+            // The idle arm does not exercise the record path.
+            "nonblocking_idle" => "not_applicable".into(),
+            // A fully assessed arm still cannot prove lossless capture:
+            // raw resize-coordinate fidelity is unavailable through the
+            // approved safe wrapper.
+            "inconclusive" if report.exact_key_evidence == "demonstrated" => "inconclusive".into(),
+            // Environmental/setup/termination failures never reached the
+            // full-lossless assessment.
+            _ => "not_reached".into(),
+        };
+
+        report
+    }
+
+    pub fn run_parent() {
+        let pty_system = NativePtySystem::default();
+        let arms = [("A", true), ("B", true), ("IDLE", false)];
+        let mut arm_reports = Vec::new();
+
+        // Binary health check outside the PTY: the fixture must reach Rust
+        // main and write its stage log for a plain spawn. The result records
+        // which side of the spawn boundary the ConPTY failure lives on.
+        let selftest_path = std::env::temp_dir().join("pi_tui_raw_record_selftest.stage.log");
+        let _ = std::fs::remove_file(&selftest_path);
+        let selftest = Command::new(raw_record_fixture_binary())
+            .arg("--selftest")
+            .env("PI_TUI_RAW_RECORD_STAGE_LOG", &selftest_path)
+            .status();
+        let selftest_summary = match selftest {
+            Ok(status) => {
+                let log = std::fs::read_to_string(&selftest_path).unwrap_or_default();
+                format!(
+                    "exit={:?} log={:?}",
+                    status.code(),
+                    if log.is_empty() { "<none>" } else { log.trim() }
+                )
+            }
+            Err(e) => format!("spawn error: {e}"),
+        };
+        let _ = std::fs::remove_file(&selftest_path);
+
+        // Same probe through ConPTY: --selftest only writes the stage log, so
+        // a spawned child that reaches main proves it without needing console
+        // output. The matrix splits "binary broken" from "ConPTY attach
+        // never hands control to user code".
+        let pty_selftest_path =
+            std::env::temp_dir().join("pi_tui_raw_record_selftest_pty.stage.log");
+        let _ = std::fs::remove_file(&pty_selftest_path);
+        let pty_selftest_summary = match pty_system.openpty(PtySize {
+            rows: INITIAL_ROWS,
+            cols: INITIAL_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(pair) => {
+                let mut cmd = CommandBuilder::new(raw_record_fixture_binary());
+                cmd.arg("--selftest");
+                cmd.env("PI_TUI_RAW_RECORD_STAGE_LOG", &pty_selftest_path);
+                match pair.slave.spawn_command(cmd) {
+                    Ok(mut child) => {
+                        // Answer conhost's DSR so the registered child is
+                        // not parked before main; see run_arm.
+                        if let Ok(mut w) = pair.master.take_writer() {
+                            let _ = w.write_all(b"\x1b[1;1R");
+                            let _ = w.flush();
+                        }
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        let mut exited = false;
+                        while Instant::now() < deadline {
+                            if child.try_wait().ok().flatten().is_some() {
+                                exited = true;
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                        if !exited {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        let log = std::fs::read_to_string(&pty_selftest_path).unwrap_or_default();
+                        format!(
+                            "exited={exited} log={:?}",
+                            if log.is_empty() { "<none>" } else { log.trim() }
+                        )
+                    }
+                    Err(e) => format!("spawn_command error: {e}"),
+                }
+            }
+            Err(e) => format!("openpty error: {e}"),
+        };
+        let _ = std::fs::remove_file(&pty_selftest_path);
+
+        // Third probe: launch the same selftest through `cmd.exe /c` so the
+        // fixture is a console grandchild rather than the process registered
+        // on the pseudo-console. Success here while the direct spawn stalls
+        // isolates the fault to the ConPTY attach handshake for this binary.
+        let cmd_selftest_path =
+            std::env::temp_dir().join("pi_tui_raw_record_selftest_cmd.stage.log");
+        let _ = std::fs::remove_file(&cmd_selftest_path);
+        let cmd_selftest_summary = match pty_system.openpty(PtySize {
+            rows: INITIAL_ROWS,
+            cols: INITIAL_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(pair) => {
+                let mut cmd = CommandBuilder::new("cmd.exe");
+                cmd.arg("/c");
+                cmd.arg(raw_record_fixture_binary());
+                cmd.arg("--selftest");
+                cmd.env("PI_TUI_RAW_RECORD_STAGE_LOG", &cmd_selftest_path);
+                match pair.slave.spawn_command(cmd) {
+                    Ok(mut child) => {
+                        if let Ok(mut w) = pair.master.take_writer() {
+                            let _ = w.write_all(b"\x1b[1;1R");
+                            let _ = w.flush();
+                        }
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        let mut exited = false;
+                        while Instant::now() < deadline {
+                            if child.try_wait().ok().flatten().is_some() {
+                                exited = true;
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                        if !exited {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        let log = std::fs::read_to_string(&cmd_selftest_path).unwrap_or_default();
+                        format!(
+                            "exited={exited} log={:?}",
+                            if log.is_empty() { "<none>" } else { log.trim() }
+                        )
+                    }
+                    Err(e) => format!("spawn_command error: {e}"),
+                }
+            }
+            Err(e) => format!("openpty error: {e}"),
+        };
+        let _ = std::fs::remove_file(&cmd_selftest_path);
+
+        for (arm, has_stimulus) in arms {
+            let report = run_arm(&pty_system, arm, has_stimulus);
+            arm_reports.push(report);
+        }
+
+        // The A/B contrast is only valid when both fresh ConPTY children
+        // inherited the same baseline mode word.
+        let cross_arm_baseline_consistent = match (arm_reports[0].baseline, arm_reports[1].baseline)
+        {
+            (Some(a), Some(b)) => Some(a == b),
+            _ => None,
+        };
+        if cross_arm_baseline_consistent == Some(false) {
+            for r in arm_reports.iter_mut().take(2) {
+                if r.exact_key_evidence == "demonstrated" {
+                    r.exact_key_evidence = "inconclusive".into();
+                    r.full_lossless_feasibility = "not_reached".into();
+                    r.stop_cause = Some(
+                        "cross-arm baseline mismatch: arms A and B observed different baseline mode words; no valid A/B contrast"
+                            .into(),
+                    );
+                }
+            }
+        }
+
+        let final_report = FinalReport {
+            arms: arm_reports,
+            fixture_selftest: selftest_summary,
+            fixture_pty_selftest: pty_selftest_summary,
+            fixture_cmd_selftest: cmd_selftest_summary,
+            cross_arm_baseline_consistent,
+            bracketed_paste_2004_emitted: false,
+            mode_9001_emitted: false,
+            negotiation_note: NEGOTIATION_NOTE,
+            limitations: vec![
+                STIMULUS_INJECTION_NOTE,
+                RESIZE_FIDELITY_NOTE,
+                FULL_LOSSLESS_NOTE,
+            ],
+        };
+        let json = serde_json::to_string_pretty(&final_report).expect("serialize final report");
+
+        let mut out = stdout().lock();
+        out.write_all(json.as_bytes()).expect("write final report");
+        out.write_all(b"\n").expect("write newline");
+        out.flush().expect("flush final report");
+
+        for r in &final_report.arms {
+            assert!(r.completed, "arm {} did not complete", r.arm);
+            assert!(
+                !r.transcript_limit_exceeded,
+                "arm {} exceeded 1 MiB transcript limit",
+                r.arm
+            );
+            assert!(
+                !r.record_limit_exceeded,
+                "arm {} exceeded 4096 record limit",
+                r.arm
+            );
+            match (r.original, r.restored) {
+                (Some(o), Some(rst)) => {
+                    assert_eq!(o, rst, "arm {} did not restore exact original mode", r.arm);
+                }
+                _ => panic!("arm {} missing mode restoration words", r.arm),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_raw_input_records_vt_mode_ab() {
+    windows_raw_record::run_parent();
 }

@@ -275,6 +275,9 @@ fn sample_model() -> Model {
         base_url: "https://example.test".to_owned(),
         reasoning: false,
         thinking_level_map: None,
+        input_limits: None,
+        prompt_cache: None,
+        sampling_params: None,
         input: vec![ModelInput::Text],
         cost: ModelCost::default(),
         context_window: 8_192,
@@ -425,9 +428,9 @@ fn run_block(
     let cpu_before = cpu::cpu_micros(clk_tck);
     for index in 0..calls {
         let message = tool_call_message(index, args);
-        sink.append_assistant(&AgentMessage::Llm(Box::new(Message::Assistant(
+        sink.append_assistant(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
             message.clone(),
-        ))));
+        )))));
         let batch = runtime
             .block_on(execute_tool_calls(context, &message, config, cancel, sink))
             .map_err(|error| format!("execute_tool_calls failed: {error}"))?;

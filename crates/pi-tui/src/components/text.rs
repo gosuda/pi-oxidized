@@ -3,7 +3,9 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use crate::component::{Component, EventResult, UiEvent};
+use crate::component::{
+    Component, DisplayRowContent, DisplayRowSpan, EventResult, RowSourceError, UiEvent,
+};
 use crate::text::{visible_width, wrap_text_with_ansi};
 
 use super::util::{KeyedLine, apply_background, empty_line, paint_lines_keyed};
@@ -18,6 +20,8 @@ pub struct Text {
     padding_y: u16,
     custom_bg: Option<TextBgFn>,
     cache: Option<RenderCache>,
+    /// Width of the last successful retained-row preparation.
+    prepared_width: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -37,6 +41,7 @@ impl Text {
             padding_y: 1,
             custom_bg: None,
             cache: None,
+            prepared_width: None,
         }
     }
 
@@ -49,6 +54,7 @@ impl Text {
             padding_y,
             custom_bg: None,
             cache: None,
+            prepared_width: None,
         }
     }
 
@@ -56,6 +62,7 @@ impl Text {
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.content = text.into();
         self.cache = None;
+        self.prepared_width = None;
     }
 
     /// Borrow the current text.
@@ -68,12 +75,14 @@ impl Text {
     pub fn set_padding_x(&mut self, padding_x: u16) {
         self.padding_x = padding_x;
         self.cache = None;
+        self.prepared_width = None;
     }
 
     /// Set vertical padding.
     pub fn set_padding_y(&mut self, padding_y: u16) {
         self.padding_y = padding_y;
         self.cache = None;
+        self.prepared_width = None;
     }
 
     /// Optional background applicator receiving a full-width line.
@@ -83,6 +92,7 @@ impl Text {
     {
         self.custom_bg = custom_bg.map(|f| Box::new(f) as TextBgFn);
         self.cache = None;
+        self.prepared_width = None;
     }
 
     fn lines_for_width(&mut self, width: u16) -> &[KeyedLine] {
@@ -103,6 +113,7 @@ impl Text {
                 width,
                 lines,
             });
+            self.prepared_width = None;
         }
         self.cache
             .as_ref()
@@ -163,6 +174,35 @@ impl Text {
 }
 
 impl Component for Text {
+    fn prepare_rows(&mut self, width: u16) -> Result<usize, RowSourceError> {
+        let rows = {
+            let lines = self.lines_for_width(width);
+            lines.len()
+        };
+        self.prepared_width = Some(width);
+        Ok(rows)
+    }
+
+    fn visit_row(
+        &self,
+        row: usize,
+        emit: &mut dyn FnMut(DisplayRowSpan<'_>),
+    ) -> Result<(), RowSourceError> {
+        let cache = self.cache.as_ref().ok_or(RowSourceError::NotPrepared)?;
+        if self.prepared_width != Some(cache.width) {
+            return Err(RowSourceError::NotPrepared);
+        }
+        let keyed = cache.lines.get(row).ok_or(RowSourceError::RowOutOfBounds {
+            row,
+            rows: cache.lines.len(),
+        })?;
+        emit(DisplayRowSpan {
+            column: 0,
+            width: cache.width,
+            content: DisplayRowContent::Text(keyed),
+        });
+        Ok(())
+    }
     fn measure(&mut self, width: u16) -> u16 {
         let lines = self.lines_for_width(width);
         u16::try_from(lines.len()).unwrap_or(u16::MAX)
@@ -179,6 +219,7 @@ impl Component for Text {
 
     fn invalidate(&mut self) {
         self.cache = None;
+        self.prepared_width = None;
     }
 }
 
@@ -246,5 +287,26 @@ mod tests {
         );
         assert!(visible_width(&plain) <= 6, "{plain}");
         assert!(!plain.contains("..."), "{plain}");
+    }
+    #[test]
+    fn retained_rows_borrow_keyed_lines_and_invalidate() -> Result<(), RowSourceError> {
+        let mut text = Text::with_padding("hello", 0, 0);
+        assert_eq!(text.prepare_rows(8)?, 1);
+
+        let mut visited = false;
+        text.visit_row(0, &mut |span| {
+            visited = true;
+            assert_eq!(span.column, 0);
+            assert_eq!(span.width, 8);
+            assert!(matches!(span.content, DisplayRowContent::Text(_)));
+        })?;
+        assert!(visited);
+
+        text.invalidate();
+        assert_eq!(
+            text.visit_row(0, &mut |_| {}),
+            Err(RowSourceError::NotPrepared)
+        );
+        Ok(())
     }
 }

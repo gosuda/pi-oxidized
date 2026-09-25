@@ -7,7 +7,10 @@ use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd}
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use crate::component::{Component, EventResult, UiEvent};
+use crate::component::{
+    Component, DisplayRowContent, DisplayRowSpan, EventResult, RowSourceError, UiEvent,
+};
+use crate::image::DocumentImage;
 use crate::link::hyperlink_capped;
 use crate::text::{
     is_image_line, render_latex, strip_trailing_partial_closing_fence, visible_width,
@@ -188,12 +191,59 @@ pub struct Markdown {
     default_style: DefaultTextStyle,
     options: MarkdownOptions,
     cache: Option<Cache>,
+    prepared: Option<PreparedRows>,
 }
 
 struct Cache {
     text: String,
     width: u16,
     lines: Vec<KeyedLine>,
+}
+/// A prepared text piece and the columns it occupies on one row.
+#[derive(Clone, Copy)]
+struct TextPiece {
+    /// Display column of the piece.
+    column: u16,
+    /// Emitted width; the piece is keyed at exactly this width because the
+    /// keyed painter paints each span's line from column zero.
+    width: u16,
+    /// Index into [`PreparedRows::pieces`].
+    piece: usize,
+}
+
+/// Positioned emission of one image-bearing prepared row.
+///
+/// Image-only lines keep the historical whole-row placement at column zero;
+/// lines that mix an image with visible text place the image at the display
+/// column after the leading text and keep the trailing text on the first
+/// row. Continuation rows emit only the image.
+#[derive(Clone, Copy)]
+struct ImageRow {
+    image_index: usize,
+    row_in_image: u16,
+    /// Display column where the image placement begins.
+    column: u16,
+    /// Emitted placement width: native columns, the inline fallback text
+    /// width, or the full prepared width for an image-only fallback row.
+    width: u16,
+    /// Leading text piece on the first row.
+    before: Option<TextPiece>,
+    /// Trailing text piece on the first row.
+    after: Option<TextPiece>,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedRow {
+    line_index: usize,
+    image: Option<ImageRow>,
+}
+
+struct PreparedRows {
+    width: u16,
+    rows: Vec<PreparedRow>,
+    images: Vec<DocumentImage>,
+    /// Owned text pieces flanking images on mixed rows.
+    pieces: Vec<KeyedLine>,
 }
 
 impl Markdown {
@@ -215,6 +265,7 @@ impl Markdown {
             default_style,
             options,
             cache: None,
+            prepared: None,
         }
     }
 
@@ -222,8 +273,8 @@ impl Markdown {
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.cache = None;
+        self.prepared = None;
     }
-
     /// Borrow source text.
     #[must_use]
     pub fn text(&self) -> &str {
@@ -234,6 +285,7 @@ impl Markdown {
     pub fn set_hyperlinks(&mut self, enabled: bool) {
         self.options.hyperlinks = enabled;
         self.cache = None;
+        self.prepared = None;
     }
 
     fn apply_default_style(&self, text: &str) -> String {
@@ -339,6 +391,7 @@ impl Markdown {
                 width,
                 lines,
             });
+            self.prepared = None;
         }
         self.cache
             .as_ref()
@@ -348,6 +401,83 @@ impl Markdown {
 }
 
 impl Component for Markdown {
+    fn prepare_rows(&mut self, width: u16) -> Result<usize, RowSourceError> {
+        self.prepared = None;
+        {
+            let _ = self.lines_for_width(width);
+        }
+        let cache = self.cache.as_ref().ok_or(RowSourceError::NotPrepared)?;
+        let mut prepared = PreparedRows {
+            width,
+            rows: Vec::new(),
+            images: Vec::new(),
+            pieces: Vec::new(),
+        };
+        let mut row_count = 0usize;
+        for (line_index, keyed) in cache.lines.iter().enumerate() {
+            let added = push_line_rows(line_index, keyed.line(), cache.width, &mut prepared)?;
+            row_count = row_count
+                .checked_add(added)
+                .ok_or(RowSourceError::RowCountOverflow)?;
+        }
+        self.prepared = Some(prepared);
+        Ok(row_count)
+    }
+
+    fn visit_row(
+        &self,
+        row: usize,
+        emit: &mut dyn FnMut(DisplayRowSpan<'_>),
+    ) -> Result<(), RowSourceError> {
+        let prepared = self.prepared.as_ref().ok_or(RowSourceError::NotPrepared)?;
+        let cache = self.cache.as_ref().ok_or(RowSourceError::NotPrepared)?;
+        if prepared.width != cache.width {
+            return Err(RowSourceError::NotPrepared);
+        }
+        let prepared_row = prepared
+            .rows
+            .get(row)
+            .ok_or(RowSourceError::RowOutOfBounds {
+                row,
+                rows: prepared.rows.len(),
+            })?;
+        if let Some(image_row) = prepared_row.image {
+            let image = prepared
+                .images
+                .get(image_row.image_index)
+                .ok_or(RowSourceError::InvalidImage)?;
+            if let Some(before) = image_row.before {
+                emit_piece_span(emit, prepared, before)?;
+            }
+            emit(DisplayRowSpan {
+                column: image_row.column,
+                width: image_row.width,
+                content: DisplayRowContent::Image {
+                    image,
+                    row_in_image: image_row.row_in_image,
+                },
+            });
+            if let Some(after) = image_row.after {
+                emit_piece_span(emit, prepared, after)?;
+            }
+            return Ok(());
+        }
+
+        let keyed = cache
+            .lines
+            .get(prepared_row.line_index)
+            .ok_or(RowSourceError::InvalidImage)?;
+        if is_image_line(keyed.line()) {
+            return Err(RowSourceError::InvalidImage);
+        }
+        emit(DisplayRowSpan {
+            column: 0,
+            width: cache.width,
+            content: DisplayRowContent::Text(keyed),
+        });
+        Ok(())
+    }
+
     fn measure(&mut self, width: u16) -> u16 {
         let lines = self.lines_for_width(width);
         u16::try_from(lines.len()).unwrap_or(u16::MAX)
@@ -364,6 +494,225 @@ impl Component for Markdown {
 
     fn invalidate(&mut self) {
         self.cache = None;
+        self.prepared = None;
+    }
+}
+
+/// Prepare the rows contributed by one cached line: a single text row, or
+/// the rows of an image placement — positioned when visible text shares the
+/// line, whole-row otherwise.
+fn push_line_rows(
+    line_index: usize,
+    line: &str,
+    width: u16,
+    prepared: &mut PreparedRows,
+) -> Result<usize, RowSourceError> {
+    // A line without an image introducer parses to `None` and stays a plain
+    // text row; an introducer that fails validation fails preparation
+    // instead of becoming searchable text.
+    let Some(image) =
+        DocumentImage::try_from_line(line).map_err(|_| RowSourceError::InvalidImage)?
+    else {
+        prepared.rows.push(PreparedRow {
+            line_index,
+            image: None,
+        });
+        return Ok(1);
+    };
+    let image_rows = image.rows();
+    if image_rows == 0 {
+        return Err(RowSourceError::InvalidImage);
+    }
+    let image_index = prepared.images.len();
+    let first = positioned_image_row(line, &image, image_index, width, &mut prepared.pieces);
+    for row_in_image in 0..image_rows {
+        let mut image_row =
+            first.unwrap_or_else(|| whole_row_image(image_index, row_in_image, &image, width));
+        if row_in_image > 0 {
+            image_row.row_in_image = row_in_image;
+            image_row.before = None;
+            image_row.after = None;
+        }
+        prepared.rows.push(PreparedRow {
+            line_index,
+            image: Some(image_row),
+        });
+    }
+    prepared.images.push(image);
+    Ok(usize::from(image_rows))
+}
+
+/// Whole-row image placement: column zero, spanning the full prepared width
+/// for a fallback row and the placement columns for a native row.
+fn whole_row_image(
+    image_index: usize,
+    row_in_image: u16,
+    image: &DocumentImage,
+    width: u16,
+) -> ImageRow {
+    ImageRow {
+        image_index,
+        row_in_image,
+        column: 0,
+        width: if image.is_fallback() {
+            width
+        } else {
+            image.columns()
+        },
+        before: None,
+        after: None,
+    }
+}
+
+/// Layout for an image that shares its line with visible text: the image
+/// sits at the display column after the leading text and the trailing text
+/// stays on the first row. Spans are clamped into the prepared row width.
+///
+/// `None` selects the whole-row placement — both when nothing visible
+/// surrounds the sequence and when the sequence bounds cannot be re-derived
+/// from a line that [`DocumentImage::try_from_line`] already validated.
+fn positioned_image_row(
+    line: &str,
+    image: &DocumentImage,
+    image_index: usize,
+    width: u16,
+    pieces: &mut Vec<KeyedLine>,
+) -> Option<ImageRow> {
+    let (start, end) = image_sequence_bounds(line)?;
+    let before = visible_width(&line[..start]);
+    let after = visible_width(&line[end..]);
+    if before == 0 && after == 0 {
+        return None;
+    }
+    let row_width = usize::from(width);
+    let column = before.min(row_width);
+    let image_width = if image.is_fallback() {
+        image
+            .fallback_text()
+            .map_or(0, |text| visible_width(text).min(row_width - column))
+    } else {
+        usize::from(image.columns()).min(row_width - column)
+    };
+    let after_column = (column + image_width).min(row_width);
+    let after_width = after.min(row_width - after_column);
+    let before = if column > 0 {
+        let piece = pieces.len();
+        pieces.push(KeyedLine::new(
+            line[..start].to_owned(),
+            u16::try_from(column).unwrap_or(u16::MAX),
+        ));
+        Some(TextPiece {
+            column: 0,
+            width: u16::try_from(column).unwrap_or(u16::MAX),
+            piece,
+        })
+    } else {
+        None
+    };
+    let after = if after_width > 0 {
+        let piece = pieces.len();
+        pieces.push(KeyedLine::new(
+            line[end..].to_owned(),
+            u16::try_from(after_width).unwrap_or(u16::MAX),
+        ));
+        Some(TextPiece {
+            column: u16::try_from(after_column).unwrap_or(u16::MAX),
+            width: u16::try_from(after_width).unwrap_or(u16::MAX),
+            piece,
+        })
+    } else {
+        None
+    };
+    Some(ImageRow {
+        image_index,
+        row_in_image: 0,
+        column: u16::try_from(column).unwrap_or(u16::MAX),
+        width: u16::try_from(image_width).unwrap_or(u16::MAX),
+        before,
+        after,
+    })
+}
+
+/// Emit one positioned text piece from the prepared piece table.
+fn emit_piece_span(
+    emit: &mut dyn FnMut(DisplayRowSpan<'_>),
+    prepared: &PreparedRows,
+    piece: TextPiece,
+) -> Result<(), RowSourceError> {
+    let keyed = prepared
+        .pieces
+        .get(piece.piece)
+        .ok_or(RowSourceError::InvalidImage)?;
+    emit(DisplayRowSpan {
+        column: piece.column,
+        width: piece.width,
+        content: DisplayRowContent::Text(keyed),
+    });
+    Ok(())
+}
+
+/// Introducer and terminator bytes of the retained image protocols,
+/// mirroring the parsing grammar in `crate::image`.
+const KITTY_INTRODUCER: &str = "\u{1b}_G";
+const ITERM2_INTRODUCER: &str = "\u{1b}]1337;File=";
+const STRING_TERMINATOR: &str = "\u{1b}\\";
+const BEL_TERMINATOR: char = '\u{7}';
+
+/// Byte range `(start, end)` of the first image sequence in `line`.
+///
+/// Mirrors the introducer precedence and terminator grammar of
+/// [`DocumentImage::try_from_line`] without re-validating payloads: the line
+/// has already parsed once, and a `None` here degrades to the whole-row
+/// placement instead of failing preparation.
+fn image_sequence_bounds(line: &str) -> Option<(usize, usize)> {
+    if let Some(start) = line.find(KITTY_INTRODUCER) {
+        return Some((start, kitty_sequence_end(line, start)?));
+    }
+    let start = line.find(ITERM2_INTRODUCER)?;
+    Some((start, iterm2_sequence_end(line, start)?))
+}
+
+/// Walk `line` from the Kitty introducer at `start` through chunked
+/// transmissions to the final string terminator.
+fn kitty_sequence_end(line: &str, start: usize) -> Option<usize> {
+    let mut controls_start = start.checked_add(KITTY_INTRODUCER.len())?;
+    loop {
+        let controls_end = controls_start.checked_add(line.get(controls_start..)?.find(';')?)?;
+        let payload_start = controls_end.checked_add(1)?;
+        let terminator =
+            payload_start.checked_add(line.get(payload_start..)?.find(STRING_TERMINATOR)?)?;
+        let end = terminator.checked_add(STRING_TERMINATOR.len())?;
+        let more_chunks = line
+            .get(controls_start..controls_end)?
+            .split(',')
+            .any(|control| control.split_once('=') == Some(("m", "1")));
+        if !more_chunks {
+            return Some(end);
+        }
+        if !line.get(end..)?.starts_with(KITTY_INTRODUCER) {
+            return None;
+        }
+        controls_start = end.checked_add(KITTY_INTRODUCER.len())?;
+    }
+}
+
+/// First BEL or string terminator after the iTerm2 payload colon at `start`.
+fn iterm2_sequence_end(line: &str, start: usize) -> Option<usize> {
+    let payload_start = start.checked_add(ITERM2_INTRODUCER.len())?;
+    let payload_start =
+        payload_start.checked_add(line.get(payload_start..)?.find(':')?.checked_add(1)?)?;
+    let rest = line.get(payload_start..)?;
+    let bel = rest
+        .find(BEL_TERMINATOR)
+        .map(|offset| payload_start + offset);
+    let st = rest
+        .find(STRING_TERMINATOR)
+        .map(|offset| payload_start + offset);
+    let terminator = bel.min(st)?;
+    if line.get(terminator..)?.starts_with(STRING_TERMINATOR) {
+        terminator.checked_add(STRING_TERMINATOR.len())
+    } else {
+        Some(terminator.checked_add(1)?)
     }
 }
 
@@ -2081,6 +2430,8 @@ fn table_border(widths: &[usize], left: &str, separator: &str, right: &str) -> S
 mod tests {
     use super::*;
     use crate::components::util::{render_snapshot, strip_ansi};
+    use crate::image::{DocumentImageOptions, ImageDimensions, ImageEmission};
+    use crate::terminal::caps::ImageProtocol;
 
     fn plain(text: &str, width: u16, opts: MarkdownOptions) -> Vec<String> {
         let mut m = Markdown::new(
@@ -3008,5 +3359,112 @@ mod tests {
         let lines = plain_default("$$\n\\frac{x+1}{x-1}\n$$", 80);
         // display mode: bar width = max(numerator, denominator) = 3
         assert_eq!(lines, vec!["x+1", "───", "x-1"]);
+    }
+
+    /// Build a retained multi-row Kitty image and its full transmission line.
+    fn retained_kitty_line() -> Result<(DocumentImage, String), RowSourceError> {
+        let image = DocumentImage::from_native(
+            "AAAA",
+            "image/png",
+            ImageDimensions {
+                width_px: 40,
+                height_px: 60,
+            },
+            &DocumentImageOptions {
+                max_width_cells: Some(4),
+                max_height_cells: Some(3),
+                protocol: Some(ImageProtocol::Kitty),
+                ..Default::default()
+            },
+        )
+        .map_err(|_| RowSourceError::InvalidImage)?;
+        let sequence = image
+            .sequence_for_rows(0, usize::from(image.rows()), ImageEmission::Upload)
+            .ok_or(RowSourceError::InvalidImage)?;
+        let sequence = String::from_utf8(sequence).map_err(|_| RowSourceError::InvalidImage)?;
+        Ok((image, sequence))
+    }
+
+    #[test]
+    fn mixed_text_and_image_line_keeps_positioned_spans() -> Result<(), RowSourceError> {
+        let (expected, sequence) = retained_kitty_line()?;
+        let image_width = expected.columns();
+        assert!(
+            expected.rows() >= 2,
+            "test expects a multi-row image placement"
+        );
+
+        let mut markdown = Markdown::new(
+            format!("before {sequence} after"),
+            0,
+            0,
+            MarkdownTheme::default(),
+            DefaultTextStyle::default(),
+            MarkdownOptions::default(),
+        );
+        assert_eq!(markdown.prepare_rows(80)?, usize::from(expected.rows()));
+
+        let mut spans = Vec::new();
+        markdown.visit_row(0, &mut |span| {
+            spans.push((span.column, span.width));
+        })?;
+        assert_eq!(spans, vec![(0, 7), (7, image_width), (7 + image_width, 6)]);
+
+        let mut texts = Vec::new();
+        markdown.visit_row(0, &mut |span| {
+            if let DisplayRowContent::Text(keyed) = span.content {
+                texts.push((span.column, strip_ansi(keyed.line())));
+            }
+        })?;
+        assert_eq!(
+            texts,
+            vec![
+                (0, "before ".to_owned()),
+                (7 + image_width, " after".to_owned()),
+            ]
+        );
+
+        let mut seen = Vec::new();
+        markdown.visit_row(0, &mut |span| {
+            if let DisplayRowContent::Image {
+                image,
+                row_in_image,
+            } = span.content
+            {
+                assert_eq!(image, &expected);
+                seen.push((span.column, row_in_image));
+            }
+        })?;
+        assert_eq!(seen, vec![(7, 0)]);
+
+        // Continuation rows carry only the image, still at its display column.
+        let mut spans = Vec::new();
+        markdown.visit_row(1, &mut |span| {
+            spans.push((span.column, span.width));
+        })?;
+        assert_eq!(spans, vec![(7, image_width)]);
+        Ok(())
+    }
+
+    #[test]
+    fn image_only_line_keeps_whole_row_placement() -> Result<(), RowSourceError> {
+        let (expected, sequence) = retained_kitty_line()?;
+        let image_width = expected.columns();
+
+        let mut markdown = Markdown::new(
+            sequence,
+            0,
+            0,
+            MarkdownTheme::default(),
+            DefaultTextStyle::default(),
+            MarkdownOptions::default(),
+        );
+        assert_eq!(markdown.prepare_rows(80)?, usize::from(expected.rows()));
+        let mut spans = Vec::new();
+        markdown.visit_row(0, &mut |span| {
+            spans.push((span.column, span.width));
+        })?;
+        assert_eq!(spans, vec![(0, image_width)]);
+        Ok(())
     }
 }

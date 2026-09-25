@@ -10,6 +10,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
 use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
+use crate::transcript::{TranscriptContext, normalize_context, resolve_transcript};
 use crate::types::{AssistantMessage, AssistantMessageEvent, Context, Model, ModelThinkingLevel};
 
 use super::shared::google::{
@@ -49,6 +50,7 @@ impl Provider for GoogleGenerativeAi {
         options: StreamOptions,
     ) -> BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
         let model = model.clone();
+        let context = resolve_transcript(normalize_context(context), false);
         let transport = self.transport.clone();
         let tool_call_counter = Arc::clone(&self.tool_call_counter);
         let (sender, stream) = ProviderEventSender::channel(
@@ -85,7 +87,7 @@ impl Provider for GoogleGenerativeAi {
 async fn run_request(
     transport: &HttpTransport,
     model: &Model,
-    context: Context,
+    context: TranscriptContext,
     options: &StreamOptions,
     sender: &ProviderEventSender,
     output: &mut AssistantMessage,
@@ -107,7 +109,7 @@ async fn run_request(
     }
 
     let thinking = thinking_config(model, options)?;
-    let mut payload = build_request_body(model, &context, options, thinking);
+    let mut payload = build_request_body(model, &context, options, thinking)?;
     if let Some(callback) = &options.on_payload {
         callback(&mut payload, model)
             .await
@@ -515,6 +517,9 @@ mod tests {
             thinking_level_map: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 1_000,
             max_tokens: 100,
             headers: None,

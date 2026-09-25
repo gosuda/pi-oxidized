@@ -210,8 +210,7 @@ fn build_chat(state: &ViewState, md_theme: &MarkdownTheme) -> Box<dyn Component>
     Box::new(stack)
 }
 
-/// Build the component stack for one message view-model.
-fn build_message(
+pub(super) fn build_message(
     msg: &MessageView,
     renderers: &BTreeMap<String, Box<dyn super::tool_renderer::CustomToolRenderer>>,
     md_theme: &MarkdownTheme,
@@ -325,6 +324,7 @@ fn build_overlay(state: &ViewState, md_theme: &MarkdownTheme) -> Option<Box<dyn 
             }
             Box::new(stack)
         }
+        OverlayKind::TranscriptSearch => Box::new(pi_tui::components::Spacer::new(0)),
         OverlayKind::Extension => {
             let slot = state.extension_overlay_slot.as_ref()?;
             let mut component = SlotComponent::new(slot.clone());

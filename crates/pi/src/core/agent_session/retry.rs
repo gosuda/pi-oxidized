@@ -263,7 +263,7 @@ static RETRYABLE_PROVIDER_ERROR_PATTERN: LazyLock<Option<Regex>> = LazyLock::new
     Regex::new(&format!("(?i)(?:{})", patterns.join("|"))).ok()
 });
 
-const RETRYABLE_STATUS_CODES: &[&str] = &["429", "500", "502", "503", "504", "524"];
+const RETRYABLE_STATUS_CODES: &[&str] = &["429", "500", "502", "503", "504", "520", "524"];
 
 /// Whether the assistant message is a retryable transient error.
 ///
@@ -485,6 +485,9 @@ mod tests {
             base_url: "url".to_owned(),
             reasoning: false,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![pi_ai::ModelInput::Text],
             cost: pi_ai::ModelCost::default(),
             context_window: 8192,

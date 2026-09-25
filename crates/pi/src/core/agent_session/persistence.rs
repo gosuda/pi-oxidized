@@ -91,7 +91,7 @@ impl AgentSession {
         }
 
         let assistant = match message.as_llm() {
-            Some(Message::Assistant(a)) => a.clone(),
+            Some(Message::Assistant(a)) => a.as_ref().clone(),
             _ => return Ok(()),
         };
 
@@ -113,7 +113,10 @@ impl AgentSession {
         Ok(())
     }
 
-    async fn persist_message_end(&self, message: &AgentMessage) -> Result<(), SessionError> {
+    pub(super) async fn persist_message_end(
+        &self,
+        message: &AgentMessage,
+    ) -> Result<(), SessionError> {
         if self.lock_inner().pending_session_error.is_some() {
             return Err(SessionError::Io {
                 path: "session persistence".to_owned(),
@@ -130,7 +133,7 @@ impl AgentSession {
                 "custom" => {
                     persist_custom_message(&mut sm, &message)?;
                 }
-                "user" | "assistant" | "toolResult" => {
+                "system" | "user" | "assistant" | "toolResult" => {
                     sm.append_message(&message)?;
                 }
                 // bashExecution / compactionSummary / branchSummary persist elsewhere
@@ -163,9 +166,11 @@ impl AgentSession {
 
         // Update live agent transcript when the tail is the assistant being replaced.
         if replacement.role() == "assistant"
-            && let Some(Message::Assistant(assistant)) = replacement.as_llm().cloned()
+            && let Some(Message::Assistant(assistant)) = replacement.as_llm()
         {
-            let _ = self.agent.replace_last_assistant(assistant);
+            let _ = self
+                .agent
+                .replace_last_assistant(assistant.as_ref().clone());
         } else if matches!(replacement.role(), "user" | "toolResult" | "custom") {
             // For non-assistant replacements, rewrite the last matching role if present.
             // Agent only exposes replace_last_assistant; other roles stay on the event
@@ -207,21 +212,6 @@ fn parse_custom_agent_message(message: &AgentMessage) -> Option<CustomMessage> {
 
 fn normalize_replacement(message: AgentMessage) -> AgentMessage {
     match &message {
-        AgentMessage::Llm(inner) => match inner.as_ref() {
-            Message::User(user) => {
-                // User content is non-optional in the typed shape.
-                let _ = user;
-                message
-            }
-            Message::Assistant(assistant) => {
-                let _ = assistant;
-                message
-            }
-            Message::ToolResult(tool) => {
-                let _ = tool;
-                message
-            }
-        },
         AgentMessage::Custom(custom) if custom.role == "custom" => {
             // Ensure content key exists for product custom messages.
             if custom.payload.get("content").is_none() {
@@ -235,7 +225,7 @@ fn normalize_replacement(message: AgentMessage) -> AgentMessage {
             }
             message
         }
-        AgentMessage::Custom(_) => message,
+        AgentMessage::Llm(_) | AgentMessage::Custom(_) => message,
     }
 }
 

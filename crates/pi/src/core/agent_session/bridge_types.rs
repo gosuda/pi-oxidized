@@ -64,6 +64,8 @@ pub enum BridgeMethod {
     SetModel,
     /// `session.compact` — correlated compact request.
     Compact,
+    /// `session.previewBoundary` — validate drafts and project current context.
+    PreviewBoundary,
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +157,15 @@ pub struct SetModelRequest {
 pub struct CompactRequest {
     /// Optional custom compaction instructions.
     pub custom_instructions: Option<String>,
+}
+
+/// Draft context preview requested during boundary dispatch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundaryPreviewRequest {
+    /// `turn_end` or `agent_before_settle`.
+    pub boundary: String,
+    /// Uncommitted entries whose wire shape the host adapter validated.
+    pub entries: Vec<Value>,
 }
 
 /// `session.newSession` request payload (host → product).

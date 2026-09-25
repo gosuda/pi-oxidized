@@ -2,7 +2,7 @@
 //!
 //! Ports `buildSessionPath`, `buildContextEntries`, `buildSessionContext`, and
 //! `sessionEntryToContextMessages` from
-//! `.references/pi-2.0/packages/coding-agent/src/core/session-manager.ts`.
+//! `.references/pi/packages/coding-agent/src/core/session-manager.ts`.
 
 use std::collections::HashMap;
 
@@ -16,7 +16,8 @@ use super::super::messages::{
     create_custom_message,
 };
 use super::entries::{
-    CompactionEntry, ModelChangeEntry, SessionEntry, SessionMessageEntry, ThinkingLevelChangeEntry,
+    CompactionEntry, ContextEditEntry, ContextEditReplacement, ModelChangeEntry, SessionEntry,
+    SessionMessageEntry, ThinkingLevelChangeEntry,
 };
 
 /// Default thinking level when no `thinking_level_change` is on the path.
@@ -56,6 +57,43 @@ pub struct SessionContext {
     pub thinking_level: String,
     /// Last model from a `model_change` or assistant message on the full path.
     pub model: Option<SessionModel>,
+}
+
+/// An active entry and its messages after context edits.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectedSessionEntry<'a> {
+    /// The append-only record that owns the projected messages.
+    pub source_entry: &'a SessionEntry,
+    /// Empty for metadata records and removed context.
+    pub messages: Vec<AgentMessage>,
+}
+
+/// The active context with entry provenance.
+#[derive(Debug)]
+pub struct SessionProjection<'a> {
+    /// Entries in model-context order.
+    pub entries: Vec<ProjectedSessionEntry<'a>>,
+    /// Last thinking level on the full path.
+    pub thinking_level: String,
+    /// Last selected model on the full path.
+    pub model: Option<SessionModel>,
+}
+
+impl SessionProjection<'_> {
+    /// Consume provenance and retain the model context without copying messages.
+    #[must_use]
+    pub fn into_context(self) -> SessionContext {
+        SessionContext {
+            messages: self
+                .entries
+                .into_iter()
+                .flat_map(|entry| entry.messages)
+                .collect(),
+            thinking_level: self.thinking_level,
+            model: self.model,
+        }
+    }
 }
 
 /// Walk from leaf to root, returning entries in root→leaf order.
@@ -142,7 +180,9 @@ pub fn build_context_entries<'a>(
         if first_kept.is_some() && entry.id() == first_kept {
             found_first_kept = true;
         }
-        if found_first_kept {
+        if found_first_kept
+            && !matches!(entry, SessionEntry::Message(message) if message.message.role() == "system")
+        {
             context.push(*entry);
         }
     }
@@ -160,17 +200,92 @@ pub fn build_session_context(
     entries: &[&SessionEntry],
     leaf: LeafRef<'_>,
 ) -> Result<SessionContext, MessageConversionError> {
+    Ok(build_session_projection(entries, leaf)?.into_context())
+}
+
+/// Project the active branch, retaining each message's source record.
+///
+/// # Errors
+///
+/// Returns a conversion error for malformed model-visible content.
+pub fn build_session_projection<'a>(
+    entries: &[&'a SessionEntry],
+    leaf: LeafRef<'a>,
+) -> Result<SessionProjection<'a>, MessageConversionError> {
     let path = build_session_path(entries, leaf);
     let (thinking_level, model) = get_session_context_settings(&path);
     let context_entries = build_context_entries(entries, leaf);
-    let mut messages = Vec::new();
-    for entry in context_entries {
-        messages.extend(session_entry_to_context_messages(entry)?);
+    let mut edits = HashMap::new();
+    for entry in &context_entries {
+        if let SessionEntry::ContextEdit(edit) = *entry {
+            edits.insert(edit.target_id.as_str(), edit);
+        }
     }
-    Ok(SessionContext {
-        messages,
+    let entries = context_entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, source_entry)| {
+            let messages = if index > 0 && matches!(source_entry, SessionEntry::Compaction(_)) {
+                Vec::new()
+            } else {
+                let edit = source_entry.id().and_then(|id| edits.get(id).copied());
+                project_context_entry(source_entry, edit)?
+            };
+            Ok(ProjectedSessionEntry {
+                source_entry,
+                messages,
+            })
+        })
+        .collect::<Result<_, MessageConversionError>>()?;
+    Ok(SessionProjection {
+        entries,
         thinking_level,
         model,
+    })
+}
+
+fn project_context_entry(
+    entry: &SessionEntry,
+    edit: Option<&ContextEditEntry>,
+) -> Result<Vec<AgentMessage>, MessageConversionError> {
+    let messages = session_entry_to_context_messages(entry)?;
+    let Some(edit) = edit else {
+        return Ok(messages);
+    };
+    let Some(replacement) = edit.replacement.as_ref() else {
+        return Ok(Vec::new());
+    };
+    messages
+        .into_iter()
+        .map(|message| apply_context_replacement(message, replacement))
+        .collect()
+}
+
+pub(super) fn apply_context_replacement(
+    message: AgentMessage,
+    replacement: &ContextEditReplacement,
+) -> Result<AgentMessage, MessageConversionError> {
+    let role = message.role();
+    if !matches!(role, "user" | "assistant" | "toolResult" | "custom") {
+        return Ok(message);
+    }
+    let mut value = serde_json::to_value(&message).map_err(|source| {
+        MessageConversionError::InvalidPayload {
+            role: "context_edit",
+            source,
+        }
+    })?;
+    let content = if matches!(role, "assistant" | "toolResult")
+        && let Value::String(text) = &replacement.content
+    {
+        serde_json::json!([{ "type": "text", "text": text }])
+    } else {
+        replacement.content.clone()
+    };
+    value["content"] = content;
+    serde_json::from_value(value).map_err(|source| MessageConversionError::InvalidPayload {
+        role: "context_edit",
+        source,
     })
 }
 
@@ -204,7 +319,14 @@ pub fn session_entry_to_context_messages(
         }
         SessionEntry::Compaction(c) => {
             let msg = create_compaction_summary_message(&c.summary, c.tokens_before, &c.timestamp)?;
-            Ok(vec![product_to_agent_message(&msg)?])
+            let mut messages = Vec::with_capacity(2);
+            if let Some(system) = &c.system_message {
+                messages.push(AgentMessage::Llm(Box::new(Message::System(Box::new(
+                    system.clone(),
+                )))));
+            }
+            messages.push(product_to_agent_message(&msg)?);
+            Ok(messages)
         }
         _ => Ok(Vec::new()),
     }

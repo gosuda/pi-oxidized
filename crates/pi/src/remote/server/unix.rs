@@ -2,10 +2,7 @@
 //! the Unix client transport, `#[cfg(unix)]`-gated per the platform
 //! contract.
 //!
-//! Ports upstream `transports/unix/{preset,listener,types}.ts`:
-//! [`create_listener`] binds one Unix-domain socket and adapts every
-//! accepted stream to the portable [`ByteConnection`] surface;
-//! [`create_server`] composes that listener with a [`PiServer`]
+//! [`create_server`] composes that listener with the generic [`Server`]
 //! (upstream `createUnixServer`).
 //!
 //! Bind discipline mirrors upstream: the parent directory is created
@@ -38,11 +35,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-use crate::remote::framing::DEFAULT_MAX_FRAME_LENGTH;
-use crate::remote::server::{
-    ByteConnection, ConnectionAcceptor, ConnectionHandler, ListenSpec, ListenerError, PiServer,
-    PiServerOptions, ServerErrorHandler, ServerListener, ServerService, build_listener,
+use super::{
+    ByteConnection, ConnectionAcceptor, ConnectionHandler, ListenSpec, ListenerError, Server,
+    ServerErrorHandler, ServerHost, ServerListener, ServerOptions, ServerOptionsError,
+    build_listener,
 };
+use crate::remote::framing::DEFAULT_MAX_FRAME_LENGTH;
+use crate::remote::schemas::ServerId;
 use crate::remote::transport::TransportError;
 
 /// Default socket mode (owner read/write only).
@@ -61,23 +60,48 @@ const READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = if cfg!(target_os = "linux") { 107 } else { 103 };
 /// Bound on how long `close` waits for the accept task to settle.
 const CLOSE_SETTLE_TIMEOUT_MS: u64 = 5_000;
-
+/// Derives the public Unix socket path for one canonical server identity.
+///
+/// `ServerId` has already enforced the lowercase `UUIDv4` wire spelling, so the
+/// helper can append the source-compatible `.sock` suffix without accepting a
+/// second, unchecked string identity.
+#[must_use]
+pub fn unix_socket_path(server_id: &ServerId, directory: &Path) -> PathBuf {
+    directory.join(format!("{server_id}.sock"))
+}
 fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Options for [`create_listener`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UnixListenerOptions {
     /// Socket path.
     pub path: PathBuf,
     /// Socket file mode (default `0o600`).
     pub mode: Option<u32>,
-    /// Outbound backpressure budget in bytes per connection (default
-    /// four times the 16 MiB frame bound).
+    /// Outbound backpressure budget in bytes per connection.
     pub max_pending_bytes: Option<usize>,
+    /// Frame length used to derive the default pending-byte budget.
+    pub max_frame_length: Option<usize>,
     /// Grace period for draining writes on close (default 5 s).
     pub graceful_close_timeout_ms: Option<u64>,
+    /// Reports listener failures.
+    pub on_error: Option<ServerErrorHandler>,
+}
+
+impl std::fmt::Debug for UnixListenerOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnixListenerOptions")
+            .field("path", &self.path)
+            .field("mode", &self.mode)
+            .field("max_pending_bytes", &self.max_pending_bytes)
+            .field("max_frame_length", &self.max_frame_length)
+            .field("graceful_close_timeout_ms", &self.graceful_close_timeout_ms)
+            .field("on_error", &self.on_error.as_ref().map(|_| "<handler>"))
+            .finish()
+    }
 }
 
 /// Construction-options failure for the Unix listener — distinct from
@@ -97,23 +121,34 @@ pub enum UnixListenerOptionsError {
     },
     /// The socket mode is outside `0o000..=0o777`.
     InvalidMode,
+    /// The frame bound is outside the protocol range.
+    InvalidMaxFrameLength,
+    /// The pending-byte budget is too small.
+    InvalidMaxPendingBytes,
     /// The graceful-close timeout is zero.
     InvalidGracefulTimeout,
 }
 
 impl std::fmt::Display for UnixListenerOptionsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyPath => write!(f, "unix listener path must not be empty"),
+            Self::EmptyPath => formatter.write_str("unix listener path must not be empty"),
             Self::PathTooLong { max } => {
                 write!(
-                    f,
+                    formatter,
                     "unix listener path is too long; maximum is {max} UTF-8 bytes"
                 )
             }
-            Self::InvalidMode => write!(f, "unix listener mode must be between 0o000 and 0o777"),
+            Self::InvalidMode => {
+                formatter.write_str("unix listener mode must be between 0o000 and 0o777")
+            }
+            Self::InvalidMaxFrameLength => {
+                formatter.write_str("unix listener maxFrameLength is invalid")
+            }
+            Self::InvalidMaxPendingBytes => formatter
+                .write_str("unix listener maxPendingBytes must be at least maxFrameLength + 4"),
             Self::InvalidGracefulTimeout => {
-                write!(f, "unix listener gracefulCloseTimeoutMs must be positive")
+                formatter.write_str("unix listener gracefulCloseTimeoutMs must be positive")
             }
         }
     }
@@ -121,8 +156,8 @@ impl std::fmt::Display for UnixListenerOptionsError {
 
 impl std::error::Error for UnixListenerOptionsError {}
 
-/// Options for [`create_server`] (port of upstream `UnixServerOptions`).
-#[derive(Clone, Default)]
+/// Options for [`create_server`], combining server and Unix listener settings.
+#[derive(Clone)]
 pub struct UnixServerOptions {
     /// Socket path.
     pub path: PathBuf,
@@ -137,9 +172,32 @@ pub struct UnixServerOptions {
     /// Handshake deadline for the composed server.
     pub handshake_timeout_ms: Option<u64>,
     /// Stable server id.
-    pub server_id: Option<String>,
+    pub server_id: ServerId,
+    /// Called after the accepted-connection count changes.
+    pub on_connection_count_changed: Option<Arc<dyn Fn(usize) + Send + Sync>>,
     /// Reports isolated server errors.
     pub on_error: Option<ServerErrorHandler>,
+}
+
+impl Default for UnixServerOptions {
+    #[expect(
+        clippy::expect_used,
+        reason = "the built-in server id is a canonical UUIDv4 literal"
+    )]
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            mode: None,
+            max_pending_bytes: None,
+            graceful_close_timeout_ms: None,
+            max_frame_length: None,
+            handshake_timeout_ms: None,
+            server_id: ServerId::new("00000000-0000-4000-8000-000000000000")
+                .expect("literal server id is canonical"),
+            on_connection_count_changed: None,
+            on_error: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for UnixServerOptions {
@@ -156,7 +214,7 @@ impl std::fmt::Debug for UnixServerOptions {
     }
 }
 
-/// Construction failure for [`create_server`].
+/// Failure while constructing a Unix-domain [`Server`].
 #[derive(Debug)]
 pub enum UnixServerError {
     /// The listen spec was rejected (typed shared owner).
@@ -164,15 +222,14 @@ pub enum UnixServerError {
     /// The preset options were rejected.
     Options(UnixListenerOptionsError),
     /// The composed server options were rejected.
-    Server(crate::remote::server::PiServerOptionsError),
+    Server(ServerOptionsError),
 }
-
 impl std::fmt::Display for UnixServerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Spec(error) => write!(f, "unix listen spec rejected: {error}"),
-            Self::Options(error) => write!(f, "unix listener options rejected: {error}"),
-            Self::Server(error) => write!(f, "PiServer options rejected: {error}"),
+            Self::Spec(error) => write!(formatter, "unix listen spec rejected: {error}"),
+            Self::Options(error) => write!(formatter, "unix listener options rejected: {error}"),
+            Self::Server(error) => write!(formatter, "server options rejected: {error}"),
         }
     }
 }
@@ -189,41 +246,50 @@ impl std::error::Error for UnixServerError {}
 // Preset (port of upstream transports/unix/preset.ts)
 // ---------------------------------------------------------------------------
 
-/// Composes a [`PiServer`] with one Unix-domain socket listener
-/// (upstream `createUnixServer`).
+/// Composes [`Server`] with one Unix-domain socket listener.
 ///
 /// # Errors
 ///
-/// Returns [`UnixServerError`] when the spec, preset options, or
-/// server options are rejected.
-pub fn create_server(
-    service: Arc<dyn ServerService>,
+/// Returns [`UnixServerError::Spec`] or [`UnixServerError::Options`] when the
+/// socket specification or listener options are invalid, respectively. It
+/// returns [`UnixServerError::Server`] when the composed server options are
+/// invalid.
+pub fn create_server<H: ServerHost>(
+    host: Arc<H>,
     options: UnixServerOptions,
-) -> Result<PiServer, UnixServerError> {
-    let listener = build_listener(&ListenSpec::Unix {
+) -> Result<Server<H>, UnixServerError> {
+    build_listener(&ListenSpec::Unix {
         path: options.path.clone(),
         max_pending_bytes: options.max_pending_bytes,
     })
     .map_err(UnixServerError::Spec)?;
-    // Eager preset-option validation (mode, graceful timeout) so an
-    // invalid preset fails at construction, not at start.
     validate_options(
         &options.path,
         options.mode,
         options.graceful_close_timeout_ms,
+        options.max_frame_length,
+        options.max_pending_bytes,
     )?;
-    let server = PiServer::new(
-        service,
-        PiServerOptions {
+    let listener = create_listener(UnixListenerOptions {
+        path: options.path.clone(),
+        mode: options.mode,
+        max_pending_bytes: options.max_pending_bytes,
+        max_frame_length: options.max_frame_length,
+        graceful_close_timeout_ms: options.graceful_close_timeout_ms,
+        on_error: options.on_error.clone(),
+    });
+    Server::new(
+        host,
+        ServerOptions {
             listeners: vec![listener],
+            server_id: options.server_id,
             max_frame_length: options.max_frame_length,
             handshake_timeout_ms: options.handshake_timeout_ms,
-            server_id: options.server_id,
+            on_connection_count_changed: options.on_connection_count_changed,
             on_error: options.on_error,
         },
     )
-    .map_err(UnixServerError::Server)?;
-    Ok(server)
+    .map_err(UnixServerError::Server)
 }
 
 /// Eager validation shared by the preset and the raw listener.
@@ -231,6 +297,8 @@ fn validate_options(
     path: &Path,
     mode: Option<u32>,
     graceful_close_timeout_ms: Option<u64>,
+    max_frame_length: Option<usize>,
+    max_pending_bytes: Option<usize>,
 ) -> Result<(), UnixListenerOptionsError> {
     if path.as_os_str().is_empty() {
         return Err(UnixListenerOptionsError::EmptyPath);
@@ -246,25 +314,40 @@ fn validate_options(
     if graceful_close_timeout_ms == Some(0) {
         return Err(UnixListenerOptionsError::InvalidGracefulTimeout);
     }
+    let max_frame_length = max_frame_length.unwrap_or(DEFAULT_MAX_FRAME_LENGTH);
+    if max_frame_length == 0 || (max_frame_length as u64) > 0xffff_ffff {
+        return Err(UnixListenerOptionsError::InvalidMaxFrameLength);
+    }
+    let default_pending = max_frame_length
+        .checked_mul(4)
+        .ok_or(UnixListenerOptionsError::InvalidMaxPendingBytes)?;
+    let max_pending_bytes = max_pending_bytes.unwrap_or(default_pending);
+    if max_pending_bytes < max_frame_length.saturating_add(4) {
+        return Err(UnixListenerOptionsError::InvalidMaxPendingBytes);
+    }
     Ok(())
 }
 
-/// Creates the Unix-domain [`ServerListener`] (upstream
-/// `createUnixListener`). Path and budget validation is owned by
-/// [`build_listener`]; preset-only options (mode, graceful timeout)
-/// are validated when the listener starts.
+/// Creates a Unix-domain listener from the supplied options.
+///
+/// Invalid options are reported as [`ListenerError::Io`] when the listener is
+/// started because the [`ServerListener`] construction surface is infallible.
 #[must_use]
 pub fn create_listener(options: UnixListenerOptions) -> Arc<dyn ServerListener> {
+    let max_frame_length = options.max_frame_length.unwrap_or(DEFAULT_MAX_FRAME_LENGTH);
+    let max_pending_bytes = options
+        .max_pending_bytes
+        .unwrap_or_else(|| max_frame_length.saturating_mul(4));
     Arc::new(UnixServerListener {
         options: ResolvedOptions {
             path: options.path,
             mode: options.mode.unwrap_or(DEFAULT_SOCKET_MODE),
-            max_pending_bytes: options
-                .max_pending_bytes
-                .unwrap_or(DEFAULT_MAX_FRAME_LENGTH * 4),
+            max_frame_length,
+            max_pending_bytes,
             graceful_close_timeout_ms: options
                 .graceful_close_timeout_ms
                 .unwrap_or(DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS),
+            on_error: options.on_error,
         },
         state: StdMutex::new(ListenerState::Idle),
         stop: Arc::new(tokio::sync::Notify::new()),
@@ -284,8 +367,10 @@ enum ListenerState {
 struct ResolvedOptions {
     path: PathBuf,
     mode: u32,
+    max_frame_length: usize,
     max_pending_bytes: usize,
     graceful_close_timeout_ms: u64,
+    on_error: Option<ServerErrorHandler>,
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +408,8 @@ impl ServerListener for UnixServerListener {
             &self.options.path,
             Some(self.options.mode),
             Some(self.options.graceful_close_timeout_ms),
+            Some(self.options.max_frame_length),
+            Some(self.options.max_pending_bytes),
         ) {
             *lock(&self.state) = ListenerState::Closing;
             return futures::future::ready(Err(ListenerError::Io(error.to_string()))).boxed();
@@ -343,6 +430,12 @@ impl ServerListener for UnixServerListener {
                     runner.run(listener).await;
                 }
                 Err(error) => {
+                    *lock(&runner.closed) = true;
+                    if let Some(callback) = &runner.options.on_error {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            callback(&error);
+                        }));
+                    }
                     let _ = ready_tx.send(Err(error));
                 }
             }
@@ -355,9 +448,17 @@ impl ServerListener for UnixServerListener {
         }
         .boxed()
     }
-
     fn close(&self) -> BoxFuture<'static, ()> {
-        *lock(&self.state) = ListenerState::Closing;
+        let idle = {
+            let mut state = lock(&self.state);
+            let idle = matches!(*state, ListenerState::Idle);
+            *state = ListenerState::Closing;
+            idle
+        };
+        if idle {
+            *lock(&self.closed) = true;
+            return futures::future::ready(()).boxed();
+        }
         self.stop.notify_one();
         let path = self.options.path.clone();
         let closed = Arc::clone(&self.closed);
@@ -384,8 +485,10 @@ fn clone_options(options: &ResolvedOptions) -> ResolvedOptions {
     ResolvedOptions {
         path: options.path.clone(),
         mode: options.mode,
+        max_frame_length: options.max_frame_length,
         max_pending_bytes: options.max_pending_bytes,
         graceful_close_timeout_ms: options.graceful_close_timeout_ms,
+        on_error: options.on_error.clone(),
     }
 }
 
@@ -413,7 +516,8 @@ impl ListenerRunner {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|error| ListenerError::Io(error.to_string()))?;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            let _ =
+                tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await;
         }
         remove_stale_socket(path).await?;
         let listener =
@@ -428,7 +532,9 @@ impl ListenerRunner {
             )));
         }
         *lock(&self.identity_tx.0) = Some((metadata.dev(), metadata.ino()));
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(self.options.mode));
+        let _ =
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(self.options.mode))
+                .await;
         Ok(listener)
     }
 
@@ -440,7 +546,18 @@ impl ListenerRunner {
                 () = self.stop.notified() => break,
                 accepted = listener.accept() => accepted,
             };
-            let Ok((stream, _)) = accepted else { break };
+            let (stream, _) = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    if let Some(callback) = &self.options.on_error {
+                        let failure = ListenerError::Io(error.to_string());
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            callback(&failure);
+                        }));
+                    }
+                    break;
+                }
+            };
             let connection = spawn_connection(stream, &self.options, &self.accept);
             lock(&self.connections).insert(Arc::clone(&connection));
         }
@@ -452,7 +569,6 @@ impl ListenerRunner {
         self.cleanup_owned_socket();
         *lock(&self.closed) = true;
     }
-
     /// Unlinks the socket only while its identity still matches the
     /// bound one (port of `cleanupOwnedSocket`, simplified to a
     /// guarded unlink).
@@ -528,17 +644,69 @@ async fn socket_is_live(path: &Path) -> bool {
 // Connection (port of upstream UnixByteConnection)
 // ---------------------------------------------------------------------------
 
-/// One accepted Unix connection behind the portable
-/// [`ByteConnection`] surface: a reader task delivering chunks and
-/// exactly one terminal event, a bounded writer queue with a
-/// pending-byte budget, and a graceful close that drains first.
 struct UnixServerConnection {
-    write_tx: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
+    write_tx: StdMutex<Option<mpsc::Sender<WriteItem>>>,
     pending_bytes: Arc<AtomicUsize>,
     max_pending_bytes: usize,
     closed: Arc<AtomicBool>,
+    closing: Arc<AtomicBool>,
+    send_tail: StdMutex<futures::future::Shared<BoxFuture<'static, ()>>>,
     writer_finished: Arc<tokio::sync::Notify>,
     graceful_close_timeout_ms: u64,
+}
+/// An RAII reservation against the connection's `pending_bytes` budget.
+/// The reserved count is released when the guard is dropped, which
+/// happens once the chunk it paid for is written or dropped.
+struct PendingBytesReservation {
+    pending: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl PendingBytesReservation {
+    /// Attempts to reserve `bytes` from `pending` without exceeding `max`.
+    /// Returns `Some(...)` if the reservation was made, `None` if the budget
+    /// would be exceeded (or the addition would overflow).
+    fn try_reserve(pending: &Arc<AtomicUsize>, bytes: usize, max: usize) -> Option<Self> {
+        if bytes == 0 {
+            return Some(Self {
+                pending: Arc::clone(pending),
+                bytes: 0,
+            });
+        }
+        let mut current = pending.load(Ordering::SeqCst);
+        loop {
+            let next = current.checked_add(bytes)?;
+            if next > max {
+                return None;
+            }
+            match pending.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => {
+                    return Some(Self {
+                        pending: Arc::clone(pending),
+                        bytes,
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for PendingBytesReservation {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
+/// One outbound chunk together with the budget reservation that pays for
+/// the bytes it retains until it is written or dropped.
+struct WriteItem {
+    bytes: Vec<u8>,
+    #[expect(
+        dead_code,
+        reason = "held, not read: its Drop returns the bytes to the budget"
+    )]
+    reservation: PendingBytesReservation,
 }
 
 /// Spawns the reader/writer tasks for one accepted stream and returns
@@ -548,12 +716,14 @@ fn spawn_connection(
     options: &ResolvedOptions,
     accept: &ConnectionAcceptor,
 ) -> Arc<UnixServerConnection> {
-    let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
+    let (write_tx, write_rx) = mpsc::channel::<WriteItem>(WRITE_QUEUE_CAPACITY);
     let connection = Arc::new(UnixServerConnection {
         write_tx: StdMutex::new(Some(write_tx)),
         pending_bytes: Arc::new(AtomicUsize::new(0)),
         max_pending_bytes: options.max_pending_bytes,
         closed: Arc::new(AtomicBool::new(false)),
+        closing: Arc::new(AtomicBool::new(false)),
+        send_tail: StdMutex::new(futures::future::ready(()).boxed().shared()),
         writer_finished: Arc::new(tokio::sync::Notify::new()),
         graceful_close_timeout_ms: options.graceful_close_timeout_ms,
     });
@@ -566,15 +736,17 @@ fn spawn_connection(
     // inside `connection` is dropped when all outside holders drop,
     // allowing `write_rx` to close and the writer task to exit.
     {
-        let pending_bytes = Arc::clone(&connection.pending_bytes);
         let closed = Arc::clone(&connection.closed);
         let writer_finished = Arc::clone(&connection.writer_finished);
         tokio::spawn(async move {
             let mut write_half = write_half;
             let mut write_rx = write_rx;
-            while let Some(chunk) = write_rx.recv().await {
-                let written = write_half.write_all(&chunk).await;
-                pending_bytes.fetch_sub(chunk.len(), Ordering::SeqCst);
+            while let Some(item) = write_rx.recv().await {
+                let written = write_half.write_all(&item.bytes).await;
+                // The item (and its reservation) is dropped at the end of the
+                // loop body, releasing the charge whether the write succeeded
+                // or failed. Any items still in the channel when the writer
+                // exits are released when the receiver drops.
                 if written.is_err() {
                     break;
                 }
@@ -619,51 +791,102 @@ impl ByteConnection for UnixServerConnection {
     fn closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
+
     fn send(&self, chunk: Vec<u8>) -> BoxFuture<'static, Result<(), TransportError>> {
-        let Some(write_tx) = lock(&self.write_tx).clone() else {
+        if self.closed.load(Ordering::Acquire) {
             return futures::future::ready(Err(TransportError::Closed)).boxed();
-        };
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
         let pending_bytes = Arc::clone(&self.pending_bytes);
         let max_pending_bytes = self.max_pending_bytes;
-        Box::pin(async move {
+        let task = {
+            let mut tail = lock(&self.send_tail);
+            if self.closed.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+                return futures::future::ready(Err(TransportError::Closed)).boxed();
+            }
+            let Some(write_tx) = lock(&self.write_tx).clone() else {
+                return futures::future::ready(Err(TransportError::Closed)).boxed();
+            };
             let bytes = chunk.len();
-            let budget = pending_bytes
-                .fetch_add(bytes, Ordering::SeqCst)
-                .saturating_add(bytes);
-            if budget > max_pending_bytes {
-                pending_bytes.fetch_sub(bytes, Ordering::SeqCst);
-                return Err(TransportError::PendingBytesExceeded);
+            let Some(reservation) =
+                PendingBytesReservation::try_reserve(&pending_bytes, bytes, max_pending_bytes)
+            else {
+                return futures::future::ready(Err(TransportError::PendingBytesExceeded)).boxed();
+            };
+            let item = WriteItem {
+                bytes: chunk,
+                reservation,
+            };
+            let previous = tail.clone();
+            let task = async move {
+                previous.await;
+                let result = if write_tx.send(item).await.is_err() {
+                    Err(TransportError::Closed)
+                } else {
+                    Ok(())
+                };
+                let _ = sender.send(result);
             }
-            if write_tx.send(chunk).await.is_err() {
-                pending_bytes.fetch_sub(bytes, Ordering::SeqCst);
-                return Err(TransportError::Closed);
-            }
-            Ok(())
-        })
+            .boxed()
+            .shared();
+            *tail = task.clone();
+            task
+        };
+        tokio::spawn(task);
+        Box::pin(async move { receiver.await.unwrap_or(Err(TransportError::Closed)) })
     }
 
     fn close(
         &self,
         final_chunk: Option<Vec<u8>>,
     ) -> BoxFuture<'static, Result<(), TransportError>> {
-        if self.closed.swap(true, Ordering::SeqCst) {
+        if self.closing.swap(true, Ordering::AcqRel) {
             return futures::future::ready(Ok(())).boxed();
         }
-        let write_tx = lock(&self.write_tx).take();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let closed = Arc::clone(&self.closed);
         let writer_finished = Arc::clone(&self.writer_finished);
         let timeout = Duration::from_millis(self.graceful_close_timeout_ms);
-        async move {
-            if let Some(write_tx) = write_tx {
-                if let Some(chunk) = final_chunk {
-                    write_tx.send(chunk).await.ok();
+        let pending_bytes = Arc::clone(&self.pending_bytes);
+        let task = {
+            let mut tail = lock(&self.send_tail);
+            let previous = tail.clone();
+            let write_tx = lock(&self.write_tx).take();
+            let task = async move {
+                previous.await;
+                let result = async {
+                    if let Some(write_tx) = write_tx {
+                        if let Some(chunk) = final_chunk {
+                            // Close's final chunk is not subject to the
+                            // pending-byte budget, but it still flows through
+                            // the same WriteItem drop path so the queue stays
+                            // uniformly typed and released.
+                            let reservation = PendingBytesReservation {
+                                pending: Arc::clone(&pending_bytes),
+                                bytes: 0,
+                            };
+                            let item = WriteItem {
+                                bytes: chunk,
+                                reservation,
+                            };
+                            let _ = write_tx.send(item).await;
+                        }
+                        drop(write_tx);
+                        let _ = tokio::time::timeout(timeout, writer_finished.notified()).await;
+                    }
+                    Ok(())
                 }
-                // Dropping the taken write_tx closes the writer's receiver
-                drop(write_tx);
-                let _ = tokio::time::timeout(timeout, writer_finished.notified()).await;
+                .await;
+                closed.store(true, Ordering::Release);
+                let _ = sender.send(result);
             }
-            Ok(())
-        }
-        .boxed()
+            .boxed()
+            .shared();
+            *tail = task.clone();
+            task
+        };
+        tokio::spawn(task);
+        Box::pin(async move { receiver.await.unwrap_or(Err(TransportError::Closed)) })
     }
 }
 impl PartialEq for UnixServerConnection {
@@ -685,131 +908,56 @@ impl std::hash::Hash for UnixServerConnection {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::remote::client::{PiClient, PiClientOptions};
-    use crate::remote::server::SessionRuntime;
-    use crate::remote::server::test_support::ScriptedService;
-    use crate::remote::transport::{EndpointSpec, build_transport};
-    #[test]
-    fn validate_options_rejects_bad_modes() {
-        assert_eq!(
-            validate_options(Path::new("/tmp/x.sock"), Some(0o1000), None),
-            Err(UnixListenerOptionsError::InvalidMode)
-        );
-        assert_eq!(
-            validate_options(Path::new(""), None, None),
-            Err(UnixListenerOptionsError::EmptyPath)
-        );
-        let long = "a".repeat(108);
-        assert_eq!(
-            validate_options(Path::new(&long), None, None),
-            Err(UnixListenerOptionsError::PathTooLong { max: 107 })
-        );
-        assert_eq!(
-            validate_options(Path::new("/tmp/x.sock"), None, Some(0)),
-            Err(UnixListenerOptionsError::InvalidGracefulTimeout)
-        );
-        assert_eq!(
-            validate_options(Path::new("/tmp/x.sock"), None, None),
-            Ok(())
-        );
-    }
+struct NoopHandler;
 
-    #[expect(
-        clippy::expect_used,
-        reason = "test assertions: tempdir, socket bind, client connect/attach/prompt/detach, and cleanup verification must all succeed"
-    )]
-    #[tokio::test]
-    async fn real_unix_socket_roundtrip_and_cleanup() {
-        let temp_dir = tempfile::tempdir().expect("tempdir created");
-        let socket_path = temp_dir.path().join("server.sock");
+#[cfg(test)]
+impl ConnectionHandler for NoopHandler {
+    fn on_data(&self, _chunk: Vec<u8>) {}
+    fn on_close(&self) {}
+    fn on_error(&self, _error: TransportError) {}
+}
 
-        let service = Arc::new(ScriptedService::new());
-        service.seed("unix-session");
+#[cfg(test)]
+#[tokio::test(flavor = "current_thread")]
+#[expect(clippy::expect_used, reason = "test setup: socket pair and sends")]
+async fn pending_bytes_budget_rejects_retained_chunks() {
+    let (server, _client) = UnixStream::pair().expect("unix socket pair");
+    let options = ResolvedOptions {
+        path: PathBuf::new(),
+        mode: DEFAULT_SOCKET_MODE,
+        max_frame_length: DEFAULT_MAX_FRAME_LENGTH,
+        max_pending_bytes: 64,
+        graceful_close_timeout_ms: DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS,
+        on_error: None,
+    };
+    let accept: ConnectionAcceptor =
+        Arc::new(|_connection| Arc::new(NoopHandler) as Arc<dyn ConnectionHandler>);
 
-        let server = create_server(
-            service.clone(),
-            UnixServerOptions {
-                path: socket_path.clone(),
-                ..Default::default()
-            },
-        )
-        .expect("unix server created");
+    let connection = spawn_connection(server, &options, &accept);
 
-        server.start().await.expect("unix server started");
-        assert!(socket_path.exists(), "socket file should exist after start");
+    let first = connection.send(vec![0u8; 32]);
+    let second = connection.send(vec![0u8; 32]);
+    let third = connection.send(vec![0u8; 32]);
 
-        // Client connects over real Unix domain socket
-        let client_spec = EndpointSpec::Unix {
-            path: socket_path.clone(),
-            max_pending_bytes: None,
-        };
-        let factory = build_transport(&client_spec).expect("client factory builds");
-        let client = PiClient::new(PiClientOptions {
-            transport_factory: factory,
-            max_frame_length: None,
-            on_listener_error: None,
-        })
-        .expect("client options valid");
+    // The third send must be rejected synchronously, before any spawned task
+    // has run and before the first two reservations are released.
+    let third_result = third.now_or_never();
+    assert!(
+        matches!(
+            &third_result,
+            Some(Err(TransportError::PendingBytesExceeded)),
+        ),
+        "third send must exceed the retained budget synchronously, got {third_result:?}"
+    );
 
-        let snapshot = client
-            .connect()
-            .await
-            .expect("client connects over unix socket");
-        assert_eq!(
-            snapshot.protocol_version,
-            crate::remote::schemas::PROTOCOL_VERSION
-        );
+    // The first two sends complete after their tasks run.
+    let (r1, r2) = tokio::join!(first, second);
+    r1.expect("first send");
+    r2.expect("second send");
 
-        // List sessions over unix socket
-        let sessions = client.list_sessions().await.expect("list sessions");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, "unix-session");
+    // Let the writer drain the two queued chunks and release the reservations.
+    tokio::task::yield_now().await;
 
-        // Attach to session
-        let handle = client
-            .attach_session("unix-session")
-            .await
-            .expect("attaches over unix socket");
-        assert!(handle.attached());
-
-        // Prompt roundtrip over unix socket.
-        // The ScriptedSession::prompt future blocks until finish_prompt is called.
-        // We finish the prompt concurrently so prompt() completes with the reply.
-        let runtime = service.latest_runtime("unix-session");
-        let finisher = tokio::spawn(async move {
-            let mut waited = 0;
-            while runtime.phase() != crate::remote::schemas::SessionPhase::Turn && waited < 100 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                waited += 1;
-            }
-            runtime.finish_prompt(true);
-        });
-
-        let prompt_snapshot = handle
-            .prompt("unix hello".to_string())
-            .await
-            .expect("prompt succeeds");
-        finisher.await.expect("finisher task completes");
-
-        assert!(
-            prompt_snapshot.transcript.iter().any(|item| match item {
-                crate::remote::schemas::TranscriptItem::User(u) => u.type_field == "assistant",
-                crate::remote::schemas::TranscriptItem::Assistant(a) => a.type_field == "assistant",
-                crate::remote::schemas::TranscriptItem::Tool(_) => false,
-            }),
-            "should have assistant reply in returned prompt snapshot, got: {:?}",
-            prompt_snapshot.transcript
-        );
-        handle.detach().await.expect("detach succeeds");
-        client.dispose();
-        server.close().await;
-
-        // Verify socket file was cleaned up on close
-        assert!(
-            !socket_path.exists(),
-            "socket file should be unlinked after server close"
-        );
-    }
+    // After the queue drains, the budget is free again.
+    assert!(connection.send(vec![0u8; 32]).await.is_ok());
 }

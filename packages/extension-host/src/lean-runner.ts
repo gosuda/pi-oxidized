@@ -37,6 +37,7 @@ import {
 	type Method,
 	PROTOCOL_VERSION,
 	ProtocolClient,
+	SESSION_PREVIEW_BOUNDARY_METHOD,
 } from "./protocol.ts";
 import {
 	assertJsonValue,
@@ -45,6 +46,7 @@ import {
 	LEAN_EVENT_TYPES,
 	type LeanCommand,
 	type LeanContext,
+	type LeanDeferredHandle,
 	type LeanExtension,
 	type LeanFlag,
 	type LeanProvider,
@@ -53,6 +55,7 @@ import {
 	parseLeanExtension,
 } from "./lean-api.ts";
 import { AssistantDeltaReducer } from "./assistant-delta.ts";
+import { isRecord, isStructuredAbortError } from "./wire-validators.ts";
 
 /** Host lifecycle state. */
 const RunnerState = {
@@ -94,11 +97,70 @@ interface RegisteredHook {
 	handler: (event: never, ctx: LeanContext) => unknown;
 	extensionPath: string;
 }
+const LEAN_PROVIDER_FETCH_DEFERRED_METHOD = "provider.fetchDeferred";
+const LEAN_PROVIDER_CANCEL_DEFERRED_METHOD = "provider.cancelDeferred";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+function isDeferredHandle(value: unknown): value is LeanDeferredHandle {
+	return isRecord(value)
+		&& typeof value["provider"] === "string"
+		&& typeof value["modelId"] === "string"
+		&& typeof value["api"] === "string"
+		&& typeof value["id"] === "string"
+		&& (value["expiresAt"] === undefined
+			|| (typeof value["expiresAt"] === "number" && Number.isFinite(value["expiresAt"])))
+		&& (value["pollAfterMs"] === undefined
+			|| (typeof value["pollAfterMs"] === "number" && Number.isFinite(value["pollAfterMs"])));
 }
 
+/** Mutable running state of one boundary replacement/preview fold. */
+interface BoundaryFoldState {
+	/** Current draft entries; handler-supplied arrays replace these. */
+	entries: readonly unknown[];
+	/** Whether the agent loop should continue after the boundary. */
+	continueAfter: boolean;
+	/** Last accepted Rust projection preview; retained across failed previews. */
+	context: unknown;
+	/** Whether any handler supplied `entries` (drives the omission-shaped response). */
+	entriesSupplied: boolean;
+	/** Whether any handler supplied `continue`. */
+	continueSupplied: boolean;
+	/** Whether the LAST preview succeeded; a failed final preview collapses the fold. */
+	valid: boolean;
+}
+
+/**
+ * Fold a handler result over the running boundary state. Present fields
+ * REPLACE the running values — entries never append. Absent fields, empty
+ * results, and thrown handlers change nothing.
+ */
+function applyBoundaryResult(result: unknown, fold: BoundaryFoldState): void {
+	if (!isRecord(result)) return;
+	if (result["entries"] !== undefined) {
+		fold.entries = result["entries"] as readonly unknown[];
+		fold.entriesSupplied = true;
+	}
+	if (result["continue"] !== undefined) {
+		fold.continueAfter = result["continue"] === true;
+		fold.continueSupplied = true;
+	}
+}
+
+/**
+ * Omission-shaped fold result: `entries` / `continue` appear only when a
+ * handler supplied them, so an endpoint whose handlers changed nothing
+ * answers `{}` and the Rust fold keeps its accumulated state. An invalid
+ * final state cannot persist: it collapses to empty entries and no
+ * continuation.
+ */
+function boundaryFoldResponse(fold: BoundaryFoldState): Record<string, unknown> {
+	if (!fold.valid) {
+		return { entries: [], continue: false };
+	}
+	const response: Record<string, unknown> = {};
+	if (fold.entriesSupplied) response["entries"] = fold.entries;
+	if (fold.continueSupplied) response["continue"] = fold.continueAfter;
+	return response;
+}
 
 /**
  * Import specifiers that mark a lean entry as accidentally built for
@@ -870,17 +932,6 @@ async function findModuleLoadViolationInGraph(entry: string): Promise<ModuleLoad
 }
 
 /**
- * Structured cancellation only: a real Error (or DOMException, which is
- * not Error-derived in every runtime) named AbortError. Message text is
- * deliberately never consulted — an extension failure that merely says
- * "cancelled" must stay an extension_error.
- */
-function isStructuredAbortError(error: unknown): boolean {
-	if (error instanceof Error && error.name === "AbortError") return true;
-	return typeof DOMException === "function" && error instanceof DOMException && error.name === "AbortError";
-}
-
-/**
  * Lean Mode-2 endpoint process. Owns the declarative registry and bridges
  * it to Rust over a single JSONL byte transport, mirroring the Mode-1
  * host's four-state machine (hello → loading → ready → disposed).
@@ -911,7 +962,7 @@ export class LeanRunner {
 
 	/** In-flight tool.execute AbortControllers keyed by request id. */
 	private readonly inFlightTools = new Map<number, AbortController>();
-	/** In-flight provider.stream AbortControllers keyed by request id. */
+	/** In-flight provider operation AbortControllers keyed by request id. */
 	private readonly inFlightProviders = new Map<number, AbortController>();
 	/** Active shortcut handlers keyed by their resolved shortcut key. */
 	private readonly inFlightShortcuts = new Map<string, AbortController>();
@@ -1142,6 +1193,9 @@ export class LeanRunner {
 				description: tool.description,
 				parameters: tool.parameters ?? {},
 			};
+			if (tool.constrainedSampling !== undefined) {
+				entry["constrainedSampling"] = tool.constrainedSampling;
+			}
 			if (tool.executionMode !== undefined) {
 				entry["executionMode"] = tool.executionMode;
 			}
@@ -1182,6 +1236,12 @@ export class LeanRunner {
 				streamSimple: typeof provider.streamSimple === "function",
 				extensionPath,
 			};
+			if (typeof provider.fetchDeferred === "function") {
+				entry["fetchDeferred"] = true;
+			}
+			if (typeof provider.cancelDeferred === "function") {
+				entry["cancelDeferred"] = true;
+			}
 			if (provider.baseUrl !== undefined) entry["baseUrl"] = provider.baseUrl;
 			if (provider.api !== undefined) entry["api"] = provider.api;
 			if (provider.displayName !== undefined) entry["displayName"] = provider.displayName;
@@ -1237,6 +1297,12 @@ export class LeanRunner {
 			case "provider.stream":
 				await this.handleProviderStream(id, p);
 				return;
+			case LEAN_PROVIDER_FETCH_DEFERRED_METHOD:
+				await this.handleProviderFetchDeferred(id, p);
+				return;
+			case LEAN_PROVIDER_CANCEL_DEFERRED_METHOD:
+				await this.handleProviderCancelDeferred(id, p);
+				return;
 			case "flags.set":
 				await this.handleFlagsSet(id, p);
 				return;
@@ -1245,6 +1311,13 @@ export class LeanRunner {
 				return;
 			case "message_update_delta":
 				await this.handleMessageUpdateDelta(id, p);
+				return;
+			case "turn_end":
+			case "agent_before_settle":
+				// Boundary folds answer even with zero registered handlers: the
+				// response carries no supplied values, so the Rust fold keeps
+				// its accumulated state.
+				await this.handleLifecycleHook(id, method, p);
 				return;
 			default:
 				if (this.hooks.has(method)) {
@@ -1449,12 +1522,22 @@ export class LeanRunner {
 			return;
 		}
 
+		const rawOptions = p["options"];
+		if (rawOptions !== undefined && !isRecord(rawOptions)) {
+			await this.client.respondError(id, "provider.stream" as Method, {
+				code: "invalid_arguments",
+				message: "provider.stream options must be an object",
+				retryable: false,
+			});
+			return;
+		}
 		const controller = new AbortController();
 		this.inFlightProviders.set(id, controller);
 		const options = {
-			...(isRecord(p["options"]) ? p["options"] : {}),
+			...(rawOptions ?? {}),
 			signal: controller.signal,
 		};
+		this.installProviderWireCallbacks(id, p, options);
 		try {
 			const stream = registered.provider.streamSimple(p["model"], p["context"], options);
 			for await (const event of stream) {
@@ -1476,6 +1559,159 @@ export class LeanRunner {
 			await this.client.respondError(id, "provider.stream" as Method, {
 				code: cancelled ? "cancelled" : "extension_error",
 				message: cancelled ? "provider stream cancelled" : message,
+				retryable: false,
+			});
+		} finally {
+			this.inFlightProviders.delete(id);
+		}
+	}
+
+	/**
+	 * Reconstruct `onPayload`/`onResponse` on a provider options object from
+	 * the request's `callbacks` flags. Rust serializes callback availability
+	 * there; each installed proxy issues the correlated `provider.*` request
+	 * back with the originating frame id as `callId`.
+	 */
+	private installProviderWireCallbacks(
+		id: number,
+		p: Record<string, unknown>,
+		options: Record<string, unknown>,
+	): void {
+		const callbacks = isRecord(p["callbacks"]) ? p["callbacks"] : undefined;
+		if (callbacks?.["beforePayload"] === true) {
+			options["onPayload"] = async (payload: unknown) => {
+				const frame = await this.client.request("provider.beforePayload" as Method, {
+					callId: String(id),
+					payload,
+				});
+				return isRecord(frame.payload) ? frame.payload["payload"] : undefined;
+			};
+		}
+		if (callbacks?.["onResponse"] === true) {
+			options["onResponse"] = async (response: unknown) => {
+				await this.client.request("provider.onResponse" as Method, {
+					callId: String(id),
+					response,
+				});
+			};
+		}
+	}
+	private async handleProviderFetchDeferred(id: number, p: Record<string, unknown>): Promise<void> {
+		const providerId = String(p["providerId"] ?? p["name"] ?? "");
+		const registered = this.providers.get(providerId);
+		if (registered === undefined || typeof registered.provider.fetchDeferred !== "function") {
+			await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: "not_found",
+				message: `Provider not found or missing fetchDeferred: ${providerId}`,
+				retryable: false,
+			});
+			return;
+		}
+
+		const model = p["model"];
+		const rawHandle = p["handle"];
+		const rawOptions = p["options"];
+		if (
+			!isRecord(model)
+			|| !isDeferredHandle(rawHandle)
+			|| (rawOptions !== undefined && !isRecord(rawOptions))
+		) {
+			await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: "invalid_arguments",
+				message: "provider.fetchDeferred model, handle, and options must be objects",
+				retryable: false,
+			});
+			return;
+		}
+
+		const controller = new AbortController();
+		this.inFlightProviders.set(id, controller);
+		const options = {
+			...(rawOptions ?? {}),
+			wait: 0,
+			signal: controller.signal,
+		};
+		this.installProviderWireCallbacks(id, p, options);
+		try {
+			const stream = registered.provider.fetchDeferred(model, rawHandle, options);
+			for await (const event of stream) {
+				if (controller.signal.aborted) break;
+				await this.client.send({ id, kind: "event", method: "providerEvent", payload: event });
+			}
+			if (controller.signal.aborted) {
+				await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
+					code: "cancelled",
+					message: "provider deferred fetch cancelled",
+					retryable: false,
+				});
+				return;
+			}
+			await this.client.respond(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {});
+		} catch (err) {
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
+			const message = err instanceof Error ? err.message : String(err);
+			await this.client.respondError(id, LEAN_PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: cancelled ? "cancelled" : "extension_error",
+				message: cancelled ? "provider deferred fetch cancelled" : message,
+				retryable: false,
+			});
+		} finally {
+			this.inFlightProviders.delete(id);
+		}
+	}
+
+	private async handleProviderCancelDeferred(id: number, p: Record<string, unknown>): Promise<void> {
+		const providerId = String(p["providerId"] ?? p["name"] ?? "");
+		const registered = this.providers.get(providerId);
+		if (registered === undefined || typeof registered.provider.cancelDeferred !== "function") {
+			await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: "not_found",
+				message: `Provider not found or missing cancelDeferred: ${providerId}`,
+				retryable: false,
+			});
+			return;
+		}
+
+		const model = p["model"];
+		const rawHandle = p["handle"];
+		const rawOptions = p["options"];
+		if (
+			!isRecord(model)
+			|| !isDeferredHandle(rawHandle)
+			|| (rawOptions !== undefined && !isRecord(rawOptions))
+		) {
+			await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: "invalid_arguments",
+				message: "provider.cancelDeferred model, handle, and options must be objects",
+				retryable: false,
+			});
+			return;
+		}
+
+		const controller = new AbortController();
+		this.inFlightProviders.set(id, controller);
+		const options = {
+			...(rawOptions ?? {}),
+			signal: controller.signal,
+		};
+		this.installProviderWireCallbacks(id, p, options);
+		try {
+			await registered.provider.cancelDeferred(model, rawHandle, options);
+			if (controller.signal.aborted) {
+				await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
+					code: "cancelled",
+					message: "provider deferred cancellation cancelled",
+					retryable: false,
+				});
+				return;
+			}
+			await this.client.respond(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {});
+		} catch (err) {
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
+			const message = err instanceof Error ? err.message : String(err);
+			await this.client.respondError(id, LEAN_PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: cancelled ? "cancelled" : "extension_error",
+				message: cancelled ? "provider deferred cancellation cancelled" : message,
 				retryable: false,
 			});
 		} finally {
@@ -1821,6 +2057,12 @@ export class LeanRunner {
 					await this.client.respond(id, eventType as Method, result ?? { ok: true });
 					return;
 				}
+				case "turn_end":
+				case "agent_before_settle": {
+					const response = await this.runBoundaryFold(eventType, payload);
+					await this.client.respond(id, eventType as Method, response);
+					return;
+				}
 				default: {
 					if (eventType === "agent_end" || eventType === "session_shutdown") {
 						this.assistantDelta.clearActiveAssistant();
@@ -1836,6 +2078,102 @@ export class LeanRunner {
 				message: err instanceof Error ? err.message : String(err),
 				retryable: false,
 			});
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Boundary replacement/preview fold (turn_end, agent_before_settle)
+	// -----------------------------------------------------------------------
+
+	/**
+	 * Replacement/preview fold for boundary hooks, mirroring the reference
+	 * runner's `emitBoundary`: each handler sees the running entries,
+	 * continuation, and context; result fields REPLACE the running values
+	 * (entries never append, `continue: false` clears a prior request). After
+	 * every handler — including one returning nothing, because it may enqueue
+	 * messages — the runner asks Rust to validate the drafts through the
+	 * correlated `session.previewBoundary` request and adopts the returned
+	 * projection preview. A failed preview is reported as an extension error,
+	 * keeps the previous context for the next handler, and lets a later
+	 * handler replace the drafts; when the LAST preview failed, the fold
+	 * collapses to empty entries and no continuation so an invalid final
+	 * state cannot persist. Rust owns all projection logic: this fold only
+	 * threads values and reports.
+	 */
+	private async runBoundaryFold(
+		eventType: "turn_end" | "agent_before_settle",
+		payload: Record<string, unknown>,
+	): Promise<Record<string, unknown>> {
+		const rawEntries = payload["entries"];
+		if (rawEntries !== undefined && !Array.isArray(rawEntries)) {
+			throw new Error(`${eventType}.entries must be an array`);
+		}
+		const fold: BoundaryFoldState = {
+			entries: Array.isArray(rawEntries) ? rawEntries : [],
+			continueAfter: payload["continue"] === true,
+			context: payload["context"],
+			entriesSupplied: false,
+			continueSupplied: false,
+			valid: true,
+		};
+		for (const { handler, extensionPath } of this.hooks.get(eventType) ?? []) {
+			await this.runBoundaryHandler(eventType, handler, extensionPath, payload, fold);
+			await this.revalidateBoundaryEntries(eventType, extensionPath, fold);
+		}
+		return boundaryFoldResponse(fold);
+	}
+
+	/** Invoke one boundary handler and fold its supplied fields over the running state. */
+	private async runBoundaryHandler(
+		eventType: "turn_end" | "agent_before_settle",
+		handler: RegisteredHook["handler"],
+		extensionPath: string,
+		payload: Record<string, unknown>,
+		fold: BoundaryFoldState,
+	): Promise<void> {
+		try {
+			const event = {
+				type: eventType,
+				...payload,
+				entries: fold.entries,
+				continue: fold.continueAfter,
+				context: fold.context,
+			};
+			const result = await handler(event as never, this.hookContext(extensionPath));
+			applyBoundaryResult(result, fold);
+		} catch (err) {
+			this.emitExtensionError(
+				extensionPath,
+				eventType,
+				err instanceof Error ? err.message : String(err),
+			);
+		}
+	}
+
+	/**
+	 * Ask Rust to validate the current drafts and adopt the returned preview.
+	 * A failure reports the extension error and marks the fold invalid while
+	 * keeping the previous context, so a later handler can replace the drafts.
+	 */
+	private async revalidateBoundaryEntries(
+		eventType: "turn_end" | "agent_before_settle",
+		extensionPath: string,
+		fold: BoundaryFoldState,
+	): Promise<void> {
+		try {
+			const preview = await this.client.request(SESSION_PREVIEW_BOUNDARY_METHOD, {
+				boundary: eventType,
+				entries: fold.entries,
+			});
+			fold.context = isRecord(preview.payload) ? preview.payload["context"] : undefined;
+			fold.valid = true;
+		} catch (err) {
+			fold.valid = false;
+			this.emitExtensionError(
+				extensionPath,
+				eventType,
+				`Invalid boundary entries: ${err instanceof Error ? err.message : String(err)}`,
+			);
 		}
 	}
 

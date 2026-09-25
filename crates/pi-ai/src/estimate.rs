@@ -4,9 +4,10 @@
 
 use serde_json::Value;
 
+use crate::transcript::get_system_message_text;
 use crate::types::{
-    AssistantContent, Context, Message, StopReason, TextContent, Tool, ToolResultContent, Usage,
-    UserContent, UserMessageContent,
+    AssistantContent, Context, Message, StopReason, TextContent, Tool, ToolReference,
+    ToolResultContent, Usage, UserContent, UserMessageContent,
 };
 
 /// Context-token estimate anchored on the last valid assistant usage.
@@ -96,6 +97,11 @@ pub fn estimate_text_and_image_content_tokens(content: &UserMessageContent) -> u
 #[must_use]
 pub fn estimate_message_tokens(message: &Message) -> u64 {
     match message {
+        Message::System(system) => estimate_text_tokens(&get_system_message_text(system))
+            .saturating_add(estimate_tools_tokens(system.tools_added.as_deref()))
+            .saturating_add(estimate_tool_references_tokens(
+                system.tools_removed.as_deref(),
+            )),
         Message::User(user) => estimate_text_and_image_content_tokens(&user.content),
         Message::ToolResult(result) => {
             let chars = estimate_tool_result_content_chars(&result.content);
@@ -145,6 +151,7 @@ fn get_last_assistant_usage_info(messages: &[Message]) -> Option<(Usage, usize)>
                 }
                 assistant.timestamp
             }
+            Message::System(system) => system.timestamp,
             Message::ToolResult(result) => result.timestamp,
         };
         latest_prefix_timestamp = latest_prefix_timestamp.max(timestamp);
@@ -185,8 +192,14 @@ fn estimate_tools_tokens(tools: Option<&[Tool]>) -> u64 {
     let value = serde_json::to_value(tools).unwrap_or(Value::Null);
     estimate_text_tokens(&safe_json_stringify(&value))
 }
+fn estimate_tool_references_tokens(tools: Option<&[ToolReference]>) -> u64 {
+    let Some(tools) = tools.filter(|tools| !tools.is_empty()) else {
+        return 0;
+    };
+    let value = serde_json::to_value(tools).unwrap_or(Value::Null);
+    estimate_text_tokens(&safe_json_stringify(&value))
+}
 
-/// Estimate context tokens for a [`Context`] or bare message list.
 ///
 /// When a prior assistant usage block is available, trailing messages (and
 /// tools newly added after that usage) are estimated on top of the reported
@@ -288,7 +301,7 @@ mod tests {
                     UserMessageContent::Text("Hello".into()),
                     1,
                 )),
-                Message::Assistant(assistant),
+                Message::Assistant(Box::new(assistant)),
                 Message::User(UserMessage::new(
                     UserMessageContent::Text("continue".into()),
                     3,
@@ -318,6 +331,7 @@ mod tests {
                 name: "bash".into(),
                 description: "run".into(),
                 parameters: serde_json::json!({"type": "object"}),
+                constrained_sampling: None,
             }]),
         };
         let estimate = estimate_context_tokens(&context);

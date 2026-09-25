@@ -23,10 +23,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
+use pi_tui::alt_screen::FullscreenStyle;
 pub use pi_tui::components::{DefaultTextStyle, MarkdownOptions, MarkdownTheme};
 use pi_tui::components::{SelectListTheme, SettingsListTheme};
 use pi_tui::terminal::probe::TerminalTheme;
 use pi_tui::text::{truncate_to_width, visible_width};
+use ratatui::style::{Color, Modifier, Style};
 use syntect::highlighting::ScopeSelector;
 use syntect::parsing::{
     ParseState, ScopeStack, ScopeStackOp, SyntaxDefinition, SyntaxSet, SyntaxSetBuilder,
@@ -72,6 +74,12 @@ pub enum ThemeColor {
     Text,
     /// Reasoning text foreground.
     ThinkingText,
+    /// Fullscreen scrollbar track foreground (optional; falls back to muted).
+    ScrollbarTrack,
+    /// Fullscreen scrollbar thumb foreground (optional; falls back to text).
+    ScrollbarThumb,
+    /// Transcript search match text (optional; falls back to text).
+    SearchMatchText,
     /// User message foreground.
     UserMessageText,
     /// Custom message foreground.
@@ -149,8 +157,8 @@ pub enum ThemeColor {
 pub enum ThemeBg {
     /// Selected row background.
     SelectedBg,
-    /// Scrollbar thumb background (optional; falls back to selectedBg).
-    ScrollbarThumb,
+    /// Transcript search match background (optional; falls back to selectedBg).
+    SearchMatchBg,
     /// User message background.
     UserMessageBg,
     /// Custom message background.
@@ -164,7 +172,7 @@ pub enum ThemeBg {
 }
 
 /// All foreground slots in schema order.
-pub const ALL_FG: [ThemeColor; 46] = [
+pub const ALL_FG: [ThemeColor; 49] = [
     ThemeColor::Accent,
     ThemeColor::Border,
     ThemeColor::BorderAccent,
@@ -176,6 +184,9 @@ pub const ALL_FG: [ThemeColor; 46] = [
     ThemeColor::Dim,
     ThemeColor::Text,
     ThemeColor::ThinkingText,
+    ThemeColor::ScrollbarTrack,
+    ThemeColor::ScrollbarThumb,
+    ThemeColor::SearchMatchText,
     ThemeColor::UserMessageText,
     ThemeColor::CustomMessageText,
     ThemeColor::CustomMessageLabel,
@@ -216,7 +227,7 @@ pub const ALL_FG: [ThemeColor; 46] = [
 /// All background slots in schema order.
 pub const ALL_BG: [ThemeBg; 7] = [
     ThemeBg::SelectedBg,
-    ThemeBg::ScrollbarThumb,
+    ThemeBg::SearchMatchBg,
     ThemeBg::UserMessageBg,
     ThemeBg::CustomMessageBg,
     ThemeBg::ToolPendingBg,
@@ -473,6 +484,80 @@ impl ResolvedTheme {
             name,
         )
     }
+
+    /// Map a resolved color onto a ratatui color, honoring the theme's color
+    /// depth (256-color themes downsample exactly like the ANSI emitters).
+    #[must_use]
+    fn ratatui_color(&self, color: ResolvedColor) -> Color {
+        match color {
+            ResolvedColor::Default => Color::Reset,
+            ResolvedColor::Indexed(index) => Color::Indexed(index),
+            ResolvedColor::Rgb(rgb) => match self.mode {
+                ColorMode::Truecolor => Color::Rgb(rgb.0, rgb.1, rgb.2),
+                ColorMode::Palette256 => Color::Indexed(rgb_to_256(rgb)),
+            },
+        }
+    }
+
+    /// Foreground [`Color`] for `slot`, falling back to `fallback` when the
+    /// slot is empty (mirrors the reference `Theme` constructor fallbacks).
+    #[must_use]
+    fn fullscreen_fg_color(&self, slot: ThemeColor, fallback: ThemeColor) -> Color {
+        let color = if self.is_fg_empty(slot) {
+            self.fg[Self::fg_index(fallback)]
+        } else {
+            self.fg[Self::fg_index(slot)]
+        };
+        self.ratatui_color(color)
+    }
+
+    /// Foreground [`Style`] for `slot`, falling back to `fallback` when the
+    /// slot is empty.
+    #[must_use]
+    fn fullscreen_fg(&self, slot: ThemeColor, fallback: ThemeColor) -> Style {
+        Style::default().fg(self.fullscreen_fg_color(slot, fallback))
+    }
+
+    /// Background [`Color`] for `slot`, falling back to `fallback` when the
+    /// slot is empty.
+    #[must_use]
+    fn fullscreen_bg_color(&self, slot: ThemeBg, fallback: ThemeBg) -> Color {
+        let color = if self.is_bg_empty(slot) {
+            self.bg[Self::bg_index(fallback)]
+        } else {
+            self.bg[Self::bg_index(slot)]
+        };
+        self.ratatui_color(color)
+    }
+
+    /// Resolve the fullscreen viewport chrome styles from this theme.
+    ///
+    /// Mirrors the reference fullscreen style wiring: normal search matches
+    /// combine the `searchMatchText`/`searchMatchBg` slots with underline;
+    /// the current match adds bold/inverse; the jump-to-end label consumes
+    /// `selectedBg`/`text`. Selection and flash use inverse video rather
+    /// than dedicated theme tokens.
+    #[must_use]
+    pub fn fullscreen_style(&self) -> FullscreenStyle {
+        let search_fg = self.fullscreen_fg_color(ThemeColor::SearchMatchText, ThemeColor::Text);
+        let search_background =
+            self.fullscreen_bg_color(ThemeBg::SearchMatchBg, ThemeBg::SelectedBg);
+        FullscreenStyle {
+            scrollbar_track: self.fullscreen_fg(ThemeColor::ScrollbarTrack, ThemeColor::Muted),
+            scrollbar_thumb: self.fullscreen_fg(ThemeColor::ScrollbarThumb, ThemeColor::Text),
+            search_match: Style::default()
+                .fg(search_fg)
+                .bg(search_background)
+                .add_modifier(Modifier::UNDERLINED),
+            search_current_match: Style::default()
+                .fg(search_fg)
+                .bg(search_background)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            jump_to_end: Style::default()
+                .fg(self.ratatui_color(self.fg[Self::fg_index(ThemeColor::Text)]))
+                .bg(self.ratatui_color(self.bg[Self::bg_index(ThemeBg::SelectedBg)])),
+        }
+    }
 }
 
 /// One theme slot value in the JSON / extension wire vocabulary:
@@ -600,6 +685,9 @@ pub fn make_fg(color: ThemeColor) -> fn(&str) -> String {
         ThemeColor::Dim => |s| current().fg(ThemeColor::Dim, s),
         ThemeColor::Text => |s| current().fg(ThemeColor::Text, s),
         ThemeColor::ThinkingText => |s| current().fg(ThemeColor::ThinkingText, s),
+        ThemeColor::ScrollbarTrack => |s| current().fg(ThemeColor::ScrollbarTrack, s),
+        ThemeColor::ScrollbarThumb => |s| current().fg(ThemeColor::ScrollbarThumb, s),
+        ThemeColor::SearchMatchText => |s| current().fg(ThemeColor::SearchMatchText, s),
         ThemeColor::UserMessageText => |s| current().fg(ThemeColor::UserMessageText, s),
         ThemeColor::CustomMessageText => |s| current().fg(ThemeColor::CustomMessageText, s),
         ThemeColor::CustomMessageLabel => |s| current().fg(ThemeColor::CustomMessageLabel, s),
@@ -1340,26 +1428,14 @@ impl ThemeJson {
             })?;
             colors.push(((*slot).to_owned(), cv));
         }
-        // thinkingMax is optional → falls back to thinkingXhigh.
-        if let Some(value) = colors_obj.get("thinkingMax") {
-            let color = parse_color_value(value).ok_or_else(|| ThemeError::InvalidColor {
-                slot: "thinkingMax".to_owned(),
-                value: value.to_string(),
-            })?;
-            colors.push(("thinkingMax".to_owned(), color));
-        } else if let Some((_, x)) = colors.iter().find(|(k, _)| k == "thinkingXhigh") {
-            colors.push(("thinkingMax".to_owned(), x.clone()));
-        }
-        // scrollbarThumb is optional → falls back to selectedBg.
-        if let Some(value) = colors_obj.get("scrollbarThumb") {
-            let color = parse_color_value(value).ok_or_else(|| ThemeError::InvalidColor {
-                slot: "scrollbarThumb".to_owned(),
-                value: value.to_string(),
-            })?;
-            colors.push(("scrollbarThumb".to_owned(), color));
-        } else if let Some((_, x)) = colors.iter().find(|(k, _)| k == "selectedBg") {
-            colors.push(("scrollbarThumb".to_owned(), x.clone()));
-        }
+        // Optional slots keep old custom themes compatible: an absent key
+        // resolves to its fallback source (mirrors the reference
+        // `withThemeColorFallbacks`).
+        push_optional_slot(&mut colors, colors_obj, "thinkingMax", "thinkingXhigh")?;
+        push_optional_slot(&mut colors, colors_obj, "scrollbarTrack", "muted")?;
+        push_optional_slot(&mut colors, colors_obj, "scrollbarThumb", "text")?;
+        push_optional_slot(&mut colors, colors_obj, "searchMatchText", "text")?;
+        push_optional_slot(&mut colors, colors_obj, "searchMatchBg", "selectedBg")?;
         Ok(Self { name, vars, colors })
     }
 
@@ -1413,6 +1489,27 @@ impl ThemeJson {
             self.name.clone(),
         ))
     }
+}
+
+/// Parse an optional color slot: an explicit value must be a valid color,
+/// while an absent key clones its fallback source's already-parsed value so
+/// old custom themes without the key keep resolving.
+fn push_optional_slot(
+    colors: &mut Vec<(String, ColorValue)>,
+    colors_obj: &serde_json::Map<String, serde_json::Value>,
+    slot: &'static str,
+    fallback: &str,
+) -> Result<(), ThemeError> {
+    if let Some(value) = colors_obj.get(slot) {
+        let color = parse_color_value(value).ok_or_else(|| ThemeError::InvalidColor {
+            slot: slot.to_owned(),
+            value: value.to_string(),
+        })?;
+        colors.push((slot.to_owned(), color));
+    } else if let Some((_, resolved)) = colors.iter().find(|(key, _)| key == fallback) {
+        colors.push((slot.to_owned(), resolved.clone()));
+    }
+    Ok(())
 }
 
 fn parse_color_map(
@@ -1847,6 +1944,9 @@ const ALL_FG_SLOTS: &[(ThemeColor, &str)] = &[
     (ThemeColor::Dim, "dim"),
     (ThemeColor::Text, "text"),
     (ThemeColor::ThinkingText, "thinkingText"),
+    (ThemeColor::ScrollbarTrack, "scrollbarTrack"),
+    (ThemeColor::ScrollbarThumb, "scrollbarThumb"),
+    (ThemeColor::SearchMatchText, "searchMatchText"),
     (ThemeColor::UserMessageText, "userMessageText"),
     (ThemeColor::CustomMessageText, "customMessageText"),
     (ThemeColor::CustomMessageLabel, "customMessageLabel"),
@@ -1886,7 +1986,7 @@ const ALL_FG_SLOTS: &[(ThemeColor, &str)] = &[
 
 const ALL_BG_SLOTS: &[(ThemeBg, &str)] = &[
     (ThemeBg::SelectedBg, "selectedBg"),
-    (ThemeBg::ScrollbarThumb, "scrollbarThumb"),
+    (ThemeBg::SearchMatchBg, "searchMatchBg"),
     (ThemeBg::UserMessageBg, "userMessageBg"),
     (ThemeBg::CustomMessageBg, "customMessageBg"),
     (ThemeBg::ToolPendingBg, "toolPendingBg"),
@@ -2299,47 +2399,199 @@ mod tests {
     }
 
     #[test]
-    fn scrollbar_thumb_falls_back_to_selected_bg_when_absent() -> TestResult {
-        // selectedBg is set explicitly; scrollbarThumb is omitted.
-        let theme = parsed_theme(&[("selectedBg", serde_json::json!("#0a0b0c"))])?
-            .resolve_owned(ColorMode::Truecolor)
-            .map_err(|error| format!("test theme should resolve: {error}"))?;
-        assert_eq!(
-            theme.bg_rgb(ThemeBg::ScrollbarThumb),
-            theme.bg_rgb(ThemeBg::SelectedBg),
-            "absent scrollbarThumb must mirror selectedBg"
-        );
-        assert_eq!(theme.bg_rgb(ThemeBg::ScrollbarThumb), Rgb(10, 11, 12));
-        Ok(())
-    }
-
-    #[test]
-    fn scrollbar_thumb_parses_explicit_value_when_present() -> TestResult {
+    fn fullscreen_slots_fall_back_to_documented_sources_when_absent() -> TestResult {
+        // Old custom themes omit the new keys; muted/text/selectedBg are set
+        // explicitly so the fallback sources are observable.
         let theme = parsed_theme(&[
-            ("selectedBg", serde_json::json!("#0a0b0c")),
-            ("scrollbarThumb", serde_json::json!("#1e2f3f")),
+            ("muted", serde_json::json!("#111213")),
+            ("text", serde_json::json!("#212223")),
+            ("selectedBg", serde_json::json!("#313233")),
         ])?
         .resolve_owned(ColorMode::Truecolor)
         .map_err(|error| format!("test theme should resolve: {error}"))?;
-        assert_eq!(theme.bg_rgb(ThemeBg::ScrollbarThumb), Rgb(0x1e, 0x2f, 0x3f));
-        assert_ne!(
-            theme.bg_rgb(ThemeBg::ScrollbarThumb),
-            theme.bg_rgb(ThemeBg::SelectedBg),
-            "explicit scrollbarThumb must not mirror selectedBg"
+        assert_eq!(
+            theme.fg_rgb(ThemeColor::ScrollbarTrack),
+            Rgb(0x11, 0x12, 0x13),
+            "absent scrollbarTrack must mirror muted"
+        );
+        assert_eq!(
+            theme.fg_rgb(ThemeColor::ScrollbarThumb),
+            Rgb(0x21, 0x22, 0x23),
+            "absent scrollbarThumb must mirror text"
+        );
+        assert_eq!(
+            theme.fg_rgb(ThemeColor::SearchMatchText),
+            Rgb(0x21, 0x22, 0x23),
+            "absent searchMatchText must mirror text"
+        );
+        assert_eq!(
+            theme.bg_rgb(ThemeBg::SearchMatchBg),
+            Rgb(0x31, 0x32, 0x33),
+            "absent searchMatchBg must mirror selectedBg"
         );
         Ok(())
     }
 
     #[test]
-    fn scrollbar_thumb_slot_is_registered() {
-        assert!(
-            ALL_BG_SLOTS
-                .iter()
-                .any(|(bg, name)| *bg == ThemeBg::ScrollbarThumb && *name == "scrollbarThumb"),
-            "ALL_BG_SLOTS must register (ScrollbarThumb, \"scrollbarThumb\")"
+    fn fullscreen_slots_parse_explicit_values_when_present() -> TestResult {
+        let theme = parsed_theme(&[
+            ("muted", serde_json::json!("#111213")),
+            ("text", serde_json::json!("#212223")),
+            ("selectedBg", serde_json::json!("#313233")),
+            ("scrollbarTrack", serde_json::json!("#414243")),
+            ("scrollbarThumb", serde_json::json!("#515253")),
+            ("searchMatchText", serde_json::json!("#616263")),
+            ("searchMatchBg", serde_json::json!("#717273")),
+        ])?
+        .resolve_owned(ColorMode::Truecolor)
+        .map_err(|error| format!("test theme should resolve: {error}"))?;
+        assert_eq!(
+            theme.fg_rgb(ThemeColor::ScrollbarTrack),
+            Rgb(0x41, 0x42, 0x43)
         );
-        assert_eq!(ALL_BG.len(), 7);
-        assert!(ALL_BG.contains(&ThemeBg::ScrollbarThumb));
+        assert_eq!(
+            theme.fg_rgb(ThemeColor::ScrollbarThumb),
+            Rgb(0x51, 0x52, 0x53)
+        );
+        assert_eq!(
+            theme.fg_rgb(ThemeColor::SearchMatchText),
+            Rgb(0x61, 0x62, 0x63)
+        );
+        assert_eq!(theme.bg_rgb(ThemeBg::SearchMatchBg), Rgb(0x71, 0x72, 0x73));
+        Ok(())
+    }
+
+    #[test]
+    fn fullscreen_slot_rejects_invalid_color() -> TestResult {
+        let mut colors = serde_json::Map::new();
+        for slot in REQUIRED_COLORS {
+            colors.insert((*slot).to_owned(), serde_json::json!("#010203"));
+        }
+        colors.insert("scrollbarTrack".to_owned(), serde_json::json!("#zzzzzz"));
+        let error = ThemeJson::from_value(&serde_json::json!({
+            "name": "test",
+            "colors": colors,
+        }))
+        .err()
+        .ok_or_else(|| "bad scrollbarTrack must fail".to_owned())?;
+        assert!(
+            matches!(error, ThemeError::InvalidColor { ref slot, .. } if slot == "scrollbarTrack"),
+            "unexpected error: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fullscreen_style_resolves_real_colors_and_modifiers() -> TestResult {
+        let theme = parsed_theme(&[
+            ("muted", serde_json::json!("#111213")),
+            ("text", serde_json::json!("#212223")),
+            ("selectedBg", serde_json::json!("#313233")),
+            ("scrollbarTrack", serde_json::json!("#414243")),
+            ("scrollbarThumb", serde_json::json!("#515253")),
+            ("searchMatchText", serde_json::json!("#616263")),
+            ("searchMatchBg", serde_json::json!("#717273")),
+        ])?
+        .resolve_owned(ColorMode::Truecolor)
+        .map_err(|error| format!("test theme should resolve: {error}"))?;
+        let style = theme.fullscreen_style();
+        assert_eq!(
+            style.scrollbar_track,
+            Style::default().fg(Color::Rgb(0x41, 0x42, 0x43))
+        );
+        assert_eq!(
+            style.scrollbar_thumb,
+            Style::default().fg(Color::Rgb(0x51, 0x52, 0x53))
+        );
+        assert_eq!(
+            style.search_match,
+            Style::default()
+                .fg(Color::Rgb(0x61, 0x62, 0x63))
+                .bg(Color::Rgb(0x71, 0x72, 0x73))
+                .add_modifier(Modifier::UNDERLINED)
+        );
+        assert_eq!(
+            style.search_current_match,
+            Style::default()
+                .fg(Color::Rgb(0x61, 0x62, 0x63))
+                .bg(Color::Rgb(0x71, 0x72, 0x73))
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        );
+        assert_eq!(
+            style.jump_to_end,
+            Style::default()
+                .fg(Color::Rgb(0x21, 0x22, 0x23))
+                .bg(Color::Rgb(0x31, 0x32, 0x33))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fullscreen_style_applies_fallbacks_for_wire_built_themes() {
+        // Extension wire objects omit absent slots (empty = reset); the
+        // resolver falls back exactly like the reference constructor.
+        let theme = ResolvedTheme::from_value_slots(
+            [
+                (ThemeColor::Muted, ThemeSlotValue::Rgb(Rgb(1, 2, 3))),
+                (ThemeColor::Text, ThemeSlotValue::Rgb(Rgb(4, 5, 6))),
+            ],
+            [(ThemeBg::SelectedBg, ThemeSlotValue::Rgb(Rgb(7, 8, 9)))],
+            ColorMode::Truecolor,
+            "wire",
+        );
+        let style = theme.fullscreen_style();
+        assert_eq!(
+            style.scrollbar_track,
+            Style::default().fg(Color::Rgb(1, 2, 3))
+        );
+        assert_eq!(
+            style.scrollbar_thumb,
+            Style::default().fg(Color::Rgb(4, 5, 6))
+        );
+        assert_eq!(
+            style.search_match,
+            Style::default()
+                .fg(Color::Rgb(4, 5, 6))
+                .bg(Color::Rgb(7, 8, 9))
+                .add_modifier(Modifier::UNDERLINED)
+        );
+    }
+
+    #[test]
+    fn fullscreen_style_downsamples_in_palette256() -> TestResult {
+        let theme = parsed_theme(&[("scrollbarTrack", serde_json::json!("#414243"))])?
+            .resolve_owned(ColorMode::Palette256)
+            .map_err(|error| format!("test theme should resolve: {error}"))?;
+        assert_eq!(
+            theme.fullscreen_style().scrollbar_track,
+            Style::default().fg(Color::Indexed(rgb_to_256(Rgb(0x41, 0x42, 0x43))))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn built_in_dark_fullscreen_slots_derive_from_existing_tokens() {
+        // Built-in JSONs carry no fullscreen keys: the resolved chrome must
+        // come from the real muted/text/selectedBg tokens, not an invented
+        // palette, and regular rendering stays untouched.
+        let theme = dark();
+        let style = theme.fullscreen_style();
+        let muted = theme.fg_rgb(ThemeColor::Muted);
+        let text = theme.fg_rgb(ThemeColor::Text);
+        let selected_bg = theme.bg_rgb(ThemeBg::SelectedBg);
+        assert_eq!(
+            style.scrollbar_track,
+            Style::default().fg(Color::Rgb(muted.0, muted.1, muted.2))
+        );
+        assert_eq!(
+            style.scrollbar_thumb,
+            Style::default().fg(Color::Rgb(text.0, text.1, text.2))
+        );
+        assert_eq!(
+            style.search_match.bg,
+            Some(Color::Rgb(selected_bg.0, selected_bg.1, selected_bg.2))
+        );
+        assert_eq!(theme.fg_rgb(ThemeColor::Text), Rgb(237, 237, 237));
     }
 
     // ---- syntax highlighting ----

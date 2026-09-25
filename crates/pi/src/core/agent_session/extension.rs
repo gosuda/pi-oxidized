@@ -908,6 +908,10 @@ impl AgentSession {
 
     /// Apply one host bridge item. Failures are isolated through
     /// [`AgentSession::report_extension_error`]; nothing aborts the session.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one match arm per bridge event; splitting would scatter the dispatch table"
+    )]
     async fn apply_session_bridge_event(
         self: &Arc<Self>,
         host: &Arc<ExtensionRuntimeSet>,
@@ -995,6 +999,15 @@ impl AgentSession {
                 tokio::spawn(async move {
                     session.handle_bridge_setup_entries(host, id, request).await;
                 });
+            }
+            SessionBridgeEvent::PreviewBoundary { id, request } => {
+                let outcome = self
+                    .preview_boundary(&request.boundary, request.entries)
+                    .await
+                    .map_err(|error| error.to_string());
+                if let Err(error) = host.respond_boundary_preview(id, outcome).await {
+                    self.report_extension_error(format!("boundary preview response: {error}"));
+                }
             }
             SessionBridgeEvent::ReplacementReady { .. }
             | SessionBridgeEvent::ReplacementAbort { .. } => {
@@ -1472,7 +1485,7 @@ impl AgentSession {
                     .as_ref()
                     .and_then(|o| o.get("triggerTurn"))
                     .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                    .unwrap_or_else(|| self.is_session_streaming());
                 let deliver_as = options
                     .as_ref()
                     .and_then(|o| o.get("deliverAs"))
@@ -1715,6 +1728,11 @@ async fn answer_unclaimed_bridge_event(host: &Arc<ExtensionRuntimeSet>, event: S
                 .respond_setup_entries(id, Err("no active session".to_owned()))
                 .await;
         }
+        SessionBridgeEvent::PreviewBoundary { id, .. } => {
+            let _ = host
+                .respond_boundary_preview(id, Err("no active session".to_owned()))
+                .await;
+        }
     }
 }
 
@@ -1824,6 +1842,9 @@ mod tests {
             base_url: String::new(),
             reasoning: false,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
             context_window: 8_192,
@@ -3525,6 +3546,9 @@ mod tests {
                     base_url: String::new(),
                     reasoning: false,
                     thinking_level_map: None,
+                    input_limits: None,
+                    prompt_cache: None,
+                    sampling_params: None,
                     input: vec![ModelInput::Text],
                     cost: ModelCost::default(),
                     context_window: 8_192,

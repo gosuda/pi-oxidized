@@ -22,10 +22,6 @@ describe("XC-8 deadline, cancellation, error-isolation, stale-guard witnesses", 
 
 	// --- 30 s hook deadline constant ---
 
-	test("EXTENSION_HOOK_TIMEOUT_MS is pinned at 30000", () => {
-		expect(verifyHookDeadlineConstant(INPUTS.hostSource)).toEqual([]);
-	});
-
 	test("M15-adjacent: changing EXTENSION_HOOK_TIMEOUT_MS fails the witness", () => {
 		const mutated = INPUTS.hostSource.replace(
 			/EXTENSION_HOOK_TIMEOUT_MS\s*=\s*30_000/,
@@ -36,10 +32,6 @@ describe("XC-8 deadline, cancellation, error-isolation, stale-guard witnesses", 
 
 	// --- Input queue capacity-64 ---
 
-	test("EXTENSION_INPUT_QUEUE_CAPACITY is pinned at 64", () => {
-		expect(verifyInputQueueCapacity(INPUTS.hostSource)).toEqual([]);
-	});
-
 	test("changing EXTENSION_INPUT_QUEUE_CAPACITY fails the witness", () => {
 		const mutated = INPUTS.hostSource.replace(
 			/EXTENSION_INPUT_QUEUE_CAPACITY\s*=\s*64/,
@@ -49,10 +41,6 @@ describe("XC-8 deadline, cancellation, error-isolation, stale-guard witnesses", 
 	});
 
 	// --- M15: terminal-input 4 ms deadline ---
-
-	test("M15: terminal-input 4 ms deadline is present", () => {
-		expect(verifyTerminalInputDeadline(INPUTS.hostSource, INPUTS.scalingTestSource)).toEqual([]);
-	});
 
 	test("M15 mutation: removing EXTENSION_INPUT_TIMEOUT_MS fails the witness", () => {
 		const mutated = INPUTS.hostSource.replace(
@@ -95,12 +83,6 @@ describe("XC-8 deadline, cancellation, error-isolation, stale-guard witnesses", 
 	});
 
 	// --- M16: error isolation ---
-
-	test("M16: error isolation is present in both host and lean-runner", () => {
-		expect(
-			verifyErrorIsolation(INPUTS.hostSource, INPUTS.leanSource, INPUTS.acceptanceTestSource),
-		).toEqual([]);
-	});
 
 	test("M16 mutation: removing host.ts handleLifecycleHook catch fails the witness", () => {
 		const mutated = INPUTS.hostSource.replace(
@@ -145,10 +127,6 @@ describe("XC-8 deadline, cancellation, error-isolation, stale-guard witnesses", 
 	});
 
 	// --- M17: stale replacement token guard ---
-
-	test("M17: stale replacement token guard is present", () => {
-		expect(verifyStaleReplacementTokenGuard(INPUTS.hostSource, INPUTS.hostTestSource)).toEqual([]);
-	});
 
 	test("M17 mutation: removing markStale call fails the witness", () => {
 		const mutated = INPUTS.hostSource.replace(

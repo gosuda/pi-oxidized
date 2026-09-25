@@ -13,11 +13,11 @@ use super::config_value::resolve_config_value;
 use super::env_keys::{env_api_key_auth, is_ambient_auth_marker};
 use super::error::AuthError;
 use super::http::AuthHttpClient;
-use super::oauth::radius::RadiusOAuthOptions;
+use super::oauth::meta::MetaOAuth;
+use super::oauth::radius::{DEFAULT_RADIUS_GATEWAY, RadiusOAuth, RadiusOAuthOptions};
 use super::oauth::{
     anthropic::AnthropicOAuth, github_copilot::GitHubCopilotOAuth, kimi_coding::KimiCodingOAuth,
-    openai_codex::OpenAiCodexOAuth, openrouter::OpenRouterOAuth, radius::RadiusOAuth,
-    xai::XaiOAuth,
+    openai_codex::OpenAiCodexOAuth, openrouter::OpenRouterOAuth, xai::XaiOAuth,
 };
 use super::types::{
     ApiKeyAuth, ApiKeyCredential, AuthCheck, AuthContext, AuthInteraction, AuthResult, ModelAuth,
@@ -127,6 +127,12 @@ static BUILTIN_PROVIDER_AUTH: &[BuiltinProviderAuth] = &[
         "Kimi For Coding",
         &["KIMI_API_KEY"],
         build_kimi_coding_oauth,
+    ),
+    oauth_provider(
+        "meta",
+        "Meta (Muse subscription)",
+        &["META_API_KEY"],
+        build_meta_oauth,
     ),
     provider("minimax", &["MINIMAX_API_KEY"]),
     provider("minimax-cn", &["MINIMAX_CN_API_KEY"]),
@@ -326,6 +332,9 @@ fn build_kimi_coding_oauth() -> Arc<dyn OAuthAuth> {
     KimiCodingOAuth::shared()
         .unwrap_or_else(|_| Arc::new(KimiCodingOAuth::default()) as Arc<dyn OAuthAuth>)
 }
+fn build_meta_oauth() -> Arc<dyn OAuthAuth> {
+    MetaOAuth::shared().unwrap_or_else(|_| Arc::new(MetaOAuth::default()) as Arc<dyn OAuthAuth>)
+}
 
 fn build_openai_codex_oauth() -> Arc<dyn OAuthAuth> {
     OpenAiCodexOAuth::shared().unwrap_or_else(|_| {
@@ -343,7 +352,7 @@ fn build_openrouter_oauth() -> Arc<dyn OAuthAuth> {
 fn build_radius_oauth() -> Arc<dyn OAuthAuth> {
     let options = RadiusOAuthOptions {
         name: "Radius".to_owned(),
-        gateway: "https://radius.pi.dev".to_owned(),
+        gateway: DEFAULT_RADIUS_GATEWAY.to_owned(),
     };
     RadiusOAuth::new(options.clone()).map_or_else(
         |_| {
@@ -388,6 +397,11 @@ mod tests {
                     "kimi-coding",
                     "Kimi For Coding",
                     "Kimi Code (subscription)".to_owned(),
+                ),
+                (
+                    "meta",
+                    "Meta (Muse subscription)",
+                    "Meta (Muse subscription)".to_owned(),
                 ),
                 (
                     "openai-codex",

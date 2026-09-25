@@ -1,0 +1,593 @@
+//! Durable product plugin package profiles.
+//!
+//! Profiles are server/session scoped, written atomically with restrictive
+//! permissions, and store normalized package paths only. An absent configured
+//! list restores the saved profile; an explicitly empty list removes it.
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use tokio::fs;
+
+use crate::remote::schemas::ServerId;
+
+/// Current on-disk plugin profile schema.
+pub const PLUGIN_PACKAGE_PROFILE_VERSION: u32 = 1;
+
+/// Profile operation failure.
+#[derive(Debug, Error)]
+pub enum PluginProfileError {
+    /// Filesystem access failed.
+    #[error("plugin profile I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    /// JSON encoding or decoding failed.
+    #[error("plugin profile JSON failed: {0}")]
+    Json(#[from] serde_json::Error),
+    /// The profile shape or version is not supported.
+    #[error("invalid plugin package profile: {0}")]
+    Invalid(String),
+    /// A configured path could not be represented as UTF-8.
+    #[error("plugin package path is not valid UTF-8: {0}")]
+    NonUtf8(PathBuf),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PluginPackageProfile {
+    version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_path: Option<String>,
+    package_paths: Vec<String>,
+}
+
+/// Restores or writes the server-level package profile.
+///
+/// `configured == None` restores the persisted profile (or an empty list when
+/// none exists). `Some(&[])` removes the profile. A non-empty explicit list is
+/// normalized, persisted, and returned.
+///
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
+pub async fn restore_server_plugin_package_profile(
+    directory: &Path,
+    server_id: &ServerId,
+    configured: Option<&[String]>,
+) -> Result<Vec<String>, PluginProfileError> {
+    match configured {
+        None => Ok(read_server_plugin_package_profile(directory, server_id)
+            .await?
+            .unwrap_or_default()),
+        Some([]) => {
+            remove_server_plugin_package_profile(directory, server_id).await?;
+            Ok(Vec::new())
+        }
+        Some(paths) => write_server_plugin_package_profile(directory, server_id, paths).await,
+    }
+}
+
+/// Reads the server-scoped package profile, returning `None` when absent.
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
+pub async fn read_server_plugin_package_profile(
+    directory: &Path,
+    server_id: &ServerId,
+) -> Result<Option<Vec<String>>, PluginProfileError> {
+    let path = server_profile_path(directory, server_id);
+    match read_profile(&path).await {
+        Ok(profile) => {
+            if profile.session_path.is_some() {
+                return Err(PluginProfileError::Invalid(
+                    "server profile has a session path".to_owned(),
+                ));
+            }
+            if profile.package_paths.is_empty() {
+                return Err(PluginProfileError::Invalid(
+                    "server profile package paths must not be empty".to_owned(),
+                ));
+            }
+            Ok(Some(profile.package_paths))
+        }
+        Err(PluginProfileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Writes the server-scoped package profile after path normalization.
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
+pub async fn write_server_plugin_package_profile(
+    directory: &Path,
+    server_id: &ServerId,
+    package_paths: &[String],
+) -> Result<Vec<String>, PluginProfileError> {
+    let package_paths = normalize_paths(package_paths)?;
+    let path = server_profile_path(directory, server_id);
+    write_profile(
+        &path,
+        &PluginPackageProfile {
+            version: PLUGIN_PACKAGE_PROFILE_VERSION,
+            session_path: None,
+            package_paths: package_paths.clone(),
+        },
+    )
+    .await?;
+    Ok(package_paths)
+}
+
+/// Removes the server-scoped package profile. Missing files are already absent.
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
+pub async fn remove_server_plugin_package_profile(
+    directory: &Path,
+    server_id: &ServerId,
+) -> Result<(), PluginProfileError> {
+    remove_profile(&server_profile_path(directory, server_id)).await
+}
+
+/// Reads the session-scoped profile for one session path.
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
+pub async fn read_session_plugin_package_profile(
+    directory: &Path,
+    server_id: &ServerId,
+    session_path: &str,
+) -> Result<Option<Vec<String>>, PluginProfileError> {
+    let path = session_profile_path(directory, server_id, session_path);
+    match read_profile(&path).await {
+        Ok(profile) => {
+            if profile.session_path.as_deref() != Some(session_path) {
+                return Err(PluginProfileError::Invalid(
+                    "session path does not match profile name".to_owned(),
+                ));
+            }
+            Ok(Some(profile.package_paths))
+        }
+        Err(PluginProfileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Writes a session-scoped profile after path normalization.
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
+pub async fn write_session_plugin_package_profile(
+    directory: &Path,
+    server_id: &ServerId,
+    session_path: &str,
+    package_paths: &[String],
+) -> Result<Vec<String>, PluginProfileError> {
+    if session_path.is_empty() {
+        return Err(PluginProfileError::Invalid(
+            "session path must not be empty".to_owned(),
+        ));
+    }
+    let package_paths = normalize_paths(package_paths)?;
+    let path = session_profile_path(directory, server_id, session_path);
+    write_profile(
+        &path,
+        &PluginPackageProfile {
+            version: PLUGIN_PACKAGE_PROFILE_VERSION,
+            session_path: Some(session_path.to_owned()),
+            package_paths: package_paths.clone(),
+        },
+    )
+    .await?;
+    Ok(package_paths)
+}
+
+/// Removes a session-scoped profile. Missing files are already absent.
+/// # Errors
+///
+/// Returns [`PluginProfileError`] if I/O, JSON, or validation fails.
+pub async fn remove_session_plugin_package_profile(
+    directory: &Path,
+    server_id: &ServerId,
+    session_path: &str,
+) -> Result<(), PluginProfileError> {
+    remove_profile(&session_profile_path(directory, server_id, session_path)).await
+}
+
+/// Returns the deterministic server profile path.
+#[must_use]
+pub fn server_profile_path(directory: &Path, server_id: &ServerId) -> PathBuf {
+    directory.join(format!("plugin-packages-{}.json", server_id.as_str()))
+}
+
+/// Returns the deterministic session profile path.
+#[must_use]
+pub fn session_profile_path(directory: &Path, server_id: &ServerId, session_path: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(session_path.as_bytes());
+    let digest = hasher.finalize();
+    directory.join(format!(
+        "session-plugin-packages-{}-{}.json",
+        server_id.as_str(),
+        hex_prefix(&digest, 24)
+    ))
+}
+
+async fn read_profile(path: &Path) -> Result<PluginPackageProfile, PluginProfileError> {
+    restore_stranded_backup(path).await;
+    let contents = fs::read_to_string(path).await?;
+    let profile: PluginPackageProfile = serde_json::from_str(&contents)?;
+    if profile.version != PLUGIN_PACKAGE_PROFILE_VERSION {
+        return Err(PluginProfileError::Invalid(format!(
+            "unsupported version {}",
+            profile.version
+        )));
+    }
+    if profile.package_paths.iter().any(String::is_empty) {
+        return Err(PluginProfileError::Invalid(
+            "package path must not be empty".to_owned(),
+        ));
+    }
+    let mut paths = profile.package_paths.clone();
+    paths.sort();
+    paths.dedup();
+    if paths.len() != profile.package_paths.len() {
+        return Err(PluginProfileError::Invalid(
+            "package paths must be unique".to_owned(),
+        ));
+    }
+    if profile
+        .package_paths
+        .iter()
+        .any(|path| !Path::new(path).is_absolute())
+    {
+        return Err(PluginProfileError::Invalid(
+            "package paths must be absolute".to_owned(),
+        ));
+    }
+    Ok(profile)
+}
+
+async fn write_profile(
+    path: &Path,
+    profile: &PluginPackageProfile,
+) -> Result<(), PluginProfileError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let temporary = unique_temporary_path(path);
+    let bytes = serde_json::to_vec_pretty(profile)?;
+    fs::write(&temporary, bytes).await?;
+    set_private_permissions(&temporary).await?;
+    replace_file(&temporary, path).await?;
+    set_private_permissions(path).await?;
+    Ok(())
+}
+
+async fn remove_profile(path: &Path) -> Result<(), PluginProfileError> {
+    for backup in lingering_backups(path).await {
+        let _ = fs::remove_file(backup).await;
+    }
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Returns lingering backup siblings for `path`: the legacy deterministic
+/// `.bak` and every per-invocation `.bak.<pid>.<sequence>` sibling.
+async fn lingering_backups(path: &Path) -> Vec<PathBuf> {
+    let mut backups = Vec::new();
+    let mut legacy = path.as_os_str().to_os_string();
+    legacy.push(".bak");
+    let legacy = PathBuf::from(legacy);
+    if fs::metadata(&legacy).await.is_ok() {
+        backups.push(legacy);
+    }
+    let prefix = {
+        let Some(name) = path.file_name() else {
+            return backups;
+        };
+        let mut prefix = name.to_os_string();
+        prefix.push(".bak.");
+        prefix
+    };
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let Ok(mut entries) = fs::read_dir(parent).await else {
+        return backups;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        if name
+            .as_encoded_bytes()
+            .starts_with(prefix.as_encoded_bytes())
+        {
+            backups.push(entry.path());
+        }
+    }
+    backups.sort();
+    backups
+}
+
+/// Restores a backup left behind by a publish that died between
+/// `path -> backup` and `.tmp -> path` (Windows rotation in `replace_file`).
+/// When `path` is absent, the newest backup is the only recoverable profile,
+/// so it is renamed back before the read reports the profile missing.
+/// Best-effort: a failed restore leaves the backup in place for the next
+/// attempt.
+async fn restore_stranded_backup(path: &Path) {
+    if fs::metadata(path).await.is_ok() {
+        return;
+    }
+    let mut backups = lingering_backups(path).await;
+    let Some(backup) = backups.pop() else {
+        return;
+    };
+    let _ = fs::rename(&backup, path).await;
+}
+
+async fn set_private_permissions(path: &Path) -> Result<(), PluginProfileError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Allocates a sibling path unique to this invocation.
+///
+/// Two concurrent writes to the same profile must never share a temp or
+/// backup name: a deterministic `*.json.tmp` or `*.json.bak` lets one task
+/// rotate or restore another task's file and report success for the wrong
+/// profile. Process id plus a per-process counter keeps every invocation's
+/// sibling distinct.
+fn unique_sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!("{suffix}.{}.{}", std::process::id(), sequence));
+    PathBuf::from(name)
+}
+
+/// Allocates a sibling temporary path unique to this write.
+fn unique_temporary_path(path: &Path) -> PathBuf {
+    unique_sibling_path(path, ".tmp")
+}
+
+/// Allocates a sibling backup path unique to this write.
+#[cfg(windows)]
+fn unique_backup_path(path: &Path) -> PathBuf {
+    unique_sibling_path(path, ".bak")
+}
+
+/// Replaces `path` with `temporary`, including when `path` already exists.
+///
+/// `tokio::fs::rename` refuses to replace an existing destination on Windows,
+/// which would fail every profile update after the first write. Rotate through
+/// a per-invocation sibling backup instead of deleting first: a crash leaves
+/// either the previous profile or the backup behind, so no valid profile is
+/// destroyed to install the new one. The backup is unique to this write and
+/// removed on success, mirroring [`unique_temporary_path`]: two overlapping
+/// writes must not rotate or restore each other's backup.
+#[cfg(windows)]
+async fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    let backup = unique_backup_path(path);
+    // A crash between a previous `path -> backup` and `.tmp -> path` leaves
+    // the only valid profile under a backup name. Restore it before rotating
+    // so the write cannot silently discard it.
+    if fs::metadata(path).await.is_err() {
+        restore_stranded_backup(path).await;
+    }
+    let _ = fs::remove_file(&backup).await;
+    match fs::rename(path, &backup).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if let Err(error) = fs::rename(temporary, path).await {
+        let _ = fs::rename(&backup, path).await;
+        return Err(error);
+    }
+    let _ = fs::remove_file(&backup).await;
+    Ok(())
+}
+
+/// Replaces `path` with `temporary`, including when `path` already exists.
+///
+/// POSIX rename replaces atomically, so no rotation is needed.
+#[cfg(not(windows))]
+async fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, path).await
+}
+
+fn normalize_paths(paths: &[String]) -> Result<Vec<String>, PluginProfileError> {
+    let mut normalized = Vec::with_capacity(paths.len());
+    for path in paths {
+        if path.trim().is_empty() {
+            return Err(PluginProfileError::Invalid(
+                "package path must not be empty".to_owned(),
+            ));
+        }
+        let candidate = absolute_lexical(Path::new(path))?;
+        let value = candidate
+            .to_str()
+            .ok_or_else(|| PluginProfileError::NonUtf8(candidate.clone()))?
+            .to_owned();
+        if normalized.contains(&value) {
+            return Err(PluginProfileError::Invalid(
+                "package paths must be unique".to_owned(),
+            ));
+        }
+        normalized.push(value);
+    }
+    Ok(normalized)
+}
+
+/// Lexically normalizes `path` to an absolute path.
+///
+/// Relative input resolves against the process working directory; a working
+/// directory that cannot be resolved is an error instead of a silently
+/// relative result, because a persisted relative path would be rejected by
+/// every later [`read_profile`].
+fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut output = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                output.pop();
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                output.push(component.as_os_str());
+            }
+            std::path::Component::Normal(value) => output.push(value),
+        }
+    }
+    Ok(output)
+}
+
+fn hex_prefix(bytes: &[u8], digits: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if digits == 0 {
+        return String::new();
+    }
+    let mut output = String::with_capacity(digits);
+    for byte in bytes {
+        let high = (byte >> 4) as usize;
+        output.push(HEX[high] as char);
+        if output.len() >= digits {
+            output.truncate(digits);
+            break;
+        }
+        let low = (byte & 0x0f) as usize;
+        output.push(HEX[low] as char);
+        if output.len() >= digits {
+            output.truncate(digits);
+            break;
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn profile_with(path: &Path) -> PluginPackageProfile {
+        PluginPackageProfile {
+            version: PLUGIN_PACKAGE_PROFILE_VERSION,
+            session_path: None,
+            package_paths: vec![path.to_string_lossy().into_owned()],
+        }
+    }
+
+    #[tokio::test]
+    async fn read_profile_restores_stranded_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".bak");
+        let backup = PathBuf::from(backup);
+        let package = directory.path().join("pkg");
+        let profile = profile_with(&package);
+        fs::write(&backup, serde_json::to_vec(&profile).unwrap())
+            .await
+            .unwrap();
+
+        let restored = read_profile(&path).await.unwrap();
+        assert_eq!(restored.package_paths, profile.package_paths);
+        assert!(path.exists());
+        assert!(!backup.exists());
+    }
+
+    #[tokio::test]
+    async fn read_profile_keeps_primary_over_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".bak");
+        let backup = PathBuf::from(backup);
+        let primary_pkg = directory.path().join("primary");
+        let backup_pkg = directory.path().join("backup");
+        fs::write(
+            &path,
+            serde_json::to_vec(&profile_with(&primary_pkg)).unwrap(),
+        )
+        .await
+        .unwrap();
+        fs::write(
+            &backup,
+            serde_json::to_vec(&profile_with(&backup_pkg)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let restored = read_profile(&path).await.unwrap();
+        assert_eq!(
+            restored.package_paths,
+            vec![primary_pkg.to_string_lossy().into_owned()]
+        );
+        assert!(backup.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_profile_clears_stranded_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".bak");
+        let backup = PathBuf::from(backup);
+        fs::write(&backup, b"{}").await.unwrap();
+
+        remove_profile(&path).await.unwrap();
+        assert!(!backup.exists());
+    }
+
+    #[tokio::test]
+    async fn read_profile_restores_unique_backup_sibling() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let backup = unique_sibling_path(&path, ".bak");
+        let package = directory.path().join("pkg");
+        let profile = profile_with(&package);
+        fs::write(&backup, serde_json::to_vec(&profile).unwrap())
+            .await
+            .unwrap();
+
+        let restored = read_profile(&path).await.unwrap();
+        assert_eq!(restored.package_paths, profile.package_paths);
+        assert!(path.exists());
+        assert!(!backup.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_profile_clears_unique_backup_sibling() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let backup = unique_sibling_path(&path, ".bak");
+        fs::write(&backup, b"{}").await.unwrap();
+
+        remove_profile(&path).await.unwrap();
+        assert!(!backup.exists());
+    }
+}

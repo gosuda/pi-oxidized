@@ -1,5 +1,6 @@
 //! Product-agnostic terminal components and lifecycle.
 
+pub mod alt_screen;
 pub mod component;
 pub mod components;
 pub mod editor_support;

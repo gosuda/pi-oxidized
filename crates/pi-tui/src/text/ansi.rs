@@ -75,29 +75,8 @@ pub fn extract_ansi_code(s: &str, pos: usize) -> Option<ExtractedAnsi<'_>> {
         return None;
     }
 
-    // OSC: ESC ] ... BEL | ST
-    if next == b']' {
-        let mut j = pos + 2;
-        while j < bytes.len() {
-            if bytes[j] == 0x07 {
-                return Some(ExtractedAnsi {
-                    code: &s[pos..=j],
-                    len: j + 1 - pos,
-                });
-            }
-            if bytes[j] == 0x1b && bytes.get(j + 1) == Some(&b'\\') {
-                return Some(ExtractedAnsi {
-                    code: &s[pos..j + 2],
-                    len: j + 2 - pos,
-                });
-            }
-            j += 1;
-        }
-        return None;
-    }
-
-    // APC: ESC _ ... BEL | ST
-    if next == b'_' {
+    // OSC: ESC ] ... BEL | ST  /  APC: ESC _ ... BEL | ST
+    if next == b']' || next == b'_' {
         let mut j = pos + 2;
         while j < bytes.len() {
             if bytes[j] == 0x07 {

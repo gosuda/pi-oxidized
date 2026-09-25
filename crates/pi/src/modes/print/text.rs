@@ -84,6 +84,7 @@ impl TextRenderer {
             | AgentSessionEvent::SessionBeforeFork { .. }
             | AgentSessionEvent::SessionStart { .. }
             | AgentSessionEvent::SessionShutdown { .. }
+            | AgentSessionEvent::CompactionFailed { .. }
             | AgentSessionEvent::ModelSelect { .. }
             | AgentSessionEvent::TurnStart
             | AgentSessionEvent::ToolExecutionStart { .. }
@@ -133,7 +134,7 @@ impl TextRenderer {
         };
 
         match assistant.stop_reason {
-            StopReason::Error | StopReason::Aborted => {
+            StopReason::Error | StopReason::Aborted | StopReason::Pending => {
                 let message = assistant.error_message.clone().unwrap_or_else(|| {
                     format!("Request {}", stop_reason_wire(assistant.stop_reason))
                 });
@@ -142,7 +143,7 @@ impl TextRenderer {
                 sink.flush().await?;
                 Ok(TextOutcome::FAILURE)
             }
-            StopReason::Stop | StopReason::Length | StopReason::ToolUse => {
+            StopReason::Stop | StopReason::Length | StopReason::ToolUse | StopReason::Deferred => {
                 for content in &assistant.content {
                     if let pi_ai::AssistantContent::Text(text_block) = content {
                         sink.write_stdout(&text_block.text).await?;
@@ -179,7 +180,7 @@ fn assistant_of(message: &AgentMessage) -> Option<&AssistantMessage> {
     match message {
         AgentMessage::Llm(boxed) => match boxed.as_ref() {
             Message::Assistant(assistant) => Some(assistant),
-            Message::User(_) | Message::ToolResult(_) => None,
+            Message::User(_) | Message::ToolResult(_) | Message::System(_) => None,
         },
         AgentMessage::Custom(_) => None,
     }
@@ -193,6 +194,8 @@ fn stop_reason_wire(reason: StopReason) -> &'static str {
         StopReason::ToolUse => "toolUse",
         StopReason::Error => "error",
         StopReason::Aborted => "aborted",
+        StopReason::Pending => "pending",
+        StopReason::Deferred => "deferred",
     }
 }
 
@@ -213,14 +216,14 @@ mod tests {
                 .push(AssistantContent::Text(TextContent::new(text)));
         }
         msg.stop_reason = reason;
-        AgentMessage::Llm(Box::new(Message::Assistant(msg)))
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(msg))))
     }
 
     fn assistant_error(message: &str) -> AgentMessage {
         let mut msg = AssistantMessage::new("api", "provider", "model", 2);
         msg.stop_reason = StopReason::Error;
         msg.error_message = Some(message.to_owned());
-        AgentMessage::Llm(Box::new(Message::Assistant(msg)))
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(msg))))
     }
 
     #[tokio::test]
@@ -261,7 +264,7 @@ mod tests {
     async fn text_aborted_without_error_message_uses_request_prefix() -> TestResult {
         let mut msg = AssistantMessage::new("api", "provider", "model", 2);
         msg.stop_reason = StopReason::Aborted;
-        let message = AgentMessage::Llm(Box::new(Message::Assistant(msg)));
+        let message = AgentMessage::Llm(Box::new(Message::Assistant(Box::new(msg))));
         let events = vec![AgentSessionEvent::AgentEnd {
             messages: vec![message],
             will_retry: false,
@@ -285,7 +288,7 @@ mod tests {
         let final_msg = assistant_with("Hello", StopReason::Stop);
         let events = vec![
             AgentSessionEvent::MessageStart {
-                message: AgentMessage::Llm(Box::new(Message::Assistant(partial))),
+                message: AgentMessage::Llm(Box::new(Message::Assistant(Box::new(partial)))),
             },
             AgentSessionEvent::MessageEnd {
                 message: final_msg.clone(),

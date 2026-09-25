@@ -279,6 +279,7 @@ where
     let mut transformed = Vec::with_capacity(messages.len());
     for message in messages {
         transformed.push(match message {
+            Message::System(system) => Message::System(system.clone()),
             Message::User(user) => {
                 let mut user = user.clone();
                 if !model.input.contains(&ModelInput::Image)
@@ -288,12 +289,12 @@ where
                 }
                 Message::User(user)
             }
-            Message::Assistant(assistant) => Message::Assistant(transform_assistant(
+            Message::Assistant(assistant) => Message::Assistant(Box::new(transform_assistant(
                 assistant,
                 model,
                 &mut id_map,
                 &mut normalize_tool_call_id,
-            )),
+            ))),
             Message::ToolResult(result) => {
                 let mut result = result.clone();
                 if let Some(normalized) = id_map.get(&result.tool_call_id) {
@@ -421,10 +422,12 @@ fn repair_tool_result_sequence(messages: Vec<Message>) -> Vec<Message> {
     let mut result = Vec::with_capacity(messages.len());
     let mut pending = Vec::new();
     let mut result_ids = BTreeSet::new();
+    let mut held_system_messages = Vec::new();
     for message in messages {
         match message {
             Message::Assistant(assistant) => {
                 append_missing_tool_results(&mut result, &mut pending, &result_ids);
+                result.append(&mut held_system_messages);
                 result_ids.clear();
                 if matches!(
                     assistant.stop_reason,
@@ -448,12 +451,20 @@ fn repair_tool_result_sequence(messages: Vec<Message>) -> Vec<Message> {
             }
             Message::User(user) => {
                 append_missing_tool_results(&mut result, &mut pending, &result_ids);
+                result.append(&mut held_system_messages);
                 result_ids.clear();
                 result.push(Message::User(user));
+            }
+            Message::System(system) if pending.is_empty() => {
+                result.push(Message::System(system));
+            }
+            Message::System(system) => {
+                held_system_messages.push(Message::System(system));
             }
         }
     }
     append_missing_tool_results(&mut result, &mut pending, &result_ids);
+    result.append(&mut held_system_messages);
     result
 }
 
@@ -518,6 +529,9 @@ mod tests {
                     input_tokens_above: 100,
                 }]),
             },
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 10_000,
             max_tokens: 2_000,
             headers: None,
@@ -682,16 +696,26 @@ mod tests {
         orphan.stop_reason = StopReason::ToolUse;
         let transformed = transform_messages(
             &[
-                Message::Assistant(assistant),
+                Message::Assistant(Box::new(assistant)),
+                Message::System(Box::new(crate::SystemMessage::new("first update", 2))),
                 Message::ToolResult(matching),
-                Message::Assistant(orphan),
+                Message::Assistant(Box::new(orphan)),
+                Message::System(Box::new(crate::SystemMessage::new("last update", 4))),
             ],
             &model(),
             |_id, _model, _source| "normalized".into(),
         );
 
-        let Message::Assistant(assistant) = &transformed[0] else {
-            return Err("first message is not assistant");
+        let [
+            Message::Assistant(assistant),
+            Message::ToolResult(matching),
+            Message::System(first_update),
+            Message::Assistant(orphan),
+            Message::ToolResult(synthetic),
+            Message::System(last_update),
+        ] = transformed.as_slice()
+        else {
+            return Err("system update interrupted or duplicated a tool exchange");
         };
         let AssistantContent::ToolCall(call) = &assistant.content[0] else {
             return Err("assistant content is not a tool call");
@@ -699,20 +723,19 @@ mod tests {
         assert_eq!(call.id, "normalized");
         assert!(call.thought_signature.is_none());
 
-        let Message::ToolResult(matching) = &transformed[1] else {
-            return Err("second message is not tool result");
-        };
+        assert_eq!(
+            crate::transcript::get_system_message_text(first_update),
+            "first update"
+        );
         assert_eq!(matching.tool_call_id, "normalized");
 
-        let Message::Assistant(orphan) = &transformed[2] else {
-            return Err("third message is not assistant");
-        };
         let AssistantContent::ToolCall(orphan_call) = &orphan.content[0] else {
             return Err("orphan content is not a tool call");
         };
-        let Message::ToolResult(synthetic) = &transformed[3] else {
-            return Err("missing synthetic tool result");
-        };
+        assert_eq!(
+            crate::transcript::get_system_message_text(last_update),
+            "last update"
+        );
         assert_eq!(synthetic.tool_call_id, orphan_call.id);
         assert!(synthetic.is_error);
         Ok(())

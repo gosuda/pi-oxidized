@@ -14,6 +14,8 @@ pub mod ls;
 pub mod mutation_queue;
 pub mod output_accumulator;
 pub mod path_utils;
+#[cfg(windows)]
+pub mod powershell;
 pub mod read;
 pub mod truncate;
 pub mod write;

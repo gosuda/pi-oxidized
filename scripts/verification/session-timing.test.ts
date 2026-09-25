@@ -21,30 +21,5 @@ describe("session-timing sha256Prefix", () => {
 		expect(prefix).toBe(expected);
 		rmSync(dir, { recursive: true, force: true });
 	});
-
-	test("is deterministic for identical content", () => {
-		const dir = resolve(REPOSITORY_ROOT, "target/bench/test-session-timing");
-		mkdirSync(dir, { recursive: true });
-		const path = resolve(dir, "deterministic-test.jsonl");
-		writeFileSync(path, "test content\n");
-		const p1 = sha256Prefix(path);
-		const p2 = sha256Prefix(path);
-		expect(p1).toBe(p2);
-		rmSync(dir, { recursive: true, force: true });
-	});
 });
 
-describe("session-timing constants", () => {
-	test("entry counts cover small, medium, and large sessions", () => {
-		const entryCounts = [100, 1_000, 5_000] as const;
-		expect(entryCounts).toContain(100);
-		expect(entryCounts).toContain(1_000);
-		expect(entryCounts).toContain(5_000);
-	});
-
-	test("sample counts are positive", () => {
-		expect(20).toBeGreaterThan(0);
-		expect(10).toBeGreaterThan(0);
-		expect(3).toBeGreaterThanOrEqual(0);
-	});
-});

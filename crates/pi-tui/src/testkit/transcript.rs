@@ -29,7 +29,10 @@ pub enum Scenario {
     FixtureStreamSettle,
     /// Exercises ordered resize behavior against the deterministic fixture.
     FixtureResizeLadder,
-    /// Exercises resize coalescing against the deterministic fixture.
+    /// Exercises the explicit completed-batch resize boundary against the
+    /// deterministic fixture (`--resize-batch`): a real ioctl storm, a Ctrl+D
+    /// producer fence, and a genuine resize notification. The resulting frame
+    /// is reanchored once from the final kernel geometry.
     FixtureResizeStorm,
     /// Exercises paste and cursor reporting against the deterministic fixture.
     FixturePasteCursor,
@@ -65,7 +68,9 @@ pub enum Scenario {
     Overlays,
     /// Captures product behavior across ordered resizes.
     ProductResizeLadder,
-    /// Captures product behavior while resizes are coalesced.
+    /// Captures product behavior across already-queued synthetic resize
+    /// storms (drains immediately available events; not a
+    /// scheduler-separated-wave proof).
     ProductResizeStorm,
     /// Exercises the Unicode/width gauntlet (TUI-V3): the 13-probe corpus
     /// across rails, assistant markdown tables, editor cursor, overlay

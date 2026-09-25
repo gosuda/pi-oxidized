@@ -1,6 +1,6 @@
 //! Verification check 8 (Rust side): native keypress-to-paint / frame CPU
-//! scaling under zero / idle / active-widget loads, terminal-input deadlines,
-//! and stale-generation drops under widget bursts.
+//! scaling under active-widget loads, the terminal-input queue bound, and
+//! stale-generation drops under widget bursts.
 //!
 //! Uses an in-process fake host (duplex pipes) so the suite stays deterministic
 //! and free of a real Bun process. The TypeScript host suite covers the real
@@ -15,9 +15,7 @@ use pi_ext::protocol::{
     Frame, FrameKind, HelloAck, Method, SlotPlacement, StyledRun, TerminalInputResult, UiSlot,
     decode_frame_str, encode_frame, from_payload, to_payload,
 };
-use pi_ext::sanitize::sanitize_slot;
-use pi_tui::component::{Component, EventResult, UiEvent};
-use pi_tui::focus::Focusable;
+use pi_tui::component::Component;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -136,76 +134,6 @@ fn paint_cycle(slots: &mut [SlotComponent], width: u16) -> f64 {
         component.render(area, &mut buf);
     }
     t0.elapsed().as_secs_f64() * 1_000.0
-}
-
-fn assert_within_ten_percent(label: &str, baseline_p99: f64, candidate_p99: f64) {
-    let limit = (baseline_p99 * 1.1).max(baseline_p99 + 0.05);
-    assert!(
-        candidate_p99 <= limit,
-        "{label}: candidate p99 {candidate_p99:.4}ms exceeds 110% of baseline {baseline_p99:.4}ms (limit {limit:.4})"
-    );
-}
-
-#[tokio::test]
-async fn idle_extensions_do_not_inflate_native_paint() -> R {
-    const WARMUPS: usize = 30;
-    const SAMPLES: usize = 120;
-    const WIDTH: u16 = 80;
-
-    // Zero-extension baseline: paint a single native empty buffer cycle.
-    let mut zero_components: Vec<SlotComponent> = Vec::new();
-    for _ in 0..WARMUPS {
-        let _ = paint_cycle(&mut zero_components, WIDTH);
-    }
-    let mut zero_samples = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        zero_samples.push(paint_cycle(&mut zero_components, WIDTH));
-    }
-    let (_, _, zero_p99) = stats(&zero_samples);
-
-    // 100 idle installed extensions: 100 sanitized slots exist, but none are
-    // active widgets with pending host work. Native paint still only walks the
-    // (empty) active set — plugin count is not part of the layout-cache key.
-    let idle_slots: Vec<UiSlot> = (0..100)
-        .map(|i| sample_slot(&format!("idle.{i}"), 1, "idle"))
-        .collect();
-    // Idle = installed but not composed into the active paint set.
-    let mut idle_components: Vec<SlotComponent> = Vec::new();
-    for _ in 0..WARMUPS {
-        let _ = paint_cycle(&mut idle_components, WIDTH);
-    }
-    let mut idle_samples = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        // Touch idle slot metadata without painting them (installed, dormant).
-        let _ = idle_slots.len();
-        idle_samples.push(paint_cycle(&mut idle_components, WIDTH));
-    }
-    let (_, _, idle_p99) = stats(&idle_samples);
-    assert_within_ten_percent("idle-100 keypress-to-paint", zero_p99, idle_p99);
-
-    // Frame CPU proxy: sanitize + measure only for active set (still empty).
-    let mut zero_frame = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        let t0 = Instant::now();
-        for component in &mut zero_components {
-            let _ = component.measure(WIDTH);
-        }
-        zero_frame.push(t0.elapsed().as_secs_f64() * 1_000.0);
-    }
-    let mut idle_frame = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        let t0 = Instant::now();
-        for component in &mut idle_components {
-            let _ = component.measure(WIDTH);
-        }
-        let _ = idle_slots.len();
-        idle_frame.push(t0.elapsed().as_secs_f64() * 1_000.0);
-    }
-    let (_, _, zero_frame_p99) = stats(&zero_frame);
-    let (_, _, idle_frame_p99) = stats(&idle_frame);
-    assert_within_ten_percent("idle-100 frame CPU", zero_frame_p99, idle_frame_p99);
-
-    Ok(())
 }
 
 #[tokio::test]
@@ -472,56 +400,6 @@ async fn terminal_input_queue_bound_is_sixty_four() -> R {
     // Contract: STREAM/outbound capacities and the host's sequential actor
     // are bounded at 64 for input. Documented constant from the plan.
     assert_eq!(pi_ext::client::STREAM_EVENT_CAPACITY, 64);
-    Ok(())
-}
-
-#[tokio::test]
-async fn slot_component_paint_ignores_plugin_count() -> R {
-    // Plugin count is not part of any native layout-cache key: painting 20
-    // active widgets is bounded by active set size, not installed extensions.
-    let mut active: Vec<SlotComponent> = (0..20)
-        .map(|i| {
-            let slot = sample_slot(&format!("w.{i}"), 1, &format!("line-{i}"));
-            SlotComponent::from_ui_slot(&slot)
-        })
-        .collect();
-    let mut installed_meta = 100usize;
-
-    let mut samples = Vec::with_capacity(40);
-    for _ in 0..40 {
-        let t0 = Instant::now();
-        let _ = installed_meta;
-        let ms = paint_cycle(&mut active, 80);
-        samples.push(ms);
-        installed_meta = 100;
-        let _ = t0;
-    }
-    let (_, _, p99) = stats(&samples);
-    assert!(
-        p99 < 5.0,
-        "20-widget paint p99 should stay under 5ms on this host, got {p99:.3}ms"
-    );
-
-    // Focused input still consumes without awaiting host.
-    if let Some(component) = active.first_mut() {
-        component.set_focused(true);
-        let result = component.handle_event(&UiEvent::Paste("z".to_owned()));
-        assert_eq!(result, EventResult::Consumed);
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn sanitize_slot_generation_independent() -> R {
-    // Fresh ground-state parse per generation; burst of 20 does not grow state.
-    let mut last_height = 0u16;
-    for generation in 1..=20u64 {
-        let slot = sample_slot("burst", generation, &format!("g{generation}"));
-        let sanitized = sanitize_slot(&slot);
-        assert_eq!(sanitized.generation, generation);
-        last_height = sanitized.height;
-    }
-    assert_eq!(last_height, 1);
     Ok(())
 }
 

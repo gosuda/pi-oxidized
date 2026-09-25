@@ -5,11 +5,14 @@
  * criteria and verifies the combined DOC-A checker + DOC-B generator program
  * catches each with a distinct, named failing mutation:
  *
+ * The constant-fork-ts-rust class (TS/Rust constant fork accepted by a
+ * single-source read) is covered by the fork-detection tests in
+ * generate-compat-docs.test.ts, which owns the cross-assert family.
+ *
  *   1. stale-sidecar-reuse         — sidecar reused after source code change
- *   2. constant-fork-ts-rust       — TS/Rust constant fork accepted by single-source read
- *   3. out-of-band-deps-doc-edit   — generated-doc-only dep commit touching non-DOC-B blocks
- *   4. disguised-example-product-import — fixture accreting example-product behavior
- *   5. evidence-free-unreleased    — Unreleased entry without commit evidence
+ *   2. out-of-band-deps-doc-edit   — generated-doc-only dep commit touching non-DOC-B blocks
+ *   3. disguised-example-product-import — fixture accreting example-product behavior
+ *   4. evidence-free-unreleased    — Unreleased entry without commit evidence
  *
  * Each mutation is asserted individually: the checker must fail with a
  * problem string that names the drift class.
@@ -20,7 +23,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { CANONICAL_REFERENCE_SHA } from "../reference-identity.ts";
+import { EXTENSION_COMPAT_REFERENCE_SHA } from "../reference-identity.ts";
 import {
 	TOOL_VERSION,
 	checkUnreleasedEntriesHaveEvidence,
@@ -32,10 +35,6 @@ import {
 	type LedgerRow,
 	type Sidecar,
 } from "../verification/docs-evidence-runners.ts";
-import {
-	extractTsConst,
-	extractRustConst,
-} from "../verification/generate-compat-docs.ts";
 import {
 	REPO_ROOT,
 	runCheck,
@@ -58,7 +57,7 @@ function scratchCheck(
 	const scDir = sidecarDir ?? join(dir, "sidecars");
 	mkdirSync(scDir, { recursive: true });
 	const result = runCheck(
-		{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows },
+		{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows },
 		{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: rows.map((r) => r.surface) }] },
 		REPO_ROOT,
 		scDir,
@@ -102,7 +101,7 @@ describe("DOC-G2: stale-sidecar-reuse after code change", () => {
 		});
 
 		const result = runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			REPO_ROOT,
 			scDir,
@@ -118,89 +117,6 @@ describe("DOC-G2: stale-sidecar-reuse after code change", () => {
 // ---------------------------------------------------------------------------
 // 2. Constant-fork TS/Rust accepted by single-source read
 // ---------------------------------------------------------------------------
-
-describe("DOC-G2: constant-fork-ts-rust", () => {
-	test("PROTOCOL_VERSION fork between TS and Rust is detectable by cross-assert", () => {
-		const tsContent = readFileSync(
-			join(REPO_ROOT, "packages/pi-tui-protocol/src/types.ts"),
-			"utf8",
-		);
-		const rustContent = readFileSync(
-			join(REPO_ROOT, "crates/pi-ext/src/protocol.rs"),
-			"utf8",
-		);
-
-		const tsVal = extractTsConst(tsContent, "PROTOCOL_VERSION");
-		const rustVal = extractRustConst(rustContent, "PROTOCOL_VERSION");
-
-		// On the real tree they agree
-		expect(tsVal).toBe(rustVal);
-
-		// Inject a fork: modify the Rust source to disagree
-		const forkedRust = rustContent.replace(
-			/pub\s+const\s+PROTOCOL_VERSION\s*(?::\s*[^=]+)?\s*=\s*["']?([A-Za-z0-9_.+-]+)["']?\s*;/,
-			'pub const PROTOCOL_VERSION: u32 = 999;',
-		);
-		const forkedRustVal = extractRustConst(forkedRust, "PROTOCOL_VERSION");
-
-		// The fork is detectable: values disagree
-		expect(forkedRustVal).not.toBe(tsVal);
-		expect(forkedRustVal).toBe("999");
-
-		// The cross-assert in collectPins would throw on this fork:
-		// if (tsProtocolVersion !== rustProtocolVersion) throw ...
-		// This is the named failing mutation — the DOC-B generator catches it.
-		expect(() => {
-			if (tsVal !== forkedRustVal) {
-				throw new Error(
-					`PROTOCOL_VERSION mismatch: TS=${tsVal}, Rust=${forkedRustVal}`,
-				);
-			}
-		}).toThrow("PROTOCOL_VERSION mismatch");
-	});
-
-	test("COMPATIBILITY_VERSION fork between TS, Rust, and extension-host is detectable", () => {
-		const tsContent = readFileSync(
-			join(REPO_ROOT, "packages/pi-tui-protocol/src/types.ts"),
-			"utf8",
-		);
-		const rustContent = readFileSync(
-			join(REPO_ROOT, "crates/pi-ext/src/protocol.rs"),
-			"utf8",
-		);
-		const extHostContent = readFileSync(
-			join(REPO_ROOT, "packages/extension-host/src/version.ts"),
-			"utf8",
-		);
-
-		const tsVal = extractTsConst(tsContent, "COMPATIBILITY_VERSION");
-		const rustVal = extractRustConst(rustContent, "COMPATIBILITY_VERSION");
-		const extHostVal = extractTsConst(extHostContent, "COMPATIBILITY_VERSION");
-
-		// All three agree on the real tree
-		expect(tsVal).toBe(rustVal);
-		expect(tsVal).toBe(extHostVal);
-
-		// Inject a fork in the extension-host source
-		const forkedExtHost = extHostContent.replace(
-			/(?:export\s+)?(?:const|let|var)\s+COMPATIBILITY_VERSION\s*=\s*["']?([A-Za-z0-9_.+-]+)["']?/,
-			'export const COMPATIBILITY_VERSION = "99.99.99"',
-		);
-		const forkedExtHostVal = extractTsConst(forkedExtHost, "COMPATIBILITY_VERSION");
-
-		expect(forkedExtHostVal).not.toBe(tsVal);
-		expect(forkedExtHostVal).toBe("99.99.99");
-
-		// The triple-owner cross-assert would throw
-		expect(() => {
-			if (tsVal !== forkedExtHostVal) {
-				throw new Error(
-					`COMPATIBILITY_VERSION mismatch: TS protocol=${tsVal}, extension-host=${forkedExtHostVal}`,
-				);
-			}
-		}).toThrow("COMPATIBILITY_VERSION mismatch");
-	});
-});
 
 // ---------------------------------------------------------------------------
 // 3. Out-of-band deps doc edit (non-DOC-B-owned block touched)
@@ -234,7 +150,7 @@ describe("DOC-G2: out-of-band-deps-doc-edit", () => {
 
 		// Second run: should detect contentHash mismatch
 		const result = runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			dir,
 			scDir,
@@ -317,7 +233,7 @@ describe("DOC-G2: disguised-example-product-import", () => {
 		};
 
 		const result = runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			dir,
 			scDir,
@@ -441,7 +357,7 @@ describe("DOC-G2: evidence-free-unreleased-entry", () => {
 		};
 
 		const result = runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			dir,
 			scDir,

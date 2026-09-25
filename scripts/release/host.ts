@@ -151,15 +151,16 @@ export async function buildHost(options: BuildHostOptions): Promise<HostArtifact
 	await installHostDeps(hostDir, runner);
 	await typecheckHost(hostDir, runner);
 
-	const compiled = await tryCompiledPath(options, hostDir, outDir, runner);
+	const failures: string[] = [];
+	const compiled = await tryCompiledPath(options, hostDir, outDir, runner, failures);
 	if (compiled !== undefined) return compiled;
 
-	const bundled = await tryRuntimeBundlePath(options, hostDir, outDir, runner);
+	const bundled = await tryRuntimeBundlePath(options, hostDir, outDir, runner, failures);
 	if (bundled !== undefined) return bundled;
 
 	throw new HostBuildError(
 		options.plan.rustTarget,
-		"compiled sidecar and runtime-bundle fallback both failed",
+		`compiled sidecar and runtime-bundle fallback both failed (${failures.join("; ") || "no detail captured"})`,
 	);
 }
 
@@ -231,7 +232,7 @@ async function typecheckHost(hostDir: string, runner: CommandRunner): Promise<vo
 	if (res.exitCode !== 0) {
 		throw new HostBuildError(
 			hostDir,
-			`host typecheck failed (exit ${res.exitCode}). stderr=${res.stderr.slice(0, 1000)}`,
+			`host typecheck failed (exit ${res.exitCode}). stdout=${res.stdout.slice(0, 1000)} stderr=${res.stderr.slice(0, 1000)}`,
 		);
 	}
 }
@@ -260,12 +261,18 @@ async function tryCompiledPath(
 	hostDir: string,
 	outDir: string,
 	runner: CommandRunner,
+	failures: string[],
 ): Promise<HostArtifact | undefined> {
 	const sidecarPath = join(outDir, options.plan.hostBinaryName);
 	if (existsSync(sidecarPath)) await rm(sidecarPath, { force: true });
 
 	const compileRes = await compileSidecar(hostDir, sidecarPath, options.plan, runner);
-	if (compileRes.exitCode !== 0 || !existsSync(sidecarPath)) return undefined;
+	if (compileRes.exitCode !== 0 || !existsSync(sidecarPath)) {
+		failures.push(
+			`bun --compile exited ${compileRes.exitCode}${existsSync(sidecarPath) ? "" : " and produced no binary"}: ${compileRes.stderr.slice(-1000) || compileRes.stdout.slice(-1000)}`,
+		);
+		return undefined;
+	}
 
 	if (!options.skipRuntimeImport) {
 		const error = await probeRuntimeImport(hostDir, sidecarPath, runner);
@@ -409,6 +416,7 @@ async function tryRuntimeBundlePath(
 	hostDir: string,
 	outDir: string,
 	runner: CommandRunner,
+	failures: string[],
 ): Promise<HostArtifact | undefined> {
 	const scriptPath = join(outDir, options.plan.hostBundleName);
 	if (existsSync(scriptPath)) await rm(scriptPath, { force: true });
@@ -418,7 +426,12 @@ async function tryRuntimeBundlePath(
 		rejectOnError: false,
 		timeoutMs: HOST_BUILD_TIMEOUT_MS,
 	});
-	if (res.exitCode !== 0 || !existsSync(scriptPath)) return undefined;
+	if (res.exitCode !== 0 || !existsSync(scriptPath)) {
+		failures.push(
+			`bun build (bundle) exited ${res.exitCode}${existsSync(scriptPath) ? "" : " and produced no bundle"}: ${res.stderr.slice(-1000) || res.stdout.slice(-1000)}`,
+		);
+		return undefined;
+	}
 	const runtimePath = join(outDir, options.plan.bunRuntimeName);
 	// Caller is responsible for populating `runtimePath` (from the official
 	// Bun release for this target) before archiving. We just record the path.

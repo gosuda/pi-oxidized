@@ -421,13 +421,8 @@ describe("DOC-E: release CHANGELOG gate (dry-run and full-build modes)", () => {
 	const noUnreleasedChangelog = "# Changelog\n\n## [0.1.0]\n\n- Shipped.\n";
 
 	test("gate fails when CHANGELOG.md is missing (dry-run mode)", async () => {
-		const fs = memoryFs({});
-		expect(await changelogGateFailure(fs, "/workspace")).toContain("missing");
-	});
-
-	test("gate fails when CHANGELOG.md is missing (full-build mode)", async () => {
-		// The gate runs before any build work, so the mode is irrelevant —
-		// changelogGateFailure is the same function called in both paths.
+		// changelogGateFailure has no mode parameter — the single gate serves
+		// both dry-run and full-build paths, so one missing-file test covers both.
 		const fs = memoryFs({});
 		expect(await changelogGateFailure(fs, "/workspace")).toContain("missing");
 	});

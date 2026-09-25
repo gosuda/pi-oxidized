@@ -27,24 +27,36 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertCanonicalReference, canonicalReferenceRoot } from "./reference-identity.ts";
+import { assertExtensionCompatReference, assertNativeReference, extensionCompatReferenceRoot, nativeReferenceRoot } from "./reference-identity.ts";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_CATALOG_PATH = join(REPO_ROOT, "crates/pi-ai/data/builtin-models.json");
 const DEFAULT_PROVIDERS_DIR = join(
-	canonicalReferenceRoot(REPO_ROOT),
+	nativeReferenceRoot(REPO_ROOT),
 	"packages/ai/src/providers",
 );
 const DEFAULT_DATA_DIR = join(DEFAULT_PROVIDERS_DIR, "data");
+const COMPAT_PROVIDERS_DIR = join(
+	extensionCompatReferenceRoot(REPO_ROOT),
+	"packages/ai/src/providers",
+);
+const COMPAT_DATA_DIR = join(COMPAT_PROVIDERS_DIR, "data");
 const DATA_DIRECTORY_LOCK_RETRY_MS = 10;
 const DEFAULT_LOCK_ACQUIRE_TIMEOUT_MS = 10_000;
 const LOCK_INITIALIZING_GRACE_MS = 30_000;
 const LOCK_OWNER_FILE = "owner.json";
 const DATA_MANIFEST_FILE = ".manifest.json";
 const MANIFEST_SCHEMA_VERSION = 3;
-// UTC time of the newest provider snapshot commit in the canonical reference
-// checkout pinned by scripts/reference-identity.ts (commit e8c632ef6).
-const PINNED_PROVIDER_DATA_GENERATED_AT = "2026-08-25T09:03:13.000Z";
+// UTC time of the newest provider snapshot commit inside the canonical
+// reference checkout pinned by scripts/reference-identity.ts (checkout SHA
+// 95fbc04997eaee961eb673fa7923e9220609ebd5; newest provider-data commit
+// f5c94648).
+const PINNED_PROVIDER_DATA_GENERATED_AT = "2026-09-20T20:59:16.000Z";
+// UTC time of the newest provider snapshot commit inside the extension-compat
+// checkout pinned by scripts/reference-identity.ts (checkout SHA
+// 853a80d26c90a14c1886f0ebb8ffaae133ca2185; newest provider-data commit
+// e8c632ef).
+const COMPAT_PINNED_PROVIDER_DATA_GENERATED_AT = "2026-08-25T09:03:13.000Z";
 const LOCK_OWNER_VERSION = 2;
 /**
  * Heartbeat freshness contract: while an owner holds the lock it atomically
@@ -191,6 +203,37 @@ function groupProviderModels(
 
 function encodeProviderModels(provider: string, models: Record<string, unknown>): string {
 	return `${JSON.stringify(sortDeep(groupProviderModels(provider, models)), null, "\t")}\n`;
+}
+
+/**
+ * Compat-tree API grouping normalization. The catalog tracks the native pin,
+ * which routes openrouter anthropic/* non-batch models through
+ * anthropic-messages; the extension-compat pin predates that split and its
+ * openrouter wrapper declares a single openai-completions api, so the compat
+ * emission flattens those models back to the completions group and base URL.
+ */
+function normalizeCompatApiGrouping(
+	provider: string,
+	models: Record<string, unknown>,
+): Record<string, unknown> {
+	if (provider !== "openrouter") return models;
+	const normalized = Object.create(null) as Record<string, unknown>;
+	for (const [modelId, value] of Object.entries(models)) {
+		if (value === null || typeof value !== "object" || Array.isArray(value)) {
+			throw new Error(`catalog model "${provider}/${modelId}" must be an object`);
+		}
+		const model = value as Record<string, unknown>;
+		if (model["api"] === "anthropic-messages") {
+			normalized[modelId] = {
+				...model,
+				api: "openai-completions",
+				baseUrl: "https://openrouter.ai/api/v1",
+			};
+		} else {
+			normalized[modelId] = model;
+		}
+	}
+	return normalized;
 }
 
 function rebuildProviderManifest(
@@ -732,6 +775,25 @@ function assertBidirectionalProviderSets(
 	);
 }
 
+/**
+ * Compat-tree variant: the catalog is a superset of the extension-compat
+ * provider set (the native pin added providers after the compat pin), so
+ * every wrapper must have catalog coverage while extra catalog providers are
+ * expected and skipped.
+ */
+function assertCatalogCoversWrappers(
+	wrappers: string[],
+	catalogProviders: string[],
+): void {
+	const catalogSet = new Set(catalogProviders);
+	const missing = wrappers.filter((id) => !catalogSet.has(id));
+	if (missing.length > 0) {
+		throw new Error(
+			`catalog does not cover compat wrappers (missing: ${missing.join(", ")})`,
+		);
+	}
+}
+
 async function validateStagingDirectory(
 	stagingDir: string,
 	expectedProviders: string[],
@@ -792,6 +854,15 @@ function usesRepositoryDefaultPaths(ctx: ReconstructProofContext): boolean {
 		resolve(ctx.catalogPath) === resolve(DEFAULT_CATALOG_PATH) &&
 		resolve(ctx.providersDir) === resolve(DEFAULT_PROVIDERS_DIR) &&
 		resolve(ctx.dataDir) === resolve(DEFAULT_DATA_DIR)
+	);
+}
+
+function usesCompatReferencePaths(ctx: ReconstructProofContext): boolean {
+	return (
+		resolve(ctx.repoRoot) === resolve(REPO_ROOT) &&
+		resolve(ctx.catalogPath) === resolve(DEFAULT_CATALOG_PATH) &&
+		resolve(ctx.providersDir) === resolve(COMPAT_PROVIDERS_DIR) &&
+		resolve(ctx.dataDir) === resolve(COMPAT_DATA_DIR)
 	);
 }
 
@@ -901,6 +972,28 @@ export async function defaultInversionProof(ctx: ReconstructProofContext): Promi
 }
 
 /**
+ * Compat-tree inversion proof: run the pinned extension-compat checkout's own
+ * generated-model-data validator (the same check its `check:model-data` npm
+ * script runs in CI) against the reconstructed data directory.
+ */
+export async function compatInversionProof(ctx: ReconstructProofContext): Promise<void> {
+	ctx.signal?.throwIfAborted();
+	const validatorUrl = new URL(
+		`file://${join(extensionCompatReferenceRoot(ctx.repoRoot), "packages/ai/scripts/model-data.ts")}`,
+	);
+	// Dynamic import is required: the specifier lives in the gitignored
+	// extension-compat checkout, which is absent for most consumers of this
+	// module — a static import would fail at load time for all of them.
+	const { validateGeneratedModelData } = (await import(validatorUrl.href)) as {
+		validateGeneratedModelData: (packageRoot: string) => void;
+	};
+	// The import can outlive an abort that fired while it was in flight; the
+	// validator must not run on an already-cancelled proof.
+	ctx.signal?.throwIfAborted();
+	validateGeneratedModelData(join(extensionCompatReferenceRoot(ctx.repoRoot), "packages/ai"));
+}
+
+/**
  * Reconstruct provider data JSONs transactionally.
  *
  * Never writes directly into the live data directory: candidates are staged,
@@ -921,10 +1014,15 @@ export async function reconstructProviderData(
 	const catalogPath = options.catalogPath ?? DEFAULT_CATALOG_PATH;
 	const providersDir = options.providersDir ?? DEFAULT_PROVIDERS_DIR;
 	const dataDir = options.dataDir ?? DEFAULT_DATA_DIR;
+	const compatTarget =
+		resolve(providersDir) === resolve(COMPAT_PROVIDERS_DIR) &&
+		resolve(dataDir) === resolve(COMPAT_DATA_DIR);
 	if (providersDir === DEFAULT_PROVIDERS_DIR) {
 		// Gate every read of the live reference providers tree on the exact
 		// canonical pin; custom fixture paths are already excluded above.
-		assertCanonicalReference();
+		assertNativeReference();
+	} else if (compatTarget) {
+		assertExtensionCompatReference();
 	}
 	const proofCtx: ReconstructProofContext = {
 		repoRoot,
@@ -935,12 +1033,15 @@ export async function reconstructProviderData(
 	};
 	let inversionProof = options.inversionProof;
 	if (inversionProof === undefined) {
-		if (!usesRepositoryDefaultPaths(proofCtx)) {
+		if (usesRepositoryDefaultPaths(proofCtx)) {
+			inversionProof = defaultInversionProof;
+		} else if (usesCompatReferencePaths(proofCtx)) {
+			inversionProof = compatInversionProof;
+		} else {
 			throw new Error(
 				"default inversion proof only covers repository default paths (catalog/providers/data under this checkout); pass an explicit inversionProof when reconstructing with custom paths",
 			);
 		}
-		inversionProof = defaultInversionProof;
 	}
 	const removeBackup = options.removeBackup ?? removeIfExists;
 	const publishStaging = options.publishStaging ?? rename;
@@ -960,11 +1061,24 @@ export async function reconstructProviderData(
 
 	const wrappers = await listWrapperProviders(providersDir);
 	const catalogProviders = Object.keys(catalog).sort();
-	assertBidirectionalProviderSets(wrappers, catalogProviders);
-
+	if (compatTarget) {
+		// The catalog tracks the native pin, which added providers after the
+		// compat pin; compat emits only the providers its wrappers declare.
+		assertCatalogCoversWrappers(wrappers, catalogProviders);
+	} else {
+		assertBidirectionalProviderSets(wrappers, catalogProviders);
+	}
+	const emitCatalog: ProviderCatalog = compatTarget
+		? Object.fromEntries(
+				wrappers.map((id) => [
+					id,
+					normalizeCompatApiGrouping(id, catalog[id] as Record<string, unknown>),
+				]),
+			)
+		: catalog;
 	const expectedBodies = new Map<string, string>();
 	for (const provider of wrappers) {
-		const models = catalog[provider];
+		const models = emitCatalog[provider];
 		if (models === undefined) {
 			throw new Error(`catalog has no models for wrapper provider: ${provider}`);
 		}
@@ -986,13 +1100,18 @@ export async function reconstructProviderData(
 			? await Bun.file(manifestPath).bytes()
 			: null;
 		const initialManifestGeneratedAt = options.initialManifestGeneratedAt
-			?? (usesRepositoryDefaultPaths(proofCtx) ? PINNED_PROVIDER_DATA_GENERATED_AT : undefined);
+			?? (usesRepositoryDefaultPaths(proofCtx) ? PINNED_PROVIDER_DATA_GENERATED_AT : undefined)
+			?? (usesCompatReferencePaths(proofCtx) ? COMPAT_PINNED_PROVIDER_DATA_GENERATED_AT : undefined);
 		const manifestBody = rebuildProviderManifest(
-			catalog,
+			emitCatalog,
 			expectedBodies,
 			previousManifest,
 			initialManifestGeneratedAt,
-			usesRepositoryDefaultPaths(proofCtx) ? PINNED_PROVIDER_DATA_GENERATED_AT : undefined,
+			usesRepositoryDefaultPaths(proofCtx)
+				? PINNED_PROVIDER_DATA_GENERATED_AT
+				: usesCompatReferencePaths(proofCtx)
+					? COMPAT_PINNED_PROVIDER_DATA_GENERATED_AT
+					: undefined,
 		);
 		const stagingDir = uniqueSibling(dataDir, "staging");
 		let backupDir: string | null = null;
@@ -1013,7 +1132,7 @@ export async function reconstructProviderData(
 				await writeFile(join(stagingDir, DATA_MANIFEST_FILE), manifestBody);
 			}
 
-			await validateStagingDirectory(stagingDir, wrappers, catalog, manifestBody);
+			await validateStagingDirectory(stagingDir, wrappers, emitCatalog, manifestBody);
 
 			if (hadLive) {
 				const candidate = uniqueSibling(dataDir, "backup");
@@ -1093,7 +1212,11 @@ export async function reconstructProviderData(
 
 		console.warn(`reconstructed ${wrappers.length} provider data files from the catalog`);
 		if (options.inversionProof === undefined) {
-			console.warn("inversion proof passed: catalog round-trips exactly");
+			console.warn(
+				compatTarget
+					? "inversion proof passed: compat model data validates"
+					: "inversion proof passed: catalog round-trips exactly",
+			);
 		}
 
 		result = {
@@ -1129,9 +1252,14 @@ export async function reconstructProviderData(
 	}
 	return result;
 }
-
 async function main(): Promise<void> {
 	await reconstructProviderData();
+	// The extension-compat checkout builds its own dist from the same catalog
+	// witness; its provider set is a subset of the native pin's.
+	await reconstructProviderData({
+		providersDir: COMPAT_PROVIDERS_DIR,
+		dataDir: COMPAT_DATA_DIR,
+	});
 }
 
 if (import.meta.main) {

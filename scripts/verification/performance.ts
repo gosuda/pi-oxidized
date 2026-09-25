@@ -13,9 +13,9 @@ import { arch, platform, release } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { PTY_KEYS, type PtyProcess, type PtySnapshot, spawnPty } from "./pty.ts";
 import {
-	CANONICAL_REFERENCE_ROOT,
-	assertCanonicalReference,
-	canonicalReferenceRoot,
+	EXTENSION_COMPAT_REFERENCE_ROOT,
+	assertExtensionCompatReference,
+	extensionCompatReferenceRoot,
 } from "../reference-identity.ts";
 import {
 	NOISE_EXIT_CODE,
@@ -31,7 +31,7 @@ const REPOSITORY_ROOT = resolve(import.meta.dirname, "../..");
 const ARTIFACT_PATH = resolve(REPOSITORY_ROOT, "target/bench/performance-comparison.json");
 const RUST_BINARY = resolve(REPOSITORY_ROOT, "target/release/pi");
 const TYPESCRIPT_BINARY = resolve(
-	canonicalReferenceRoot(REPOSITORY_ROOT),
+	extensionCompatReferenceRoot(REPOSITORY_ROOT),
 	"packages/coding-agent/dist/pi",
 );
 const HOST_BUILD_ROOT = resolve(REPOSITORY_ROOT, "target/bench/performance-extension-host");
@@ -59,12 +59,12 @@ const RUST_SOURCE_ROOTS = [
 	"scripts/release",
 ] as const;
 const TYPESCRIPT_SOURCE_ROOTS = [
-	join(CANONICAL_REFERENCE_ROOT, "package.json"),
-	join(CANONICAL_REFERENCE_ROOT, "package-lock.json"),
-	join(CANONICAL_REFERENCE_ROOT, "packages/ai"),
-	join(CANONICAL_REFERENCE_ROOT, "packages/agent"),
-	join(CANONICAL_REFERENCE_ROOT, "packages/tui"),
-	join(CANONICAL_REFERENCE_ROOT, "packages/coding-agent"),
+	join(EXTENSION_COMPAT_REFERENCE_ROOT, "package.json"),
+	join(EXTENSION_COMPAT_REFERENCE_ROOT, "package-lock.json"),
+	join(EXTENSION_COMPAT_REFERENCE_ROOT, "packages/ai"),
+	join(EXTENSION_COMPAT_REFERENCE_ROOT, "packages/agent"),
+	join(EXTENSION_COMPAT_REFERENCE_ROOT, "packages/tui"),
+	join(EXTENSION_COMPAT_REFERENCE_ROOT, "packages/coding-agent"),
 ] as const;
 const SOURCE_IGNORED_DIRECTORIES: Record<string, true> = {
 	".git": true,
@@ -702,7 +702,13 @@ export function observeProcessTreeMemory(
 			throw new HarnessFailure(label, `live process pid ${pid} omitted startTime`);
 		}
 
-		const assembled = assembleProcessMemoryReading({
+		// A process observed mid-execve keeps its identity but publishes an
+		// empty smaps_rollup while the kernel rebuilds the address space. That
+		// window is microseconds; re-read a few times before treating an
+		// incomplete parse as an instrumentation failure. Identity churn and
+		// vanish are still settled on the first attempt, so retries only ever
+		// resolve the exec-transient case.
+		let assembled = assembleProcessMemoryReading({
 			pid,
 			initialStartTime,
 			root: isRoot,
@@ -710,6 +716,21 @@ export function observeProcessTreeMemory(
 			status: read(`/proc/${pid}/status`),
 			reconfirm: read(`/proc/${pid}/stat`),
 		});
+		for (
+			let attempt = 0;
+			attempt < 3 && assembled.kind === "incomplete" && assembled.reason === "parse";
+			attempt += 1
+		) {
+			Bun.sleepSync(1);
+			assembled = assembleProcessMemoryReading({
+				pid,
+				initialStartTime,
+				root: isRoot,
+				smaps: read(`/proc/${pid}/smaps_rollup`),
+				status: read(`/proc/${pid}/status`),
+				reconfirm: read(`/proc/${pid}/stat`),
+			});
+		}
 		if (assembled.kind === "discard-identity-race") {
 			// Reused/discarded identity must not contribute descendants.
 			continue;
@@ -2162,13 +2183,61 @@ async function buildProducts(): Promise<void> {
 	});
 	await runCheckedCommand({
 		label: "TypeScript pi locked dependency install",
-		cwd: canonicalReferenceRoot(REPOSITORY_ROOT),
+		cwd: extensionCompatReferenceRoot(REPOSITORY_ROOT),
 		argv: [npm, "ci", "--ignore-scripts"],
 	});
+	// Provider JSON under .references/*/packages/ai/src/providers/data is
+	// gitignored upstream; the reconstruct step restores it deterministically
+	// from the committed catalog so every package build below stays offline.
 	await runCheckedCommand({
-		label: "TypeScript pi official package binary build",
+		label: "Reference provider data reconstruction",
 		cwd: REPOSITORY_ROOT,
-		argv: [npm, "--prefix", join(CANONICAL_REFERENCE_ROOT, "packages/coding-agent"), "run", "build:binary"],
+		argv: [bun, "run", "scripts/reconstruct-provider-data.ts"],
+	});
+	// `npm run build:binary` runs `ai`'s `build` script, which calls
+	// generate-models --strict against the live models.dev catalog. Upstream
+	// has already dropped `kimi-for-coding`, so that path deleted the tracked
+	// kimi-coding.models.ts shard and broke tsgo. Mirror the chain with ai's
+	// `build:offline`, which compiles from the reconstructed data instead.
+	const referenceRoot = extensionCompatReferenceRoot(REPOSITORY_ROOT);
+	const packageBuilds: readonly [string, string][] = [
+		["tui", "build"],
+		["telemetry", "build"],
+		["ai", "build:offline"],
+		["agent", "build"],
+		["protocol", "build"],
+		["client", "build"],
+	];
+	for (const [pkg, script] of packageBuilds) {
+		await runCheckedCommand({
+			label: `TypeScript reference build ${pkg}`,
+			cwd: REPOSITORY_ROOT,
+			argv: [npm, "--prefix", join(referenceRoot, "packages", pkg), "run", script],
+		});
+	}
+	await runCheckedCommand({
+		label: "TypeScript pi coding-agent bundle build",
+		cwd: REPOSITORY_ROOT,
+		argv: [npm, "--prefix", join(referenceRoot, "packages/coding-agent"), "run", "build"],
+	});
+	await runCheckedCommand({
+		label: "TypeScript pi official package binary compile",
+		cwd: join(referenceRoot, "packages/coding-agent"),
+		argv: [
+			bun,
+			"build",
+			"--compile",
+			"--no-compile-autoload-bunfig",
+			"./src/bun/cli.ts",
+			"./src/utils/image-resize-worker.ts",
+			"--outfile",
+			"dist/pi",
+		],
+	});
+	await runCheckedCommand({
+		label: "TypeScript pi binary asset staging",
+		cwd: REPOSITORY_ROOT,
+		argv: [npm, "--prefix", join(referenceRoot, "packages/coding-agent"), "run", "copy-binary-assets"],
 	});
 	artifact.build.artifacts = {
 		rustPi: fileRecord(RUST_BINARY),
@@ -2180,7 +2249,7 @@ async function buildProducts(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-	assertCanonicalReference();
+	assertExtensionCompatReference();
 	artifact.machine = machineMetadata();
 	const ticksPerSecond = clockTicksPerSecond();
 	const python = requiredExecutable("python3");

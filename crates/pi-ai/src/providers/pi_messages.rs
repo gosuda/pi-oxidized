@@ -1,5 +1,7 @@
 //! Native pi-messages HTTP and SSE adapter.
 
+use crate::transcript::{TranscriptContext, normalize_context};
+
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -48,6 +50,7 @@ impl Provider for PiMessages {
     ) -> futures::stream::BoxStream<'static, Result<AssistantMessageEvent, ProviderError>> {
         let adapter = self.clone();
         let model = model.clone();
+        let context = normalize_context(context);
         let (sender, stream) = ProviderEventSender::channel(EVENT_CHANNEL_CAPACITY);
         tokio::spawn(async move {
             let mut converter = EventConverter::new(&model);
@@ -76,7 +79,7 @@ impl PiMessages {
     async fn run(
         &self,
         model: &Model,
-        context: Context,
+        context: TranscriptContext,
         options: &StreamOptions,
         sender: &ProviderEventSender,
         converter: &mut EventConverter,
@@ -304,7 +307,7 @@ fn debug_enabled(options: &StreamOptions) -> bool {
         .unwrap_or(false)
 }
 
-fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> Value {
+fn build_payload(model: &Model, context: &TranscriptContext, options: &StreamOptions) -> Value {
     let mut request_options = Map::new();
     if let Some(temperature) = options.temperature {
         request_options.insert("temperature".into(), Value::from(temperature));
@@ -329,7 +332,7 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
 
     serde_json::json!({
         "model": model.id,
-        "context": context,
+        "context": { "messages": &context.messages },
         "options": request_options,
     })
 }
@@ -836,6 +839,7 @@ impl EventConverter {
                     DoneReason::Stop => StopReason::Stop,
                     DoneReason::Length => StopReason::Length,
                     DoneReason::ToolUse => StopReason::ToolUse,
+                    DoneReason::Deferred => StopReason::Deferred,
                 };
                 self.partial.usage = usage;
                 self.partial.response_id = response_id;
@@ -1012,6 +1016,9 @@ mod tests {
             thinking_level_map: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 100_000,
             max_tokens: 4_096,
             headers: None,
@@ -1108,10 +1115,13 @@ mod tests {
     fn request_payload_passes_native_context_and_options_through() {
         let context = Context {
             system_prompt: Some("system".into()),
-            messages: vec![crate::types::Message::User(UserMessage::new(
-                UserMessageContent::Text("hello".into()),
-                7,
-            ))],
+            messages: vec![
+                crate::Message::User(UserMessage::new(
+                    UserMessageContent::Text("hello".into()),
+                    7,
+                )),
+                crate::Message::System(Box::new(crate::SystemMessage::new("later", 8))),
+            ],
             tools: None,
         };
         let mut options = StreamOptions {
@@ -1124,12 +1134,15 @@ mod tests {
         options.insert_extra(StreamOptionKey::TOOL_CHOICE, json!("required"));
 
         assert_eq!(
-            build_payload(&model(), &context, &options),
+            build_payload(&model(), &normalize_context(context), &options),
             json!({
                 "model": "radius-model",
                 "context": {
-                    "systemPrompt": "system",
-                    "messages": [{"role": "user", "content": "hello", "timestamp": 7}]
+                    "messages": [
+                        {"role": "system", "content": "system", "timestamp": 0},
+                        {"role": "user", "content": "hello", "timestamp": 7},
+                        {"role": "system", "content": "later", "timestamp": 8}
+                    ]
                 },
                 "options": {
                     "temperature": 0.25,
@@ -1179,6 +1192,32 @@ mod tests {
         assert_eq!(message.stop_reason, StopReason::ToolUse);
         assert_eq!(message.response_id.as_deref(), Some("response-1"));
         assert_eq!(message.diagnostics.as_ref().map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn done_event_with_deferred_reason_keeps_terminal_deferred()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut converter = EventConverter::new(&model());
+        let _start = converter.apply(serde_json::from_value(json!({"type": "start"}))?)?;
+        let _text_start = converter.apply(serde_json::from_value(json!({
+            "type": "text_start", "contentIndex": 0
+        }))?)?;
+        let _delta = converter.apply(serde_json::from_value(json!({
+            "type": "text_delta", "contentIndex": 0, "delta": "queued"
+        }))?)?;
+
+        let terminal = converter.apply(serde_json::from_value(json!({
+            "type": "done",
+            "reason": "deferred",
+            "usage": empty_usage_json(),
+            "responseId": "response-9"
+        }))?)?;
+        let ConvertedEvent::Done(DoneReason::Deferred, message) = terminal else {
+            return Err("expected deferred done".into());
+        };
+        assert_eq!(message.stop_reason, StopReason::Deferred);
+        assert_eq!(serde_json::to_value(&message.content[0])?["text"], "queued");
         Ok(())
     }
 

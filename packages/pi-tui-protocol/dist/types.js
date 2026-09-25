@@ -36,6 +36,8 @@ const METHOD_SET = new Set(METHODS);
 export function isMethod(raw) {
     return METHOD_SET.has(raw);
 }
+/** Open method string: correlated `session.previewBoundary` request (host → Rust). */
+export const SESSION_PREVIEW_BOUNDARY_METHOD = "session.previewBoundary";
 /** Local hello payload for this build. */
 export function localHello() {
     return {

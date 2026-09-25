@@ -134,9 +134,14 @@ impl AgentSession {
     }
 
     /// Process one agent event through extension → public → persistence.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one stage per agent event in a fixed pipeline; splitting would scatter the stage order"
+    )]
     async fn process_agent_event(self: &Arc<Self>, event: AgentEvent) {
         let is_agent_end = matches!(&event, AgentEvent::AgentEnd { .. });
         let is_turn_end = matches!(&event, AgentEvent::TurnEnd { .. });
+        let is_message_end = matches!(&event, AgentEvent::MessageEnd { .. });
         if matches!(&event, AgentEvent::AgentStart) {
             self.reset_persistence_epoch();
         }
@@ -204,7 +209,8 @@ impl AgentSession {
             event => {
                 let public = self.map_agent_event_for_public(event);
                 let runner = self.hooks.runner();
-                if runner.has_handlers(public.type_name())
+                if !is_turn_end
+                    && runner.has_handlers(public.type_name())
                     && let Err(error) = runner.emit(public.clone()).await
                 {
                     runner.emit_error(error.to_string());
@@ -224,7 +230,20 @@ impl AgentSession {
             self.agent.abort();
         }
 
+        if is_message_end {
+            let notify = {
+                let mut inner = self.lock_inner();
+                inner.processed_message_ends += 1;
+                Arc::clone(&inner.message_end_notify)
+            };
+            notify.notify_one();
+        }
+
         if is_turn_end {
+            if let Err(error) = self.flush_pending_custom_messages().await {
+                self.record_session_error(error);
+                self.agent.abort();
+            }
             self.publish_turn_end_marker();
         }
 
@@ -351,6 +370,9 @@ impl AgentSession {
     pub(super) fn mark_agent_run_active(&self) {
         let mut inner = self.lock_inner();
         inner.is_agent_run_active = true;
+        inner.run_message_baseline = inner.processed_message_ends;
+        inner.boundary_turn_index = 0;
+        inner.boundary_abort_requested = false;
     }
 
     /// Resolve waiters blocked in `wait_for_idle` when session is idle.
@@ -398,6 +420,9 @@ mod tests {
             base_url: String::new(),
             reasoning: false,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
             context_window: 8_192,
@@ -411,7 +436,7 @@ mod tests {
     fn assistant_message() -> pi_agent::AgentMessage {
         let mut assistant = pi_ai::AssistantMessage::new("test", "test", "model", 0);
         assistant.stop_reason = pi_ai::StopReason::Stop;
-        pi_agent::AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(assistant)))
+        pi_agent::AgentMessage::Llm(Box::new(pi_ai::Message::Assistant(Box::new(assistant))))
     }
 
     fn update_event(index: i64) -> AgentEvent {

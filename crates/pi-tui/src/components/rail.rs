@@ -3,9 +3,11 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use crate::component::{Component, EventResult, UiEvent};
+use crate::component::{
+    Component, DisplayRowContent, DisplayRowSpan, EventResult, RowSourceError, UiEvent,
+};
 
-use super::util::paint_line;
+use super::util::{KeyedLine, paint_line};
 
 /// Columns consumed by the rail: glyph at column 0, then one space.
 pub const RAIL_WIDTH: u16 = 2;
@@ -18,6 +20,14 @@ pub struct Rail {
     glyph: String,
     paint: RailPaintFn,
     children: Vec<Box<dyn Component>>,
+    prepared: Option<PreparedRows>,
+}
+struct PreparedRows {
+    /// Cumulative child row ends, built with checked `usize` arithmetic.
+    prefixes: Vec<usize>,
+    width: u16,
+    /// Styled rail glyph, keyed for its true one-cell span width.
+    glyph: KeyedLine,
 }
 
 impl Rail {
@@ -32,12 +42,14 @@ impl Rail {
             glyph: glyph.into(),
             paint: Box::new(paint),
             children: Vec::new(),
+            prepared: None,
         }
     }
 
     /// Add a child component.
     pub fn add_child(&mut self, child: impl Component + 'static) {
         self.children.push(Box::new(child));
+        self.prepared = None;
     }
 
     fn draw_glyph(&self, area: Rect, buf: &mut Buffer) {
@@ -50,7 +62,99 @@ impl Rail {
 }
 
 impl Component for Rail {
+    fn prepare_rows(&mut self, width: u16) -> Result<usize, RowSourceError> {
+        let child_width = width.saturating_sub(RAIL_WIDTH);
+        let glyph = KeyedLine::new((self.paint)(&self.glyph), 1);
+        let mut prefixes = Vec::with_capacity(self.children.len());
+        let mut total = 0usize;
+
+        if child_width != 0 {
+            let mut failure = None;
+            for child in &mut self.children {
+                let rows = match child.prepare_rows(child_width) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                };
+                let Some(next) = total.checked_add(rows) else {
+                    failure = Some(RowSourceError::RowCountOverflow);
+                    break;
+                };
+                total = next;
+                prefixes.push(total);
+            }
+            if let Some(error) = failure {
+                for child in &mut self.children {
+                    child.invalidate();
+                }
+                self.prepared = None;
+                return Err(error);
+            }
+        }
+
+        self.prepared = Some(PreparedRows {
+            prefixes,
+            width,
+            glyph,
+        });
+        Ok(total)
+    }
+
+    fn visit_row(
+        &self,
+        row: usize,
+        emit: &mut dyn FnMut(DisplayRowSpan<'_>),
+    ) -> Result<(), RowSourceError> {
+        let prepared = self.prepared.as_ref().ok_or(RowSourceError::NotPrepared)?;
+        let rows = prepared.prefixes.last().copied().unwrap_or(0);
+        if row >= rows {
+            return Err(RowSourceError::RowOutOfBounds { row, rows });
+        }
+
+        let child_index = prepared.prefixes.partition_point(|end| *end <= row);
+        let child_start = child_index
+            .checked_sub(1)
+            .and_then(|index| prepared.prefixes.get(index).copied())
+            .unwrap_or(0);
+        let child = self
+            .children
+            .get(child_index)
+            .ok_or(RowSourceError::RowOutOfBounds { row, rows })?;
+        let child_row = row
+            .checked_sub(child_start)
+            .ok_or(RowSourceError::RowCountOverflow)?;
+
+        emit(DisplayRowSpan {
+            column: 0,
+            width: 1,
+            content: DisplayRowContent::Text(&prepared.glyph),
+        });
+
+        let mut offset_overflow = false;
+        child.visit_row(child_row, &mut |mut span| {
+            let Some(column) = span.column.checked_add(RAIL_WIDTH) else {
+                offset_overflow = true;
+                return;
+            };
+            span.column = column;
+            emit(span);
+        })?;
+        if offset_overflow {
+            return Err(RowSourceError::RowCountOverflow);
+        }
+        Ok(())
+    }
+
     fn measure(&mut self, width: u16) -> u16 {
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.width != width)
+        {
+            self.prepared = None;
+        }
         let content_width = width.saturating_sub(RAIL_WIDTH);
         if content_width == 0 {
             return 0;
@@ -63,6 +167,13 @@ impl Component for Rail {
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.width != area.width)
+        {
+            self.prepared = None;
+        }
         let content_width = area.width.saturating_sub(RAIL_WIDTH);
         if content_width == 0 {
             self.draw_glyph(area, buf);
@@ -104,6 +215,7 @@ impl Component for Rail {
     }
 
     fn invalidate(&mut self) {
+        self.prepared = None;
         for child in &mut self.children {
             child.invalidate();
         }
@@ -187,5 +299,22 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn retained_rows_keep_rail_offsets_and_child_width() -> Result<(), RowSourceError> {
+        let mut rail = Rail::with_glyph("|", str::to_owned);
+        rail.add_child(Text::with_padding("x", 0, 0));
+
+        assert_eq!(rail.prepare_rows(5)?, 1);
+        let mut spans = Vec::new();
+        rail.visit_row(0, &mut |span| spans.push((span.column, span.width)))?;
+        assert_eq!(spans, vec![(0, 1), (2, 3)]);
+
+        assert_eq!(rail.prepare_rows(2)?, 0);
+        assert_eq!(
+            rail.visit_row(0, &mut |_| {}),
+            Err(RowSourceError::RowOutOfBounds { row: 0, rows: 0 })
+        );
+        Ok(())
     }
 }

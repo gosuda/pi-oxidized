@@ -22,7 +22,8 @@ use std::sync::Mutex;
 
 use pi_agent::QueueMode;
 use pi_ai::{ModelThinkingLevel, Transport};
-use pi_tui::terminal::{ImageProtocolOverride, TerminalCapabilityOverrides};
+use pi_tui::alt_screen::ScrollbarMode;
+use pi_tui::terminal::{ImageProtocolOverride, ScreenMode, TerminalCapabilityOverrides};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
@@ -66,6 +67,7 @@ const KNOWN_SETTINGS_KEYS: &[&str] = &[
     "followUpMode",
     "theme",
     "themeMode",
+    "cacheWarming",
     "compaction",
     "branchSummary",
     "retry",
@@ -103,6 +105,10 @@ const KNOWN_SETTINGS_KEYS: &[&str] = &[
     "httpProxy",
     "httpIdleTimeoutMs",
     "websocketConnectTimeoutMs",
+    "tuiMode",
+    "fullscreenExitOutput",
+    "fullscreenScrollbar",
+    "fullscreenCopyOnSelect",
 ];
 
 const PACKAGE_SOURCE_FILTER_KEYS: &[&str] = &[
@@ -285,6 +291,39 @@ impl ThemeMode {
     }
 }
 
+/// Prompt cache warming policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CacheWarmingMode {
+    /// Do not warm prompt caches.
+    Off,
+    /// Warm while the agent streams.
+    #[default]
+    Streaming,
+    /// Warm while idle between agent runs.
+    Idle,
+}
+
+impl CacheWarmingMode {
+    /// Wire string used in settings JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Streaming => "streaming",
+            Self::Idle => "idle",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "streaming" => Some(Self::Streaming),
+            "idle" => Some(Self::Idle),
+            _ => None,
+        }
+    }
+}
+
 /// Infer the effective `themeMode` from the stored `theme` value.
 ///
 /// Used when `themeMode` is unset or invalid, and for plain theme names
@@ -297,6 +336,84 @@ fn infer_theme_mode(theme: Option<&str>) -> ThemeMode {
         Some(name) if name == "light" || name.ends_with("-light") => ThemeMode::Light,
         Some(name) if name == "dark" || name.ends_with("-dark") => ThemeMode::Dark,
         Some(_) => ThemeMode::Dark,
+    }
+}
+
+/// Fullscreen exit output (`fullscreenExitOutput`).
+///
+/// Product exit policy; has no effect in regular TUI mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FullscreenExitOutput {
+    /// Render the retained transcript through the regular output path (default).
+    #[default]
+    Transcript,
+    /// Leave fullscreen preserving the primary screen and print only a
+    /// session resume hint.
+    ResumeHint,
+}
+
+impl FullscreenExitOutput {
+    /// Wire string used in settings JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transcript => "transcript",
+            Self::ResumeHint => "resume-hint",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "transcript" => Some(Self::Transcript),
+            "resume-hint" => Some(Self::ResumeHint),
+            _ => None,
+        }
+    }
+}
+
+/// Fullscreen transcript scrollbar preference (`fullscreenScrollbar`).
+///
+/// Product spelling of the viewport scrollbar mode; converts to the
+/// framework mode via [`FullscreenScrollbar::to_scrollbar_mode`].
+/// Has no effect in regular TUI mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FullscreenScrollbar {
+    /// Transient overlay while scrolling or hovering the track (default).
+    #[default]
+    Auto,
+    /// Reserve the rightmost column and keep the bar visible.
+    Always,
+    /// Never draw or hit-test the bar.
+    Hidden,
+}
+
+impl FullscreenScrollbar {
+    /// Wire string used in settings JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "always" => Some(Self::Always),
+            "hidden" => Some(Self::Hidden),
+            _ => None,
+        }
+    }
+
+    /// Framework viewport mode for fullscreen viewport construction.
+    pub(crate) const fn to_scrollbar_mode(self) -> ScrollbarMode {
+        match self {
+            Self::Auto => ScrollbarMode::Auto,
+            Self::Always => ScrollbarMode::Always,
+            Self::Hidden => ScrollbarMode::Hidden,
+        }
     }
 }
 
@@ -405,6 +522,17 @@ impl OutputPad {
     }
 }
 
+/// Per-model compaction token overrides.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CompactionModelOverride {
+    /// Tokens reserved for prompt + response.
+    pub reserve_tokens: Option<u64>,
+    /// Recent-message tokens kept.
+    pub keep_recent_tokens: Option<u64>,
+    /// Unknown override fields preserved.
+    pub extra: Map<String, Value>,
+}
+
 /// Nested `compaction` settings object.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CompactionSettings {
@@ -412,8 +540,10 @@ pub struct CompactionSettings {
     pub enabled: Option<bool>,
     /// Tokens reserved for prompt + LLM response (default: 16384).
     pub reserve_tokens: Option<u64>,
-    /// Recent-message tokens kept (default: 20000).
+    /// Recent-message tokens kept (default 20000).
     pub keep_recent_tokens: Option<u64>,
+    /// Exact `provider/modelId` token overrides.
+    pub model_overrides: Option<BTreeMap<String, CompactionModelOverride>>,
     /// Unknown nested keys preserved from the raw document.
     pub extra: Map<String, Value>,
 }
@@ -616,6 +746,16 @@ pub struct Settings {
     pub theme: Option<String>,
     /// Theme polarity mode (`auto`, `light`, `dark`).
     pub theme_mode: Option<ThemeMode>,
+    /// Prompt cache warming policy (default: streaming).
+    pub cache_warming: Option<CacheWarmingMode>,
+    /// Interactive TUI mode (`regular`, `fullscreen`; default: regular).
+    pub tui_mode: Option<ScreenMode>,
+    /// Fullscreen exit output (`transcript`, `resume-hint`; default: transcript).
+    pub fullscreen_exit_output: Option<FullscreenExitOutput>,
+    /// Fullscreen transcript scrollbar (`auto`, `always`, `hidden`; default: auto).
+    pub fullscreen_scrollbar: Option<FullscreenScrollbar>,
+    /// Automatically copy selected text in fullscreen mode (default: true).
+    pub fullscreen_copy_on_select: Option<bool>,
     /// Compaction settings.
     pub compaction: Option<CompactionSettings>,
     /// Branch-summary settings.
@@ -711,6 +851,23 @@ impl Settings {
                 .get("themeMode")
                 .and_then(Value::as_str)
                 .and_then(ThemeMode::parse),
+            cache_warming: map
+                .get("cacheWarming")
+                .and_then(Value::as_str)
+                .and_then(CacheWarmingMode::parse),
+            tui_mode: map
+                .get("tuiMode")
+                .and_then(Value::as_str)
+                .and_then(|mode| mode.parse().ok()),
+            fullscreen_exit_output: map
+                .get("fullscreenExitOutput")
+                .and_then(Value::as_str)
+                .and_then(FullscreenExitOutput::parse),
+            fullscreen_scrollbar: map
+                .get("fullscreenScrollbar")
+                .and_then(Value::as_str)
+                .and_then(FullscreenScrollbar::parse),
+            fullscreen_copy_on_select: bool_field(map, "fullscreenCopyOnSelect"),
             compaction: nested_field(map, "compaction", CompactionSettings::from_map),
             branch_summary: nested_field(map, "branchSummary", BranchSummarySettings::from_map),
             retry: nested_field(map, "retry", RetrySettings::from_map),
@@ -780,6 +937,10 @@ impl Settings {
         map
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one insert per scalar settings field; splitting would scatter the field table"
+    )]
     fn insert_scalar_fields(&self, map: &mut Map<String, Value>) {
         insert_opt_string(
             map,
@@ -810,6 +971,35 @@ impl Settings {
             "themeMode",
             self.theme_mode
                 .map(|mode| Value::String(mode.as_str().to_owned())),
+        );
+        insert_opt_value(
+            map,
+            "cacheWarming",
+            self.cache_warming
+                .map(|mode| Value::String(mode.as_str().to_owned())),
+        );
+        insert_opt_value(
+            map,
+            "tuiMode",
+            self.tui_mode
+                .map(|mode| Value::String(mode.as_str().to_owned())),
+        );
+        insert_opt_value(
+            map,
+            "fullscreenExitOutput",
+            self.fullscreen_exit_output
+                .map(|output| Value::String(output.as_str().to_owned())),
+        );
+        insert_opt_value(
+            map,
+            "fullscreenScrollbar",
+            self.fullscreen_scrollbar
+                .map(|mode| Value::String(mode.as_str().to_owned())),
+        );
+        insert_opt_bool(
+            map,
+            "fullscreenCopyOnSelect",
+            self.fullscreen_copy_on_select,
         );
         insert_opt_bool(map, "hideThinkingBlock", self.hide_thinking_block);
         insert_opt_bool(map, "showCacheMissNotices", self.show_cache_miss_notices);
@@ -938,13 +1128,52 @@ impl Settings {
     }
 }
 
+impl CompactionModelOverride {
+    fn from_map(map: &Map<String, Value>) -> Self {
+        Self {
+            reserve_tokens: number_to_u64(map.get("reserveTokens")),
+            keep_recent_tokens: number_to_u64(map.get("keepRecentTokens")),
+            extra: unknown_fields(map, &["reserveTokens", "keepRecentTokens"]),
+        }
+    }
+
+    fn to_map(&self) -> Map<String, Value> {
+        let mut map = self.extra.clone();
+        insert_opt_u64(&mut map, "reserveTokens", self.reserve_tokens);
+        insert_opt_u64(&mut map, "keepRecentTokens", self.keep_recent_tokens);
+        map
+    }
+}
+
 impl CompactionSettings {
     fn from_map(map: &Map<String, Value>) -> Self {
+        let model_overrides = map
+            .get("modelOverrides")
+            .and_then(Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(model, value)| {
+                        value.as_object().map(|object| {
+                            (model.clone(), CompactionModelOverride::from_map(object))
+                        })
+                    })
+                    .collect()
+            });
         Self {
             enabled: bool_field(map, "enabled"),
             reserve_tokens: number_to_u64(map.get("reserveTokens")),
             keep_recent_tokens: number_to_u64(map.get("keepRecentTokens")),
-            extra: unknown_fields(map, &["enabled", "reserveTokens", "keepRecentTokens"]),
+            model_overrides,
+            extra: unknown_fields(
+                map,
+                &[
+                    "enabled",
+                    "reserveTokens",
+                    "keepRecentTokens",
+                    "modelOverrides",
+                ],
+            ),
         }
     }
 
@@ -953,6 +1182,18 @@ impl CompactionSettings {
         insert_opt_bool(&mut map, "enabled", self.enabled);
         insert_opt_u64(&mut map, "reserveTokens", self.reserve_tokens);
         insert_opt_u64(&mut map, "keepRecentTokens", self.keep_recent_tokens);
+        insert_opt_value(
+            &mut map,
+            "modelOverrides",
+            self.model_overrides.as_ref().map(|entries| {
+                Value::Object(
+                    entries
+                        .iter()
+                        .map(|(model, value)| (model.clone(), Value::Object(value.to_map())))
+                        .collect(),
+                )
+            }),
+        );
         map
     }
 }
@@ -1991,6 +2232,76 @@ impl SettingsManager {
         })
     }
 
+    // -- Fullscreen TUI -------------------------------------------------------
+
+    /// `tuiMode` from merged settings. Only an exact `"fullscreen"` selects
+    /// fullscreen; anything unset or unrecognized stays regular (default).
+    ///
+    /// An explicit `--tui-mode` CLI value overrides this at startup.
+    #[must_use]
+    pub fn get_tui_mode(&self) -> ScreenMode {
+        self.settings
+            .get("tuiMode")
+            .and_then(Value::as_str)
+            .and_then(|mode| mode.parse().ok())
+            .unwrap_or_default()
+    }
+
+    /// Set `tuiMode` (global).
+    pub fn set_tui_mode(&mut self, mode: ScreenMode) {
+        self.set_global_field("tuiMode", Value::String(mode.as_str().to_owned()));
+    }
+
+    /// `fullscreenExitOutput` from merged settings (default: transcript).
+    /// Has no effect in regular TUI mode.
+    #[must_use]
+    pub fn get_fullscreen_exit_output(&self) -> FullscreenExitOutput {
+        self.settings
+            .get("fullscreenExitOutput")
+            .and_then(Value::as_str)
+            .and_then(FullscreenExitOutput::parse)
+            .unwrap_or_default()
+    }
+
+    /// Set `fullscreenExitOutput` (global).
+    pub fn set_fullscreen_exit_output(&mut self, output: FullscreenExitOutput) {
+        self.set_global_field(
+            "fullscreenExitOutput",
+            Value::String(output.as_str().to_owned()),
+        );
+    }
+
+    /// `fullscreenScrollbar` from merged settings (default: auto).
+    /// Has no effect in regular TUI mode.
+    #[must_use]
+    pub fn get_fullscreen_scrollbar(&self) -> FullscreenScrollbar {
+        self.settings
+            .get("fullscreenScrollbar")
+            .and_then(Value::as_str)
+            .and_then(FullscreenScrollbar::parse)
+            .unwrap_or_default()
+    }
+
+    /// Set `fullscreenScrollbar` (global).
+    pub fn set_fullscreen_scrollbar(&mut self, mode: FullscreenScrollbar) {
+        self.set_global_field(
+            "fullscreenScrollbar",
+            Value::String(mode.as_str().to_owned()),
+        );
+    }
+
+    /// `fullscreenCopyOnSelect` from merged settings (default: true).
+    /// Has no effect in regular TUI mode.
+    #[must_use]
+    pub fn get_fullscreen_copy_on_select(&self) -> bool {
+        self.merged_bool("fullscreenCopyOnSelect").unwrap_or(true)
+    }
+
+    /// Set `fullscreenCopyOnSelect` (global).
+    pub fn set_fullscreen_copy_on_select(&mut self, enabled: bool) {
+        self.set_global_field("fullscreenCopyOnSelect", Value::Bool(enabled));
+    }
+
     // -- Compaction / branch summary ------------------------------------------
 
     /// `compaction.enabled` (default: true).
@@ -2019,6 +2330,73 @@ impl SettingsManager {
             .unwrap_or(DEFAULT_COMPACTION_KEEP_RECENT_TOKENS)
     }
 
+    fn compaction_model_override(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> Option<CompactionModelOverride> {
+        let key = format!("{provider}/{model_id}");
+        self.settings
+            .get("compaction")
+            .and_then(Value::as_object)
+            .and_then(|compaction| compaction.get("modelOverrides"))
+            .and_then(Value::as_object)
+            .and_then(|overrides| overrides.get(&key))
+            .and_then(Value::as_object)
+            .map(CompactionModelOverride::from_map)
+    }
+
+    /// Resolve reserve tokens using model override, global setting, then default.
+    #[must_use]
+    pub fn get_compaction_reserve_tokens_for_model(&self, provider: &str, model_id: &str) -> u64 {
+        self.compaction_model_override(provider, model_id)
+            .and_then(|override_| override_.reserve_tokens)
+            .or_else(|| self.merged_nested_u64("compaction", "reserveTokens"))
+            .unwrap_or(DEFAULT_COMPACTION_RESERVE_TOKENS)
+    }
+
+    /// Resolve recent tokens using model override, global setting, then default.
+    #[must_use]
+    pub fn get_compaction_keep_recent_tokens_for_model(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> u64 {
+        self.compaction_model_override(provider, model_id)
+            .and_then(|override_| override_.keep_recent_tokens)
+            .or_else(|| self.merged_nested_u64("compaction", "keepRecentTokens"))
+            .unwrap_or(DEFAULT_COMPACTION_KEEP_RECENT_TOKENS)
+    }
+
+    /// Resolve all compaction settings for a provider/model pair.
+    #[must_use]
+    pub fn get_compaction_settings_for_model(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> ResolvedCompactionSettings {
+        ResolvedCompactionSettings {
+            enabled: self.get_compaction_enabled(),
+            reserve_tokens: self.get_compaction_reserve_tokens_for_model(provider, model_id),
+            keep_recent_tokens: self
+                .get_compaction_keep_recent_tokens_for_model(provider, model_id),
+        }
+    }
+
+    /// Prompt cache warming policy (default: streaming).
+    #[must_use]
+    pub fn get_cache_warming_mode(&self) -> CacheWarmingMode {
+        self.global_settings
+            .get("cacheWarming")
+            .and_then(Value::as_str)
+            .and_then(CacheWarmingMode::parse)
+            .unwrap_or_default()
+    }
+
+    /// Set the global prompt cache warming policy.
+    pub fn set_cache_warming_mode(&mut self, mode: CacheWarmingMode) {
+        self.set_global_field("cacheWarming", Value::String(mode.as_str().to_owned()));
+    }
     /// Fully-resolved compaction settings.
     #[must_use]
     pub fn get_compaction_settings(&self) -> ResolvedCompactionSettings {
@@ -3003,16 +3381,7 @@ fn is_js_decimal(text: &str) -> bool {
 }
 
 fn parse_thinking_level(value: Option<&Value>) -> Option<ModelThinkingLevel> {
-    match value?.as_str()? {
-        "off" => Some(ModelThinkingLevel::Off),
-        "minimal" => Some(ModelThinkingLevel::Minimal),
-        "low" => Some(ModelThinkingLevel::Low),
-        "medium" => Some(ModelThinkingLevel::Medium),
-        "high" => Some(ModelThinkingLevel::High),
-        "xhigh" => Some(ModelThinkingLevel::Xhigh),
-        "max" => Some(ModelThinkingLevel::Max),
-        _ => None,
-    }
+    value?.as_str()?.parse().ok()
 }
 
 fn thinking_level_value(level: ModelThinkingLevel) -> Value {
@@ -3886,6 +4255,148 @@ mod tests {
                 "stored={stored}"
             );
         }
+    }
+
+    #[test]
+    fn fullscreen_wire_values_roundtrip() {
+        assert_eq!(ScreenMode::Regular.as_str(), "regular");
+        assert_eq!(ScreenMode::Fullscreen.as_str(), "fullscreen");
+        assert_eq!("fullscreen".parse(), Ok(ScreenMode::Fullscreen));
+        assert_eq!("regular".parse(), Ok(ScreenMode::Regular));
+        assert!("other".parse::<ScreenMode>().is_err());
+
+        assert_eq!(
+            FullscreenExitOutput::parse("transcript"),
+            Some(FullscreenExitOutput::Transcript)
+        );
+        assert_eq!(
+            FullscreenExitOutput::parse("resume-hint"),
+            Some(FullscreenExitOutput::ResumeHint)
+        );
+        assert_eq!(FullscreenExitOutput::parse("bogus"), None);
+        assert_eq!(FullscreenExitOutput::Transcript.as_str(), "transcript");
+        assert_eq!(FullscreenExitOutput::ResumeHint.as_str(), "resume-hint");
+
+        assert_eq!(
+            FullscreenScrollbar::parse("auto"),
+            Some(FullscreenScrollbar::Auto)
+        );
+        assert_eq!(
+            FullscreenScrollbar::parse("always"),
+            Some(FullscreenScrollbar::Always)
+        );
+        assert_eq!(
+            FullscreenScrollbar::parse("hidden"),
+            Some(FullscreenScrollbar::Hidden)
+        );
+        assert_eq!(FullscreenScrollbar::parse("sometimes"), None);
+        assert_eq!(FullscreenScrollbar::Auto.as_str(), "auto");
+        assert_eq!(FullscreenScrollbar::Always.as_str(), "always");
+        assert_eq!(FullscreenScrollbar::Hidden.as_str(), "hidden");
+        assert_eq!(
+            FullscreenScrollbar::Auto.to_scrollbar_mode(),
+            ScrollbarMode::Auto
+        );
+        assert_eq!(
+            FullscreenScrollbar::Always.to_scrollbar_mode(),
+            ScrollbarMode::Always
+        );
+        assert_eq!(
+            FullscreenScrollbar::Hidden.to_scrollbar_mode(),
+            ScrollbarMode::Hidden
+        );
+    }
+
+    #[test]
+    fn fullscreen_settings_default_to_regular_transcript_auto_copy() {
+        let manager = SettingsManager::in_memory(
+            &Settings::default(),
+            SettingsManagerCreateOptions::default(),
+        );
+        assert_eq!(manager.get_tui_mode(), ScreenMode::Regular);
+        assert_eq!(
+            manager.get_fullscreen_exit_output(),
+            FullscreenExitOutput::Transcript
+        );
+        assert_eq!(
+            manager.get_fullscreen_scrollbar(),
+            FullscreenScrollbar::Auto
+        );
+        assert!(manager.get_fullscreen_copy_on_select());
+    }
+
+    #[test]
+    fn fullscreen_settings_roundtrip_through_global_storage() {
+        let mut manager = SettingsManager::in_memory(
+            &Settings::default(),
+            SettingsManagerCreateOptions::default(),
+        );
+        manager.set_tui_mode(ScreenMode::Fullscreen);
+        assert_eq!(manager.get_tui_mode(), ScreenMode::Fullscreen);
+        manager.set_fullscreen_exit_output(FullscreenExitOutput::ResumeHint);
+        assert_eq!(
+            manager.get_fullscreen_exit_output(),
+            FullscreenExitOutput::ResumeHint
+        );
+        manager.set_fullscreen_scrollbar(FullscreenScrollbar::Hidden);
+        assert_eq!(
+            manager.get_fullscreen_scrollbar(),
+            FullscreenScrollbar::Hidden
+        );
+        manager.set_fullscreen_copy_on_select(false);
+        assert!(!manager.get_fullscreen_copy_on_select());
+
+        let stored = manager.get_global_settings().to_map();
+        assert_eq!(stored["tuiMode"], "fullscreen");
+        assert_eq!(stored["fullscreenExitOutput"], "resume-hint");
+        assert_eq!(stored["fullscreenScrollbar"], "hidden");
+        assert_eq!(stored["fullscreenCopyOnSelect"], false);
+    }
+
+    /// Malformed stored values fall back to the documented defaults instead
+    /// of becoming hidden modes.
+    #[test]
+    fn fullscreen_settings_invalid_stored_values_fall_back() {
+        for (key, stored) in [
+            ("tuiMode", Value::String("other".to_owned())),
+            ("tuiMode", Value::from(5)),
+            ("fullscreenExitOutput", Value::String("nothing".to_owned())),
+            ("fullscreenScrollbar", Value::String("sometimes".to_owned())),
+            ("fullscreenScrollbar", Value::Bool(true)),
+        ] {
+            let mut map = Map::new();
+            map.insert(key.into(), stored.clone());
+            let manager = SettingsManager::in_memory(
+                &Settings::from_map(&map),
+                SettingsManagerCreateOptions::default(),
+            );
+            assert_eq!(
+                manager.get_tui_mode(),
+                ScreenMode::Regular,
+                "stored tuiMode must fall back to regular"
+            );
+            assert_eq!(
+                manager.get_fullscreen_exit_output(),
+                FullscreenExitOutput::Transcript,
+                "stored fullscreenExitOutput must fall back to transcript"
+            );
+            assert_eq!(
+                manager.get_fullscreen_scrollbar(),
+                FullscreenScrollbar::Auto,
+                "stored fullscreenScrollbar must fall back to auto"
+            );
+        }
+        // A wrong-typed copy flag is ignored; the default stays true.
+        let mut map = Map::new();
+        map.insert(
+            "fullscreenCopyOnSelect".into(),
+            Value::String("yes".to_owned()),
+        );
+        let manager = SettingsManager::in_memory(
+            &Settings::from_map(&map),
+            SettingsManagerCreateOptions::default(),
+        );
+        assert!(manager.get_fullscreen_copy_on_select());
     }
 
     #[test]

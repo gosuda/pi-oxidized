@@ -7,7 +7,7 @@
 
 ## 1. Consolidated better-interface review
 
-Single consolidated review routed to all six owning `better-*` domain skills (accessibility, layout, writing, typography, colors, UI/motion), each executed as an independent inspection of the settled surfaces (`crates/pi-tui/src/**`, `crates/pi/src/modes/interactive/**`) against the track's own settled conventions (`docs/STYLE_LEDGER.md`, `docs/TUI-G6-color-doctrine.md`, `docs/TUI-G1-reduced-motion-policy.md`, `docs/TUI-G8-viewport-floor-policy.md`, `docs/terminal-rail-doctrine.md`). Out of scope per the ruling: exported-HTML accessibility, i18n, `/privacy`, screen-model redesign, pi-ext internals, performance, alt-screen/scroll-view/mouse implementation.
+Single consolidated review routed to all six owning `better-*` domain skills (accessibility, layout, writing, typography, colors, UI/motion), each executed as an independent inspection of the settled surfaces (`crates/pi-tui/src/**`, `crates/pi/src/modes/interactive/**`) against the track's own settled conventions (`docs/STYLE_LEDGER.md`, `docs/TUI-G6-color-doctrine.md`, `docs/TUI-G1-reduced-motion-policy.md`, `docs/TUI-G8-viewport-floor-policy.md`, `docs/terminal-rail-doctrine.md`). Out of scope per the ruling: exported-HTML accessibility, i18n, `/privacy`, screen-model redesign, pi-ext internals, performance, alt-screen/scroll-view/mouse implementation. (Historical classification; the alt-screen/scroll-view/mouse portion is superseded by `docs/TUI-G4-supersession.md` against C `9767ba275f3e9a5ee0f5c5342249b629ab1b2282` and is pending DES-07 implementation, not closed here.)
 
 | Domain | Evidence inspected | Result |
 | --- | --- | --- |
@@ -46,9 +46,9 @@ Per-suite deterministic runs on this tree (§2); contrast/oracle claims carried 
 
 ## 2. Five-row Tier N deterministic transcript gate
 
-Canonical frozen topology (`docs/tui-transcript-schema-v1.md` §6): `gnu-x64`, `gnu-arm64`, `darwin-x64`, `darwin-arm64`, `windows-x64` (`RowId`, `transcript.rs:103`; `RowTier::TierN`:97). Structural guarantees re-verified in source: local runs cannot claim Tier N (`crates/pi/tests/tui_transcripts.rs:372-374`); Tier N requires a runner image (`ValidatorError::TierNMissingRunnerImage`, `validate.rs:290`); the five-row set is frozen (TUI-R2 §7.3).
+Canonical frozen topology (`docs/tui-transcript-schema-v1.md` §6): `gnu-x64`, `gnu-arm64`, `darwin-x64`, `darwin-arm64`, `windows-x64` (`RowId`, `transcript.rs:103`; `RowTier::TierN`:97). The implementation rejects local Tier-N claims and requires a runner image for Tier N; those guards do not substitute for five-runner execution evidence.
 
-Fresh deterministic corpus runs on this tree (host = local gnu-x64 row, k=3 byte-identical digests inside each):
+Previously recorded deterministic corpus results on this tree (host = local gnu-x64 row, k=3 byte-identical digests inside each); the current resize-storm capture is not green and is described below:
 
 | Suite | Result |
 | --- | --- |
@@ -58,7 +58,7 @@ Fresh deterministic corpus runs on this tree (host = local gnu-x64 row, k=3 byte
 | `transcript_unicode_gauntlet` (V3) | 1 passed, 13.91s (k=3) |
 | `transcript_a11y_invariants` (V6) | 5 passed |
 | `transcript_ext_gauntlet` (P3) | 1 passed (k=3) |
-| `transcript_fixture` (P1 corpus: stream-settle, resize-ladder, resize-storm, paste-cursor) | post-fix: four green runs, one failed on the intermittent resize-ladder k=3 divergence (§6.7) — the close deadlock is gone; the divergence is pre-existing and routed |
+| `transcript_fixture` (P1 corpus: stream-settle, resize-ladder, resize-storm, paste-cursor) | The preserved resize-storm failure is `target/verification/tui-transcripts/local/resize-storm/run-1/storm-window-failure.bin`: one post-ready transaction is anchored on rows 23–28 and publishes `Resize=1/Paste=0/Cursor=0`, but its observable status is `STATUS serving`, not the required `STATUS batch-complete 96x28`. This identifies a fixture frame-publication defect, not a raw-ANSI contiguity issue. After the repair, the exact proof command is `cargo test -p pi-tui --features testkit --test transcript_fixture --locked`; negative cases must still reject missing Ctrl+D/Resize input and any synthetic notification. |
 
 **Tier-N five-runner CI evidence: PENDING** — the standing, schema-documented limitation (`tui-transcript-schema-v1.md` §9): multi-runner artifacts land with REL-T4 #108 wiring, which this ticket unblocks.
 
@@ -103,7 +103,7 @@ Every retained change stayed within its ticket's classification (copy / presenta
 | TUI-T9 narrow-width floor #83 | TUI-G8 #56 (`c80f7c0`) | refuse-and-blank below 20 columns | implemented `c527481` on `feat/tui-t9-floor-impl` (pushed) — **not yet integrated into the campaign line; see §6.2** |
 | TUI-T11 reduced-motion #78 | TUI-G1 #49 (`14e3973`) | upstream no-preference-gate; static-frame programmatic seam | executed `f008886`, merged `4dc0900` |
 | Confirm selection/Esc semantics | TUI-G7 #61 (`3a7d020`,`1fce102`) | settled dispatch policy | landed |
-| Alt-screen / scroll-view / mouse / search-overlay / flash-confirm | TUI-G4 #35 (`fd36be9`) | deferred-by-design roadmap | recorded |
+| Alt-screen / scroll-view / mouse / search-overlay / flash-confirm | TUI-G4 #35 (`fd36be9`) | deferred-by-design roadmap (historical; superseded by `docs/TUI-G4-supersession.md`) | recorded (historical) — superseded; fullscreen pending DES-07 implementation, not closed here |
 | Copy policy authority | TUI-G5 #50 → `docs/STYLE_LEDGER.md` (repair `1c99543`) | ledger-pinned copy | live |
 | Color doctrine / hyperlinks / depth | TUI-G6 #63 (`4a3895c`,`442e214`,`e9bfed3`) | five rulings | live |
 | Hardware cursor | TUI-G2 #53 → `docs/TUI-G2-hardware-cursor-policy.md` | first-class setting, default off | decided; parity indicator retained (see row 4, §1) |

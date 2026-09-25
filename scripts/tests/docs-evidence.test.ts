@@ -5,9 +5,8 @@ import { join, relative } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import {
-	CANONICAL_REFERENCE_SHA,
-	LEGACY_REFERENCE_SHA,
-	RETIRED_REFERENCE_SHA,
+	EXTENSION_COMPAT_REFERENCE_SHA,
+	RETIRED_REFERENCE_SHAS,
 } from "../reference-identity.ts";
 import {
 	DEFAULT_REPROOF_INTERVAL_MS,
@@ -76,7 +75,7 @@ function sampleRow(evidenceClass: string, id: string): LedgerRow {
 /** Write a scratch ledger + inventory to a temp dir and run the checker. */
 function runScratchCheck(
 	rows: readonly LedgerRow[],
-	referencePin: string = CANONICAL_REFERENCE_SHA,
+	referencePin: string = EXTENSION_COMPAT_REFERENCE_SHA,
 	sidecarDir?: string,
 ): CheckResult & { sidecarDir: string } {
 	const dir = mkdtempSync(join(tmpdir(), "docs-ev-"));
@@ -147,7 +146,7 @@ describe("docs-evidence: green on current tree", () => {
 			expect(existsSync(manifestPath)).toBe(true);
 			const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as RunManifest;
 			expect(manifest.schema).toBe(RUN_MANIFEST_SCHEMA);
-			expect(manifest.referencePin).toBe(CANONICAL_REFERENCE_SHA);
+			expect(manifest.referencePin).toBe(EXTENSION_COMPAT_REFERENCE_SHA);
 			expect(manifest.ledgerHash).toBe(sha256(canonicalJson(LEDGER)));
 			expect(manifest.rowCount).toBe(LEDGER.rows.length);
 			expect(manifest.presentCount).toBe(LEDGER.rows.length);
@@ -283,9 +282,9 @@ describe("docs-evidence: ledger structure", () => {
 	});
 
 	test("exactly one reference-pin literal is recorded", () => {
-		expect(LEDGER.referencePin).toBe(CANONICAL_REFERENCE_SHA);
+		expect(LEDGER.referencePin).toBe(EXTENSION_COMPAT_REFERENCE_SHA);
 		const raw = JSON.stringify(LEDGER);
-		const occurrences = raw.split(CANONICAL_REFERENCE_SHA).length - 1;
+		const occurrences = raw.split(EXTENSION_COMPAT_REFERENCE_SHA).length - 1;
 		expect(occurrences).toBe(1);
 	});
 
@@ -364,7 +363,7 @@ describe("docs-evidence: mutation suite (per class)", () => {
 			runId: new Date().toISOString(),
 		});
 		const result = runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			REPO_ROOT,
 			scDir,
@@ -382,7 +381,7 @@ describe("docs-evidence: mutation suite (per class)", () => {
 		const row = sampleRow("review-only-prose", "mut-stale-tv");
 		// First run to produce a fresh sidecar
 		runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			REPO_ROOT,
 			scDir,
@@ -395,7 +394,7 @@ describe("docs-evidence: mutation suite (per class)", () => {
 			toolVersion: "pi.docs.evidence.v0",
 		});
 		const result = runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			REPO_ROOT,
 			scDir,
@@ -419,7 +418,7 @@ describe("docs-evidence: mutation suite (per class)", () => {
 			runId: oldDate,
 		});
 		const result = runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			REPO_ROOT,
 			scDir,
@@ -459,7 +458,7 @@ describe("docs-evidence: mutation suite (per class)", () => {
 			runId: new Date().toISOString(),
 		});
 		const result = runCheck(
-			{ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows: [row] },
+			{ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows: [row] },
 			{ schema: "pi.docs.inventory.v1", categories: [{ id: "t", name: "t", surfaces: [row.surface] }] },
 			REPO_ROOT,
 			scDir,
@@ -492,7 +491,7 @@ describe("docs-evidence: mutation suite (per class)", () => {
 				...sampleRow("review-only-prose", `mut-${pendingStatus}`),
 				status: pendingStatus,
 			};
-			const result = runScratchCheck([row], CANONICAL_REFERENCE_SHA, scDir);
+			const result = runScratchCheck([row], EXTENSION_COMPAT_REFERENCE_SHA, scDir);
 			try {
 				expect(result.ok).toBe(false);
 				expect(result.problems.some((p) => p.includes(`status ${pendingStatus} is not final`))).toBe(true);
@@ -535,16 +534,16 @@ describe("docs-evidence: mutation suite (per class)", () => {
 			sampleRow("review-only-prose", "zz-manifest-prose"),
 			sampleRow("changelog-unreleased", "aa-manifest-changelog"),
 		];
-		const result = runScratchCheck(rows, CANONICAL_REFERENCE_SHA, scDir);
+		const result = runScratchCheck(rows, EXTENSION_COMPAT_REFERENCE_SHA, scDir);
 		const manifestPath = join(scDir, RUN_MANIFEST_FILENAME);
 		try {
 			expect(result.ok).toBe(true);
 			expect(result.manifestPath).toBe(manifestPath);
 			const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as RunManifest;
 			expect(manifest.schema).toBe(RUN_MANIFEST_SCHEMA);
-			expect(manifest.referencePin).toBe(CANONICAL_REFERENCE_SHA);
+			expect(manifest.referencePin).toBe(EXTENSION_COMPAT_REFERENCE_SHA);
 			expect(manifest.ledgerHash).toBe(
-				sha256(canonicalJson({ schema: "pi.docs.evidence.v1", referencePin: CANONICAL_REFERENCE_SHA, rows })),
+				sha256(canonicalJson({ schema: "pi.docs.evidence.v1", referencePin: EXTENSION_COMPAT_REFERENCE_SHA, rows })),
 			);
 			expect(manifest.rowCount).toBe(2);
 			expect(manifest.presentCount).toBe(2);
@@ -568,7 +567,7 @@ describe("docs-evidence: mutation suite (per class)", () => {
 		const manifestPath = join(scDir, RUN_MANIFEST_FILENAME);
 		writeFileSync(manifestPath, '{"schema":"pi.docs.evidence.run.v1"}\n');
 		const row = { ...sampleRow("review-only-prose", "mut-manifest-fail"), status: "bogus" };
-		const result = runScratchCheck([row as LedgerRow], CANONICAL_REFERENCE_SHA, scDir);
+		const result = runScratchCheck([row as LedgerRow], EXTENSION_COMPAT_REFERENCE_SHA, scDir);
 		try {
 			expect(result.ok).toBe(false);
 			expect(result.manifestPath).toBeNull();
@@ -586,16 +585,16 @@ describe("docs-evidence: mutation suite (per class)", () => {
 describe("docs-evidence: reference-pin literal", () => {
 	test("legacy pin injected into scratch ledger fails the checker", () => {
 		const row = sampleRow("review-only-prose", "legacy-pin-test");
-		const result = runScratchCheck([row], LEGACY_REFERENCE_SHA);
+		const result = runScratchCheck([row], RETIRED_REFERENCE_SHAS[0]);
 		expect(result.ok).toBe(false);
-		expect(result.problems.some((p) => p.includes("legacy pin") || p.includes(LEGACY_REFERENCE_SHA))).toBe(true);
+		expect(result.problems.some((p) => p.includes("legacy pin") || p.includes(RETIRED_REFERENCE_SHAS[0]))).toBe(true);
 	});
 
 	test("retired pin injected into scratch ledger fails the checker", () => {
 		const row = sampleRow("review-only-prose", "retired-pin-test");
-		const result = runScratchCheck([row], RETIRED_REFERENCE_SHA);
+		const result = runScratchCheck([row], RETIRED_REFERENCE_SHAS[1]);
 		expect(result.ok).toBe(false);
-		expect(result.problems.some((p) => p.includes("retired pin") || p.includes(RETIRED_REFERENCE_SHA))).toBe(true);
+		expect(result.problems.some((p) => p.includes("retired pin") || p.includes(RETIRED_REFERENCE_SHAS[1]))).toBe(true);
 	});
 
 	test("validateLedger rejects a non-canonical referencePin", () => {
@@ -610,7 +609,7 @@ describe("docs-evidence: reference-pin literal", () => {
 	test("validateLedger accepts the canonical referencePin", () => {
 		const problems = validateLedger({
 			schema: "pi.docs.evidence.v1",
-			referencePin: CANONICAL_REFERENCE_SHA,
+			referencePin: EXTENSION_COMPAT_REFERENCE_SHA,
 			rows: [],
 		});
 		expect(problems.filter((p) => p.message.includes("referencePin"))).toEqual([]);

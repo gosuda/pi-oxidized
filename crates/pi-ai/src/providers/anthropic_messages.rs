@@ -1,6 +1,6 @@
 //! Native Anthropic Messages HTTP and streaming adapter.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,7 +9,13 @@ use futures::StreamExt;
 use reqwest::{Client, Request};
 use serde_json::{Map, Value, json};
 
+use crate::constrained_sampling::{ConstrainedSamplingError, resolve_json_schema_strict_sampling};
 use crate::provider::{Provider, StreamOptionKey, StreamOptions};
+use crate::transcript::{
+    TranscriptContext, get_current_tools, get_declared_tools, get_initial_system_message,
+    get_system_message_text, has_tool_redefinitions, normalize_context,
+    render_system_message_update, resolve_transcript,
+};
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DoneReason,
     ErrorReason, Message, Model, ModelThinkingLevel, StopReason, ThinkingContent, ToolCall,
@@ -56,6 +62,10 @@ impl Provider for AnthropicMessages {
         options: StreamOptions,
     ) -> ProviderEventStream {
         let model = resolve_model(model, options.env.as_ref()).into_owned();
+        let context = resolve_transcript(
+            normalize_context(context),
+            compat_bool(&model, "supportsMidConvoSystemMessages", false),
+        );
         let transport = self.transport.clone();
         let client = self.client.clone();
         let (sender, stream) = ProviderEventSender::channel(STREAM_CAPACITY);
@@ -72,7 +82,7 @@ impl Provider for AnthropicMessages {
                 &client,
                 &transport,
                 &model,
-                context,
+                &context,
                 &options,
                 &sender,
                 &mut assembler,
@@ -96,7 +106,7 @@ async fn run_stream(
     client: &Client,
     transport: &HttpTransport,
     model: &Model,
-    context: Context,
+    context: &TranscriptContext,
     options: &StreamOptions,
     sender: &ProviderEventSender,
     assembler: &mut StreamAssembler,
@@ -109,7 +119,9 @@ async fn run_stream(
         return Err(AdapterError::Cancelled);
     }
 
-    let mut payload = build_payload(model, &context, options);
+    let mut payload = build_payload(model, context, options)
+        .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+
     if let Some(callback) = &options.on_payload {
         callback(&mut payload, model)
             .await
@@ -179,7 +191,7 @@ async fn run_stream(
         StopReason::Stop => DoneReason::Stop,
         StopReason::Length => DoneReason::Length,
         StopReason::ToolUse => DoneReason::ToolUse,
-        StopReason::Error | StopReason::Aborted => {
+        StopReason::Error | StopReason::Aborted | StopReason::Pending | StopReason::Deferred => {
             return Err(AdapterError::Protocol(
                 "invalid Anthropic terminal state".to_owned(),
             ));
@@ -206,9 +218,24 @@ fn build_request(
     payload: &Value,
 ) -> Result<Request, AdapterError> {
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
-    let mut request = ClientRequest::new(url, payload.clone());
+    let mut body = payload.clone();
+    let betas = body.as_object_mut().and_then(|body| body.remove("betas"));
+    let mut request = ClientRequest::new(url, body);
     request.header("anthropic-version", Some(ANTHROPIC_VERSION));
     request.header("content-type", Some("application/json"));
+    let is_openrouter = model.provider == "openrouter" || model.base_url.contains("openrouter.ai");
+    if let Some(session_id) = options.session_id.as_deref().filter(|id| !id.is_empty())
+        && compat_bool(model, "sendSessionAffinityHeaders", is_openrouter)
+    {
+        let format =
+            compat_string(model, "sessionAffinityFormat").or(is_openrouter.then_some("openrouter"));
+        let header = if format == Some("openrouter") {
+            "x-session-id"
+        } else {
+            "x-session-affinity"
+        };
+        request.header(header, Some(session_id));
+    }
     if let Some(api_key) = options.api_key.as_deref() {
         request.header("x-api-key", Some(api_key));
     }
@@ -220,6 +247,23 @@ fn build_request(
     if let Some(headers) = &options.headers {
         for (name, value) in headers {
             request.header(name, value.as_deref());
+        }
+    }
+    if let Some(features) = betas.as_ref().and_then(Value::as_array) {
+        let header = request
+            .headers
+            .entry("anthropic-beta".to_owned())
+            .or_insert_with(|| Some(String::new()));
+        if let Some(header) = header {
+            for feature in features.iter().filter_map(Value::as_str) {
+                if header.split(',').any(|existing| existing.trim() == feature) {
+                    continue;
+                }
+                if !header.is_empty() {
+                    header.push(',');
+                }
+                header.push_str(feature);
+            }
         }
     }
     request.build(client, options.timeout_ms)
@@ -259,13 +303,22 @@ impl ClientRequest {
     }
 }
 
-fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> Value {
+fn build_payload(
+    model: &Model,
+    context: &TranscriptContext,
+    options: &StreamOptions,
+) -> Result<Value, ConstrainedSamplingError> {
     let cache_control = cache_control(model, options);
     let mut payload = Map::new();
     payload.insert("model".to_owned(), Value::String(model.id.clone()));
     payload.insert(
         "messages".to_owned(),
-        Value::Array(convert_messages(model, context, cache_control.as_ref())),
+        Value::Array(convert_messages(
+            model,
+            context,
+            cache_control.as_ref(),
+            options,
+        )),
     );
     payload.insert(
         "max_tokens".to_owned(),
@@ -273,8 +326,11 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
     );
     payload.insert("stream".to_owned(), Value::Bool(true));
 
-    if let Some(system) = context.system_prompt.as_deref() {
-        let mut block = json!({ "type": "text", "text": sanitize_surrogates(system) });
+    if let Some(system) = get_initial_system_message(&context.messages)
+        .map(get_system_message_text)
+        .filter(|text| !text.is_empty())
+    {
+        let mut block = json!({ "type": "text", "text": sanitize_surrogates(&system) });
         if let Some(cache) = &cache_control {
             block["cache_control"] = cache.clone();
         }
@@ -283,14 +339,57 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
 
     insert_temperature(&mut payload, model, options);
     insert_thinking(&mut payload, model, options);
-    insert_tools(&mut payload, model, context, cache_control.as_ref());
+    let tool_choice = options.extra_value(StreamOptionKey::TOOL_CHOICE);
+    // Anthropic rejects `{"type": "none"}`; the neutral choice is expressed by
+    // withholding the tool definitions entirely.
+    let tools_forbidden = tool_choice.is_some_and(|choice| {
+        choice.as_str() == Some("none")
+            || choice.get("type").and_then(Value::as_str) == Some("none")
+    });
+    if !tools_forbidden {
+        let tools = if native_tool_changes(model, context) {
+            payload.insert(
+                "betas".to_owned(),
+                json!(["mid-conversation-tool-changes-2026-07-01"]),
+            );
+            let initial = get_initial_system_message(&context.messages)
+                .and_then(|message| message.tools_added.as_deref())
+                .unwrap_or_default();
+            let mut tools = convert_tools(model, initial, cache_control.as_ref())?;
+            tools.push(json!({
+                "name": "__pi_deferred_placeholder__",
+                "description": "Reserved placeholder. Never available. Never call this.",
+                "input_schema": { "type": "object", "properties": {}, "required": [] },
+                "defer_loading": true
+            }));
+            let initial_names: HashSet<_> = initial.iter().map(|tool| tool.name.as_str()).collect();
+            let mut later = get_declared_tools(&context.messages);
+            later.retain(|tool| !initial_names.contains(tool.name.as_str()));
+            for mut tool in convert_tools(model, &later, None)? {
+                tool["defer_loading"] = Value::Bool(true);
+                tools.push(tool);
+            }
+            tools
+        } else {
+            convert_tools(
+                model,
+                &get_current_tools(&context.messages),
+                cache_control.as_ref(),
+            )?
+        };
+        if !tools.is_empty() {
+            payload.insert("tools".to_owned(), Value::Array(tools));
+        }
+    }
 
     if let Some(metadata) = &options.metadata
         && let Some(user_id) = metadata.get("user_id").and_then(Value::as_str)
     {
         payload.insert("metadata".to_owned(), json!({ "user_id": user_id }));
     }
-    if let Some(tool_choice) = options.extra_value(StreamOptionKey::TOOL_CHOICE) {
+    if let Some(tool_choice) = tool_choice
+        && !tools_forbidden
+    {
         payload.insert(
             "tool_choice".to_owned(),
             if let Some(kind) = tool_choice.as_str() {
@@ -300,7 +399,7 @@ fn build_payload(model: &Model, context: &Context, options: &StreamOptions) -> V
             },
         );
     }
-    Value::Object(payload)
+    Ok(Value::Object(payload))
 }
 
 fn insert_temperature(payload: &mut Map<String, Value>, model: &Model, options: &StreamOptions) {
@@ -361,23 +460,18 @@ fn insert_thinking(payload: &mut Map<String, Value>, model: &Model, options: &St
     }
 }
 
-fn insert_tools(
-    payload: &mut Map<String, Value>,
+fn convert_tools(
     model: &Model,
-    context: &Context,
+    tools: &[crate::Tool],
     cache_control: Option<&Value>,
-) {
-    let Some(tools) = context.tools.as_deref() else {
-        return;
-    };
-    if tools.is_empty() {
-        return;
-    }
-
+) -> Result<Vec<Value>, ConstrainedSamplingError> {
+    let supports_strict_tools = compat_bool(model, "supportsStrictTools", false);
     let mut converted: Vec<Value> = tools
         .iter()
         .map(|tool| {
-            let mut input_schema = tool.parameters.clone();
+            let resolved = resolve_json_schema_strict_sampling(tool, supports_strict_tools)?;
+            let strict = resolved.is_some();
+            let mut input_schema = resolved.unwrap_or_else(|| tool.parameters.clone());
             if !input_schema.is_object() {
                 input_schema = json!({});
             }
@@ -393,18 +487,30 @@ fn insert_tools(
                 "description": tool.description,
                 "input_schema": input_schema,
             });
+            if strict {
+                value["strict"] = Value::Bool(true);
+            }
             if compat_bool(model, "supportsEagerToolInputStreaming", true) {
                 value["eager_input_streaming"] = Value::Bool(true);
             }
-            value
+            Ok(value)
         })
-        .collect();
+        .collect::<Result<_, ConstrainedSamplingError>>()?;
     if compat_bool(model, "supportsCacheControlOnTools", true)
         && let (Some(last), Some(cache)) = (converted.last_mut(), cache_control)
     {
         last["cache_control"] = cache.clone();
     }
-    payload.insert("tools".to_owned(), Value::Array(converted));
+    Ok(converted)
+}
+
+fn native_tool_changes(model: &Model, context: &TranscriptContext) -> bool {
+    compat_bool(model, "supportsMidConvoSystemMessages", false)
+        && compat_bool(model, "supportsMidConvoToolChanges", false)
+        && get_initial_system_message(&context.messages)
+            .and_then(|message| message.tools_added.as_deref())
+            .is_some_and(|tools| !tools.is_empty())
+        && !has_tool_redefinitions(&context.messages)
 }
 
 fn cache_control(model: &Model, options: &StreamOptions) -> Option<Value> {
@@ -438,16 +544,44 @@ fn compat_bool(model: &Model, key: &str, default: bool) -> bool {
         .and_then(Value::as_bool)
         .unwrap_or(default)
 }
+fn compat_string<'a>(model: &'a Model, key: &str) -> Option<&'a str> {
+    model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.get(key))
+        .and_then(Value::as_str)
+}
 
 fn extra_bool(options: &StreamOptions, key: StreamOptionKey) -> Option<bool> {
     options.extra_value(key).and_then(Value::as_bool)
 }
 
-fn convert_messages(model: &Model, context: &Context, cache: Option<&Value>) -> Vec<Value> {
+fn convert_messages(
+    model: &Model,
+    context: &TranscriptContext,
+    cache: Option<&Value>,
+    options: &StreamOptions,
+) -> Vec<Value> {
+    let transcript = super::shared::transform_messages(&context.messages, model, |id, _, _| {
+        normalize_tool_call_id(id)
+    });
+    let choice = options.extra_value(StreamOptionKey::TOOL_CHOICE);
+    let native_tools = native_tool_changes(model, context)
+        && !choice.is_some_and(|choice| {
+            choice.as_str() == Some("none")
+                || choice.get("type").and_then(Value::as_str) == Some("none")
+        });
     let mut messages = Vec::new();
-    let mut index = 0;
-    while index < context.messages.len() {
-        match &context.messages[index] {
+    let mut pending_system = Vec::new();
+    let mut index = usize::from(get_initial_system_message(&transcript).is_some());
+    while index < transcript.len() {
+        match &transcript[index] {
+            Message::System(message) => {
+                if let Some(update) = convert_system_update(message, native_tools) {
+                    pending_system.push(update);
+                }
+                index += 1;
+            }
             Message::User(message) => {
                 if let Some(content) = convert_user_content(&message.content) {
                     messages.push(json!({ "role": "user", "content": content }));
@@ -455,6 +589,7 @@ fn convert_messages(model: &Model, context: &Context, cache: Option<&Value>) -> 
                 index += 1;
             }
             Message::Assistant(message) => {
+                messages.append(&mut pending_system);
                 let blocks = convert_assistant_content(
                     model,
                     message,
@@ -467,7 +602,7 @@ fn convert_messages(model: &Model, context: &Context, cache: Option<&Value>) -> 
             }
             Message::ToolResult(_) => {
                 let mut blocks = Vec::new();
-                while let Some(Message::ToolResult(message)) = context.messages.get(index) {
+                while let Some(Message::ToolResult(message)) = transcript.get(index) {
                     blocks.push(json!({
                         "type": "tool_result",
                         "tool_use_id": normalize_tool_call_id(&message.tool_call_id),
@@ -480,16 +615,20 @@ fn convert_messages(model: &Model, context: &Context, cache: Option<&Value>) -> 
             }
         }
     }
+    messages.append(&mut pending_system);
 
     if let (Some(cache), Some(last)) = (cache, messages.last_mut())
-        && last.get("role").and_then(Value::as_str) == Some("user")
+        && matches!(
+            last.get("role").and_then(Value::as_str),
+            Some("user" | "system")
+        )
     {
         let last_content = &mut last["content"];
         if let Some(blocks) = last_content.as_array_mut() {
             if let Some(block) = blocks.last_mut()
                 && matches!(
                     block.get("type").and_then(Value::as_str),
-                    Some("text" | "image" | "tool_result")
+                    Some("text" | "image" | "tool_result" | "tool_addition" | "tool_removal")
                 )
             {
                 block["cache_control"] = cache.clone();
@@ -499,6 +638,29 @@ fn convert_messages(model: &Model, context: &Context, cache: Option<&Value>) -> 
         }
     }
     messages
+}
+
+fn convert_system_update(message: &crate::SystemMessage, native_tools: bool) -> Option<Value> {
+    let text = render_system_message_update(message);
+    let mut blocks = Vec::new();
+    if !text.is_empty() {
+        blocks.push(json!({ "type": "text", "text": sanitize_surrogates(&text) }));
+    }
+    if native_tools {
+        for tool in message.tools_removed.as_deref().unwrap_or_default() {
+            blocks.push(json!({
+                "type": "tool_removal",
+                "tool": { "type": "tool_reference", "name": tool.name }
+            }));
+        }
+        for tool in message.tools_added.as_deref().unwrap_or_default() {
+            blocks.push(json!({
+                "type": "tool_addition",
+                "tool": { "type": "tool_reference", "name": tool.name }
+            }));
+        }
+    }
+    (!blocks.is_empty()).then(|| json!({ "role": "system", "content": blocks }))
 }
 
 fn convert_user_content(content: &UserMessageContent) -> Option<Value> {
@@ -1156,13 +1318,18 @@ enum AdapterError {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests use contextual failure messages"
+)]
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
 
     use super::*;
     use crate::types::{
-        ModelCost, ModelInput, TextContent, Tool, ToolResultMessage, Usage, UserMessage,
+        ConstrainedSampling, ConstrainedSamplingConfig, ModelCost, ModelInput, StrictMode,
+        TextContent, Tool, ToolChoice, ToolResultMessage, Usage, UserMessage,
     };
 
     fn model() -> Model {
@@ -1182,12 +1349,98 @@ mod tests {
                 cache_write: 3.75,
                 tiers: None,
             },
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             context_window: 200_000,
             max_tokens: 8_192,
             headers: None,
             compat: None,
             extra: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn session_affinity_headers_follow_anthropic_compatibility() -> Result<(), String> {
+        let mut model = model();
+        model.compat = Some(json!({
+            "sendSessionAffinityHeaders": true,
+            "sessionAffinityFormat": "openrouter"
+        }));
+        let options = StreamOptions {
+            session_id: Some("session-123".to_owned()),
+            ..StreamOptions::default()
+        };
+        let request = build_request(&Client::new(), &model, &options, &json!({}))
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            request
+                .headers()
+                .get("x-session-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("session-123")
+        );
+        assert!(request.headers().get("x-session-affinity").is_none());
+
+        model.compat = Some(json!({"sendSessionAffinityHeaders": true}));
+        let request = build_request(&Client::new(), &model, &options, &json!({}))
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            request
+                .headers()
+                .get("x-session-affinity")
+                .and_then(|value| value.to_str().ok()),
+            Some("session-123")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_affinity_defaults_yield_to_explicit_overrides() -> Result<(), String> {
+        let client = Client::new();
+        let mut model = model();
+        let mut options = StreamOptions {
+            session_id: Some("session-123".to_owned()),
+            ..StreamOptions::default()
+        };
+        for (provider, base_url) in [
+            ("openrouter", "https://gateway.example"),
+            ("custom", "https://openrouter.ai/api"),
+        ] {
+            model.provider = provider.to_owned();
+            model.base_url = base_url.to_owned();
+            let request = build_request(&client, &model, &options, &json!({}))
+                .map_err(|error| error.to_string())?;
+            assert_eq!(request.headers()["x-session-id"], "session-123");
+            assert!(!request.headers().contains_key("x-session-affinity"));
+        }
+
+        model.compat = Some(json!({"sendSessionAffinityHeaders": false}));
+        let request = build_request(&client, &model, &options, &json!({}))
+            .map_err(|error| error.to_string())?;
+        assert!(!request.headers().contains_key("x-session-id"));
+        assert!(!request.headers().contains_key("x-session-affinity"));
+
+        model.compat = Some(json!({"sessionAffinityFormat": "anthropic"}));
+        let request = build_request(&client, &model, &options, &json!({}))
+            .map_err(|error| error.to_string())?;
+        assert_eq!(request.headers()["x-session-affinity"], "session-123");
+        assert!(!request.headers().contains_key("x-session-id"));
+
+        model.compat = None;
+        model.headers = Some(BTreeMap::from([(
+            "X-Session-Id".to_owned(),
+            "model-session".to_owned(),
+        )]));
+        let request = build_request(&client, &model, &options, &json!({}))
+            .map_err(|error| error.to_string())?;
+        assert_eq!(request.headers()["x-session-id"], "model-session");
+
+        options.headers = Some(BTreeMap::from([("x-session-id".to_owned(), None)]));
+        let request = build_request(&client, &model, &options, &json!({}))
+            .map_err(|error| error.to_string())?;
+        assert!(!request.headers().contains_key("x-session-id"));
+        Ok(())
     }
 
     /// Render one HTTP/1.1 stub reply with an exact `Content-Length`.
@@ -1269,7 +1522,7 @@ mod tests {
                     UserMessageContent::Text("hello".to_owned()),
                     0,
                 )),
-                Message::Assistant({
+                Message::Assistant(Box::new({
                     let mut message =
                         AssistantMessage::new("anthropic-messages", "anthropic", "old", 0);
                     message
@@ -1281,7 +1534,7 @@ mod tests {
                         Map::new(),
                     )));
                     message
-                }),
+                })),
                 Message::ToolResult(ToolResultMessage::new(
                     "bad id/with punctuation and a suffix that makes this identifier much longer than sixty four characters",
                     "read",
@@ -1294,6 +1547,7 @@ mod tests {
                 name: "read".to_owned(),
                 description: "read a file".to_owned(),
                 parameters: json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
+                constrained_sampling: None,
             }]),
         };
         let mut options = StreamOptions {
@@ -1302,7 +1556,8 @@ mod tests {
         };
         options.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(true));
         options.insert_extra(StreamOptionKey::THINKING_BUDGET_TOKENS, Value::from(2048));
-        let payload = build_payload(&model(), &context, &options);
+        let payload = build_payload(&model(), &normalize_context(context.clone()), &options)
+            .expect("ordinary Anthropic payload conversion should succeed");
         assert_eq!(payload["system"][0]["cache_control"]["ttl"], "1h");
         assert_eq!(payload["thinking"]["budget_tokens"], 2048);
         assert_eq!(payload["tools"][0]["eager_input_streaming"], true);
@@ -1319,6 +1574,67 @@ mod tests {
         assert_eq!(payload["messages"][2]["content"][0]["tool_use_id"], tool_id);
     }
     #[test]
+    fn strict_tools_transform_schema_and_require_failures_are_fallible() {
+        let tool = Tool {
+            name: "lookup".into(),
+            description: "Lookup".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            constrained_sampling: Some(ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema {
+                    strict: StrictMode::Prefer,
+                },
+            )),
+        };
+        let context = Context {
+            tools: Some(vec![tool]),
+            ..Context::default()
+        };
+        let mut strict_model = model();
+        strict_model.compat = Some(json!({"supportsStrictTools": true}));
+        let payload = build_payload(
+            &strict_model,
+            &normalize_context(context.clone()),
+            &StreamOptions::default(),
+        )
+        .expect("strict Anthropic payload should succeed");
+        assert_eq!(payload["tools"][0]["strict"], true);
+        assert_eq!(
+            payload["tools"][0]["input_schema"]["additionalProperties"],
+            false
+        );
+
+        let required = Tool {
+            constrained_sampling: Some(ConstrainedSampling::Config(
+                ConstrainedSamplingConfig::JsonSchema {
+                    strict: StrictMode::Require,
+                },
+            )),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"$ref": "#/$defs/path"}}
+            }),
+            ..context.tools.as_ref().expect("tool exists")[0].clone()
+        };
+        let required_context = Context {
+            tools: Some(vec![required]),
+            ..Context::default()
+        };
+        let error = build_payload(
+            &strict_model,
+            &normalize_context(required_context.clone()),
+            &StreamOptions::default(),
+        )
+        .expect_err("unsupported required strict schema must fail");
+        assert_eq!(
+            error.to_string(),
+            "Tool \"lookup\" requires JSON-schema constrained sampling, but $ref schemas are unsupported."
+        );
+    }
+    #[test]
     fn temperature_yields_to_thinking_and_thinking_requests_default() {
         let context = Context::default();
 
@@ -1327,7 +1643,8 @@ mod tests {
             temperature: Some(0.7),
             ..StreamOptions::default()
         };
-        let payload = build_payload(&model(), &context, &options);
+        let payload = build_payload(&model(), &normalize_context(context.clone()), &options)
+            .expect("ordinary Anthropic payload conversion should succeed");
         assert_eq!(payload["temperature"], 0.7);
 
         // Enabled thinking omits temperature and defaults budget and display.
@@ -1336,7 +1653,8 @@ mod tests {
             ..StreamOptions::default()
         };
         thinking.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(true));
-        let payload = build_payload(&model(), &context, &thinking);
+        let payload = build_payload(&model(), &normalize_context(context.clone()), &thinking)
+            .expect("ordinary Anthropic payload conversion should succeed");
         assert!(payload.get("temperature").is_none());
         assert_eq!(payload["thinking"]["type"], "enabled");
         assert_eq!(payload["thinking"]["budget_tokens"], 1024);
@@ -1348,7 +1666,8 @@ mod tests {
         let mut options = StreamOptions::default();
         options.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(true));
         options.insert_extra(StreamOptionKey::EFFORT, Value::String("high".to_owned()));
-        let payload = build_payload(&adaptive, &context, &options);
+        let payload = build_payload(&adaptive, &normalize_context(context.clone()), &options)
+            .expect("ordinary Anthropic payload conversion should succeed");
         assert_eq!(payload["thinking"]["type"], "adaptive");
         assert_eq!(payload["output_config"]["effort"], "high");
     }
@@ -1360,7 +1679,8 @@ mod tests {
         options.insert_extra(StreamOptionKey::THINKING_ENABLED, Value::Bool(false));
 
         // Plain reasoning model: explicit disable is sent (upstream parity).
-        let payload = build_payload(&model(), &context, &options);
+        let payload = build_payload(&model(), &normalize_context(context.clone()), &options)
+            .expect("ordinary Anthropic payload conversion should succeed");
         assert_eq!(payload["thinking"]["type"], "disabled");
 
         // off:null pins the level as unsupported: the disable is omitted.
@@ -1369,8 +1689,136 @@ mod tests {
             ModelThinkingLevel::Off,
             None,
         )]));
-        let payload = build_payload(&adaptive, &context, &options);
+        let payload = build_payload(&adaptive, &normalize_context(context.clone()), &options)
+            .expect("ordinary Anthropic payload conversion should succeed");
         assert!(payload.get("thinking").is_none());
+    }
+
+    #[test]
+    fn tool_choice_none_omits_tool_choice_and_tools() {
+        let context = Context {
+            tools: Some(vec![Tool {
+                name: "read".to_owned(),
+                description: "read a file".to_owned(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+                constrained_sampling: None,
+            }]),
+            ..Context::default()
+        };
+        let mut options = StreamOptions::default();
+        options.insert_extra(
+            StreamOptionKey::TOOL_CHOICE,
+            Value::String(ToolChoice::None.as_str().to_owned()),
+        );
+        let payload = build_payload(&model(), &normalize_context(context.clone()), &options)
+            .expect("neutral tool choice payload should succeed");
+        assert!(payload.get("tool_choice").is_none());
+        assert!(payload.get("tools").is_none());
+
+        // A supported choice still selects among the advertised tools.
+        options.insert_extra(
+            StreamOptionKey::TOOL_CHOICE,
+            Value::String(ToolChoice::Auto.as_str().to_owned()),
+        );
+        let payload = build_payload(&model(), &normalize_context(context.clone()), &options)
+            .expect("auto tool choice payload should succeed");
+        assert_eq!(payload["tool_choice"], json!({ "type": "auto" }));
+        assert_eq!(payload["tools"][0]["name"], "read");
+    }
+
+    #[test]
+    fn system_tool_changes_follow_results_and_defer_later_tools() -> Result<(), String> {
+        let mut model = model();
+        model.compat = Some(json!({
+            "supportsMidConvoSystemMessages": true,
+            "supportsMidConvoToolChanges": true
+        }));
+        let read_tool = Tool {
+            name: "read".to_owned(),
+            description: "Read".to_owned(),
+            parameters: json!({"type": "object"}),
+            constrained_sampling: None,
+        };
+        let write_tool = Tool {
+            name: "write".to_owned(),
+            description: "Write".to_owned(),
+            ..read_tool.clone()
+        };
+        let mut assistant = AssistantMessage::new(&model.api, &model.provider, &model.id, 1);
+        assistant.stop_reason = StopReason::ToolUse;
+        assistant
+            .content
+            .push(AssistantContent::ToolCall(ToolCall::new(
+                "call",
+                "read",
+                Map::new(),
+            )));
+        let mut update = crate::SystemMessage::new("policy update", 2);
+        update.tools_removed = Some(vec![crate::ToolReference {
+            name: "read".to_owned(),
+        }]);
+        update.tools_added = Some(vec![write_tool]);
+        let context = normalize_context(Context {
+            system_prompt: Some("initial policy".to_owned()),
+            tools: Some(vec![read_tool]),
+            messages: vec![
+                Message::Assistant(Box::new(assistant)),
+                Message::System(Box::new(update)),
+                Message::ToolResult(ToolResultMessage::new(
+                    "call",
+                    "read",
+                    vec![ToolResultContent::Text(TextContent::new("result"))],
+                    false,
+                    3,
+                )),
+            ],
+        });
+        let options = StreamOptions::default();
+        let payload =
+            build_payload(&model, &context, &options).map_err(|error| error.to_string())?;
+        assert_eq!(payload["messages"][0]["role"], "assistant");
+        assert_eq!(payload["messages"][1]["content"][0]["type"], "tool_result");
+        assert_eq!(payload["messages"][2]["role"], "system");
+        assert_eq!(payload["messages"][2]["content"][1]["type"], "tool_removal");
+        assert_eq!(
+            payload["messages"][2]["content"][2]["type"],
+            "tool_addition"
+        );
+        assert_eq!(payload["tools"][0]["name"], "read");
+        assert!(payload["tools"][0].get("defer_loading").is_none());
+        assert_eq!(payload["tools"][2]["name"], "write");
+        assert_eq!(payload["tools"][2]["defer_loading"], true);
+        let request = build_request(&Client::new(), &model, &options, &payload)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            request.headers()["anthropic-beta"],
+            "mid-conversation-tool-changes-2026-07-01",
+        );
+        let body = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .ok_or("missing HTTP body")?;
+        let body: Value = serde_json::from_slice(body).map_err(|error| error.to_string())?;
+        assert!(body.get("betas").is_none());
+
+        model.compat = None;
+        let collapsed = resolve_transcript(context, false);
+        let payload =
+            build_payload(&model, &collapsed, &options).map_err(|error| error.to_string())?;
+        assert_eq!(payload["tools"][0]["name"], "write");
+        assert_eq!(payload["messages"][1]["content"][0]["type"], "tool_result");
+        assert!(
+            payload["messages"]
+                .as_array()
+                .ok_or("missing messages")?
+                .iter()
+                .all(|message| message["role"] != "system")
+        );
+        Ok(())
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Terminal mode guard with ordered activate/restore and emergency paths.
 
+use std::fmt;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +13,12 @@ use crossterm::event::{
 };
 use crossterm::queue;
 use crossterm::style::ResetColor;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
+};
+
+use crate::terminal::ScreenMode;
 
 /// Desired Kitty keyboard flags: disambiguate | event types | alternate keys (= 7).
 pub const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags =
@@ -20,11 +26,27 @@ pub const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags =
         .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
         .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
 
-/// Exact signal-safe terminal recovery sequence used by panic/signal handlers.
-pub const EMERGENCY_RESTORE_BYTES: &[u8] =
-    b"\x1b[?2026l\x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[0m";
+/// Complete signal-safe terminal recovery sequence for a process that entered fullscreen.
+///
+/// Mouse modes and wrapping are always restored. The emergency writer omits
+/// alternate-screen exit until this process has entered it, preserving a
+/// parent application's alternate screen.
+pub const EMERGENCY_RESTORE_BYTES: &[u8] = b"\x1b[?2026l\
+\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\
+\x1b[?7h\x1b[?1049l\x1b[<u\x1b[?2004l\
+\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[0m";
 
-/// Ordered restore stack entry.
+/// Complete signal-safe terminal recovery sequence for a process that has not entered fullscreen.
+pub const EMERGENCY_REGULAR_RESTORE_BYTES: &[u8] = b"\x1b[?2026l\
+\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\
+\x1b[?7h\x1b[<u\x1b[?2004l\
+\x1b[?1004l\x1b[?2031l\x1b[?25h\x1b[0m";
+
+// Historical rather than guard-local: rollback/drop must not erase emergency
+// recovery coverage after a successful entry write.
+static ENTERED_ALTERNATE_SCREEN: AtomicBool = AtomicBool::new(false);
+
+/// Ordered restore stack entry for regular terminal modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestoreStep {
     RawMode,
@@ -35,10 +57,51 @@ enum RestoreStep {
     ColorSchemeNotify,
 }
 
+/// Ordered fullscreen mode activation step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullscreenStep {
+    AlternateScreen,
+    AutowrapDisabled,
+    MouseNormal,
+    MouseButton,
+    MouseAll,
+    MouseSgr,
+}
+
+/// Compound fullscreen-activation failure.
+///
+/// Carries the primary activation error plus, when the best-effort unwind
+/// also failed, its error. The outer [`io::Error`] preserves the primary
+/// [`io::ErrorKind`]; the original primary error stays reachable through
+/// [`std::error::Error::source`].
+#[derive(Debug)]
+struct FullscreenActivationError {
+    primary: io::Error,
+    rollback: Option<io::Error>,
+}
+
+impl fmt::Display for FullscreenActivationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "fullscreen activation failed: {}", self.primary)?;
+        if let Some(rollback) = &self.rollback {
+            write!(formatter, "; restore also failed: {rollback}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for FullscreenActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
 /// Owns raw mode and terminal modes; restores on drop.
 pub struct TerminalGuard<W: Write> {
     writer: W,
     applied: Vec<RestoreStep>,
+    fullscreen_applied: Vec<FullscreenStep>,
+    screen_mode: ScreenMode,
     restored: bool,
     emergency: Arc<AtomicBool>,
     viewport_bottom_row: u16,
@@ -50,10 +113,18 @@ impl<W: Write> TerminalGuard<W> {
         Self {
             writer,
             applied: Vec::new(),
+            fullscreen_applied: Vec::new(),
+            screen_mode: ScreenMode::Regular,
             restored: false,
             emergency: Arc::new(AtomicBool::new(false)),
             viewport_bottom_row: 0,
         }
+    }
+
+    /// Current guard-owned screen mode.
+    #[must_use]
+    pub fn screen_mode(&self) -> ScreenMode {
+        self.screen_mode
     }
 
     /// Shared emergency flag for panic/signal hooks.
@@ -114,6 +185,179 @@ impl<W: Write> TerminalGuard<W> {
         Ok(())
     }
 
+    /// Enter the fullscreen terminal modes while retaining the same writer.
+    ///
+    /// Every successful mode write is recorded before the next step is
+    /// attempted. Activation runs as one fallible path — the ordered steps
+    /// then the flush — and on failure the recorded prefix is unwound exactly
+    /// once, in the opposite order. The returned error preserves the primary
+    /// [`io::ErrorKind`] and original error and additionally reports a
+    /// rollback (unwind) failure instead of discarding it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the guard is already restored, fullscreen
+    /// mode activation fails, or its rollback cannot complete.
+    pub fn enter_fullscreen(&mut self) -> io::Result<()> {
+        if self.restored {
+            return Err(io::Error::other("terminal guard already restored"));
+        }
+        if self.screen_mode == ScreenMode::Fullscreen {
+            return Ok(());
+        }
+        if self.applied.is_empty() {
+            self.activate(false)?;
+        }
+
+        let mut steps = vec![
+            FullscreenStep::AlternateScreen,
+            FullscreenStep::AutowrapDisabled,
+            FullscreenStep::MouseNormal,
+            FullscreenStep::MouseButton,
+        ];
+        if !multiplexer_detected() {
+            steps.push(FullscreenStep::MouseAll);
+        }
+        steps.push(FullscreenStep::MouseSgr);
+
+        if let Err(primary) = self.activate_fullscreen_steps(&steps) {
+            let rollback = self.restore_fullscreen_modes().err();
+            let kind = primary.kind();
+            return Err(io::Error::new(
+                kind,
+                FullscreenActivationError { primary, rollback },
+            ));
+        }
+        self.screen_mode = ScreenMode::Fullscreen;
+        Ok(())
+    }
+
+    /// One fallible activation path: apply every missing step, flushing the
+    /// alternate-screen entry before later steps, then flush again at the end.
+    fn activate_fullscreen_steps(&mut self, steps: &[FullscreenStep]) -> io::Result<()> {
+        for step in steps {
+            // A failed teardown keeps its mode recorded as unresolved; retain
+            // that entry while adding only the missing fullscreen modes.
+            if !self.fullscreen_applied.contains(step) {
+                self.apply_fullscreen_step(*step)?;
+            }
+        }
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Leave fullscreen terminal modes without parking the cursor in
+    /// scrollback. The regular inline cursor restoration remains deferred to
+    /// the normal guard restore path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when fullscreen mode teardown cannot complete.
+    pub fn leave_fullscreen(&mut self) -> io::Result<()> {
+        if self.restored {
+            self.screen_mode = ScreenMode::Regular;
+            self.fullscreen_applied.clear();
+            return Ok(());
+        }
+        if self.screen_mode == ScreenMode::Regular && self.fullscreen_applied.is_empty() {
+            return Ok(());
+        }
+        let result = self.restore_fullscreen_modes();
+        // Report Regular even after a failed teardown so a rollback can
+        // re-enter and rebuild the complete fullscreen set. Failed steps
+        // remain recorded for a direct retry or final restore.
+        self.screen_mode = ScreenMode::Regular;
+        result
+    }
+
+    /// Switch only the guard-owned terminal modes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when switching the guard-owned terminal modes
+    /// cannot complete.
+    pub fn set_screen_mode(&mut self, mode: ScreenMode) -> io::Result<()> {
+        match mode {
+            ScreenMode::Regular => self.leave_fullscreen(),
+            ScreenMode::Fullscreen => self.enter_fullscreen(),
+        }
+    }
+
+    fn apply_fullscreen_step(&mut self, step: FullscreenStep) -> io::Result<()> {
+        match step {
+            FullscreenStep::AlternateScreen => {
+                queue!(self.writer, EnterAlternateScreen)?;
+                // `queue!` may only buffer the entry. Arm emergency cleanup
+                // after the flush that proves the terminal saw it.
+                self.writer.flush()?;
+                ENTERED_ALTERNATE_SCREEN.store(true, Ordering::Release);
+            }
+            FullscreenStep::AutowrapDisabled => {
+                queue!(self.writer, DisableLineWrap)?;
+            }
+            FullscreenStep::MouseNormal => self.writer.write_all(b"\x1b[?1000h")?,
+            FullscreenStep::MouseButton => self.writer.write_all(b"\x1b[?1002h")?,
+            FullscreenStep::MouseAll => self.writer.write_all(b"\x1b[?1003h")?,
+            FullscreenStep::MouseSgr => self.writer.write_all(b"\x1b[?1006h")?,
+        }
+        self.fullscreen_applied.push(step);
+        Ok(())
+    }
+
+    fn restore_fullscreen_modes(&mut self) -> io::Result<()> {
+        if self.fullscreen_applied.is_empty() && self.screen_mode == ScreenMode::Regular {
+            return Ok(());
+        }
+        let mut first_error = None;
+        // Walk the activation stack in reverse (last activated first), removing
+        // only the steps that successfully restore. Failed steps stay on the
+        // applied list so the caller can retry.
+        let mut i = self.fullscreen_applied.len();
+        let mut left_alternate = false;
+        while i > 0 {
+            i -= 1;
+            let step = self.fullscreen_applied[i];
+            let result = match step {
+                FullscreenStep::AlternateScreen => queue!(self.writer, LeaveAlternateScreen),
+                FullscreenStep::AutowrapDisabled => queue!(self.writer, EnableLineWrap),
+                FullscreenStep::MouseNormal => self.writer.write_all(b"\x1b[?1000l"),
+                FullscreenStep::MouseButton => self.writer.write_all(b"\x1b[?1002l"),
+                FullscreenStep::MouseAll => self.writer.write_all(b"\x1b[?1003l"),
+                FullscreenStep::MouseSgr => self.writer.write_all(b"\x1b[?1006l"),
+            };
+            if let Err(error) = result {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+            if step == FullscreenStep::AlternateScreen {
+                left_alternate = true;
+            }
+            self.fullscreen_applied.remove(i);
+        }
+        // Show after leaving 1049 so a hot switch never emits inline cursor
+        // parking or a scroll while the alternate screen is still active.
+        if let Err(error) = queue!(self.writer, Show)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        let flush_result = self.writer.flush();
+        // The leave is only durable once the flush lands; clearing the latch
+        // earlier would let a later panic skip the 1049 exit while the
+        // terminal may still own the alternate screen.
+        if left_alternate && flush_result.is_ok() {
+            ENTERED_ALTERNATE_SCREEN.store(false, Ordering::Release);
+        }
+        if let Err(error) = flush_result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Suspend modes without dropping (ctrl+Z path).
     ///
     /// # Errors
@@ -131,13 +375,34 @@ impl<W: Write> TerminalGuard<W> {
 
     /// Re-apply modes after resume.
     ///
+    /// A failed fullscreen re-entry keeps the requested screen mode recorded
+    /// so a later [`Self::resume`] retries the restoration.
+    ///
     /// # Errors
     ///
     /// Returns an I/O error when terminal modes cannot be re-enabled.
     pub fn resume(&mut self, enable_kitty: bool) -> io::Result<()> {
+        let desired_mode = self.screen_mode;
         self.restored = false;
         self.applied.clear();
-        self.activate(enable_kitty)
+        self.fullscreen_applied.clear();
+        self.screen_mode = ScreenMode::Regular;
+        self.activate(enable_kitty)?;
+        self.reenter_screen_mode(desired_mode)
+    }
+
+    /// Re-enter the remembered screen mode after re-activation.
+    fn reenter_screen_mode(&mut self, desired_mode: ScreenMode) -> io::Result<()> {
+        if desired_mode == ScreenMode::Fullscreen
+            && let Err(error) = self.enter_fullscreen()
+        {
+            // The runtime still considers fullscreen active after SIGCONT:
+            // keep the requested mode latched so the next resume retries the
+            // fullscreen restoration instead of silently staying regular.
+            self.screen_mode = desired_mode;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Explicit restore (normal unwind).
@@ -187,6 +452,11 @@ impl<W: Write> TerminalGuard<W> {
         if self.restored {
             return;
         }
+        // Fullscreen teardown must precede the regular cursor parking below:
+        // the inline MoveTo + CRLF sequence is forbidden while 1049 is active.
+        let mode = self.screen_mode;
+        let _ = self.restore_fullscreen_modes();
+        self.screen_mode = mode;
         self.restored = true;
 
         // Stage-3 transactions always close DEC synchronized output themselves.
@@ -229,6 +499,15 @@ impl<W: Write> TerminalGuard<W> {
     }
 }
 
+fn multiplexer_detected() -> bool {
+    ["TMUX", "ZELLIJ", "STY"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+        || std::env::var_os("TERM")
+            .and_then(|value| value.into_string().ok())
+            .is_some_and(|term| term.starts_with("tmux") || term.starts_with("screen"))
+}
+
 impl<W: Write> Drop for TerminalGuard<W> {
     fn drop(&mut self) {
         self.restore_modes(true);
@@ -256,6 +535,18 @@ impl GuardScript {
         }
         self.applied.push("cursor_hidden");
         self.applied.push("color_scheme_notify");
+    }
+
+    /// Simulate the fullscreen activation order.
+    pub fn enter_fullscreen(&mut self, multiplexer: bool) {
+        self.applied.push("alternate_screen");
+        self.applied.push("autowrap_disabled");
+        self.applied.push("mouse_normal");
+        self.applied.push("mouse_button");
+        if !multiplexer {
+            self.applied.push("mouse_all");
+        }
+        self.applied.push("mouse_sgr");
     }
 
     /// Simulate restore reverse ordering (no unpaired sync close).
@@ -310,7 +601,12 @@ pub fn install_panic_emergency_hook(
 ///
 /// Returns an I/O error if writing or flushing the restore sequence fails.
 pub fn write_emergency_restore_bytes<W: Write>(writer: &mut W) -> io::Result<()> {
-    writer.write_all(EMERGENCY_RESTORE_BYTES)?;
+    let bytes = if ENTERED_ALTERNATE_SCREEN.load(Ordering::Acquire) {
+        EMERGENCY_RESTORE_BYTES
+    } else {
+        EMERGENCY_REGULAR_RESTORE_BYTES
+    };
+    writer.write_all(bytes)?;
     writer.flush()
 }
 
@@ -473,4 +769,306 @@ mod tests {
         assert_eq!(first, b"\x1b[?2031l");
         assert!(!first.windows(8).any(|window| window == b"\x1b[?2026l"));
     }
+
+    /// Writer that accepts writes up to a byte budget, then latches: every
+    /// later write fails while every attempt is still recorded. The attempt
+    /// log lets a test prove the rollback attempted every recorded step even
+    /// after its first write failure.
+    struct LatchingFailureWriter {
+        bytes: Vec<u8>,
+        attempted: Vec<Vec<u8>>,
+        budget: usize,
+    }
+
+    impl Write for LatchingFailureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_all(buf)?;
+            Ok(buf.len())
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            self.attempted.push(buf.to_vec());
+            if self.bytes.len() + buf.len() > self.budget {
+                return Err(io::Error::other("latched write failure"));
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fullscreen_activation_failure_reports_primary_and_rollback() -> io::Result<()> {
+        // Budget 13 accepts exactly CSI ?1049h (8) + CSI ?7l (5); the third
+        // activation write (CSI ?1000h) fails, and every later write fails.
+        let mut guard = TerminalGuard::new(LatchingFailureWriter {
+            bytes: Vec::new(),
+            attempted: Vec::new(),
+            budget: 13,
+        });
+        // Seed one applied step so enter_fullscreen skips real raw-mode
+        // activation (enable_raw_mode needs a tty).
+        guard.applied.push(RestoreStep::RawMode);
+
+        let Err(error) = guard.enter_fullscreen() else {
+            return Err(io::Error::other("activation must fail at the third step"));
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            error.to_string().contains("restore also failed"),
+            "compound error must expose the rollback failure: {error}"
+        );
+        let compound = error
+            .get_ref()
+            .and_then(|payload| payload.downcast_ref::<FullscreenActivationError>())
+            .ok_or_else(|| io::Error::other("compound activation payload"))?;
+        assert_eq!(compound.primary.to_string(), "latched write failure");
+        let rollback = compound
+            .rollback
+            .as_ref()
+            .ok_or_else(|| io::Error::other("rollback failure must be reported, not swallowed"))?;
+        assert_eq!(rollback.to_string(), "latched write failure");
+
+        // Only the two successful activation steps reached the wire.
+        assert_eq!(guard.writer().bytes, b"\x1b[?1049h\x1b[?7l");
+        // Every activation step and every restore step must have attempted a
+        // write — including the second restore step (CSI ?1049l) even though
+        // the first restore write (CSI ?7h) already failed.
+        let attempted: Vec<&[u8]> = guard.writer().attempted.iter().map(Vec::as_slice).collect();
+        for expected in [
+            b"\x1b[?1049h".as_slice(), // activation step 1 (recorded)
+            b"\x1b[?7l".as_slice(),    // activation step 2 (recorded)
+            b"\x1b[?1000h".as_slice(), // activation step 3 (primary failure)
+            b"\x1b[?7h".as_slice(),    // restore step 2 (first rollback write fails)
+            b"\x1b[?1049l".as_slice(), // restore step 1 (attempted anyway)
+            b"\x1b[?25h".as_slice(),   // cursor Show unwind
+        ] {
+            assert!(
+                attempted.contains(&expected),
+                "missing write attempt {expected:?}"
+            );
+        }
+        // A failed switch must not latch the fullscreen bookkeeping.
+        assert_eq!(guard.screen_mode(), ScreenMode::Regular);
+        Ok(())
+    }
+
+    #[test]
+    fn leave_fullscreen_retains_failed_steps_and_reports_regular() {
+        // Activation order: alternate screen, then autowrap, then SGR mouse.
+        // Budget 15 lets the first two restore writes (SGR mouse 8,
+        // autowrap 5) succeed, then fails the alternate-screen restore (8)
+        // and Show. The failed step stays recorded for retry while the
+        // logical mode reports Regular so a rollback can re-enter fullscreen.
+        let mut guard = TerminalGuard::new(LatchingFailureWriter {
+            bytes: Vec::new(),
+            attempted: Vec::new(),
+            budget: 15,
+        });
+        guard.applied.push(RestoreStep::RawMode);
+        guard.fullscreen_applied = vec![
+            FullscreenStep::AlternateScreen,
+            FullscreenStep::AutowrapDisabled,
+            FullscreenStep::MouseSgr,
+        ];
+        guard.screen_mode = ScreenMode::Fullscreen;
+
+        let result = guard.leave_fullscreen();
+        assert!(
+            result.is_err(),
+            "leave_fullscreen must report the failed restore"
+        );
+        assert_eq!(
+            guard.screen_mode(),
+            ScreenMode::Regular,
+            "failed teardown must permit fullscreen rollback"
+        );
+        assert_eq!(
+            guard.fullscreen_applied,
+            [FullscreenStep::AlternateScreen],
+            "only successfully restored steps should be removed"
+        );
+
+        // Increase the budget and retry; the remaining step, Show, and flush
+        // now all succeed, so the mode remains Regular with no steps pending.
+        guard.writer_mut().budget = 100;
+        let result = guard.leave_fullscreen();
+        assert!(result.is_ok(), "retry should succeed with a healthy writer");
+        assert_eq!(
+            guard.screen_mode(),
+            ScreenMode::Regular,
+            "mode remains Regular after full success"
+        );
+        assert!(guard.fullscreen_applied.is_empty(), "all steps restored");
+    }
+
+    #[test]
+    fn failed_leave_reentry_reapplies_missing_fullscreen_steps() -> io::Result<()> {
+        let mut guard = TerminalGuard::new(LatchingFailureWriter {
+            bytes: Vec::new(),
+            attempted: Vec::new(),
+            budget: 15,
+        });
+        guard.applied.push(RestoreStep::RawMode);
+        guard.fullscreen_applied = vec![
+            FullscreenStep::AlternateScreen,
+            FullscreenStep::AutowrapDisabled,
+            FullscreenStep::MouseSgr,
+        ];
+        guard.screen_mode = ScreenMode::Fullscreen;
+
+        let result = guard.leave_fullscreen();
+        assert!(result.is_err(), "the seeded teardown must fail first");
+        guard.writer_mut().budget = 100;
+
+        // Re-entry keeps the unresolved mode and adds only missing modes.
+        guard.enter_fullscreen()?;
+        let mut expected = vec![
+            FullscreenStep::AlternateScreen,
+            FullscreenStep::AutowrapDisabled,
+            FullscreenStep::MouseNormal,
+            FullscreenStep::MouseButton,
+        ];
+        if !multiplexer_detected() {
+            expected.push(FullscreenStep::MouseAll);
+        }
+        expected.push(FullscreenStep::MouseSgr);
+        assert_eq!(guard.screen_mode(), ScreenMode::Fullscreen);
+        assert_eq!(
+            guard.fullscreen_applied, expected,
+            "re-entry must not duplicate or lose fullscreen steps"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn leave_fullscreen_clears_alternate_screen_latch_only_after_flush() -> io::Result<()> {
+        // A successful leave must clear the process-global latch so a later
+        // panic in regular mode does not emit CSI ? 1049 l into a screen this
+        // process no longer owns.
+        let mut guard = TerminalGuard::new(Cursor::new(Vec::new()));
+        guard.applied.push(RestoreStep::RawMode);
+        guard.enter_fullscreen()?;
+        assert!(ENTERED_ALTERNATE_SCREEN.load(Ordering::Acquire));
+
+        guard.leave_fullscreen()?;
+        assert!(
+            !ENTERED_ALTERNATE_SCREEN.load(Ordering::Acquire),
+            "flushed leave must clear the latch"
+        );
+
+        // A leave whose writes never reach the terminal keeps the latch: the
+        // alternate screen may still be active, so emergency restore must
+        // still emit the 1049 exit.
+        let mut guard = TerminalGuard::new(LatchingFailureWriter {
+            bytes: Vec::new(),
+            attempted: Vec::new(),
+            budget: 0,
+        });
+        guard.applied.push(RestoreStep::RawMode);
+        guard.fullscreen_applied = vec![FullscreenStep::AlternateScreen];
+        guard.screen_mode = ScreenMode::Fullscreen;
+        ENTERED_ALTERNATE_SCREEN.store(true, Ordering::Release);
+
+        let result = guard.leave_fullscreen();
+        assert!(result.is_err(), "failed teardown must report an error");
+        assert!(
+            ENTERED_ALTERNATE_SCREEN.load(Ordering::Acquire),
+            "unflushed leave must keep the latch"
+        );
+        ENTERED_ALTERNATE_SCREEN.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    #[test]
+    fn restored_fullscreen_guard_rejects_reentry() {
+        let mut guard = TerminalGuard::new(Cursor::new(Vec::new()));
+        guard.screen_mode = ScreenMode::Fullscreen;
+
+        guard.restore_modes(false);
+
+        let result = guard.enter_fullscreen();
+        assert!(result.is_err(), "restored guards must reject re-entry");
+        assert!(
+            !guard
+                .writer()
+                .get_ref()
+                .windows(8)
+                .any(|window| window == b"\x1b[?1049h"),
+            "re-entry must not report success without activation"
+        );
+    }
+    // MUTATION RECIPE — reverting `enter_fullscreen` to the pre-fix shape
+    // must fail the test above:
+    //     if let Err(error) = self.activate_fullscreen_steps(&steps) {
+    //         self.restore_fullscreen_modes(); // unwind result discarded
+    //         return Err(error);
+    //     }
+    // The discarded unwind result drops the rollback error, so the
+    // `rollback ... expect` assertion fails.
+
+    #[test]
+    fn failed_resume_reentry_keeps_fullscreen_desired_for_retry() -> io::Result<()> {
+        // Resume order: the seeded RawMode step lets fullscreen entry skip
+        // real raw-mode activation (enable_raw_mode needs a tty). Budget 13
+        // accepts exactly CSI ?1049h (8) + CSI ?7l (5); the third entry write
+        // (CSI ?1000h) fails and latches, so the re-entry cannot succeed.
+        let mut guard = TerminalGuard::new(LatchingFailureWriter {
+            bytes: Vec::new(),
+            attempted: Vec::new(),
+            budget: 13,
+        });
+        guard.applied.push(RestoreStep::RawMode);
+
+        // First resume attempt: the regular modes re-applied fine, so the
+        // re-entry below runs with the reset (empty) fullscreen bookkeeping.
+        let result = guard.reenter_screen_mode(ScreenMode::Fullscreen);
+        assert!(result.is_err(), "the seeded re-entry must fail");
+        assert_eq!(
+            guard.screen_mode(),
+            ScreenMode::Fullscreen,
+            "a failed re-entry must keep the desired mode for the next retry"
+        );
+        assert_eq!(
+            guard.fullscreen_applied,
+            [
+                FullscreenStep::AlternateScreen,
+                FullscreenStep::AutowrapDisabled
+            ],
+            "failed steps stay recorded while the desired mode is latched"
+        );
+
+        // A later resume retries: it clears the bookkeeping and re-enters
+        // fullscreen from Regular with a healthy writer.
+        guard.writer_mut().budget = 100;
+        guard.fullscreen_applied.clear();
+        guard.screen_mode = ScreenMode::Regular;
+        guard.reenter_screen_mode(ScreenMode::Fullscreen)?;
+
+        let mut expected = vec![
+            FullscreenStep::AlternateScreen,
+            FullscreenStep::AutowrapDisabled,
+            FullscreenStep::MouseNormal,
+            FullscreenStep::MouseButton,
+        ];
+        if !multiplexer_detected() {
+            expected.push(FullscreenStep::MouseAll);
+        }
+        expected.push(FullscreenStep::MouseSgr);
+        assert_eq!(guard.screen_mode(), ScreenMode::Fullscreen);
+        assert_eq!(
+            guard.fullscreen_applied, expected,
+            "the retry must rebuild the complete fullscreen set"
+        );
+        Ok(())
+    }
+    // MUTATION RECIPE — reverting `resume` to the pre-fix shape
+    //     if desired_mode == ScreenMode::Fullscreen {
+    //         self.enter_fullscreen()?;
+    //     }
+    // must fail the test above: the failed re-entry leaves the guard Regular,
+    // so the "desired mode for the next retry" assertion fails.
 }

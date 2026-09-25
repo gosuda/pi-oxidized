@@ -111,38 +111,37 @@ fn match_query(normalized_query: &str, text_lower: &str) -> FuzzyMatch {
 
 fn swap_alpha_numeric(query: &str) -> String {
     let bytes = query.as_bytes();
-    if bytes.is_empty() {
+    if bytes.len() < 2 {
         return String::new();
     }
-    let mut i = 0usize;
-    if bytes[0].is_ascii_lowercase() {
-        while i < bytes.len() && bytes[i].is_ascii_lowercase() {
-            i += 1;
-        }
-        let letters = &query[..i];
-        let mut j = i;
-        while j < bytes.len() && bytes[j].is_ascii_digit() {
-            j += 1;
-        }
-        if i > 0 && j > i && j == bytes.len() {
-            return format!("{}{letters}", &query[i..j]);
-        }
+    let (i, j) = if bytes[0].is_ascii_lowercase() {
+        let i_end = bytes
+            .iter()
+            .position(|&b| !b.is_ascii_lowercase())
+            .unwrap_or(bytes.len());
+        let j_end = bytes[i_end..]
+            .iter()
+            .position(|&b| !b.is_ascii_digit())
+            .map_or(bytes.len(), |p| i_end + p);
+        (i_end, j_end)
+    } else if bytes[0].is_ascii_digit() {
+        let i_end = bytes
+            .iter()
+            .position(|&b| !b.is_ascii_digit())
+            .unwrap_or(bytes.len());
+        let j_end = bytes[i_end..]
+            .iter()
+            .position(|&b| !b.is_ascii_lowercase())
+            .map_or(bytes.len(), |p| i_end + p);
+        (i_end, j_end)
+    } else {
         return String::new();
+    };
+    if i > 0 && j > i && j == bytes.len() {
+        format!("{}{}", &query[i..j], &query[..i])
+    } else {
+        String::new()
     }
-    if bytes[0].is_ascii_digit() {
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        let digits = &query[..i];
-        let mut j = i;
-        while j < bytes.len() && bytes[j].is_ascii_lowercase() {
-            j += 1;
-        }
-        if i > 0 && j > i && j == bytes.len() {
-            return format!("{}{digits}", &query[i..j]);
-        }
-    }
-    String::new()
 }
 
 /// Filter and sort items by fuzzy match quality (best first).

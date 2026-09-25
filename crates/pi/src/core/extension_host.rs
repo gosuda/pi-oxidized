@@ -22,11 +22,11 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use pi_agent::{AfterToolCallResult, AgentMessage, AgentTool, BeforeToolCallResult};
-use pi_ai::{AssistantMessage, AssistantMessageEvent, ToolResultContent};
+use pi_ai::{AssistantMessage, AssistantMessageEvent, ConstrainedSampling, ToolResultContent};
 use pi_ext::adapters::{
     self, CommandRegistration, CommandSourceInfo, ExtensionAgentTool, ExtensionProvider,
-    FlagRegistration, ProviderRegistration, Registry, RendererRegistration, ShortcutRegistration,
-    ToolRegistration,
+    FlagRegistration, ProviderCapabilities, ProviderRegistration, Registry, RendererRegistration,
+    ShortcutRegistration, ToolRegistration,
 };
 use pi_ext::client::{
     HostClient, HostClientError, HostNotification, HostSessionControlEvent, HostSessionRequest,
@@ -45,13 +45,15 @@ use serde_json::{Map, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use super::agent_session::bridge_types::{
-    BridgeMethod, BridgeRequestId, CommandCatalogEntry, CompactRequest, ExtensionHostError,
-    ForkRequest, NavigateTreeRequest, NewSessionRequest, SessionCommand, SessionCommandEnvelope,
-    SessionState, SetModelRequest, SetupEntriesRequest, SwitchSessionRequest,
+    BoundaryPreviewRequest, BridgeMethod, BridgeRequestId, CommandCatalogEntry, CompactRequest,
+    ExtensionHostError, ForkRequest, NavigateTreeRequest, NewSessionRequest, SessionCommand,
+    SessionCommandEnvelope, SessionState, SetModelRequest, SetupEntriesRequest,
+    SwitchSessionRequest,
 };
 use super::agent_session::events::AgentSessionEvent;
 use super::agent_session::extension_runner::{
-    BeforeAgentStartResult, CancelResult, ExtensionRunner, InputTransformResult,
+    BeforeAgentStartResult, BoundaryPreview, BoundaryResult, CancelResult, ExtensionRunner,
+    InputTransformResult,
 };
 use super::agent_session::tree::NavigateTreeResult;
 use super::extension_runtime_set::EndpointId;
@@ -88,9 +90,9 @@ pub const MESSAGE_UPDATE_DELTA_METHOD: &str = "message_update_delta";
 /// Open method string: render an extension tool call/result as HTML (export).
 pub const TOOL_RENDER_HTML_METHOD: &str = "tool.renderHtml";
 
-/// The 35 lifecycle event `type` discriminants mirrored from the reference
-/// `ExtensionAPI.on()` overloads. The host reports which of these have at
-/// least one handler; Rust gates IPC on that set.
+/// The 39 lifecycle event `type` discriminants mirrored from the reference
+/// `ExtensionAPI.on()` overloads (types.ts:1340-1418). The host reports which
+/// of these have at least one handler; Rust gates IPC on that set.
 pub const ALL_EVENT_TYPES: &[&str] = &[
     "project_trust",
     "resources_discover",
@@ -100,16 +102,20 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     "session_before_fork",
     "session_before_compact",
     "session_compact",
+    "session_compact_failed",
     "session_shutdown",
     "session_before_tree",
     "session_tree",
     "context",
+    "context_with_system",
+    "cache_warming_decision",
     "before_provider_request",
     "before_provider_headers",
     "after_provider_response",
     "before_agent_start",
     "agent_start",
     "agent_end",
+    "agent_before_settle",
     "agent_settled",
     "ui_prompt_start",
     "ui_prompt_end",
@@ -216,6 +222,13 @@ pub(crate) enum SessionBridgeEvent {
         request: SetupEntriesRequest,
         /// Endpoint that requested the candidate snapshot.
         origin: Option<EndpointId>,
+    },
+    /// Correlated `session.previewBoundary` request (host → Rust).
+    PreviewBoundary {
+        /// Host correlation id (echo into `respond_boundary_preview`).
+        id: BridgeRequestId,
+        /// Preview request payload.
+        request: BoundaryPreviewRequest,
     },
     /// Host completed the command that initiated a ready-gated operation.
     ReplacementReady {
@@ -395,6 +408,19 @@ impl From<pi_ext::protocol::SessionSetupEntriesRequest> for SetupEntriesRequest 
     }
 }
 
+impl From<pi_ext::protocol::SessionPreviewBoundaryRequest> for BoundaryPreviewRequest {
+    fn from(wire: pi_ext::protocol::SessionPreviewBoundaryRequest) -> Self {
+        Self {
+            boundary: wire.boundary,
+            entries: wire
+                .entries
+                .into_iter()
+                .map(|entry| serde_json::to_value(entry).unwrap_or(Value::Null))
+                .collect(),
+        }
+    }
+}
+
 /// Convert the pi-ext wire `CommandSourceInfo` into the product `SourceInfo`.
 ///
 /// Moved here from `agent_session/extension.rs:695-701` — the host adapter
@@ -429,6 +455,7 @@ fn bridge_method_to_wire(method: BridgeMethod) -> &'static str {
         BridgeMethod::SetupEntries => protocol::SESSION_SETUP_ENTRIES_METHOD,
         BridgeMethod::SetModel => protocol::SESSION_SET_MODEL_METHOD,
         BridgeMethod::Compact => protocol::SESSION_COMPACT_METHOD,
+        BridgeMethod::PreviewBoundary => protocol::SESSION_PREVIEW_BOUNDARY_METHOD,
     }
 }
 
@@ -524,6 +551,8 @@ struct ToolWire {
     parameters: Value,
     #[serde(default)]
     execution_mode: Option<pi_agent::ToolExecutionMode>,
+    #[serde(default)]
+    constrained_sampling: Option<ConstrainedSampling>,
 }
 
 /// Wire form of [`CommandRegistration`].
@@ -595,9 +624,7 @@ struct RendererWire {
 /// Wire form of a host-registered custom provider.
 ///
 /// Matches the host's `buildRegistrySnapshot` camelCase payload: full
-/// `ProviderConfig` fields plus a boolean `streamSimple` flag (the function
-/// itself never crosses the wire; the host keeps it and Rust proxies via
-/// [`ExtensionProvider`] when the flag is true).
+/// `ProviderConfig` fields plus the callback capabilities held by the host.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderWire {
@@ -617,9 +644,15 @@ struct ProviderWire {
     auth_header: Option<bool>,
     #[serde(default)]
     models: Option<Vec<ProviderModelDefinition>>,
-    /// `true` when the host holds a live `streamSimple` function for this provider.
+    /// `true` when the host holds a live `streamSimple` function.
     #[serde(default)]
     stream_simple: bool,
+    /// `true` when the host holds a live `fetchDeferred` function.
+    #[serde(default)]
+    fetch_deferred: bool,
+    /// `true` when the host holds a live `cancelDeferred` function.
+    #[serde(default)]
+    cancel_deferred: bool,
     /// Optional extension path used in diagnostic messages when present.
     #[serde(default)]
     extension_path: Option<String>,
@@ -707,14 +740,18 @@ struct RegistrySnapshot {
     flag_values: HashMap<String, Value>,
     /// Provider config inputs keyed by provider id (for `ModelRuntime` registration).
     provider_configs: HashMap<String, ProviderConfigInput>,
-    /// Provider ids that expose a host-side `streamSimple` handler.
-    stream_provider_ids: HashSet<String>,
+    /// Host callback capabilities keyed by provider id.
+    provider_capabilities: HashMap<String, ProviderCapabilities>,
     /// Optional extension path per provider (diagnostics).
     provider_extension_paths: HashMap<String, String>,
     /// Host-reported per-path load errors.
     load_errors: Vec<(String, String)>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "flat wire-to-domain projection: one field per line, no branching to extract"
+)]
 fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> RegistrySnapshot {
     let mut snapshot = RegistrySnapshot {
         terminal_input: wire.terminal_input,
@@ -728,6 +765,7 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
             description: tool.description,
             parameters: tool.parameters,
             execution_mode: tool.execution_mode,
+            constrained_sampling: tool.constrained_sampling,
         };
         // First registration wins (host already dedups; this is the Rust-side
         // trust boundary for a duplicated name).
@@ -796,18 +834,22 @@ fn build_snapshot(wire: RegistrySnapshotWire, client: &Arc<HostClient>) -> Regis
 
     for provider in wire.providers {
         let name = provider.name.clone();
-        let stream_simple = provider.stream_simple;
         let extension_path = provider.extension_path.clone();
         let config = provider.to_config_input();
+        let capabilities = ProviderCapabilities {
+            stream_simple: provider.stream_simple,
+            fetch_deferred: provider.fetch_deferred,
+            cancel_deferred: provider.cancel_deferred,
+        };
         if snapshot.registry.register_provider(ProviderRegistration {
             name: name.clone(),
             base_url: config.base_url.clone(),
             api: config.api.clone(),
         }) {
             snapshot.provider_configs.insert(name.clone(), config);
-            if stream_simple {
-                snapshot.stream_provider_ids.insert(name.clone());
-            }
+            snapshot
+                .provider_capabilities
+                .insert(name.clone(), capabilities);
             if let Some(path) = extension_path {
                 snapshot.provider_extension_paths.insert(name, path);
             }
@@ -848,6 +890,9 @@ struct BeforeToolCallWire {
     block: bool,
     #[serde(default)]
     reason: Option<String>,
+    /// Hint that the agent loop should stop after the current tool batch.
+    #[serde(default)]
+    terminate: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1379,13 +1424,13 @@ impl HostExtensionRunner {
             .unwrap_or_default()
     }
 
-    /// Provider ids that expose a host-side `streamSimple` handler.
+    /// Host callback capabilities keyed by provider id.
     #[must_use]
-    pub fn stream_provider_ids(&self) -> HashSet<String> {
+    pub fn provider_capabilities(&self) -> HashMap<String, ProviderCapabilities> {
         self.inner
             .snapshot
             .read()
-            .map(|guard| guard.stream_provider_ids.clone())
+            .map(|guard| guard.provider_capabilities.clone())
             .unwrap_or_default()
     }
 
@@ -1415,11 +1460,18 @@ impl HostExtensionRunner {
         let snap = &mut *guard;
         // Clear and rebuild from the update.
         snap.provider_configs.clear();
-        snap.stream_provider_ids.clear();
+        snap.provider_capabilities.clear();
         snap.registry.clear_providers();
         snap.provider_extension_paths.clear();
         for entry in &update.providers {
             let name = entry.name.clone();
+            if !snap.registry.register_provider(ProviderRegistration {
+                name: name.clone(),
+                base_url: entry.base_url.clone(),
+                api: entry.api.clone(),
+            }) {
+                continue;
+            }
             let config = ProviderConfigInput {
                 name: Some(entry.name.clone()),
                 base_url: entry.base_url.clone(),
@@ -1439,19 +1491,18 @@ impl HostExtensionRunner {
                 oauth: None,
             };
             snap.provider_configs.insert(name.clone(), config);
-            if entry.stream_simple {
-                snap.stream_provider_ids.insert(name.clone());
-            }
+            snap.provider_capabilities.insert(
+                name.clone(),
+                ProviderCapabilities {
+                    stream_simple: entry.stream_simple,
+                    fetch_deferred: entry.fetch_deferred,
+                    cancel_deferred: entry.cancel_deferred,
+                },
+            );
             if let Some(path) = &entry.extension_path {
                 snap.provider_extension_paths
                     .insert(name.clone(), path.clone());
             }
-            // Register in the registry.
-            let _ = snap.registry.register_provider(ProviderRegistration {
-                name: name.clone(),
-                base_url: entry.base_url.clone(),
-                api: entry.api.clone(),
-            });
         }
     }
 
@@ -1485,9 +1536,8 @@ impl HostExtensionRunner {
     /// bound to the live host client (callers register them with the model
     /// runtime). Rebuilt per call since [`ExtensionProvider`] is not `Clone`.
     ///
-    /// Includes every host-registered provider. Custom-stream selection still
-    /// requires `streamSimple: true` at registration time
-    /// ([`Self::register_providers_on`]); baseURL-only providers stay native.
+    /// Includes every host-registered provider. Callback capabilities are
+    /// materialized on each adapter from the current endpoint snapshot.
     #[must_use]
     pub fn providers(&self) -> HashMap<String, ExtensionProvider> {
         let client = Arc::clone(&self.inner.client);
@@ -1500,9 +1550,15 @@ impl HostExtensionRunner {
                     .providers()
                     .iter()
                     .map(|provider| {
+                        let capabilities = guard
+                            .provider_capabilities
+                            .get(&provider.name)
+                            .copied()
+                            .unwrap_or_default();
                         (
                             provider.name.clone(),
-                            ExtensionProvider::new(provider.name.clone(), Arc::clone(&client)),
+                            ExtensionProvider::new(provider.name.clone(), Arc::clone(&client))
+                                .with_capabilities(capabilities),
                         )
                     })
                     .collect()
@@ -1510,25 +1566,37 @@ impl HostExtensionRunner {
             .unwrap_or_default()
     }
 
-    /// Register this host's provider configs + stream adapters on `runtime`.
+    /// Register this host's provider configs and callback adapters on `runtime`.
     ///
     /// Each provider failure becomes a diagnostic string; siblings continue.
-    /// Stream handlers are registered only when `streamSimple` was true.
+    /// A provider with `streamSimple` is registered for ordinary streaming;
+    /// deferred-only providers are registered for fetch/cancel without
+    /// becoming ordinary stream handlers.
     #[must_use]
     pub fn register_providers_on(
         &self,
         runtime: &ModelRuntime,
     ) -> Vec<(String, Result<(), ModelRuntimeError>)> {
         let configs = self.provider_configs();
-        let stream_ids = self.stream_provider_ids();
+        let capabilities = self.provider_capabilities();
         let paths = self.provider_extension_paths();
         let mut results = Vec::with_capacity(configs.len());
         for (name, config) in configs {
             let path = paths.get(&name).cloned().unwrap_or_else(|| name.clone());
             let outcome = runtime.register_provider(&name, config);
-            if outcome.is_ok() && stream_ids.contains(&name) {
-                let adapter = ExtensionProvider::new(name.clone(), Arc::clone(self.client()));
-                runtime.register_extension_stream_provider(name.clone(), Arc::new(adapter));
+            let provider_capabilities = capabilities.get(&name).copied().unwrap_or_default();
+            if outcome.is_ok()
+                && (provider_capabilities.stream_simple
+                    || provider_capabilities.fetch_deferred
+                    || provider_capabilities.cancel_deferred)
+            {
+                let adapter = ExtensionProvider::new(name.clone(), Arc::clone(self.client()))
+                    .with_capabilities(provider_capabilities);
+                if provider_capabilities.stream_simple {
+                    runtime.register_extension_stream_provider(name.clone(), Arc::new(adapter));
+                } else {
+                    runtime.register_extension_deferred_provider(name.clone(), Arc::new(adapter));
+                }
             }
             results.push((path, outcome));
         }
@@ -2091,6 +2159,28 @@ impl HostExtensionRunner {
             .map_err(ExtensionHostError::from)
     }
 
+    /// Answer a correlated `session.previewBoundary` request.
+    ///
+    /// The client serializes `Ok(context)` as the wire
+    /// [`protocol::SessionPreviewBoundaryResponse`] and sends `Err(message)`
+    /// as an `extension_error` frame, so invalid preview states surface as
+    /// named host errors instead of fake success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExtensionHostError`] if the host has already exited.
+    pub async fn respond_boundary_preview(
+        &self,
+        id: BridgeRequestId,
+        result: Result<Value, String>,
+    ) -> Result<(), ExtensionHostError> {
+        self.inner
+            .client
+            .respond_boundary_preview(id.0, result)
+            .await
+            .map_err(ExtensionHostError::from)
+    }
+
     /// Reject a ready-gated operation while another operation owns the facade slot.
     ///
     /// # Errors
@@ -2506,6 +2596,16 @@ fn spawn_event_pump(inner: Arc<Inner>) {
                             )
                             .await;
                         }
+                        Some(HostSessionRequest::PreviewBoundary { id, request }) => {
+                            forward_session_bridge(
+                                &inner,
+                                SessionBridgeEvent::PreviewBoundary {
+                                    id: BridgeRequestId(id),
+                                    request: request.into(),
+                                },
+                            )
+                            .await;
+                        }
                         None => {
                             // Channel closed (client gone); park this class.
                             session_requests = None;
@@ -2703,6 +2803,12 @@ async fn forward_session_bridge(inner: &Arc<Inner>, event: SessionBridgeEvent) {
             let _ = inner
                 .client
                 .respond_setup_entries(id.0, Err("no active session".to_owned()))
+                .await;
+        }
+        Some(SessionBridgeEvent::PreviewBoundary { id, .. }) => {
+            let _ = inner
+                .client
+                .respond_boundary_preview(id.0, Err("no active session".to_owned()))
                 .await;
         }
         Some(SessionBridgeEvent::SetModel { id, .. }) => {
@@ -2958,6 +3064,7 @@ impl ExtensionRunner for HostExtensionRunner {
             let method = match event.type_name() {
                 "compaction_start" => "session_before_compact",
                 "compaction_end" => "session_compact",
+                "compaction_failed" => "session_compact_failed",
                 "thinking_level_changed" => "thinking_level_select",
                 name => name,
             };
@@ -3100,6 +3207,7 @@ impl ExtensionRunner for HostExtensionRunner {
                             .map(|wire| BeforeToolCallResult {
                                 block: wire.block,
                                 reason: wire.reason,
+                                terminate: wire.terminate,
                             });
                     Ok(result)
                 }
@@ -3291,6 +3399,59 @@ impl ExtensionRunner for HostExtensionRunner {
                 Err(err) => {
                     inner.report_host_error(&err);
                     Ok(ResourceExtensionPaths::default())
+                }
+            }
+        })
+    }
+
+    fn emit_boundary<'a>(
+        &'a self,
+        event: &'a str,
+        payload: Value,
+        _preview: BoundaryPreview,
+    ) -> BoxFuture<
+        'a,
+        Result<
+            Option<BoundaryResult>,
+            super::agent_session::extension_runner::ExtensionRunnerError,
+        >,
+    > {
+        let inner = Arc::clone(&self.inner);
+        let event = event.to_owned();
+        // The preview closure is driven by the runtime-set fold after every
+        // endpoint; a single endpoint only reports its own draft replacement.
+        Box::pin(async move {
+            if !inner.has_handlers(&event) {
+                return Ok(None);
+            }
+            match inner.hook_request(&event, payload).await {
+                Ok(frame) => {
+                    // `{ok:true}` and `null` are valid no-draft responses from
+                    // the pinned Mode 1 host: `Option` maps `null` to `None`
+                    // and unknown fields are ignored. Anything else that fails
+                    // to decode is a named error, never a silent `None`.
+                    let wire =
+                        serde_json::from_value::<Option<pi_ext::protocol::BoundaryResultWire>>(
+                            frame.payload,
+                        )
+                        .map_err(|error| {
+                            super::agent_session::extension_runner::ExtensionRunnerError::Failed(
+                                format!("malformed boundary result from extension host: {error}"),
+                            )
+                        })?;
+                    Ok(wire.map(|wire| BoundaryResult {
+                        entries: wire.entries.map(|entries| {
+                            entries
+                                .into_iter()
+                                .map(|entry| serde_json::to_value(entry).unwrap_or(Value::Null))
+                                .collect()
+                        }),
+                        continue_after: wire.r#continue,
+                    }))
+                }
+                Err(err) => {
+                    inner.report_host_error(&err);
+                    Ok(None)
                 }
             }
         })

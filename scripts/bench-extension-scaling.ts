@@ -204,7 +204,15 @@ export interface RoundSummary {
 	readonly roundMedian: number;
 	readonly roundStddev: number;
 	readonly roundRelativeSpread: number | null;
+	/** Round medians actually gated on, after symmetric tail trimming. */
+	readonly trimmedRoundMedians: number[];
 }
+
+/** Outermost round medians dropped on each side before the spread gate.
+ * The gate detects persistent round-to-round instability; a shared CI
+ * runner produces isolated scheduler-hit rounds that would otherwise flip
+ * the verdict on a sub-10µs median lane without indicating real noise. */
+export const ROUND_TRIM_PER_SIDE = 2;
 
 export function roundSummary(rounds: readonly (readonly number[])[]): RoundSummary {
 	if (rounds.length === 0) {
@@ -212,12 +220,18 @@ export function roundSummary(rounds: readonly (readonly number[])[]): RoundSumma
 	}
 	const medians = rounds.map((round) => percentile([...round].sort((a, b) => a - b), 50));
 	const median = percentile([...medians].sort((a, b) => a - b), 50);
-	const spread = spreadStats(medians, median);
+	const sortedMedians = [...medians].sort((a, b) => a - b);
+	const trimmed = sortedMedians.slice(
+		ROUND_TRIM_PER_SIDE,
+		Math.max(sortedMedians.length - ROUND_TRIM_PER_SIDE, ROUND_TRIM_PER_SIDE + 1),
+	);
+	const spread = spreadStats(trimmed, median);
 	return {
 		roundMedians: medians,
 		roundMedian: median,
 		roundStddev: spread.stddev,
 		roundRelativeSpread: spread.relativeSpread,
+		trimmedRoundMedians: trimmed,
 	};
 }
 
@@ -649,6 +663,7 @@ function noiseGateMetadata() {
 		warmupRounds: NOISE_ROUND_WARMUPS,
 		roundMedianRelativeSpreadLimit: NOISE_RELATIVE_SPREAD_LIMIT,
 		rounds: NOISE_ROUNDS,
+		roundTrimPerSide: ROUND_TRIM_PER_SIDE,
 		samplesPerRound: SAMPLES_PER_ROUND,
 	};
 }
@@ -658,6 +673,7 @@ function withRounds<T extends object>(distribution: T, rounds: RoundSummary) {
 		...distribution,
 		rounds: {
 			roundMedians: rounds.roundMedians,
+			trimmedRoundMedians: rounds.trimmedRoundMedians,
 			median: rounds.roundMedian,
 			stddev: rounds.roundStddev,
 			relativeSpread: rounds.roundRelativeSpread,

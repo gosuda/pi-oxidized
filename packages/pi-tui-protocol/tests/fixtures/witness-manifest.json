@@ -1,9 +1,13 @@
 {
 	"generator": "scripts/verification/gen-witness.ts",
-	"totalLines": 147,
+	"totalLines": 161,
 	"methodKindPairs": [
 		[
 			"after_provider_response",
+			"req"
+		],
+		[
+			"agent_before_settle",
 			"req"
 		],
 		[
@@ -31,6 +35,10 @@
 			"req"
 		],
 		[
+			"cache_warming_decision",
+			"req"
+		],
+		[
 			"command.execute",
 			"req"
 		],
@@ -48,6 +56,10 @@
 		],
 		[
 			"context",
+			"req"
+		],
+		[
+			"context_with_system",
 			"req"
 		],
 		[
@@ -155,8 +167,40 @@
 			"res"
 		],
 		[
+			"provider.beforePayload",
+			"req"
+		],
+		[
+			"provider.beforePayload",
+			"res"
+		],
+		[
 			"provider.cancel",
 			"event"
+		],
+		[
+			"provider.cancelDeferred",
+			"req"
+		],
+		[
+			"provider.cancelDeferred",
+			"res"
+		],
+		[
+			"provider.fetchDeferred",
+			"req"
+		],
+		[
+			"provider.fetchDeferred",
+			"res"
+		],
+		[
+			"provider.onResponse",
+			"req"
+		],
+		[
+			"provider.onResponse",
+			"res"
 		],
 		[
 			"provider.stream",
@@ -255,6 +299,14 @@
 			"res"
 		],
 		[
+			"session.previewBoundary",
+			"req"
+		],
+		[
+			"session.previewBoundary",
+			"res"
+		],
+		[
 			"session.reload",
 			"error"
 		],
@@ -332,6 +384,10 @@
 		],
 		[
 			"session_compact",
+			"req"
+		],
+		[
+			"session_compact_failed",
 			"req"
 		],
 		[
@@ -492,16 +548,20 @@
 		"session_before_fork",
 		"session_before_compact",
 		"session_compact",
+		"session_compact_failed",
 		"session_shutdown",
 		"session_before_tree",
 		"session_tree",
 		"context",
+		"context_with_system",
+		"cache_warming_decision",
 		"before_provider_request",
 		"before_provider_headers",
 		"after_provider_response",
 		"before_agent_start",
 		"agent_start",
 		"agent_end",
+		"agent_before_settle",
 		"agent_settled",
 		"ui_prompt_start",
 		"ui_prompt_end",
@@ -558,5 +618,5 @@
 			"kind": "release"
 		}
 	],
-	"fixtureSha256": "e75b821c271c708d4d9f282298bf7f1968276bce3b0845879ff9445da78b4677"
+	"fixtureSha256": "02c38919f6451c50295fcc7b5e68c204f37cb341fca43aac652c19f7403d4928"
 }

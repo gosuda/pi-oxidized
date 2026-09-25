@@ -1,7 +1,7 @@
 /**
- * All-35-events fixture: registers a handler for every lifecycle event type
+ * All-39-events fixture: registers a handler for every lifecycle event type
  * in the ExtensionAPI. Used to verify the REAL ExtensionRunner dispatches all
- * 35 methods without error.
+ * 39 methods without error.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -15,16 +15,20 @@ const ALL_EVENTS = [
 	"session_before_fork",
 	"session_before_compact",
 	"session_compact",
+	"session_compact_failed",
 	"session_shutdown",
 	"session_before_tree",
 	"session_tree",
 	"context",
+	"context_with_system",
+	"cache_warming_decision",
 	"before_provider_request",
 	"before_provider_headers",
 	"after_provider_response",
 	"before_agent_start",
 	"agent_start",
 	"agent_end",
+	"agent_before_settle",
 	"agent_settled",
 	"ui_prompt_start",
 	"ui_prompt_end",

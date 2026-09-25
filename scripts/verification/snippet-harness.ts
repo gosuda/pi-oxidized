@@ -20,6 +20,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { SpawnRunner, type RunResult } from "../release/runner.ts";
+import { rootPatchTables } from "./vendor-provenance.ts";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 const FIXTURE_ROOT = "scripts/verification/fixtures/docs-snippets";
@@ -455,6 +456,7 @@ export function mapCargoDiagnostic(
 	});
 }
 
+
 function tail(text: string, limit = 2000): string {
 	const trimmed = text.trim();
 	return trimmed.length <= limit ? trimmed : trimmed.slice(-limit);
@@ -489,6 +491,7 @@ export async function runRustLane(root: string, allFences: readonly RegisteredFe
 			"[dependencies]",
 			...[...dependencies].sort().map((name) => `${name} = { path = ${JSON.stringify(join(resolve(root), "crates", name))} }`),
 			"",
+			...rootPatchTables(root),
 			"[workspace]",
 			"",
 		].join("\n");

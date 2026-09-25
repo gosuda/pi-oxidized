@@ -44,6 +44,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use futures::future::BoxFuture;
+use pi_tui::terminal::ScreenMode;
 
 use crate::cli::args::{Args, DiagnosticLevel, ListModels, Mode};
 use crate::cli::package_manager_cli::{self, DispatchPlatform, PackageHandler, PackageOutput};
@@ -51,7 +52,9 @@ use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::config::{ENV_SESSION_DIR, VERSION, expand_tilde_path};
 use crate::core::migrations::{self, MigrationResult};
 use crate::core::output_guard::{self, ProductOutput};
-use crate::core::sessions::SessionManager;
+use crate::core::sessions::{
+    MissingSessionCwdError, SessionManager, get_missing_session_cwd_issue,
+};
 
 /// Resolved application mode.
 ///
@@ -258,6 +261,16 @@ pub trait BootstrapIo: Send + Sync {
     fn write_stdout(&self, line: &str);
     /// Write a line to product stderr (newline appended).
     fn write_stderr(&self, line: &str);
+    /// Prompt for a missing session cwd in interactive mode.
+    ///
+    /// Returning `Some(path)` selects the fallback; `None` cancels startup.
+    /// Test I/O implementations may keep the default cancellation behavior.
+    fn select_missing_session_cwd(
+        &self,
+        _issue: &crate::core::sessions::SessionCwdIssue,
+    ) -> Option<PathBuf> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +361,8 @@ pub struct Dispatched {
     pub initial_images: Vec<pi_ai::ImageContent>,
     /// Remaining CLI messages for follow-up prompts.
     pub remaining_messages: Vec<String>,
+    /// Explicit/parsed interactive screen mode, omitted for demoted modes.
+    pub tui_mode: Option<ScreenMode>,
     /// Migration result (carried into interactive mode for changelog display).
     pub migrations: MigrationResult,
 }
@@ -551,6 +566,40 @@ async fn prepare_session(
                     &format!("Error: {message}"),
                 )
             })?;
+    if let Some(issue) = get_missing_session_cwd_issue(&session_manager, &cwd) {
+        if !app_mode.is_interactive() {
+            return Err(fail(
+                inputs.io,
+                should_take_over_stdout,
+                &format!("Error: {}", MissingSessionCwdError { issue }),
+            ));
+        }
+        let Some(selected_cwd) = inputs.io.select_missing_session_cwd(&issue) else {
+            return Err(stop(0, false));
+        };
+        let session_file = session_manager
+            .get_session_file()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                fail(
+                    inputs.io,
+                    should_take_over_stdout,
+                    "Error: missing session file",
+                )
+            })?;
+        let session_dir = session_manager.get_session_dir().to_owned();
+        let selected_cwd = selected_cwd.to_string_lossy().into_owned();
+        session_manager =
+            SessionManager::open(&session_file, Some(&session_dir), Some(&selected_cwd)).map_err(
+                |error| {
+                    fail(
+                        inputs.io,
+                        should_take_over_stdout,
+                        &format!("Error: {error}"),
+                    )
+                },
+            )?;
+    }
 
     if let Some(name) = parsed.name.as_ref() {
         let trimmed = name.trim();
@@ -976,6 +1025,11 @@ async fn finish_bootstrap(
         initial_message,
         initial_images,
         remaining_messages,
+        tui_mode: state
+            .app_mode
+            .is_interactive()
+            .then_some(state.parsed.tui_mode)
+            .flatten(),
         migrations: state.migrations,
     })
 }
@@ -1400,6 +1454,9 @@ mod tests {
             base_url: String::new(),
             reasoning: false,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![pi_ai::ModelInput::Text],
             cost: pi_ai::ModelCost::default(),
             context_window: 8_192,

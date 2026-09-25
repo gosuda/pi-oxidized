@@ -23,7 +23,9 @@ use crate::keybindings::get_keybindings;
 use crate::keys::{
     KeyId, backslash_enter_inserts_newline, key_matches, should_submit_on_backslash_enter,
 };
-use crate::text::{is_whitespace_char, truncate_with_marker, visible_width};
+use crate::text::{
+    is_whitespace_char, slice_by_column, truncate_to_width, truncate_with_marker, visible_width,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Position, Rect};
@@ -60,6 +62,33 @@ impl Default for EditorTheme {
         }
         Self { border_color: id }
     }
+}
+
+/// Activity content embedded in the editor's top border while attached.
+///
+/// This is the editor-side seam of the upstream #8799 "working indicator in
+/// the border" feature (`packages/tui/src/components/editor.ts` +
+/// `packages/coding-agent/.../components/custom-editor.ts` at C): the product
+/// pushes freshly styled content from its existing spinner tick / render pass
+/// and the editor owns the border layout — dash runs, width budgets, and
+/// coexistence with the `↑ N more` scroll label. The editor never starts a
+/// timer and never picks a color: both strings arrive pre-styled (the product
+/// colors them with its live thinking-level border color, matching C's
+/// `colorFn` wiring) and right-trimmed; the editor truncates them to the
+/// current border budget with [`truncate_to_width`].
+///
+/// Attaching content *is* the opt-in: `None` (the default) paints a border
+/// byte-identical to an editor without this feature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BorderActivity {
+    /// Full status: indicator frame + message (C's `renderInBorder` content
+    /// before its width truncation — leading padding stripped, no trailing
+    /// pad). Embedded after a `── ` prefix when it fits the border.
+    pub label: String,
+    /// Indicator glyph alone, no trailing space (C's `renderSpinnerInBorder`
+    /// content). Used when the label cannot share the border with the
+    /// scroll-overflow label or the border is too narrow for the label form.
+    pub glyph: String,
 }
 
 /// Construction options.
@@ -118,6 +147,8 @@ pub struct Editor {
     terminal_rows: u16,
     /// Dynamic border color (product may reassign).
     pub border_color: fn(&str) -> String,
+    /// Activity embedded in the top border; `None` paints the plain border.
+    border_activity: Option<BorderActivity>,
 
     pastes: HashMap<u32, Arc<str>>,
     paste_counter: u32,
@@ -169,6 +200,7 @@ impl Editor {
         let max_visible = options.autocomplete_max_visible.clamp(3, 20);
         let padding = options.padding_x;
         Self {
+            border_activity: None,
             state: EditorState::new(),
             focused: false,
             border_color: theme.border_color,
@@ -286,6 +318,21 @@ impl Editor {
     pub fn set_padding_x(&mut self, padding: u16) {
         self.padding_x = padding;
         self.needs_layout = true;
+    }
+
+    /// Attach activity content rendered inside the top border, or restore the
+    /// plain border with `None`.
+    ///
+    /// This is the entire editor-side integration surface for the DES-03
+    /// working indicator (upstream #8799): content presence is the opt-in —
+    /// there is no editor-side working/idle flag and no animation state. The
+    /// product re-pushes the current frame's [`BorderActivity`] from the same
+    /// tick that advances its spinner and requests the render, so the border
+    /// always paints fresh content without an editor-owned timer. Only the
+    /// top border embeds; the bottom border keeps the plain / scroll-label
+    /// form, matching C.
+    pub fn set_border_activity(&mut self, activity: Option<BorderActivity>) {
+        self.border_activity = activity;
     }
 
     /// Autocomplete max visible rows.
@@ -1761,22 +1808,126 @@ impl Editor {
             self.request_autocomplete(true, true);
         }
     }
+    /// Scroll-label border row of exactly `width` columns (ports the upstream
+    /// `createScrollBorder`, including the #8799 centering): the
+    /// `↑/↓ N more` label is centered when it fits with a two-column margin,
+    /// left-aligned after a `───` prefix when it does not, and clipped with a
+    /// trailing `...` on borders narrower than the indicator.
+    fn scroll_border_line(direction: &str, hidden: usize, width: usize) -> String {
+        let label = format!(" {direction} {hidden} more ");
+        let label_width = visible_width(&label);
+        if label_width + 2 <= width {
+            let left = (width - label_width) / 2;
+            return format!(
+                "{}{label}{}",
+                "─".repeat(left),
+                "─".repeat(width - left - label_width)
+            );
+        }
+        let indicator = format!("─── {direction} {hidden} more ");
+        let indicator_width = visible_width(&indicator);
+        if indicator_width <= width {
+            return format!("{indicator}{}", "─".repeat(width - indicator_width));
+        }
+        let ellipsis = &"..."[..width.min(3)];
+        let keep = width - visible_width(ellipsis);
+        format!("{}{ellipsis}", slice_by_column(&indicator, 0, keep, true))
+    }
+
     fn paint_top_border(&self, area: Rect, buf: &mut Buffer, width: u16, y: u16) -> u16 {
-        let top = if self.scroll_offset > 0 {
-            let indicator = format!("─── ↑ {} more ", self.scroll_offset);
-            let rem = usize::from(width).saturating_sub(visible_width(&indicator));
-            format!("{indicator}{}", "─".repeat(rem))
-        } else {
-            "─".repeat(usize::from(width))
-        };
-        paint_line(
-            area.x,
-            y,
-            usize::from(width),
-            buf,
-            &(self.border_color)(&top),
-        );
+        let line = self.top_border_line(usize::from(width));
+        paint_line(area.x, y, usize::from(width), buf, &line);
         y.saturating_add(1)
+    }
+
+    /// Top border row content (ports upstream `Editor.renderTopBorder` plus
+    /// the #8799 embedded-activity layout from the product's
+    /// `CustomEditor.renderTopBorder` override).
+    fn top_border_line(&self, width: usize) -> String {
+        let hidden = self.scroll_offset;
+        match &self.border_activity {
+            Some(activity) => self.embedded_top_border_line(width, hidden, activity),
+            None => self.plain_top_border_line(width, hidden),
+        }
+    }
+
+    /// Plain top border: all dashes, or the scroll-label form.
+    fn plain_top_border_line(&self, width: usize, hidden: usize) -> String {
+        let border = if hidden > 0 {
+            Self::scroll_border_line("↑", hidden, width)
+        } else {
+            "─".repeat(width)
+        };
+        (self.border_color)(&border)
+    }
+
+    /// Top border with the attached [`BorderActivity`] embedded: `── ` +
+    /// status + dash fill, sharing the row with the centered `↑ N more`
+    /// label when both fit, degrading to the glyph-only form when the label
+    /// cannot share the row or the border is too narrow for the label form.
+    /// Only dash runs pass through `border_color`; the activity keeps the
+    /// styling the product gave it.
+    fn embedded_top_border_line(
+        &self,
+        width: usize,
+        hidden: usize,
+        activity: &BorderActivity,
+    ) -> String {
+        let border_color = self.border_color;
+        let mut status =
+            truncate_to_width(&activity.label, width.saturating_sub(5).max(1), "", false);
+        let mut status_width = visible_width(&status);
+        if status_width == 0 {
+            return self.plain_top_border_line(width, hidden);
+        }
+
+        let overflow_label = (hidden > 0).then(|| format!(" ↑ {hidden} more "));
+        let overflow_width = overflow_label.as_deref().map_or(0, visible_width);
+        // Center position of the scroll label; only meaningful once the label
+        // fits with margin (`overflow_width + 2 <= width`), which is also what
+        // keeps the subtraction exact instead of saturating.
+        let overflow_start = width.saturating_sub(overflow_width) / 2;
+        let fits = |status_width: usize| {
+            overflow_label.is_some()
+                && overflow_width + 2 <= width
+                && overflow_start >= status_width + 5
+        };
+
+        if overflow_label.is_some() && !fits(status_width) {
+            status = truncate_to_width(&activity.glyph, width, "", false);
+            status_width = visible_width(&status);
+        }
+
+        if fits(status_width) {
+            let label = overflow_label.as_deref().unwrap_or_default();
+            let left_block = 3 + status_width + 1;
+            // `fits` guarantees `overflow_start > left_block`.
+            let fill = "─".repeat(overflow_start - left_block);
+            let tail = "─".repeat(width - overflow_start - overflow_width);
+            return format!(
+                "{}{}{}",
+                border_color("── "),
+                status,
+                border_color(&format!(" {fill}{label}{tail}"))
+            );
+        }
+
+        if width >= status_width + 5 {
+            let tail = "─".repeat(width - status_width - 4);
+            return format!(
+                "{}{}{}",
+                border_color("── "),
+                status,
+                border_color(&format!(" {tail}"))
+            );
+        }
+
+        let status = truncate_to_width(&activity.glyph, width, "", false);
+        let status_width = visible_width(&status);
+        let prefix_cols = 3.min(width.saturating_sub(status_width));
+        let prefix = "─".repeat(prefix_cols);
+        let tail = "─".repeat(width.saturating_sub(prefix_cols + status_width));
+        format!("{}{}{}", border_color(&prefix), status, border_color(&tail))
     }
 
     fn paint_bottom_border(
@@ -1793,21 +1944,19 @@ impl Editor {
         }
         let visible_end = (self.scroll_offset + max_visible).min(visual.len());
         let lines_below = visual.len().saturating_sub(visible_end);
-        let bottom = if lines_below > 0 {
-            let indicator = format!("─── ↓ {lines_below} more ");
-            let rem = usize::from(width).saturating_sub(visible_width(&indicator));
-            format!("{indicator}{}", "─".repeat(rem))
-        } else {
-            "─".repeat(usize::from(width))
-        };
-        paint_line(
-            area.x,
-            y,
-            usize::from(width),
-            buf,
-            &(self.border_color)(&bottom),
-        );
+        let line = self.bottom_border_line(usize::from(width), lines_below);
+        paint_line(area.x, y, usize::from(width), buf, &line);
         y.saturating_add(1)
+    }
+
+    /// Bottom border row content (ports upstream `Editor.renderBottomBorder`).
+    fn bottom_border_line(&self, width: usize, lines_below: usize) -> String {
+        let border = if lines_below > 0 {
+            Self::scroll_border_line("↓", lines_below, width)
+        } else {
+            "─".repeat(width)
+        };
+        (self.border_color)(&border)
     }
 
     fn paint_body_lines(
@@ -2156,6 +2305,7 @@ impl Component for Editor {
     fn handle_event(&mut self, event: &UiEvent) -> EventResult {
         match event {
             UiEvent::Key(key) => self.handle_key(key),
+            UiEvent::Mouse(_) => EventResult::Ignored,
             UiEvent::Paste(text) => {
                 self.handle_paste(text);
                 EventResult::Render
@@ -2854,5 +3004,169 @@ mod tests {
         );
         // Caret screen position should be at column 2 (after "ab", ZWSP is invisible).
         assert_eq!(editor.last_cursor_screen, Some((2, 1)));
+    }
+
+    /// Paint the editor at `width` and return the visible rows.
+    fn render_rows(editor: &mut Editor, width: u16) -> Vec<String> {
+        let height = editor.measure(width).max(1);
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        editor.render(area, &mut buffer);
+        crate::components::util::snapshot_area(&buffer, area)
+    }
+
+    /// Twenty short lines with the cursor driven ten rows up, leaving the
+    /// viewport at scroll offset 9 with 4 lines below (mirrors the upstream
+    /// #8799 scroll-indicator test setup).
+    fn scrolled_editor(width: u16) -> Editor {
+        let mut editor = Editor::with_defaults();
+        editor.set_text(
+            &(0..20)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        // Prime the wrap layout at the target width before moving (C renders
+        // once for the same reason), then move the cursor up ten lines.
+        let _ = render_rows(&mut editor, width);
+        for _ in 0..10 {
+            editor.handle_event(&UiEvent::Key(press(KeyCode::Up)));
+        }
+        editor
+    }
+
+    #[test]
+    fn scroll_border_centers_overflow_label() {
+        let mut editor = scrolled_editor(40);
+        let rows = render_rows(&mut editor, 40);
+        let dashes = "─".repeat(15);
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some(format!("{dashes} ↑ 9 more {dashes}").as_str())
+        );
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some(format!("{dashes} ↓ 4 more {dashes}").as_str())
+        );
+    }
+
+    #[test]
+    fn scroll_border_clips_with_ellipsis_on_narrow_width() {
+        let mut editor = scrolled_editor(10);
+        let rows = render_rows(&mut editor, 10);
+        // The centered label needs 12 columns and the left-aligned indicator
+        // needs 14, so a 10-column border clips to `...` form.
+        assert_eq!(rows.first().map(String::as_str), Some("─── ↑ 9..."));
+        assert_eq!(rows.last().map(String::as_str), Some("─── ↓ 4..."));
+    }
+
+    #[test]
+    fn border_activity_embeds_label_in_top_border() -> Result<(), String> {
+        fn magenta(s: &str) -> String {
+            format!("\u{1b}[35m{s}\u{1b}[39m")
+        }
+        fn cyan(s: &str) -> String {
+            format!("\u{1b}[36m{s}\u{1b}[39m")
+        }
+        let mut editor = Editor::with_defaults();
+        editor.border_color = magenta;
+        editor.set_text("hello");
+        editor.set_border_activity(Some(BorderActivity {
+            label: cyan("⠋ Working"),
+            glyph: cyan("⠋"),
+        }));
+
+        let height = editor.measure(30).max(1);
+        let area = Rect::new(0, 0, 30, height);
+        let mut buffer = Buffer::empty(area);
+        editor.render(area, &mut buffer);
+
+        let rows = crate::components::util::snapshot_area(&buffer, area);
+        // `── ` + 9-column status + ` ` + 17 dashes of fill.
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some(format!("── ⠋ Working {}", "─".repeat(17)).as_str())
+        );
+        // Dash runs take the border color; the status keeps its own styling.
+        let dash = buffer
+            .cell((0, 0))
+            .ok_or_else(|| "missing dash cell".to_owned())?;
+        assert_eq!(dash.symbol(), "─");
+        assert_eq!(dash.fg, ratatui::style::Color::Magenta);
+        let spinner = buffer
+            .cell((3, 0))
+            .ok_or_else(|| "missing spinner cell".to_owned())?;
+        assert_eq!(spinner.symbol(), "⠋");
+        assert_eq!(spinner.fg, ratatui::style::Color::Cyan);
+        let fill = buffer
+            .cell((13, 0))
+            .ok_or_else(|| "missing fill cell".to_owned())?;
+        assert_eq!(fill.symbol(), "─");
+        assert_eq!(fill.fg, ratatui::style::Color::Magenta);
+        Ok(())
+    }
+
+    #[test]
+    fn border_activity_shares_border_with_scroll_label() {
+        let mut editor = scrolled_editor(40);
+        editor.set_border_activity(Some(BorderActivity {
+            label: "⠋ Working".to_owned(),
+            glyph: "⠋".to_owned(),
+        }));
+        let rows = render_rows(&mut editor, 40);
+        // `── ` + 9-column status + ` ` + 2 fill dashes, then the centered
+        // scroll label at column 15 and 15 trailing dashes.
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some(format!("── ⠋ Working ── ↑ 9 more {}", "─".repeat(15)).as_str())
+        );
+        // The bottom border never embeds the activity.
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some(format!("{} ↓ 4 more {}", "─".repeat(15), "─".repeat(15)).as_str())
+        );
+    }
+
+    #[test]
+    fn border_activity_narrow_border_uses_glyph() {
+        let mut editor = Editor::with_defaults();
+        editor.set_text("hello");
+        editor.set_border_activity(Some(BorderActivity {
+            label: "⠋ Working".to_owned(),
+            glyph: "⠋".to_owned(),
+        }));
+        let rows = render_rows(&mut editor, 5);
+        // Too narrow for `── ` + label + ` ` + dash: glyph-only fallback with
+        // at most three leading dashes.
+        assert_eq!(rows.first().map(String::as_str), Some("───⠋─"));
+    }
+
+    #[test]
+    fn border_activity_clear_restores_idle_border() {
+        let mut editor = Editor::with_defaults();
+        editor.set_text("hello");
+        let idle = render_rows(&mut editor, 30);
+        assert_eq!(
+            idle.first().map(String::as_str),
+            Some("─".repeat(30).as_str())
+        );
+
+        // An empty label paints the plain border even while attached (C
+        // falls back when the status renders to zero width).
+        editor.set_border_activity(Some(BorderActivity {
+            label: String::new(),
+            glyph: "⠋".to_owned(),
+        }));
+        assert_eq!(render_rows(&mut editor, 30), idle);
+
+        editor.set_border_activity(Some(BorderActivity {
+            label: "⠋ Working".to_owned(),
+            glyph: "⠋".to_owned(),
+        }));
+        assert_ne!(render_rows(&mut editor, 30), idle);
+
+        // Detaching restores the idle border bytes exactly.
+        editor.set_border_activity(None);
+        assert_eq!(render_rows(&mut editor, 30), idle);
     }
 }

@@ -3,8 +3,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(test)]
 use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
@@ -29,8 +27,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use super::agent_session::AgentSession;
 use super::agent_session::events::AgentSessionEvent;
 use super::agent_session::extension_runner::{
-    BeforeAgentStartResult, CancelResult, ExtensionRunner, ExtensionRunnerError,
-    InputTransformResult,
+    BeforeAgentStartResult, BoundaryPreview, BoundaryResult, CancelResult, ExtensionRunner,
+    ExtensionRunnerError, InputTransformResult,
 };
 use super::agent_session::tree::NavigateTreeResult;
 use super::agent_session::{
@@ -1107,6 +1105,21 @@ impl ExtensionRuntimeSet {
             .await
     }
 
+    /// Route a correlated boundary-preview response to its originating endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response route is stale or missing, or its host rejects it.
+    pub async fn respond_boundary_preview(
+        &self,
+        id: BridgeRequestId,
+        result: Result<Value, String>,
+    ) -> Result<(), ExtensionHostError> {
+        self.session_routing
+            .respond_boundary_preview(id, result)
+            .await
+    }
+
     /// Validate a replacement token and return the pending replacement target
     /// session. Returns `None` for stale or missing tokens (fail closed).
     #[must_use]
@@ -1687,6 +1700,80 @@ impl ExtensionRunner for ExtensionRuntimeSet {
         })
     }
 
+    fn emit_boundary<'a>(
+        &'a self,
+        event: &'a str,
+        payload: Value,
+        preview: BoundaryPreview,
+    ) -> BoxFuture<'a, Result<Option<BoundaryResult>, ExtensionRunnerError>> {
+        let lease = self.lease();
+        Box::pin(async move {
+            // Source semantics (pi runner.ts:928-977): handlers run in order,
+            // each seeing the accumulated state; supplied entries REPLACE,
+            // supplied continue REPLACES (including false). A preview is
+            // rebuilt after every endpoint; an invalid state retains the
+            // previous context so later endpoints can correct it, and a final
+            // invalid state commits nothing and never continues.
+            let mut current = normalize_boundary_payload(payload);
+            let mut supplied = false;
+            let mut valid = true;
+            for endpoint in lease.live_endpoints() {
+                let request = current.clone();
+                match endpoint
+                    .runner
+                    .emit_boundary(event, request, Arc::clone(&preview))
+                    .await
+                {
+                    Ok(Some(result)) => {
+                        if result.entries.is_some() || result.continue_after.is_some() {
+                            supplied = true;
+                        }
+                        if let Some(entries) = result.entries {
+                            current["entries"] = Value::Array(entries);
+                        }
+                        if let Some(continue_after) = result.continue_after {
+                            current["continue"] = Value::Bool(continue_after);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.channels
+                            .publish_error("extension_error", error.to_string(), None);
+                    }
+                }
+                match (preview)(boundary_entries(&current)).await {
+                    Ok(context) => {
+                        current["context"] = context;
+                        valid = true;
+                    }
+                    Err(error) => {
+                        valid = false;
+                        self.channels
+                            .publish_error("extension_error", error.to_string(), None);
+                    }
+                }
+            }
+            if !supplied && valid {
+                return Ok(None);
+            }
+            if !valid {
+                return Ok(Some(BoundaryResult {
+                    entries: Some(Vec::new()),
+                    continue_after: Some(false),
+                }));
+            }
+            Ok(Some(BoundaryResult {
+                entries: Some(boundary_entries(&current)),
+                continue_after: Some(
+                    current
+                        .get("continue")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                ),
+            }))
+        })
+    }
+
     /// WHY inline: order-preserving dedup-flatten into a `Vec`, not a map
     /// merge. `fan_out_first_wins` targets map accumulators; only this and
     /// `command_catalog` (which also enriches) share the shape, and the
@@ -1782,6 +1869,32 @@ pub(crate) fn generation_from_endpoints(
         })
         .collect();
     (Generation::new(id, endpoints.into()), pending)
+}
+
+/// Normalized starting state for boundary dispatch: `entries` defaults to an
+/// empty array, `continue` to false, `context` to null.
+fn normalize_boundary_payload(mut payload: Value) -> Value {
+    let Some(map) = payload.as_object_mut() else {
+        return serde_json::json!({
+            "entries": [],
+            "continue": false,
+            "context": Value::Null,
+        });
+    };
+    map.entry("entries")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    map.entry("continue").or_insert(Value::Bool(false));
+    map.entry("context").or_insert(Value::Null);
+    payload
+}
+
+/// Current draft entries carried by a boundary payload.
+fn boundary_entries(payload: &Value) -> Vec<Value> {
+    payload
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn spawn_broadcast_relay<T, F>(
@@ -2069,6 +2182,14 @@ fn spawn_session_relay(
                                 routed_id,
                             )
                         }
+                        SessionBridgeEvent::PreviewBoundary { id, request } => {
+                            let routed_id = state.allocate_route(endpoint, id);
+                            (
+                                routed_id
+                                    .map(|id| SessionBridgeEvent::PreviewBoundary { id, request }),
+                                routed_id,
+                            )
+                        }
                         SessionBridgeEvent::Command { envelope, .. } => (
                             Some(SessionBridgeEvent::Command {
                                 envelope,
@@ -2224,6 +2345,11 @@ async fn answer_unclaimed_session(runner: &HostExtensionRunner, event: SessionBr
                 .respond_setup_entries(id, Err("no active session".to_owned()))
                 .await;
         }
+        SessionBridgeEvent::PreviewBoundary { id, .. } => {
+            let _ = runner
+                .respond_boundary_preview(id, Err("no active session".to_owned()))
+                .await;
+        }
         SessionBridgeEvent::Command { .. }
         | SessionBridgeEvent::ReplacementReady { .. }
         | SessionBridgeEvent::ReplacementAbort { .. } => {}
@@ -2357,7 +2483,7 @@ pub(crate) mod tests {
 
     use std::error::Error;
     use std::io::{BufRead, Write};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::core::agent_session::{SessionCommand, SessionCommandEnvelope};
     use pi_ext::client::DialogOutcome;
@@ -3181,7 +3307,7 @@ pub(crate) mod tests {
         std::fs::write(directory.join("snapshot.json"), snapshot.to_string())?;
         Ok(())
     }
-    fn slot_frame(key: &str, text: &str) -> Frame {
+    pub(crate) fn slot_frame(key: &str, text: &str, focusable: bool) -> Frame {
         Frame {
             id: 0,
             kind: FrameKind::Event,
@@ -3192,7 +3318,7 @@ pub(crate) mod tests {
                 "placement": "aboveEditor",
                 "height": 1,
                 "runs": [[{"text": text}]],
-                "focusable": false,
+                "focusable": focusable,
             }),
         }
     }
@@ -4377,9 +4503,11 @@ pub(crate) mod tests {
             (EndpointKind::Native, second),
         ]);
 
-        first_host.emit(slot_frame("shared", "first")).await;
+        first_host.emit(slot_frame("shared", "first", false)).await;
         wait_for_slot_text(&set, "first").await?;
-        second_host.emit(slot_frame("shared", "second")).await;
+        second_host
+            .emit(slot_frame("shared", "second", false))
+            .await;
         wait_for_slot_text(&set, "second").await?;
         second_host
             .emit(Frame {
@@ -4729,7 +4857,7 @@ pub(crate) mod tests {
             make_runner_with_hook_timeout(snapshot(&["input"]), HOOK_TIMEOUT).await?;
         let mut parked = old_host.park_method("input");
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
-        old_host.emit(slot_frame("old", "old")).await;
+        old_host.emit(slot_frame("old", "old", false)).await;
         wait_for_slot_text(&set, "old").await?;
         let mut ui = set.subscribe_ui();
 
@@ -4775,7 +4903,7 @@ pub(crate) mod tests {
             make_runner_with_hook_timeout(snapshot(&["input"]), HOOK_TIMEOUT).await?;
         let mut parked = old_host.park_method("input");
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
-        old_host.emit(slot_frame("old", "old")).await;
+        old_host.emit(slot_frame("old", "old", false)).await;
         wait_for_slot_text(&set, "old").await?;
         let mut ui = set.subscribe_ui();
         let caller_set = Arc::clone(&set);
@@ -4797,7 +4925,7 @@ pub(crate) mod tests {
         let cutover = tokio::spawn(async move { cutover_set.cutover(next, pending).await });
         wait_for_dispose(&mut ui, "old").await?;
 
-        old_host.emit(slot_frame("late", "late")).await;
+        old_host.emit(slot_frame("late", "late", false)).await;
         old_host
             .emit(Frame {
                 id: request_id,
@@ -4821,7 +4949,7 @@ pub(crate) mod tests {
             make_runner_with_hook_timeout(snapshot(&["input"]), HOOK_TIMEOUT).await?;
         let mut parked = old_host.park_method("input");
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
-        old_host.emit(slot_frame("old", "old")).await;
+        old_host.emit(slot_frame("old", "old", false)).await;
         wait_for_slot_text(&set, "old").await?;
         let mut ui = set.subscribe_ui();
         let mut ui_requests = set.take_ui_requests().ok_or("ui bridge missing")?;
@@ -4908,7 +5036,7 @@ pub(crate) mod tests {
             (EndpointKind::TsCompat, old_first),
             (EndpointKind::Native, old_owner),
         ]);
-        old_host.emit(slot_frame("old-key", "old")).await;
+        old_host.emit(slot_frame("old-key", "old", false)).await;
         wait_for_slot_text(&set, "old").await?;
         let mut requests = set.take_ui_requests().ok_or("ui bridge missing")?;
         old_host
@@ -4967,7 +5095,7 @@ pub(crate) mod tests {
         let old_runner = Arc::clone(&old);
         let mut parked = old_host.park_method("input");
         let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, old)]);
-        old_host.emit(slot_frame("old", "old")).await;
+        old_host.emit(slot_frame("old", "old", false)).await;
         wait_for_slot_text(&set, "old").await?;
         let mut ui = set.subscribe_ui();
         let caller_set = Arc::clone(&set);
@@ -6573,6 +6701,359 @@ pub(crate) mod tests {
         let plans = plan_endpoints(&classified);
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].kind, EndpointKind::TsCompat);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Boundary dispatch: correlated preview routing + endpoint fold
+    // -----------------------------------------------------------------------
+
+    fn custom_draft(custom_type: &str, n: i64) -> Value {
+        json!({"type": "custom", "customType": custom_type, "data": {"n": n}})
+    }
+
+    /// Preview closure counting every rebuild; entries carrying `reject` fail
+    /// validation the way the session preview rejects malformed drafts.
+    fn counting_preview(reject: Option<&'static str>) -> (BoundaryPreview, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handle = Arc::clone(&calls);
+        let preview: BoundaryPreview = Arc::new(move |entries: Vec<Value>| {
+            let calls = Arc::clone(&calls);
+            Box::pin(async move {
+                let index = calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(reject) = reject
+                    && entries.iter().any(|entry| entry["customType"] == reject)
+                {
+                    return Err(ExtensionRunnerError::Failed("invalid draft".to_owned()));
+                }
+                Ok(json!({ "gen": index }))
+            })
+        });
+        (preview, handle)
+    }
+
+    fn boundary_payload() -> Value {
+        json!({
+            "type": "turn_end",
+            "entries": [],
+            "continue": false,
+            "context": {"v": -1},
+        })
+    }
+
+    async fn next_error(
+        rx: &mut broadcast::Receiver<ExtensionErrorEvent>,
+    ) -> TestResult<ExtensionErrorEvent> {
+        let event = tokio::time::timeout(TEST_TIMEOUT, rx.recv()).await??;
+        Ok(event)
+    }
+
+    #[tokio::test]
+    async fn preview_boundary_bridge_request_routes_and_answers_exactly_once() -> TestResult {
+        let (runner, host) = make_runner(snapshot(&[])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+        let mut session_bridge = set
+            .take_session_bridge()
+            .ok_or("session bridge receiver missing")?;
+        let method = protocol::SESSION_PREVIEW_BOUNDARY_METHOD;
+
+        host.emit(Frame {
+            id: 42,
+            kind: FrameKind::Req,
+            method: method.to_owned(),
+            payload: json!({
+                "boundary": "turn_end",
+                "entries": [custom_draft("note", 1)],
+            }),
+        })
+        .await;
+        let event = tokio::time::timeout(TEST_TIMEOUT, session_bridge.recv())
+            .await?
+            .ok_or("session bridge closed")?;
+        let SessionBridgeEvent::PreviewBoundary { id, request } = event else {
+            return Err("expected preview-boundary bridge event".into());
+        };
+        assert_eq!(request.boundary, "turn_end");
+        assert_eq!(request.entries, vec![custom_draft("note", 1)]);
+
+        set.respond_boundary_preview(id, Ok(json!({"canContinue": false})))
+            .await?;
+        host.wait_for_response(method, 42).await?;
+        assert_eq!(
+            host.response_payload(method, 42),
+            Some(json!({"context": {"canContinue": false}}))
+        );
+
+        // The route is consumed by the first claim: a stale response cannot
+        // answer the same host request twice.
+        assert!(
+            set.respond_boundary_preview(id, Ok(json!({})))
+                .await
+                .is_err()
+        );
+
+        // Validation failures travel as named extension errors, not fake success.
+        host.emit(Frame {
+            id: 43,
+            kind: FrameKind::Req,
+            method: method.to_owned(),
+            payload: json!({"boundary": "agent_before_settle", "entries": []}),
+        })
+        .await;
+        let event = tokio::time::timeout(TEST_TIMEOUT, session_bridge.recv())
+            .await?
+            .ok_or("session bridge closed")?;
+        let SessionBridgeEvent::PreviewBoundary { id, .. } = event else {
+            return Err("expected second preview-boundary bridge event".into());
+        };
+        set.respond_boundary_preview(id, Err("invalid drafts".to_owned()))
+            .await?;
+        let error_frame = tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                if let Some(frame) = host.correlated_frame(method, 43) {
+                    return frame;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "no error frame for invalid preview")?;
+        assert_eq!(error_frame.kind, FrameKind::Error);
+        assert_eq!(error_frame.payload["code"], "extension_error");
+        assert_eq!(error_frame.payload["message"], "invalid drafts");
+
+        // Retiring the endpoint releases the pending route: the session
+        // observes a stale-route error instead of answering a quarantined host.
+        host.emit(Frame {
+            id: 44,
+            kind: FrameKind::Req,
+            method: method.to_owned(),
+            payload: json!({"boundary": "turn_end", "entries": []}),
+        })
+        .await;
+        let event = tokio::time::timeout(TEST_TIMEOUT, session_bridge.recv())
+            .await?
+            .ok_or("session bridge closed")?;
+        let SessionBridgeEvent::PreviewBoundary { id, .. } = event else {
+            return Err("expected third preview-boundary bridge event".into());
+        };
+        {
+            let mut state = set.state();
+            let doomed = state.generation.endpoints[0].id;
+            assert!(state.retire_endpoint(doomed, &set.channels));
+        }
+        let response = set.respond_boundary_preview(id, Ok(json!({}))).await;
+        assert!(
+            matches!(response, Err(ExtensionHostError::NotRunning)),
+            "retired endpoint route must reject with NotRunning"
+        );
+        assert!(host.correlated_frame(method, 44).is_none());
+
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boundary_fold_later_endpoint_replaces_entries_and_clears_continue() -> TestResult {
+        let (first, first_host) = make_runner(snapshot(&["turn_end"])).await?;
+        let (second, second_host) = make_runner(snapshot(&["turn_end"])).await?;
+        first_host.set_response(
+            "turn_end",
+            json!({"entries": [custom_draft("a", 1)], "continue": true}),
+        );
+        second_host.set_response(
+            "turn_end",
+            json!({"entries": [custom_draft("b", 2)], "continue": false}),
+        );
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, first),
+            (EndpointKind::TsCompat, second),
+        ]);
+        let (preview, calls) = counting_preview(None);
+
+        let result = set
+            .emit_boundary("turn_end", boundary_payload(), preview)
+            .await?;
+
+        // Supplied entries REPLACE (never append); supplied continue REPLACES,
+        // including false coming after an earlier true.
+        assert_eq!(
+            result,
+            Some(BoundaryResult {
+                entries: Some(vec![custom_draft("b", 2)]),
+                continue_after: Some(false),
+            })
+        );
+        // The later endpoint saw the earlier endpoint's accumulated state.
+        assert_eq!(
+            second_host.first_payload("turn_end"),
+            Some(json!({
+                "type": "turn_end",
+                "entries": [custom_draft("a", 1)],
+                "continue": true,
+                "context": {"gen": 0},
+            }))
+        );
+        // One preview rebuild per endpoint, in order.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boundary_fold_invalid_drafts_retain_context_and_later_endpoint_corrects() -> TestResult
+    {
+        let (first, first_host) = make_runner(snapshot(&["turn_end"])).await?;
+        let (second, second_host) = make_runner(snapshot(&["turn_end"])).await?;
+        first_host.set_response("turn_end", json!({"entries": [custom_draft("bad", 1)]}));
+        second_host.set_response(
+            "turn_end",
+            json!({"entries": [custom_draft("good", 2)], "continue": true}),
+        );
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, first),
+            (EndpointKind::TsCompat, second),
+        ]);
+        let mut errors = set.subscribe_errors();
+        let (preview, calls) = counting_preview(Some("bad"));
+
+        let result = set
+            .emit_boundary("turn_end", boundary_payload(), preview)
+            .await?;
+
+        // The later endpoint corrected the invalid drafts and its continue
+        // request survives: the final state is valid.
+        assert_eq!(
+            result,
+            Some(BoundaryResult {
+                entries: Some(vec![custom_draft("good", 2)]),
+                continue_after: Some(true),
+            })
+        );
+        // The second endpoint saw the retained previous context, not a fake
+        // success for the invalid drafts.
+        assert_eq!(
+            second_host.first_payload("turn_end"),
+            Some(json!({
+                "type": "turn_end",
+                "entries": [custom_draft("bad", 1)],
+                "continue": false,
+                "context": {"v": -1},
+            }))
+        );
+        let error = next_error(&mut errors).await?;
+        assert_eq!(error.code, "extension_error");
+        assert!(error.message.contains("invalid draft"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boundary_fold_final_invalid_drafts_return_empty_entries_and_no_continue() -> TestResult
+    {
+        let (first, first_host) = make_runner(snapshot(&["turn_end"])).await?;
+        let (second, second_host) = make_runner(snapshot(&["turn_end"])).await?;
+        first_host.set_response(
+            "turn_end",
+            json!({"entries": [custom_draft("good", 1)], "continue": true}),
+        );
+        second_host.set_response("turn_end", json!({"entries": [custom_draft("bad", 2)]}));
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, first),
+            (EndpointKind::TsCompat, second),
+        ]);
+        let mut errors = set.subscribe_errors();
+        let (preview, _calls) = counting_preview(Some("bad"));
+
+        let result = set
+            .emit_boundary("turn_end", boundary_payload(), preview)
+            .await?;
+
+        // A final invalid state commits nothing and never continues, even
+        // though an earlier endpoint requested continuation.
+        assert_eq!(
+            result,
+            Some(BoundaryResult {
+                entries: Some(Vec::new()),
+                continue_after: Some(false),
+            })
+        );
+        let error = next_error(&mut errors).await?;
+        assert_eq!(error.code, "extension_error");
+        assert!(error.message.contains("invalid draft"));
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boundary_fold_malformed_result_reports_named_error_and_later_endpoints_run()
+    -> TestResult {
+        let (first, first_host) = make_runner(snapshot(&["turn_end"])).await?;
+        let (second, second_host) = make_runner(snapshot(&["turn_end"])).await?;
+        first_host.set_response("turn_end", json!({"entries": "not-an-array"}));
+        second_host.set_response("turn_end", json!({"entries": [custom_draft("good", 2)]}));
+        let set = ExtensionRuntimeSet::bind(vec![
+            (EndpointKind::TsCompat, first),
+            (EndpointKind::TsCompat, second),
+        ]);
+        let mut errors = set.subscribe_errors();
+        let (preview, _calls) = counting_preview(None);
+
+        let result = set
+            .emit_boundary("turn_end", boundary_payload(), preview)
+            .await?;
+
+        // The malformed result is a named error, not a silent no-draft, and
+        // the later endpoint still ran against the uncorrupted state.
+        assert_eq!(
+            result,
+            Some(BoundaryResult {
+                entries: Some(vec![custom_draft("good", 2)]),
+                continue_after: Some(false),
+            })
+        );
+        assert_eq!(
+            second_host.first_payload("turn_end"),
+            Some(json!({
+                "type": "turn_end",
+                "entries": [],
+                "continue": false,
+                "context": {"gen": 0},
+            }))
+        );
+        let error = next_error(&mut errors).await?;
+        assert_eq!(error.code, "extension_error");
+        assert!(error.message.contains("malformed boundary result"));
+        set.shutdown_once().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn boundary_fold_treats_mode1_no_draft_responses_as_nothing_supplied() -> TestResult {
+        let (runner, host) = make_runner(snapshot(&["turn_end"])).await?;
+        let set = ExtensionRuntimeSet::bind(vec![(EndpointKind::TsCompat, runner)]);
+
+        // The pinned Mode 1 host answers `{ok:true}` for handlers that return
+        // nothing; it is a valid no-draft response and must not be rejected.
+        host.set_response("turn_end", json!({"ok": true}));
+        let (preview, calls) = counting_preview(None);
+        let result = set
+            .emit_boundary("turn_end", boundary_payload(), preview)
+            .await?;
+        assert_eq!(result, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A literal `null` payload is equally valid and supplies nothing.
+        host.set_response("turn_end", Value::Null);
+        let (preview, calls) = counting_preview(None);
+        let result = set
+            .emit_boundary("turn_end", boundary_payload(), preview)
+            .await?;
+        assert_eq!(result, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        set.shutdown_once().await;
         Ok(())
     }
 }

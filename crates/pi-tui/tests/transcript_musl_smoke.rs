@@ -185,6 +185,7 @@ impl From<RecordingError> for LaneError {
             RecordingError::FinishBeforeClose => {
                 Self::Transcript("recording cannot finish before close".to_owned())
             }
+            RecordingError::UnrecordedObservation(_) => Self::Transcript(error.to_string()),
         }
     }
 }

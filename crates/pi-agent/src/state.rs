@@ -23,7 +23,10 @@ pub fn default_model() -> Model {
         reasoning: false,
         thinking_level_map: None,
         input: Vec::new(),
+        input_limits: None,
         cost: ModelCost::default(),
+        prompt_cache: None,
+        sampling_params: None,
         context_window: 0,
         max_tokens: 0,
         headers: None,
@@ -227,12 +230,12 @@ mod tests {
     fn assistant_with_error(error: &str) -> AgentMessage {
         let mut message = AssistantMessage::new("unknown", "unknown", "unknown", 1);
         message.error_message = Some(error.to_owned());
-        AgentMessage::Llm(Box::new(Message::Assistant(message)))
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(message))))
     }
 
     fn assistant_ok() -> AgentMessage {
-        AgentMessage::Llm(Box::new(Message::Assistant(AssistantMessage::new(
-            "unknown", "unknown", "unknown", 1,
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+            AssistantMessage::new("unknown", "unknown", "unknown", 1),
         ))))
     }
 

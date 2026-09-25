@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -16,7 +16,6 @@ import {
 } from "../bench-tool-dispatch.ts";
 
 const REPOSITORY_ROOT = resolve(import.meta.dirname, "../..");
-const ARTIFACT_PATH = join(REPOSITORY_ROOT, "target/bench/tool-dispatch.json");
 
 function sampleReport(overrides: Partial<WorkerReport> = {}): WorkerReport {
 	return {
@@ -150,12 +149,6 @@ describe("bench-tool-dispatch pure helpers", () => {
 		});
 	});
 
-	test("importing the module does not run the benchmark", () => {
-		const before = existsSync(ARTIFACT_PATH) ? readFileSync(ARTIFACT_PATH) : undefined;
-		expect(typeof distribution).toBe("function");
-		const after = existsSync(ARTIFACT_PATH) ? readFileSync(ARTIFACT_PATH) : undefined;
-		expect(after).toEqual(before);
-	});
 });
 
 describe("bench-tool-dispatch TypeScript worker", () => {

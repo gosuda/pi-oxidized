@@ -547,7 +547,11 @@ fn median_of(vals: &mut [f64]) -> f64 {
 }
 
 fn fresh_tui(rows: u16) -> Tui<NullWriter> {
-    let caps = TerminalCapabilities::default();
+    // PERF-T11 probes the synchronized stage-3 path; keep it wrapped.
+    let caps = TerminalCapabilities {
+        sync_output: true,
+        ..TerminalCapabilities::default()
+    };
     match Tui::new(
         NullWriter::new(),
         Size::new(COLUMNS, rows),
@@ -853,7 +857,10 @@ fn main() -> ExitCode {
         return run_probe();
     }
 
-    let caps = TerminalCapabilities::default();
+    let caps = TerminalCapabilities {
+        sync_output: true,
+        ..TerminalCapabilities::default()
+    };
     let outer = NullWriter::new();
     let size = Size::new(COLUMNS, ROWS);
 

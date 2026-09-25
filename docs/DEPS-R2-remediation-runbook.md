@@ -141,38 +141,29 @@ compressible for Class S.
 ## 5. Reference integrity
 
 The canonical reference (`scripts/verification/fixtures/dependency-exposure/reference/`)
-is a hash-chained manifest, not a convenience snapshot:
+is a hash-chained manifest, not a convenience snapshot. Counts below are historical seed values, not re-asserted results:
 
-- `reference.json` pins the sha256 of both projections (`metafile-projection.json`,
-  `cargo-graph-projection.json`), the dep-field content and hash of every npm surface,
-  the hash of every Cargo manifest + `Cargo.lock`, and the hash of the three release
-  authority modules (`scripts/release/{host,targets,stage}.ts`).
-- The metafile projection pins the sha256 of **every** module-graph input (2493 at
-  capture) plus the metafile itself, and records the exact authority `--compile` argv.
-- The cargo graph projection records workspace members and every dep-graph edge with
-  kinds, captured with `cargo metadata --locked --offline --all-features`.
-- Authority modules are byte-compared against their pins **before** they are dynamically
-  imported; a drifted authority makes E2/E4 undecidable (fail-closed), never
-  untrusted-executed.
-
-Capture procedure: `bun run verify:dependency-exposure capture-reference --out <dir>` on
-the **clean pre-change commit** — the command refuses a dirty relevant tree (all three
-`package.json` surfaces + `bun.lock`s, `Cargo.toml`/`Cargo.lock` + crate manifests,
-`scripts/release/**` + the two release entry scripts, `packages/extension-host/src`,
-`packages/pi-tui-protocol/src`). `--allow-dirty-relevant` exists solely for dirt that is
-provably dep-field-free and is recorded in `manifest.relevantTreeStatus`; the checked-in
-capture records `M package.json` from a sibling's scripts-line-only edit (dep fields
-unaffected).
+- `reference.json` is the single selection and commit point. It pins the sha256 of both selected projections (hash-named after migration, see below), the dep-field content and hash of every npm surface, the hash of every Cargo manifest + `Cargo.lock`, the hash of every tracked vendored source / manifest / provenance / license file, and the hash of the three release authority modules (`scripts/release/{host,targets,stage}.ts`). Vendored coverage is the frozen six-scope `VENDOR_SCOPES` set — `vendor/*/Cargo.toml`, `vendor/*/Cargo.toml.orig`, `vendor/*/LICENSE`, `vendor/*/.cargo_vcs_info.json`, `vendor/*/VENDORED.txt`, `vendor/*/src/**` — where the trailing `**` is required because a Git pathspec wildcard matches the whole path with no implicit directory recursion (`vendor/*/src` matches only the directory entry); crate-local `target/` and `Cargo.lock` stay out of scope as unindexed build residue that is never pinned.
+- The metafile projection pins the sha256 of every captured module-graph input under the existing hydrated-provider-data exclusions (2493 captured inputs at the historical seed capture) plus the metafile itself, and records the exact authority `--compile` argv. The scope has always been captured inputs under those exclusions; unindexed hydrated catalogs were never part of the projection.
+- The cargo graph projection records workspace members and every dep-graph edge with kinds, captured with `cargo metadata --locked --offline --all-features`. Workspace membership is taken from cargo metadata's `workspace_members` array, not from manifest paths, so a patched path crate under `vendor/` is not misreported as a workspace member.
+- Authority modules are byte-compared against their pins **before** they are dynamically imported; a drifted authority makes E2/E4 undecidable (fail-closed), never untrusted-executed. These hash pins are content pins; they are not a pre/post consistency proof of unindexed inputs.
+- Three disjoint input modes. Committed default `bun run scripts/verification/dependency-exposure.ts capture-reference --out <dir>` (same flags through `verify:dependency-exposure`) on the clean tree refuses a dirty relevant tree (all three `package.json` surfaces + `bun.lock`s, `Cargo.toml`/`Cargo.lock` + crate manifests, tracked vendored source/manifest/provenance/license files per the frozen `VENDOR_SCOPES` grammar above, `scripts/release/**` + the two release entry scripts, `packages/extension-host/src`, `packages/pi-tui-protocol/src`, plus provenance-relevant configs and the private capture helper). Committed clean captures use the private `scripts/verification/capture-inputs.ts` helper (`beginStagedInputCapture`) for pre/post/publication stability but record no staged provenance.
+- Narrow dep-field-free exception, unchanged: `--allow-dirty-relevant` exists solely for dirt that is provably dep-field-free and is recorded in `manifest.relevantTreeStatus`; the checked-in historical capture records `M package.json` from a sibling scripts-line-only edit (dep fields unaffected). This path keeps its existing guard and then uses the bounded working-tree observation (`beginRelevantInputObservation`); it is never routed through staged provenance and never records `stagedInputProvenance`. A dep-field-free file that stays porcelain `M` while its bytes change during capture still refuses, and the old canonical selection stays intact.
+- Explicit staged mode (after integration): `bun run scripts/verification/dependency-exposure.ts capture-reference --staged-inputs --out scripts/verification/fixtures/dependency-exposure/reference` captures only after the helper proves every declared relevant input is an ordinary indexed file with identical raw working bytes, records no `relevantTreeStatus`, snapshots the real parent `HEAD` as `captureHead` before producers, and stores strict optional `stagedInputProvenance` (`schema: pi.deps.staged-inputs.v1`, `mode: staged`, `baseHead` equal to that `captureHead`, `objectFormat: sha1|sha256`, nonempty sorted `pathspecs`, nonempty sorted `entries` of `{path, mode: 100644|100755, blob}` with each entry inside the declared scope).
 
 **Reference refresh law.** The canonical fixture is a living artifact. Any commit that
-changes a relevant input — any Cargo manifest or `Cargo.lock`, extension-host or
-protocol sources under the metafile graph, the release authority scripts, or dep fields
-on any surface — must regenerate the canonical reference in the same commit
-(`capture-reference` on the clean tree, then replace the fixture). This is mechanical
+changes a relevant input — any Cargo manifest or `Cargo.lock`, tracked vendored
+source/manifest/provenance/license file under the frozen `VENDOR_SCOPES` grammar above,
+extension-host or protocol sources under the metafile graph, the release authority
+scripts, or dep fields on any surface — must regenerate the canonical reference in the
+same commit
+(committed `capture-reference` on the clean tree, or the staged command above after staging exactly the intended relevant sources and then installing only the tool-reported files). This is mechanical
 regeneration, like generated docs. Without it the checked-in `self-check` fails closed
 by design: cross-identity, metafile-input, or authority pins go stale and known members
 classify Class S. A red self-check after a relevant change means "refresh the reference",
 never "ignore the gate".
+
+Staged guarantee boundary. Pre/post/publication rechecks with identity and time observations catch ordinary edit-restore races, but they do not prove absence of every adversarial ABA rewrite and are not a global filesystem transaction; no locking, watchers, retries, or transaction framework is claimed. A detected relevant worktree, index, or `HEAD` race stops capture; rerun only when stable. The stored `pathspecs` and `entries` define the exact claim. They do not cover ignored `.references`, `node_modules`, hydrated provider catalogs, Cargo home or cache, out-of-repo config, tool executables and environment, or the entire bundler graph. Existing G3 remains explicitly unclaimed, and classifier transitive-authority pinning is a separate policy change outside this slice. Staged success is real-surface smoke proof for the capture itself, not native Windows or seven-target release proof. Section 10 transcripts remain the historical seed ledger, not new gate results.
 
 ## 6. Redesign disposition (why this shape)
 

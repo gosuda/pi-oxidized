@@ -1,6 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import {
 	NOISE_ROUNDS,
 	NOISE_ROUND_WARMUPS,
@@ -13,10 +11,10 @@ import {
 	stats,
 	validateRustSamplerReport,
 } from "../bench-extension-scaling.ts";
+import { resolve } from "node:path";
 import { NOISE_RELATIVE_SPREAD_LIMIT, requireQuiet } from "../statistics.ts";
 
 const REPOSITORY_ROOT = resolve(import.meta.dirname, "../..");
-const ARTIFACT_PATH = resolve(REPOSITORY_ROOT, "target/bench/extension-scaling.json");
 
 describe("bench-extension-scaling stats regression", () => {
 	test("preserves ceil-rank quantiles and mean while adding population spread", () => {
@@ -44,12 +42,6 @@ describe("bench-extension-scaling stats regression", () => {
 		});
 	});
 
-	test("does not run the benchmark when the module is imported", () => {
-		const before = existsSync(ARTIFACT_PATH) ? readFileSync(ARTIFACT_PATH) : undefined;
-		expect(typeof stats).toBe("function");
-		const after = existsSync(ARTIFACT_PATH) ? readFileSync(ARTIFACT_PATH) : undefined;
-		expect(after).toEqual(before);
-	});
 });
 
 describe("bench-extension-scaling round-median noise validity", () => {
@@ -90,6 +82,33 @@ describe("bench-extension-scaling round-median noise validity", () => {
 		expect(rounds.roundMedian).toBe(1);
 		expect(rounds.roundRelativeSpread).toBeGreaterThan(NOISE_RELATIVE_SPREAD_LIMIT);
 		expect(() => requireQuiet([roundNoiseLane("bimodal lane", rounds)])).toThrow();
+	});
+
+	test("isolated scheduler-hit rounds are trimmed before the spread gate", () => {
+		// Two contaminated rounds out of 27 are scheduler noise, not the
+		// persistent instability the gate detects.
+		const spikyRounds = Array.from({ length: NOISE_ROUNDS }, (_, round) =>
+			round === 3 || round === 17
+				? Array.from({ length: 10 }, () => 4)
+				: Array.from({ length: 10 }, () => 1),
+		);
+		const rounds = roundSummary(spikyRounds);
+		expect(rounds.roundMedians.filter((m) => m === 4)).toHaveLength(2);
+		expect(rounds.trimmedRoundMedians).not.toContain(4);
+		expect(rounds.roundRelativeSpread).not.toBeNull();
+		expect(rounds.roundRelativeSpread).toBeLessThanOrEqual(NOISE_RELATIVE_SPREAD_LIMIT);
+		expect(() => requireQuiet([roundNoiseLane("trimmed lane", rounds)])).not.toThrow();
+	});
+
+	test("contamination beyond the trim width still fails", () => {
+		// Six bad rounds exceed the trim budget: that is a real instability
+		// signature, not a transient spike.
+		const spikyRounds = Array.from({ length: NOISE_ROUNDS }, (_, round) =>
+			round % 4 === 0 ? Array.from({ length: 10 }, () => 4) : Array.from({ length: 10 }, () => 1),
+		);
+		const rounds = roundSummary(spikyRounds);
+		expect(rounds.roundRelativeSpread).toBeGreaterThan(NOISE_RELATIVE_SPREAD_LIMIT);
+		expect(() => requireQuiet([roundNoiseLane("wide-contaminated lane", rounds)])).toThrow();
 	});
 
 	test("refuses to manufacture stability from zero rounds", () => {

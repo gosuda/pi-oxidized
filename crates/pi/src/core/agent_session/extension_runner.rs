@@ -35,6 +35,24 @@ pub struct InputTransformResult {
     pub images: Option<Value>,
 }
 
+/// Result from a boundary lifecycle handler (`turn_end` / `agent_before_settle`).
+///
+/// Draft entries remain opaque JSON at this seam. The extension host validates
+/// their tagged wire shape before returning them to the session layer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BoundaryResult {
+    /// Draft entries returned by extension handlers, when the handler
+    /// supplied an `entries` replacement.
+    pub entries: Option<Vec<Value>>,
+    /// Optional hint that the agent loop should continue after the boundary.
+    pub continue_after: Option<bool>,
+}
+
+/// Rebuild a boundary preview without persisting its draft entries.
+pub type BoundaryPreview = Arc<
+    dyn Fn(Vec<Value>) -> BoxFuture<'static, Result<Value, ExtensionRunnerError>> + Send + Sync,
+>;
+
 /// Optional system-prompt / custom-message injection from `before_agent_start`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BeforeAgentStartResult {
@@ -136,6 +154,19 @@ pub trait ExtensionRunner: Send + Sync {
         cwd: &'a str,
         reason: &'a str,
     ) -> BoxFuture<'a, Result<ResourceExtensionPaths, ExtensionRunnerError>>;
+
+    /// Emit a boundary lifecycle event (`turn_end` / `agent_before_settle`).
+    ///
+    /// `payload` carries the current drafts and preview. Implementations that
+    /// combine handlers rebuild the preview after each handler.
+    fn emit_boundary<'a>(
+        &'a self,
+        _event: &'a str,
+        _payload: Value,
+        _preview: BoundaryPreview,
+    ) -> BoxFuture<'a, Result<Option<BoundaryResult>, ExtensionRunnerError>> {
+        Box::pin(async move { Ok(None) })
+    }
 
     /// Registered slash-command names (extension source).
     fn get_registered_commands(&self) -> Vec<String>;
@@ -453,6 +484,21 @@ impl SessionHooks {
         )
     }
 
+    /// Run the session boundary before the low-level turn-end event.
+    #[must_use]
+    pub fn finish_turn_hook(self: &Arc<Self>) -> pi_agent::FinishTurn {
+        let hooks = Arc::clone(self);
+        Arc::new(move |turn, _cancel| {
+            let hooks = Arc::clone(&hooks);
+            Box::pin(async move {
+                let Some(session) = hooks.session() else {
+                    return Ok(None);
+                };
+                session.finish_turn_boundary(turn).await
+            })
+        })
+    }
+
     /// Build the `prepare_next_turn` closure.
     ///
     /// Session phase (when the weak binding upgrades): wait until the FIFO
@@ -490,6 +536,7 @@ impl SessionHooks {
                     }
                     Ok(Some(AgentLoopTurnUpdate {
                         context: Some(context),
+                        messages: None,
                         model: None,
                         thinking_level: None,
                     }))

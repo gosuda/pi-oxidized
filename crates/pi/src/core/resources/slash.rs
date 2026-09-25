@@ -59,6 +59,8 @@ const BUILTIN_STATIC: &[(&str, &str, Option<&str>)] = &[
         "Select model (opens selector UI)",
         Some("<provider/model>"),
     ),
+    ("tree", "Navigate session tree (switch branches)", None),
+    ("thinking", "Set thinking level", Some("<level>")),
     (
         "scoped-models",
         "Enable/disable models for Ctrl+P cycling",
@@ -90,7 +92,6 @@ const BUILTIN_STATIC: &[(&str, &str, Option<&str>)] = &[
         "Duplicate the current session at the current position",
         None,
     ),
-    ("tree", "Navigate session tree (switch branches)", None),
     (
         "trust",
         "Save project trust decision for future sessions",
@@ -119,7 +120,7 @@ pub fn builtin_quit_description() -> String {
     format!("Quit {APP_NAME}")
 }
 
-/// Exact 22 built-in slash commands from TypeScript `BUILTIN_SLASH_COMMANDS`.
+/// Exact 23 built-in slash commands from TypeScript `BUILTIN_SLASH_COMMANDS`.
 ///
 /// `/quit` uses the live [`APP_NAME`] description.
 #[must_use]
@@ -142,24 +143,26 @@ pub fn builtin_slash_commands() -> Vec<BuiltinSlashCommand> {
         .collect()
 }
 
-/// Number of built-in slash commands (always 22).
-pub const BUILTIN_SLASH_COMMAND_COUNT: usize = 22;
+/// Number of built-in slash commands (always 23).
+pub const BUILTIN_SLASH_COMMAND_COUNT: usize = 23;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn exact_twenty_two_builtins() {
+    fn exact_twenty_three_builtins() {
         assert_eq!(BUILTIN_STATIC.len(), BUILTIN_SLASH_COMMAND_COUNT);
         let cmds = builtin_slash_commands();
-        assert_eq!(cmds.len(), 22);
+        assert_eq!(cmds.len(), 23);
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 "settings",
                 "model",
+                "tree",
+                "thinking",
                 "scoped-models",
                 "export",
                 "import",
@@ -171,7 +174,6 @@ mod tests {
                 "hotkeys",
                 "fork",
                 "clone",
-                "tree",
                 "trust",
                 "login",
                 "logout",
@@ -194,6 +196,6 @@ mod tests {
                 .and_then(|c| c.argument_hint.as_deref()),
             Some("<provider>")
         );
-        assert_eq!(cmds[21].description, format!("Quit {APP_NAME}"));
+        assert_eq!(cmds[22].description, format!("Quit {APP_NAME}"));
     }
 }

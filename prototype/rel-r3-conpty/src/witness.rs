@@ -295,11 +295,28 @@ pub fn run() -> (u8, String) {
         }),
     );
 
-    // Enter key delivery (recorded; no response assertion).
-    let _ = writer.write_all(b"\r");
-    let _ = transcript.event("input", json!({"bytes": 1, "text": "\\r"}));
-    let (enter_batch, _) = pump.settle(SETTLE_IDLE, SETTLE_DEADLINE);
-    log.extend_from_slice(&enter_batch);
+    // Output-side resize markers: the lines pi actually rendered for the
+    // typed input (echo-frame delta vs the boot frame). The storm asserts
+    // preservation of what appeared on screen, never of the scripted
+    // constant, so a broken echo or resize round-trip cannot pass vacuously.
+    let mut echo_markers: Vec<String> = Vec::new();
+    for line in &echo_frame {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || boot_frame.iter().any(|boot| boot.trim() == trimmed) {
+            continue;
+        }
+        if !echo_markers.iter().any(|marker| marker == trimmed) {
+            echo_markers.push(trimmed.to_owned());
+        }
+    }
+    let _ = transcript.event(
+        "echo_markers",
+        json!({
+            "source": "echo_frame_delta_vs_boot",
+            "count": echo_markers.len(),
+            "lines": echo_markers,
+        }),
+    );
 
     // No-clear hard assertion is scoped to the pre-resize stream: after a
     // resize the renderer may inject repaint bytes itself (conhost-derived).
@@ -335,7 +352,12 @@ pub fn run() -> (u8, String) {
         let (batch, _) = pump.settle(SETTLE_IDLE, SETTLE_DEADLINE);
         log.extend_from_slice(&batch);
         let storm_frame = frame(&log, cols, rows);
-        let preserved = any_line_contains(&storm_frame, INPUT_LINE);
+        let preserved = !echo_markers.is_empty()
+            && echo_markers.iter().all(|marker| {
+                storm_frame
+                    .iter()
+                    .any(|line| line.contains(marker.as_str()))
+            });
         if !preserved {
             hard.push("resize_content");
         }
@@ -346,10 +368,20 @@ pub fn run() -> (u8, String) {
                 "rows": rows,
                 "batch_len": batch.len(),
                 "marker_preserved": preserved,
+                "echo_lines": echo_markers.len(),
                 "clears_in_window": count_seq(&batch, b"\x1b[2J") + count_seq(&batch, b"\x1b[3J"),
+                "text": Transcript::head(visible_text(&storm_frame).as_bytes(), 1200),
             }),
         );
     }
+
+    // Enter key delivery (recorded; no response assertion). Moved after the
+    // resize storm so the composer still holds the typed line while the
+    // content-preservation markers are asserted.
+    let _ = writer.write_all(b"\r");
+    let _ = transcript.event("input", json!({"bytes": 1, "text": "\\r"}));
+    let (enter_batch, _) = pump.settle(SETTLE_IDLE, SETTLE_DEADLINE);
+    log.extend_from_slice(&enter_batch);
 
     // Phase 4: teardown. Tree snapshot (advisory), then taskkill /T /F.
     let pid_text = pid.to_string();

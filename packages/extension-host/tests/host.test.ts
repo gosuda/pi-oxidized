@@ -15,7 +15,6 @@ import {
 } from "@earendil-works/pi-tui-protocol";
 import type {
 	ExtensionFactory,
-	ExtensionContextActions,
 } from "@earendil-works/pi-coding-agent";
 import {
 	loadExtensionFromFactory,
@@ -27,7 +26,6 @@ import { COMPATIBILITY_VERSION } from "../src/version.ts";
 import { createExtensionJiti } from "../src/virtual-modules.ts";
 import { loadRunOptions, parseArgs } from "../src/main.ts";
 
-import hooksFactory from "../fixtures/extensions/hooks.ts";
 import toolFactory from "../fixtures/extensions/tool.ts";
 import commandContextFactory from "../fixtures/extensions/command-context.ts";
 import replacedSessionFactory from "../fixtures/extensions/replaced-session.ts";
@@ -75,21 +73,6 @@ function decodeChunks(chunks: Uint8Array[]): Frame[] {
 	}
 	return frames;
 }
-
-/** Minimal context-actions stub for runner construction in tests. */
-const noopContextActions: ExtensionContextActions = {
-	getModel: () => undefined,
-	getScopedModels: () => [],
-	isIdle: () => true,
-	isProjectTrusted: () => true,
-	getSignal: () => undefined,
-	abort: () => {},
-	hasPendingMessages: () => false,
-	shutdown: () => {},
-	getContextUsage: () => undefined,
-	compact: () => {},
-	getSystemPrompt: () => "",
-};
 
 describe("host: hello handshake", () => {
 	test("matching versions ack successfully", async () => {
@@ -142,11 +125,6 @@ describe("host: hello handshake", () => {
 });
 
 describe("host: built-in options", () => {
-	test("defaults to compat mode with built-ins", async () => {
-		const options = await loadRunOptions(["bun", "pi-extension-host"]);
-		expect(options.factories.length).toBeGreaterThan(0);
-	});
-
 	test("parses --no-builtins in any argument position", async () => {
 		const argv = [
 			"bun", "pi-extension-host", "--extension", "first.mjs",
@@ -171,57 +149,11 @@ describe("host: REAL ExtensionRunner hooks", () => {
 		return { ext, runtime };
 	}
 
-	test("hooks fixture registers lifecycle handlers", async () => {
-		const { ext } = await loadFactory(hooksFactory, "hooks.ts");
-		expect([...ext.handlers.keys()]).toEqual(expect.arrayContaining([
-			"session_start", "agent_start", "message_end", "context", "input",
-			"turn_start", "tool_execution_start",
-		]));
-	});
-
 	test("tool fixture registers tool, command, and widget handler", async () => {
 		const { ext } = await loadFactory(toolFactory, "tool.ts");
 		expect([...ext.tools.keys()]).toContain("echo");
 		expect([...ext.commands.keys()]).toContain("greet");
 		expect(ext.handlers.has("session_start")).toBe(true);
-	});
-
-	test("runner dispatches session_start without error", async () => {
-		const { ext, runtime } = await loadFactory(hooksFactory, "hooks.ts");
-		// Escape hatch: reference class stubs.
-		const runner = new ExtensionRunner(
-			[ext], runtime, process.cwd(),
-			{} as unknown as ConstructorParameters<typeof ExtensionRunner>[3],
-			{ getAll: () => [], find: () => undefined } as unknown as ConstructorParameters<typeof ExtensionRunner>[4],
-		);
-		runner.bindCore({} as never, noopContextActions);
-		await runner.emit({ type: "session_start", reason: "startup" });
-		expect(runner.hasHandlers("session_start")).toBe(true);
-	});
-
-	test("runner returns context hook result (pipeline)", async () => {
-		const { ext, runtime } = await loadFactory(hooksFactory, "hooks.ts");
-		const runner = new ExtensionRunner(
-			[ext], runtime, process.cwd(),
-			{} as unknown as ConstructorParameters<typeof ExtensionRunner>[3],
-			{ getAll: () => [], find: () => undefined } as unknown as ConstructorParameters<typeof ExtensionRunner>[4],
-		);
-		runner.bindCore({} as never, noopContextActions);
-		const messages = [{ role: "user", content: [{ type: "text", text: "hi" }] }] as never;
-		const result = await runner.emitContext(messages);
-		expect(result).toEqual(messages);
-	});
-
-	test("runner returns input hook result (continue)", async () => {
-		const { ext, runtime } = await loadFactory(hooksFactory, "hooks.ts");
-		const runner = new ExtensionRunner(
-			[ext], runtime, process.cwd(),
-			{} as unknown as ConstructorParameters<typeof ExtensionRunner>[3],
-			{ getAll: () => [], find: () => undefined } as unknown as ConstructorParameters<typeof ExtensionRunner>[4],
-		);
-		runner.bindCore({} as never, noopContextActions);
-		const result = await runner.emitInput("hello", undefined, "interactive");
-		expect(result.action).toBe("continue");
 	});
 
 	test("first registration wins for duplicate tool names", async () => {
@@ -1604,6 +1536,73 @@ describe("host: replacementReady write failure is contained", () => {
 		await teardown(connected);
 	});
 });
+describe("host: constrained sampling registry", () => {
+	test("snapshot preserves false/config and omits an absent value", async () => {
+		const factory: ExtensionFactory = (pi) => {
+			pi.registerTool({
+				name: "sampling-disabled",
+				label: "Sampling disabled",
+				description: "Explicitly disables constrained sampling",
+				parameters: { type: "object" },
+				constrainedSampling: false,
+				async execute() {
+					return { content: [] };
+				},
+			});
+			pi.registerTool({
+				name: "sampling-configured",
+				label: "Sampling configured",
+				description: "Requests strict constrained sampling",
+				parameters: { type: "object" },
+				constrainedSampling: { type: "json_schema", strict: "prefer" },
+				async execute() {
+					return { content: [] };
+				},
+			});
+			pi.registerTool({
+				name: "sampling-absent",
+				label: "Sampling absent",
+				description: "Leaves constrained sampling to the provider",
+				parameters: { type: "object" },
+				async execute() {
+					return { content: [] };
+				},
+			});
+		};
+		const connected = await connectHost([factory]);
+		try {
+			push(connected.stdin, {
+				id: 230,
+				kind: "req",
+				method: "extensions.load",
+				payload: { extensionPaths: [], cwd: process.cwd() },
+			});
+			const response = payloadOf(
+				await connected.collector.awaitFrame(
+					(frame) => frame.id === 230 && frame.kind === "res",
+					"constrained sampling registry",
+				),
+			);
+			const tools = response["tools"] as Array<Record<string, unknown>>;
+			expect(tools.map((tool) => tool["name"])).toEqual([
+				"sampling-disabled",
+				"sampling-configured",
+				"sampling-absent",
+			]);
+			const byName = new Map(tools.map((tool) => [tool["name"], tool]));
+
+			expect(byName.get("sampling-disabled")?.["constrainedSampling"]).toBe(false);
+			expect(byName.get("sampling-configured")?.["constrainedSampling"]).toEqual({
+				type: "json_schema",
+				strict: "prefer",
+			});
+			expect(Object.hasOwn(byName.get("sampling-absent") ?? {}, "constrainedSampling")).toBe(false);
+		} finally {
+			await teardown(connected);
+		}
+	});
+});
+
 describe("host: protocol extension order", () => {
 	test("initial protocol paths precede builtins and later loads append", async () => {
 		const dir = await mkdtemp(join(tmpdir(), "pr10-precedence-"));

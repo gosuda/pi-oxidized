@@ -2,6 +2,7 @@
 
 use indexmap::IndexMap;
 use pi_ai::ModelThinkingLevel;
+use pi_tui::terminal::ScreenMode;
 use std::ops::{Deref, DerefMut};
 
 /// Output mode requested via `--mode`.
@@ -162,6 +163,10 @@ pub struct Args {
     pub thinking: Option<ModelThinkingLevel>,
     /// `--mode`.
     pub mode: Option<Mode>,
+    /// `--use-theme <name>`.
+    pub use_theme: Option<String>,
+    /// `--tui-mode` (`regular` default; explicit value overrides settings).
+    pub tui_mode: Option<ScreenMode>,
     /// `--name` / `-n`.
     pub name: Option<String>,
     /// `--session`.
@@ -289,15 +294,44 @@ fn parse_general_arg(arg: &str, args: &[String], i: &mut usize, result: &mut Arg
         "--offline" => result.offline = true,
         "--approve" | "-a" => result.project_trust_override = Some(true),
         "--no-approve" | "-na" => result.project_trust_override = Some(false),
-        "--mode" if *i + 1 < args.len() => {
-            *i += 1;
-            match args[*i].as_str() {
-                "text" => result.mode = Some(Mode::Text),
-                "json" => result.mode = Some(Mode::Json),
-                "rpc" => result.mode = Some(Mode::Rpc),
-                _ => {}
+        "--mode" => match args.get(*i + 1) {
+            Some(value) if !value.starts_with('-') => {
+                *i += 1;
+                match value.as_str() {
+                    "text" => result.mode = Some(Mode::Text),
+                    "json" => result.mode = Some(Mode::Json),
+                    "rpc" => result.mode = Some(Mode::Rpc),
+                    _ => result.diagnostics.push(Diagnostic {
+                        level: DiagnosticLevel::Error,
+                        message: format!("Invalid mode \"{value}\". Valid values: text, json, rpc"),
+                    }),
+                }
             }
-        }
+            _ => result.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "--mode requires text, json, or rpc".to_owned(),
+            }),
+        },
+        "--tui-mode" => match args.get(*i + 1) {
+            // A dash-prefixed or missing value is a usage error; the flag
+            // itself is consumed by the loop, the next token is not.
+            Some(value) if !value.starts_with('-') => {
+                *i += 1;
+                match value.parse::<ScreenMode>() {
+                    Ok(mode) => result.tui_mode = Some(mode),
+                    Err(_) => result.diagnostics.push(Diagnostic {
+                        level: DiagnosticLevel::Error,
+                        message: format!(
+                            "Invalid TUI mode \"{value}\". Valid values: regular, fullscreen"
+                        ),
+                    }),
+                }
+            }
+            _ => result.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "--tui-mode requires regular or fullscreen".to_owned(),
+            }),
+        },
         "--provider" if *i + 1 < args.len() => {
             *i += 1;
             result.provider = Some(args[*i].clone());
@@ -427,6 +461,16 @@ fn parse_resource_arg(arg: &str, args: &[String], i: &mut usize, result: &mut Ar
             *i += 1;
             result.themes.push(args[*i].clone());
         }
+        "--use-theme" => match args.get(*i + 1) {
+            Some(value) if !value.starts_with('-') => {
+                *i += 1;
+                result.use_theme = Some(value.clone());
+            }
+            _ => result.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "--use-theme requires a theme name".to_owned(),
+            }),
+        },
         "--no-skills" | "-ns" => result.no_skills = true,
         "--no-prompt-templates" | "-np" => result.no_prompt_templates = true,
         "--no-themes" => result.no_themes = true,
@@ -449,16 +493,7 @@ fn split_comma_list(raw: &str, filter_empty: bool) -> Vec<String> {
 }
 
 fn parse_thinking_level(level: &str) -> Option<ModelThinkingLevel> {
-    match level {
-        "off" => Some(ModelThinkingLevel::Off),
-        "minimal" => Some(ModelThinkingLevel::Minimal),
-        "low" => Some(ModelThinkingLevel::Low),
-        "medium" => Some(ModelThinkingLevel::Medium),
-        "high" => Some(ModelThinkingLevel::High),
-        "xhigh" => Some(ModelThinkingLevel::Xhigh),
-        "max" => Some(ModelThinkingLevel::Max),
-        _ => None,
-    }
+    level.parse().ok()
 }
 
 #[cfg(test)]
@@ -586,6 +621,37 @@ mod tests {
                 "claude-sonnet".to_owned(),
                 "gemini-pro".to_owned()
             ]
+        );
+    }
+
+    #[test]
+    fn mode_requires_valid_value_and_use_theme_is_captured() {
+        let missing = parse_args(&args(&["--mode"]));
+        assert_eq!(missing.diagnostics[0].level, DiagnosticLevel::Error);
+        assert_eq!(
+            missing.diagnostics[0].message,
+            "--mode requires text, json, or rpc"
+        );
+
+        let invalid = parse_args(&args(&["--mode", "yaml"]));
+        assert_eq!(invalid.diagnostics[0].level, DiagnosticLevel::Error);
+        assert_eq!(
+            invalid.diagnostics[0].message,
+            "Invalid mode \"yaml\". Valid values: text, json, rpc"
+        );
+
+        let flag_value = parse_args(&args(&["--mode", "--print"]));
+        assert_eq!(
+            flag_value.diagnostics[0].message,
+            "--mode requires text, json, or rpc"
+        );
+
+        let themed = parse_args(&args(&["--use-theme", "solarized"]));
+        assert_eq!(themed.use_theme.as_deref(), Some("solarized"));
+        let missing_theme = parse_args(&args(&["--use-theme"]));
+        assert_eq!(
+            missing_theme.diagnostics[0].message,
+            "--use-theme requires a theme name"
         );
     }
 
@@ -872,11 +938,100 @@ mod tests {
     }
 
     #[test]
-    fn invalid_mode_is_ignored_and_bare_mode_is_unknown() {
-        assert_eq!(parse_args(&args(&["--mode", "xml"])).mode, None);
+    fn invalid_mode_reports_diagnostic_and_bare_mode_errors() {
+        let invalid = parse_args(&args(&["--mode", "xml"]));
+        assert_eq!(invalid.mode, None);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("Invalid mode \"xml\"") })
+        );
         let bare = parse_args(&args(&["--mode"]));
         assert_eq!(bare.mode, None);
-        assert_eq!(bare.unknown_flags.get("mode"), Some(&FlagValue::Bool));
+        assert!(bare.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("--mode requires text, json, or rpc")
+        }));
+    }
+
+    #[test]
+    fn tui_mode_parses_regular_and_fullscreen() {
+        assert_eq!(
+            parse_args(&args(&["--tui-mode", "regular"])).tui_mode,
+            Some(ScreenMode::Regular)
+        );
+        assert_eq!(
+            parse_args(&args(&["--tui-mode", "fullscreen"])).tui_mode,
+            Some(ScreenMode::Fullscreen)
+        );
+        // Unset by default; resolution against settings happens later.
+        assert_eq!(parse_args(&args(&[])).tui_mode, None);
+    }
+
+    #[test]
+    fn tui_mode_is_independent_of_output_mode() {
+        let result = parse_args(&args(&["--mode", "json", "--tui-mode", "fullscreen"]));
+        assert_eq!(result.mode, Some(Mode::Json));
+        assert_eq!(result.tui_mode, Some(ScreenMode::Fullscreen));
+        // Fullscreen selection must not rewrite the requested output mode.
+        let result = parse_args(&args(&["--tui-mode", "fullscreen", "--mode", "rpc"]));
+        assert_eq!(result.mode, Some(Mode::Rpc));
+        assert_eq!(result.tui_mode, Some(ScreenMode::Fullscreen));
+    }
+
+    #[test]
+    fn tui_mode_missing_value_is_a_usage_error() {
+        let bare = parse_args(&args(&["--tui-mode"]));
+        assert_eq!(bare.tui_mode, None);
+        assert_eq!(
+            bare.diagnostics,
+            vec![Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "--tui-mode requires regular or fullscreen".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn tui_mode_does_not_consume_a_dash_prefixed_next_token() {
+        let result = parse_args(&args(&["--tui-mode", "--print"]));
+        assert_eq!(result.tui_mode, None);
+        assert!(result.print, "the following flag must still parse");
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "--tui-mode requires regular or fullscreen".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn tui_mode_unknown_value_is_a_usage_error_and_consumed() {
+        let result = parse_args(&args(&["--tui-mode", "other", "--print"]));
+        assert_eq!(result.tui_mode, None);
+        assert!(result.print);
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "Invalid TUI mode \"other\". Valid values: regular, fullscreen".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn tui_mode_equals_form_stays_an_unknown_flag() {
+        // Mirrors the reference parser: only the space-separated form is known.
+        let result = parse_args(&args(&["--tui-mode=fullscreen"]));
+        assert_eq!(result.tui_mode, None);
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(
+            result.unknown_flags.get("tui-mode"),
+            Some(&FlagValue::Str("fullscreen".to_owned()))
+        );
     }
 
     #[test]

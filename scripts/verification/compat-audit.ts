@@ -25,10 +25,10 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import type { Dirent } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
-import { CANONICAL_REFERENCE_ROOT, assertCanonicalReference } from "../reference-identity.ts";
+import { EXTENSION_COMPAT_REFERENCE_ROOT, assertExtensionCompatReference } from "../reference-identity.ts";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
-const REF_ROOT = join(REPO_ROOT, CANONICAL_REFERENCE_ROOT, "packages");
+const REF_ROOT = join(REPO_ROOT, EXTENSION_COMPAT_REFERENCE_ROOT, "packages");
 const COMPAT_TS = join(REF_ROOT, "ai", "src", "compat.ts");
 
 // ---------------------------------------------------------------------------
@@ -585,7 +585,7 @@ export function verifyConfigValueSingleOwner(repoRoot: string): string[] {
 // ---------------------------------------------------------------------------
 
 export function runCompatAuditWitnesses(repoRoot: string): string[] {
-	assertCanonicalReference(repoRoot);
+	assertExtensionCompatReference(repoRoot);
 	const violations: string[] = [];
 	const add = (witness: string, results: readonly string[]): void => {
 		for (const result of results) violations.push(`[${witness}] ${result}`);
@@ -596,7 +596,7 @@ export function runCompatAuditWitnesses(repoRoot: string): string[] {
 	try {
 		compatSource = readFileSync(COMPAT_TS, "utf8");
 	} catch {
-		add("source-evidence", [`${CANONICAL_REFERENCE_ROOT}/packages/ai/src/compat.ts not readable`]);
+		add("source-evidence", [`${EXTENSION_COMPAT_REFERENCE_ROOT}/packages/ai/src/compat.ts not readable`]);
 		return violations;
 	}
 	add("source-evidence", verifySourceEvidence(compatSource));

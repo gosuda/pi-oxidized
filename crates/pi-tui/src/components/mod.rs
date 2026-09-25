@@ -6,6 +6,7 @@ mod image;
 mod input;
 mod loader;
 mod markdown;
+mod mouse_region;
 mod padded;
 mod rail;
 mod select_list;
@@ -19,6 +20,7 @@ pub use image::{ImageComponent, ImageOptions, ImageTheme};
 pub use input::Input;
 pub use loader::{CancellableLoader, DEFAULT_LOADER_FRAMES, Loader, LoaderIndicatorOptions};
 pub use markdown::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
+pub use mouse_region::MouseRegion;
 pub use padded::Padded;
 pub use rail::Rail;
 pub use select_list::{

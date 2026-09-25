@@ -336,7 +336,8 @@ pub fn resolve_overlay_layout(
 
     let mut row = match spec.row {
         Some(SizeValue::Percent(p)) => {
-            margin_top + resolve_percentage(avail_height.saturating_sub(effective_height), p)
+            margin_top
+                + SizeValue::Percent(p).resolve(avail_height.saturating_sub(effective_height))
         }
         Some(SizeValue::Cells(r)) => r,
         None => resolve_anchor_row(anchor, effective_height, avail_height, margin_top),
@@ -344,7 +345,7 @@ pub fn resolve_overlay_layout(
 
     let mut col = match spec.col {
         Some(SizeValue::Percent(p)) => {
-            margin_left + resolve_percentage(avail_width.saturating_sub(width), p)
+            margin_left + SizeValue::Percent(p).resolve(avail_width.saturating_sub(width))
         }
         Some(SizeValue::Cells(c)) => c,
         None => resolve_anchor_col(anchor, width, avail_width, margin_left),
@@ -409,10 +410,6 @@ fn resolve_anchor_col(
             margin_left + avail_width.saturating_sub(width) / 2
         }
     }
-}
-
-fn resolve_percentage(reference: u16, percentage: u8) -> u16 {
-    u16::try_from(u32::from(reference) * u32::from(percentage.min(100)) / 100).unwrap_or(u16::MAX)
 }
 
 fn add_i16(base: u16, delta: i16) -> u16 {

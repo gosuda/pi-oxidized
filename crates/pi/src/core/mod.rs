@@ -10,6 +10,7 @@ pub mod export_html;
 pub mod extension_host;
 pub(crate) mod extension_manifest;
 pub mod extension_runtime_set;
+pub mod harness_session;
 pub mod keybindings;
 pub mod messages;
 pub mod migrations;

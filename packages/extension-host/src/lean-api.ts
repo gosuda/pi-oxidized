@@ -13,6 +13,8 @@
  * upstream `@earendil-works/*` packages so prebundled entries and the lean
  * runner share zero runtime graph with Mode 1.
  */
+import type { SessionBoundaryDraftWire } from "./protocol.ts";
+import { isRecord } from "./wire-validators.ts";
 
 /** Lifecycle event discriminants (mirrors Rust `ALL_EVENT_TYPES`). */
 export const LEAN_EVENT_TYPES = [
@@ -24,16 +26,20 @@ export const LEAN_EVENT_TYPES = [
 	"session_before_fork",
 	"session_before_compact",
 	"session_compact",
+	"session_compact_failed",
 	"session_shutdown",
 	"session_before_tree",
 	"session_tree",
 	"context",
+	"context_with_system",
+	"cache_warming_decision",
 	"before_provider_request",
 	"before_provider_headers",
 	"after_provider_response",
 	"before_agent_start",
 	"agent_start",
 	"agent_end",
+	"agent_before_settle",
 	"agent_settled",
 	"ui_prompt_start",
 	"ui_prompt_end",
@@ -98,6 +104,8 @@ export interface LeanTool {
 	readonly description: string;
 	/** JSON Schema for the arguments; forwarded to the model. */
 	readonly parameters?: Record<string, unknown>;
+	/** Optional provider-side constrained sampling request for this tool. */
+	readonly constrainedSampling?: LeanConstrainedSampling;
 	readonly executionMode?: "sequential" | "parallel";
 	/** Map raw model arguments before validation. Defaults to identity. */
 	readonly prepare?: (args: unknown, ctx: LeanContext) => unknown | Promise<unknown>;
@@ -106,6 +114,21 @@ export interface LeanTool {
 	/** Run the tool; the return value crosses the wire as the tool result. */
 	readonly execute: (args: unknown, ctx: LeanToolContext) => unknown | Promise<unknown>;
 }
+
+/** OpenAI grammar variants accepted by the constrained-sampling wire contract. */
+export type LeanGrammarVariants = Partial<Record<"openai_lark" | "openai_regex", string>>;
+
+/** Provider-side constrained sampling request for one lean tool. */
+export type LeanConstrainedSampling =
+	| false
+	| {
+			readonly type: "json_schema";
+			readonly strict: "prefer" | "require";
+	  }
+	| {
+			readonly type: "grammar";
+			readonly variants: LeanGrammarVariants;
+	  };
 
 /** Declarative slash command. */
 export interface LeanCommand {
@@ -135,6 +158,27 @@ export interface LeanShortcutContext extends LeanContext {
 	readonly signal: AbortSignal;
 }
 
+/** Opaque provider-owned handle used by deferred-response operations. */
+export interface LeanDeferredHandle {
+	readonly provider: string;
+	readonly modelId: string;
+	readonly api: string;
+	readonly id: string;
+	readonly expiresAt?: number;
+	readonly pollAfterMs?: number;
+	readonly data?: unknown;
+}
+
+/** Options passed to stream and deferred provider callbacks. */
+export interface LeanProviderOptions {
+	readonly signal: AbortSignal;
+	readonly onPayload?: (payload: unknown) => unknown | Promise<unknown>;
+	readonly onResponse?: (
+		response: { status: number; headers: unknown },
+	) => void | Promise<void>;
+	readonly [key: string]: unknown;
+}
+
 /** Declarative custom provider (mirrors the Mode 1 provider wire shape). */
 export interface LeanProvider {
 	readonly name: string;
@@ -149,8 +193,20 @@ export interface LeanProvider {
 	readonly streamSimple?: (
 		model: unknown,
 		context: unknown,
-		options: Record<string, unknown> & { signal: AbortSignal },
+		options: LeanProviderOptions,
 	) => AsyncIterable<unknown>;
+	/** Poll one provider-owned deferred response (`wait = 0`). */
+	readonly fetchDeferred?: (
+		model: unknown,
+		handle: LeanDeferredHandle,
+		options: LeanProviderOptions,
+	) => AsyncIterable<unknown>;
+	/** Best-effort cancellation of a provider-owned deferred response. */
+	readonly cancelDeferred?: (
+		model: unknown,
+		handle: LeanDeferredHandle,
+		options: LeanProviderOptions,
+	) => void | Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +304,30 @@ export interface LeanGenericHookResult {
 	readonly [key: string]: unknown;
 }
 
+/** Boundary draft entry threaded through `turn_end` / `agent_before_settle`. */
+export type LeanBoundaryDraft = SessionBoundaryDraftWire;
+
+/**
+ * Event passed to boundary lifecycle handlers. Carries the running fold
+ * state: the current draft entries, the pending continuation, and the
+ * Rust-owned projection preview. Supplied result fields REPLACE the running
+ * values (entries never append); the projection itself stays opaque here —
+ * Rust validates drafts and rebuilds the preview after every handler.
+ */
+export interface LeanBoundaryEvent {
+	readonly type: "turn_end" | "agent_before_settle";
+	readonly entries: readonly LeanBoundaryDraft[];
+	readonly continue: boolean;
+	readonly context: unknown;
+	readonly [key: string]: unknown;
+}
+
+/** Boundary handler result; present fields replace the running fold values. */
+export interface LeanBoundaryHookResult {
+	readonly entries?: readonly LeanBoundaryDraft[];
+	readonly continue?: boolean;
+}
+
 /** Typed hooks for the shaped lifecycle events. */
 export interface LeanShapedHooks {
 	readonly tool_call?: (
@@ -274,6 +354,14 @@ export interface LeanShapedHooks {
 		event: LeanResourcesDiscoverEvent,
 		ctx: LeanContext,
 	) => LeanResourcesDiscoverHookResult | void | Promise<LeanResourcesDiscoverHookResult | void>;
+	readonly turn_end?: (
+		event: LeanBoundaryEvent,
+		ctx: LeanContext,
+	) => LeanBoundaryHookResult | void | Promise<LeanBoundaryHookResult | void>;
+	readonly agent_before_settle?: (
+		event: LeanBoundaryEvent,
+		ctx: LeanContext,
+	) => LeanBoundaryHookResult | void | Promise<LeanBoundaryHookResult | void>;
 }
 
 /** Generic hook signature for the remaining lifecycle events. */
@@ -316,33 +404,40 @@ const TOOL_KEYS: ReadonlySet<string> = new Set([
 	"label",
 	"description",
 	"parameters",
+	"constrainedSampling",
 	"executionMode",
 	"prepare",
 	"validate",
 	"execute",
 ]);
+const CONSTRAINED_JSON_SCHEMA_KEYS: Readonly<Record<string, true>> = { type: true, strict: true };
+const CONSTRAINED_GRAMMAR_KEYS: Readonly<Record<string, true>> = { type: true, variants: true };
+const GRAMMAR_VARIANT_KEYS: Readonly<Record<string, true>> = { openai_lark: true, openai_regex: true };
 const COMMAND_KEYS: ReadonlySet<string> = new Set(["name", "description", "handler"]);
 const FLAG_KEYS: ReadonlySet<string> = new Set(["name", "description", "type", "default"]);
 const SHORTCUT_KEYS: ReadonlySet<string> = new Set(["key", "description", "handler"]);
-const PROVIDER_KEYS: ReadonlySet<string> = new Set([
-	"name",
-	"displayName",
-	"baseUrl",
-	"api",
-	"apiKey",
-	"headers",
-	"authHeader",
-	"models",
-	"streamSimple",
-]);
+const PROVIDER_KEYS: Readonly<Record<string, true>> = {
+	name: true,
+	displayName: true,
+	baseUrl: true,
+	api: true,
+	apiKey: true,
+	headers: true,
+	authHeader: true,
+	models: true,
+	streamSimple: true,
+	fetchDeferred: true,
+	cancelDeferred: true,
+};
 
 function requireKnownKeys(
 	context: string,
 	value: Record<string, unknown>,
-	allowed: ReadonlySet<string>,
+	allowed: ReadonlySet<string> | Readonly<Record<string, true>>,
 ): void {
 	for (const key of Object.keys(value)) {
-		if (!allowed.has(key)) {
+		const known = allowed instanceof Set ? allowed.has(key) : Object.hasOwn(allowed, key);
+		if (!known) {
 			fail(context, `unknown key "${key}"`);
 		}
 	}
@@ -364,11 +459,6 @@ export class LeanSurfaceError extends Error {
 		this.name = "LeanSurfaceError";
 	}
 }
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 
 function validateJsonValue(
 	context: string,
@@ -466,6 +556,37 @@ function optionalString(context: string, value: unknown, field: string): void {
 	}
 }
 
+function parseConstrainedSampling(context: string, value: unknown): void {
+	if (value === undefined || value === false) return;
+	if (!isRecord(value)) fail(context, "must be false or an object");
+	assertJsonValue(context, value);
+
+	const type = value["type"];
+	if (type === "json_schema") {
+		requireKnownKeys(context, value, CONSTRAINED_JSON_SCHEMA_KEYS);
+		const strict = value["strict"];
+		if (strict !== "prefer" && strict !== "require") {
+			fail(context, 'strict must be "prefer" or "require"');
+		}
+		return;
+	}
+
+	if (type === "grammar") {
+		requireKnownKeys(context, value, CONSTRAINED_GRAMMAR_KEYS);
+		const variants = value["variants"];
+		if (!isRecord(variants)) fail(context, "variants must be an object");
+		requireKnownKeys(`${context}.variants`, variants, GRAMMAR_VARIANT_KEYS);
+		for (const [variant, definition] of Object.entries(variants)) {
+			if (typeof definition !== "string" || definition.trim() === "") {
+				fail(`${context}.variants`, `${variant} must be a non-empty string`);
+			}
+		}
+		return;
+	}
+
+	fail(context, 'type must be "json_schema" or "grammar"');
+}
+
 function parseTools(value: unknown): void {
 	if (value === undefined) return;
 	if (!Array.isArray(value)) fail("tools", "must be an array");
@@ -476,6 +597,7 @@ function parseTools(value: unknown): void {
 		requireString(context, tool["name"], "name");
 		requireString(context, tool["description"], "description");
 		optionalString(context, tool["label"], "label");
+		parseConstrainedSampling(`${context}.constrainedSampling`, tool["constrainedSampling"]);
 		const executionMode = tool["executionMode"];
 		if (
 			executionMode !== undefined
@@ -573,6 +695,12 @@ function parseProviders(value: unknown): void {
 		}
 		if (provider["streamSimple"] !== undefined) {
 			requireFunction(context, provider["streamSimple"], "streamSimple");
+		}
+		if (provider["fetchDeferred"] !== undefined) {
+			requireFunction(context, provider["fetchDeferred"], "fetchDeferred");
+		}
+		if (provider["cancelDeferred"] !== undefined) {
+			requireFunction(context, provider["cancelDeferred"], "cancelDeferred");
 		}
 	}
 }

@@ -20,13 +20,10 @@ import { describe, expect, test } from "bun:test";
 import { EXECUTION_MAP_CURRENT_PATH, computeExecutionMapGenerationId } from "./map.ts";
 
 import {
-	CANONICAL_REFERENCE_ROOT,
-	CANONICAL_REFERENCE_SHA,
-	LEGACY_REFERENCE_ROOT,
-	LEGACY_REFERENCE_SHA,
-	LEGACY_REFERENCE_SHA_SHORT,
-	RETIRED_REFERENCE_SHA,
-	RETIRED_REFERENCE_SHA_SHORT,
+	EXTENSION_COMPAT_REFERENCE_ROOT,
+	EXTENSION_COMPAT_REFERENCE_SHA,
+	NATIVE_REFERENCE_ROOT,
+	RETIRED_REFERENCE_SHAS,
 } from "../reference-identity.ts";
 
 import {
@@ -45,16 +42,16 @@ function parametersFor(names: readonly string[]): Record<string, unknown> {
 
 describe("VER-ALIGN reference identity", () => {
 	test("canonical identity is the settled pi-2.0 baseline", () => {
-		expect(CANONICAL_REFERENCE_ROOT).toBe(".references/pi-2.0");
-		expect(CANONICAL_REFERENCE_SHA).toBe("853a80d26c90a14c1886f0ebb8ffaae133ca2185");
+		expect(EXTENSION_COMPAT_REFERENCE_ROOT).toBe(".references/pi-2.0");
+		expect(EXTENSION_COMPAT_REFERENCE_SHA).toBe("853a80d26c90a14c1886f0ebb8ffaae133ca2185");
 	});
 
 	test("retired identity literals keep their historical values", () => {
-		expect(LEGACY_REFERENCE_ROOT).toBe(".references/pi"); // historical witness: retired root literal
-		expect(LEGACY_REFERENCE_SHA).toBe("8fa7eebd235355522c8104166b4f1f959b4e2f10"); // historical witness: legacy full SHA
-		expect(LEGACY_REFERENCE_SHA_SHORT).toBe("8fa7eebd"); // historical witness: legacy short SHA
-		expect(RETIRED_REFERENCE_SHA).toBe("4488ad55c18f07ae89a489096c90de8667b3adfb"); // historical witness: retired full SHA
-		expect(RETIRED_REFERENCE_SHA_SHORT).toBe("4488ad55"); // historical witness: retired short SHA
+		expect(NATIVE_REFERENCE_ROOT).toBe(".references/pi"); // historical witness: retired root literal
+		expect(RETIRED_REFERENCE_SHAS[0]).toBe("8fa7eebd235355522c8104166b4f1f959b4e2f10"); // historical witness: legacy full SHA
+		expect(RETIRED_REFERENCE_SHAS[0].slice(0, 8)).toBe("8fa7eebd"); // historical witness: legacy short SHA
+		expect(RETIRED_REFERENCE_SHAS[1]).toBe("4488ad55c18f07ae89a489096c90de8667b3adfb"); // historical witness: retired full SHA
+		expect(RETIRED_REFERENCE_SHAS[1].slice(0, 8)).toBe("4488ad55"); // historical witness: retired short SHA
 	});
 
 	test("every legacy witness allowance is closure-ineligible", () => {
@@ -67,6 +64,7 @@ describe("VER-ALIGN reference identity", () => {
 			[
 				ALIGNMENT_POLICY_PATH,
 				CLASSIFIER_FIXTURE_PATH,
+				".github/workflows/release-verification.yml",
 				"docs/PERF-R2-workload-surface-ranking.md",
 				"docs/PERF-R8-paired-baselines.md",
 				"docs/performance/floors/memory-resource-units.md",
@@ -82,18 +80,18 @@ describe("VER-ALIGN reference pin carriers", () => {
 		const inputs = await loadAlignmentInputs(REPO_ROOT);
 		expect(verifyPinLiterals(inputs.files)).toEqual([]);
 		expect(inputs.files[".github/workflows/release-verification.yml"]).toContain(
-			CANONICAL_REFERENCE_ROOT,
+			EXTENSION_COMPAT_REFERENCE_ROOT,
 		);
 		expect(inputs.files[".github/workflows/musl-bakeoff.yml"]).toContain(
-			CANONICAL_REFERENCE_ROOT,
+			EXTENSION_COMPAT_REFERENCE_ROOT,
 		);
 		const identitySource = inputs.files["scripts/reference-identity.ts"];
 		if (identitySource === undefined) throw new Error("reference identity carrier is missing");
-		expect(identitySource.split(CANONICAL_REFERENCE_SHA)).toHaveLength(2);
+		expect(identitySource.split(EXTENSION_COMPAT_REFERENCE_SHA)).toHaveLength(2);
 		for (const path of PIN_LITERAL_PATHS) {
 			if (path === "scripts/reference-identity.ts") continue;
-			expect(inputs.files[path]).not.toContain(LEGACY_REFERENCE_SHA);
-			expect(inputs.files[path]).not.toContain(RETIRED_REFERENCE_SHA);
+			expect(inputs.files[path]).not.toContain(RETIRED_REFERENCE_SHAS[0]);
+			expect(inputs.files[path]).not.toContain(RETIRED_REFERENCE_SHAS[1]);
 		}
 	});
 
@@ -101,30 +99,30 @@ describe("VER-ALIGN reference pin carriers", () => {
 		const inputs = await loadAlignmentInputs(REPO_ROOT);
 		const ledger = inputs.files[LEDGER_CARRIER_PATH];
 		if (ledger === undefined) throw new Error("docs-evidence ledger carrier is missing");
-		expect((JSON.parse(ledger) as { referencePin: string }).referencePin).toBe(CANONICAL_REFERENCE_SHA);
-		expect(ledger.split(CANONICAL_REFERENCE_SHA).length - 1).toBe(1);
-		expect(ledger).not.toContain(LEGACY_REFERENCE_SHA);
-		expect(ledger).not.toContain(RETIRED_REFERENCE_SHA);
+		expect((JSON.parse(ledger) as { referencePin: string }).referencePin).toBe(EXTENSION_COMPAT_REFERENCE_SHA);
+		expect(ledger.split(EXTENSION_COMPAT_REFERENCE_SHA).length - 1).toBe(1);
+		expect(ledger).not.toContain(RETIRED_REFERENCE_SHAS[0]);
+		expect(ledger).not.toContain(RETIRED_REFERENCE_SHAS[1]);
 	});
 
 	test("pin witness fails on retired workflow literals", () => {
 		const files = {
-			".github/workflows/release-verification.yml": `ref: ${RETIRED_REFERENCE_SHA}\nassert ${RETIRED_REFERENCE_SHA}\n`,
-			"scripts/reconstruct-provider-data.ts": `// pinned reference ${CANONICAL_REFERENCE_SHA}\n`,
+			".github/workflows/release-verification.yml": `ref: ${RETIRED_REFERENCE_SHAS[1]}\nassert ${RETIRED_REFERENCE_SHAS[1]}\n`,
+			"scripts/reconstruct-provider-data.ts": `// pinned reference ${EXTENSION_COMPAT_REFERENCE_SHA}\n`,
 		};
 		const problems = verifyPinLiterals(files);
-		expect(problems.some((problem) => problem.includes(RETIRED_REFERENCE_SHA))).toBe(true);
+		expect(problems.some((problem) => problem.includes(RETIRED_REFERENCE_SHAS[1]))).toBe(true);
 	});
 
 	test("pin witness fails on a legacy ledger pin", () => {
 		const files = {
-			".github/workflows/release-verification.yml": `ref: ${CANONICAL_REFERENCE_SHA}\nassert ${CANONICAL_REFERENCE_SHA}\npath: ${CANONICAL_REFERENCE_ROOT}\n`,
-			"scripts/reconstruct-provider-data.ts": `// pinned reference ${CANONICAL_REFERENCE_SHA}\n`,
-			[LEDGER_CARRIER_PATH]: JSON.stringify({ schema: "pi.docs.evidence.v1", referencePin: LEGACY_REFERENCE_SHA }),
+			".github/workflows/release-verification.yml": `ref: ${EXTENSION_COMPAT_REFERENCE_SHA}\nassert ${EXTENSION_COMPAT_REFERENCE_SHA}\npath: ${EXTENSION_COMPAT_REFERENCE_ROOT}\n`,
+			"scripts/reconstruct-provider-data.ts": `// pinned reference ${EXTENSION_COMPAT_REFERENCE_SHA}\n`,
+			[LEDGER_CARRIER_PATH]: JSON.stringify({ schema: "pi.docs.evidence.v1", referencePin: RETIRED_REFERENCE_SHAS[0] }),
 		};
 		const problems = verifyPinLiterals(files);
 		expect(
-			problems.some((problem) => problem.includes(LEDGER_CARRIER_PATH) && problem.includes(LEGACY_REFERENCE_SHA)),
+			problems.some((problem) => problem.includes(LEDGER_CARRIER_PATH) && problem.includes(RETIRED_REFERENCE_SHAS[0])),
 		).toBe(true);
 		expect(
 			problems.some((problem) => problem.includes(LEDGER_CARRIER_PATH) && problem.includes("exactly once")),
@@ -132,12 +130,12 @@ describe("VER-ALIGN reference pin carriers", () => {
 	});
 
 	test("reference checkout witness accepts only the canonical HEAD", () => {
-		expect(verifyReferenceCheckout(CANONICAL_REFERENCE_SHA)).toEqual([]);
-		expect(verifyReferenceCheckout(LEGACY_REFERENCE_SHA)).toEqual([
-			`${CANONICAL_REFERENCE_ROOT} HEAD is ${LEGACY_REFERENCE_SHA}, expected ${CANONICAL_REFERENCE_SHA}`,
+		expect(verifyReferenceCheckout(EXTENSION_COMPAT_REFERENCE_SHA)).toEqual([]);
+		expect(verifyReferenceCheckout(RETIRED_REFERENCE_SHAS[0])).toEqual([
+			`${EXTENSION_COMPAT_REFERENCE_ROOT} HEAD is ${RETIRED_REFERENCE_SHAS[0]}, expected ${EXTENSION_COMPAT_REFERENCE_SHA}`,
 		]);
 		expect(verifyReferenceCheckout("")).toEqual([
-			`${CANONICAL_REFERENCE_ROOT} HEAD is (missing or unreadable), expected ${CANONICAL_REFERENCE_SHA}`,
+			`${EXTENSION_COMPAT_REFERENCE_ROOT} HEAD is (missing or unreadable), expected ${EXTENSION_COMPAT_REFERENCE_SHA}`,
 		]);
 	});
 });
@@ -164,11 +162,6 @@ describe("VER-ALIGN portable tool selection", () => {
 		);
 	});
 
-	test("portable selection witness tolerates reference-only platform tools", () => {
-		const registryTools = parametersFor([...REQUIRED_TOOL_NAMES, "powershell"]);
-		expect(verifyPortableToolSelection(registryTools)).toEqual([]);
-	});
-
 	test("portable selection witness fails when a required tool is missing", () => {
 		const registryTools = parametersFor(REQUIRED_TOOL_NAMES.filter((name) => name !== "ls"));
 		expect(
@@ -180,33 +173,33 @@ describe("VER-ALIGN portable tool selection", () => {
 describe("VER-ALIGN legacy identity classifier", () => {
 	test("classifier detects direct and split retired roots", () => {
 		expect(
-			scanLegacyIdentity(`read("${LEGACY_REFERENCE_ROOT}/README.md")`).map((o) => o.kind),
+			scanLegacyIdentity(`read("${NATIVE_REFERENCE_ROOT}/README.md")`).map((o) => o.kind),
 		).toEqual(["legacy-root-direct"]);
 		const splitForm = 'join(repo, ".references", "pi")'; // historical witness: split-root regression literal
 		expect(scanLegacyIdentity(`const p = ${splitForm};`).map((o) => o.kind)).toEqual(["legacy-root-split"]);
 		expect(
-			scanLegacyIdentity(`read("${CANONICAL_REFERENCE_ROOT}/README.md")`),
+			scanLegacyIdentity(`read("${EXTENSION_COMPAT_REFERENCE_ROOT}/README.md")`),
 		).toEqual([]);
 	});
 
 	test("classifier separates full and short retired SHAs", () => {
-		expect(scanLegacyIdentity(`pin ${LEGACY_REFERENCE_SHA} end`).map((o) => o.kind)).toEqual(["legacy-sha-full"]);
+		expect(scanLegacyIdentity(`pin ${RETIRED_REFERENCE_SHAS[0]} end`).map((o) => o.kind)).toEqual(["legacy-sha-full"]);
 		expect(
-			scanLegacyIdentity(`see ${LEGACY_REFERENCE_SHA_SHORT} for the short form`).map((o) => o.kind),
+			scanLegacyIdentity(`see ${RETIRED_REFERENCE_SHAS[0].slice(0, 8)} for the short form`).map((o) => o.kind),
 		).toEqual(["legacy-sha-short"]);
-		expect(scanLegacyIdentity(`pin ${RETIRED_REFERENCE_SHA} end`).map((o) => o.kind)).toEqual(["retired-sha-full"]);
+		expect(scanLegacyIdentity(`pin ${RETIRED_REFERENCE_SHAS[1]} end`).map((o) => o.kind)).toEqual(["retired-sha-full"]);
 		expect(
-			scanLegacyIdentity(`see ${RETIRED_REFERENCE_SHA_SHORT} for the short form`).map((o) => o.kind),
+			scanLegacyIdentity(`see ${RETIRED_REFERENCE_SHAS[1].slice(0, 8)} for the short form`).map((o) => o.kind),
 		).toEqual(["retired-sha-short"]);
 		// A short prefix inside a full SHA is never double-counted.
 		expect(
-			scanLegacyIdentity(`${LEGACY_REFERENCE_SHA}${LEGACY_REFERENCE_SHA_SHORT}`).map((o) => o.kind),
+			scanLegacyIdentity(`${RETIRED_REFERENCE_SHAS[0]}${RETIRED_REFERENCE_SHAS[0].slice(0, 8)}`).map((o) => o.kind),
 		).toEqual(["legacy-sha-full"]);
 	});
 
 	test("classifier rejects unknown legacy occurrences in tracked text", () => {
 		const problems = verifyLegacyIdentity(
-			{ "scripts/example.ts": `const p = "${LEGACY_REFERENCE_ROOT}/README.md";\n` },
+			{ "scripts/example.ts": `const p = "${NATIVE_REFERENCE_ROOT}/README.md";\n` },
 			{},
 		);
 		expect(problems).toEqual([
@@ -219,7 +212,7 @@ describe("VER-ALIGN legacy identity classifier", () => {
 		if (fixtureAllowance === undefined) throw new Error("fixture allowance is missing");
 		const problems = verifyLegacyIdentity(
 			{
-				[CLASSIFIER_FIXTURE_PATH]: `pin ${LEGACY_REFERENCE_SHA} // ${HISTORICAL_LABEL}\npin ${LEGACY_REFERENCE_SHA} // ${HISTORICAL_LABEL}\n`,
+				[CLASSIFIER_FIXTURE_PATH]: `pin ${RETIRED_REFERENCE_SHAS[0]} // ${HISTORICAL_LABEL}\npin ${RETIRED_REFERENCE_SHAS[0]} // ${HISTORICAL_LABEL}\n`,
 			},
 			{ [CLASSIFIER_FIXTURE_PATH]: fixtureAllowance },
 		);
@@ -231,7 +224,7 @@ describe("VER-ALIGN legacy identity classifier", () => {
 		const fixtureAllowance = LEGACY_ALLOWANCES[CLASSIFIER_FIXTURE_PATH];
 		if (fixtureAllowance === undefined) throw new Error("fixture allowance is missing");
 		const problems = verifyLegacyIdentity(
-			{ [CLASSIFIER_FIXTURE_PATH]: `pin ${LEGACY_REFERENCE_SHA}\n` },
+			{ [CLASSIFIER_FIXTURE_PATH]: `pin ${RETIRED_REFERENCE_SHAS[0]}\n` },
 			{ [CLASSIFIER_FIXTURE_PATH]: fixtureAllowance },
 		);
 		expect(problems.some((p) => p.includes("unlabelled") && p.includes("legacy-sha-full"))).toBe(true);
@@ -239,7 +232,7 @@ describe("VER-ALIGN legacy identity classifier", () => {
 
 	test("classifier rejects closure contamination in DOC-F sources", () => {
 		const problems = verifyLegacyIdentity(
-			{ "docs/DOC-F-closure-evidence.md": `witness: ${LEGACY_REFERENCE_ROOT}/README.md\n` },
+			{ "docs/DOC-F-closure-evidence.md": `witness: ${NATIVE_REFERENCE_ROOT}/README.md\n` },
 			{},
 		);
 		expect(problems.some((problem) => problem.includes("current DOC-F source consuming a legacy witness"))).toBe(true);
@@ -267,14 +260,14 @@ describe("VER-ALIGN execution-map generation classifier", () => {
 
 	test("retired identity inside a verified generation's canonical witness passes", () => {
 		const { path, text } = generationPath("# Execution map\n\nRendered registry rows.\n", {
-			retiredSha: RETIRED_REFERENCE_SHA,
-			retiredRoot: LEGACY_REFERENCE_ROOT,
+			retiredSha: RETIRED_REFERENCE_SHAS[1],
+			retiredRoot: NATIVE_REFERENCE_ROOT,
 		});
 		expect(verifyLegacyIdentity({ [path]: text }, {})).toEqual([]);
 	});
 
 	test("rendered map text is never exempt from scanning", () => {
-		const { path, text } = generationPath(`# Execution map\n\npin ${RETIRED_REFERENCE_SHA}\n`, {});
+		const { path, text } = generationPath(`# Execution map\n\npin ${RETIRED_REFERENCE_SHAS[1]}\n`, {});
 		expect(verifyLegacyIdentity({ [path]: text }, {})).toEqual([
 			`unclassified legacy retired-sha-full occurrence at ${path}:3`,
 		]);
@@ -282,7 +275,7 @@ describe("VER-ALIGN execution-map generation classifier", () => {
 
 	test("digest mismatch fails closed before the witness exemption", () => {
 		const { text } = generationPath("# Execution map\n\nRendered registry rows.\n", {
-			retiredSha: RETIRED_REFERENCE_SHA,
+			retiredSha: RETIRED_REFERENCE_SHAS[1],
 		});
 		const forgedId = "ff".repeat(32);
 		expect(verifyLegacyIdentity({ [`${GENERATIONS_DIRECTORY}/${forgedId}.md`]: text }, {})).toEqual([
@@ -291,7 +284,7 @@ describe("VER-ALIGN execution-map generation classifier", () => {
 	});
 
 	test("malformed bundle grammar fails closed before the witness exemption", () => {
-		const text = `# Execution map\n\n## Canonical witness\n\n\`\`\`json\n${JSON.stringify({ retiredSha: RETIRED_REFERENCE_SHA })}\n`;
+		const text = `# Execution map\n\n## Canonical witness\n\n\`\`\`json\n${JSON.stringify({ retiredSha: RETIRED_REFERENCE_SHAS[1] })}\n`;
 		const path = `${GENERATIONS_DIRECTORY}/${computeExecutionMapGenerationId(text)}.md`;
 		const problems = verifyLegacyIdentity({ [path]: text }, {});
 		expect(problems).toHaveLength(1);

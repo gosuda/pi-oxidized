@@ -163,8 +163,9 @@ export const BASE_SURFACES: readonly FrameSpec[] = [
 
 // ---------------------------------------------------------------------------
 // Layer 1 — ARC11 gap surfaces (plan Decision 2). Payload literals mirror the
-// producing handlers. Ids start at 40 (committed corpus max is 32); streaming
-// updates reuse the parent request id; cancel control frames use id 0.
+// producing handlers. Id 33 (previewBoundary) and the ARC11 batch (40+) sit
+// above the committed corpus max of 32; streaming updates reuse the parent
+// request id; cancel control frames use id 0.
 // ---------------------------------------------------------------------------
 
 export const NEW_SURFACES: readonly FrameSpec[] = [
@@ -356,6 +357,116 @@ export const NEW_SURFACES: readonly FrameSpec[] = [
 		payload: { type: "message_update_delta", event: { type: "text_delta", delta: "hi" } },
 	},
 	{ id: 50, kind: "res", method: "message_update_delta", payload: {} },
+	// provider.fetchDeferred / provider.cancelDeferred (protocol.rs): deferred
+	// requests carry a fully serialized Model, handle, prepared options, and
+	// callback flags. The terminal fetch value is open JSON; cancellation
+	// acknowledges with an empty object.
+	{
+		id: 51,
+		kind: "req",
+		method: "provider.fetchDeferred",
+		payload: {
+			providerId: "callbackProv",
+			model: {
+				id: "m",
+				name: "m",
+				api: "openai",
+				provider: "test",
+				baseUrl: "",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1,
+				maxTokens: 1,
+			},
+			handle: { provider: "test", modelId: "m", api: "openai", id: "h1" },
+			options: { wait: 0 },
+			callbacks: { beforePayload: true, onResponse: true },
+		},
+	},
+	{ id: 51, kind: "res", method: "provider.fetchDeferred", payload: {} },
+	{
+		id: 52,
+		kind: "req",
+		method: "provider.cancelDeferred",
+		payload: {
+			providerId: "callbackProv",
+			model: {
+				id: "m",
+				name: "m",
+				api: "openai",
+				provider: "test",
+				baseUrl: "",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1,
+				maxTokens: 1,
+			},
+			handle: { provider: "test", modelId: "m", api: "openai", id: "h1" },
+			options: {},
+			callbacks: { beforePayload: true, onResponse: true },
+		},
+	},
+	{ id: 52, kind: "res", method: "provider.cancelDeferred", payload: {} },
+	// Provider callback methods use independent request/response frames. The
+	// call id is the originating deferred operation's frame id as a string.
+	{
+		id: 53,
+		kind: "req",
+		method: "provider.beforePayload",
+		payload: { callId: "51", payload: { original: true } },
+	},
+	{
+		id: 53,
+		kind: "res",
+		method: "provider.beforePayload",
+		payload: { payload: { mutated: true } },
+	},
+	{
+		id: 54,
+		kind: "req",
+		method: "provider.onResponse",
+		payload: {
+			callId: "51",
+			response: { status: 200, headers: { "content-type": "application/json" } },
+		},
+	},
+	{ id: 54, kind: "res", method: "provider.onResponse", payload: {} },
+	// session.previewBoundary (protocol.rs SESSION_PREVIEW_BOUNDARY_METHOD):
+	// correlated request from the host — boundary names the turn_end /
+	// agent_before_settle decoder gate and entries carry one of each wire
+	// draft variant; the response mirrors the projection preview object the
+	// product returns (empty draft projection on a fresh session).
+	{
+		id: 33,
+		kind: "req",
+		method: "session.previewBoundary",
+		payload: {
+			boundary: "turn_end",
+			entries: [
+				{ type: "custom", customType: "note", data: { tag: "draft" } },
+				{ type: "custom_message", customType: "status", content: "settling", display: true },
+				{ type: "context_edit", targetId: "e1", replacement: null },
+				{ type: "compaction", summary: "kept the plan", firstKeptEntryId: "e9" },
+			],
+		},
+	},
+	{
+		id: 33,
+		kind: "res",
+		method: "session.previewBoundary",
+		payload: {
+			context: {
+				contextEntries: [],
+				contextMessages: [],
+				llmMessages: [],
+				pendingMessages: [],
+				canContinue: true,
+			},
+		},
+	},
+
 ];
 
 // ---------------------------------------------------------------------------
@@ -374,8 +485,8 @@ const LIFECYCLE_RES_REPS: readonly string[] = [
  * (callback_timeout_frame: code "timeout", not retryable). */
 const LIFECYCLE_ERROR_REP = "message_update";
 
-/** First id of the 35 lifecycle req frames (after the last gap-surface id). */
-const FIRST_LIFECYCLE_ID = 51;
+/** First id of the 39 lifecycle req frames (after the last gap-surface id). */
+const FIRST_LIFECYCLE_ID = 55;
 
 function lifecycleFrames(lifecycle: readonly string[]): readonly FrameSpec[] {
 	const frames: FrameSpec[] = [];

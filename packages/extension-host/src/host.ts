@@ -48,11 +48,12 @@ import type {
 	ToolDefinition,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
-import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { Context, DeferredHandle, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
 import { AssistantDeltaReducer } from "./assistant-delta.ts";
+import { isRecord, isStructuredAbortError } from "./wire-validators.ts";
 
 /** Minimal event bus for extension-to-extension communication. */
 export function createEventBus() {
@@ -77,16 +78,20 @@ export const ALL_EVENT_TYPES = [
 	"session_before_fork",
 	"session_before_compact",
 	"session_compact",
+	"session_compact_failed",
 	"session_shutdown",
 	"session_before_tree",
 	"session_tree",
 	"context",
+	"context_with_system",
+	"cache_warming_decision",
 	"before_provider_request",
 	"before_provider_headers",
 	"after_provider_response",
 	"before_agent_start",
 	"agent_start",
 	"agent_end",
+	"agent_before_settle",
 	"agent_settled",
 	"ui_prompt_start",
 	"ui_prompt_end",
@@ -174,19 +179,6 @@ function isSlotComponent(value: unknown): value is SlotComponent {
 	return value !== null
 		&& typeof value === "object"
 		&& typeof (value as SlotComponent).render === "function";
-}
-
-/**
- * Structured cancellation only: a real Error (or DOMException, which is
- * not Error-derived in every runtime) named AbortError. Message text is
- * deliberately never consulted — an extension failure that merely says
- * "cancelled" must stay an extension_error.
- */
-function isStructuredAbortError(error: unknown): boolean {
-	if (error instanceof Error && error.name === "AbortError") return true;
-	return typeof DOMException === "function"
-		&& error instanceof DOMException
-		&& error.name === "AbortError";
 }
 
 /** Pending load options captured during the hello handshake. */
@@ -510,6 +502,20 @@ type ProviderLoadScope = {
 	readonly extensionPath: string;
 	readonly operations: ProviderRegistrationOperation[];
 };
+const PROVIDER_FETCH_DEFERRED_METHOD = "provider.fetchDeferred";
+const PROVIDER_CANCEL_DEFERRED_METHOD = "provider.cancelDeferred";
+
+function isDeferredHandle(value: unknown): value is DeferredHandle {
+	return isRecord(value)
+		&& typeof value["provider"] === "string"
+		&& typeof value["modelId"] === "string"
+		&& typeof value["api"] === "string"
+		&& typeof value["id"] === "string"
+		&& (value["expiresAt"] === undefined
+			|| (typeof value["expiresAt"] === "number" && Number.isFinite(value["expiresAt"])))
+		&& (value["pollAfterMs"] === undefined
+			|| (typeof value["pollAfterMs"] === "number" && Number.isFinite(value["pollAfterMs"])));
+}
 
 /**
  * Extension host process. Owns the ExtensionRunner and bridges it to Rust over
@@ -539,7 +545,7 @@ export class ExtensionHost {
 	private nextExtensionLoadToken = 0;
 	private nextProviderRegistrationOrder = 0;
 	private readonly inFlightTools = new Map<number, AbortController>();
-	/** In-flight provider.stream AbortControllers keyed by request id. */
+	/** In-flight provider operation AbortControllers keyed by request id. */
 	private readonly inFlightProviders = new Map<number, AbortController>();
 	/** Active shortcut handlers keyed by their resolved shortcut key (single-flight). */
 	private readonly inFlightShortcuts = new Map<string, AbortController>();
@@ -807,6 +813,12 @@ export class ExtensionHost {
 			case "provider.stream":
 				await this.handleProviderStream(id, p);
 				return;
+			case PROVIDER_FETCH_DEFERRED_METHOD:
+				await this.handleProviderFetchDeferred(id, p);
+				return;
+			case PROVIDER_CANCEL_DEFERRED_METHOD:
+				await this.handleProviderCancelDeferred(id, p);
+				return;
 			default:
 				if (this.runner?.hasHandlers(method)) {
 					await this.handleLifecycleHook(id, method, p);
@@ -1044,6 +1056,44 @@ export class ExtensionHost {
 						headers as Record<string, string | null>,
 					);
 					await this.client.respond(id, eventType as Method, { headers: result });
+					return;
+				}
+				case "context": {
+					// The pinned 0.80.10 runner exposes emitContext.
+					const messages = payload["messages"];
+					const result = await runner.emitContext(Array.isArray(messages) ? messages : []);
+					await this.client.respond(id, eventType as Method, {
+						messages: result ?? undefined,
+					});
+					return;
+				}
+				case "before_provider_request": {
+					// The pinned 0.80.10 runner exposes emitBeforeProviderRequest.
+					const result = await runner.emitBeforeProviderRequest(payload["payload"]);
+					await this.client.respond(id, eventType as Method, { payload: result });
+					return;
+				}
+				case "user_bash": {
+					// The pinned 0.80.10 runner exposes emitUserBash.
+					const result = await runner.emitUserBash({
+						type: "user_bash",
+						...payload,
+					} as Parameters<typeof runner.emitUserBash>[0]);
+					await this.client.respond(id, eventType as Method, result ?? {});
+					return;
+				}
+				case "cache_warming_decision":
+				case "turn_end":
+				case "agent_before_settle":
+				case "context_with_system": {
+					// The pinned runner has no emitBoundary or
+					// emitCacheWarmingDecision. Generic emit runs handlers but
+					// cannot harvest those newer result shapes.
+					result = await runner.emit({
+						type: eventType,
+						...payload,
+					} as Parameters<typeof runner.emit>[0]);
+					await this.client.respond(id, eventType as Method, result ?? { ok: true });
 					return;
 				}
 				case "session_before_compact":
@@ -1879,6 +1929,8 @@ export class ExtensionHost {
 							name: native.name,
 							baseUrl: native.baseUrl,
 							streamSimple: native.streamSimple,
+							fetchDeferred: native.fetchDeferred,
+							cancelDeferred: native.cancelDeferred,
 						});
 					}
 				},
@@ -1953,6 +2005,37 @@ export class ExtensionHost {
 		};
 	}
 
+	/**
+	 * Reconstruct `onPayload`/`onResponse` on a provider options object from
+	 * the request's `callbacks` flags. Rust serializes callback availability
+	 * there; each installed proxy issues the correlated `provider.*` request
+	 * back with the originating frame id as `callId`.
+	 */
+	private installProviderWireCallbacks(
+		id: number,
+		p: Record<string, unknown>,
+		options: Record<string, unknown>,
+	): void {
+		const callbacks = isRecord(p["callbacks"]) ? p["callbacks"] : undefined;
+		if (callbacks?.["beforePayload"] === true) {
+			options["onPayload"] = async (payload: unknown) => {
+				const frame = await this.client.request("provider.beforePayload" as Method, {
+					callId: String(id),
+					payload,
+				});
+				return isRecord(frame.payload) ? frame.payload["payload"] : undefined;
+			};
+		}
+		if (callbacks?.["onResponse"] === true) {
+			options["onResponse"] = async (response: unknown) => {
+				await this.client.request("provider.onResponse" as Method, {
+					callId: String(id),
+					response,
+				});
+			};
+		}
+	}
+
 	private applyProviderOperation(operation: ProviderRegistrationOperation): void {
 		if (operation.kind === "native") {
 			const id = operation.provider["id"];
@@ -1965,6 +2048,8 @@ export class ExtensionHost {
 						name: native.name,
 						baseUrl: native.baseUrl,
 						streamSimple: native.streamSimple,
+						fetchDeferred: native.fetchDeferred,
+						cancelDeferred: native.cancelDeferred,
 					},
 					extensionPath: operation.extensionPath,
 					order: operation.order,
@@ -2074,6 +2159,8 @@ export class ExtensionHost {
 				name,
 				streamSimple: typeof config.streamSimple === "function",
 			};
+			if (typeof config.fetchDeferred === "function") entry["fetchDeferred"] = true;
+			if (typeof config.cancelDeferred === "function") entry["cancelDeferred"] = true;
 			if (config.baseUrl !== undefined) entry["baseUrl"] = config.baseUrl;
 			if (config.api !== undefined) entry["api"] = config.api;
 			if (config.name !== undefined) entry["displayName"] = config.name;
@@ -2109,6 +2196,9 @@ export class ExtensionHost {
 				description: def.description,
 				parameters: def.parameters ?? {},
 			};
+			if (def.constrainedSampling !== undefined) {
+				entry["constrainedSampling"] = def.constrainedSampling;
+			}
 			if (def.executionMode !== undefined) {
 				entry["executionMode"] = def.executionMode;
 			}
@@ -2528,12 +2618,22 @@ export class ExtensionHost {
 			return;
 		}
 
+		const rawOptions = p["options"];
+		if (rawOptions !== undefined && !isRecord(rawOptions)) {
+			await this.client.respondError(id, "provider.stream" as Method, {
+				code: "invalid_arguments",
+				message: "provider.stream options must be an object",
+				retryable: false,
+			});
+			return;
+		}
 		const controller = new AbortController();
 		this.inFlightProviders.set(id, controller);
 		const options = {
-			...((p["options"] as Record<string, unknown> | undefined) ?? {}),
+			...(rawOptions ?? {}),
 			signal: controller.signal,
 		};
+		this.installProviderWireCallbacks(id, p, options);
 		try {
 			const stream = config.streamSimple(p["model"] as Model<string>, p["context"] as Context, options as SimpleStreamOptions);
 			for await (const event of stream) {
@@ -2561,6 +2661,133 @@ export class ExtensionHost {
 			await this.client.respondError(id, "provider.stream" as Method, {
 				code: cancelled ? "cancelled" : "extension_error",
 				message: cancelled ? "provider stream cancelled" : message,
+				retryable: false,
+			});
+		} finally {
+			this.inFlightProviders.delete(id);
+		}
+	}
+	private async handleProviderFetchDeferred(id: number, p: Record<string, unknown>): Promise<void> {
+		const providerId = String(p["providerId"] ?? p["name"] ?? "");
+		const config = this.providers.get(providerId);
+		if (config === undefined || typeof config.fetchDeferred !== "function") {
+			await this.client.respondError(id, PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: "not_found",
+				message: `Provider not found or missing fetchDeferred: ${providerId}`,
+				retryable: false,
+			});
+			return;
+		}
+
+		const model = p["model"];
+		const rawHandle = p["handle"];
+		const rawOptions = p["options"];
+		if (
+			!isRecord(model)
+			|| !isDeferredHandle(rawHandle)
+			|| (rawOptions !== undefined && !isRecord(rawOptions))
+		) {
+			await this.client.respondError(id, PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: "invalid_arguments",
+				message: "provider.fetchDeferred model, handle, and options must be objects",
+				retryable: false,
+			});
+			return;
+		}
+
+		const controller = new AbortController();
+		this.inFlightProviders.set(id, controller);
+		const options = {
+			...(rawOptions ?? {}),
+			wait: 0,
+			signal: controller.signal,
+		};
+		this.installProviderWireCallbacks(id, p, options);
+		try {
+			const stream = config.fetchDeferred(p["model"] as Model<string>, rawHandle, options as SimpleStreamOptions);
+			for await (const event of stream) {
+				if (controller.signal.aborted) break;
+				await this.client.send({
+					id,
+					kind: "event",
+					method: "providerEvent",
+					payload: event,
+				});
+			}
+			if (controller.signal.aborted) {
+				await this.client.respondError(id, PROVIDER_FETCH_DEFERRED_METHOD, {
+					code: "cancelled",
+					message: "provider deferred fetch cancelled",
+					retryable: false,
+				});
+				return;
+			}
+			await this.client.respond(id, PROVIDER_FETCH_DEFERRED_METHOD, {});
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
+			await this.client.respondError(id, PROVIDER_FETCH_DEFERRED_METHOD, {
+				code: cancelled ? "cancelled" : "extension_error",
+				message: cancelled ? "provider deferred fetch cancelled" : message,
+				retryable: false,
+			});
+		} finally {
+			this.inFlightProviders.delete(id);
+		}
+	}
+
+	private async handleProviderCancelDeferred(id: number, p: Record<string, unknown>): Promise<void> {
+		const providerId = String(p["providerId"] ?? p["name"] ?? "");
+		const config = this.providers.get(providerId);
+		if (config === undefined || typeof config.cancelDeferred !== "function") {
+			await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: "not_found",
+				message: `Provider not found or missing cancelDeferred: ${providerId}`,
+				retryable: false,
+			});
+			return;
+		}
+
+		const model = p["model"];
+		const rawHandle = p["handle"];
+		const rawOptions = p["options"];
+		if (
+			!isRecord(model)
+			|| !isDeferredHandle(rawHandle)
+			|| (rawOptions !== undefined && !isRecord(rawOptions))
+		) {
+			await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: "invalid_arguments",
+				message: "provider.cancelDeferred model, handle, and options must be objects",
+				retryable: false,
+			});
+			return;
+		}
+
+		const controller = new AbortController();
+		this.inFlightProviders.set(id, controller);
+		const options = {
+			...(rawOptions ?? {}),
+			signal: controller.signal,
+		};
+		this.installProviderWireCallbacks(id, p, options);
+		try {
+			await config.cancelDeferred(p["model"] as Model<string>, rawHandle, options as SimpleStreamOptions);
+			if (controller.signal.aborted) {
+				await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
+					code: "cancelled",
+					message: "provider deferred cancellation cancelled",
+					retryable: false,
+				});
+				return;
+			}
+			await this.client.respond(id, PROVIDER_CANCEL_DEFERRED_METHOD, {});
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			const cancelled = controller.signal.aborted || isStructuredAbortError(err);
+			await this.client.respondError(id, PROVIDER_CANCEL_DEFERRED_METHOD, {
+				code: cancelled ? "cancelled" : "extension_error",
+				message: cancelled ? "provider deferred cancellation cancelled" : message,
 				retryable: false,
 			});
 		} finally {
@@ -3182,10 +3409,6 @@ export class ExtensionHost {
 	get extensionCount(): number { return this.extensions.length; }
 	getExtensions(): Extension[] { return [...this.extensions]; }
 	getRunner(): ExtensionRunner | undefined { return this.runner; }
-}
-
-function isRecord<T extends Record<string, unknown>>(value: unknown): value is T {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Compare JSON-serializable values ignoring object-key insertion order. */

@@ -5,37 +5,32 @@
  * Captures the deterministic software-bill-of-materials snapshot that every
  * later epoch diffs against (EXT-23 post-audit: "SBOM regenerated and diffed
  * vs the Phase 1 baseline"). The baseline covers every shipped input class
- * named by the policy:
+ * named by the policy.
  *
- * - the locked Rust graph (`cargo metadata --locked --offline --all-features`
- *   over Cargo.lock): one record per resolved crate with license, registry vs
- *   workspace provenance, and direct/dev-only edge position;
- * - the Rust toolchain channel (rust-toolchain.toml) and the CI toolchain pin;
- * - all three package.json surfaces with their dependency fields;
- * - both lockfiles of record (root bun.lock + extension-host bun.lock) with
- *   every resolved `name@version` entry;
- * - the bundled Bun runtime version, its seven sha256-pinned release assets,
- *   and the CI bun-version pin.
- *
- * `capture` refuses a tree whose inputs are dirty, so a snapshot always
- * describes a committed tree; `verify` recomputes the content from the live
- * tree and fails closed on any drift — a red verify after a dependency change
- * means "refresh the baseline in the same commit", never "ignore the guard".
+ * `capture` refuses a tree whose inputs are dirty unless `--staged-inputs` is
+ * given; in the staged mode the snapshot records an honest indexed-provenance
+ * claim against the real base commit, and every input is rechecked immediately
+ * after capture and again before the atomic file replacement. `verify`
+ * recomputes the content from the live tree and fails closed on any drift.
  *
  * CLI:
- *   deps-sbom.ts capture [--out <file>]   write the snapshot (default: the
- *                                         checked-in baseline fixture)
- *   deps-sbom.ts verify [--snapshot <f>]  recompute and diff against the
- *                                         checked-in baseline; exit 1 on drift
+ *   deps-sbom.ts capture [--staged-inputs] [--out <file>]
+ *   deps-sbom.ts verify [--snapshot <file>]
  */
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { closeSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
+import { dirname, join, posix, resolve } from "node:path";
 
-import { BUN_RUNTIME_VERSION } from "../release/runtime.ts";
-import { RUST_TARGETS } from "../release/targets.ts";
+import {
+	beginStagedInputCapture,
+	parseStagedInputProvenance,
+	assertCaptureOutputPathsDisjoint,
+} from "./capture-inputs.ts";
+import type { StagedInputProvenance, StagedInputCapture } from "./capture-inputs.ts";
+import { assertCompiledVendorCoverage, vendorInputScopes, readVendorSourcePins } from "./vendor-provenance.ts";
+import type { VendorSourcePin } from "./vendor-provenance.ts";
 
 export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
@@ -58,7 +53,11 @@ const CARGO_METADATA_ARGV = [
 ] as const;
 
 /** Every tracked file the snapshot content is derived from. */
-export const SBOM_INPUT_PATHS: readonly string[] = [
+function sbomInputPaths(root: string): readonly string[] {
+	return [
+	".gitattributes",
+	".cargo/config",
+	".cargo/config.toml",
 	"Cargo.toml",
 	"Cargo.lock",
 	...["pi", "pi-agent", "pi-ai", "pi-ext", "pi-tui"].map((c) => `crates/${c}/Cargo.toml`),
@@ -70,15 +69,27 @@ export const SBOM_INPUT_PATHS: readonly string[] = [
 	"packages/pi-tui-protocol/package.json",
 	"scripts/release/runtime.ts",
 	"scripts/release/targets.ts",
+	"scripts/verification/capture-inputs.ts",
+	"scripts/verification/deps-sbom.ts",
+	"scripts/verification/vendor-provenance.ts",
+	...vendorInputScopes(root),
 	".github/workflows/release-verification.yml",
-];
+	];
+}
 
 /** One resolved Rust crate (or workspace member) in the locked graph. */
 export interface RustPackageRecord {
 	readonly name: string;
 	readonly version: string;
 	readonly license: string;
-	readonly source: "registry" | "workspace";
+	/**
+	 * `workspace` for workspace members, `path` for non-member local-path
+	 * packages (e.g. approved vendor crates), `registry` for all other
+	 * external sources. Determined by cargo metadata `source` field, not
+	 * merely workspace membership, so a patched path crate is never
+	 * misreported as registry.
+	 */
+	readonly source: "registry" | "workspace" | "path";
 	readonly direct: boolean;
 	readonly devOnly: boolean;
 }
@@ -118,6 +129,8 @@ export interface SbomContent {
 		readonly toolchainChannel: string;
 		readonly ciRustToolchain: string;
 		readonly packages: readonly RustPackageRecord[];
+		/** Tracked vendored build source / manifest / provenance / license pins. */
+		readonly vendorPins?: readonly VendorSourcePin[];
 	};
 	readonly npm: {
 		readonly surfaces: readonly NpmSurfaceRecord[];
@@ -138,6 +151,7 @@ export interface SbomSnapshot {
 	readonly captureHead: string;
 	readonly contentSha256: string;
 	readonly content: SbomContent;
+	readonly stagedInputProvenance?: StagedInputProvenance;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -179,6 +193,8 @@ interface CargoMetadata {
 		license: string | null;
 		id: string;
 		manifest_path: string;
+		/** `null` for path/workspace packages; `registry+...`/`git+...` otherwise. */
+		source: string | null;
 	}>;
 	workspace_members: string[];
 	resolve: {
@@ -213,17 +229,18 @@ function cargoMetadata(root: string): CargoMetadata {
 		? resolveNode["nodes"]
 		: [];
 	return {
-		packages: packages.map((p) => {
-			if (!isRecord(p)) throw new Error("cargo metadata: malformed package");
-			return {
-				name: asString(p["name"], "package.name"),
-				version: asString(p["version"], "package.version"),
-				license: typeof p["license"] === "string" ? p["license"] : null,
-				id: asString(p["id"], "package.id"),
-				manifest_path: asString(p["manifest_path"], "package.manifest_path"),
-			};
-		}),
-		workspace_members: workspaceMembers.map((m) => asString(m, "workspace_member")),
+	packages: packages.map((p) => {
+		if (!isRecord(p)) throw new Error("cargo metadata: malformed package");
+		return {
+			name: asString(p["name"], "package.name"),
+			version: asString(p["version"], "package.version"),
+			license: typeof p["license"] === "string" ? p["license"] : null,
+			id: asString(p["id"], "package.id"),
+			manifest_path: asString(p["manifest_path"], "package.manifest_path"),
+			source: typeof p["source"] === "string" ? p["source"] : null,
+		};
+	}),
+	workspace_members: workspaceMembers.map((m) => asString(m, "workspace_member")),
 		resolve: { nodes: nodes.map((n) => {
 			if (!isRecord(n)) throw new Error("cargo metadata: malformed resolve node");
 			const deps = Array.isArray(n["deps"]) ? n["deps"] : [];
@@ -245,8 +262,9 @@ function cargoMetadata(root: string): CargoMetadata {
 	};
 }
 
-function rustPackages(root: string): readonly RustPackageRecord[] {
+function rustPackages(root: string, vendorPins: readonly VendorSourcePin[]): readonly RustPackageRecord[] {
 	const meta = cargoMetadata(root);
+	assertCompiledVendorCoverage(root, meta.packages, vendorPins);
 	const members = new Set(meta.workspace_members);
 	const byId = new Map(meta.packages.map((p) => [p.id, p]));
 	const directEdges = new Map<string, Set<string>>();
@@ -266,11 +284,19 @@ function rustPackages(root: string): readonly RustPackageRecord[] {
 	}
 	const records = meta.packages.map((p) => {
 		const kinds = directEdges.get(p.id);
+		let source: RustPackageRecord["source"];
+		if (members.has(p.id)) {
+			source = "workspace";
+		} else if (p.source === null) {
+			source = "path";
+		} else {
+			source = "registry";
+		}
 		return {
 			name: p.name,
 			version: p.version,
 			license: p.license ?? "",
-			source: members.has(p.id) ? ("workspace" as const) : ("registry" as const),
+			source,
 			direct: kinds !== undefined,
 			devOnly: kinds !== undefined && [...kinds].every((k) => k === "dev"),
 		};
@@ -330,7 +356,6 @@ function lockfileRecords(root: string): readonly LockfileRecord[] {
 		}
 		const packages = Object.entries(parsed["packages"])
 			.map(([, value]) => {
-				// bun.lock shape: "<name>": ["<name>@<version>", scope, meta, integrity]
 				const id = Array.isArray(value) && typeof value[0] === "string" ? value[0] : null;
 				if (id === null) throw new Error(`${rel}: package entry without name@version id`);
 				return splitPackageKey(id);
@@ -347,31 +372,103 @@ function lockfileRecords(root: string): readonly LockfileRecord[] {
 	});
 }
 
-function assetPins(root: string): readonly AssetPinRecord[] {
-	const text = readFileSync(resolve(root, "scripts/release/runtime.ts"), "utf8");
-	const pinPattern =
-		/"(?<triple>[a-z0-9_-]+)":\s*\{\s*bunTarget:\s*"(?<bunTarget>[^"]+)",\s*fileName:\s*"[^"]+",\s*sha256:\s*"(?<sha256>[0-9a-f]{64})",/g;
+const ASSET_PIN_PATTERN =
+	/"(?<triple>[a-z0-9_-]+)":\s*\{\s*bunTarget:\s*"(?<bunTarget>[^"]+)",\s*fileName:\s*"[^"]+",\s*sha256:\s*"(?<sha256>[0-9a-f]{64})",/g;
+
+const BUN_RUNTIME_VERSION_PATTERN =
+	/export\s+const\s+BUN_RUNTIME_VERSION\s*=\s*"([^"]+)"\s*;/g;
+
+const RUST_TARGETS_PATTERN =
+	/export\s+const\s+RUST_TARGETS\s*=\s*\[([\s\S]*?)\]\s*as\s+const\s*;/g;
+
+function extractBunRuntimeVersion(text: string, what: string): string {
+	const present = text.includes("export const BUN_RUNTIME_VERSION");
+	const matches = [...text.matchAll(BUN_RUNTIME_VERSION_PATTERN)];
+	if (matches.length === 0) {
+		const problem = present ? "non-literal or malformed" : "missing";
+		throw new Error(`${what}: ${problem} BUN_RUNTIME_VERSION declaration`);
+	}
+	if (matches.length > 1) throw new Error(`${what}: duplicate BUN_RUNTIME_VERSION declaration`);
+	const declaration = matches[0];
+	if (declaration === undefined) {
+		throw new Error(`${what}: BUN_RUNTIME_VERSION declaration did not match`);
+	}
+	const version = declaration[1];
+	if (version === undefined || version.length === 0) {
+		throw new Error(`${what}: BUN_RUNTIME_VERSION is empty`);
+	}
+	return version;
+}
+
+function extractBunAssetPins(
+	text: string,
+	releaseTargets: readonly string[],
+	what: string,
+): readonly AssetPinRecord[] {
 	const pins: AssetPinRecord[] = [];
-	for (const match of text.matchAll(pinPattern)) {
+	for (const match of text.matchAll(ASSET_PIN_PATTERN)) {
 		const groups = match.groups;
-		if (groups === undefined) continue;
-		pins.push({
-			rustTarget: groups["triple"] ?? "",
-			bunTarget: groups["bunTarget"] ?? "",
-			sha256: groups["sha256"] ?? "",
-		});
+		if (groups === undefined) {
+			throw new Error(`${what}: asset pin declaration did not capture its groups`);
+		}
+		const rustTarget = groups["triple"];
+		const bunTarget = groups["bunTarget"];
+		const sha256 = groups["sha256"];
+		if (rustTarget === undefined || bunTarget === undefined || sha256 === undefined) {
+			throw new Error(`${what}: asset pin declaration is missing a capture value`);
+		}
+		pins.push({ rustTarget, bunTarget, sha256 });
 	}
 	const pinned = new Set(pins.map((p) => p.rustTarget));
-	const targets = new Set(RUST_TARGETS);
-	if (pins.length !== RUST_TARGETS.length || pinned.size !== targets.size) {
+	if (pins.length !== releaseTargets.length || pinned.size !== releaseTargets.length) {
 		throw new Error(
-			`asset pin extraction mismatch: ${pins.length} pins for ${RUST_TARGETS.length} targets`,
+			`${what}: asset pin extraction mismatch: ${pins.length} pins for ${releaseTargets.length} targets`,
 		);
 	}
-	for (const target of targets) {
-		if (!pinned.has(target)) throw new Error(`asset pin extraction lost target: ${target}`);
+	for (const target of releaseTargets) {
+		if (!pinned.has(target)) throw new Error(`${what}: asset pin extraction lost target: ${target}`);
 	}
 	return pins.sort((a, b) => (a.rustTarget < b.rustTarget ? -1 : 1));
+}
+
+function readRustTargets(root: string): readonly string[] {
+	const text = readFileSync(resolve(root, "scripts/release/targets.ts"), "utf8");
+	const present = text.includes("export const RUST_TARGETS");
+	const matches = [...text.matchAll(RUST_TARGETS_PATTERN)];
+	if (matches.length === 0) {
+		const problem = present ? "non-literal or malformed" : "missing";
+		throw new Error(`scripts/release/targets.ts: ${problem} RUST_TARGETS declaration`);
+	}
+	if (matches.length > 1) throw new Error("scripts/release/targets.ts: duplicate RUST_TARGETS declaration");
+	const declaration = matches[0];
+	if (declaration === undefined) {
+		throw new Error("scripts/release/targets.ts: RUST_TARGETS declaration did not match");
+	}
+	const arrayText = declaration[1];
+	if (arrayText === undefined) {
+		throw new Error("scripts/release/targets.ts: RUST_TARGETS declaration did not capture its array body");
+	}
+	const targets: string[] = [];
+	for (const segment of arrayText.split(",")) {
+		const literal = segment.match(/^\s*"([^"]*)"\s*$/);
+		if (literal === null) {
+			if (segment.trim().length === 0) continue;
+			throw new Error(`scripts/release/targets.ts: non-literal target in RUST_TARGETS: ${segment.trim()}`);
+		}
+		const value = literal[1];
+		if (value === undefined || value.length === 0) {
+			throw new Error("scripts/release/targets.ts: empty target in RUST_TARGETS");
+		}
+		if (targets.includes(value)) {
+			throw new Error(`scripts/release/targets.ts: duplicate target in RUST_TARGETS: ${value}`);
+		}
+		if (!/^[a-z0-9_-]+$/.test(value) || !value.includes("-")) {
+			throw new Error(`scripts/release/targets.ts: invalid target in RUST_TARGETS: ${value}`);
+		}
+		targets.push(value);
+	}
+	if (targets.length === 0) throw new Error("scripts/release/targets.ts: RUST_TARGETS is empty");
+	return targets;
 }
 
 function workflowPins(root: string): { rust: string; bun: string } {
@@ -384,10 +481,15 @@ function workflowPins(root: string): { rust: string; bun: string } {
 	if (rust === null || bun === null) {
 		throw new Error("release-verification.yml: toolchain/bun-version pins not found");
 	}
-	return { rust: rust[1] ?? "", bun: bun[1] ?? "" };
+	const rustPin = rust[1];
+	const bunPin = bun[1];
+	if (rustPin === undefined || bunPin === undefined) {
+		throw new Error("release-verification.yml: toolchain/bun-version pins did not capture a value");
+	}
+	return { rust: rustPin, bun: bunPin };
 }
 
-function toolchainChannel(root: string): string {
+export function toolchainChannel(root: string): string {
 	const parsed = Bun.TOML.parse(readFileSync(resolve(root, "rust-toolchain.toml"), "utf8"));
 	if (!isRecord(parsed) || !isRecord(parsed["toolchain"])) {
 		throw new Error("rust-toolchain.toml: expected [toolchain]");
@@ -397,36 +499,39 @@ function toolchainChannel(root: string): string {
 
 /** Recompute the SBOM content from the tree at `root` (offline, tracked files only). */
 export function captureContent(root: string): SbomContent {
+	const vendorPins = readVendorSourcePins(root);
+	const runtimeText = readFileSync(resolve(root, "scripts/release/runtime.ts"), "utf8");
+	const bunRuntimeVersion = extractBunRuntimeVersion(runtimeText, "scripts/release/runtime.ts");
+	const releaseTargets = readRustTargets(root);
+	const bunAssetPins = extractBunAssetPins(runtimeText, releaseTargets, "scripts/release/runtime.ts");
 	const pins = workflowPins(root);
 	return {
 		rust: {
 			toolchainChannel: toolchainChannel(root),
 			ciRustToolchain: pins.rust,
-			packages: rustPackages(root),
+			packages: rustPackages(root, vendorPins),
+			vendorPins: vendorPins.length > 0 ? vendorPins : undefined,
 		},
 		npm: { surfaces: npmSurfaces(root), lockfiles: lockfileRecords(root) },
 		tools: {
-			bunRuntimeVersion: BUN_RUNTIME_VERSION,
+			bunRuntimeVersion,
 			ciBunVersion: pins.bun,
-			bunAssetPins: assetPins(root),
-			releaseTargets: [...RUST_TARGETS],
+			bunAssetPins,
+			releaseTargets: [...releaseTargets],
 		},
 	};
 }
 
-function gitHeadAndDirtyInputs(root: string): { head: string; dirty: string[] } {
-	const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" });
-	if (head.status !== 0) throw new Error("git rev-parse failed");
-	const status = spawnSync("git", ["status", "--porcelain", "--", ...SBOM_INPUT_PATHS], {
+function gitDirtyInputs(root: string): string[] {
+	const status = spawnSync("git", ["status", "--porcelain", "--", ...sbomInputPaths(root)], {
 		cwd: root,
 		encoding: "utf8",
 	});
 	if (status.status !== 0) throw new Error("git status failed");
-	const dirty = (status.stdout ?? "")
+	return (status.stdout ?? "")
 		.split("\n")
 		.map((line) => line.trim())
 		.filter((line) => line.length > 0);
-	return { head: (head.stdout ?? "").trim(), dirty };
 }
 
 /** Validate and load a snapshot document (schema + digest chain). */
@@ -439,18 +544,25 @@ export function loadSnapshot(text: string): SbomSnapshot {
 	const rawContent: unknown = parsed["content"];
 	if (!isRecord(rawContent)) throw new Error("snapshot: missing content");
 	const expectedSha = asString(parsed["contentSha256"], "snapshot.contentSha256");
-	// Shape is proven by the digest chain: the content hash below the named type
-	// was produced by `capture` from a real SbomContent, so any malformed store
-	// fails this comparison before the boundary assertion carries it forward.
 	if (createHash("sha256").update(canonicalJson(rawContent)).digest("hex") !== expectedSha) {
 		throw new Error("snapshot: content does not match contentSha256");
+	}
+	const captureHead = asString(parsed["captureHead"], "snapshot.captureHead");
+	let stagedInputProvenance: StagedInputProvenance | undefined;
+	const rawProvenance = parsed["stagedInputProvenance"];
+	if (rawProvenance !== undefined) {
+		stagedInputProvenance = parseStagedInputProvenance(rawProvenance, "snapshot.stagedInputProvenance");
+		if (stagedInputProvenance.baseHead !== captureHead) {
+			throw new Error("snapshot: stagedInputProvenance.baseHead does not match captureHead");
+		}
 	}
 	return {
 		schema: SBOM_SCHEMA,
 		capturedAt: asString(parsed["capturedAt"], "snapshot.capturedAt"),
-		captureHead: asString(parsed["captureHead"], "snapshot.captureHead"),
+		captureHead,
 		contentSha256: expectedSha,
 		content: parsed["content"] as SbomContent,
+		stagedInputProvenance,
 	};
 }
 
@@ -504,53 +616,168 @@ export function verifySnapshot(snapshot: SbomSnapshot, live: SbomContent): strin
 	return drift;
 }
 
+/**
+ * Capture a full SBOM snapshot, optionally recording staged-input provenance,
+ * and publish it to `outPath` through an atomic single-file replacement.
+ */
+export function captureSnapshot(
+	root: string,
+	outPath: string,
+	inputMode: "committed" | "staged" = "committed",
+): SbomSnapshot {
+	const absoluteOut = resolve(outPath);
+	const inputPaths = sbomInputPaths(root);
+	readVendorSourcePins(root);
+
+	// Guard output overlap before any producer work or Git reads.
+	assertCaptureOutputPathsDisjoint(root, inputPaths, [absoluteOut]);
+
+	if (inputMode === "committed") {
+		const dirty = gitDirtyInputs(root);
+		if (dirty.length > 0) {
+			throw new Error(
+				`SBOM capture refused: inputs dirty (commit or stash first):\n${dirty.join("\n")}\n`,
+			);
+		}
+	}
+	const handle = beginStagedInputCapture(root, inputPaths);
+	const captureHead = handle.provenance.baseHead;
+	const stagedInputProvenance = inputMode === "staged" ? handle.provenance : undefined;
+
+	const content = captureContent(root);
+
+	// Immediate post-capture recheck: inputs must still match the captured index.
+	handle.assertUnchanged();
+
+	const snapshot: SbomSnapshot = {
+		schema: SBOM_SCHEMA,
+		capturedAt: new Date().toISOString().slice(0, 10),
+		captureHead,
+		contentSha256: contentDigest(content),
+		content,
+		stagedInputProvenance,
+	};
+
+	const text = `${JSON.stringify(snapshot, null, "\t")}\n`;
+
+	// Validate the serialized document (digest chain and metadata) before writing.
+	loadSnapshot(text);
+
+	const outDir = dirname(absoluteOut);
+	const tmpName = `.sbom-snapshot-${process.pid}-${randomUUID()}.tmp.json`;
+	const tmpPath = resolve(outDir, tmpName);
+	let written = false;
+	try {
+		const fd = openSync(tmpPath, "wx");
+		written = true;
+		try {
+			writeSync(fd, Buffer.from(text, "utf8"));
+		} finally {
+			closeSync(fd);
+		}
+		// Final pre-rename recheck: no input may have changed while the temp was written.
+		handle.assertUnchanged();
+		renameSync(tmpPath, absoluteOut);
+	} catch (err) {
+		if (written) {
+			rmSync(tmpPath, { force: true });
+		}
+		throw err;
+	}
+
+	return snapshot;
+}
+
+class UsageError extends Error {}
+
+function parseCaptureArgs(args: string[]): { out: string; inputMode: "committed" | "staged" } {
+	let out: string | undefined;
+	let inputMode: "committed" | "staged" = "committed";
+	for (let i = 0; i < args.length; i++) {
+		const a = args[i];
+		if (a === "--staged-inputs") {
+			if (inputMode === "staged") throw new UsageError("duplicate --staged-inputs");
+			inputMode = "staged";
+		} else if (a === "--out") {
+			if (out !== undefined) throw new UsageError("duplicate --out");
+			const v = args[i + 1];
+			if (v === undefined || v.startsWith("--")) throw new UsageError("--out requires a value");
+			out = v;
+			i++;
+		} else {
+			throw new UsageError(`unknown capture flag ${a}`);
+		}
+	}
+	return { out: out ?? BASELINE_PATH, inputMode };
+}
+
+function parseVerifyArgs(args: string[]): { snapshot: string } {
+	let snapshot: string | undefined;
+	for (let i = 0; i < args.length; i++) {
+		const a = args[i];
+		if (a === "--staged-inputs") {
+			throw new UsageError("--staged-inputs is not valid for verify");
+		}
+		if (a === "--snapshot") {
+			if (snapshot !== undefined) throw new UsageError("duplicate --snapshot");
+			const v = args[i + 1];
+			if (v === undefined || v.startsWith("--")) throw new UsageError("--snapshot requires a value");
+			snapshot = v;
+			i++;
+		} else {
+			throw new UsageError(`unknown verify flag ${a}`);
+		}
+	}
+	return { snapshot: snapshot ?? BASELINE_PATH };
+}
+
 function main(): void {
 	const args = process.argv.slice(2);
 	const mode = args[0];
-	if (mode === "capture") {
-		const outFlag = args.indexOf("--out");
-		const outRel = outFlag !== -1 ? (args[outFlag + 1] ?? BASELINE_PATH) : BASELINE_PATH;
-		const { head, dirty } = gitHeadAndDirtyInputs(REPO_ROOT);
-		if (dirty.length > 0) {
-			process.stderr.write(
-				`SBOM capture refused: inputs dirty (commit or stash first):\n${dirty.join("\n")}\n`,
+	const rest = args.slice(1);
+	try {
+		if (mode === "capture") {
+			const { out, inputMode } = parseCaptureArgs(rest);
+			const outPath = resolve(REPO_ROOT, out);
+			const snapshot = captureSnapshot(REPO_ROOT, outPath, inputMode);
+			if (snapshot.stagedInputProvenance !== undefined) {
+				process.stdout.write(
+					`captured indexed SBOM baseline at ${out} (based on commit ${snapshot.captureHead.slice(0, 8)}, digest ${snapshot.contentSha256.slice(0, 12)})\n`,
+				);
+			} else {
+				process.stdout.write(
+					`captured SBOM baseline at ${out} (head ${snapshot.captureHead.slice(0, 8)}, digest ${snapshot.contentSha256.slice(0, 12)})\n`,
+				);
+			}
+			return;
+		}
+		if (mode === "verify") {
+			const { snapshot } = parseVerifyArgs(rest);
+			const doc = loadSnapshot(readFileSync(resolve(REPO_ROOT, snapshot), "utf8"));
+			const drift = verifySnapshot(doc, captureContent(REPO_ROOT));
+			if (drift.length > 0) {
+				for (const line of drift) process.stdout.write(`FAIL ${line}\n`);
+				process.stderr.write("DEPENDENCY_SBOM_DRIFT\n");
+				process.exit(1);
+			}
+			process.stdout.write(
+				`${SBOM_OK} baseline ${doc.captureHead.slice(0, 8)} (${doc.capturedAt}) still describes the tree\n`,
 			);
-			process.exit(1);
+			return;
 		}
-		const content = captureContent(REPO_ROOT);
-		const snapshot: SbomSnapshot = {
-			schema: SBOM_SCHEMA,
-			capturedAt: new Date().toISOString().slice(0, 10),
-			captureHead: head,
-			contentSha256: contentDigest(content),
-			content,
-		};
-		writeFileSync(
-			resolve(REPO_ROOT, outRel),
-			`${JSON.stringify(snapshot, null, "\t")}\n`,
-		);
-		process.stdout.write(
-			`captured SBOM baseline at ${outRel} (head ${head.slice(0, 8)}, digest ${snapshot.contentSha256.slice(0, 12)})\n`,
-		);
-		return;
-	}
-	if (mode === "verify") {
-		const snapFlag = args.indexOf("--snapshot");
-		const snapRel = snapFlag !== -1 ? (args[snapFlag + 1] ?? BASELINE_PATH) : BASELINE_PATH;
-		const snapshot = loadSnapshot(readFileSync(resolve(REPO_ROOT, snapRel), "utf8"));
-		const drift = verifySnapshot(snapshot, captureContent(REPO_ROOT));
-		if (drift.length > 0) {
-			for (const line of drift) process.stdout.write(`FAIL ${line}\n`);
-			process.stderr.write("DEPENDENCY_SBOM_DRIFT\n");
-			process.exit(1);
+		throw new UsageError("expected capture or verify");
+	} catch (err) {
+		if (err instanceof UsageError) {
+			process.stderr.write(`${err.message}\n`);
+			process.stderr.write(
+				"usage: deps-sbom.ts capture [--staged-inputs] [--out <file>] | verify [--snapshot <file>]\n",
+			);
+			process.exit(2);
 		}
-		process.stdout.write(
-			`${SBOM_OK} baseline ${snapshot.captureHead.slice(0, 8)} (${snapshot.capturedAt}) still describes the tree\n`,
-		);
-		return;
+		const message = err instanceof Error ? err.message : String(err);
+		process.stderr.write(`${message}\n`);
+		process.exit(1);
 	}
-	process.stderr.write("usage: deps-sbom.ts capture [--out <file>] | verify [--snapshot <file>]\n");
-	process.exit(2);
 }
 
 if (import.meta.main) main();

@@ -346,6 +346,8 @@ pub enum OverlayKind {
     FirstTimeSetup,
     /// Login dialog.
     Login,
+    /// Native fullscreen transcript search overlay.
+    TranscriptSearch,
     /// Extension custom overlay.
     Extension,
 }
@@ -814,6 +816,8 @@ pub enum ViewAction {
 pub enum SelectorKind {
     /// Model selector.
     Model,
+    /// Thinking-level selector.
+    Thinking,
     /// Session picker.
     Session,
     /// Tree selector.

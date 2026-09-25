@@ -28,14 +28,11 @@ import {
 } from "./map.ts";
 import { REQUIRED_TOOL_NAMES, loadCanonicalToolRegistry, selectPortableToolParameters } from "../generate-tool-schemas.ts";
 import {
-	CANONICAL_REFERENCE_ROOT,
-	CANONICAL_REFERENCE_SHA,
-	LEGACY_REFERENCE_ROOT,
-	LEGACY_REFERENCE_SHA,
-	LEGACY_REFERENCE_SHA_SHORT,
-	RETIRED_REFERENCE_SHA,
-	RETIRED_REFERENCE_SHA_SHORT,
-	assertCanonicalReference,
+	EXTENSION_COMPAT_REFERENCE_ROOT,
+	EXTENSION_COMPAT_REFERENCE_SHA,
+	NATIVE_REFERENCE_ROOT,
+	RETIRED_REFERENCE_SHAS,
+	assertExtensionCompatReference,
 	readReferenceHead,
 } from "../reference-identity.ts";
 
@@ -51,7 +48,7 @@ export const PIN_LITERAL_PATHS = [
 const PIN_LITERAL_OCCURRENCES: Readonly<
 	Record<(typeof PIN_LITERAL_PATHS)[number], { readonly sha: number; readonly root: number }>
 > = {
-	".github/workflows/release-verification.yml": { sha: 2, root: 4 },
+	".github/workflows/release-verification.yml": { sha: 4, root: 8 },
 	".github/workflows/musl-bakeoff.yml": { sha: 4, root: 4 },
 	"scripts/reference-identity.ts": { sha: 1, root: 2 },
 };
@@ -76,7 +73,7 @@ export interface AlignmentInputs {
 /** Fail when an owned carrier mis-pins the reference identity. */
 export function verifyPinLiterals(files: Readonly<Record<string, string>>): string[] {
 	const problems: string[] = [];
-	const retiredShas = [LEGACY_REFERENCE_SHA, RETIRED_REFERENCE_SHA];
+	const retiredShas = [RETIRED_REFERENCE_SHAS[0], RETIRED_REFERENCE_SHAS[1]];
 	for (const path of PIN_LITERAL_PATHS) {
 		const body = files[path];
 		if (body === undefined) {
@@ -84,16 +81,16 @@ export function verifyPinLiterals(files: Readonly<Record<string, string>>): stri
 			continue;
 		}
 		const expected = PIN_LITERAL_OCCURRENCES[path];
-		const shaOccurrences = body.split(CANONICAL_REFERENCE_SHA).length - 1;
+		const shaOccurrences = body.split(EXTENSION_COMPAT_REFERENCE_SHA).length - 1;
 		if (shaOccurrences !== expected.sha) {
 			problems.push(
-				`${path} must carry ${CANONICAL_REFERENCE_SHA} exactly ${expected.sha} time(s); found ${shaOccurrences}`,
+				`${path} must carry ${EXTENSION_COMPAT_REFERENCE_SHA} exactly ${expected.sha} time(s); found ${shaOccurrences}`,
 			);
 		}
-		const rootOccurrences = body.split(CANONICAL_REFERENCE_ROOT).length - 1;
+		const rootOccurrences = body.split(EXTENSION_COMPAT_REFERENCE_ROOT).length - 1;
 		if (rootOccurrences !== expected.root) {
 			problems.push(
-				`${path} must carry ${CANONICAL_REFERENCE_ROOT} exactly ${expected.root} time(s); found ${rootOccurrences}`,
+				`${path} must carry ${EXTENSION_COMPAT_REFERENCE_ROOT} exactly ${expected.root} time(s); found ${rootOccurrences}`,
 			);
 		}
 		if (path !== "scripts/reference-identity.ts") {
@@ -116,15 +113,15 @@ export function verifyPinLiterals(files: Readonly<Record<string, string>>): stri
 				`${LEDGER_CARRIER_PATH} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
-		if (referencePin !== undefined && referencePin !== CANONICAL_REFERENCE_SHA) {
+		if (referencePin !== undefined && referencePin !== EXTENSION_COMPAT_REFERENCE_SHA) {
 			problems.push(
-				`${LEDGER_CARRIER_PATH} referencePin is ${String(referencePin)}, expected ${CANONICAL_REFERENCE_SHA}`,
+				`${LEDGER_CARRIER_PATH} referencePin is ${String(referencePin)}, expected ${EXTENSION_COMPAT_REFERENCE_SHA}`,
 			);
 		}
-		const occurrences = ledger.split(CANONICAL_REFERENCE_SHA).length - 1;
+		const occurrences = ledger.split(EXTENSION_COMPAT_REFERENCE_SHA).length - 1;
 		if (occurrences !== 1) {
 			problems.push(
-				`${LEDGER_CARRIER_PATH} must carry ${CANONICAL_REFERENCE_SHA} exactly once (referencePin); found ${occurrences}`,
+				`${LEDGER_CARRIER_PATH} must carry ${EXTENSION_COMPAT_REFERENCE_SHA} exactly once (referencePin); found ${occurrences}`,
 			);
 		}
 	}
@@ -133,9 +130,9 @@ export function verifyPinLiterals(files: Readonly<Record<string, string>>): stri
 
 /** Fail when the checked-out canonical reference is not at the baseline. */
 export function verifyReferenceCheckout(headSha: string): string[] {
-	if (headSha !== CANONICAL_REFERENCE_SHA) {
+	if (headSha !== EXTENSION_COMPAT_REFERENCE_SHA) {
 		return [
-			`${CANONICAL_REFERENCE_ROOT} HEAD is ${headSha === "" ? "(missing or unreadable)" : headSha}, expected ${CANONICAL_REFERENCE_SHA}`,
+			`${EXTENSION_COMPAT_REFERENCE_ROOT} HEAD is ${headSha === "" ? "(missing or unreadable)" : headSha}, expected ${EXTENSION_COMPAT_REFERENCE_SHA}`,
 		];
 	}
 	return [];
@@ -172,7 +169,7 @@ export function verifyPortableToolSelection(registryTools: Readonly<Record<strin
 /** Canonical checkout HEAD, or "" when missing/unreadable (witness reports it). */
 export function readCanonicalReferenceHead(root: string): string {
 	try {
-		return readReferenceHead(join(root, CANONICAL_REFERENCE_ROOT));
+		return readReferenceHead(join(root, EXTENSION_COMPAT_REFERENCE_ROOT));
 	} catch {
 		return "";
 	}
@@ -211,14 +208,14 @@ export interface LegacyAllowance {
 
 const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-const LEGACY_SHA_FULL_RE = new RegExp(escapeRegExp(LEGACY_REFERENCE_SHA), "g");
-const LEGACY_SHA_SHORT_RE = new RegExp(`(?<![0-9A-Fa-f])${LEGACY_REFERENCE_SHA_SHORT}(?![0-9A-Fa-f])`, "g");
-const RETIRED_SHA_FULL_RE = new RegExp(escapeRegExp(RETIRED_REFERENCE_SHA), "g");
-const RETIRED_SHA_SHORT_RE = new RegExp(`(?<![0-9A-Fa-f])${RETIRED_REFERENCE_SHA_SHORT}(?![0-9A-Fa-f])`, "g");
-const LEGACY_ROOT_DIRECT_RE = new RegExp(`${escapeRegExp(LEGACY_REFERENCE_ROOT)}(?![0-9A-Za-z_-])`, "g");
+const LEGACY_SHA_FULL_RE = new RegExp(escapeRegExp(RETIRED_REFERENCE_SHAS[0]), "g");
+const LEGACY_SHA_SHORT_RE = new RegExp(`(?<![0-9A-Fa-f])${RETIRED_REFERENCE_SHAS[0].slice(0, 8)}(?![0-9A-Fa-f])`, "g");
+const RETIRED_SHA_FULL_RE = new RegExp(escapeRegExp(RETIRED_REFERENCE_SHAS[1]), "g");
+const RETIRED_SHA_SHORT_RE = new RegExp(`(?<![0-9A-Fa-f])${RETIRED_REFERENCE_SHAS[1].slice(0, 8)}(?![0-9A-Fa-f])`, "g");
+const LEGACY_ROOT_DIRECT_RE = new RegExp(`${escapeRegExp(NATIVE_REFERENCE_ROOT)}(?![0-9A-Za-z_-])`, "g");
 
 /** The reference root without its leaf segment, for split-form detection. */
-const LEGACY_ROOT_HEAD = LEGACY_REFERENCE_ROOT.slice(0, LEGACY_REFERENCE_ROOT.length - "/pi".length);
+const LEGACY_ROOT_HEAD = NATIVE_REFERENCE_ROOT.slice(0, NATIVE_REFERENCE_ROOT.length - "/pi".length);
 
 /** Split root forms: the retired root reassembled from string pieces. */
 const LEGACY_ROOT_SPLIT_RES: readonly RegExp[] = [
@@ -309,6 +306,15 @@ export const LEGACY_ALLOWANCES: Readonly<Record<string, LegacyAllowance>> = {
 		closureEligible: false,
 		counts: {
 			"legacy-root-direct": 1,
+		},
+	},
+	".github/workflows/release-verification.yml": {
+		label: "native reference checkout pin",
+		reason:
+			"the workflow must name the native reference checkout path literally; YAML cannot import the reference-identity constant",
+		closureEligible: false,
+		counts: {
+			"legacy-root-direct": 9,
 		},
 	},
 };
@@ -514,7 +520,7 @@ export async function loadAlignmentInputs(root: string): Promise<AlignmentInputs
 	}
 	// Fail closed before any reference-derived data is read: the canonical
 	// checkout must sit at the exact baseline HEAD.
-	assertCanonicalReference(root);
+	assertExtensionCompatReference(root);
 	const { definitions } = await loadCanonicalToolRegistry();
 	return {
 		files,

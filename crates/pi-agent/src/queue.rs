@@ -74,6 +74,19 @@ impl PendingMessageQueue {
         self.mode = mode;
     }
 
+    /// Returns the messages the next [`PendingMessageQueue::drain`] would
+    /// release, without consuming them.
+    ///
+    /// Mirrors `PendingMessageQueue.prototype.peek` in
+    /// `.references/pi/packages/agent/src/agent.ts:158-163`.
+    #[must_use]
+    pub fn peek(&self) -> Vec<AgentMessage> {
+        match self.mode {
+            QueueMode::All => self.messages.clone(),
+            QueueMode::OneAtATime => self.messages.first().cloned().into_iter().collect(),
+        }
+    }
+
     /// Drains messages according to the live [`QueueMode`].
     ///
     /// - [`QueueMode::All`]: removes and returns every queued message.

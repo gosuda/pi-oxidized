@@ -429,6 +429,7 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
                 ceil_div4(chars)
             }
             Message::ToolResult(result) => ceil_div4(estimate_tool_result_chars(&result.content)),
+            Message::System(_) => pi_ai::estimate::estimate_message_tokens(llm.as_ref()),
         },
         AgentMessage::Custom(custom) => match custom.role.as_str() {
             "custom" => {
@@ -1436,7 +1437,7 @@ mod tests {
         msg.content = vec![AssistantContent::Text(TextContent::new(text))];
         msg.usage = u;
         msg.stop_reason = StopReason::Stop;
-        AgentMessage::Llm(Box::new(Message::Assistant(msg)))
+        AgentMessage::Llm(Box::new(Message::Assistant(Box::new(msg))))
     }
 
     fn tool_result_msg(text: &str) -> AgentMessage {
@@ -1547,6 +1548,9 @@ mod tests {
             base_url: "https://example.test".into(),
             reasoning: false,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![pi_ai::ModelInput::Text],
             cost: pi_ai::ModelCost::default(),
             context_window,
@@ -1613,7 +1617,7 @@ mod tests {
             let mut m = AssistantMessage::new("anthropic-messages", "anthropic", "m", 1);
             m.usage = usage(300, 150, 0, 0);
             m.stop_reason = StopReason::Aborted;
-            AgentMessage::Llm(Box::new(Message::Assistant(m)))
+            AgentMessage::Llm(Box::new(Message::Assistant(Box::new(m))))
         });
         let entries = [&a1, &a2];
         let found = option_some(get_last_assistant_usage(&entries));
@@ -1666,7 +1670,12 @@ mod tests {
                 Map::from_iter([("path".into(), Value::String("x".into()))]),
             )),
         ];
-        assert!(estimate_tokens(&AgentMessage::Llm(Box::new(Message::Assistant(asst)))) > 0);
+        assert!(
+            estimate_tokens(&AgentMessage::Llm(Box::new(Message::Assistant(Box::new(
+                asst
+            )))))
+                > 0
+        );
 
         assert!(estimate_tokens(&tool_result_msg("result text")) > 0);
         assert!(estimate_tokens(&custom_msg("custom body")) > 0);
@@ -1716,7 +1725,7 @@ mod tests {
                 Map::from_iter([("path".into(), Value::String("f".into()))]),
             ))];
             m.usage = usage(0, 0, 0, 0);
-            AgentMessage::Llm(Box::new(Message::Assistant(m)))
+            AgentMessage::Llm(Box::new(Message::Assistant(Box::new(m))))
         });
         let tr = message_entry("tr", Some("a"), tool_result_msg(&"x".repeat(8000)));
         let a2 = message_entry("a2", Some("tr"), assistant_msg("done", usage(0, 50, 0, 0)));

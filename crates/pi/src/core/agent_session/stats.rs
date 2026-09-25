@@ -150,7 +150,7 @@ impl AgentSession {
                     cache_write = cache_write.saturating_add(assistant.usage.cache_write);
                     cost += assistant.usage.cost.total;
                 }
-                None => {}
+                Some(Message::System(_)) | None => {}
             }
         }
 
@@ -314,6 +314,9 @@ mod tests {
             base_url: String::new(),
             reasoning: false,
             thinking_level_map: None,
+            input_limits: None,
+            prompt_cache: None,
+            sampling_params: None,
             input: vec![ModelInput::Text],
             cost: ModelCost::default(),
             context_window: 8_192,
@@ -385,7 +388,7 @@ mod tests {
             let mut sm = session.session_manager.lock().await;
             sm.append_compaction(
                 "first compaction",
-                "kept1",
+                Some("kept1"),
                 1000,
                 None,
                 None,
@@ -393,7 +396,7 @@ mod tests {
             )?;
             sm.append_compaction(
                 "second compaction",
-                "kept2",
+                Some("kept2"),
                 2000,
                 None,
                 None,
@@ -421,7 +424,7 @@ mod tests {
             let mut sm = session.session_manager.lock().await;
             sm.append_compaction(
                 "compaction summary",
-                "kept1",
+                Some("kept1"),
                 1000,
                 None,
                 None,

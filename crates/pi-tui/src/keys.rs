@@ -1074,6 +1074,11 @@ mod tests {
                 true,
             ),
             (
+                "left",
+                key_press(KeyCode::Left, KeyModifiers::empty()),
+                true,
+            ),
+            (
                 "1",
                 key_press_state(
                     KeyCode::Char('1'),
