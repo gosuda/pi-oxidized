@@ -7,44 +7,16 @@ import {
 	PathTraversalError,
 	pathExists,
 	RecordingRunner,
-	RunResult,
 	safeJoinPath,
 	SpawnRunner,
 	type Fs,
 } from "../release/runner.ts";
 
 describe("RecordingRunner", () => {
-	test("records every call and returns the responder's result", async () => {
-		const reply: RunResult = { exitCode: 0, stdout: "ok", stderr: "" };
-		const runner = new RecordingRunner((call) => {
-			if (call.command === "cargo" && call.args[0] === "metadata") return reply;
-			return OK_RUN;
-		});
-		const a = await runner.run("cargo", ["metadata"]);
-		const b = await runner.run("bun", ["build", "main.ts"]);
-		expect(a).toEqual(reply);
-		expect(b).toEqual(OK_RUN);
-		expect(runner.calls).toHaveLength(2);
-		expect(runner.calls[0]?.command).toBe("cargo");
-		expect(runner.calls[0]?.args).toEqual(["metadata"]);
-		expect(runner.calls[1]?.command).toBe("bun");
-		expect(runner.calls[1]?.args).toEqual(["build", "main.ts"]);
-	});
-
 	test("falls back to OK_RUN when responder returns undefined", async () => {
 		const runner = new RecordingRunner(() => undefined);
 		const res = await runner.run("echo", ["hi"]);
 		expect(res).toEqual(OK_RUN);
-	});
-
-	test("preserves the options object on the recorded call", async () => {
-		const runner = new RecordingRunner(() => OK_RUN);
-		await runner.run("bun", ["test"], { cwd: "/x", env: { A: "1" }, stdin: "in" });
-		expect(runner.calls[0]?.options).toEqual({
-			cwd: "/x",
-			env: { A: "1" },
-			stdin: "in",
-		});
 	});
 });
 

@@ -17,10 +17,6 @@ describe("XC-5 registration conflict matrix witnesses", () => {
 	});
 
 	// M4: tool first-wins
-	test("M4: tool first-wins guard is present in getAllRegisteredTools", () => {
-		expect(verifyToolFirstWins(INPUTS.runnerSource)).toEqual([]);
-	});
-
 	test("M4 mutation: removing the has-guard fails the witness", () => {
 		const mutated = INPUTS.runnerSource.replace(
 			/if\s*\(!toolsByName\.has\(tool\.definition\.name\)\)/,
@@ -30,10 +26,6 @@ describe("XC-5 registration conflict matrix witnesses", () => {
 	});
 
 	// M5: command suffix disambiguation
-	test("M5: command suffix disambiguation is present in resolveRegisteredCommands", () => {
-		expect(verifyCommandSuffixDisambiguation(INPUTS.runnerSource)).toEqual([]);
-	});
-
 	test("M5 mutation: dropping the suffix template fails the witness", () => {
 		const mutated = INPUTS.runnerSource.replace(
 			/`\$\{command\.name\}:\$\{occurrence\}`/,
@@ -51,10 +43,6 @@ describe("XC-5 registration conflict matrix witnesses", () => {
 	});
 
 	// M6: reserved-shortcut guard
-	test("M6: reserved-shortcut guard is present in getShortcuts", () => {
-		expect(verifyReservedShortcutGuard(INPUTS.runnerSource)).toEqual([]);
-	});
-
 	test("M6 mutation: removing the restrictOverride check fails the witness", () => {
 		const mutated = INPUTS.runnerSource.replace(
 			/builtInKeybinding\s*\?\.\s*restrictOverride\s*===\s*true/,

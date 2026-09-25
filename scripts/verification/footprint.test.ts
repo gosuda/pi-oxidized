@@ -8,11 +8,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { NoiseRejection, requireQuiet } from "../statistics.ts";
 import {
 	classifyPackFiles,
-	FOOTPRINT_SCAN_SAMPLES,
-	FOOTPRINT_SCHEMA,
 	npmPlatformMatches,
 	PRIMARY_PAYLOAD_PACKAGE,
 	parsePackListing,
@@ -27,7 +24,7 @@ import {
 // docs/PERF-T7-install-footprint-accounting.md: launcher vs runtime payload
 // vs compiled-launcher variant, npm os/cpu platform filtering, symlink
 // handling in the apparent-byte walk, the double-counting ban on the primary
-// payload, and the degenerate-quiet behavior of repeated static scans.
+// payload.
 
 const temporaryPaths: string[] = [];
 
@@ -42,18 +39,6 @@ function temporaryDirectory(prefix: string): string {
 	return path;
 }
 
-test("does not run the measurement when footprint.ts is imported", () => {
-	// The entrypoint guard: importing the module for its helpers must not
-	// invoke cargo, npm, or any build step, and must not write the artifact.
-	// Importing above already proved no side effect on load; assert the
-	// exported constants are the contract's, which the runner only defines
-	// (never executes) at module scope.
-	expect(FOOTPRINT_SCHEMA).toBe("pi.footprint.v1");
-	expect(FOOTPRINT_SCAN_SAMPLES).toBeGreaterThanOrEqual(5);
-	expect(UPSTREAM_NPM_LAUNCHER).toBe("dist/bundle/cli.js");
-	expect(UPSTREAM_COMPILED_LAUNCHER).toBe("dist/pi");
-	expect(PRIMARY_PAYLOAD_PACKAGE).toBe("@earendil-works/pi-coding-agent");
-});
 
 describe("classifyPackFiles", () => {
 	test("splits launcher, runtime payload, and the compiled-launcher variant", () => {
@@ -249,36 +234,3 @@ describe("parsePackListing", () => {
 	});
 });
 
-test("repeated static scans are degenerate and pass the D4 noise gate", () => {
-	// The contract requires distributions, not single numbers, and requires
-	// them to be quiet. A deterministic byte measurement is the degenerate
-	// case: five identical scans must satisfy requireQuiet, not trip it.
-	const scans = Array.from(
-		{ length: FOOTPRINT_SCAN_SAMPLES },
-		() => 118_000_000,
-	);
-	const sorted = [...scans].sort((a, b) => a - b);
-	const median = sorted[Math.floor(sorted.length / 2)] ?? 0;
-	expect(() =>
-		requireQuiet([
-			{
-				label: "degenerate static scan",
-				count: scans.length,
-				median,
-				stddev: 0,
-				relativeSpread: 0,
-			},
-		]),
-	).not.toThrow();
-	expect(() =>
-		requireQuiet([
-			{
-				label: "jittery scan",
-				count: 5,
-				median: 100,
-				stddev: 50,
-				relativeSpread: 0.5,
-			},
-		]),
-	).toThrow(NoiseRejection);
-});

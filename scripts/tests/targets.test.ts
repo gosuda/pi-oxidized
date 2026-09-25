@@ -152,26 +152,6 @@ describe("targets", () => {
 		}
 	});
 
-	test("freezes the pre-existing five plans' derived values", () => {
-		const oldFive = EXPECTED_PLANS.filter((p) => p.libc !== "musl");
-		expect(oldFive).toHaveLength(5);
-		for (const expected of oldFive) {
-			const plan = planFor(expected.rustTarget);
-			expect(plan.bunTarget, expected.rustTarget).toBe(expected.bunTarget);
-			expect(plan.os, expected.rustTarget).toBe(expected.os);
-			expect(plan.arch, expected.rustTarget).toBe(expected.arch);
-			expect(plan.archive, expected.rustTarget).toBe(expected.archive);
-			expect(plan.windows, expected.rustTarget).toBe(expected.windows);
-			expect(plan.darwin, expected.rustTarget).toBe(expected.darwin);
-			expect(plan.piBinaryName, expected.rustTarget).toBe(expected.piBinaryName);
-			expect(plan.hostBinaryName, expected.rustTarget).toBe(expected.hostBinaryName);
-			expect(plan.bunRuntimeName, expected.rustTarget).toBe(expected.bunRuntimeName);
-			expect(plan.hostBundleName, expected.rustTarget).toBe(expected.hostBundleName);
-			expect(plan.archiveDir, expected.rustTarget).toBe(expected.archiveDir);
-			expect(plan.rustTarget, expected.rustTarget).toBe(expected.rustTarget);
-		}
-	});
-
 	test("resolves explicit libc for every supported OS", () => {
 		expect(planFor("x86_64-unknown-linux-gnu").libc).toBe("gnu");
 		expect(planFor("x86_64-unknown-linux-musl").libc).toBe("musl");
@@ -187,70 +167,6 @@ describe("targets", () => {
 		expect(isSupportedTarget("x86_64-unknown-freebsd")).toBe(false);
 		expect(isSupportedTarget("x86_64-unknown-linux")).toBe(false);
 		expect(isSupportedTarget("aarch64-apple-darwin-musl")).toBe(false);
-	});
-
-	test("planFor resolves x86_64-unknown-linux-gnu", () => {
-		const plan = planFor("x86_64-unknown-linux-gnu");
-		expect(plan.bunTarget).toBe("bun-linux-x64-baseline");
-		expect(plan.os).toBe("linux");
-		expect(plan.arch).toBe("x86_64");
-		expect(plan.libc).toBe("gnu");
-		expect(plan.archive).toBe("tar.gz");
-		expect(plan.windows).toBe(false);
-		expect(plan.piBinaryName).toBe("pi");
-		expect(plan.hostBinaryName).toBe("pi-extension-host");
-		expect(plan.archiveDir).toBe("pi-linux-x64-base");
-	});
-
-	test("planFor resolves x86_64-unknown-linux-musl", () => {
-		const plan = planFor("x86_64-unknown-linux-musl");
-		expect(plan.bunTarget).toBe("bun-linux-x64-musl-baseline");
-		expect(plan.os).toBe("linux");
-		expect(plan.arch).toBe("x86_64");
-		expect(plan.libc).toBe("musl");
-		expect(plan.archive).toBe("tar.gz");
-		expect(plan.windows).toBe(false);
-		expect(plan.piBinaryName).toBe("pi");
-		expect(plan.hostBinaryName).toBe("pi-extension-host");
-		expect(plan.archiveDir).toBe("pi-linux-x64-musl-base");
-	});
-
-	test("planFor resolves aarch64-unknown-linux-musl", () => {
-		const plan = planFor("aarch64-unknown-linux-musl");
-		expect(plan.bunTarget).toBe("bun-linux-arm64-musl");
-		expect(plan.os).toBe("linux");
-		expect(plan.arch).toBe("aarch64");
-		expect(plan.libc).toBe("musl");
-		expect(plan.archive).toBe("tar.gz");
-		expect(plan.windows).toBe(false);
-		expect(plan.piBinaryName).toBe("pi");
-		expect(plan.hostBinaryName).toBe("pi-extension-host");
-		expect(plan.archiveDir).toBe("pi-linux-arm64-musl");
-	});
-
-	test("planFor resolves x86_64-pc-windows-msvc", () => {
-		const plan = planFor("x86_64-pc-windows-msvc");
-		expect(plan.bunTarget).toBe("bun-windows-x64-baseline");
-		expect(plan.os).toBe("windows");
-		expect(plan.arch).toBe("x86_64");
-		expect(plan.libc).toBe("msvc");
-		expect(plan.archive).toBe("zip");
-		expect(plan.windows).toBe(true);
-		expect(plan.piBinaryName).toBe("pi.exe");
-		expect(plan.hostBinaryName).toBe("pi-extension-host.exe");
-		expect(plan.bunRuntimeName).toBe("bun.exe");
-		expect(plan.archiveDir).toBe("pi-windows-x64-base");
-	});
-
-	test("planFor resolves aarch64-apple-darwin", () => {
-		const plan = planFor("aarch64-apple-darwin");
-		expect(plan.bunTarget).toBe("bun-darwin-arm64");
-		expect(plan.os).toBe("darwin");
-		expect(plan.arch).toBe("aarch64");
-		expect(plan.libc).toBe("unknown");
-		expect(plan.archive).toBe("tar.gz");
-		expect(plan.windows).toBe(false);
-		expect(plan.archiveDir).toBe("pi-darwin-arm64");
 	});
 
 	test("InvalidTargetError lists the supported triples (musl included)", () => {

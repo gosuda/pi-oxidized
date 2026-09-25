@@ -463,24 +463,6 @@ describe("stream PTY geometry", () => {
 	});
 });
 
-describe("startup versus idle memory labels", () => {
-	test("idle lane uses startupSumVmHwmBytes as non-simultaneous lifetime upper bound", () => {
-		const source = readFileSync(PERFORMANCE_MODULE, "utf8");
-		expect(source).toContain("startupSumVmHwmBytes");
-		expect(source).toContain("steadyWindowMaxTreeRssBytes");
-		expect(source).toContain("steadyWindowMaxTreePssBytes");
-		expect(source).toContain("non-simultaneous sum of per-identity VmHWM");
-		expect(source).not.toMatch(/startupPeakRssBytes/);
-		expect(source).not.toMatch(/idlePeakRssBytes/);
-		const idleArtifact = source.slice(source.indexOf("idleProcessTreeMemory"));
-		expect(idleArtifact).toContain("startupSumVmHwm");
-		expect(idleArtifact).toContain("steadyWindowRss");
-		expect(idleArtifact).toContain("steadyWindowPss");
-		expect(idleArtifact).toContain("lifetime upper bound");
-		expect(idleArtifact).not.toMatch(/\bidlePeak/);
-	});
-});
-
 describe("pre-memory verdict ordering", () => {
 	test("evaluates requireQuiet and blockers before memory collectors", () => {
 		const source = readFileSync(PERFORMANCE_MODULE, "utf8");

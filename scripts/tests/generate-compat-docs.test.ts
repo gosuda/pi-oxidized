@@ -198,8 +198,7 @@ describe("generate-compat-docs: no hand-edited version numbers in other docs", (
 });
 
 describe("generate-compat-docs: cross-assert disagreement fails generation", () => {
-	test("PROTOCOL_VERSION mismatch between TS and Rust is detectable", () => {
-		// Verify the extraction helpers produce values that can be compared
+	test("PROTOCOL_VERSION fork between TS and Rust is detectable", () => {
 		const tsContent = readFileSync(
 			join(REPO_ROOT, "packages/pi-tui-protocol/src/types.ts"),
 			"utf8",
@@ -210,14 +209,21 @@ describe("generate-compat-docs: cross-assert disagreement fails generation", () 
 		);
 		const tsVal = extractTsConst(tsContent, "PROTOCOL_VERSION");
 		const rustVal = extractRustConst(rustContent, "PROTOCOL_VERSION");
-		// Simulate disagreement: if we extract "99" from a crafted string, it should differ
-		expect(extractTsConst('export const PROTOCOL_VERSION = 99 as const;', "PROTOCOL_VERSION")).toBe("99");
-		expect(extractRustConst('pub const PROTOCOL_VERSION: u32 = 99;', "PROTOCOL_VERSION")).toBe("99");
-		// The actual values match (proven by collectPins succeeding)
 		expect(tsVal).toBe(rustVal);
+
+		// Inject a fork in the Rust source: the extractor must surface the
+		// mutated value so the collectPins cross-assert throws before any
+		// doc is generated.
+		const forkedRust = rustContent.replace(
+			/pub\s+const\s+PROTOCOL_VERSION\s*(?::\s*[^=]+)?\s*=\s*["']?([A-Za-z0-9_.+-]+)["']?\s*;/,
+			"pub const PROTOCOL_VERSION: u32 = 999;",
+		);
+		const forkedRustVal = extractRustConst(forkedRust, "PROTOCOL_VERSION");
+		expect(forkedRustVal).not.toBe(tsVal);
+		expect(forkedRustVal).toBe("999");
 	});
 
-	test("COMPATIBILITY_VERSION mismatch between TS, Rust, and extension-host is detectable", () => {
+	test("COMPATIBILITY_VERSION fork between TS, Rust, and extension-host is detectable", () => {
 		const tsContent = readFileSync(
 			join(REPO_ROOT, "packages/pi-tui-protocol/src/types.ts"),
 			"utf8",
@@ -236,11 +242,16 @@ describe("generate-compat-docs: cross-assert disagreement fails generation", () 
 		// All three must match
 		expect(tsVal).toBe(rustVal);
 		expect(tsVal).toBe(extHostVal);
-		// Simulate what collectPins does: throw on mismatch
-		const fakeTs = "0.99.0";
-		const fakeRust = "0.80.10";
-		expect(fakeTs).not.toBe(fakeRust);
-		// If we crafted a mismatch, collectPins would throw — verified by the logic in collectPins
+
+		// Inject a fork in the extension-host source: the extractor must
+		// surface the mutated value so the triple-owner cross-assert throws.
+		const forkedExtHost = extHostContent.replace(
+			/(?:export\s+)?(?:const|let|var)\s+COMPATIBILITY_VERSION\s*=\s*["']?([A-Za-z0-9_.+-]+)["']?/,
+			'export const COMPATIBILITY_VERSION = "99.99.99"',
+		);
+		const forkedExtHostVal = extractTsConst(forkedExtHost, "COMPATIBILITY_VERSION");
+		expect(forkedExtHostVal).not.toBe(tsVal);
+		expect(forkedExtHostVal).toBe("99.99.99");
 	});
 
 	test("collectPins succeeds on current tree (all cross-asserts pass)", () => {

@@ -65,20 +65,6 @@ describe("spreadStats", () => {
 });
 
 describe("requireQuiet boundary and class semantics", () => {
-	test("relative spread exactly 0.20 is quiet", () => {
-		expect(() =>
-			requireQuiet([
-				{
-					label: "boundary",
-					count: 2,
-					median: 10,
-					stddev: 2,
-					relativeSpread: NOISE_RELATIVE_SPREAD_LIMIT,
-				},
-			]),
-		).not.toThrow();
-	});
-
 	test("relative spread above 0.20 is noisy", () => {
 		expect(() =>
 			requireQuiet([

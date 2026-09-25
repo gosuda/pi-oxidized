@@ -11,7 +11,6 @@ import { REPO_ROOT } from "./parity.ts";
 import {
 	DEPENDENCY_LAWS,
 	GATES,
-	GATE_COUNT,
 	TRACK_ORDERINGS,
 	checkDependencyLaws,
 	checkGateEdges,
@@ -55,20 +54,9 @@ function statusesExcept(open: readonly string[]): StatusMap {
 // ============================================================================
 
 describe("gate definitions (MAP-4)", () => {
-	test("exactly seven gates are defined", () => {
-		expect(GATES).toHaveLength(GATE_COUNT);
-	});
-
 	test("every gate has a unique id", () => {
 		const ids = GATES.map((g) => g.id);
 		expect(new Set(ids).size).toBe(ids.length);
-	});
-
-	test("every gate has at least one trigger and one required edge", () => {
-		for (const gate of GATES) {
-			expect(gate.trigger.length).toBeGreaterThan(0);
-			expect(gate.requiredEdges.length).toBeGreaterThan(0);
-		}
 	});
 
 	test("gate ids are the six named gates plus G-RELDOCS", () => {

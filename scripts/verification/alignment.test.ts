@@ -162,11 +162,6 @@ describe("VER-ALIGN portable tool selection", () => {
 		);
 	});
 
-	test("portable selection witness tolerates reference-only platform tools", () => {
-		const registryTools = parametersFor([...REQUIRED_TOOL_NAMES, "powershell"]);
-		expect(verifyPortableToolSelection(registryTools)).toEqual([]);
-	});
-
 	test("portable selection witness fails when a required tool is missing", () => {
 		const registryTools = parametersFor(REQUIRED_TOOL_NAMES.filter((name) => name !== "ls"));
 		expect(

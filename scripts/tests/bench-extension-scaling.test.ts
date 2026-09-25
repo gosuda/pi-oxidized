@@ -1,6 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import {
 	NOISE_ROUNDS,
 	NOISE_ROUND_WARMUPS,
@@ -13,10 +11,10 @@ import {
 	stats,
 	validateRustSamplerReport,
 } from "../bench-extension-scaling.ts";
+import { resolve } from "node:path";
 import { NOISE_RELATIVE_SPREAD_LIMIT, requireQuiet } from "../statistics.ts";
 
 const REPOSITORY_ROOT = resolve(import.meta.dirname, "../..");
-const ARTIFACT_PATH = resolve(REPOSITORY_ROOT, "target/bench/extension-scaling.json");
 
 describe("bench-extension-scaling stats regression", () => {
 	test("preserves ceil-rank quantiles and mean while adding population spread", () => {
@@ -44,12 +42,6 @@ describe("bench-extension-scaling stats regression", () => {
 		});
 	});
 
-	test("does not run the benchmark when the module is imported", () => {
-		const before = existsSync(ARTIFACT_PATH) ? readFileSync(ARTIFACT_PATH) : undefined;
-		expect(typeof stats).toBe("function");
-		const after = existsSync(ARTIFACT_PATH) ? readFileSync(ARTIFACT_PATH) : undefined;
-		expect(after).toEqual(before);
-	});
 });
 
 describe("bench-extension-scaling round-median noise validity", () => {

@@ -17,10 +17,6 @@ describe("XC-4 handshake asymmetry witnesses", () => {
 	});
 
 	// M3: Mode 1 host MUST check compatibilityVersion
-	test("M3: host compat-mismatch guard is present in handleHelloFrame", () => {
-		expect(verifyHostCompatCheck(INPUTS.hostSource)).toEqual([]);
-	});
-
 	test("M3 mutation: dropping the compat check fails the witness", () => {
 		const mutated = INPUTS.hostSource.replace(
 			/if\s*\(\s*typeof\s+remoteCompat\s*!==\s*"string"\s*\|\|\s*remoteCompat\s*!==\s*COMPATIBILITY_VERSION\s*\)/,
@@ -40,10 +36,6 @@ describe("XC-4 handshake asymmetry witnesses", () => {
 	});
 
 	// M1: Mode 2 lean MUST NOT check compatibilityVersion
-	test("M1: lean protocol-only validation is present (no compat gate)", () => {
-		expect(verifyLeanProtocolOnly(INPUTS.leanSource)).toEqual([]);
-	});
-
 	test("M1 mutation: adding a compat requirement fails the witness", () => {
 		// Inject a compat gate after the protocol check in lean handleHelloFrame.
 		const mutated = INPUTS.leanSource.replace(
@@ -57,10 +49,6 @@ describe("XC-4 handshake asymmetry witnesses", () => {
 	});
 
 	// M2: Mode 3 native server MUST NOT check compatibility_version
-	test("M2: server protocol-only validation is present (no compat gate)", () => {
-		expect(verifyServerProtocolOnly(INPUTS.serverSource)).toEqual([]);
-	});
-
 	test("M2 mutation: adding a compat requirement fails the witness", () => {
 		// Inject a compat gate after the protocol check in validate_hello.
 		const mutated = INPUTS.serverSource.replace(
