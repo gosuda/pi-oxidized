@@ -1224,6 +1224,7 @@ mod windows_raw_record {
     #[derive(Clone, Debug, Serialize)]
     pub struct FinalReport {
         pub arms: Vec<ArmReport>,
+        pub fixture_selftest: String,
         pub cross_arm_baseline_consistent: Option<bool>,
         pub bracketed_paste_2004_emitted: bool,
         pub mode_9001_emitted: bool,
@@ -1857,6 +1858,28 @@ mod windows_raw_record {
         let arms = [("A", true), ("B", true), ("IDLE", false)];
         let mut arm_reports = Vec::new();
 
+        // Binary health check outside the PTY: the fixture must reach Rust
+        // main and write its stage log for a plain spawn. The result records
+        // which side of the spawn boundary the ConPTY failure lives on.
+        let selftest_path = std::env::temp_dir().join("pi_tui_raw_record_selftest.stage.log");
+        let _ = std::fs::remove_file(&selftest_path);
+        let selftest = Command::new(raw_record_fixture_binary())
+            .arg("--selftest")
+            .env("PI_TUI_RAW_RECORD_STAGE_LOG", &selftest_path)
+            .status();
+        let selftest_summary = match selftest {
+            Ok(status) => {
+                let log = std::fs::read_to_string(&selftest_path).unwrap_or_default();
+                format!(
+                    "exit={:?} log={:?}",
+                    status.code(),
+                    if log.is_empty() { "<none>" } else { log.trim() }
+                )
+            }
+            Err(e) => format!("spawn error: {e}"),
+        };
+        let _ = std::fs::remove_file(&selftest_path);
+
         for (arm, has_stimulus) in arms {
             let report = run_arm(&pty_system, arm, has_stimulus);
             arm_reports.push(report);
@@ -1884,6 +1907,7 @@ mod windows_raw_record {
 
         let final_report = FinalReport {
             arms: arm_reports,
+            fixture_selftest: selftest_summary,
             cross_arm_baseline_consistent,
             bracketed_paste_2004_emitted: false,
             mode_9001_emitted: false,

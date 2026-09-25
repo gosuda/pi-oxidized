@@ -345,6 +345,15 @@ mod imp {
         // always pass ConPTY untransformed, so the last marker in the
         // transcript localizes any stall to a single stage.
         stage("entry");
+        // `--selftest` verifies the binary reaches Rust main and can write
+        // the evidence file outside any PTY. The parent runs it before the
+        // ConPTY arms: an empty exit-0 log pins a broken spawn, while a
+        // missing/empty file after a successful process exit proves the
+        // runner's early-process path never hands control to user code.
+        if std::env::args().any(|arg| arg == "--selftest") {
+            stage("selftest");
+            return;
+        }
         let arm = std::env::var("PI_TUI_RAW_RECORD_ARM")
             .unwrap_or_else(|e| panic!("PI_TUI_RAW_RECORD_ARM must be set to A, B, or IDLE: {e}"));
 
