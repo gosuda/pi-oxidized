@@ -576,9 +576,12 @@ fn request_headers(model: &ImagesModel, options: &ImagesOptions, api_key: &str) 
     }
     if let Some(option_headers) = options.headers.as_ref() {
         for (name, value) in option_headers {
-            // JS object spread replaces exact (case-sensitive) keys; a null
-            // suppresses the model default with the same name.
-            record.retain(|(existing, _)| existing != name);
+            // Header names are case-insensitive on the wire and HeaderMap
+            // canonicalizes them, so an override (or a null suppression)
+            // must drop the model default regardless of stored casing —
+            // the JS object-spread form cannot be reproduced once names
+            // share one canonical slot.
+            record.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
             if let Some(value) = value {
                 record.push((name.clone(), value.clone()));
             }
@@ -1272,7 +1275,10 @@ mod tests {
             headers: Some(BTreeMap::from([
                 ("X-Title".to_owned(), Some("override".to_owned())),
                 ("X-Drop".to_owned(), None),
-                ("X-Session".to_owned(), None),
+                // Differs from the stored "X-Session" only by case: the
+                // suppression must still apply because header names are
+                // case-insensitive on the wire.
+                ("x-session".to_owned(), None),
                 ("Authorization".to_owned(), Some("Bearer option".to_owned())),
             ])),
             ..ImagesOptions::default()
