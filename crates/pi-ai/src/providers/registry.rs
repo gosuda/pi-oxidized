@@ -872,9 +872,22 @@ mod tests {
                 StreamOptions::default(),
             ));
         }
+        // Builtin openrouter also serves anthropic-messages; the stream must
+        // reach the anthropic adapter rather than the routing-error path.
+        drop(registry.stream(
+            &model("openrouter", "anthropic-messages", "https://example.test"),
+            Context::default(),
+            StreamOptions::default(),
+        ));
 
         for (index, recorder) in recorders.iter().enumerate() {
-            let expected_calls = if index == 1 { 2 } else { 1 };
+            let expected_calls = match index {
+                // openai-responses route plus one custom-provider model.
+                1 => 2,
+                // custom-provider sweep plus the openrouter anthropic route.
+                4 => 2,
+                _ => 1,
+            };
             assert!(
                 recorder
                     .calls
@@ -882,6 +895,15 @@ mod tests {
                     .is_ok_and(|calls| calls.len() == expected_calls)
             );
         }
+        let anthropic_calls = recorders[4]
+            .calls
+            .lock()
+            .expect("anthropic recorder lock")
+            .clone();
+        assert_eq!(
+            anthropic_calls.last(),
+            Some(&("anthropic-messages".to_owned(), "https://example.test".to_owned()))
+        );
     }
 
     #[test]

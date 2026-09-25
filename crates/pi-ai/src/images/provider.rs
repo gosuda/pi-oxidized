@@ -7,6 +7,7 @@
 //! refresh calls share one fetch, the stored list stays at its last-known
 //! state when the fetch fails, and a later call retries.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
@@ -65,16 +66,21 @@ pub trait ImagesProvider: Send + Sync {
 pub type ImagesRefreshFn =
     Arc<dyn Fn() -> BoxFuture<'static, Result<Vec<ImagesModel>, ModelsError>> + Send + Sync>;
 
-/// One in-flight model-list fetch shared by concurrent refresh callers.
-type SharedRefreshCell = Arc<OnceCell<Result<Vec<ImagesModel>, ModelsError>>>;
+/// One in-flight model-list fetch with its monotonic generation, shared by
+/// concurrent refresh callers.
+type SharedRefreshCell = (u64, Arc<OnceCell<Result<Vec<ImagesModel>, ModelsError>>>);
 
 /// Shared-in-flight refresh state with the frozen semantics.
 ///
 /// Concurrent callers awaiting the same refresh share one fetch via a
 /// once-cell; the slot is cleared when the fetch settles so a later call
-/// retries.
+/// retries. Each newly installed fetch bumps a monotonic generation so
+/// publishers can tell whether a newer fetch superseded theirs.
 struct SharedRefresh {
     inflight: Mutex<Option<SharedRefreshCell>>,
+    /// Monotonic counter of installed fetch generations. Mutated only while
+    /// holding `inflight`; read atomically by publication guards.
+    generation: AtomicU64,
     refresh: Option<ImagesRefreshFn>,
 }
 
@@ -82,6 +88,7 @@ impl SharedRefresh {
     fn new(refresh: Option<ImagesRefreshFn>) -> Self {
         Self {
             inflight: Mutex::new(None),
+            generation: AtomicU64::new(0),
             refresh,
         }
     }
@@ -90,22 +97,31 @@ impl SharedRefresh {
         self.refresh.is_some()
     }
 
-    async fn run(&self) -> Result<Vec<ImagesModel>, ModelsError> {
+    /// Whether `generation` is still the newest fetch this state started.
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) == generation
+    }
+
+    async fn run(&self) -> (u64, Result<Vec<ImagesModel>, ModelsError>) {
         let Some(refresh) = self.refresh.clone() else {
-            return Ok(Vec::new());
+            return (u64::MAX, Ok(Vec::new()));
         };
 
-        let cell = {
+        let (generation, cell) = {
             let mut slot = self
                 .inflight
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(cell) = slot.as_ref() {
-                Arc::clone(cell)
+            if let Some((generation, cell)) = slot.as_ref() {
+                (*generation, Arc::clone(cell))
             } else {
+                // `fetch_add` yields the previous count, so generation ids
+                // start at 1 and `is_current` compares against the live
+                // counter.
+                let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
                 let cell = Arc::new(OnceCell::new());
-                *slot = Some(Arc::clone(&cell));
-                cell
+                *slot = Some((generation, Arc::clone(&cell)));
+                (generation, cell)
             }
         };
 
@@ -120,11 +136,13 @@ impl SharedRefresh {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot
             .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &cell))
+            .is_some_and(|(current_generation, current_cell)| {
+                *current_generation == generation && Arc::ptr_eq(current_cell, &cell)
+            })
         {
             *slot = None;
         }
-        result
+        (generation, result)
     }
 }
 
@@ -164,13 +182,19 @@ impl ImagesProvider for BuiltImagesProvider {
             return None;
         }
         Some(Box::pin(async move {
-            let models = self.refresh.run().await?;
-            // The frozen builder assigns `models = await refreshModels()` on
-            // success only; a failed fetch leaves the previous list stored.
-            self.models
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone_from(&models);
+            // A waiter whose fetch was superseded by a newer generation must
+            // not publish an older list over the newer result.
+            let (generation, models) = self.refresh.run().await;
+            let models = models?;
+            if self.refresh.is_current(generation) {
+                // The frozen builder assigns `models = await refreshModels()`
+                // on success only; a failed fetch leaves the previous list
+                // stored.
+                self.models
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone_from(&models);
+            }
             Ok(models)
         }))
     }
@@ -306,6 +330,51 @@ mod tests {
             .await
             .expect("second refresh succeeds");
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn newer_fetch_generation_supersedes_older_publication() {
+        let fetches = Arc::new(AtomicU32::new(0));
+        let refresh: ImagesRefreshFn = Arc::new(move || {
+            let fetches = Arc::clone(&fetches);
+            Box::pin(async move {
+                let generation = fetches.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![model(&format!("fetched-{generation}"))])
+            })
+        });
+        let shared = SharedRefresh::new(Some(refresh));
+
+        let (first_generation, first) = shared.run().await;
+        assert_eq!(first.expect("first refresh succeeds")[0].id, "fetched-0");
+        let (second_generation, second) = shared.run().await;
+        assert_eq!(second.expect("second refresh succeeds")[0].id, "fetched-1");
+        assert_ne!(first_generation, second_generation);
+        // A waiter on the older generation must not publish over the newer
+        // fetch result.
+        assert!(!shared.is_current(first_generation));
+        assert!(shared.is_current(second_generation));
+    }
+
+    #[tokio::test]
+    async fn concurrent_waiters_share_one_fetch_generation() {
+        let fetches = Arc::new(AtomicU32::new(0));
+        let fetches_for_closure = Arc::clone(&fetches);
+        let refresh: ImagesRefreshFn = Arc::new(move || {
+            let fetches = Arc::clone(&fetches_for_closure);
+            Box::pin(async move {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                Ok(vec![model("shared")])
+            })
+        });
+        let shared = SharedRefresh::new(Some(refresh));
+
+        let ((first_generation, first), (second_generation, _)) =
+            tokio::join!(shared.run(), shared.run());
+        assert_eq!(first.expect("shared refresh succeeds")[0].id, "shared");
+        assert_eq!(first_generation, second_generation);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1, "one shared fetch");
+        assert!(shared.is_current(first_generation));
     }
 
     #[tokio::test]
