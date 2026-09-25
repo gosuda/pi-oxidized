@@ -1102,7 +1102,8 @@ mod windows_raw_record {
     use serde::{Deserialize, Serialize};
 
     use super::{
-        HARD_TIMEOUT, INITIAL_COLS, INITIAL_ROWS, READ_IDLE, find_subslice, write_stimulus,
+        HARD_TIMEOUT, INITIAL_COLS, INITIAL_ROWS, READ_IDLE, find_subslice,
+        raw_record_fixture_binary, write_stimulus,
     };
 
     const VT_INPUT: u32 = 0x0200;
