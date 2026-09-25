@@ -20,7 +20,7 @@ pub use pi_agent::service::wire::{
 };
 pub use transport_adapter::create_client_service_transport;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +45,13 @@ use crate::remote::schemas::{
 use crate::remote::transport::ByteTransportFactory;
 
 use self::connection::{Connection, ConnectionOptions, open_transport};
+
+/// Maximum updates buffered for one service subscription while delivery is
+/// paused: wire frames before the subscribe snapshot hydrates, and decoded
+/// updates until [`ServiceSubscription::start`] drains the backlog. A remote
+/// endpoint that exceeds the bound fails the connection instead of growing
+/// client memory without limit.
+const MAX_QUEUED_SERVICE_UPDATES: usize = 4096;
 
 /// A connection-state callback.
 pub type ConnectionStateListener = Arc<dyn Fn(&ConnectionStateChange) + Send + Sync>;
@@ -255,6 +262,8 @@ struct Inner {
     next_request_id: u64,
     next_service_id: u64,
     next_listener_id: u64,
+    publishing: bool,
+    pending_state_events: VecDeque<(u64, ConnectionStateChange)>,
     pending: HashMap<String, PendingRequest>,
     service_listeners: HashMap<String, Arc<ActiveServiceListener>>,
     connection_state_listeners: HashMap<u64, ConnectionStateListener>,
@@ -501,7 +510,7 @@ impl Client {
             Ok(catalogue) => Ok(catalogue),
             Err(error) => {
                 let error = ClientError::from(error);
-                self.core.fail_active_connection(error.clone());
+                self.core.fail_active_connection(&error);
                 Err(error)
             }
         }
@@ -529,7 +538,7 @@ impl Client {
 
 impl ClientCore {
     async fn connect(self: &Arc<Self>) -> Result<ServerHello, ClientError> {
-        let (connection, handshake) = {
+        let (connection, handshake, publish) = {
             let mut inner = lock(&self.inner);
             if inner.disposed {
                 return Err(ClientError::Disposed(ClientDisposedError));
@@ -553,18 +562,28 @@ impl ClientCore {
             let (connection, handshake) =
                 Connection::new(connection_id, options, Arc::downgrade(self))?;
             inner.connection = Some(Arc::clone(&connection));
-            (connection, handshake)
+            // The transition is queued under the same lock that installs the
+            // connection, so a concurrent failure for this connection can
+            // only be queued after `Connecting`, never before it.
+            let publish = Self::enqueue_connection_state(
+                &mut inner,
+                connection_id,
+                ConnectionStateChange {
+                    state: ConnectionState::Connecting,
+                    error: None,
+                },
+            );
+            (connection, handshake, publish)
         };
-        self.fire_connection_state(&ConnectionStateChange {
-            state: ConnectionState::Connecting,
-            error: None,
-        });
+        if publish {
+            self.drain_connection_state();
+        }
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(open_transport(connection));
             }
             Err(_) => {
-                connection.fail(ClientError::disconnected(
+                connection.fail(&ClientError::disconnected(
                     "connect requires a Tokio runtime",
                 ));
             }
@@ -579,7 +598,7 @@ impl ClientCore {
     fn disconnect(&self, reason: String) {
         let connection = lock(&self.inner).connection.clone();
         if let Some(connection) = connection {
-            connection.fail(ClientError::disconnected(reason));
+            connection.fail(&ClientError::disconnected(reason));
         }
     }
 
@@ -602,7 +621,7 @@ impl ClientCore {
             let _ = sender.send(Err(ClientError::Disposed(ClientDisposedError)));
         }
         if let Some(connection) = connection {
-            connection.fail(ClientError::Disposed(ClientDisposedError));
+            connection.fail(&ClientError::Disposed(ClientDisposedError));
         }
         let mut inner = lock(&self.inner);
         inner.hello = None;
@@ -758,7 +777,7 @@ impl ClientCore {
                 Err(error) => {
                     drop(state);
                     self.remove_service_listener(&subscription_id, &active);
-                    self.fail_active_connection(error.clone());
+                    self.fail_active_connection(&error);
                     return Err(error);
                 }
             };
@@ -768,7 +787,7 @@ impl ClientCore {
                     let error = ClientError::from(error);
                     drop(state);
                     self.remove_service_listener(&subscription_id, &active);
-                    self.fail_active_connection(error.clone());
+                    self.fail_active_connection(&error);
                     return Err(error);
                 }
             };
@@ -781,7 +800,7 @@ impl ClientCore {
                     Err(error) => {
                         drop(state);
                         self.remove_service_listener(&subscription_id, &active);
-                        self.fail_active_connection(error.clone());
+                        self.fail_active_connection(&error);
                         return Err(error);
                     }
                 };
@@ -791,7 +810,7 @@ impl ClientCore {
                         let error = ClientError::from(error);
                         drop(state);
                         self.remove_service_listener(&subscription_id, &active);
-                        self.fail_active_connection(error.clone());
+                        self.fail_active_connection(&error);
                         return Err(error);
                     }
                 }
@@ -831,14 +850,14 @@ impl ClientCore {
         lock(&self.inner).pending.remove(id)
     }
 
-    fn fail_active_connection(&self, error: ClientError) {
+    fn fail_active_connection(&self, error: &ClientError) {
         let connection = lock(&self.inner).connection.clone();
         if let Some(connection) = connection {
             connection.fail(error);
         }
     }
 
-    fn fail_connection(&self, connection_id: u64, error: ClientError) {
+    fn fail_connection(&self, connection_id: u64, error: &ClientError) {
         let connection = {
             let inner = lock(&self.inner);
             inner
@@ -867,20 +886,28 @@ impl ClientCore {
     /// around a disconnect or reconnect can never record a superseded
     /// server identity.
     pub(crate) fn on_handshake(&self, connection_id: u64, hello: ServerHello) {
-        {
+        let publish = {
             let mut inner = lock(&self.inner);
             let live = inner.connection.as_ref().is_some_and(|connection| {
                 connection.id == connection_id && connection.state() == ConnectionState::Connected
             });
             if !live || inner.disposed {
-                return;
+                false
+            } else {
+                inner.hello = Some(hello);
+                Self::enqueue_connection_state(
+                    &mut inner,
+                    connection_id,
+                    ConnectionStateChange {
+                        state: ConnectionState::Connected,
+                        error: None,
+                    },
+                )
             }
-            inner.hello = Some(hello);
+        };
+        if publish {
+            self.drain_connection_state();
         }
-        self.fire_connection_state(&ConnectionStateChange {
-            state: ConnectionState::Connected,
-            error: None,
-        });
     }
 
     pub(crate) fn on_message(&self, connection_id: u64, message: ServerMessage) {
@@ -900,7 +927,7 @@ impl ClientCore {
                 } else {
                     self.fail_connection(
                         connection_id,
-                        ClientError::protocol("Response has no matching request"),
+                        &ClientError::protocol("Response has no matching request"),
                     );
                 }
             }
@@ -908,7 +935,7 @@ impl ClientCore {
                 if error.code.is_empty() {
                     self.fail_connection(
                         connection_id,
-                        ClientError::protocol("Response error has an empty code"),
+                        &ClientError::protocol("Response error has an empty code"),
                     );
                     return;
                 }
@@ -923,7 +950,7 @@ impl ClientCore {
                 } else {
                     self.fail_connection(
                         connection_id,
-                        ClientError::protocol("Response has no matching request"),
+                        &ClientError::protocol("Response has no matching request"),
                     );
                 }
             }
@@ -934,7 +961,7 @@ impl ClientCore {
                 if subscription_id.is_empty() {
                     self.fail_connection(
                         connection_id,
-                        ClientError::protocol("Service update has an empty subscription id"),
+                        &ClientError::protocol("Service update has an empty subscription id"),
                     );
                     return;
                 }
@@ -943,13 +970,13 @@ impl ClientCore {
             ServerMessage::Attachment { attachment } => {
                 if let Some(attachment) = attachment.as_ref() {
                     if let Err(error) = validate_session_target(attachment) {
-                        self.fail_connection(connection_id, error);
+                        self.fail_connection(connection_id, &error);
                         return;
                     }
                     if attachment.server_id.as_str() != self.server_id.as_str() {
                         self.fail_connection(
                             connection_id,
-                            ClientError::protocol("Attachment update belongs to another server"),
+                            &ClientError::protocol("Attachment update belongs to another server"),
                         );
                         return;
                     }
@@ -959,14 +986,14 @@ impl ClientCore {
             ServerMessage::Hello { .. } | ServerMessage::HelloError { .. } => {
                 self.fail_connection(
                     connection_id,
-                    ClientError::protocol("Unexpected handshake message"),
+                    &ClientError::protocol("Unexpected handshake message"),
                 );
             }
         }
     }
 
-    pub(crate) fn on_disconnected(&self, connection_id: u64, error: ClientError) {
-        let (pending, attachment_generation) = {
+    pub(crate) fn on_disconnected(&self, connection_id: u64, error: &ClientError) {
+        let (pending, attachment_generation, publish) = {
             let mut inner = lock(&self.inner);
             if inner
                 .connection
@@ -988,7 +1015,21 @@ impl ClientCore {
                 .map(|(_, pending)| pending.sender)
                 .collect::<Vec<_>>();
             inner.service_listeners.clear();
-            (pending, attachment_generation)
+            // The transition is queued under the same lock that performs the
+            // cleanup, so a reconnect racing in afterwards can only be queued
+            // after `Disconnected`. At dispatch time the transition is
+            // published only while it still describes the registered
+            // connection, so a superseded connection can never publish
+            // `Disconnected` after a newer `Connecting`.
+            let publish = Self::enqueue_connection_state(
+                &mut inner,
+                connection_id,
+                ConnectionStateChange {
+                    state: ConnectionState::Disconnected,
+                    error: Some(error.clone()),
+                },
+            );
+            (pending, attachment_generation, publish)
         };
         if attachment_generation
             .is_some_and(|generation| self.attachment_generation_is_current(generation))
@@ -998,19 +1039,8 @@ impl ClientCore {
         for sender in pending {
             let _ = sender.send(Err(error.clone()));
         }
-        // A connect() that raced in after the lock was released has already
-        // installed a new generation and fired Connecting; firing Disconnected
-        // for the superseded connection would publish a state the client no
-        // longer holds.
-        let still_current = lock(&self.inner)
-            .connection
-            .as_ref()
-            .is_some_and(|connection| connection.id == connection_id);
-        if still_current {
-            self.fire_connection_state(&ConnectionStateChange {
-                state: ConnectionState::Disconnected,
-                error: Some(error),
-            });
+        if publish {
+            self.drain_connection_state();
         }
     }
 
@@ -1028,6 +1058,16 @@ impl ClientCore {
         let parsed = {
             let mut state = lock(&active.state);
             if !state.hydrated {
+                if state.queued_wire.len() >= MAX_QUEUED_SERVICE_UPDATES {
+                    drop(state);
+                    self.fail_connection(
+                        connection_id,
+                        &ClientError::protocol(
+                            "Service updates queued before subscription start exceeded the limit",
+                        ),
+                    );
+                    return;
+                }
                 state.queued_wire.push(update.clone());
                 return;
             }
@@ -1036,20 +1076,30 @@ impl ClientCore {
                     Ok(update) => update,
                     Err(error) => {
                         drop(state);
-                        self.fail_connection(connection_id, error);
+                        self.fail_connection(connection_id, &error);
                         return;
                     }
                 };
             match state.decoder.decode_update(&wire_update) {
                 Ok(update) if state.ready && !state.delivering => Some(update),
                 Ok(update) => {
+                    if state.queued.len() >= MAX_QUEUED_SERVICE_UPDATES {
+                        drop(state);
+                        self.fail_connection(
+                            connection_id,
+                            &ClientError::protocol(
+                                "Service updates queued before subscription start exceeded the limit",
+                            ),
+                        );
+                        return;
+                    }
                     state.queued.push(update);
                     None
                 }
                 Err(error) => {
                     let error = ClientError::from(error);
                     drop(state);
-                    self.fail_connection(connection_id, error);
+                    self.fail_connection(connection_id, &error);
                     return;
                 }
             }
@@ -1129,18 +1179,68 @@ impl ClientCore {
         }
     }
 
-    fn fire_connection_state(&self, change: &ConnectionStateChange) {
-        let listeners = lock(&self.inner)
-            .connection_state_listeners
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for listener in listeners {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| listener(change))) {
-                self.report_listener_error(ClientError::protocol(format!(
-                    "Connection-state listener panicked: {}",
-                    panic_message(&payload),
-                )));
+    /// Queues one connection-state transition under `inner`'s lock.
+    ///
+    /// Returns whether the caller claimed the publisher role and must call
+    /// [`ClientCore::drain_connection_state`] after releasing `inner`.
+    fn enqueue_connection_state(
+        inner: &mut Inner,
+        connection_id: u64,
+        change: ConnectionStateChange,
+    ) -> bool {
+        inner.pending_state_events.push_back((connection_id, change));
+        if inner.publishing {
+            return false;
+        }
+        inner.publishing = true;
+        true
+    }
+
+    /// Returns the next queued transition, releasing the publisher role when
+    /// the queue is empty.
+    fn pop_connection_state(inner: &mut Inner) -> Option<(u64, ConnectionStateChange)> {
+        let next = inner.pending_state_events.pop_front();
+        if next.is_none() {
+            inner.publishing = false;
+        }
+        next
+    }
+
+    /// Publishes queued connection-state transitions to listeners.
+    ///
+    /// Publication is serialized: transitions are queued under `inner`'s lock
+    /// in exactly the order the lifecycle produced them, and only one thread
+    /// dispatches at a time. Each transition is published only while it still
+    /// describes the registered connection, so a superseded connection can
+    /// never observe its `Disconnected` after a newer `Connecting`. Callbacks
+    /// run with no lock held; a listener that synchronously triggers another
+    /// transition only queues it, and this drain publishes it in turn.
+    fn drain_connection_state(&self) {
+        loop {
+            // The guard is confined to this block: listener callbacks below
+            // take `inner` themselves, and the std mutex is not reentrant.
+            let next = {
+                let mut inner = lock(&self.inner);
+                Self::pop_connection_state(&mut inner)
+            };
+            let Some((connection_id, change)) = next else {
+                break;
+            };
+            if !self.is_current(connection_id) {
+                continue;
+            }
+            let listeners = lock(&self.inner)
+                .connection_state_listeners
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for listener in listeners {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| listener(&change))) {
+                    self.report_listener_error(ClientError::protocol(format!(
+                        "Connection-state listener panicked: {}",
+                        panic_message(&payload),
+                    )));
+                }
             }
         }
     }

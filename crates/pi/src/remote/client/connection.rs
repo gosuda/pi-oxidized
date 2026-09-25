@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -9,6 +10,9 @@ use crate::remote::schemas::{ClientMessage, PROTOCOL_VERSION, ServerHello, Serve
 use crate::remote::transport::{
     ByteTransport, ByteTransportFactory, ByteTransportHandlers, TransportError,
 };
+
+/// Maximum frames queued for the transport writer while it drains.
+const MAX_QUEUED_WRITER_FRAMES: usize = 256;
 
 pub(super) struct ConnectionOptions {
     pub factory: ByteTransportFactory,
@@ -26,10 +30,70 @@ pub(super) enum ConnectionLifecycle {
 struct State {
     lifecycle: ConnectionLifecycle,
     transport: Option<Arc<dyn ByteTransport>>,
-    sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    sender: Option<WriterQueue>,
     hello_sent: bool,
     decoder: ServerMessageDecoder,
     handshake: Option<oneshot::Sender<Result<ServerHello, ClientError>>>,
+}
+
+/// Bounded outbound queue in front of the single transport writer task.
+///
+/// Each frame reserves its bytes against a queue budget before it is
+/// enqueued, and the reservation is released once the writer dequeues the
+/// frame. A caller whose frame does not fit is rejected immediately instead
+/// of accumulating encoded frames while the transport is stalled.
+#[derive(Clone)]
+struct WriterQueue {
+    tx: mpsc::Sender<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
+}
+
+/// One rejected frame admission.
+enum Admission {
+    /// The frame did not fit the queue bound; the connection stays usable.
+    Full,
+    /// The writer is gone; the connection must fail.
+    Closed(ClientError),
+}
+
+impl WriterQueue {
+    fn admit(&self, frame: Vec<u8>, max_queued_bytes: usize) -> Result<(), Admission> {
+        let length = frame.len();
+        if !reserve_queued_bytes(&self.queued, length, max_queued_bytes) {
+            return Err(Admission::Full);
+        }
+        if self.tx.try_send(frame).is_err() {
+            self.queued.fetch_sub(length, Ordering::AcqRel);
+            return Err(if self.tx.is_closed() {
+                Admission::Closed(ClientError::disconnected("Transport writer closed"))
+            } else {
+                Admission::Full
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Reserves `bytes` against `max`, returning whether the reserve fit.
+///
+/// The caller releases the reservation once the bytes leave the queue.
+fn reserve_queued_bytes(queued: &AtomicUsize, bytes: usize, max: usize) -> bool {
+    if bytes > max {
+        return false;
+    }
+    let mut current = queued.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(bytes) else {
+            return false;
+        };
+        if next > max {
+            return false;
+        }
+        match queued.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
 }
 type HandshakeReceiver = oneshot::Receiver<Result<ServerHello, ClientError>>;
 
@@ -78,7 +142,7 @@ impl Connection {
         }
     }
 
-    pub fn fail(&self, error: ClientError) {
+    pub fn fail(&self, error: &ClientError) {
         let (transport, handshake, sender) = {
             let mut state = lock(&self.state);
             if matches!(state.lifecycle, ConnectionLifecycle::Disconnected) {
@@ -93,10 +157,10 @@ impl Connection {
         };
         drop(sender);
         if let Some(core) = self.core.upgrade() {
-            core.on_disconnected(self.id, error.clone());
+            core.on_disconnected(self.id, error);
         }
         if let Some(handshake) = handshake {
-            let _ = handshake.send(Err(error));
+            let _ = handshake.send(Err(error.clone()));
         }
         if let Some(transport) = transport {
             transport.close();
@@ -120,12 +184,18 @@ impl Connection {
                 .clone()
                 .ok_or_else(|| ClientError::disconnected("Transport writer unavailable"))?
         };
-        if let Ok(()) = sender.send(frame) {
-            Ok(())
-        } else {
-            let error = ClientError::disconnected("Transport writer closed");
-            self.fail(error.clone());
-            Err(error)
+        // The frame's bytes are reserved against the queue bound before it is
+        // enqueued, so a stalled transport sheds new frames instead of
+        // accumulating them without limit.
+        match sender.admit(frame, self.options.max_frame_length) {
+            Ok(()) => Ok(()),
+            Err(Admission::Full) => {
+                Err(ClientError::disconnected("Transport writer queue is full"))
+            }
+            Err(Admission::Closed(error)) => {
+                self.fail(&error);
+                Err(error)
+            }
         }
     }
 
@@ -154,7 +224,7 @@ impl Connection {
         let messages = match messages {
             Ok(messages) => messages,
             Err(error) => {
-                self.fail(error);
+                self.fail(&error);
                 return;
             }
         };
@@ -173,17 +243,16 @@ impl Connection {
                             ServerHello { version, server_id }
                         }
                         ServerMessage::HelloError { error } => {
-                            if error.code.is_empty() {
-                                self.fail(ClientError::protocol(
-                                    "Handshake error has an empty code",
-                                ));
+                            let error = if error.code.is_empty() {
+                                ClientError::protocol("Handshake error has an empty code")
                             } else {
-                                self.fail(error.into());
-                            }
+                                error.into()
+                            };
+                            self.fail(&error);
                             return;
                         }
                         _ => {
-                            self.fail(ClientError::protocol("Expected matching v8 server hello"));
+                            self.fail(&ClientError::protocol("Expected matching v8 server hello"));
                             return;
                         }
                     };
@@ -207,7 +276,7 @@ impl Connection {
                 }
                 ConnectionState::Connected => match message {
                     ServerMessage::Hello { .. } | ServerMessage::HelloError { .. } => {
-                        self.fail(ClientError::protocol("Unexpected handshake message"));
+                        self.fail(&ClientError::protocol("Unexpected handshake message"));
                         return;
                     }
                     message => {
@@ -266,13 +335,13 @@ impl ByteTransportHandlers for ConnHandlers {
                 || ClientError::disconnected("Byte transport closed"),
                 ClientError::from,
             );
-            connection.fail(error);
+            connection.fail(&error);
         }
     }
 
     fn on_error(&self, error: TransportError) {
         if let Some(connection) = self.current() {
-            connection.fail(error.into());
+            connection.fail(&error.into());
         }
     }
 }
@@ -285,11 +354,16 @@ pub(super) async fn open_transport(connection: Arc<Connection>) {
     let transport = match (connection.options.factory)(handlers).await {
         Ok(transport) => transport,
         Err(error) => {
-            connection.fail(error.into());
+            connection.fail(&error.into());
             return;
         }
     };
-    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let (sender, mut receiver) = mpsc::channel(MAX_QUEUED_WRITER_FRAMES);
+    let writer_queue = WriterQueue {
+        tx: sender,
+        queued: Arc::clone(&queued),
+    };
     {
         let mut state = lock(&connection.state);
         if !matches!(state.lifecycle, ConnectionLifecycle::Connecting) {
@@ -298,7 +372,7 @@ pub(super) async fn open_transport(connection: Arc<Connection>) {
             return;
         }
         state.transport = Some(transport.clone());
-        state.sender = Some(sender.clone());
+        state.sender = Some(writer_queue.clone());
     }
     let writer_connection = Arc::downgrade(&connection);
     let shutdown = Arc::clone(&connection.shutdown);
@@ -315,6 +389,7 @@ pub(super) async fn open_transport(connection: Arc<Connection>) {
                         transport.close();
                         break;
                     };
+                    queued.fetch_sub(frame.len(), Ordering::AcqRel);
                     let Some(connection) = writer_connection.upgrade() else {
                         transport.close();
                         break;
@@ -324,11 +399,16 @@ pub(super) async fn open_transport(connection: Arc<Connection>) {
                         break;
                     }
                     if let Err(error) = transport.send(frame).await {
-                        connection.fail(error.into());
+                        connection.fail(&error.into());
                         break;
                     }
                 }
             }
+        }
+        // Frames still queued when the writer exits are never sent; release
+        // their reservations so the bound holds across reconnect attempts.
+        while let Ok(frame) = receiver.try_recv() {
+            queued.fetch_sub(frame.len(), Ordering::AcqRel);
         }
     });
     let frame = match encode_client_message(
@@ -341,18 +421,18 @@ pub(super) async fn open_transport(connection: Arc<Connection>) {
     ) {
         Ok(frame) => frame,
         Err(error) => {
-            connection.fail(error.into());
+            connection.fail(&error.into());
             return;
         }
     };
-    let send_result = {
+    let hello_admitted = {
         let mut state = lock(&connection.state);
         if matches!(state.lifecycle, ConnectionLifecycle::Connecting) {
             state.hello_sent = true;
         }
-        sender.send(frame)
+        writer_queue.admit(frame, connection.options.max_frame_length)
     };
-    if send_result.is_err() {
-        connection.fail(ClientError::disconnected("Transport writer closed"));
+    if let Err(Admission::Closed(error)) = hello_admitted {
+        connection.fail(&error);
     }
 }
