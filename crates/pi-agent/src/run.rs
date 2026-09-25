@@ -8,10 +8,9 @@
 
 use std::sync::Arc;
 
-use pi_ai::transcript::{ToolStateChanges, get_current_tools, get_tool_state_changes};
 use pi_ai::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, Context, Message,
-    ModelThinkingLevel, Provider, ProviderError, StopReason, SystemMessage, ToolResultMessage,
+    ModelThinkingLevel, Provider, ProviderError, StopReason, ToolResultMessage,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -56,7 +55,7 @@ pub async fn run_agent_loop(
     io: RunIo<'_>,
     cancel: CancellationToken,
 ) -> Result<Vec<AgentMessage>, AgentLoopError> {
-    let initial_messages = declare_tool_changes(&context, prompts);
+    let initial_messages = prompts;
     let mut new_messages = initial_messages.clone();
     let mut current_context = AgentContext {
         system_prompt: context.system_prompt,
@@ -163,10 +162,7 @@ async fn run_loop(
             }
 
             turn_messages.append(&mut pending_messages);
-            // Declare tool-loadout changes against the executable set before
-            // the next request (`agent-loop.ts:210`).
-            let declared = declare_tool_changes(current_context, turn_messages);
-            append_messages(io.sink, current_context, new_messages, declared);
+            append_messages(io.sink, current_context, new_messages, turn_messages);
 
             apply_prepare_request(current_context, &mut config, cancel.clone()).await?;
 
@@ -737,131 +733,6 @@ fn tool_result_agent_message(message: ToolResultMessage) -> AgentMessage {
     AgentMessage::Llm(Box::new(Message::ToolResult(message)))
 }
 
-/// Declares tool-loadout differences before a provider request.
-///
-/// Mirrors `declareToolChanges` in
-/// `.references/pi/packages/agent/src/agent-loop.ts:322-373`: `context.tools`
-/// is what the runtime can execute; the transcript's system messages declare
-/// what the model may call. When a pending system message exists, its tool
-/// fields are intent and are replaced with the delta between the committed
-/// transcript and the executable set, so replay always yields exactly the
-/// executable tools. Otherwise a new system message is inserted before the
-/// first non-system pending message.
-fn declare_tool_changes(
-    context: &AgentContext,
-    pending_messages: Vec<AgentMessage>,
-) -> Vec<AgentMessage> {
-    let executable_tools: Vec<pi_ai::Tool> = context
-        .tools
-        .iter()
-        .map(|tool| to_pi_tool(tool.as_ref()))
-        .collect();
-
-    let Some(system_index) = pending_messages
-        .iter()
-        .rposition(|message| matches!(message.as_llm(), Some(Message::System(_))))
-    else {
-        let changes = transcript_tool_changes(context, &pending_messages, &executable_tools);
-        if changes.tools_added.is_empty() && changes.tools_removed.is_empty() {
-            return pending_messages;
-        }
-        let update =
-            system_update_with_tool_changes(SystemMessage::new("", now_millis()), &changes);
-        let insert_index = pending_messages
-            .iter()
-            .position(|message| message.role() != "system")
-            .unwrap_or(pending_messages.len());
-        let mut declared = pending_messages;
-        declared.insert(insert_index, update);
-        return declared;
-    };
-
-    let pending_system = match pending_messages[system_index].as_llm() {
-        Some(Message::System(system)) => system.as_ref().clone(),
-        _ => return pending_messages,
-    };
-
-    // Baseline treats the pending declaration's tool fields as absent.
-    let baseline: Vec<AgentMessage> = pending_messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            if index == system_index {
-                AgentMessage::Llm(Box::new(Message::System(Box::new(with_tool_changes(
-                    pending_system.clone(),
-                    &ToolStateChanges {
-                        tools_added: Vec::new(),
-                        tools_removed: Vec::new(),
-                    },
-                )))))
-            } else {
-                message.clone()
-            }
-        })
-        .collect();
-
-    let changes = transcript_tool_changes(context, &baseline, &executable_tools);
-    let unchanged = changes.tools_added.is_empty() && changes.tools_removed.is_empty();
-    // Keep the caller's message when it already declares no tool changes.
-    if unchanged
-        && pending_system
-            .tools_added
-            .as_ref()
-            .is_none_or(Vec::is_empty)
-        && pending_system
-            .tools_removed
-            .as_ref()
-            .is_none_or(Vec::is_empty)
-    {
-        return pending_messages;
-    }
-
-    let mut declared = baseline;
-    declared[system_index] = AgentMessage::Llm(Box::new(Message::System(Box::new(
-        with_tool_changes(pending_system, &changes),
-    ))));
-    declared
-}
-
-/// Computes the delta between committed transcript tools (including any
-/// pending-baseline system update) and the executable declarations.
-fn transcript_tool_changes(
-    context: &AgentContext,
-    extra: &[AgentMessage],
-    executable_tools: &[pi_ai::Tool],
-) -> ToolStateChanges {
-    let committed: Vec<Message> = context
-        .messages
-        .iter()
-        .chain(extra)
-        .filter_map(|message| message.as_llm())
-        .filter_map(|message| match message {
-            Message::System(system) => Some(Message::System(system.clone())),
-            _ => None,
-        })
-        .collect();
-    get_tool_state_changes(&get_current_tools(&committed), executable_tools)
-}
-
-/// Copies a system message with its tool fields replaced by `changes`;
-/// empty lists omit the field.
-fn with_tool_changes(mut message: SystemMessage, changes: &ToolStateChanges) -> SystemMessage {
-    message.tools_added = (!changes.tools_added.is_empty()).then(|| changes.tools_added.clone());
-    message.tools_removed =
-        (!changes.tools_removed.is_empty()).then(|| changes.tools_removed.clone());
-    message
-}
-
-/// Wraps a tool-changes-bearing system update as an agent message.
-fn system_update_with_tool_changes(
-    message: SystemMessage,
-    changes: &ToolStateChanges,
-) -> AgentMessage {
-    AgentMessage::Llm(Box::new(Message::System(Box::new(with_tool_changes(
-        message, changes,
-    )))))
-}
-
 fn emit_message_pair(sink: &dyn crate::bus::EventSink, message: AgentMessage) {
     sink.emit(AgentEvent::MessageStart {
         message: message.clone(),
@@ -995,13 +866,6 @@ mod tests {
                 .lock()
                 .ok()
                 .and_then(|guard| guard.last().cloned())
-        }
-
-        fn contexts_snapshot(&self) -> Vec<Context> {
-            self.contexts
-                .lock()
-                .map(|guard| guard.clone())
-                .unwrap_or_default()
         }
 
         fn model_ids(&self) -> Vec<String> {
@@ -1533,10 +1397,6 @@ mod tests {
             vec![
                 "agent_start",
                 "turn_start",
-                // Tool-loadout declaration precedes the prompt on the first
-                // request (`declareToolChanges`).
-                "message_start",
-                "message_end",
                 "message_start",
                 "message_end",
                 "message_start",
@@ -1608,7 +1468,7 @@ mod tests {
         let message_roles: Vec<_> = message_ends.iter().map(AgentMessage::role).collect();
         assert_eq!(
             message_roles,
-            ["system", "user", "assistant", "toolResult", "assistant"],
+            ["user", "assistant", "toolResult", "assistant"],
             "the witness must exercise each run-owned message kind in order"
         );
 
@@ -1623,194 +1483,6 @@ mod tests {
             transcript, expected_transcript,
             "the reducer must append each message_end payload in order"
         );
-        Ok(())
-    }
-
-    fn declaration_tool(name: &str) -> pi_ai::Tool {
-        pi_ai::Tool {
-            name: name.to_owned(),
-            description: "recording".to_owned(),
-            parameters: (*EMPTY_OBJECT_SCHEMA).clone(),
-            constrained_sampling: None,
-        }
-    }
-
-    fn system_intent(tools: Vec<pi_ai::Tool>) -> AgentMessage {
-        let mut message = SystemMessage::new("", 5);
-        message.tools_added = Some(tools);
-        AgentMessage::Llm(Box::new(Message::System(Box::new(message))))
-    }
-
-    fn context_system_messages(context: &Context) -> Vec<&SystemMessage> {
-        context
-            .messages
-            .iter()
-            .filter_map(|message| match message {
-                Message::System(system) => Some(system.as_ref()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn optional_tool_names(tools: Option<&[pi_ai::Tool]>) -> Vec<&str> {
-        tools
-            .map(|tools| tools.iter().map(|tool| tool.name.as_str()).collect())
-            .unwrap_or_default()
-    }
-
-    fn context_tool_names(context: &Context) -> Vec<String> {
-        get_current_tools(&context.messages)
-            .iter()
-            .map(|tool| tool.name.clone())
-            .collect()
-    }
-
-    fn context_executable_names(context: &Context) -> Vec<&str> {
-        context
-            .tools
-            .as_ref()
-            .map(|tools| tools.iter().map(|tool| tool.name.as_str()).collect())
-            .unwrap_or_default()
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tool_loadout_changes_declared_between_turns() -> TestResult {
-        let alpha = Arc::new(RecordingTool::new("alpha"));
-        let beta = Arc::new(RecordingTool::new("beta"));
-        let provider = ScriptedProvider::new(vec![tool_script("c1", "alpha"), text_script("done")]);
-        let mut config = sample_config();
-        config.tool_execution = ToolExecutionMode::Sequential;
-        let beta_for_hook = Arc::clone(&beta);
-        config.prepare_next_turn = Some(Arc::new(move |turn, _cancel| {
-            let beta = Arc::clone(&beta_for_hook);
-            Box::pin(async move {
-                // The product refreshes the executable tool set between turns.
-                let mut next = turn.context.clone();
-                next.tools = vec![beta];
-                Ok(Some(AgentLoopTurnUpdate {
-                    context: Some(next),
-                    messages: None,
-                    model: None,
-                    thinking_level: None,
-                }))
-            })
-        }));
-
-        let (_messages, _events, _) = run_prompt(
-            vec![text_user_message("prompt")],
-            base_context(vec![alpha]),
-            config,
-            &provider,
-            CancellationToken::new(),
-        )
-        .await?;
-
-        assert_eq!(
-            provider.call_count(),
-            2,
-            "the tool swap must precede a second request"
-        );
-        let contexts = provider.contexts_snapshot();
-
-        let first = contexts
-            .first()
-            .ok_or("the first request must be captured")?;
-        let first_systems = context_system_messages(first);
-        assert_eq!(first_systems.len(), 1, "one initial declaration");
-        assert_eq!(
-            optional_tool_names(first_systems[0].tools_added.as_deref()),
-            ["alpha"],
-            "the first request declares the executable set"
-        );
-        assert!(first_systems[0].tools_removed.is_none());
-        assert_eq!(context_executable_names(first), ["alpha"]);
-
-        let second = contexts
-            .last()
-            .ok_or("the second request must be captured")?;
-        let second_systems = context_system_messages(second);
-        assert_eq!(
-            second_systems.len(),
-            2,
-            "the swap must append one reconciling declaration"
-        );
-        assert_eq!(
-            second_systems[1]
-                .tools_removed
-                .as_ref()
-                .map(|removed| removed
-                    .iter()
-                    .map(|tool| tool.name.as_str())
-                    .collect::<Vec<_>>()),
-            Some(vec!["alpha"]),
-            "the replaced declaration must remove the retired tool"
-        );
-        assert_eq!(
-            optional_tool_names(second_systems[1].tools_added.as_deref()),
-            ["beta"],
-            "the replaced declaration must add the new tool"
-        );
-        assert_eq!(
-            context_tool_names(second),
-            ["beta".to_owned()],
-            "replayed declarations must equal the executable set"
-        );
-        assert_eq!(context_executable_names(second), ["beta"]);
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pending_system_declaration_intent_is_reconciled() -> TestResult {
-        let alpha = Arc::new(RecordingTool::new("alpha"));
-        let provider = ScriptedProvider::new(vec![tool_script("c1", "alpha"), text_script("done")]);
-        let mut config = sample_config();
-        config.tool_execution = ToolExecutionMode::Sequential;
-        let polls = Arc::new(AtomicUsize::new(0));
-        let polls_for_hook = Arc::clone(&polls);
-        config.get_steering_messages = Some(Arc::new(move || {
-            let polls = Arc::clone(&polls_for_hook);
-            Box::pin(async move {
-                if polls.fetch_add(1, Ordering::SeqCst) == 1 {
-                    // A queued system update declaring tool intent that does
-                    // not match the executable delta.
-                    return Ok(vec![system_intent(vec![declaration_tool("ghost")])]);
-                }
-                Ok(Vec::new())
-            })
-        }));
-
-        let (_messages, _events, _) = run_prompt(
-            vec![text_user_message("prompt")],
-            base_context(vec![alpha]),
-            config,
-            &provider,
-            CancellationToken::new(),
-        )
-        .await?;
-
-        let contexts = provider.contexts_snapshot();
-        assert_eq!(
-            contexts.len(),
-            2,
-            "the steered intent must not add a request"
-        );
-        let second = contexts
-            .last()
-            .ok_or("the second request must be captured")?;
-        let second_systems = context_system_messages(second);
-        assert_eq!(second_systems.len(), 2, "the intent message must survive");
-        let reconciled = second_systems[1];
-        assert!(
-            reconciled.tools_added.is_none(),
-            "intent that does not match the executable delta must never declare ghost"
-        );
-        assert!(reconciled.tools_removed.is_none());
-        assert_eq!(
-            context_tool_names(second),
-            ["alpha".to_owned()],
-            "replayed declarations must stay equal to the executable set"
-        );
-        assert_eq!(context_executable_names(second), ["alpha"]);
         Ok(())
     }
 
