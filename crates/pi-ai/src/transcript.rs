@@ -222,7 +222,7 @@ pub fn get_effective_system_prompt(context: &Context) -> Option<String> {
         .map(|head| get_system_message_text(&head))
         .filter(|text| !text.is_empty());
     match (context.system_prompt.as_deref(), updates) {
-        (Some(prompt), Some(update)) if prompt.is_empty() => Some(update),
+        (Some(""), Some(update)) => Some(update),
         (Some(prompt), Some(update)) => Some(format!("{prompt}\n\n{update}")),
         (Some(prompt), None) => Some(prompt.to_owned()),
         (None, update) => update,

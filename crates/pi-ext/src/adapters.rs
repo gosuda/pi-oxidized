@@ -701,6 +701,10 @@ fn deferred_terminal_result(
     clippy::needless_pass_by_value,
     reason = "pre-existing adapter shape; narrowing the surface is a separate port task"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "cancellation-aware publication added a select arm per publication site; splitting mid-flight would obscure the deadline contract"
+)]
 fn deferred_fetch_stream(
     client: Arc<HostClient>,
     provider_id: String,
@@ -811,7 +815,7 @@ fn deferred_fetch_stream(
             let item = deferred_terminal_result(&model, error);
             // Best-effort publication: a stalled consumer must not pin this
             // task past the whole-fetch deadline either.
-            let _ = tokio::select! {
+            tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
                     let _ = tx.try_send(Err(ProviderError::new("provider deferred fetch cancelled")));

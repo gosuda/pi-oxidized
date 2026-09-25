@@ -360,7 +360,7 @@ impl ReplicatedState {
                     match deliveries.pending.pop_front() {
                         Some(entry) if entry.epoch == deliveries.epoch => break Some(entry),
                         // A `clear` discarded this revision's hydration epoch.
-                        Some(_) => continue,
+                        Some(_) => {}
                         None => {
                             deliveries.draining = false;
                             break None;

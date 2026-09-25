@@ -1118,7 +1118,7 @@ mod tests {
             .expect("re-subscribe reuses the id");
         release.send(()).expect("release blocked delivery");
         timeout(Duration::from_secs(1), async {
-            while lock(&first_updates).len() < 1 {
+            while lock(&first_updates).is_empty() {
                 tokio::task::yield_now().await;
             }
         })

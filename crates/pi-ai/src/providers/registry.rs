@@ -882,10 +882,9 @@ mod tests {
 
         for (index, recorder) in recorders.iter().enumerate() {
             let expected_calls = match index {
-                // openai-responses route plus one custom-provider model.
-                1 => 2,
+                // openai-responses route plus one custom-provider model;
                 // custom-provider sweep plus the openrouter anthropic route.
-                4 => 2,
+                1 | 4 => 2,
                 _ => 1,
             };
             assert!(
