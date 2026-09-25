@@ -1100,6 +1100,7 @@ mod windows_raw_record {
 
     use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
     use serde::{Deserialize, Serialize};
+    use std::process::Command;
 
     use super::{
         HARD_TIMEOUT, INITIAL_COLS, INITIAL_ROWS, READ_IDLE, find_subslice,
