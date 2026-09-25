@@ -1227,6 +1227,7 @@ mod windows_raw_record {
         pub arms: Vec<ArmReport>,
         pub fixture_selftest: String,
         pub fixture_pty_selftest: String,
+        pub fixture_cmd_selftest: String,
         pub cross_arm_baseline_consistent: Option<bool>,
         pub bracketed_paste_2004_emitted: bool,
         pub mode_9001_emitted: bool,
@@ -1931,6 +1932,53 @@ mod windows_raw_record {
         };
         let _ = std::fs::remove_file(&pty_selftest_path);
 
+        // Third probe: launch the same selftest through `cmd.exe /c` so the
+        // fixture is a console grandchild rather than the process registered
+        // on the pseudo-console. Success here while the direct spawn stalls
+        // isolates the fault to the ConPTY attach handshake for this binary.
+        let cmd_selftest_path =
+            std::env::temp_dir().join("pi_tui_raw_record_selftest_cmd.stage.log");
+        let _ = std::fs::remove_file(&cmd_selftest_path);
+        let cmd_selftest_summary = match pty_system.openpty(PtySize {
+            rows: INITIAL_ROWS,
+            cols: INITIAL_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(pair) => {
+                let mut cmd = CommandBuilder::new("cmd.exe");
+                cmd.arg("/c");
+                cmd.arg(raw_record_fixture_binary());
+                cmd.arg("--selftest");
+                cmd.env("PI_TUI_RAW_RECORD_STAGE_LOG", &cmd_selftest_path);
+                match pair.slave.spawn_command(cmd) {
+                    Ok(mut child) => {
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        let mut exited = false;
+                        while Instant::now() < deadline {
+                            if child.try_wait().ok().flatten().is_some() {
+                                exited = true;
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                        if !exited {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        let log = std::fs::read_to_string(&cmd_selftest_path).unwrap_or_default();
+                        format!(
+                            "exited={exited} log={:?}",
+                            if log.is_empty() { "<none>" } else { log.trim() }
+                        )
+                    }
+                    Err(e) => format!("spawn_command error: {e}"),
+                }
+            }
+            Err(e) => format!("openpty error: {e}"),
+        };
+        let _ = std::fs::remove_file(&cmd_selftest_path);
+
         for (arm, has_stimulus) in arms {
             let report = run_arm(&pty_system, arm, has_stimulus);
             arm_reports.push(report);
@@ -1960,6 +2008,7 @@ mod windows_raw_record {
             arms: arm_reports,
             fixture_selftest: selftest_summary,
             fixture_pty_selftest: pty_selftest_summary,
+            fixture_cmd_selftest: cmd_selftest_summary,
             cross_arm_baseline_consistent,
             bracketed_paste_2004_emitted: false,
             mode_9001_emitted: false,
