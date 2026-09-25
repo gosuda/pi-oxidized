@@ -515,16 +515,9 @@ impl SqliteSessionRepo {
         cx: &Context,
     ) -> Result<ForkSourceSnapshot, SessionError> {
         cx.check().map_err(|_| aborted())?;
-        let path = canonical_path(&source.path).await.map_err(|error| {
-            if is_not_found(&error) {
-                not_found(format!(
-                    "session file does not exist: {}",
-                    source.path.display()
-                ))
-            } else {
-                error
-            }
-        })?;
+        // Fork reads the source file, so hold it to the same repository
+        // ownership boundary as `open` and `delete`.
+        let path = self.repository_path_for_metadata(source).await?;
         let identity = storage_identity(&path, &source.session.id);
         let open_storage = {
             let open = self.open.lock().map_err(|_| lock_failed("fork"))?;
