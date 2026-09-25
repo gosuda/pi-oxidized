@@ -13,6 +13,7 @@
  * upstream `@earendil-works/*` packages so prebundled entries and the lean
  * runner share zero runtime graph with Mode 1.
  */
+import type { SessionBoundaryDraftWire } from "./protocol.ts";
 import { isRecord } from "./wire-validators.ts";
 
 /** Lifecycle event discriminants (mirrors Rust `ALL_EVENT_TYPES`). */
@@ -303,6 +304,30 @@ export interface LeanGenericHookResult {
 	readonly [key: string]: unknown;
 }
 
+/** Boundary draft entry threaded through `turn_end` / `agent_before_settle`. */
+export type LeanBoundaryDraft = SessionBoundaryDraftWire;
+
+/**
+ * Event passed to boundary lifecycle handlers. Carries the running fold
+ * state: the current draft entries, the pending continuation, and the
+ * Rust-owned projection preview. Supplied result fields REPLACE the running
+ * values (entries never append); the projection itself stays opaque here —
+ * Rust validates drafts and rebuilds the preview after every handler.
+ */
+export interface LeanBoundaryEvent {
+	readonly type: "turn_end" | "agent_before_settle";
+	readonly entries: readonly LeanBoundaryDraft[];
+	readonly continue: boolean;
+	readonly context: unknown;
+	readonly [key: string]: unknown;
+}
+
+/** Boundary handler result; present fields replace the running fold values. */
+export interface LeanBoundaryHookResult {
+	readonly entries?: readonly LeanBoundaryDraft[];
+	readonly continue?: boolean;
+}
+
 /** Typed hooks for the shaped lifecycle events. */
 export interface LeanShapedHooks {
 	readonly tool_call?: (
@@ -329,6 +354,14 @@ export interface LeanShapedHooks {
 		event: LeanResourcesDiscoverEvent,
 		ctx: LeanContext,
 	) => LeanResourcesDiscoverHookResult | void | Promise<LeanResourcesDiscoverHookResult | void>;
+	readonly turn_end?: (
+		event: LeanBoundaryEvent,
+		ctx: LeanContext,
+	) => LeanBoundaryHookResult | void | Promise<LeanBoundaryHookResult | void>;
+	readonly agent_before_settle?: (
+		event: LeanBoundaryEvent,
+		ctx: LeanContext,
+	) => LeanBoundaryHookResult | void | Promise<LeanBoundaryHookResult | void>;
 }
 
 /** Generic hook signature for the remaining lifecycle events. */

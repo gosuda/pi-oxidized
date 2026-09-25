@@ -556,6 +556,8 @@ declare module "@earendil-works/pi-coding-agent" {
 		onError(listener: ExtensionErrorListener): () => void;
 		emit(event: unknown): Promise<unknown>;
 		emitContext(messages: unknown[]): Promise<unknown[]>;
+		emitBeforeProviderRequest(payload: unknown): Promise<unknown>;
+		emitUserBash(event: unknown): Promise<unknown>;
 		emitInput(text: string, images: unknown, source: string, streamingBehavior?: string): Promise<{ action: string; text?: string }>;
 		emitMessageEnd(event: unknown): Promise<unknown>;
 		emitResourcesDiscover(cwd: string, reason: string): Promise<unknown>;

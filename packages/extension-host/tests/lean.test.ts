@@ -41,6 +41,11 @@ const TOOL_CALL_REORDER_ENTRY = join(LEAN_FIXTURES, "tool-call-reorder.mjs");
 const TOOL_CALL_VALUE_CHANGE_ENTRY = join(LEAN_FIXTURES, "tool-call-value-change.mjs");
 const FLOW_CONTROL_ENTRY = join(LEAN_FIXTURES, "flow-control.mjs");
 const FLAG_CONTEXT_ENTRY = join(LEAN_FIXTURES, "flag-context.mjs");
+const BOUNDARY_SEED_ENTRY = join(LEAN_FIXTURES, "boundary-seed.mjs");
+const BOUNDARY_REPLACE_ENTRY = join(LEAN_FIXTURES, "boundary-replace.mjs");
+const BOUNDARY_NOOP_ENTRY = join(LEAN_FIXTURES, "boundary-noop.mjs");
+const BOUNDARY_INVALID_ENTRY = join(LEAN_FIXTURES, "boundary-invalid.mjs");
+const BOUNDARY_CORRECT_ENTRY = join(LEAN_FIXTURES, "boundary-correct.mjs");
 const PRELOAD = resolve(import.meta.dirname, "fixtures", "lean-forbid-compat-graph.ts");
 
 type Marker = { name: string; value: unknown };
@@ -1484,10 +1489,10 @@ describe("lean: lifecycle hooks", () => {
 
 	test("undeclared methods are rejected as unknown", async () => {
 		const link = await loadedLink();
-		link.request(33, "turn_end", {});
-		const err = payload(await link.error(33, "turn_end"));
+		link.request(33, "session.compact", {});
+		const err = payload(await link.error(33, "session.compact"));
 		expect(err["code"]).toBe("extension_error");
-		expect(String(err["message"])).toContain("unknown method: turn_end");
+		expect(String(err["message"])).toContain("unknown method: session.compact");
 		await link.finish();
 	});
 
@@ -2229,6 +2234,305 @@ describe("lean: ordered folds", () => {
 			(f) => f.kind === "event" && f.method === "extensionError",
 		);
 		expect(String(payload(errEvent)["message"])).toContain("same role");
+		await link.finish();
+	});
+});
+
+
+// ---------------------------------------------------------------------------
+// Boundary replacement/preview folds (turn_end, agent_before_settle)
+// ---------------------------------------------------------------------------
+
+describe("lean: boundary folds", () => {
+	/** Loaded link over an explicit extension set. */
+	async function loadedLink(
+		extensionPaths: string[],
+	): Promise<LeanLink> {
+		const link = new LeanLink({ cwd: PACKAGE_DIR, extensionPaths: [] });
+		await link.hello(1);
+		link.request(2, "extensions.load", { extensionPaths, cwd: PACKAGE_DIR });
+		await link.response(2, "extensions.load");
+		return link;
+	}
+
+	test("turn_end: later handler replaces drafts and clears continuation; previews ride the real transport", async () => {
+		const link = new LeanLink({
+			cwd: PACKAGE_DIR,
+			extensionPaths: [],
+			beforeDeliver: async (frames) => {
+				for (const frame of frames) {
+					if (
+						frame.kind === "req"
+						&& frame.method === "session.previewBoundary"
+					) {
+						link.send({
+							id: frame.id,
+							kind: "res",
+							method: frame.method,
+							payload: { context: { ok: true } },
+						});
+					}
+				}
+			},
+		});
+		await link.hello(1);
+		link.request(2, "extensions.load", {
+			extensionPaths: [BOUNDARY_SEED_ENTRY, BOUNDARY_REPLACE_ENTRY],
+			cwd: PACKAGE_DIR,
+		});
+		await link.response(2, "extensions.load");
+
+		link.request(10, "turn_end", { entries: [], continue: false });
+		const res = payload(await link.response(10, "turn_end"));
+		// Both handlers supplied fields; the response carries the REPLACED
+		// running values (the seed's drafts and continue:true are gone).
+		expect(res["entries"]).toEqual([{
+			type: "custom_message",
+			customType: "replace-draft",
+			content: "replaced",
+			display: true,
+		}]);
+		expect(res["continue"]).toBe(false);
+		// Two handlers → two correlated preview requests over the wire.
+		const previews = link
+			.allFrames()
+			.filter((f) => f.kind === "req" && f.method === "session.previewBoundary");
+		expect(previews).toHaveLength(2);
+		expect(payload(previews[0]!)["boundary"]).toBe("turn_end");
+		expect(payload(previews[0]!)["entries"]).toEqual([
+			{ type: "custom", customType: "seed-draft", data: { ok: true } },
+		]);
+		expect(payload(previews[1]!)["entries"]).toEqual([{
+			type: "custom_message",
+			customType: "replace-draft",
+			content: "replaced",
+			display: true,
+		}]);
+		// Handlers observed the running fold, not the incoming payload.
+		expect(markerLog()).toContainEqual({
+			name: "replace.turn_end",
+			value: {
+				entries: [{ type: "custom", customType: "seed-draft", data: { ok: true } }],
+				continue: true,
+				context: { ok: true },
+			},
+		});
+		await link.finish();
+	});
+
+	test("turn_end: invalid draft fails its preview, a later handler corrects it, and the final state validates", async () => {
+		const poison = "{ type: custom, customType: poison-draft }";
+		const link = new LeanLink({
+			cwd: PACKAGE_DIR,
+			extensionPaths: [],
+			beforeDeliver: async (frames) => {
+				for (const frame of frames) {
+					if (
+						frame.kind !== "req"
+						|| frame.method !== "session.previewBoundary"
+					) {
+						continue;
+					}
+					const entries = (frame.payload as Record<string, unknown>)["entries"];
+					const poisoned = Array.isArray(entries)
+						&& entries.some(
+							(entry) => (entry as Record<string, unknown>)["customType"] === "poison-draft",
+						);
+					link.send(
+						poisoned
+							? {
+								id: frame.id,
+								kind: "error",
+								method: frame.method,
+								payload: {
+									code: "extension_error",
+									message: `invalid draft: ${poison}`,
+									retryable: false,
+								},
+							}
+							: {
+								id: frame.id,
+								kind: "res",
+								method: frame.method,
+								payload: { context: { ok: true } },
+							},
+					);
+				}
+			},
+		});
+		await link.hello(1);
+		link.request(2, "extensions.load", {
+			extensionPaths: [BOUNDARY_INVALID_ENTRY, BOUNDARY_CORRECT_ENTRY],
+			cwd: PACKAGE_DIR,
+		});
+		await link.response(2, "extensions.load");
+
+		link.request(10, "turn_end", { entries: [], continue: false });
+		const res = payload(await link.response(10, "turn_end"));
+		// The correcting handler's drafts replaced the poisoned ones and the
+		// final preview validated, so the fold reports them.
+		expect(res["entries"]).toEqual([{
+			type: "custom",
+			customType: "corrected-draft",
+			data: { ok: true },
+		}]);
+		expect(res["continue"]).toBeUndefined();
+		// The failed preview was reported as an extension error.
+		const errorEvents = link
+			.allFrames()
+			.filter((f) => f.kind === "event" && f.method === "extensionError");
+		expect(errorEvents.some(
+			(f) => String(payload(f)["message"]).includes("Invalid boundary entries"),
+		)).toBe(true);
+		// The correcting handler saw the stale previous context, not undefined.
+		expect(markerLog()).toContainEqual({
+			name: "correct.turn_end",
+			value: {
+				entries: [{ type: "custom", customType: "poison-draft" }],
+				continue: false,
+				context: undefined,
+			},
+		});
+		await link.finish();
+	});
+
+	test("turn_end: a final invalid preview collapses the fold to empty drafts and no continuation", async () => {
+		const link = new LeanLink({
+			cwd: PACKAGE_DIR,
+			extensionPaths: [],
+			beforeDeliver: async (frames) => {
+				for (const frame of frames) {
+					if (frame.kind !== "req" || frame.method !== "session.previewBoundary") {
+						continue;
+					}
+					link.send({
+						id: frame.id,
+						kind: "error",
+						method: frame.method,
+						payload: {
+							code: "extension_error",
+							message: "always invalid",
+							retryable: false,
+						},
+					});
+				}
+			},
+		});
+		await link.hello(1);
+		link.request(2, "extensions.load", {
+			extensionPaths: [BOUNDARY_SEED_ENTRY],
+			cwd: PACKAGE_DIR,
+		});
+		await link.response(2, "extensions.load");
+
+		link.request(10, "turn_end", {
+			entries: [{ type: "custom", customType: "incoming" }],
+			continue: true,
+		});
+		const res = payload(await link.response(10, "turn_end"));
+		expect(res).toEqual({ entries: [], continue: false });
+		await link.finish();
+	});
+
+	test("turn_end: a noop handler still revalidates and preserves the running drafts", async () => {
+		const link = new LeanLink({
+			cwd: PACKAGE_DIR,
+			extensionPaths: [],
+			beforeDeliver: async (frames) => {
+				for (const frame of frames) {
+					if (frame.kind !== "req" || frame.method !== "session.previewBoundary") {
+						continue;
+					}
+					link.send({
+						id: frame.id,
+						kind: "res",
+						method: frame.method,
+						payload: { context: { generation: 7 } },
+					});
+				}
+			},
+		});
+		await link.hello(1);
+		link.request(2, "extensions.load", {
+			extensionPaths: [BOUNDARY_SEED_ENTRY, BOUNDARY_NOOP_ENTRY],
+			cwd: PACKAGE_DIR,
+		});
+		await link.response(2, "extensions.load");
+
+		link.request(10, "turn_end", {});
+		const res = payload(await link.response(10, "turn_end"));
+		// The seed handler supplied values; the noop handler did not, and the
+		// response keeps them without re-echoing.
+		expect(res["entries"]).toEqual([
+			{ type: "custom", customType: "seed-draft", data: { ok: true } },
+		]);
+		expect(res["continue"]).toBe(true);
+		// The noop handler saw the post-seed running state, including the
+		// preview context adopted after the seed's validation.
+		expect(markerLog()).toContainEqual({
+			name: "noop.turn_end",
+			value: {
+				entries: [{ type: "custom", customType: "seed-draft", data: { ok: true } }],
+				continue: true,
+				context: { generation: 7 },
+			},
+		});
+		// Two handlers → two previews even though only one supplied drafts.
+		const previews = link
+			.allFrames()
+			.filter((f) => f.kind === "req" && f.method === "session.previewBoundary");
+		expect(previews).toHaveLength(2);
+		await link.finish();
+	});
+
+	test("agent_before_settle: the same fold runs under the settle boundary", async () => {
+		const link = new LeanLink({
+			cwd: PACKAGE_DIR,
+			extensionPaths: [],
+			beforeDeliver: async (frames) => {
+				for (const frame of frames) {
+					if (frame.kind !== "req" || frame.method !== "session.previewBoundary") {
+						continue;
+					}
+					link.send({
+						id: frame.id,
+						kind: "res",
+						method: frame.method,
+						payload: { context: { ok: true } },
+					});
+				}
+			},
+		});
+		await link.hello(1);
+		link.request(2, "extensions.load", {
+			extensionPaths: [BOUNDARY_NOOP_ENTRY],
+			cwd: PACKAGE_DIR,
+		});
+		await link.response(2, "extensions.load");
+
+		link.request(10, "agent_before_settle", { entries: [], continue: false });
+		const res = payload(await link.response(10, "agent_before_settle"));
+		// No handler supplied values: the omission-shaped response lets the
+		// Rust fold keep its accumulated state.
+		expect(res).toEqual({});
+		expect(markerLog()).toContainEqual({
+			name: "noop.agent_before_settle",
+			value: { entries: [], context: undefined },
+		});
+		const previews = link
+			.allFrames()
+			.filter((f) => f.kind === "req" && f.method === "session.previewBoundary");
+		expect(previews).toHaveLength(1);
+		expect(payload(previews[0]!)["boundary"]).toBe("agent_before_settle");
+		await link.finish();
+	});
+
+	test("turn_end: a malformed non-array entries payload errors explicitly", async () => {
+		const link = await loadedLink([BOUNDARY_SEED_ENTRY]);
+		link.request(10, "turn_end", { entries: "not-an-array" });
+		const err = payload(await link.error(10, "turn_end"));
+		expect(err["code"]).toBe("extension_error");
+		expect(String(err["message"])).toContain("entries must be an array");
 		await link.finish();
 	});
 });

@@ -1058,6 +1058,44 @@ export class ExtensionHost {
 					await this.client.respond(id, eventType as Method, { headers: result });
 					return;
 				}
+				case "context": {
+					// The pinned 0.80.10 runner exposes emitContext.
+					const messages = payload["messages"];
+					const result = await runner.emitContext(Array.isArray(messages) ? messages : []);
+					await this.client.respond(id, eventType as Method, {
+						messages: result ?? undefined,
+					});
+					return;
+				}
+				case "before_provider_request": {
+					// The pinned 0.80.10 runner exposes emitBeforeProviderRequest.
+					const result = await runner.emitBeforeProviderRequest(payload["payload"]);
+					await this.client.respond(id, eventType as Method, { payload: result });
+					return;
+				}
+				case "user_bash": {
+					// The pinned 0.80.10 runner exposes emitUserBash.
+					const result = await runner.emitUserBash({
+						type: "user_bash",
+						...payload,
+					} as Parameters<typeof runner.emitUserBash>[0]);
+					await this.client.respond(id, eventType as Method, result ?? {});
+					return;
+				}
+				case "cache_warming_decision":
+				case "turn_end":
+				case "agent_before_settle":
+				case "context_with_system": {
+					// The pinned runner has no emitBoundary or
+					// emitCacheWarmingDecision. Generic emit runs handlers but
+					// cannot harvest those newer result shapes.
+					result = await runner.emit({
+						type: eventType,
+						...payload,
+					} as Parameters<typeof runner.emit>[0]);
+					await this.client.respond(id, eventType as Method, result ?? { ok: true });
+					return;
+				}
 				case "session_before_compact":
 				case "session_compact":
 				case "thinking_level_select":

@@ -37,6 +37,7 @@ import {
 	type Method,
 	PROTOCOL_VERSION,
 	ProtocolClient,
+	SESSION_PREVIEW_BOUNDARY_METHOD,
 } from "./protocol.ts";
 import {
 	assertJsonValue,
@@ -109,6 +110,56 @@ function isDeferredHandle(value: unknown): value is LeanDeferredHandle {
 			|| (typeof value["expiresAt"] === "number" && Number.isFinite(value["expiresAt"])))
 		&& (value["pollAfterMs"] === undefined
 			|| (typeof value["pollAfterMs"] === "number" && Number.isFinite(value["pollAfterMs"])));
+}
+
+/** Mutable running state of one boundary replacement/preview fold. */
+interface BoundaryFoldState {
+	/** Current draft entries; handler-supplied arrays replace these. */
+	entries: readonly unknown[];
+	/** Whether the agent loop should continue after the boundary. */
+	continueAfter: boolean;
+	/** Last accepted Rust projection preview; retained across failed previews. */
+	context: unknown;
+	/** Whether any handler supplied `entries` (drives the omission-shaped response). */
+	entriesSupplied: boolean;
+	/** Whether any handler supplied `continue`. */
+	continueSupplied: boolean;
+	/** Whether the LAST preview succeeded; a failed final preview collapses the fold. */
+	valid: boolean;
+}
+
+/**
+ * Fold a handler result over the running boundary state. Present fields
+ * REPLACE the running values — entries never append. Absent fields, empty
+ * results, and thrown handlers change nothing.
+ */
+function applyBoundaryResult(result: unknown, fold: BoundaryFoldState): void {
+	if (!isRecord(result)) return;
+	if (result["entries"] !== undefined) {
+		fold.entries = result["entries"] as readonly unknown[];
+		fold.entriesSupplied = true;
+	}
+	if (result["continue"] !== undefined) {
+		fold.continueAfter = result["continue"] === true;
+		fold.continueSupplied = true;
+	}
+}
+
+/**
+ * Omission-shaped fold result: `entries` / `continue` appear only when a
+ * handler supplied them, so an endpoint whose handlers changed nothing
+ * answers `{}` and the Rust fold keeps its accumulated state. An invalid
+ * final state cannot persist: it collapses to empty entries and no
+ * continuation.
+ */
+function boundaryFoldResponse(fold: BoundaryFoldState): Record<string, unknown> {
+	if (!fold.valid) {
+		return { entries: [], continue: false };
+	}
+	const response: Record<string, unknown> = {};
+	if (fold.entriesSupplied) response["entries"] = fold.entries;
+	if (fold.continueSupplied) response["continue"] = fold.continueAfter;
+	return response;
 }
 
 /**
@@ -1261,6 +1312,13 @@ export class LeanRunner {
 			case "message_update_delta":
 				await this.handleMessageUpdateDelta(id, p);
 				return;
+			case "turn_end":
+			case "agent_before_settle":
+				// Boundary folds answer even with zero registered handlers: the
+				// response carries no supplied values, so the Rust fold keeps
+				// its accumulated state.
+				await this.handleLifecycleHook(id, method, p);
+				return;
 			default:
 				if (this.hooks.has(method)) {
 					await this.handleLifecycleHook(id, method, p);
@@ -1999,6 +2057,12 @@ export class LeanRunner {
 					await this.client.respond(id, eventType as Method, result ?? { ok: true });
 					return;
 				}
+				case "turn_end":
+				case "agent_before_settle": {
+					const response = await this.runBoundaryFold(eventType, payload);
+					await this.client.respond(id, eventType as Method, response);
+					return;
+				}
 				default: {
 					if (eventType === "agent_end" || eventType === "session_shutdown") {
 						this.assistantDelta.clearActiveAssistant();
@@ -2014,6 +2078,102 @@ export class LeanRunner {
 				message: err instanceof Error ? err.message : String(err),
 				retryable: false,
 			});
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Boundary replacement/preview fold (turn_end, agent_before_settle)
+	// -----------------------------------------------------------------------
+
+	/**
+	 * Replacement/preview fold for boundary hooks, mirroring the reference
+	 * runner's `emitBoundary`: each handler sees the running entries,
+	 * continuation, and context; result fields REPLACE the running values
+	 * (entries never append, `continue: false` clears a prior request). After
+	 * every handler — including one returning nothing, because it may enqueue
+	 * messages — the runner asks Rust to validate the drafts through the
+	 * correlated `session.previewBoundary` request and adopts the returned
+	 * projection preview. A failed preview is reported as an extension error,
+	 * keeps the previous context for the next handler, and lets a later
+	 * handler replace the drafts; when the LAST preview failed, the fold
+	 * collapses to empty entries and no continuation so an invalid final
+	 * state cannot persist. Rust owns all projection logic: this fold only
+	 * threads values and reports.
+	 */
+	private async runBoundaryFold(
+		eventType: "turn_end" | "agent_before_settle",
+		payload: Record<string, unknown>,
+	): Promise<Record<string, unknown>> {
+		const rawEntries = payload["entries"];
+		if (rawEntries !== undefined && !Array.isArray(rawEntries)) {
+			throw new Error(`${eventType}.entries must be an array`);
+		}
+		const fold: BoundaryFoldState = {
+			entries: Array.isArray(rawEntries) ? rawEntries : [],
+			continueAfter: payload["continue"] === true,
+			context: payload["context"],
+			entriesSupplied: false,
+			continueSupplied: false,
+			valid: true,
+		};
+		for (const { handler, extensionPath } of this.hooks.get(eventType) ?? []) {
+			await this.runBoundaryHandler(eventType, handler, extensionPath, payload, fold);
+			await this.revalidateBoundaryEntries(eventType, extensionPath, fold);
+		}
+		return boundaryFoldResponse(fold);
+	}
+
+	/** Invoke one boundary handler and fold its supplied fields over the running state. */
+	private async runBoundaryHandler(
+		eventType: "turn_end" | "agent_before_settle",
+		handler: RegisteredHook["handler"],
+		extensionPath: string,
+		payload: Record<string, unknown>,
+		fold: BoundaryFoldState,
+	): Promise<void> {
+		try {
+			const event = {
+				type: eventType,
+				...payload,
+				entries: fold.entries,
+				continue: fold.continueAfter,
+				context: fold.context,
+			};
+			const result = await handler(event as never, this.hookContext(extensionPath));
+			applyBoundaryResult(result, fold);
+		} catch (err) {
+			this.emitExtensionError(
+				extensionPath,
+				eventType,
+				err instanceof Error ? err.message : String(err),
+			);
+		}
+	}
+
+	/**
+	 * Ask Rust to validate the current drafts and adopt the returned preview.
+	 * A failure reports the extension error and marks the fold invalid while
+	 * keeping the previous context, so a later handler can replace the drafts.
+	 */
+	private async revalidateBoundaryEntries(
+		eventType: "turn_end" | "agent_before_settle",
+		extensionPath: string,
+		fold: BoundaryFoldState,
+	): Promise<void> {
+		try {
+			const preview = await this.client.request(SESSION_PREVIEW_BOUNDARY_METHOD, {
+				boundary: eventType,
+				entries: fold.entries,
+			});
+			fold.context = isRecord(preview.payload) ? preview.payload["context"] : undefined;
+			fold.valid = true;
+		} catch (err) {
+			fold.valid = false;
+			this.emitExtensionError(
+				extensionPath,
+				eventType,
+				`Invalid boundary entries: ${err instanceof Error ? err.message : String(err)}`,
+			);
 		}
 	}
 
