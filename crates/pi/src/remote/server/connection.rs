@@ -150,6 +150,7 @@ pub struct InMemoryServerListener {
     listener: Arc<InMemoryListener>,
     state: StdMutex<InMemoryListenerState>,
     stop: Arc<tokio::sync::Notify>,
+    accept_task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for InMemoryServerListener {
@@ -168,6 +169,7 @@ impl InMemoryServerListener {
             listener,
             state: StdMutex::new(InMemoryListenerState::Idle),
             stop: Arc::new(tokio::sync::Notify::new()),
+            accept_task: StdMutex::new(None),
         }
     }
 
@@ -339,7 +341,7 @@ impl ServerListener for InMemoryServerListener {
         }
         let listener = Arc::clone(&self.listener);
         let stop = Arc::clone(&self.stop);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 let connection = Arc::new(InMemoryConnection::new());
                 let handler = accept(Arc::clone(&connection) as Arc<dyn ByteConnection>);
@@ -361,6 +363,7 @@ impl ServerListener for InMemoryServerListener {
                 }
             }
         });
+        *lock(&self.accept_task) = Some(task);
         Box::pin(futures::future::ready(Ok(())))
     }
 
@@ -374,8 +377,18 @@ impl ServerListener for InMemoryServerListener {
                 *state = InMemoryListenerState::Closing;
             }
         }
-        self.stop.notify_waiters();
-        Box::pin(futures::future::ready(()))
+        // `notify_one` stores a permit when the accept loop has not yet
+        // polled `notified()`, so a close that races the spawned loop - for
+        // example immediately after `start` on a current-thread runtime -
+        // still terminates it; `notify_waiters` would leave the loop blocked
+        // in `accept` forever.
+        self.stop.notify_one();
+        let accept_task = lock(&self.accept_task).take();
+        Box::pin(async move {
+            if let Some(accept_task) = accept_task {
+                let _ = accept_task.await;
+            }
+        })
     }
 }
 

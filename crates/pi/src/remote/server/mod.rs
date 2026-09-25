@@ -1037,6 +1037,13 @@ impl<H: ServerHost> ServerCore<H> {
             subscription_id.as_deref(),
             result,
         );
+        let (installed, result) = Self::gate_subscription_overflow(
+            connection,
+            subscription_id.as_deref(),
+            &pending,
+            installed,
+            result,
+        );
         self.finish_request(
             connection,
             id,
@@ -1049,6 +1056,32 @@ impl<H: ServerHost> ServerCore<H> {
         .await;
     }
 
+    /// Fails the subscription when publications buffered while the handler
+    /// produced its snapshot exceeded their bound: they are part of the
+    /// subscription's history, so activating with a gap would be wrong.
+    fn gate_subscription_overflow(
+        connection: &Arc<ServerConnection>,
+        subscription_id: Option<&str>,
+        pending: &Arc<PendingUpdates>,
+        installed: bool,
+        result: Result<Option<JsonValue>, HostError>,
+    ) -> (bool, Result<Option<JsonValue>, HostError>) {
+        if !(installed && pending.overflowed()) {
+            return (installed, result);
+        }
+        if let Some(subscription_id) = subscription_id {
+            lock(&connection.inner)
+                .state_encoders
+                .remove(subscription_id);
+        }
+        (
+            false,
+            Err(HostError::Protocol(
+                "service subscription update buffer exceeded the limit".to_owned(),
+            )),
+        )
+    }
+
     fn make_publish(
         core: Arc<Self>,
         connection: Arc<ServerConnection>,
@@ -1059,14 +1092,55 @@ impl<H: ServerHost> ServerCore<H> {
             let core = Arc::clone(&core);
             let connection = Arc::clone(&connection);
             Box::pin(async move {
-                if pending.buffer(&subscription, update.clone()) {
+                if !pending.is_for(&subscription) {
+                    let _ = core
+                        .send_service_update(&connection, subscription, update)
+                        .await;
                     return;
                 }
-                let _ = core
-                    .send_service_update(&connection, subscription, update)
-                    .await;
+                match pending.enqueue(update) {
+                    EnqueuedPublication::Buffered | EnqueuedPublication::Deferred => {}
+                    EnqueuedPublication::Claimed(batch) => {
+                        core.drain_subscription_updates(
+                            &connection,
+                            &subscription,
+                            &pending,
+                            batch,
+                        )
+                        .await;
+                    }
+                    EnqueuedPublication::Overflow => {
+                        let _ = core.close_connection(&connection, None).await;
+                        core.disconnect(&connection).await;
+                    }
+                }
             })
         })
+    }
+
+    /// Sends one claimed batch, then keeps draining publications queued
+    /// behind it until the subscription's backlog quiesces. Only one worker
+    /// drains at a time, so updates reach the client in publication order
+    /// instead of task scheduling order.
+    async fn drain_subscription_updates(
+        &self,
+        connection: &Arc<ServerConnection>,
+        subscription_id: &str,
+        pending: &Arc<PendingUpdates>,
+        mut batch: Vec<ServiceProviderUpdate<DeltaOp>>,
+    ) {
+        let subscription_id = subscription_id.to_owned();
+        loop {
+            for update in batch {
+                let _ = self
+                    .send_service_update(connection, subscription_id.clone(), update)
+                    .await;
+            }
+            let Some(next) = pending.next_batch() else {
+                break;
+            };
+            batch = next;
+        }
     }
 
     async fn invoke_request(
@@ -1178,11 +1252,13 @@ impl<H: ServerHost> ServerCore<H> {
                     .await;
                 if sent && let Some(subscription_id) = subscription_id {
                     let updates = pending.activate();
-                    for update in updates {
-                        let _ = self
-                            .send_service_update(connection, subscription_id.clone(), update)
-                            .await;
-                    }
+                    self.drain_subscription_updates(
+                        connection,
+                        &subscription_id,
+                        &pending,
+                        updates,
+                    )
+                    .await;
                 }
             }
             Err(error) => {
@@ -1420,36 +1496,107 @@ impl ConnectionHandler for ClosedHandler {
     }
 }
 
+/// Maximum updates buffered for one subscription: while the subscribe handler
+/// is still producing its snapshot, and while the active backlog drains. A
+/// provider that exceeds the bound fails its subscription (setup) or sheds the
+/// connection (live) instead of growing server memory without limit.
+const MAX_QUEUED_SUBSCRIPTION_UPDATES: usize = 1024;
+
 struct PendingUpdates {
     subscription: Option<String>,
-    state: StdMutex<(bool, Vec<ServiceProviderUpdate<DeltaOp>>)>,
+    state: StdMutex<PendingUpdatesState>,
+}
+
+#[derive(Default)]
+struct PendingUpdatesState {
+    /// The subscribe response has been sent; publications queue behind the
+    /// backlog instead of bypassing it.
+    active: bool,
+    /// A worker is draining the queue in order.
+    draining: bool,
+    queue: Vec<ServiceProviderUpdate<DeltaOp>>,
+    /// The setup buffer exceeded its bound; the subscription must fail.
+    overflowed: bool,
+}
+
+/// One queued live publication.
+enum EnqueuedPublication {
+    /// Buffered until the subscribe response activates delivery.
+    Buffered,
+    /// Queued behind the backlog; the caller claimed the worker role and must
+    /// drain the returned batch in order.
+    Claimed(Vec<ServiceProviderUpdate<DeltaOp>>),
+    /// Queued behind an in-flight drain; the worker delivers it in order.
+    Deferred,
+    /// The queue bound was exceeded; the connection must be shed.
+    Overflow,
 }
 
 impl PendingUpdates {
     fn new(subscription: Option<String>) -> Self {
         Self {
             subscription,
-            state: StdMutex::new((false, Vec::new())),
+            state: StdMutex::new(PendingUpdatesState::default()),
         }
     }
 
-    fn buffer(&self, subscription_id: &str, update: ServiceProviderUpdate<DeltaOp>) -> bool {
-        if self.subscription.as_deref() != Some(subscription_id) {
-            return false;
-        }
+    fn is_for(&self, subscription_id: &str) -> bool {
+        self.subscription.as_deref() == Some(subscription_id)
+    }
+
+    /// Queues one publication for this subscription.
+    ///
+    /// Before activation, publications wait for the subscribe response.
+    /// After activation they join the same ordered queue the backlog drains
+    /// from, and the first publisher without an in-flight worker claims the
+    /// worker role, so a live update can never overtake an older buffered
+    /// delta. The empty check and the worker release happen under one lock,
+    /// so no queued publication is ever stranded.
+    fn enqueue(
+        &self,
+        update: ServiceProviderUpdate<DeltaOp>,
+    ) -> EnqueuedPublication {
         let mut state = lock(&self.state);
-        if state.0 {
-            false
-        } else {
-            state.1.push(update);
-            true
+        if !state.active {
+            if state.queue.len() >= MAX_QUEUED_SUBSCRIPTION_UPDATES {
+                state.overflowed = true;
+                return EnqueuedPublication::Buffered;
+            }
+            state.queue.push(update);
+            return EnqueuedPublication::Buffered;
         }
+        if state.queue.len() >= MAX_QUEUED_SUBSCRIPTION_UPDATES {
+            return EnqueuedPublication::Overflow;
+        }
+        state.queue.push(update);
+        if state.draining {
+            return EnqueuedPublication::Deferred;
+        }
+        state.draining = true;
+        EnqueuedPublication::Claimed(std::mem::take(&mut state.queue))
     }
 
+    /// Activates delivery and returns the buffered backlog in order.
     fn activate(&self) -> Vec<ServiceProviderUpdate<DeltaOp>> {
         let mut state = lock(&self.state);
-        state.0 = true;
-        std::mem::take(&mut state.1)
+        state.active = true;
+        state.draining = true;
+        std::mem::take(&mut state.queue)
+    }
+
+    /// Returns the next queued batch, releasing the worker role when empty.
+    fn next_batch(&self) -> Option<Vec<ServiceProviderUpdate<DeltaOp>>> {
+        let mut state = lock(&self.state);
+        if state.queue.is_empty() {
+            state.draining = false;
+            None
+        } else {
+            Some(std::mem::take(&mut state.queue))
+        }
+    }
+
+    fn overflowed(&self) -> bool {
+        lock(&self.state).overflowed
     }
 }
 
