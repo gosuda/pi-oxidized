@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-09-25T08:15:11.262Z",
-	"captureHead": "875ec8c0eab7ee788de5b9c6d5bab881c25e983c",
+	"capturedAt": "2026-09-25T13:28:24.339Z",
+	"captureHead": "f382241d5970c9e61004e703f7069364ba9e2229",
 	"metafile": {
-		"projectionPath": "metafile-projection.777b2bc7e3c3cc8578258b5c74a7e8d0cd9229a360f0780fd44851e8db5d3b74.json",
-		"sha256": "777b2bc7e3c3cc8578258b5c74a7e8d0cd9229a360f0780fd44851e8db5d3b74",
+		"projectionPath": "metafile-projection.67c0c91e2893438e5b4ec5583bc4dbbd2c8ee210897abeed40c8af5a5c9223dd.json",
+		"sha256": "67c0c91e2893438e5b4ec5583bc4dbbd2c8ee210897abeed40c8af5a5c9223dd",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -17,10 +17,10 @@
 			"--target",
 			"bun-linux-x64-baseline",
 			"--outfile",
-			"/tmp/exposure-capture-scG4Q5/pi-extension-host",
-			"--metafile=/tmp/exposure-capture-scG4Q5/metafile.json"
+			"/tmp/exposure-capture-nck4Cm/pi-extension-host",
+			"--metafile=/tmp/exposure-capture-nck4Cm/metafile.json"
 		],
-		"metafileSha256": "200ba8c60d14cb6a5e2d1813970aaf342657bc4ef73aeb13c55114e989b1c468"
+		"metafileSha256": "7405be5f717fe21bdc700bc301202c8c1205a3c1f8395370cc4292c71f4a5efa"
 	},
 	"cargo": {
 		"projectionPath": "cargo-graph-projection.bb5cf5659db2aec137d16f02d4f6d1057e892e8c5bd5ce50776b478f354e7629.json",
@@ -113,7 +113,7 @@
 		},
 		{
 			"path": "crates/pi-tui/Cargo.toml",
-			"sha256": "7d45b7fc57e356c1f577f52175d52ee86ed473972492ad05c8b44bfbb64e7a2f"
+			"sha256": "3b93d7345e53f7cf7d2edbf47642819508351b98c26520f99554e81025a9a28f"
 		},
 		{
 			"path": "crates/pi/Cargo.toml",
