@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
-	"capturedAt": "2026-09-24",
-	"captureHead": "b08583361c3c94b57e53575c32ec5e4a1d48d370",
-	"contentSha256": "82c0b0b84c62cebc6fd6aef8b4eb7363101e959f9c860c20eff05c15778f2c00",
+	"capturedAt": "2026-09-25",
+	"captureHead": "aefcac67e4f1a8e760e6f9549800b4f40c57e44e",
+	"contentSha256": "be41c09db89eb3bac6f549819c7d486fb8060a1e86c79ca9c4e16ea837c95853",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.98.0",
@@ -154,7 +154,7 @@
 				},
 				{
 					"name": "aws-lc-rs",
-					"version": "1.17.1",
+					"version": "1.18.1",
 					"license": "ISC AND (Apache-2.0 OR ISC)",
 					"source": "registry",
 					"direct": false,
@@ -162,7 +162,7 @@
 				},
 				{
 					"name": "aws-lc-sys",
-					"version": "0.42.0",
+					"version": "0.45.0",
 					"license": "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)",
 					"source": "registry",
 					"direct": false,
@@ -2602,7 +2602,7 @@
 				},
 				{
 					"name": "rustls",
-					"version": "0.23.42",
+					"version": "0.23.45",
 					"license": "Apache-2.0 OR ISC OR MIT",
 					"source": "registry",
 					"direct": false,
@@ -2642,7 +2642,7 @@
 				},
 				{
 					"name": "rustls-webpki",
-					"version": "0.103.13",
+					"version": "0.103.15",
 					"license": "ISC",
 					"source": "registry",
 					"direct": false,
