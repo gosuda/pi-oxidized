@@ -702,7 +702,13 @@ export function observeProcessTreeMemory(
 			throw new HarnessFailure(label, `live process pid ${pid} omitted startTime`);
 		}
 
-		const assembled = assembleProcessMemoryReading({
+		// A process observed mid-execve keeps its identity but publishes an
+		// empty smaps_rollup while the kernel rebuilds the address space. That
+		// window is microseconds; re-read a few times before treating an
+		// incomplete parse as an instrumentation failure. Identity churn and
+		// vanish are still settled on the first attempt, so retries only ever
+		// resolve the exec-transient case.
+		let assembled = assembleProcessMemoryReading({
 			pid,
 			initialStartTime,
 			root: isRoot,
@@ -710,6 +716,21 @@ export function observeProcessTreeMemory(
 			status: read(`/proc/${pid}/status`),
 			reconfirm: read(`/proc/${pid}/stat`),
 		});
+		for (
+			let attempt = 0;
+			attempt < 3 && assembled.kind === "incomplete" && assembled.reason === "parse";
+			attempt += 1
+		) {
+			Bun.sleepSync(1);
+			assembled = assembleProcessMemoryReading({
+				pid,
+				initialStartTime,
+				root: isRoot,
+				smaps: read(`/proc/${pid}/smaps_rollup`),
+				status: read(`/proc/${pid}/status`),
+				reconfirm: read(`/proc/${pid}/stat`),
+			});
+		}
 		if (assembled.kind === "discard-identity-race") {
 			// Reused/discarded identity must not contribute descendants.
 			continue;

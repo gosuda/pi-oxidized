@@ -678,6 +678,51 @@ describe("memory-path child enumeration policy", () => {
 		expect(observation.identitiesWithCompleteMemory).toBe(1);
 		expect(observation.processes.map((process) => process.pid)).toEqual([1]);
 	});
+
+	test("mid-exec empty smaps resolves on retry instead of failing", () => {
+		const stat = (pid: number) =>
+			`${pid} (cmd) R ${Array.from({ length: 18 }, () => "0").concat("100").join(" ")}`;
+		let smapsReads = 0;
+		const observation = observeProcessTreeMemory(1, "mid-exec-retry", {
+			readProcFile: (path) => {
+				if (path.endsWith("/stat")) return { kind: "ok", text: stat(1) };
+				if (path.endsWith("smaps_rollup")) {
+					smapsReads += 1;
+					// First read lands inside the exec window; the retry sees the
+					// rebuilt address space.
+					if (smapsReads === 1) return { kind: "ok", text: "" };
+					return { kind: "ok", text: "Rss: 10 kB\nPss: 7 kB\n" };
+				}
+				if (path.endsWith("status")) return { kind: "ok", text: "VmHWM:\t12 kB\n" };
+				return { kind: "vanished" };
+			},
+			enumerateChildren: () => ({ kind: "ok", children: [] }),
+		});
+		expect(smapsReads).toBe(2);
+		expect(observation.coverageComplete).toBe(true);
+		expect(observation.identitiesWithCompleteMemory).toBe(1);
+	});
+
+	test("persistently unparseable smaps still fails the observation", () => {
+		const stat = (pid: number) =>
+			`${pid} (cmd) R ${Array.from({ length: 18 }, () => "0").concat("100").join(" ")}`;
+		let smapsReads = 0;
+		expect(() =>
+			observeProcessTreeMemory(1, "persistent-parse", {
+				readProcFile: (path) => {
+					if (path.endsWith("/stat")) return { kind: "ok", text: stat(1) };
+					if (path.endsWith("smaps_rollup")) {
+						smapsReads += 1;
+						return { kind: "ok", text: "" };
+					}
+					if (path.endsWith("status")) return { kind: "ok", text: "VmHWM:\t12 kB\n" };
+					return { kind: "vanished" };
+				},
+				enumerateChildren: () => ({ kind: "ok", children: [] }),
+			}),
+		).toThrow(HarnessFailure);
+		expect(smapsReads).toBe(4);
+	});
 });
 
 describe("memory window coverage aggregation", () => {
