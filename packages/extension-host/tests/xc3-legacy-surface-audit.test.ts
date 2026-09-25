@@ -110,10 +110,6 @@ describe("XC-3: extension-import legacy-surface audit", () => {
 		const allKeys = [...virtualModuleKeys, ...aliasKeys, ...ambientModules];
 		const record = Array.from(new Set(allKeys)).sort();
 
-		// The record size must equal the deduped input size — proves no
-		// unexpected key was silently dropped or duplicated by the union.
-		expect(record.length).toBe(new Set(allKeys).size);
-
 		// The record is non-empty and contains the expected legacy-surface keys.
 		expect(record.length).toBeGreaterThan(0);
 		expect(record).toContain("@earendil-works/pi-ai");

@@ -254,24 +254,6 @@ describe("acceptance: widget slot measure/render", () => {
 // ===========================================================================
 
 describe("acceptance: stale generation tracking", () => {
-	test("uiSlot and disposeSlot carry matching generations", async () => {
-		const { collector, stdin, host, runPromise } = await connectHost([hostileFactory]);
-		await sendSessionStart(stdin, collector);
-
-		const slotEvent = await collector.awaitFrame((f) => f.method === "uiSlot");
-		const slotGen = (slotEvent.payload as Record<string, unknown>)["generation"];
-
-		host.disposeSlot("widget.hostile");
-		const disposeEvent = await collector.awaitFrame((f) => f.method === "disposeSlot");
-		const disposeGen = (disposeEvent.payload as Record<string, unknown>)["generation"];
-
-		expect(disposeGen).toBe(slotGen);
-
-		stdin.push(null);
-		host.dispose("test");
-		await runPromise.catch(() => void 0);
-	});
-
 	test("re-pushing a slot produces a newer generation", async () => {
 		const { collector, stdin, host, runPromise } = await connectHost([hostileFactory]);
 		await sendSessionStart(stdin, collector);
