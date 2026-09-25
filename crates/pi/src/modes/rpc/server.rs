@@ -394,6 +394,7 @@ fn normalize_event_envelope(event: &AgentSessionEvent, wire: &mut Value) {
         | AgentSessionEvent::SessionBeforeFork { .. }
         | AgentSessionEvent::SessionStart { .. }
         | AgentSessionEvent::SessionShutdown { .. }
+        | AgentSessionEvent::CompactionFailed { .. }
         | AgentSessionEvent::ModelSelect { .. }
         | AgentSessionEvent::AgentStart
         | AgentSessionEvent::TurnStart

@@ -170,8 +170,17 @@ impl AgentSession {
                     result: None,
                     aborted: false,
                     will_retry: false,
-                    error_message: Some(message),
+                    error_message: Some(message.clone()),
                 })
+                .await;
+                let runner = self.hooks.runner();
+                self.extension_compact_failed(
+                    &runner,
+                    CompactionReason::Manual,
+                    Some(message),
+                    false,
+                    false,
+                )
                 .await;
                 Err(err)
             }
@@ -187,8 +196,17 @@ impl AgentSession {
                     result: None,
                     aborted,
                     will_retry: false,
-                    error_message: message,
+                    error_message: message.clone(),
                 })
+                .await;
+                let runner = self.hooks.runner();
+                self.extension_compact_failed(
+                    &runner,
+                    CompactionReason::Manual,
+                    message,
+                    aborted,
+                    false,
+                )
                 .await;
                 Err(err)
             }
@@ -276,16 +294,25 @@ impl AgentSession {
             if already_attempted {
                 // Second overflow after one recovery: terminal error, no
                 // preceding compaction_start (never started).
+                let message =
+                    "Context overflow recovery failed after one compact-and-retry attempt"
+                        .to_owned();
                 self.emit_public_awaited(&AgentSessionEvent::CompactionEnd {
                     reason: CompactionReason::Overflow,
                     result: None,
                     aborted: false,
                     will_retry: false,
-                    error_message: Some(
-                        "Context overflow recovery failed after one compact-and-retry attempt"
-                            .to_owned(),
-                    ),
+                    error_message: Some(message.clone()),
                 })
+                .await;
+                let runner = self.hooks.runner();
+                self.extension_compact_failed(
+                    &runner,
+                    CompactionReason::Overflow,
+                    Some(message),
+                    false,
+                    false,
+                )
                 .await;
                 return false;
             }
@@ -434,6 +461,9 @@ impl AgentSession {
                     error_message: None,
                 })
                 .await;
+                let runner = self.hooks.runner();
+                self.extension_compact_failed(&runner, reason, None, true, false)
+                    .await;
                 false
             }
             Err(err) => {
@@ -447,8 +477,17 @@ impl AgentSession {
                     result: None,
                     aborted: false,
                     will_retry: false,
-                    error_message: Some(message),
+                    error_message: Some(message.clone()),
                 })
+                .await;
+                let runner = self.hooks.runner();
+                self.extension_compact_failed(
+                    &runner,
+                    reason,
+                    Some(message),
+                    false,
+                    will_retry,
+                )
                 .await;
                 false
             }
@@ -942,6 +981,36 @@ impl AgentSession {
             result = runner.emit(event) => result,
         };
         if let Err(err) = result {
+            runner.emit_error(err.to_string());
+        }
+    }
+
+    /// Dispatch the extension `session_compact_failed` event.
+    ///
+    /// Mirrors the reference `_emitSessionCompactFailed`: best-effort,
+    /// extension handlers only, awaited without the abort token so the hook
+    /// still fires when compaction failed because it was aborted.  The
+    /// failure payload is carried verbatim by
+    /// [`AgentSessionEvent::CompactionFailed`].
+    async fn extension_compact_failed(
+        &self,
+        runner: &Arc<dyn ExtensionRunner>,
+        reason: CompactionReason,
+        error_message: Option<String>,
+        aborted: bool,
+        will_retry: bool,
+    ) {
+        if !runner.has_handlers("session_compact_failed") {
+            return;
+        }
+        let event = AgentSessionEvent::CompactionFailed {
+            reason,
+            error_message,
+            aborted,
+            will_retry,
+            from_extension: false,
+        };
+        if let Err(err) = runner.emit(event).await {
             runner.emit_error(err.to_string());
         }
     }

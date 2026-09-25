@@ -335,6 +335,30 @@ pub enum AgentSessionEvent {
         )]
         error_message: Option<String>,
     },
+    /// Compaction failed or was aborted.  Extension-host-facing only
+    /// (`session_compact_failed`); never routed through `emit_public`,
+    /// matching the reference `_emitSessionCompactFailed`.
+    CompactionFailed {
+        /// Why compaction was triggered.
+        reason: CompactionReason,
+        /// Error text when compaction failed for a non-abort reason.
+        #[serde(
+            rename = "errorMessage",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        error_message: Option<String>,
+        /// Whether compaction was cancelled or aborted.
+        aborted: bool,
+        /// Whether the aborted turn would have been retried after this
+        /// compaction (overflow recovery).
+        #[serde(rename = "willRetry")]
+        will_retry: bool,
+        /// Whether the failing compaction content came from a
+        /// `session_before_compact` handler.  Always `false` while the
+        /// replacement path finalizes before failures can be attributed.
+        from_extension: bool,
+    },
     /// A session entry was appended.
     EntryAppended {
         /// Appended entry.
@@ -506,6 +530,7 @@ impl AgentSessionEvent {
             Self::QueueUpdate { .. } => "queue_update",
             Self::CompactionStart { .. } => "compaction_start",
             Self::CompactionEnd { .. } => "compaction_end",
+            Self::CompactionFailed { .. } => "compaction_failed",
             Self::EntryAppended { .. } => "entry_appended",
             Self::SessionInfoChanged { .. } => "session_info_changed",
             Self::ThinkingLevelChanged { .. } => "thinking_level_changed",

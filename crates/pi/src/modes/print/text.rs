@@ -84,6 +84,7 @@ impl TextRenderer {
             | AgentSessionEvent::SessionBeforeFork { .. }
             | AgentSessionEvent::SessionStart { .. }
             | AgentSessionEvent::SessionShutdown { .. }
+            | AgentSessionEvent::CompactionFailed { .. }
             | AgentSessionEvent::ModelSelect { .. }
             | AgentSessionEvent::TurnStart
             | AgentSessionEvent::ToolExecutionStart { .. }

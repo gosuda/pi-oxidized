@@ -7491,6 +7491,7 @@ fn project_event(view: &mut ViewState, event: &AgentSessionEvent) {
         | Event::SessionStart { .. }
         | Event::SessionShutdown { .. }
         | Event::ModelSelect { .. }
+        | Event::CompactionFailed { .. }
         | Event::BashExecutionUpdate { .. } => {}
         Event::SummarizationRetryScheduled {
             attempt,

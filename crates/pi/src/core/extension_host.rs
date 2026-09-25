@@ -3064,6 +3064,7 @@ impl ExtensionRunner for HostExtensionRunner {
             let method = match event.type_name() {
                 "compaction_start" => "session_before_compact",
                 "compaction_end" => "session_compact",
+                "compaction_failed" => "session_compact_failed",
                 "thinking_level_changed" => "thinking_level_select",
                 name => name,
             };
