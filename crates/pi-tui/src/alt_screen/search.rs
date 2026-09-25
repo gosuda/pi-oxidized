@@ -639,6 +639,10 @@ fn find_corpus_matches(corpus: &SearchCorpus, normalized_query: &str) -> Vec<Sea
             break;
         };
         let mut segments: Vec<SearchSegment> = Vec::new();
+        // A folded grapheme can expand (ß -> ss), so a match may end strictly
+        // inside a span. Track the last overlapped span: resuming from there
+        // keeps one displayed grapheme from producing duplicate matches.
+        let mut matched_text_end = start;
         for span in &corpus.spans {
             if span.text_end <= start {
                 continue;
@@ -646,6 +650,7 @@ fn find_corpus_matches(corpus: &SearchCorpus, normalized_query: &str) -> Vec<Sea
             if span.text_start >= end {
                 break;
             }
+            matched_text_end = matched_text_end.max(span.text_end);
             if let Some(previous) = segments.last_mut()
                 && previous.row == span.row
                 && span.start_col <= previous.end_col
@@ -662,7 +667,7 @@ fn find_corpus_matches(corpus: &SearchCorpus, normalized_query: &str) -> Vec<Sea
         if !segments.is_empty() {
             matches.push(SearchMatch { segments });
         }
-        search_from = end.max(search_from.saturating_add(1));
+        search_from = matched_text_end.max(search_from.saturating_add(1));
     }
     matches
 }
@@ -726,6 +731,24 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].segments[0].start_col, 0);
         assert_eq!(matches[0].segments[0].end_col, 4);
+    }
+
+    #[test]
+    fn folded_expansion_matches_once_per_displayed_grapheme() {
+        // "ß" folds to "ss": the query "s" matches inside the expansion, and
+        // the search must not report the same displayed grapheme twice.
+        let matches = find_search_matches(&rows(&["ß"]), "s");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].segments.len(), 1);
+        assert_eq!(matches[0].segments[0].start_col, 0);
+        assert_eq!(matches[0].segments[0].end_col, 1);
+
+        // "straße" folds to "strasse": the standalone "s" and the first half
+        // of the "ß" expansion are two distinct displayed occurrences.
+        let matches = find_search_matches(&rows(&["straße"]), "s");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].segments[0].start_col, 0);
+        assert_eq!(matches[1].segments[0].start_col, 4);
     }
 
     #[test]
