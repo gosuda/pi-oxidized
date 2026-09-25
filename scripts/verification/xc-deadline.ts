@@ -216,10 +216,19 @@ export function verifyErrorIsolation(
 	}
 
 	// lean-runner runHooks must have a per-handler try/catch that calls
-	// emitExtensionError (not a rethrow).
+	// emitExtensionError (not a rethrow). Scan only the runHooks body: later
+	// emitExtensionError catches (e.g. the boundary fold's runBoundaryHandler)
+	// must not shadow a missing catch inside runHooks itself.
+	const runHooksStart = leanSource.indexOf("private async runHooks(");
+	const runHooksEnd =
+		runHooksStart === -1 ? -1 : leanSource.indexOf("\n\tprivate ", runHooksStart);
+	const runHooksBody =
+		runHooksStart === -1 || runHooksEnd === -1
+			? ""
+			: leanSource.slice(runHooksStart, runHooksEnd);
 	const runHooksCatchPattern =
 		/catch\s*\(\s*err\s*\)\s*\{[^}]*emitExtensionError\s*\(\s*extensionPath\s*,\s*eventType/;
-	if (!runHooksCatchPattern.test(leanSource)) {
+	if (!runHooksCatchPattern.test(runHooksBody)) {
 		violations.push(
 			"lean-runner.ts runHooks per-handler catch is missing or does not " +
 				"call emitExtensionError — a single handler throw would abort " +
