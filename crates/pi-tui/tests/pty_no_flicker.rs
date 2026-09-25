@@ -1769,6 +1769,7 @@ mod windows_raw_record {
             record_count: 0,
             records: Vec::new(),
             transcript_bytes: 0,
+            transcript_tail: None,
             transcript_limit_exceeded: false,
             record_limit_exceeded: false,
             child_deadline_exceeded: false,
