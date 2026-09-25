@@ -15,7 +15,10 @@
 mod imp {
 
     use std::cell::Cell;
-    use std::io::{self, Write, stdout};
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Write};
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -200,20 +203,60 @@ mod imp {
         entry.variant == "KeyEvent" && entry.key_down == Some(true) && entry.u_char == Some(0x0004)
     }
 
+    /// Console-side writer: `CONOUT$` under ConPTY, falling back to the
+    /// standard output handle. Writing to `stdout()` proved lossy on the CI
+    /// runner (a spawned child observed zero bytes reaching the ConPTY
+    /// master while console-mode writes succeeded), so the witness channel
+    /// opens the real console output device first.
+    fn console_writer() -> &'static Mutex<Box<dyn Write + Send>> {
+        static WRITER: OnceLock<Mutex<Box<dyn Write + Send>>> = OnceLock::new();
+        WRITER.get_or_init(|| {
+            let conout = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("CONOUT$")
+                .map(|f| Box::new(f) as Box<dyn Write + Send>);
+            Mutex::new(conout.unwrap_or_else(|_| Box::new(io::stdout())))
+        })
+    }
+
+    /// Stage-marker side channel the parent reads out of band. It survives a
+    /// completely dead console-output channel, which is exactly the failure
+    /// mode this fixture exists to make diagnosable.
+    fn stage_log() -> Option<&'static Mutex<File>> {
+        static LOG: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+        LOG.get_or_init(|| {
+            let path = std::env::var_os("PI_TUI_RAW_RECORD_STAGE_LOG").map(PathBuf::from)?;
+            File::create(path).ok().map(Mutex::new)
+        })
+        .as_ref()
+    }
+
+    fn write_console_line(body: &[u8]) {
+        if let Ok(mut out) = console_writer().lock() {
+            let _ = out.write_all(body);
+            let _ = out.flush();
+        }
+    }
+
     fn write_osc999_line(prefix: &[u8], body: &[u8]) {
-        let mut out = stdout().lock();
-        out.write_all(prefix).expect("write prefix");
-        out.write_all(body).expect("write body");
-        out.write_all(b"\x07").expect("write bel");
-        out.flush().expect("flush");
+        let mut line = Vec::with_capacity(prefix.len() + body.len() + 1);
+        line.extend_from_slice(prefix);
+        line.extend_from_slice(body);
+        line.push(0x07);
+        write_console_line(&line);
     }
 
     fn stage(name: &str) {
-        let mut out = stdout().lock();
-        out.write_all(b"PI_TUI_RAW_RECORD_STAGE=").expect("stage");
-        out.write_all(name.as_bytes()).expect("stage name");
-        out.write_all(b"\n").expect("stage nl");
-        out.flush().expect("stage flush");
+        write_console_line(b"PI_TUI_RAW_RECORD_STAGE=");
+        write_console_line(name.as_bytes());
+        write_console_line(b"\n");
+        if let Some(log) = stage_log()
+            && let Ok(mut f) = log.lock()
+        {
+            let _ = writeln!(f, "{name}");
+            let _ = f.flush();
+        }
     }
 
     fn emit_event(event: &Event, prefix: &[u8]) {

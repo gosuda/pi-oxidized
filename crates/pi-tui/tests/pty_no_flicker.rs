@@ -1441,7 +1441,6 @@ mod windows_raw_record {
         // A plain fixture binary, not this test executable: a libtest
         // binary spawned under ConPTY never reached the test body on the
         // CI runner (the transcript carried only console-mode noise), so
-        // the witness child lives in src/bin/pi_tui_raw_record_fixture.rs.
         let exe = raw_record_fixture_binary();
         let mut cmd = CommandBuilder::new(&exe);
         cmd.env("PI_TUI_RAW_RECORD_ARM", arm);
@@ -1450,6 +1449,14 @@ mod windows_raw_record {
             if has_stimulus { "15000" } else { "3000" },
         );
         cmd.env("NO_COLOR", "1");
+        // Filesystem witness of the child's progress. The 2026-09-25 CI leg
+        // observed a child whose console writes never reached the master
+        // (blank transcript, mode toggles only); the stage log survives any
+        // console-channel fault and records the last completed stage.
+        let stage_log_path =
+            std::env::temp_dir().join(format!("pi_tui_raw_record_{arm}.stage.log"));
+        cmd.env("PI_TUI_RAW_RECORD_STAGE_LOG", &stage_log_path);
+        let _ = std::fs::remove_file(&stage_log_path);
 
         let mut child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
@@ -1497,7 +1504,11 @@ mod windows_raw_record {
             if child.try_wait().ok().flatten().is_some() {
                 break;
             }
-            thread::sleep(Duration::from_millis(5));
+            // A finished reader thread means the master closed: the child is
+            // gone even if try_wait has not observed it yet.
+            if reader_thread.is_finished() {
+                break;
+            }
         }
 
         if ready && has_stimulus {
@@ -1563,6 +1574,12 @@ mod windows_raw_record {
                 }
                 break;
             }
+            if reader_thread.is_finished() {
+                // Master EOF: the child exited without try_wait observing
+                // it (portable-pty reaps lazily); drain what arrived and
+                // let kill() settle the zombie state below.
+                break;
+            }
             thread::sleep(Duration::from_millis(15));
         }
 
@@ -1583,6 +1600,15 @@ mod windows_raw_record {
         if raw.len() > TRANSCRIPT_LIMIT {
             report.transcript_limit_exceeded = true;
         }
+        report.transcript_tail = Some(String::from_utf8_lossy(&raw[tail_start..]).into_owned());
+        if let Ok(stage_log) = std::fs::read_to_string(&stage_log_path)
+            && !stage_log.is_empty()
+        {
+            let tail = report.transcript_tail.get_or_insert_default();
+            tail.push_str("\nstage-log: ");
+            tail.push_str(&stage_log);
+        }
+        let _ = std::fs::remove_file(&stage_log_path);
 
         let (events, parse_failure) = parse_events(&raw);
         let mut lifecycles: Vec<LifecycleEntry> = Vec::new();
