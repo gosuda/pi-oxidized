@@ -6220,7 +6220,8 @@
 			"from": "pi-tui",
 			"to": "crossterm_winapi",
 			"kinds": [
-				"dev"
+				"dev",
+				"normal"
 			]
 		},
 		{

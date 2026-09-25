@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
 	"capturedAt": "2026-09-25",
-	"captureHead": "aefcac67e4f1a8e760e6f9549800b4f40c57e44e",
-	"contentSha256": "be41c09db89eb3bac6f549819c7d486fb8060a1e86c79ca9c4e16ea837c95853",
+	"captureHead": "0b6cb7255f3080b23b820d8fdfcb0c4a758b1f16",
+	"contentSha256": "7ecabd4db6ae0be0eb1c4d21c60858eb442f5f409b28192a0edae5ba014e1b83",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.98.0",
@@ -710,7 +710,7 @@
 					"license": "MIT",
 					"source": "registry",
 					"direct": true,
-					"devOnly": true
+					"devOnly": false
 				},
 				{
 					"name": "crypto-common",
