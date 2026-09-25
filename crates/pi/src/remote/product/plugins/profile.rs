@@ -270,9 +270,9 @@ async fn write_profile(
 }
 
 async fn remove_profile(path: &Path) -> Result<(), PluginProfileError> {
-    let mut backup = path.as_os_str().to_os_string();
-    backup.push(".bak");
-    let _ = fs::remove_file(PathBuf::from(backup)).await;
+    for backup in lingering_backups(path).await {
+        let _ = fs::remove_file(backup).await;
+    }
     match fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -280,22 +280,56 @@ async fn remove_profile(path: &Path) -> Result<(), PluginProfileError> {
     }
 }
 
-/// Restores a sibling `.bak` left behind by a publish that died between
-/// `path -> .bak` and `.tmp -> path` (Windows rotation in `replace_file`).
-/// When `path` is absent and the backup exists, the backup is the only
-/// recoverable profile, so it is renamed back before the read reports the
-/// profile missing. Best-effort: a failed restore leaves the backup in
-/// place for the next attempt.
+/// Returns lingering backup siblings for `path`: the legacy deterministic
+/// `.bak` and every per-invocation `.bak.<pid>.<sequence>` sibling.
+async fn lingering_backups(path: &Path) -> Vec<PathBuf> {
+    let mut backups = Vec::new();
+    let mut legacy = path.as_os_str().to_os_string();
+    legacy.push(".bak");
+    let legacy = PathBuf::from(legacy);
+    if fs::metadata(&legacy).await.is_ok() {
+        backups.push(legacy);
+    }
+    let prefix = {
+        let Some(name) = path.file_name() else {
+            return backups;
+        };
+        let mut prefix = name.to_os_string();
+        prefix.push(".bak.");
+        prefix
+    };
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let Ok(mut entries) = fs::read_dir(parent).await else {
+        return backups;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        if name.as_encoded_bytes().starts_with(prefix.as_encoded_bytes()) {
+            backups.push(entry.path());
+        }
+    }
+    backups.sort();
+    backups
+}
+
+/// Restores a backup left behind by a publish that died between
+/// `path -> backup` and `.tmp -> path` (Windows rotation in `replace_file`).
+/// When `path` is absent, the newest backup is the only recoverable profile,
+/// so it is renamed back before the read reports the profile missing.
+/// Best-effort: a failed restore leaves the backup in place for the next
+/// attempt.
 async fn restore_stranded_backup(path: &Path) {
     if fs::metadata(path).await.is_ok() {
         return;
     }
-    let mut backup = path.as_os_str().to_os_string();
-    backup.push(".bak");
-    let backup = PathBuf::from(backup);
-    if fs::metadata(&backup).await.is_ok() {
-        let _ = fs::rename(&backup, path).await;
-    }
+    let mut backups = lingering_backups(path).await;
+    let Some(backup) = backups.pop() else {
+        return;
+    };
+    let _ = fs::rename(&backup, path).await;
 }
 
 async fn set_private_permissions(path: &Path) -> Result<(), PluginProfileError> {
@@ -311,38 +345,49 @@ async fn set_private_permissions(path: &Path) -> Result<(), PluginProfileError> 
     Ok(())
 }
 
-/// Allocates a sibling temporary path unique to this write.
+/// Allocates a sibling path unique to this invocation.
 ///
-/// Two concurrent writes to the same profile must never share a temp name:
-/// a deterministic `*.json.tmp` lets one task rename the other's bytes and
-/// report success for the wrong profile. Process id plus a per-process
-/// counter keeps every invocation's temp distinct.
-fn unique_temporary_path(path: &Path) -> PathBuf {
+/// Two concurrent writes to the same profile must never share a temp or
+/// backup name: a deterministic `*.json.tmp` or `*.json.bak` lets one task
+/// rotate or restore another task's file and report success for the wrong
+/// profile. Process id plus a per-process counter keeps every invocation's
+/// sibling distinct.
+fn unique_sibling_path(path: &Path, suffix: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut name = path.as_os_str().to_os_string();
-    name.push(format!(".tmp.{}.{}", std::process::id(), sequence));
+    name.push(format!("{suffix}.{}.{}", std::process::id(), sequence));
     PathBuf::from(name)
+}
+
+/// Allocates a sibling temporary path unique to this write.
+fn unique_temporary_path(path: &Path) -> PathBuf {
+    unique_sibling_path(path, ".tmp")
+}
+
+/// Allocates a sibling backup path unique to this write.
+#[cfg(windows)]
+fn unique_backup_path(path: &Path) -> PathBuf {
+    unique_sibling_path(path, ".bak")
 }
 
 /// Replaces `path` with `temporary`, including when `path` already exists.
 ///
 /// `tokio::fs::rename` refuses to replace an existing destination on Windows,
 /// which would fail every profile update after the first write. Rotate through
-/// a sibling backup instead of deleting first: a crash leaves either the
-/// previous profile or the backup behind, so no valid profile is destroyed to
-/// install the new one. The backup is removed on success and reclaimed on the
-/// next write when one lingers.
+/// a per-invocation sibling backup instead of deleting first: a crash leaves
+/// either the previous profile or the backup behind, so no valid profile is
+/// destroyed to install the new one. The backup is unique to this write and
+/// removed on success, mirroring [`unique_temporary_path`]: two overlapping
+/// writes must not rotate or restore each other's backup.
 #[cfg(windows)]
 async fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
-    let mut backup = path.as_os_str().to_os_string();
-    backup.push(".bak");
-    let backup = PathBuf::from(backup);
-    // A crash between `path -> .bak` and `.tmp -> path` leaves the only valid
-    // profile under the backup name. Restore it before rotating so the write
-    // cannot silently discard it.
-    if fs::metadata(path).await.is_err() && fs::metadata(&backup).await.is_ok() {
-        let _ = fs::rename(&backup, path).await;
+    let backup = unique_backup_path(path);
+    // A crash between a previous `path -> backup` and `.tmp -> path` leaves
+    // the only valid profile under a backup name. Restore it before rotating
+    // so the write cannot silently discard it.
+    if fs::metadata(path).await.is_err() {
+        restore_stranded_backup(path).await;
     }
     let _ = fs::remove_file(&backup).await;
     match fs::rename(path, &backup).await {
@@ -374,7 +419,7 @@ fn normalize_paths(paths: &[String]) -> Result<Vec<String>, PluginProfileError> 
                 "package path must not be empty".to_owned(),
             ));
         }
-        let candidate = absolute_lexical(Path::new(path));
+        let candidate = absolute_lexical(Path::new(path))?;
         let value = candidate
             .to_str()
             .ok_or_else(|| PluginProfileError::NonUtf8(candidate.clone()))?
@@ -389,11 +434,17 @@ fn normalize_paths(paths: &[String]) -> Result<Vec<String>, PluginProfileError> 
     Ok(normalized)
 }
 
-fn absolute_lexical(path: &Path) -> PathBuf {
+/// Lexically normalizes `path` to an absolute path.
+///
+/// Relative input resolves against the process working directory; a working
+/// directory that cannot be resolved is an error instead of a silently
+/// relative result, because a persisted relative path would be rejected by
+/// every later [`read_profile`].
+fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().map_or_else(|_| PathBuf::from("."), |cwd| cwd.join(path))
+        std::env::current_dir()?.join(path)
     };
     let mut output = PathBuf::new();
     for component in absolute.components() {
@@ -408,7 +459,7 @@ fn absolute_lexical(path: &Path) -> PathBuf {
             std::path::Component::Normal(value) => output.push(value),
         }
     }
-    output
+    Ok(output)
 }
 
 fn hex_prefix(bytes: &[u8], digits: usize) -> String {
@@ -503,6 +554,34 @@ mod tests {
         let mut backup = path.as_os_str().to_os_string();
         backup.push(".bak");
         let backup = PathBuf::from(backup);
+        fs::write(&backup, b"{}").await.unwrap();
+
+        remove_profile(&path).await.unwrap();
+        assert!(!backup.exists());
+    }
+
+    #[tokio::test]
+    async fn read_profile_restores_unique_backup_sibling() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let backup = unique_sibling_path(&path, ".bak");
+        let package = directory.path().join("pkg");
+        let profile = profile_with(&package);
+        fs::write(&backup, serde_json::to_vec(&profile).unwrap())
+            .await
+            .unwrap();
+
+        let restored = read_profile(&path).await.unwrap();
+        assert_eq!(restored.package_paths, profile.package_paths);
+        assert!(path.exists());
+        assert!(!backup.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_profile_clears_unique_backup_sibling() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let backup = unique_sibling_path(&path, ".bak");
         fs::write(&backup, b"{}").await.unwrap();
 
         remove_profile(&path).await.unwrap();

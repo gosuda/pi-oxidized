@@ -46,6 +46,14 @@ const MAX_QUEUED_CONTROL_FRAMES: usize = 256;
 /// be queued, while a reader that stops draining cannot accumulate frames
 /// without end.
 const MAX_QUEUED_CONTROL_BYTES: usize = MAX_CONTROL_LINE_BYTES;
+/// Maximum write requests queued for the coordinator socket while the single
+/// writer task drains it. A caller beyond the bound is refused instead of
+/// accumulating encoded frames while the socket is stalled.
+const MAX_QUEUED_SERVER_WRITES: usize = 256;
+/// Maximum events queued for the single coordinator loop. Control-connection
+/// readers await admission, so a client that submits control lines faster
+/// than the loop consumes them waits instead of growing memory without end.
+const MAX_QUEUED_PROCESS_EVENTS: usize = 1024;
 
 /// Messages delivered by the coordinator to a registered server.
 #[derive(Clone, Debug, PartialEq)]
@@ -307,7 +315,7 @@ struct WriteRequest {
     reason = "connection lifecycle state is naturally a set of boolean flags"
 )]
 struct ConnectionState {
-    sender: Option<mpsc::UnboundedSender<WriteRequest>>,
+    sender: Option<mpsc::Sender<WriteRequest>>,
     reader_task: Option<JoinHandle<()>>,
     attempt_id: u64,
     registration: Option<oneshot::Sender<Result<(), String>>>,
@@ -509,9 +517,16 @@ impl CoordinatorConnection {
             })?
         };
         let (result, receiver) = oneshot::channel();
+        // Bounded admission: a stalled coordinator socket sheds new writes
+        // instead of letting concurrent callers queue them without limit.
         sender
-            .send(WriteRequest { bytes, result })
-            .map_err(|_| CoordinatorError::Closed)?;
+            .try_send(WriteRequest { bytes, result })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    CoordinatorError::Protocol("Coordinator writer queue is full".to_owned())
+                }
+                mpsc::error::TrySendError::Closed(_) => CoordinatorError::Closed,
+            })?;
         receiver
             .await
             .map_err(|_| CoordinatorError::Closed)?
@@ -671,7 +686,7 @@ impl CoordinatorConnection {
             .to_owned();
         let socket = UnixStream::connect(&self.inner.control_path).await?;
         let (reader, writer) = socket.into_split();
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(MAX_QUEUED_SERVER_WRITES);
         let (registration, registered) = oneshot::channel();
         let cancel = self.inner.cancel.child_token();
         let attempt_id = {
@@ -743,7 +758,7 @@ impl CoordinatorConnection {
 #[cfg(unix)]
 async fn writer_loop(
     mut writer: tokio::net::unix::OwnedWriteHalf,
-    mut receiver: mpsc::UnboundedReceiver<WriteRequest>,
+    mut receiver: mpsc::Receiver<WriteRequest>,
     connection: Arc<CoordinatorConnectionInner>,
     cancel: CancellationToken,
     attempt_id: u64,
@@ -1026,6 +1041,21 @@ async fn try_connect(path: &Path) -> Result<Option<tokio::net::UnixStream>, Coor
 static COORDINATOR_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Releases the process-wide single-instance latch when the run ends.
+///
+/// Clearing happens on every exit path - normal return, failure after the
+/// latch was taken, or cancellation - so a later coordinator invocation in
+/// the same process is not refused because a previous one left the latch set.
+#[cfg(unix)]
+struct CoordinatorRunningGuard;
+
+#[cfg(unix)]
+impl Drop for CoordinatorRunningGuard {
+    fn drop(&mut self) {
+        COORDINATOR_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Runs the standalone coordinator process until it becomes empty or receives
 /// SIGINT/SIGTERM.
 ///
@@ -1153,7 +1183,7 @@ enum ProcessEvent {
 
 #[cfg(unix)]
 struct CoordinatorProcess {
-    event_tx: mpsc::UnboundedSender<ProcessEvent>,
+    event_tx: mpsc::Sender<ProcessEvent>,
     control_connections: BTreeMap<u64, ControlState>,
     peers: BTreeMap<String, PeerState>,
     current_server: Option<ServerState>,
@@ -1164,7 +1194,7 @@ struct CoordinatorProcess {
 
 #[cfg(unix)]
 impl CoordinatorProcess {
-    fn new(event_tx: mpsc::UnboundedSender<ProcessEvent>) -> Self {
+    fn new(event_tx: mpsc::Sender<ProcessEvent>) -> Self {
         Self {
             event_tx,
             control_connections: BTreeMap::new(),
@@ -1187,7 +1217,9 @@ impl CoordinatorProcess {
         tokio::spawn(async move {
             tokio::select! {
                 () = timer_cancel.cancelled() => {}
-                () = tokio::time::sleep(delay) => { let _ = event_tx.send(ProcessEvent::EmptyTimer); }
+                () = tokio::time::sleep(delay) => {
+                    let _ = event_tx.send(ProcessEvent::EmptyTimer).await;
+                }
             }
         });
     }
@@ -1579,7 +1611,7 @@ impl CoordinatorProcess {
 async fn control_connection(
     stream: tokio::net::UnixStream,
     connection_id: u64,
-    event_tx: mpsc::UnboundedSender<ProcessEvent>,
+    event_tx: mpsc::Sender<ProcessEvent>,
 ) {
     let (reader, writer) = stream.into_split();
     let cancel = CancellationToken::new();
@@ -1618,6 +1650,7 @@ async fn control_connection(
             writer: writer_state,
             cancel: cancel.clone(),
         })
+        .await
         .is_err()
     {
         cancel.cancel();
@@ -1652,13 +1685,14 @@ async fn control_connection(
                 connection_id,
                 value,
             })
+            .await
             .is_err()
         {
             break;
         }
     }
     cancel.cancel();
-    let _ = event_tx.send(ProcessEvent::ControlClosed { connection_id });
+    let _ = event_tx.send(ProcessEvent::ControlClosed { connection_id }).await;
 }
 
 #[cfg(unix)]
@@ -1667,7 +1701,7 @@ async fn proxy_public(
     endpoint: PathBuf,
     connection_id: u64,
     cancel: CancellationToken,
-    event_tx: mpsc::UnboundedSender<ProcessEvent>,
+    event_tx: mpsc::Sender<ProcessEvent>,
 ) {
     let upstream = tokio::select! {
         () = cancel.cancelled() => None,
@@ -1680,7 +1714,7 @@ async fn proxy_public(
         }
     }
     cancel.cancel();
-    let _ = event_tx.send(ProcessEvent::PublicClosed { connection_id });
+    let _ = event_tx.send(ProcessEvent::PublicClosed { connection_id }).await;
 }
 
 #[cfg(unix)]
@@ -1714,6 +1748,7 @@ async fn run_coordinator_process_unix(args: &[String]) -> Result<(), Coordinator
             "Coordinator process is already running".to_owned(),
         ));
     }
+    let _running = CoordinatorRunningGuard;
     let public_path = PathBuf::from(public_arg);
     let control_path = PathBuf::from(control_arg);
     remove_stale_socket(&control_path).await?;
@@ -1749,7 +1784,7 @@ async fn run_coordinator_process_unix(args: &[String]) -> Result<(), Coordinator
         return Err(error);
     }
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = mpsc::channel(MAX_QUEUED_PROCESS_EVENTS);
     let mut process = CoordinatorProcess::new(event_tx.clone());
     process.schedule_empty_shutdown(EMPTY_STARTUP_GRACE);
     let mut next_connection_id = 1_u64;
@@ -1983,8 +2018,8 @@ mod tests {
     #[cfg(unix)]
     struct Harness {
         process: CoordinatorProcess,
-        event_tx: mpsc::UnboundedSender<ProcessEvent>,
-        event_rx: mpsc::UnboundedReceiver<ProcessEvent>,
+        event_tx: mpsc::Sender<ProcessEvent>,
+        event_rx: mpsc::Receiver<ProcessEvent>,
         next_connection_id: u64,
     }
 
@@ -1995,7 +2030,7 @@ mod tests {
     )]
     impl Harness {
         fn new() -> Self {
-            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            let (event_tx, event_rx) = mpsc::channel(MAX_QUEUED_PROCESS_EVENTS);
             Self {
                 process: CoordinatorProcess::new(event_tx.clone()),
                 event_tx,
@@ -2375,18 +2410,26 @@ mod tests {
         harness.pump_until(Pumped::ControlLine(stalled_id)).await;
 
         // ~17 MiB of routed frames: enough to saturate any reasonable socket
-        // buffer and then overflow the bounded writer queue.
-        let payload = "x".repeat(4096);
-        for _ in 0..4096 {
-            send_line(
-                &mut server_writer,
-                &json_object([
-                    ("type", json_string("broadcast")),
-                    ("payload", json_string(&payload)),
-                ]),
-            )
-            .await;
-        }
+        // buffer and then overflow the bounded writer queue. The feed runs
+        // while the harness pumps, because the control reader now awaits
+        // admission into the bounded event queue and can only make progress
+        // while the coordinator loop consumes events.
+        let feed = {
+            let mut server_writer = server_writer;
+            tokio::spawn(async move {
+                let payload = "x".repeat(4096);
+                for _ in 0..4096 {
+                    send_line(
+                        &mut server_writer,
+                        &json_object([
+                            ("type", json_string("broadcast")),
+                            ("payload", json_string(&payload)),
+                        ]),
+                    )
+                    .await;
+                }
+            })
+        };
 
         let mut closed = false;
         for _ in 0..200 {
@@ -2402,6 +2445,7 @@ mod tests {
             closed,
             "the stalled connection was never closed at the queue bound"
         );
+        feed.abort();
 
         // The offending connection closes cleanly: buffered frames drain and
         // the client observes EOF afterwards.
