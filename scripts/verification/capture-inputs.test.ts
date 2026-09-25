@@ -473,12 +473,14 @@ describe("staged-input capture (real Git repositories)", () => {
 		"case 7: spaces, TAB, newline and Unicode paths survive NUL parsing; sha1 and sha256 formats work",
 		() => {
 			const repo = newRepo("case7");
+			// Win32 forbids TAB and LF in filenames; the NUL-parsing contract is
+			// still exercised by the space and Unicode names on that platform.
 			const names = [
 				"data/sp ace.txt",
 				"data/tab\tx.txt",
 				"data/nl\nx.txt",
 				"data/ünïcode-λ-世界.txt",
-			];
+			].filter((name) => process.platform !== "win32" || !/[\t\n]/.test(name));
 			for (const name of names) writeFixture(repo, name, `content of ${name}\n`);
 			git(repo, ["add", "--", ...names]);
 

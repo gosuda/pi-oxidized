@@ -906,21 +906,35 @@ function writeBunShim(workDir: string): Record<string, string> {
 	mkdirSync(shimDir, { recursive: true });
 	const wrapperPath = join(workDir, "build-wrapper.ts");
 	writeFileSync(wrapperPath, BUILD_WRAPPER_SOURCE);
-	const shimPath = join(shimDir, "bun");
-	writeFileSync(
-		shimPath,
-		[
-			"#!/bin/sh",
-			'case " $* " in',
-			`*" --metafile="*) exec "$EXPOSURE_FIXTURE_REAL_BUN" ${JSON.stringify(wrapperPath)} "$@" ;;`,
-			'*) exec "$EXPOSURE_FIXTURE_REAL_BUN" "$@" ;;',
-			"esac",
-			"",
-		].join("\n"),
-	);
-	chmodSync(shimPath, 0o755);
+	if (process.platform === "win32") {
+		// cmd.exe resolves bun.cmd ahead of bun.exe on PATH; the wrapper itself
+		// decides whether the argv carries --metafile=, so the shim delegates
+		// unconditionally.
+		writeFileSync(
+			join(shimDir, "bun.cmd"),
+			[
+				"@echo off",
+				`"%EXPOSURE_FIXTURE_REAL_BUN%" ${JSON.stringify(wrapperPath)} %*`,
+				"",
+			].join("\r\n"),
+		);
+	} else {
+		const shimPath = join(shimDir, "bun");
+		writeFileSync(
+			shimPath,
+			[
+				"#!/bin/sh",
+				'case " $* " in',
+				`*" --metafile="*) exec "$EXPOSURE_FIXTURE_REAL_BUN" ${JSON.stringify(wrapperPath)} "$@" ;;`,
+				'*) exec "$EXPOSURE_FIXTURE_REAL_BUN" "$@" ;;',
+				"esac",
+				"",
+			].join("\n"),
+		);
+		chmodSync(shimPath, 0o755);
+	}
 	return {
-		PATH: `${shimDir}:${process.env.PATH ?? ""}`,
+		PATH: `${shimDir}${process.platform === "win32" ? ";" : ":"}${process.env.PATH ?? ""}`,
 		EXPOSURE_FIXTURE_REAL_BUN: process.execPath,
 	};
 }
@@ -1430,7 +1444,11 @@ describe("captureReference real producer captures (plan cases 14-19)", () => {
 			mkdirSync(priorDir, { recursive: true });
 			writeFileSync(join(priorDir, "prior-state"), sentinel);
 
-			await expect(captureReference(repo, out, { inputMode: "staged" })).rejects.toThrow(/EISDIR/);
+			// POSIX rename onto a nonempty directory fails EISDIR; Win32 reports
+			// the same refusal as EPERM.
+			await expect(captureReference(repo, out, { inputMode: "staged" })).rejects.toThrow(
+				process.platform === "win32" ? /EPERM/ : /EISDIR/,
+			);
 
 			// The failure happened at the kernel rename itself: the prior state
 			// is intact and was never replaced.

@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { afterEach, describe, expect, test } from "bun:test";
 
@@ -619,7 +620,7 @@ describe("SBOM staged capture error handling", () => {
 		const wrapper = resolve(root, "capture-wrapper.ts");
 		writeFileSync(
 			wrapper,
-			`import { captureSnapshot } from "${resolve(REPO_ROOT, "scripts/verification/deps-sbom.ts")}";\n` +
+			`import { captureSnapshot } from ${JSON.stringify(pathToFileURL(resolve(REPO_ROOT, "scripts/verification/deps-sbom.ts")).href)};\n` +
 				`const [root, out, mode] = process.argv.slice(2);\n` +
 				`captureSnapshot(root, out, mode as "committed" | "staged");\n`,
 		);

@@ -228,14 +228,14 @@ function assertNoRedirection(context: string): void {
 function openWorktreeRoot(root: string, context: string): string {
 	let resolved: string;
 	try {
-		resolved = realpathSync(resolve(root));
+		resolved = canonicalRealpath(resolve(root));
 	} catch {
 		fail(context, "git-failure", `repository root ${root} does not exist or is unreadable`);
 	}
 	const toplevel = runGit(resolved, ["rev-parse", "--show-toplevel"], context).toString("utf8").trim();
 	let canonicalToplevel: string;
 	try {
-		canonicalToplevel = realpathSync(toplevel);
+		canonicalToplevel = canonicalRealpath(toplevel);
 	} catch {
 		fail(context, "malformed-git-data", `git rev-parse --show-toplevel returned an unusable path: ${toplevel}`);
 	}
@@ -973,11 +973,25 @@ function toPosix(path: string): string {
 	return sep === "/" ? path : path.split(sep).join("/");
 }
 
+/**
+ * Canonical real path without the Windows `\\?\` verbatim prefix. Node's
+ * realpathSync returns verbatim paths on win32; path.relative cannot relate
+ * them to an unprefixed root, so case-canonicalized outputs would escape the
+ * scope and input comparisons. UNC shares map to `\\?\UNC\server\share`.
+ */
+function canonicalRealpath(path: string): string {
+	const real = realpathSync(path);
+	if (sep !== "\\") return real;
+	if (real.startsWith("\\\\?\\UNC\\")) return `\\\\${real.slice("\\\\?\\UNC\\".length)}`;
+	if (real.startsWith("\\\\?\\")) return real.slice("\\\\?\\".length);
+	return real;
+}
+
 function resolveAdminDir(root: string, args: readonly string[], context: string): string {
 	const raw = runGit(root, args, context).toString("utf8").trim();
 	if (raw.length === 0) fail(context, "malformed-git-data", `git ${args.join(" ")} returned an empty path`);
 	try {
-		return realpathSync(resolve(root, raw));
+		return canonicalRealpath(resolve(root, raw));
 	} catch {
 		fail(context, "malformed-git-data", `git ${args.join(" ")} returned an unusable path: ${raw}`);
 	}
@@ -1093,7 +1107,7 @@ function resolveInRootOutput(root: string, relLexical: string, output: string, c
 		consumed = i + 1;
 		probe = next;
 	}
-	const realPrefix = realpathSync(probe);
+	const realPrefix = canonicalRealpath(probe);
 	const remaining = segments.slice(consumed);
 	if (remaining.length > 1) {
 		// An ancestor is missing, so the final component cannot exist either.
@@ -1112,7 +1126,7 @@ function resolveInRootOutput(root: string, relLexical: string, output: string, c
 	if (finalStats.isSymbolicLink()) {
 		fail(context, "output-overlap", `output ${output} traverses existing symlink ancestor ${finalPath}; write real directories instead`);
 	}
-	return realpathSync(finalPath);
+	return canonicalRealpath(finalPath);
 }
 
 /**
@@ -1140,7 +1154,7 @@ function resolveRealOutputPath(output: string, context: string): string {
 			continue;
 		}
 		try {
-			const real = realpathSync(probe);
+			const real = canonicalRealpath(probe);
 			return missing.length === 0 ? real : join(real, ...missing);
 		} catch (error) {
 			fail(context, "output-overlap", `output ${output}: could not resolve the real path of ${probe}: ${(error as Error).message}`);

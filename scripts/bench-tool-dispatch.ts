@@ -137,7 +137,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function isAgentMessage(value: unknown): value is AgentMessage {
 	return (
 		isRecord(value) &&
-		(value.role === "user" || value.role === "assistant" || value.role === "toolResult")
+		(value.role === "system" ||
+			value.role === "user" ||
+			value.role === "assistant" ||
+			value.role === "toolResult")
 	);
 }
 

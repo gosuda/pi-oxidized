@@ -394,7 +394,7 @@ describe("patch-table serialization and rebase", () => {
 			`vendored = { path = ${JSON.stringify(resolve(root, "vendor/vendored-0.1.0"))}, features = ["serde"] }`,
 			`legacy = "1.2.3"`,
 			`remote = { version = "2.0.1", default-features = false }`,
-			`absolute = { path = "/elsewhere/abs-crate-0.4.0" }`,
+			`absolute = { path = ${JSON.stringify(resolve(root, "/elsewhere/abs-crate-0.4.0"))} }`,
 			"",
 			`[patch."odd source"]`,
 			`weird = { git = "https://example.invalid/x" }`,
