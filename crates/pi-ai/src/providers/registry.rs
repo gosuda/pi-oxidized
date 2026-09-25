@@ -413,7 +413,7 @@ pub const BUILTIN_PROVIDERS: [BuiltinProviderSpec; 41] = [
     },
     BuiltinProviderSpec {
         id: KnownProvider::Openrouter,
-        apis: COMPLETIONS,
+        apis: ANTHROPIC_COMPLETIONS,
     },
     BuiltinProviderSpec {
         id: KnownProvider::QwenTokenPlan,
@@ -800,7 +800,7 @@ mod tests {
                 CODEX_RESPONSES,
                 ANTHROPIC_GENERATIVE_COMPLETIONS_RESPONSES,
                 ANTHROPIC_COMPLETIONS,
-                COMPLETIONS,
+                ANTHROPIC_COMPLETIONS,
                 COMPLETIONS,
                 COMPLETIONS,
                 COMPLETIONS,
@@ -833,6 +833,7 @@ mod tests {
                 ("github-copilot", ANTHROPIC_COMPLETIONS_RESPONSES),
                 ("opencode", ANTHROPIC_GENERATIVE_COMPLETIONS_RESPONSES),
                 ("opencode-go", ANTHROPIC_COMPLETIONS),
+                ("openrouter", ANTHROPIC_COMPLETIONS),
                 ("xai", COMPLETIONS_RESPONSES),
             ]
         );

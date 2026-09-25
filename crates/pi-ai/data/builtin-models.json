@@ -18182,8 +18182,8 @@
       "reasoning": false
     },
     "anthropic/claude-3-haiku": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18206,8 +18206,8 @@
       "reasoning": false
     },
     "anthropic/claude-fable-5": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18264,8 +18264,8 @@
       }
     },
     "anthropic/claude-haiku-4.5": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18312,8 +18312,8 @@
       "reasoning": true
     },
     "anthropic/claude-opus-4": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18336,8 +18336,8 @@
       "reasoning": true
     },
     "anthropic/claude-opus-4.1": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18384,8 +18384,8 @@
       "reasoning": true
     },
     "anthropic/claude-opus-4.5": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18432,8 +18432,8 @@
       "reasoning": true
     },
     "anthropic/claude-opus-4.6": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18486,8 +18486,8 @@
       }
     },
     "anthropic/claude-opus-4.7": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18514,8 +18514,8 @@
       }
     },
     "anthropic/claude-opus-4.7-fast": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18570,8 +18570,8 @@
       }
     },
     "anthropic/claude-opus-4.8": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18598,8 +18598,8 @@
       }
     },
     "anthropic/claude-opus-4.8-fast": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18654,8 +18654,8 @@
       }
     },
     "anthropic/claude-opus-5": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18682,8 +18682,8 @@
       }
     },
     "anthropic/claude-opus-5-fast": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18738,8 +18738,8 @@
       }
     },
     "anthropic/claude-sonnet-4": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18762,8 +18762,8 @@
       "reasoning": true
     },
     "anthropic/claude-sonnet-4.5": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18810,8 +18810,8 @@
       "reasoning": true
     },
     "anthropic/claude-sonnet-4.6": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"
@@ -18864,8 +18864,8 @@
       }
     },
     "anthropic/claude-sonnet-5": {
-      "api": "openai-completions",
-      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "anthropic-messages",
+      "baseUrl": "https://openrouter.ai/api",
       "compat": {
         "cacheControlFormat": "anthropic",
         "thinkingFormat": "openrouter"

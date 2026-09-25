@@ -1091,7 +1091,7 @@ export async function reconstructProviderData(
 				await writeFile(join(stagingDir, DATA_MANIFEST_FILE), manifestBody);
 			}
 
-			await validateStagingDirectory(stagingDir, wrappers, catalog, manifestBody);
+			await validateStagingDirectory(stagingDir, wrappers, emitCatalog, manifestBody);
 
 			if (hadLive) {
 				const candidate = uniqueSibling(dataDir, "backup");
