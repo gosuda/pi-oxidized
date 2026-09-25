@@ -1518,6 +1518,9 @@ mod windows_raw_record {
             if reader_thread.is_finished() {
                 break;
             }
+            // Throttles both the CPU spin and the evidence-file poll; 5ms
+            // granularity still lands readiness well inside HARD_TIMEOUT.
+            thread::sleep(Duration::from_millis(5));
         }
 
         if ready && has_stimulus {
@@ -1625,11 +1628,12 @@ mod windows_raw_record {
         }
         let _ = std::fs::remove_file(&stage_log_path);
 
-        // The evidence file is authoritative when the console channel dropped
-        // the child's bytes: parse it only when the transcript carried no
-        // events, so a live console still supplies the same payloads.
-        let transcript_has_events = find_subslice(&raw, RECORD_PREFIX).is_some();
-        let evidence_source = if !transcript_has_events && !evidence_bytes.is_empty() {
+        // The fixture writes each event to the file before the console, so
+        // a non-empty evidence stream is always a superset of whatever the
+        // console delivered. Prefer it whenever it carries records; a partly
+        // dropped transcript must not shadow the complete channel.
+        let evidence_has_events = find_subslice(&evidence_bytes, RECORD_PREFIX).is_some();
+        let evidence_source = if evidence_has_events {
             evidence_bytes.as_slice()
         } else {
             raw.as_slice()
