@@ -39,6 +39,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+        with:
+          key: doc-d-snippet
       - name: Install bun dependencies
         run: bun install --frozen-lockfile
 
