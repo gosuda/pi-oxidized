@@ -418,4 +418,36 @@ mod tests {
         assert_eq!(fs::read_to_string(&path)?, "foreign session");
         Ok(())
     }
+
+    #[tokio::test]
+    async fn listing_reports_the_canonical_session_once_alongside_its_backup(
+    ) -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let directory = root.path().join(session_directory_name("/cwd"));
+        fs::create_dir_all(&directory)?;
+        let primary = directory.join(session_file_name(0, "dedupe"));
+        let backup = directory.join(format!("{}.bak", session_file_name(0, "dedupe")));
+        // The stale backup stays on disk next to the live primary, and the
+        // canonical path must appear exactly once regardless of the order
+        // read_dir happens to observe the two entries in.
+        fs::write(&primary, "{}")?;
+        fs::write(&backup, "stale")?;
+        assert_eq!(list_session_files(root.path(), None).await?, vec![primary]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn listing_restores_a_stranded_backup_under_its_canonical_name_once(
+    ) -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let directory = root.path().join(session_directory_name("/cwd"));
+        fs::create_dir_all(&directory)?;
+        let restored = directory.join(session_file_name(0, "stranded"));
+        fs::write(directory.join(format!("{}.bak", session_file_name(0, "stranded"))), "{}")?;
+        assert_eq!(
+            list_session_files(root.path(), None).await?,
+            vec![restored]
+        );
+        Ok(())
+    }
 }
