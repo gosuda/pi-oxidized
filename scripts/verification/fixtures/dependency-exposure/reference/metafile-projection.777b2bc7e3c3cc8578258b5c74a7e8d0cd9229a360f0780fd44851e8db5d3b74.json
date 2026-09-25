@@ -1,0 +1,35 @@
+{
+	"schema": "pi.deps.exposure-metafile.v1",
+	"entry": "./src/main.ts",
+	"hostDirRel": "packages/extension-host",
+	"argv": [
+		"build",
+		"./src/main.ts",
+		"--compile",
+		"--minify",
+		"--compile-autoload-tsconfig",
+		"--compile-autoload-package-json",
+		"--target",
+		"bun-linux-x64-baseline",
+		"--outfile",
+		"/tmp/exposure-capture-scG4Q5/pi-extension-host",
+		"--metafile=/tmp/exposure-capture-scG4Q5/metafile.json"
+	],
+	"metafileSha256": "200ba8c60d14cb6a5e2d1813970aaf342657bc4ef73aeb13c55114e989b1c468",
+	"inputs": {
+		"src/main.ts": "1f85830ccbda5a75ac46f03db1605d35a24551c2a16b104fa01151236dee54fe",
+		"src/host.ts": "2e9b3db409e25f75c9fae108d05e506e4e8d955b0b11283c631c76e9f3137023",
+		"src/lean-runner.ts": "de25e8952048cbcbc35f23a8f0946057b459267c13ce26cbdef43b106a7d8adb",
+		"src/wire-validators.ts": "d7f84b516dd575931803799c0d8778611f0c6c068b180d430cf0ae2283d2214d",
+		"src/lean-api.ts": "be61502f861b9ed6705d38857527265868f588c3c40e6e56da6320c7e6f1ff08",
+		"src/protocol.ts": "74beea02bc95083d01c54d9be7e0ba7c8048650980fac26a27548f05b993824e",
+		"src/assistant-delta.ts": "d63fb9651d1eedea51a368feab1defb6a28de330d2a968446dacee0a9975fb62",
+		"../pi-tui-protocol/src/index.ts": "531e8aed4f88572a31f961addb719f99429d9c9e2dff9017346c841cb4d290e9",
+		"src/sanitize.ts": "26413f3cce3f3c889ef3e09c27e432cb62b6cba05573ab53ce8ac7b7cef302fe",
+		"src/version.ts": "9279912c7446f69428566a136f5fb4c6244c19353c6a9e06c43cdac7ad7b3ed7",
+		"src/virtual-modules.ts": "2823b769a98d90a4cb4c0b4bf442bd78eb214687ebf99e68a7a54e82cdb4f9fa",
+		"../pi-tui-protocol/src/codec.ts": "382c005fa63342fc927e7cc886c589b13997b3c2ae7ae1c22b7afc5cdca6f0c7",
+		"../pi-tui-protocol/src/client.ts": "9ae082de68ea63a97678d385d643806ff61a3d3133ce1930290dc09c84fd1e29",
+		"../pi-tui-protocol/src/types.ts": "679eb2335083c4d5e6e7ec1bf6402c10a8e37b00c9dec0e75d339b10ed6e193b"
+	}
+}

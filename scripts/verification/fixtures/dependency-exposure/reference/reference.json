@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-09-25T06:30:33.399Z",
-	"captureHead": "0b6cb7255f3080b23b820d8fdfcb0c4a758b1f16",
+	"capturedAt": "2026-09-25T08:15:11.262Z",
+	"captureHead": "875ec8c0eab7ee788de5b9c6d5bab881c25e983c",
 	"metafile": {
-		"projectionPath": "metafile-projection.7acf84e514da7e365c6c5db6407f8184831978a090cad73c3d08409489e2e61b.json",
-		"sha256": "7acf84e514da7e365c6c5db6407f8184831978a090cad73c3d08409489e2e61b",
+		"projectionPath": "metafile-projection.777b2bc7e3c3cc8578258b5c74a7e8d0cd9229a360f0780fd44851e8db5d3b74.json",
+		"sha256": "777b2bc7e3c3cc8578258b5c74a7e8d0cd9229a360f0780fd44851e8db5d3b74",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -17,10 +17,10 @@
 			"--target",
 			"bun-linux-x64-baseline",
 			"--outfile",
-			"/tmp/exposure-capture-rW26wp/pi-extension-host",
-			"--metafile=/tmp/exposure-capture-rW26wp/metafile.json"
+			"/tmp/exposure-capture-scG4Q5/pi-extension-host",
+			"--metafile=/tmp/exposure-capture-scG4Q5/metafile.json"
 		],
-		"metafileSha256": "e8368aa74e86b2e0b6219b0820f1c0aede0a4a03e378e43b99706c5f4920116f"
+		"metafileSha256": "200ba8c60d14cb6a5e2d1813970aaf342657bc4ef73aeb13c55114e989b1c468"
 	},
 	"cargo": {
 		"projectionPath": "cargo-graph-projection.bb5cf5659db2aec137d16f02d4f6d1057e892e8c5bd5ce50776b478f354e7629.json",
@@ -345,7 +345,7 @@
 	"authority": [
 		{
 			"path": "scripts/release/host.ts",
-			"sha256": "b08e1d9908eebcf5ddee9a433449cf618ba47dac26bdf5277005e2280acfee3d"
+			"sha256": "5a59452f68bc7141c85162a201aa398bdf607f31ba44833dc5ee715779b5bffc"
 		},
 		{
 			"path": "scripts/release/targets.ts",
