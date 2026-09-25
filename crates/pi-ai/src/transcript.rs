@@ -211,6 +211,24 @@ pub fn get_current_system_prompt(messages: &[Message]) -> String {
         .unwrap_or_default()
 }
 
+/// Fold the `Context` shorthand and every transcript update into one prompt.
+///
+/// Replays the shorthand prompt first and then every in-place system update
+/// in order, so transports that only serialize a leading system prompt still
+/// observe mid-transcript policy changes.
+#[must_use]
+pub fn get_effective_system_prompt(context: &Context) -> Option<String> {
+    let updates = get_current_system_message(&context.messages)
+        .map(|head| get_system_message_text(&head))
+        .filter(|text| !text.is_empty());
+    match (context.system_prompt.as_deref(), updates) {
+        (Some(prompt), Some(update)) if prompt.is_empty() => Some(update),
+        (Some(prompt), Some(update)) => Some(format!("{prompt}\n\n{update}")),
+        (Some(prompt), None) => Some(prompt.to_owned()),
+        (None, update) => update,
+    }
+}
+
 /// Rebuild the transcript for APIs without mid-conversation system messages.
 #[must_use]
 pub fn collapse_system_messages(context: TranscriptContext) -> TranscriptContext {
@@ -362,5 +380,71 @@ pub fn resolve_transcript_tools(
     TranscriptTools {
         request_tools,
         anchors_additions,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_prompt_folds_shorthand_and_updates() {
+        let mut update = SystemMessage::new("policy: refuse harm", 3);
+        update.sections = Some(
+            [(
+                "tone".to_owned(),
+                Some("be terse".to_owned()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let context = Context {
+            system_prompt: Some("base".to_owned()),
+            messages: vec![Message::System(Box::new(update))],
+            tools: None,
+        };
+        assert_eq!(
+            get_effective_system_prompt(&context).as_deref(),
+            Some("base\n\npolicy: refuse harm\n\nbe terse")
+        );
+    }
+
+    #[test]
+    fn effective_prompt_section_removal_drops_the_value() {
+        let initial = SystemMessage::new("base", 1);
+        let mut removal = SystemMessage::new(String::new(), 3);
+        removal.sections = Some([("tone".to_owned(), None)].into_iter().collect());
+        let mut context = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::System(Box::new(initial)),
+                Message::System(Box::new(removal)),
+            ],
+            tools: None,
+        };
+        assert_eq!(
+            get_effective_system_prompt(&context).as_deref(),
+            Some("base")
+        );
+        context.messages.reverse();
+        assert_eq!(
+            get_effective_system_prompt(&context).as_deref(),
+            Some("base")
+        );
+    }
+
+    #[test]
+    fn effective_prompt_without_updates_matches_shorthand() {
+        let context = Context {
+            system_prompt: Some("base".to_owned()),
+            messages: Vec::new(),
+            tools: None,
+        };
+        assert_eq!(get_effective_system_prompt(&context).as_deref(), Some("base"));
+    }
+
+    #[test]
+    fn effective_prompt_without_shorthand_or_updates_is_none() {
+        assert_eq!(get_effective_system_prompt(&Context::default()), None);
     }
 }

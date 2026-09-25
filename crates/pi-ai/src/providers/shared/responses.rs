@@ -16,6 +16,7 @@ use crate::constrained_sampling::{
     resolve_json_schema_strict_sampling,
 };
 use crate::providers::stream_state::{AssistantState, ProviderEventSender};
+use crate::transcript::get_effective_system_prompt;
 use crate::types::{
     AssistantContent, AssistantMessage, Context, DoneReason, ErrorReason, Message, Model,
     ModelInput, StopReason, Tool, ToolResultContent, Usage, UsageCost, UserContent,
@@ -110,8 +111,11 @@ pub(crate) fn convert_messages(
     let mut input = Vec::new();
     let mut loaded_tool_names = BTreeSet::new();
 
+    // The Responses wire shape carries one leading system/developer item, so
+    // replay mid-transcript `Message::System` policy changes into the prompt
+    // instead of dropping them in the match below.
     if options.include_system_prompt
-        && let Some(system_prompt) = context.system_prompt.as_deref()
+        && let Some(system_prompt) = get_effective_system_prompt(context).as_deref()
     {
         let supports_developer = compat_bool(model, "supportsDeveloperRole", true);
         let role = if model.reasoning && supports_developer {
@@ -141,6 +145,7 @@ pub(crate) fn convert_messages(
                 &mut loaded_tool_names,
                 &mut input,
             )?,
+            // Prompt and tool policy already folded into the system prompt above.
             Message::System(_) => {}
         }
     }

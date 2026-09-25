@@ -27,6 +27,7 @@ use crate::constrained_sampling::{
     resolve_json_schema_strict_sampling,
 };
 use crate::provider::{Provider, ProviderError, StreamOptionKey, StreamOptions};
+use crate::transcript::get_effective_system_prompt;
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DoneReason,
     ErrorReason, Message, Model, ModelInput, ModelThinkingLevel, StopReason, ThinkingContent, Tool,
@@ -840,7 +841,10 @@ fn convert_messages(
     };
     let transformed = transform_messages(&context.messages, model, &mut normalize);
     let mut messages = Vec::new();
-    if let Some(system_prompt) = context.system_prompt.as_deref() {
+    // Chat Completions carries one leading system/developer message, so
+    // replay mid-transcript `Message::System` policy changes into the prompt
+    // instead of dropping them in the match below.
+    if let Some(system_prompt) = get_effective_system_prompt(context).as_deref() {
         let role = if model.reasoning && compat.roles.supports_developer_role {
             "developer"
         } else {
@@ -885,6 +889,7 @@ fn convert_messages(
                     &mut messages,
                 )?;
             }
+            // Prompt and tool policy already folded into the system prompt above.
             Message::System(_) => {}
         }
         index += 1;
@@ -1945,6 +1950,64 @@ mod tests {
             compat: None,
             extra: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn system_updates_fold_into_the_serialized_prompt() {
+        let model = model("openai");
+        let mut update = crate::types::SystemMessage::new("policy: refuse harm", 3);
+        update.sections = Some(
+            [(
+                "tone".to_owned(),
+                Some("be terse".to_owned()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let context = Context {
+            system_prompt: Some("base prompt".into()),
+            messages: vec![
+                Message::User(UserMessage::new(
+                    UserMessageContent::Text("hello".into()),
+                    1,
+                )),
+                Message::System(Box::new(update)),
+                Message::Assistant(Box::new(AssistantMessage::new(
+                    "openai-completions",
+                    "openai",
+                    "model",
+                    4,
+                ))),
+            ],
+            tools: None,
+        };
+
+        let payload = build_payload(
+            &model,
+            &context,
+            &StreamOptions::default(),
+            &Compat::resolve(&model),
+            CacheRetention::None,
+            &BTreeMap::new(),
+        )
+        .expect("payload with system update builds");
+
+        let first = &payload["messages"][0];
+        assert_eq!(first["role"], json!("system"));
+        assert_eq!(
+            first["content"],
+            json!("base prompt\n\npolicy: refuse harm\n\nbe terse")
+        );
+        // No separate mid-transcript system message remains in the payload.
+        assert_eq!(
+            payload["messages"]
+                .as_array()
+                .expect("messages array")
+                .iter()
+                .filter(|message| message["role"] == json!("system"))
+                .count(),
+            1
+        );
     }
 
     #[test]

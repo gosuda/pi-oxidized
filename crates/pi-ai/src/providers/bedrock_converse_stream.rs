@@ -33,6 +33,7 @@ use serde_json::{Map, Value, json};
 
 use crate::constrained_sampling::resolve_json_schema_strict_sampling;
 use crate::provider::{Provider, ProviderError, ProviderResponse, StreamOptionKey, StreamOptions};
+use crate::transcript::get_effective_system_prompt;
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, CacheRetention, Context, DoneReason,
     ErrorReason, Message, Model, ModelThinkingLevel, ThinkingLevel, ToolResultContent, Usage,
@@ -570,10 +571,10 @@ fn build_system_prompt(
     cache_retention: CacheRetention,
     options: &StreamOptions,
 ) -> Option<Vec<Value>> {
-    let prompt = context
-        .system_prompt
-        .as_deref()
-        .filter(|prompt| !prompt.is_empty())?;
+    // The Converse wire shape carries one leading system block, so replay
+    // mid-transcript `Message::System` policy changes into it instead of
+    // dropping them in `convert_messages`.
+    let prompt = get_effective_system_prompt(context).filter(|prompt| !prompt.is_empty())?;
     let mut blocks = vec![json!({ "text": prompt })];
     if cache_retention != CacheRetention::None && supports_prompt_caching(model, options) {
         blocks.push(cache_point_value(cache_retention));
@@ -608,6 +609,7 @@ fn convert_messages(
                 result.push(entry);
                 index = next.saturating_sub(1);
             }
+            // Prompt and tool policy already folded into the system prompt blocks.
             Message::System(_) => {}
         }
         index += 1;
