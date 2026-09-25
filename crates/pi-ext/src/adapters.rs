@@ -726,18 +726,30 @@ fn deferred_fetch_stream(
     let model = model.clone();
     let (tx, rx) = mpsc::channel::<Result<AssistantMessageEvent, ProviderError>>(64);
     tokio::spawn(async move {
-        let mut stream = match client
-            .open_stream_raw_with_callbacks(
+        // Publication must obey the same whole-fetch deadline: a full outbound
+        // queue (extension host stopped reading) must not park this task past
+        // it. Losing the race abandons publication; the client drops the
+        // pending correlation entry when it shuts down.
+        let mut stream = match tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            () = tokio::time::sleep_until(deadline) => None,
+            result = client.open_stream_raw_with_callbacks(
                 methods::PROVIDER_FETCH_DEFERRED,
                 payload,
                 64,
                 callback_scope,
-            )
-            .await
-        {
-            Ok(stream) => stream,
-            Err(error) => {
+            ) => Some(result),
+        } {
+            Some(Ok(stream)) => stream,
+            Some(Err(error)) => {
                 let _ = tx.send(Err(provider_error(error))).await;
+                return;
+            }
+            None => {
+                let _ = tx.try_send(Err(ProviderError::new(
+                    "provider deferred fetch cancelled or timed out",
+                )));
                 return;
             }
         };
@@ -797,7 +809,20 @@ fn deferred_fetch_stream(
         };
         if let Err(error) = terminal {
             let item = deferred_terminal_result(&model, error);
-            let _ = tx.send(item).await;
+            // Best-effort publication: a stalled consumer must not pin this
+            // task past the whole-fetch deadline either.
+            let _ = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    let _ = tx.try_send(Err(ProviderError::new("provider deferred fetch cancelled")));
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    let _ = tx.try_send(Err(ProviderError::new("provider deferred fetch timed out")));
+                }
+                result = tx.send(item) => {
+                    let _ = result;
+                }
+            };
         }
     });
     Box::pin(ProviderStream { rx })
