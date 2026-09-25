@@ -977,7 +977,7 @@ function toPosix(path: string): string {
  * Canonical real path without the Windows `\\?\` verbatim prefix. Node's
  * realpathSync returns verbatim paths on win32; path.relative cannot relate
  * them to an unprefixed root, so case-canonicalized outputs would escape the
- * scope and input comparisons. UNC shares map to `\\?\UNC\server\share`.
+ * scope and input comparisons. UNC shares map to `\\server\share`.
  */
 function canonicalRealpath(path: string): string {
 	const real = realpathSync(path);
@@ -996,8 +996,10 @@ function canonicalRealpath(path: string): string {
  */
 function filesystemFoldsCase(root: string): boolean {
 	const probe = join(root, `.capture-case-probe-${process.pid}`);
+	// Exclusive creation: a pre-existing file with the probe name is never
+	// read, truncated, or removed. Collisions conservatively report folding.
 	try {
-		writeFileSync(probe, "");
+		writeFileSync(probe, "", { flag: "wx" });
 	} catch {
 		return true;
 	}

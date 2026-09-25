@@ -47,11 +47,15 @@ const LOCK_INITIALIZING_GRACE_MS = 30_000;
 const LOCK_OWNER_FILE = "owner.json";
 const DATA_MANIFEST_FILE = ".manifest.json";
 const MANIFEST_SCHEMA_VERSION = 3;
-// UTC time of the newest provider snapshot commit in the canonical reference
-// checkout pinned by scripts/reference-identity.ts (commit f5c94648).
+// UTC time of the newest provider snapshot commit inside the canonical
+// reference checkout pinned by scripts/reference-identity.ts (checkout SHA
+// 95fbc04997eaee961eb673fa7923e9220609ebd5; newest provider-data commit
+// f5c94648).
 const PINNED_PROVIDER_DATA_GENERATED_AT = "2026-09-20T20:59:16.000Z";
-// UTC time of the newest provider snapshot commit in the extension-compat
-// checkout pinned by scripts/reference-identity.ts (commit e8c632ef).
+// UTC time of the newest provider snapshot commit inside the extension-compat
+// checkout pinned by scripts/reference-identity.ts (checkout SHA
+// 853a80d26c90a14c1886f0ebb8ffaae133ca2185; newest provider-data commit
+// e8c632ef).
 const COMPAT_PINNED_PROVIDER_DATA_GENERATED_AT = "2026-08-25T09:03:13.000Z";
 const LOCK_OWNER_VERSION = 2;
 /**
@@ -215,6 +219,9 @@ function normalizeCompatApiGrouping(
 	if (provider !== "openrouter") return models;
 	const normalized = Object.create(null) as Record<string, unknown>;
 	for (const [modelId, value] of Object.entries(models)) {
+		if (value === null || typeof value !== "object" || Array.isArray(value)) {
+			throw new Error(`catalog model "${provider}/${modelId}" must be an object`);
+		}
 		const model = value as Record<string, unknown>;
 		if (model["api"] === "anthropic-messages") {
 			normalized[modelId] = {
@@ -970,6 +977,7 @@ export async function defaultInversionProof(ctx: ReconstructProofContext): Promi
  * script runs in CI) against the reconstructed data directory.
  */
 export async function compatInversionProof(ctx: ReconstructProofContext): Promise<void> {
+	ctx.signal?.throwIfAborted();
 	const validatorUrl = new URL(
 		`file://${join(extensionCompatReferenceRoot(ctx.repoRoot), "packages/ai/scripts/model-data.ts")}`,
 	);
@@ -979,6 +987,9 @@ export async function compatInversionProof(ctx: ReconstructProofContext): Promis
 	const { validateGeneratedModelData } = (await import(validatorUrl.href)) as {
 		validateGeneratedModelData: (packageRoot: string) => void;
 	};
+	// The import can outlive an abort that fired while it was in flight; the
+	// validator must not run on an already-cancelled proof.
+	ctx.signal?.throwIfAborted();
 	validateGeneratedModelData(join(extensionCompatReferenceRoot(ctx.repoRoot), "packages/ai"));
 }
 
