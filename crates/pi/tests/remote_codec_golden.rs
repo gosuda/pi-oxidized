@@ -15,11 +15,11 @@ use std::fs;
 use serde::Deserialize;
 
 use pi::remote::codec::{
-    ClientMessageDecoder, CodecError, ServerMessageDecoder, create_client_message_decoder,
-    create_server_message_decoder, decode_client_message, decode_server_message,
-    encode_client_message, encode_server_message, is_supported_protocol_version,
+    CodecError, create_client_message_decoder, create_server_message_decoder,
+    decode_client_message, decode_server_message, encode_client_message, encode_server_message,
+    is_supported_protocol_version,
 };
-use pi::remote::framing::{FrameDecoder, FrameError, assert_complete_frame, encode_frame};
+use pi::remote::framing::{FrameDecoder, FrameError, encode_frame};
 use pi::remote::schemas::{ClientMessage, PROTOCOL_VERSION, RpcTarget, ServerMessage};
 
 /// One row of the generator-owned golden corpus JSONL.
