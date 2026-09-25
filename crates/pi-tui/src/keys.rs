@@ -1073,7 +1073,11 @@ mod tests {
                 key_press(KeyCode::Char('k'), control | shift | super_key),
                 true,
             ),
-            ("left", key_press(KeyCode::Left, KeyModifiers::empty()), true),
+            (
+                "left",
+                key_press(KeyCode::Left, KeyModifiers::empty()),
+                true,
+            ),
             (
                 "1",
                 key_press_state(
