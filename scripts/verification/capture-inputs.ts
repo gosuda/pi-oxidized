@@ -51,7 +51,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import type { BigIntStats } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -987,6 +987,32 @@ function canonicalRealpath(path: string): string {
 	return real;
 }
 
+/**
+ * Whether the filesystem under `root` folds letter case. Probed by file
+ * identity (dev+ino) rather than platform name: win32 realpathSync preserves
+ * the caller's casing, so a case-variant output would otherwise escape the
+ * overlap comparisons. The probe file is created and removed inside the
+ * repository root; a creation failure conservatively reports folding.
+ */
+function filesystemFoldsCase(root: string): boolean {
+	const probe = join(root, `.capture-case-probe-${process.pid}`);
+	try {
+		writeFileSync(probe, "");
+	} catch {
+		return true;
+	}
+	try {
+		const variant = join(root, `.CAPTURE-CASE-PROBE-${process.pid}`);
+		const a = lstatSync(probe, { bigint: true });
+		const b = lstatSync(variant, { bigint: true });
+		return a.dev === b.dev && a.ino === b.ino;
+	} catch {
+		return false;
+	} finally {
+		rmSync(probe, { force: true });
+	}
+}
+
 function resolveAdminDir(root: string, args: readonly string[], context: string): string {
 	const raw = runGit(root, args, context).toString("utf8").trim();
 	if (raw.length === 0) fail(context, "malformed-git-data", `git ${args.join(" ")} returned an empty path`);
@@ -1014,8 +1040,10 @@ export function assertCaptureOutputPathsDisjoint(
 	const context = "staged capture output";
 	assertNoRedirection(context);
 	const canonicalRoot = openWorktreeRoot(root, context);
+	const foldCase = filesystemFoldsCase(canonicalRoot);
+	const fold = (path: string): string => (foldCase ? path.toLowerCase() : path);
 	const scopes = normalizeScopes(pathspecs, context);
-	const matcher = buildScopeMatcher(scopes, context);
+	const matcher = buildScopeMatcher(scopes.map(fold), context);
 	const objectFormat = readObjectFormat(canonicalRoot, context);
 	const entryPaths = readIndexEntries(canonicalRoot, scopes, objectFormat, context).map((entry) => entry.path);
 	const adminDirs = [
@@ -1023,7 +1051,7 @@ export function assertCaptureOutputPathsDisjoint(
 		resolveAdminDir(canonicalRoot, ["rev-parse", "--git-common-dir"], context),
 	];
 	for (const output of outputPaths) {
-		assertOutputDisjoint(canonicalRoot, matcher, entryPaths, adminDirs, output, context);
+		assertOutputDisjoint(canonicalRoot, matcher, entryPaths, adminDirs, output, context, fold);
 	}
 }
 
@@ -1034,6 +1062,7 @@ function assertOutputDisjoint(
 	adminDirs: readonly string[],
 	output: string,
 	context: string,
+	fold: (path: string) => string,
 ): void {
 	if (typeof output !== "string" || output.length === 0) {
 		fail(context, "output-overlap", "each output path must be a nonempty absolute file path");
@@ -1052,26 +1081,29 @@ function assertOutputDisjoint(
 		? resolveRealOutputPath(output, context)
 		: resolveInRootOutput(root, relLexical, output, context);
 	const relReal = toPosix(relative(root, realOutput));
-	if (matchesScope(matcher, relLexical) || matchesScope(matcher, relReal)) {
+	if (matchesScope(matcher, fold(relLexical)) || matchesScope(matcher, fold(relReal))) {
 		const aliased = relReal !== relLexical ? ` (resolves to ${relReal})` : "";
 		fail(context, "output-overlap", `output ${output} lands inside a relevant capture scope: ${relLexical}${aliased}; outputs must never overwrite relevant inputs`);
 	}
 	for (const input of entryPaths) {
+		const foldedInput = fold(input);
+		const foldedLexical = fold(relLexical);
+		const foldedReal = fold(relReal);
 		if (
-			relLexical === input ||
-			relReal === input ||
-			input.startsWith(`${relLexical}/`) ||
-			input.startsWith(`${relReal}/`) ||
-			relLexical.startsWith(`${input}/`) ||
-			relReal.startsWith(`${input}/`)
+			foldedLexical === foldedInput ||
+			foldedReal === foldedInput ||
+			foldedInput.startsWith(`${foldedLexical}/`) ||
+			foldedInput.startsWith(`${foldedReal}/`) ||
+			foldedLexical.startsWith(`${foldedInput}/`) ||
+			foldedReal.startsWith(`${foldedInput}/`)
 		) {
 			fail(context, "output-overlap", `output ${output} is an ancestor, descendant or replacement of relevant input ${input}`);
 		}
 	}
 	for (const admin of adminDirs) {
-		const adminPosix = toPosix(admin);
+		const adminPosix = fold(toPosix(admin));
 		for (const candidate of [output, realOutput]) {
-			const candidatePosix = toPosix(candidate);
+			const candidatePosix = fold(toPosix(candidate));
 			if (candidatePosix === adminPosix || candidatePosix.startsWith(`${adminPosix}/`)) {
 				fail(context, "output-overlap", `output ${candidate} is inside the Git administrative directory ${admin}`);
 			}
