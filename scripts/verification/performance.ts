@@ -2165,10 +2165,58 @@ async function buildProducts(): Promise<void> {
 		cwd: extensionCompatReferenceRoot(REPOSITORY_ROOT),
 		argv: [npm, "ci", "--ignore-scripts"],
 	});
+	// Provider JSON under .references/*/packages/ai/src/providers/data is
+	// gitignored upstream; the reconstruct step restores it deterministically
+	// from the committed catalog so every package build below stays offline.
 	await runCheckedCommand({
-		label: "TypeScript pi official package binary build",
+		label: "Reference provider data reconstruction",
 		cwd: REPOSITORY_ROOT,
-		argv: [npm, "--prefix", join(EXTENSION_COMPAT_REFERENCE_ROOT, "packages/coding-agent"), "run", "build:binary"],
+		argv: [bun, "run", "scripts/reconstruct-provider-data.ts"],
+	});
+	// `npm run build:binary` runs `ai`'s `build` script, which calls
+	// generate-models --strict against the live models.dev catalog. Upstream
+	// has already dropped `kimi-for-coding`, so that path deleted the tracked
+	// kimi-coding.models.ts shard and broke tsgo. Mirror the chain with ai's
+	// `build:offline`, which compiles from the reconstructed data instead.
+	const referenceRoot = extensionCompatReferenceRoot(REPOSITORY_ROOT);
+	const packageBuilds: readonly [string, string][] = [
+		["tui", "build"],
+		["telemetry", "build"],
+		["ai", "build:offline"],
+		["agent", "build"],
+		["protocol", "build"],
+		["client", "build"],
+	];
+	for (const [pkg, script] of packageBuilds) {
+		await runCheckedCommand({
+			label: `TypeScript reference build ${pkg}`,
+			cwd: REPOSITORY_ROOT,
+			argv: [npm, "--prefix", join(referenceRoot, "packages", pkg), "run", script],
+		});
+	}
+	await runCheckedCommand({
+		label: "TypeScript pi coding-agent bundle build",
+		cwd: REPOSITORY_ROOT,
+		argv: [npm, "--prefix", join(referenceRoot, "packages/coding-agent"), "run", "build"],
+	});
+	await runCheckedCommand({
+		label: "TypeScript pi official package binary compile",
+		cwd: join(referenceRoot, "packages/coding-agent"),
+		argv: [
+			bun,
+			"build",
+			"--compile",
+			"--no-compile-autoload-bunfig",
+			"./src/bun/cli.ts",
+			"./src/utils/image-resize-worker.ts",
+			"--outfile",
+			"dist/pi",
+		],
+	});
+	await runCheckedCommand({
+		label: "TypeScript pi binary asset staging",
+		cwd: REPOSITORY_ROOT,
+		argv: [npm, "--prefix", join(referenceRoot, "packages/coding-agent"), "run", "copy-binary-assets"],
 	});
 	artifact.build.artifacts = {
 		rustPi: fileRecord(RUST_BINARY),
