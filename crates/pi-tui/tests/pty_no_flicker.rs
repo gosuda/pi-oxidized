@@ -18,9 +18,6 @@
 //! aggressive resizes / paste / cursor input, parses the byte stream with
 //! `avt`, and asserts the no-clear / single-write / probe-before-sync contract.
 //!
-//! Platform key-matrix coverage documents the intentional legacy
-//! `modifyOtherKeys` omission (see test name and
-//! [`pi_tui::keys::MODIFY_OTHER_KEYS_OMISSION`]).
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -30,11 +27,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use avt::Vt;
-use crossterm::event::{KeyCode, KeyEventState, KeyModifiers};
-use pi_tui::keys::{
-    KeyId, MODIFY_OTHER_KEYS_OMISSION, is_kitty_protocol_active, key_matches, key_press,
-    key_press_state, set_kitty_protocol_active,
-};
 use pi_tui::terminal::guard::{EMERGENCY_REGULAR_RESTORE_BYTES, EMERGENCY_RESTORE_BYTES};
 use pi_tui::terminal::{audit_bytes, probe_query_batch};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
@@ -144,113 +136,6 @@ fn pty_final_snapshots_narrow_normal_wide() {
             non_empty > 0,
             "width={width}: blank frame detected in snapshot"
         );
-    }
-}
-
-/// Key matrix is OS-aware. On every host we assert structured Kitty/crossterm
-/// matching works and document that legacy `modifyOtherKeys` is intentionally
-/// omitted so modified-Enter cannot be distinguished without Kitty.
-#[test]
-fn key_matrix_linux_macos_windows_legacy_modifyotherkeys_omission() {
-    let host = std::env::consts::OS;
-    assert!(
-        matches!(host, "linux" | "macos" | "windows")
-            || cfg!(target_os = "linux")
-            || cfg!(target_os = "macos")
-            || cfg!(target_os = "windows"),
-        "unexpected host OS for key matrix: {host}"
-    );
-
-    let cases: &[(&str, crossterm::event::KeyEvent, bool)] = &[
-        (
-            "ctrl+c",
-            key_press(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            true,
-        ),
-        (
-            "enter",
-            key_press(KeyCode::Enter, KeyModifiers::empty()),
-            true,
-        ),
-        (
-            "shift+enter",
-            key_press(KeyCode::Enter, KeyModifiers::SHIFT),
-            true,
-        ),
-        (
-            "alt+enter",
-            key_press(KeyCode::Enter, KeyModifiers::ALT),
-            true,
-        ),
-        (
-            "ctrl+enter",
-            key_press(KeyCode::Enter, KeyModifiers::CONTROL),
-            true,
-        ),
-        (
-            "left",
-            key_press(KeyCode::Left, KeyModifiers::empty()),
-            true,
-        ),
-        (
-            "ctrl+right",
-            key_press(KeyCode::Right, KeyModifiers::CONTROL),
-            true,
-        ),
-        (
-            "1",
-            key_press_state(
-                KeyCode::Char('1'),
-                KeyModifiers::empty(),
-                KeyEventState::KEYPAD,
-            ),
-            true,
-        ),
-    ];
-
-    for (id, event, expected) in cases {
-        assert_eq!(
-            key_matches(event, &KeyId::from(*id)),
-            *expected,
-            "os={host} key_id={id}"
-        );
-    }
-
-    set_kitty_protocol_active(false);
-    assert!(!is_kitty_protocol_active());
-    let plain = key_press(KeyCode::Enter, KeyModifiers::empty());
-    assert!(key_matches(&plain, &KeyId::from("enter")));
-    assert!(
-        !key_matches(&plain, &KeyId::from("shift+enter")),
-        "legacy plain Enter must not satisfy shift+enter without Kitty/modifyOtherKeys"
-    );
-    assert!(
-        MODIFY_OTHER_KEYS_OMISSION.contains("modifyOtherKeys"),
-        "omission marker must name modifyOtherKeys"
-    );
-    assert!(
-        MODIFY_OTHER_KEYS_OMISSION.contains("never emitted or parsed"),
-        "omission marker must state never emitted/parsed"
-    );
-    assert!(
-        MODIFY_OTHER_KEYS_OMISSION.contains("backslash-Enter"),
-        "omission marker must document backslash-Enter workaround"
-    );
-
-    match host {
-        "linux" => assert!(
-            MODIFY_OTHER_KEYS_OMISSION.contains("Legacy non-Kitty"),
-            "linux key-matrix omission docs"
-        ),
-        "macos" => assert!(
-            MODIFY_OTHER_KEYS_OMISSION.contains("Legacy non-Kitty"),
-            "macos key-matrix omission docs"
-        ),
-        "windows" => assert!(
-            MODIFY_OTHER_KEYS_OMISSION.contains("Legacy non-Kitty"),
-            "windows key-matrix omission docs (console modifiers via crossterm, no modifyOtherKeys)"
-        ),
-        _ => {}
     }
 }
 

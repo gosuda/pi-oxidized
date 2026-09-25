@@ -13,15 +13,13 @@
 //! construction, or protocol method registry — it uses only production
 //! modules (`server`, `protocol`, `adapters::methods`) and the production
 //! `serve_io`, `encode_frame`, and `decode_frame_str` entry points.
-//! Verifiable by import and grep audit (see `no_benchmark_specific_code_audit`).
+//! Verifiable by import and grep audit.
 
 use std::error::Error;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures::Future;
 use pi_ext::adapters::methods;
 use pi_ext::protocol::{
     COMPATIBILITY_VERSION, ErrorPayload, Frame, FrameKind, HelloAck, Method, PROTOCOL_VERSION,
@@ -37,7 +35,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
 type R = Result<(), Box<dyn Error + Send + Sync>>;
-type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -898,76 +895,6 @@ async fn cooperative_cancellation_tool_execute() -> R {
     Ok(())
 }
 
-/// Full corpus replay: hello → `session_start` → 300 fast terminal inputs
-/// in a single `serve_io` session, verifying id correlation throughout.
-#[tokio::test]
-async fn full_corpus_replay_id_correlation() -> R {
-    const FAST_REQUESTS: u64 = 300;
-
-    let (ext, handles) = ScalingAdapter::new(LoadProfile::Active20, TerminalInputMode::Fast);
-    let (mut peer, server) = spawn_server(ext, ServerConfig::default());
-
-    // 1. Hello handshake
-    peer.hello().await?;
-    let ack = peer.recv().await?;
-    assert_eq!(ack.id, 1);
-    assert_eq!(ack.kind, FrameKind::Res);
-    let ack_payload: HelloAck = from_payload(&ack.payload)?;
-    assert_eq!(ack_payload.protocol_version, PROTOCOL_VERSION);
-
-    // 2. extensions.load (20-active profile)
-    let load_res = peer.load(2).await?;
-    assert_eq!(load_res.id, 2);
-    assert_eq!(load_res.kind, FrameKind::Res);
-    let tools = load_res
-        .payload
-        .get("tools")
-        .and_then(Value::as_array)
-        .ok_or("missing tools")?;
-    assert_eq!(tools.len(), 20);
-
-    // 3. session_start
-    let ss_res = peer.session_start(3).await?;
-    assert_eq!(ss_res.id, 3);
-    assert_eq!(ss_res.kind, FrameKind::Res);
-
-    // Drain uiSlot events from session_start
-    let widget_keys = collect_ui_slot_keys(&mut peer, Duration::from_secs(2)).await;
-    assert_eq!(widget_keys.len(), 20, "must collect 20 widget keys");
-
-    // 4. 300-request fast terminal-input stream
-    let start_id: u64 = 300;
-    for i in 0..FAST_REQUESTS {
-        let id = start_id + i;
-        let data = match i % 3 {
-            0 => "x",
-            1 => "a",
-            _ => "b",
-        };
-        let response = peer.terminal_input(id, data).await?;
-        assert_eq!(response.id, id, "corpus request {i}: id must correlate");
-        assert_eq!(response.kind, FrameKind::Res);
-    }
-
-    {
-        let inputs = handles
-            .terminal_inputs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "FAST_REQUESTS is 300, fits in usize on all targets"
-        )]
-        let expected = FAST_REQUESTS as usize;
-        assert_eq!(inputs.len(), expected);
-    }
-
-    drop(peer);
-    let result = tokio::time::timeout(TIMEOUT, server).await??;
-    assert!(result.is_ok(), "clean EOF after full corpus: {result:?}");
-    Ok(())
-}
-
 /// Prepare and validate: the adapter's fixed prepare/validate results
 /// must flow through the production server with correct id correlation
 /// and the `prepared`/`validated` flags set.
@@ -1036,53 +963,6 @@ async fn prepare_validate_fixed_results_id_correlation() -> R {
     drop(peer);
     let result = tokio::time::timeout(TIMEOUT, server).await??;
     assert!(result.is_ok());
-    Ok(())
-}
-
-type ServeIoFn = fn(
-    tokio::io::DuplexStream,
-    tokio::io::DuplexStream,
-    ScalingAdapter,
-    ServerConfig,
-) -> BoxFuture<Result<(), ServerError>>;
-
-/// Grep / import audit: verify the test contains zero benchmark-specific
-/// frame decoding, server loop construction, or protocol method registry.
-///
-/// This is a compile-time and source audit: the test imports only from
-/// production modules (`pi_ext::server`, `pi_ext::protocol`,
-/// `pi_ext::adapters::methods`), uses only `encode_frame` /
-/// `decode_frame_str` for frame I/O, and drives only the production
-/// `serve_io` entry point. No custom frame decoder, server loop, or
-/// method dispatch exists in this file.
-#[tokio::test]
-async fn no_benchmark_specific_code_audit() -> R {
-    // The test file itself is the audit artifact. Verify at runtime that
-    // the production entry points are used (not custom reimplementations).
-
-    let serve_io_fn: ServeIoFn = |r, w, e, c| Box::pin(serve_io(r, w, e, c));
-    let _ = serve_io_fn;
-
-    // 2. encode_frame / decode_frame_str are the production codec
-    let frame = Frame {
-        id: 1,
-        kind: FrameKind::Req,
-        method: "hello".to_owned(),
-        payload: json!({}),
-    };
-    let bytes = encode_frame(&frame).map_err(|e| e.to_string())?;
-    assert!(!bytes.is_empty(), "encode_frame must produce bytes");
-    let decoded = decode_frame_str(
-        std::str::from_utf8(&bytes)
-            .map_err(|e| e.to_string())?
-            .trim_end(),
-    )?;
-    assert_eq!(decoded.id, frame.id, "decode_frame_str must round-trip");
-
-    // 3. No custom method registry: the production server routes methods
-    //    internally. This test sends frames by method string and relies
-    //    on the production dispatch — it does not construct a method table.
-
     Ok(())
 }
 

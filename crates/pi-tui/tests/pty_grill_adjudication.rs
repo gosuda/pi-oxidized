@@ -10,18 +10,16 @@
 //! - T1: Differential rendering engine — no full-screen clears, row-local
 //!   erase followed by immediate reflow, content continuity across resizes.
 //! - T2: Terminal state management — probe batch precedes synchronized output;
-//!   Kitty keyboard protocol activation flag toggles; emergency restore bytes
-//!   present on exit.
-//! - T3: Terminal image rendering — Kitty/iTerm2 encoders produce correct
-//!   escape sequences (unit-level evidence); PTY wire never emits raw image
-//!   bytes outside frame annotations (host-tier evidence).
+//!   emergency restore bytes present on exit. The Kitty keyboard flag and key
+//!   matching are unit-level evidence in `pi_tui::keys` tests.
+//! - T3: Terminal image rendering — PTY wire never emits raw image bytes
+//!   outside frame annotations (host-tier evidence). Kitty/iTerm2 encoder and
+//!   fallback goldens are unit-level evidence in `pi_tui::image` tests.
 //! - T9: Terminal interfaces — all output flows through the Tui stage-3 writer
 //!   (sole stdout owner), transaction markers present, cursor show on exit.
-//! - OSC52: Clipboard OSC 52 encoder adjudicated in `crates/pi/tests/pty_grill_osc52.rs`
-//!   (unit-level; the PTY fixture does not exercise clipboard actions).
-//! - T4 (math): InlineMath/DisplayMath events are silently dropped — the
-//!   raw-literal fallback path is NOT implemented; ruled **unverified** and
-//!   re-scoped as an open parity gap.
+//! - OSC52: Clipboard OSC 52 encoder adjudicated by the unit tests in
+//!   `crates/pi/src/core/platform/clipboard.rs` (the PTY fixture does not
+//!   exercise clipboard actions).
 
 #![cfg(unix)]
 
@@ -35,13 +33,6 @@ use std::time::{Duration, Instant};
 use avt::Vt;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
-use pi_tui::image::{
-    ITerm2EncodeOptions, KittyEncodeOptions, encode_iterm2, encode_kitty, image_fallback,
-};
-use pi_tui::keys::{
-    MODIFY_OTHER_KEYS_OMISSION, is_kitty_protocol_active, key_matches, key_press,
-    set_kitty_protocol_active,
-};
 use pi_tui::terminal::guard::EMERGENCY_RESTORE_BYTES;
 use pi_tui::terminal::{audit_bytes, probe_query_batch};
 
@@ -146,105 +137,9 @@ fn grill_t2_terminal_state_probes_before_sync_kitty_flag_emergency_restore() {
     );
 }
 
-/// T2 VERIFIED (unit-level): Kitty keyboard protocol flag toggles and
-/// structured key matching works on every host.
-#[test]
-fn grill_t2_kitty_keyboard_flag_and_key_matching() {
-    // Flag toggles.
-    set_kitty_protocol_active(true);
-    assert!(is_kitty_protocol_active(), "T2: kitty flag must toggle on");
-    set_kitty_protocol_active(false);
-    assert!(
-        !is_kitty_protocol_active(),
-        "T2: kitty flag must toggle off"
-    );
-
-    // Structured key matching: plain Enter matches "enter" on every host.
-    let enter = key_press(
-        crossterm::event::KeyCode::Enter,
-        crossterm::event::KeyModifiers::NONE,
-    );
-    assert!(
-        key_matches(&enter, &"enter".into()),
-        "T2: plain Enter must match 'enter' binding"
-    );
-
-    // Legacy non-Kitty: plain Enter does NOT match shift+enter.
-    assert!(
-        !key_matches(&enter, &"shift+enter".into()),
-        "T2: legacy plain Enter must not satisfy shift+enter without Kitty"
-    );
-
-    // The modifyOtherKeys omission is documented.
-    assert!(
-        MODIFY_OTHER_KEYS_OMISSION.contains("Legacy non-Kitty"),
-        "T2: modifyOtherKeys omission marker must document the legacy gap"
-    );
-}
-
 // ---------------------------------------------------------------------------
-// T3: Terminal image rendering — verified (unit-level), no PTY wire emission
+// T3: Terminal image rendering — no raw image bytes on the PTY wire
 // ---------------------------------------------------------------------------
-
-/// T3 VERIFIED (unit-level): Kitty graphics encoder produces correct ESC _G
-/// sequences with a=T, f=100, q=2, and chunked m=1/m=0 for large payloads.
-#[test]
-fn grill_t3_kitty_graphics_encoder() {
-    let small = encode_kitty("AAAA", KittyEncodeOptions::default());
-    assert!(
-        small.contains("\u{1b}_Ga=T,f=100,q=2"),
-        "T3: Kitty encode must emit a=T,f=100,q=2"
-    );
-    assert!(
-        small.ends_with("\u{1b}\\"),
-        "T3: Kitty encode must terminate with ST (ESC backslash)"
-    );
-
-    // Large payload: must chunk with m=1 intermediate and m=0 final.
-    let large_data = "A".repeat(4096 * 3);
-    let large = encode_kitty(&large_data, KittyEncodeOptions::default());
-    assert!(
-        large.contains("m=1"),
-        "T3: large Kitty payload must use m=1 for intermediate chunks"
-    );
-    assert!(
-        large.contains("m=0"),
-        "T3: large Kitty payload must use m=0 for the final chunk"
-    );
-}
-
-/// T3 VERIFIED (unit-level): iTerm2 inline image encoder produces correct
-/// OSC 1337 File= sequences.
-#[test]
-fn grill_t3_iterm2_encoder() {
-    let encoded = encode_iterm2("AAAA", ITerm2EncodeOptions::default());
-    assert!(
-        encoded.starts_with("\u{1b}]1337;File="),
-        "T3: iTerm2 encode must start with OSC 1337 File="
-    );
-    assert!(
-        encoded.contains("inline=1"),
-        "T3: iTerm2 encode must include inline=1"
-    );
-}
-
-/// T3 VERIFIED (unit-level): image fallback produces a text description when
-/// no graphics protocol is available.
-#[test]
-fn grill_t3_image_fallback() {
-    let fallback = image_fallback(
-        "image/png",
-        Some(pi_tui::image::ImageDimensions {
-            width_px: 100,
-            height_px: 50,
-        }),
-        Some("test.png"),
-    );
-    assert!(
-        fallback.contains("test.png") || fallback.contains("100") || fallback.contains("image"),
-        "T3: image fallback must name the file or dimensions: {fallback}"
-    );
-}
 
 /// T3 VERIFIED (host-tier): The PTY fixture never emits raw Kitty/iTerm2
 /// image escape sequences on the wire — image bytes flow through frame
@@ -299,83 +194,6 @@ fn grill_t9_terminal_interfaces_sole_stdout_owner() {
     assert!(
         text.contains("STATUS") || text.contains("FOOTER") || text.contains("DONE"),
         "T9: avt final view missing fixture content: {text:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// T4: Math rendering — VERIFIED (re-adjudicated under PAR-CLOSE, #39)
-// ---------------------------------------------------------------------------
-
-/// T4 LANDED: the markdown math path landed (stage 1 engine at
-/// text/latex.rs in 0c27a40, stage 2 markdown integration under
-/// PAR-CLOSE). The original gap witness asserted delimiters and LaTeX
-/// commands survive as literal text; this re-adjudicated witness pins
-/// the landed contract — math renders to Unicode, delimiters do not
-/// docs/PAR-PTY-GRILL-verdict.md for the full re-adjudication record.
-#[expect(
-    dead_code,
-    reason = "re-adjudicated witness: kept as living documentation of the T4 math parity gap"
-)]
-fn grill_t4_math_rendering_landed() {
-    use pi_tui::component::Component;
-    use pi_tui::components::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-
-    let mut md = Markdown::new(
-        "Inline $x^2$ and display:\n\n$$\\sum_{i=1}^n x_i$$\n",
-        0,
-        0,
-        MarkdownTheme::default(),
-        DefaultTextStyle::default(),
-        MarkdownOptions::default(),
-    );
-
-    let area = Rect::new(0, 0, 80, 10);
-    let mut buf = Buffer::empty(area);
-    md.render(area, &mut buf);
-
-    let rendered: String = buf
-        .content
-        .iter()
-        .map(|cell| cell.symbol().to_string())
-        .collect();
-
-    // Re-adjudicated under PAR-CLOSE (#39): the markdown math path landed
-    // (stage 1 engine 0c27a40 + stage 2 integration), so delimiters no longer
-    // survive as literal text and LaTeX commands render to Unicode.
-    assert!(
-        !rendered.contains('$'),
-        "T4 LANDED: math delimiters must not survive as literal text"
-    );
-    assert!(
-        !rendered.contains("\\sum"),
-        "T4 LANDED: LaTeX commands must render, not pass through literally"
-    );
-    assert!(
-        rendered.contains('²') && rendered.contains('∑'),
-        "T4 LANDED: expected rendered superscript and summation in {rendered:?}"
-    );
-
-    // The fallback contract: unsupported math falls back to raw source.
-    let mut md = Markdown::new(
-        "Bad $\\unknown{thing}$ end.\n",
-        0,
-        0,
-        MarkdownTheme::default(),
-        DefaultTextStyle::default(),
-        MarkdownOptions::default(),
-    );
-    let mut buf = Buffer::empty(area);
-    md.render(area, &mut buf);
-    let rendered: String = buf
-        .content
-        .iter()
-        .map(|cell| cell.symbol().to_string())
-        .collect();
-    assert!(
-        rendered.contains("$\\unknown{thing}$"),
-        "T4 LANDED: unsupported input must fall back to raw delimiters, got {rendered:?}"
     );
 }
 

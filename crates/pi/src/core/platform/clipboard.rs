@@ -1148,13 +1148,20 @@ mod tests {
     #[test]
     fn osc52_encodes_small_text() -> TestResult {
         let seq = required(osc52_encode("hi"), "OSC 52 sequence")?;
-        assert!(seq.starts_with("\x1b]52;c;"));
-        assert!(seq.ends_with('\x07'));
+        // Padded standard base64 ("aGk=" is "hi") inside the ESC ]52;c; … BEL frame.
+        assert_eq!(seq, "\x1b]52;c;aGk=\x07");
         Ok(())
     }
 
     #[test]
     fn osc52_rejects_oversized_payload() {
+        // Absolute wire budget: 100_000 encoded bytes, so exactly 75_000 text
+        // bytes fit and one more byte does not.
+        assert_eq!(MAX_OSC52_ENCODED_LENGTH, 100_000);
+        assert!(
+            osc52_encode(&"a".repeat(75_000)).is_some(),
+            "a payload at the exact budget must encode"
+        );
         let big = "a".repeat(MAX_OSC52_ENCODED_LENGTH * 3 / 4 + 1);
         assert!(osc52_encode(&big).is_none());
     }

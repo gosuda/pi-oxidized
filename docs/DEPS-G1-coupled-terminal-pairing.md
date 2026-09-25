@@ -223,7 +223,8 @@ lane, already established and verified:
   with `avt` (`=0.18.0`) plus `audit_bytes` — the `testkit` feature
   (crates/pi-tui/Cargo.toml:12,26-27). Companion lanes:
   `crates/pi-tui/tests/pty_no_flicker.rs` (synchronized-output framing, probe-
-  before-sync, balance) and `crates/pi/tests/pty_grill_osc52.rs`.
+  before-sync, balance). OSC 52 clipboard encoding is adjudicated by the unit
+  tests in `crates/pi/src/core/platform/clipboard.rs`.
 - Claim set re-adjudicated on the **new** pairing: T1 (differential rendering —
   zero full-screen clears, row-local erase + reflow, continuity across
   resizes), T2 (terminal state — probe batch precedes sync, balanced

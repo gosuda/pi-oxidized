@@ -362,24 +362,3 @@ fn is_supported_protocol_version_works() {
     assert!(!is_supported_protocol_version(PROTOCOL_VERSION - 1));
     assert!(!is_supported_protocol_version(PROTOCOL_VERSION + 1));
 }
-
-// ---------------------------------------------------------------------------
-// Absence witness: no R3/R4 symbols are part of the codec surface
-// ---------------------------------------------------------------------------
-
-#[test]
-fn absence_witness_no_r3_r4_symbols() {
-    let _ = PROTOCOL_VERSION;
-    let _: fn(&[u8], Option<pi::remote::framing::FrameDecoderOptions>) -> Result<(), FrameError> =
-        assert_complete_frame;
-    let _: fn(&[u8]) -> Vec<u8> = encode_frame;
-    let _: fn(u64) -> bool = is_supported_protocol_version;
-    let _: fn(&ClientMessage, Option<_>) -> Result<Vec<u8>, CodecError> = encode_client_message;
-    let _: fn(&ServerMessage, Option<_>) -> Result<Vec<u8>, CodecError> = encode_server_message;
-    let _: fn(&[u8], Option<_>) -> Result<ClientMessage, CodecError> = decode_client_message;
-    let _: fn(&[u8], Option<_>) -> Result<ServerMessage, CodecError> = decode_server_message;
-    let _: fn(Option<_>) -> Result<ClientMessageDecoder, FrameError> =
-        create_client_message_decoder;
-    let _: fn(Option<_>) -> Result<ServerMessageDecoder, FrameError> =
-        create_server_message_decoder;
-}

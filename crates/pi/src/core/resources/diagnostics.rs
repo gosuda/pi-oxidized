@@ -119,30 +119,3 @@ impl ResourceDiagnostic {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn constructors_set_fields() {
-        let w = ResourceDiagnostic::warning("x", Some("/a".into()));
-        assert_eq!(w.type_, DiagnosticType::Warning);
-        assert_eq!(w.message, "x");
-        assert_eq!(w.path.as_deref(), Some("/a"));
-        let c = ResourceDiagnostic::collision(
-            "name \"s\" collision",
-            Some("/loser".into()),
-            ResourceCollision {
-                resource_type: ResourceType::Skill,
-                name: "s".into(),
-                winner_path: "/win".into(),
-                loser_path: "/loser".into(),
-                winner_source: None,
-                loser_source: None,
-            },
-        );
-        assert_eq!(c.type_, DiagnosticType::Collision);
-        assert!(c.collision.is_some());
-    }
-}

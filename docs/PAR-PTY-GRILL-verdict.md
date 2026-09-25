@@ -23,7 +23,7 @@ Host-tier PTY evidence proves:
 
 ### T2: Terminal state management — VERIFIED
 
-**Evidence**: `grill_t2_terminal_state_probes_before_sync_kitty_flag_emergency_restore`, `grill_t2_kitty_keyboard_flag_and_key_matching`
+**Evidence**: `grill_t2_terminal_state_probes_before_sync_kitty_flag_emergency_restore` (host-tier); `keys::tests::kitty_protocol_flag_roundtrip`, `keys::tests::table_driven_keyid_x_event_cross_product`, `keys::tests::legacy_modified_enter_cannot_be_distinguished` (unit-level)
 
 Host-tier PTY evidence proves:
 - Probe query batch (DA1, cursor position, OSC 11, Kitty keyboard disable) is emitted on the wire before any synchronized output
@@ -36,7 +36,7 @@ Host-tier PTY evidence proves:
 
 ### T3: Terminal image rendering — VERIFIED (unit-level + negative PTY witness)
 
-**Evidence**: `grill_t3_kitty_graphics_encoder`, `grill_t3_iterm2_encoder`, `grill_t3_image_fallback`, `grill_t3_no_raw_image_bytes_on_pty_wire`
+**Evidence**: `grill_t3_no_raw_image_bytes_on_pty_wire` (host-tier); `image::tests::kitty_small_golden`, `image::tests::kitty_multi_chunk_4096`, `image::tests::iterm2_goldens`, `image::tests::fallback_text` (unit-level)
 
 Unit-level evidence proves:
 - Kitty graphics encoder produces correct `ESC _Ga=T,f=100,q=2` sequences with chunked `m=1`/`m=0` for large payloads
@@ -62,7 +62,7 @@ Host-tier PTY evidence proves:
 
 ### OSC52: Clipboard encoder — VERIFIED (unit-level)
 
-**Evidence**: `crates/pi/tests/pty_grill_osc52.rs::grill_osc52_encoder_correct_sequence`, `grill_osc52_rejects_oversized`
+**Evidence**: `core::platform::clipboard::tests::osc52_encodes_small_text`, `core::platform::clipboard::tests::osc52_rejects_oversized_payload` (the `grill_osc52_*` integration witnesses duplicated these goldens and were removed)
 
 Unit-level evidence proves:
 - OSC 52 encoder produces correct `ESC ]52;c;<base64> BEL` sequences
@@ -74,7 +74,7 @@ The PTY fixture does not exercise clipboard actions; OSC 52 is not emitted on th
 
 ### T4: LaTeX math rendering — VERIFIED (re-adjudicated under PAR-CLOSE)
 
-**Evidence**: `grill_t4_math_rendering_landed` (re-adjudicated; originally `grill_t4_math_rendering_unverified_gap`)
+**Evidence**: `components::markdown::tests::inline_dollar_math_renders`, `components::markdown::tests::block_dollar_math_renders`, `components::markdown::tests::unsupported_math_falls_back_to_raw` (unit-level; re-adjudicated under PAR-CLOSE)
 
 Original findings (2026-08-26, superseded):
 1. `ENABLE_MATH` was not enabled in the pulldown-cmark parser options, so `$...$` and `$$...$$` were treated as literal text, not as InlineMath/DisplayMath events
@@ -95,7 +95,7 @@ The raw-literal fallback path described in `docs/PAR-MATH-latex-strategy.md` was
 | T3 Image rendering | verified | Unit: Kitty/iTerm2 encoders, fallback; PTY: no raw image bytes on wire |
 | T9 Terminal interfaces | verified | PTY: sole stdout owner, transaction markers, probe emission |
 | OSC52 Clipboard | verified | Unit: correct encoding, oversized rejection |
-| T4 Math rendering | verified (re-adjudicated) | Test: `grill_t4_math_rendering_landed` — math renders to Unicode, unsupported falls back to raw |
+| T4 Math rendering | verified (re-adjudicated) | Unit: markdown math tests — math renders to Unicode, unsupported falls back to raw |
 
 ## Fullscreen pending supplement (DES-12 supersession; no new verdict)
 
