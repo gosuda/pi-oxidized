@@ -201,6 +201,34 @@ function encodeProviderModels(provider: string, models: Record<string, unknown>)
 	return `${JSON.stringify(sortDeep(groupProviderModels(provider, models)), null, "\t")}\n`;
 }
 
+/**
+ * Compat-tree API grouping normalization. The catalog tracks the native pin,
+ * which routes openrouter anthropic/* non-batch models through
+ * anthropic-messages; the extension-compat pin predates that split and its
+ * openrouter wrapper declares a single openai-completions api, so the compat
+ * emission flattens those models back to the completions group and base URL.
+ */
+function normalizeCompatApiGrouping(
+	provider: string,
+	models: Record<string, unknown>,
+): Record<string, unknown> {
+	if (provider !== "openrouter") return models;
+	const normalized = Object.create(null) as Record<string, unknown>;
+	for (const [modelId, value] of Object.entries(models)) {
+		const model = value as Record<string, unknown>;
+		if (model["api"] === "anthropic-messages") {
+			normalized[modelId] = {
+				...model,
+				api: "openai-completions",
+				baseUrl: "https://openrouter.ai/api/v1",
+			};
+		} else {
+			normalized[modelId] = model;
+		}
+	}
+	return normalized;
+}
+
 function rebuildProviderManifest(
 	catalog: ProviderCatalog,
 	bodies: ReadonlyMap<string, string>,
@@ -1031,10 +1059,12 @@ export async function reconstructProviderData(
 	}
 	const emitCatalog: ProviderCatalog = compatTarget
 		? Object.fromEntries(
-				wrappers.map((id) => [id, catalog[id] as Record<string, unknown>]),
+				wrappers.map((id) => [
+					id,
+					normalizeCompatApiGrouping(id, catalog[id] as Record<string, unknown>),
+				]),
 			)
 		: catalog;
-
 	const expectedBodies = new Map<string, string>();
 	for (const provider of wrappers) {
 		const models = emitCatalog[provider];
