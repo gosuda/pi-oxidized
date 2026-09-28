@@ -138,15 +138,29 @@ impl DriverSession for ConPtySession {
     fn close(mut self) -> Result<ExitStatus, DriverError> {
         self.ensure_open()?;
         self.io.closed = true;
-        // Writer EOF first, then wait for the child, then join the reader.
         self.io.close_writer();
         let mut child = self.child.take().ok_or(DriverError::Closed)?;
-        let wait_result = child.wait().map_err(|err| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let wait_result = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    break child.wait();
+                }
+                Err(err) => break Err(err),
+            }
+        }
+        .map_err(|err| {
             DriverError::Io(std::io::Error::new(
                 err.kind(),
                 format!("conpty child wait failed: {err}"),
             ))
         });
+        let _ = child.kill();
         let join_result = self.io.join_readers();
         let status = wait_result?;
         join_result?;

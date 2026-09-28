@@ -188,16 +188,20 @@ impl DriverSession for PosixPtySession {
         let _ = self.io.write_all(b"\n\x04");
         self.io.closed = true;
         self.io.close_writer();
-        let mut child = self.child.take().ok_or(DriverError::Closed)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let wait_result = loop {
-            match child.try_wait() {
+            let status = match self.child.as_mut() {
+                Some(child) => child.try_wait(),
+                None => break Err(std::io::Error::other("pty child missing")),
+            };
+            match status {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Ok(None) => {
                     self.kill_session();
+                    let mut child = self.child.take().ok_or(DriverError::Closed)?;
                     break child.wait();
                 }
                 Err(err) => break Err(err),
@@ -209,11 +213,10 @@ impl DriverSession for PosixPtySession {
                 format!("posix pty child wait failed: {err}"),
             ))
         });
+        self.kill_session();
         let join_result = self.io.join_readers();
         let status = wait_result?;
         join_result?;
-        // Reap leftover session members (extension host) after pi exits.
-        self.kill_session();
         Ok(status.into())
     }
 }
