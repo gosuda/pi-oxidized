@@ -747,13 +747,6 @@ fn build_snapshot(raw: &[u8], geometry: Geometry, viewport_only: bool) -> Termin
     }
 }
 
-/// CLEAN-ENV CONTRACT: retain parent `PATH`, `TMPDIR`, `TEMP`, `LANG`, and
-/// `LC_ALL`; retain parent `HOME` only when the caller did not overlay it.
-/// `TERM` and other capability values come from the profile, then caller
-/// overlays win. portable-pty injects `SHELL`, so clean launches force it
-/// empty before the overlays are applied. `SystemRoot` is retained so Windows
-/// children keep resolving `taskkill.exe` under `%SystemRoot%\System32`
-/// instead of falling back to a `PATH` search.
 const PARENT_ENV_ALLOWLIST: &[&str] = &["PATH", "TMPDIR", "TEMP", "LANG", "LC_ALL", "SystemRoot"];
 
 fn seed_clean_parent_env(
@@ -772,7 +765,6 @@ fn seed_clean_parent_env(
     }
 }
 
-/// Clears inherited variables and seeds the clean-environment base.
 pub(crate) fn prepare_posix_base_environment(
     cmd: &mut portable_pty::CommandBuilder,
     spec: &crate::testkit::driver::LaunchSpec,
