@@ -11,21 +11,31 @@ use crate::testkit::driver::{
     SettlePolicy, SettledFrame, TerminalDriver, TerminalSnapshot,
 };
 use crate::testkit::session::{
-    SessionIo, apply_env, snapshot_from_raw, viewport_snapshot_from_raw,
+    SessionIo, apply_env, prepare_posix_base_environment, snapshot_from_raw,
+    viewport_snapshot_from_raw,
 };
 
 /// Windows `ConPTY` driver using `portable-pty` 0.9.0 `ConPtySystem`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConPtyDriver;
 
-impl TerminalDriver for ConPtyDriver {
-    type Session = ConPtySession;
-
-    fn kind(&self) -> DriverKind {
-        DriverKind::ConPty
+impl ConPtyDriver {
+    /// Opens a `ConPTY` with the documented clean-environment contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the launch spec is invalid or the PTY cannot be opened.
+    pub fn open_clean(spec: &LaunchSpec) -> Result<ConPtySession, DriverError> {
+        Self::open_with_env(spec, |cmd, spec| {
+            prepare_posix_base_environment(cmd, spec);
+            apply_env(cmd, spec);
+        })
     }
 
-    fn open(&self, spec: &LaunchSpec) -> Result<Self::Session, DriverError> {
+    fn open_with_env(
+        spec: &LaunchSpec,
+        configure_env: impl FnOnce(&mut CommandBuilder, &LaunchSpec),
+    ) -> Result<ConPtySession, DriverError> {
         spec.validate()?;
         let system = ConPtySystem::default();
         let pair = system
@@ -43,7 +53,7 @@ impl TerminalDriver for ConPtyDriver {
         }
         let mut cmd = CommandBuilder::from_argv(argv);
         cmd.cwd(&spec.cwd);
-        apply_env(&mut cmd, spec);
+        configure_env(&mut cmd, spec);
 
         let child = pair
             .slave
@@ -76,6 +86,18 @@ impl TerminalDriver for ConPtyDriver {
             io: SessionIo::new(Box::new(shared), pump),
             geometry: spec.geometry,
         })
+    }
+}
+
+impl TerminalDriver for ConPtyDriver {
+    type Session = ConPtySession;
+
+    fn kind(&self) -> DriverKind {
+        DriverKind::ConPty
+    }
+
+    fn open(&self, spec: &LaunchSpec) -> Result<Self::Session, DriverError> {
+        Self::open_with_env(spec, apply_env)
     }
 }
 

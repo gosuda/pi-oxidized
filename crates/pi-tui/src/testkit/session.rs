@@ -747,6 +747,43 @@ fn build_snapshot(raw: &[u8], geometry: Geometry, viewport_only: bool) -> Termin
     }
 }
 
+/// CLEAN-ENV CONTRACT: retain parent `PATH`, `TMPDIR`, `TEMP`, `LANG`, and
+/// `LC_ALL`; retain parent `HOME` only when the caller did not overlay it.
+/// `TERM` and other capability values come from the profile, then caller
+/// overlays win. portable-pty injects `SHELL`, so clean launches force it
+/// empty before the overlays are applied. `SystemRoot` is retained so Windows
+/// children keep resolving `taskkill.exe` under `%SystemRoot%\System32`
+/// instead of falling back to a `PATH` search.
+const PARENT_ENV_ALLOWLIST: &[&str] = &["PATH", "TMPDIR", "TEMP", "LANG", "LC_ALL", "SystemRoot"];
+
+fn seed_clean_parent_env(
+    spec: &crate::testkit::driver::LaunchSpec,
+    mut set_env: impl FnMut(&str, std::ffi::OsString),
+) {
+    for &key in PARENT_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(key) {
+            set_env(key, value);
+        }
+    }
+    if !spec.env.contains_key("HOME")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        set_env("HOME", home);
+    }
+}
+
+/// Clears inherited variables and seeds the clean-environment base.
+pub(crate) fn prepare_posix_base_environment(
+    cmd: &mut portable_pty::CommandBuilder,
+    spec: &crate::testkit::driver::LaunchSpec,
+) {
+    cmd.env_clear();
+    cmd.env("SHELL", "");
+    seed_clean_parent_env(spec, |key, value| {
+        cmd.env(key, value);
+    });
+}
+
 /// Applies profile env then launch-spec overlays onto a portable-pty command.
 pub(crate) fn apply_env(
     cmd: &mut portable_pty::CommandBuilder,
@@ -781,6 +818,65 @@ mod tests {
         CanonicalEvent, EventKind, OutputCanon, RowId, RowTier, RunnerRow, Scenario,
         TimingEnvelope, TranscriptMode,
     };
+
+    #[test]
+    fn posix_base_environment_applies_allowlist_and_overlays() {
+        let make_spec = |env| crate::testkit::driver::LaunchSpec {
+            argv: vec!["fixture".to_owned()],
+            cwd: std::path::PathBuf::from("."),
+            env,
+            geometry: Geometry { cols: 80, rows: 24 },
+            profile: CapabilityProfile::Xterm256ColorTruecolor,
+        };
+        let spec = make_spec(std::collections::BTreeMap::from([
+            ("HOME".to_owned(), "sandbox-home".to_owned()),
+            ("PI_TUI_ENV_OVERLAY".to_owned(), "overlay".to_owned()),
+        ]));
+        let mut clean = portable_pty::CommandBuilder::from_argv(vec!["fixture".into()]);
+        clean.env("ANTHROPIC_API_KEY", "ambient-secret");
+        prepare_posix_base_environment(&mut clean, &spec);
+        apply_env(&mut clean, &spec);
+
+        assert_eq!(clean.get_env("ANTHROPIC_API_KEY"), None);
+        for &key in PARENT_ENV_ALLOWLIST {
+            assert_eq!(
+                clean.get_env(key),
+                std::env::var_os(key).as_deref(),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            clean.get_env("HOME"),
+            Some(std::ffi::OsStr::new("sandbox-home"))
+        );
+        assert_eq!(
+            clean.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
+        assert_eq!(
+            clean.get_env("PI_TUI_ENV_OVERLAY"),
+            Some(std::ffi::OsStr::new("overlay"))
+        );
+        assert_eq!(clean.get_env("SHELL"), Some(std::ffi::OsStr::new("")));
+
+        let inherited_spec = make_spec(std::collections::BTreeMap::new());
+        let mut inherited = portable_pty::CommandBuilder::from_argv(vec!["fixture".into()]);
+        inherited.env("ANTHROPIC_API_KEY", "ambient-secret");
+        apply_env(&mut inherited, &inherited_spec);
+        assert_eq!(
+            inherited.get_env("ANTHROPIC_API_KEY"),
+            Some(std::ffi::OsStr::new("ambient-secret"))
+        );
+
+        let parent_home_spec = make_spec(std::collections::BTreeMap::new());
+        let mut parent_home = portable_pty::CommandBuilder::from_argv(vec!["fixture".into()]);
+        prepare_posix_base_environment(&mut parent_home, &parent_home_spec);
+        apply_env(&mut parent_home, &parent_home_spec);
+        assert_eq!(
+            parent_home.get_env("HOME"),
+            std::env::var_os("HOME").as_deref()
+        );
+    }
 
     #[derive(Default)]
     struct FakeDriver {

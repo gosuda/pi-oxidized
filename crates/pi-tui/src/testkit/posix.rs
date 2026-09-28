@@ -17,21 +17,31 @@ use crate::testkit::driver::{
     SettlePolicy, SettledFrame, TerminalDriver, TerminalSnapshot,
 };
 use crate::testkit::session::{
-    SessionIo, apply_env, snapshot_from_raw, viewport_snapshot_from_raw,
+    SessionIo, apply_env, prepare_posix_base_environment, snapshot_from_raw,
+    viewport_snapshot_from_raw,
 };
 
 /// POSIX PTY driver using `portable-pty`'s Unix backend.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PosixPtyDriver;
 
-impl TerminalDriver for PosixPtyDriver {
-    type Session = PosixPtySession;
-
-    fn kind(&self) -> DriverKind {
-        DriverKind::PosixPty
+impl PosixPtyDriver {
+    /// Opens a POSIX PTY with the documented clean-environment contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the launch spec is invalid or the PTY cannot be opened.
+    pub fn open_clean(spec: &LaunchSpec) -> Result<PosixPtySession, DriverError> {
+        Self::open_with_env(spec, |cmd, spec| {
+            prepare_posix_base_environment(cmd, spec);
+            apply_env(cmd, spec);
+        })
     }
 
-    fn open(&self, spec: &LaunchSpec) -> Result<Self::Session, DriverError> {
+    fn open_with_env(
+        spec: &LaunchSpec,
+        configure_env: impl FnOnce(&mut CommandBuilder, &LaunchSpec),
+    ) -> Result<PosixPtySession, DriverError> {
         spec.validate()?;
         let system = UnixPtySystem::default();
         let pair = system
@@ -49,7 +59,7 @@ impl TerminalDriver for PosixPtyDriver {
         }
         let mut cmd = CommandBuilder::from_argv(argv);
         cmd.cwd(&spec.cwd);
-        apply_env(&mut cmd, spec);
+        configure_env(&mut cmd, spec);
 
         disable_pty_echo(pair.master.as_ref())?;
         let child = pair
@@ -91,6 +101,18 @@ impl TerminalDriver for PosixPtyDriver {
             io: SessionIo::new(Box::new(shared), pump),
             geometry: spec.geometry,
         })
+    }
+}
+
+impl TerminalDriver for PosixPtyDriver {
+    type Session = PosixPtySession;
+
+    fn kind(&self) -> DriverKind {
+        DriverKind::PosixPty
+    }
+
+    fn open(&self, spec: &LaunchSpec) -> Result<Self::Session, DriverError> {
+        Self::open_with_env(spec, apply_env)
     }
 }
 
