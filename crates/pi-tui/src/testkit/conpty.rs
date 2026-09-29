@@ -11,8 +11,8 @@ use crate::testkit::driver::{
     SettlePolicy, SettledFrame, TerminalDriver, TerminalSnapshot,
 };
 use crate::testkit::session::{
-    POST_KILL_GRACE, SessionIo, apply_env, prepare_posix_base_environment, reap_child,
-    snapshot_from_raw, viewport_snapshot_from_raw,
+    POST_KILL_GRACE, READER_JOIN_GRACE, SessionIo, apply_env, prepare_posix_base_environment,
+    reap_child, shed_to_reaper, snapshot_from_raw, viewport_snapshot_from_raw,
 };
 
 /// Windows `ConPTY` driver using `portable-pty` 0.9.0 `ConPtySystem`.
@@ -81,7 +81,7 @@ impl ConPtyDriver {
             spec.profile,
         );
         Ok(ConPtySession {
-            master: pair.master,
+            master: Some(pair.master),
             child: Some(child),
             io: SessionIo::new(Box::new(shared), pump),
             geometry: spec.geometry,
@@ -103,7 +103,7 @@ impl TerminalDriver for ConPtyDriver {
 
 /// Render-capable `ConPTY` session.
 pub struct ConPtySession {
-    master: Box<dyn MasterPty + Send>,
+    master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     io: SessionIo,
     geometry: Geometry,
@@ -180,12 +180,21 @@ impl DriverSession for ConPtySession {
                 format!("conpty child wait failed: {err}"),
             ))
         });
-        // Shed before joining: on a post-kill timeout the reader may never see
-        // EOF either, so returning here lets Drop detach it. Only a reaped
-        // child reaches the join below.
-        let status = wait_result?;
+        // Shed before joining: on a wait failure the reader may never see EOF
+        // either, so returning here lets Drop detach it. The handle moves to
+        // the detached reaper so a late exit is still waited, not zombied.
+        let status = match wait_result {
+            Ok(status) => status,
+            Err(err) => {
+                shed_to_reaper(child);
+                return Err(err);
+            }
+        };
         let _ = child.kill();
-        let join_result = self.io.join_readers();
+        // Closing the console terminates any attached descendants, giving the
+        // reader its EOF; the bounded join sheds whatever still lingers.
+        drop(self.master.take());
+        let join_result = self.io.join_readers_bounded(READER_JOIN_GRACE);
         join_result?;
         Ok(status.into())
     }
@@ -196,6 +205,8 @@ impl RenderSession for ConPtySession {
         self.ensure_open()?;
         let geometry = Geometry::new(cols, rows)?;
         self.master
+            .as_ref()
+            .ok_or(DriverError::Closed)?
             .resize(PtySize {
                 rows: geometry.rows,
                 cols: geometry.cols,
@@ -257,12 +268,16 @@ impl Drop for ConPtySession {
             self.io.close_writer();
             if let Some(mut child) = self.child.take() {
                 let _ = child.kill();
-                // Drop cannot report: reap bounded, then join only a reaped
-                // child. On timeout the reader detaches in SessionIo::drop.
-                if matches!(reap_child(&mut child, POST_KILL_GRACE), Ok(Some(_))) {
-                    let _ = self.io.join_readers();
+                // Drop cannot report: reap bounded, then shed an unreaped
+                // handle to the detached reaper instead of zombifying it.
+                if !matches!(reap_child(&mut child, POST_KILL_GRACE), Ok(Some(_))) {
+                    shed_to_reaper(child);
                 }
             }
+            // Closing the console terminates attached descendants, giving the
+            // reader EOF; the bounded join sheds whatever still lingers.
+            drop(self.master.take());
+            let _ = self.io.join_readers_bounded(READER_JOIN_GRACE);
         }
     }
 }

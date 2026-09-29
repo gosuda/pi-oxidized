@@ -508,6 +508,54 @@ impl ReaderPump {
             None => Ok(()),
         }
     }
+
+    /// Joins every reader thread within one shared `grace` deadline,
+    /// surfacing the first panic as an I/O error and detaching any
+    /// thread still blocked at expiry.
+    ///
+    /// A reaped child does not guarantee PTY EOF: a descendant holding
+    /// the console or slave end open keeps the reader blocked, so an
+    /// unbounded join could hang session teardown forever. A detached
+    /// reader still unblocks when its pipe finally EOFs or the process
+    /// exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error on a reader panic (joined before expiry) or
+    /// a `TimedOut` error when any thread survived the deadline.
+    pub(crate) fn join_bounded(&mut self, grace: Duration) -> Result<(), DriverError> {
+        let deadline = Instant::now() + grace;
+        let mut detached = false;
+        let mut first_err: Option<DriverError> = None;
+        for join in self.joins.drain(..) {
+            while !join.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if !join.is_finished() {
+                // Dropping the handle detaches the thread.
+                detached = true;
+                continue;
+            }
+            if let Err(panic) = join.join() {
+                let msg = panic_message(&panic);
+                if first_err.is_none() {
+                    first_err = Some(DriverError::Io(std::io::Error::other(format!(
+                        "reader thread panicked: {msg}"
+                    ))));
+                }
+            }
+        }
+        if detached {
+            return Err(DriverError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "reader thread did not exit within grace",
+            )));
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
 }
 
 fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
@@ -615,6 +663,16 @@ impl SessionIo {
             Ok(())
         }
     }
+
+    /// Bounded variant of [`Self::join_readers`]: reader threads still
+    /// blocked past `grace` detach instead of hanging the caller.
+    pub(crate) fn join_readers_bounded(&mut self, grace: Duration) -> Result<(), DriverError> {
+        if let Some(mut pump) = self.pump.take() {
+            pump.join_bounded(grace)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Post-kill grace before a reap gives up instead of blocking.
@@ -642,6 +700,23 @@ pub(crate) fn reap_child(
             Ok(None) => return Ok(None),
         }
     }
+}
+
+/// Grace for reader threads to see EOF after the child is reaped. A
+/// descendant that outlives the direct child can hold the console or
+/// slave end open, so the join is bounded like the reap: on expiry the
+/// remaining handles drop, detaching threads that then exit with the
+/// process or when the pipe finally EOFs.
+pub(crate) const READER_JOIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Hands a possibly-live child to a detached reaper thread so a late
+/// exit is still waited. Dropping the only handle after a failed bounded
+/// reap would orphan a zombie once the process dies; for an already
+/// reaped child the wait returns immediately.
+pub(crate) fn shed_to_reaper(mut child: Box<dyn Child + Send + Sync>) {
+    let _ = thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 impl Drop for SessionIo {
@@ -786,10 +861,31 @@ fn seed_clean_parent_env(
             set_env(key, value);
         }
     }
-    if !spec.env.contains_key("HOME")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        set_env("HOME", home);
+    let home = spec
+        .env
+        .get("HOME")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("HOME"));
+    let Some(home) = home else { return };
+    if !spec.env.contains_key("HOME") {
+        set_env("HOME", home.clone());
+    }
+    // Windows dependencies resolve profile dirs through USERPROFILE and
+    // the AppData roots, which env_clear wipes while launch specs
+    // sandbox only HOME; mirror the effective home onto them so a child
+    // cannot fall back to the real user profile. Spec overlays still
+    // win via apply_env. On Unix those vars are meaningless.
+    if cfg!(windows) {
+        if !spec.env.contains_key("USERPROFILE") {
+            set_env("USERPROFILE", home.clone());
+        }
+        let appdata = std::path::PathBuf::from(&home).join("AppData");
+        if !spec.env.contains_key("APPDATA") {
+            set_env("APPDATA", appdata.join("Roaming").into_os_string());
+        }
+        if !spec.env.contains_key("LOCALAPPDATA") {
+            set_env("LOCALAPPDATA", appdata.join("Local").into_os_string());
+        }
     }
 }
 

@@ -17,8 +17,8 @@ use crate::testkit::driver::{
     SettlePolicy, SettledFrame, TerminalDriver, TerminalSnapshot,
 };
 use crate::testkit::session::{
-    POST_KILL_GRACE, SessionIo, apply_env, prepare_posix_base_environment, reap_child,
-    snapshot_from_raw, viewport_snapshot_from_raw,
+    POST_KILL_GRACE, READER_JOIN_GRACE, SessionIo, apply_env, prepare_posix_base_environment,
+    reap_child, shed_to_reaper, snapshot_from_raw, viewport_snapshot_from_raw,
 };
 
 /// POSIX PTY driver using `portable-pty`'s Unix backend.
@@ -188,20 +188,17 @@ impl DriverSession for PosixPtySession {
         let _ = self.io.write_all(b"\n\x04");
         self.io.closed = true;
         self.io.close_writer();
+        let mut child = self.child.take().ok_or(DriverError::Closed)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let wait_result = loop {
-            let status = match self.child.as_mut() {
-                Some(child) => child.try_wait(),
-                None => break Err(std::io::Error::other("pty child missing")),
-            };
-            match status {
+            match child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Ok(None) => {
                     self.kill_session();
-                    let mut child = self.child.take().ok_or(DriverError::Closed)?;
+                    let _ = child.kill();
                     break match reap_child(&mut child, POST_KILL_GRACE) {
                         Ok(Some(status)) => Ok(status),
                         Ok(None) => Err(std::io::Error::new(
@@ -220,12 +217,19 @@ impl DriverSession for PosixPtySession {
                 format!("posix pty child wait failed: {err}"),
             ))
         });
-        // Shed before joining: on a post-kill timeout the reader may never see
-        // EOF either, so returning here lets Drop detach it. Only a reaped
-        // child reaches the join below.
-        let status = wait_result?;
+        // Shed before joining: on a wait failure the reader may never see EOF
+        // either, so returning here lets Drop detach it. The handle moves to
+        // the detached reaper so a late exit is still waited, not zombied.
+        let status = match wait_result {
+            Ok(status) => status,
+            Err(err) => {
+                shed_to_reaper(child);
+                return Err(err);
+            }
+        };
         self.kill_session();
-        let join_result = self.io.join_readers();
+        let _ = child.kill();
+        let join_result = self.io.join_readers_bounded(READER_JOIN_GRACE);
         join_result?;
         Ok(status.into())
     }
@@ -320,11 +324,13 @@ impl Drop for PosixPtySession {
         }
         self.kill_session();
         if let Some(mut child) = self.child.take() {
-            // Drop cannot report: reap bounded, then join only a reaped child.
-            // On timeout the reader detaches in SessionIo::drop.
-            if matches!(reap_child(&mut child, POST_KILL_GRACE), Ok(Some(_))) {
-                let _ = self.io.join_readers();
+            // Drop cannot report: reap bounded, then shed an unreaped handle
+            // to the detached reaper instead of zombifying it. The bounded
+            // join sheds whatever still lingers on the reader.
+            if !matches!(reap_child(&mut child, POST_KILL_GRACE), Ok(Some(_))) {
+                shed_to_reaper(child);
             }
+            let _ = self.io.join_readers_bounded(READER_JOIN_GRACE);
         }
     }
 }
