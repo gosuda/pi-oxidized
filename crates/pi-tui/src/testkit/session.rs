@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use avt::Vt;
+use portable_pty::Child;
 
 use super::profile::CapabilityProfile;
 use crate::testkit::driver::{
@@ -612,6 +613,33 @@ impl SessionIo {
             pump.join()
         } else {
             Ok(())
+        }
+    }
+}
+
+/// Post-kill grace before a reap gives up instead of blocking.
+pub(crate) const POST_KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// Bounded reap shared by explicit close and Drop paths.
+///
+/// Kills stay the caller's job: explicit close reports the kill result,
+/// Drop is best-effort. Polls `try_wait` until `grace` elapses: `Ok(Some)`
+/// on exit, the `try_wait` error on failure, `Ok(None)` on timeout. A
+/// `None` means shed, not retry: after SIGKILL the only unbounded case is
+/// D-state exit, and a test harness must not block on it.
+pub(crate) fn reap_child(
+    child: &mut Box<dyn Child + Send + Sync>,
+    grace: Duration,
+) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Err(err) => return Err(err),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => return Ok(None),
         }
     }
 }

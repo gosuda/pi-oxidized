@@ -11,8 +11,8 @@ use crate::testkit::driver::{
     SettlePolicy, SettledFrame, TerminalDriver, TerminalSnapshot,
 };
 use crate::testkit::session::{
-    SessionIo, apply_env, prepare_posix_base_environment, snapshot_from_raw,
-    viewport_snapshot_from_raw,
+    POST_KILL_GRACE, SessionIo, apply_env, prepare_posix_base_environment, reap_child,
+    snapshot_from_raw, viewport_snapshot_from_raw,
 };
 
 /// Windows `ConPTY` driver using `portable-pty` 0.9.0 `ConPtySystem`.
@@ -137,6 +137,10 @@ impl DriverSession for ConPtySession {
 
     fn close(mut self) -> Result<ExitStatus, DriverError> {
         self.ensure_open()?;
+        // Serve-mode children wait for the Ctrl+D terminator; offer it before
+        // closing the writer so a live child can exit itself instead of eating
+        // SIGKILL at the deadline (mirrors the POSIX close).
+        let _ = self.io.write_all(b"\n\x04");
         self.io.closed = true;
         self.io.close_writer();
         let mut child = self.child.take().ok_or(DriverError::Closed)?;
@@ -151,28 +155,14 @@ impl DriverSession for ConPtySession {
                     if let Err(err) = child.kill() {
                         break Err(err);
                     }
-                    let post_kill =
-                        std::time::Instant::now() + std::time::Duration::from_secs(2);
-                    let mut outcome = Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "conpty child did not exit after kill",
-                    ));
-                    while std::time::Instant::now() < post_kill {
-                        match child.try_wait() {
-                            Ok(Some(status)) => {
-                                outcome = Ok(status);
-                                break;
-                            }
-                            Err(err) => {
-                                outcome = Err(err);
-                                break;
-                            }
-                            Ok(None) => {
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                            }
-                        }
-                    }
-                    break outcome;
+                    break match reap_child(&mut child, POST_KILL_GRACE) {
+                        Ok(Some(status)) => Ok(status),
+                        Ok(None) => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "conpty child did not exit after kill",
+                        )),
+                        Err(err) => Err(err),
+                    };
                 }
                 Err(err) => break Err(err),
             }
@@ -183,9 +173,12 @@ impl DriverSession for ConPtySession {
                 format!("conpty child wait failed: {err}"),
             ))
         });
+        // Shed before joining: on a post-kill timeout the reader may never see
+        // EOF either, so returning here lets Drop detach it. Only a reaped
+        // child reaches the join below.
+        let status = wait_result?;
         let _ = child.kill();
         let join_result = self.io.join_readers();
-        let status = wait_result?;
         join_result?;
         Ok(status.into())
     }
@@ -257,9 +250,12 @@ impl Drop for ConPtySession {
             self.io.close_writer();
             if let Some(mut child) = self.child.take() {
                 let _ = child.kill();
-                let _ = child.wait();
+                // Drop cannot report: reap bounded, then join only a reaped
+                // child. On timeout the reader detaches in SessionIo::drop.
+                if matches!(reap_child(&mut child, POST_KILL_GRACE), Ok(Some(_))) {
+                    let _ = self.io.join_readers();
+                }
             }
-            let _ = self.io.join_readers();
         }
     }
 }
