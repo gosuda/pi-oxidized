@@ -153,7 +153,14 @@ impl DriverSession for ConPtySession {
                 }
                 Ok(None) => {
                     if let Err(err) = child.kill() {
-                        break Err(err);
+                        // Race: the child may have exited between the last
+                        // try_wait and the kill (Windows has no std guarantee
+                        // for kill on an exited process). Reap the winner
+                        // instead of reporting a wait failure.
+                        break match child.try_wait() {
+                            Ok(Some(status)) => Ok(status),
+                            _ => Err(err),
+                        };
                     }
                     break match reap_child(&mut child, POST_KILL_GRACE) {
                         Ok(Some(status)) => Ok(status),
