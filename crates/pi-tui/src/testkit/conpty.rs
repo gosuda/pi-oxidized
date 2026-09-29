@@ -148,8 +148,31 @@ impl DriverSession for ConPtySession {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Ok(None) => {
-                    let _ = child.kill();
-                    break child.wait();
+                    if let Err(err) = child.kill() {
+                        break Err(err);
+                    }
+                    let post_kill =
+                        std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    let mut outcome = Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "conpty child did not exit after kill",
+                    ));
+                    while std::time::Instant::now() < post_kill {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                outcome = Ok(status);
+                                break;
+                            }
+                            Err(err) => {
+                                outcome = Err(err);
+                                break;
+                            }
+                            Ok(None) => {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                        }
+                    }
+                    break outcome;
                 }
                 Err(err) => break Err(err),
             }

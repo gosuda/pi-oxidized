@@ -202,7 +202,28 @@ impl DriverSession for PosixPtySession {
                 Ok(None) => {
                     self.kill_session();
                     let mut child = self.child.take().ok_or(DriverError::Closed)?;
-                    break child.wait();
+                    let post_kill =
+                        std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    let mut outcome = Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "posix pty child did not exit after kill",
+                    ));
+                    while std::time::Instant::now() < post_kill {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                outcome = Ok(status);
+                                break;
+                            }
+                            Err(err) => {
+                                outcome = Err(err);
+                                break;
+                            }
+                            Ok(None) => {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                        }
+                    }
+                    break outcome;
                 }
                 Err(err) => break Err(err),
             }
