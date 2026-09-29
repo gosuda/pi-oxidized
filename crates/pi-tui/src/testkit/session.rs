@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use avt::Vt;
+use portable_pty::Child;
 
 use super::profile::CapabilityProfile;
 use crate::testkit::driver::{
@@ -507,6 +508,54 @@ impl ReaderPump {
             None => Ok(()),
         }
     }
+
+    /// Joins every reader thread within one shared `grace` deadline,
+    /// surfacing the first panic as an I/O error and detaching any
+    /// thread still blocked at expiry.
+    ///
+    /// A reaped child does not guarantee PTY EOF: a descendant holding
+    /// the console or slave end open keeps the reader blocked, so an
+    /// unbounded join could hang session teardown forever. A detached
+    /// reader still unblocks when its pipe finally EOFs or the process
+    /// exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error on a reader panic (joined before expiry) or
+    /// a `TimedOut` error when any thread survived the deadline.
+    pub(crate) fn join_bounded(&mut self, grace: Duration) -> Result<(), DriverError> {
+        let deadline = Instant::now() + grace;
+        let mut detached = false;
+        let mut first_err: Option<DriverError> = None;
+        for join in self.joins.drain(..) {
+            while !join.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if !join.is_finished() {
+                // Dropping the handle detaches the thread.
+                detached = true;
+                continue;
+            }
+            if let Err(panic) = join.join() {
+                let msg = panic_message(&panic);
+                if first_err.is_none() {
+                    first_err = Some(DriverError::Io(std::io::Error::other(format!(
+                        "reader thread panicked: {msg}"
+                    ))));
+                }
+            }
+        }
+        if detached {
+            return Err(DriverError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "reader thread did not exit within grace",
+            )));
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
 }
 
 fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
@@ -614,6 +663,60 @@ impl SessionIo {
             Ok(())
         }
     }
+
+    /// Bounded variant of [`Self::join_readers`]: reader threads still
+    /// blocked past `grace` detach instead of hanging the caller.
+    pub(crate) fn join_readers_bounded(&mut self, grace: Duration) -> Result<(), DriverError> {
+        if let Some(mut pump) = self.pump.take() {
+            pump.join_bounded(grace)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Post-kill grace before a reap gives up instead of blocking.
+pub(crate) const POST_KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// Bounded reap shared by explicit close and Drop paths.
+///
+/// Kills stay the caller's job: explicit close reports the kill result,
+/// Drop is best-effort. Polls `try_wait` until `grace` elapses: `Ok(Some)`
+/// on exit, the `try_wait` error on failure, `Ok(None)` on timeout. A
+/// `None` means shed, not retry: after SIGKILL the only unbounded case is
+/// D-state exit, and a test harness must not block on it.
+pub(crate) fn reap_child(
+    child: &mut Box<dyn Child + Send + Sync>,
+    grace: Duration,
+) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Err(err) => return Err(err),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => return Ok(None),
+        }
+    }
+}
+
+/// Grace for reader threads to see EOF after the child is reaped. A
+/// descendant that outlives the direct child can hold the console or
+/// slave end open, so the join is bounded like the reap: on expiry the
+/// remaining handles drop, detaching threads that then exit with the
+/// process or when the pipe finally EOFs.
+pub(crate) const READER_JOIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Hands a possibly-live child to a detached reaper thread so a late
+/// exit is still waited. Dropping the only handle after a failed bounded
+/// reap would orphan a zombie once the process dies; for an already
+/// reaped child the wait returns immediately.
+pub(crate) fn shed_to_reaper(mut child: Box<dyn Child + Send + Sync>) {
+    let _ = thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 impl Drop for SessionIo {
@@ -747,6 +850,56 @@ fn build_snapshot(raw: &[u8], geometry: Geometry, viewport_only: bool) -> Termin
     }
 }
 
+const PARENT_ENV_ALLOWLIST: &[&str] = &["PATH", "TMPDIR", "TEMP", "LANG", "LC_ALL", "SystemRoot"];
+
+fn seed_clean_parent_env(
+    spec: &crate::testkit::driver::LaunchSpec,
+    mut set_env: impl FnMut(&str, std::ffi::OsString),
+) {
+    for &key in PARENT_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(key) {
+            set_env(key, value);
+        }
+    }
+    let home = spec
+        .env
+        .get("HOME")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("HOME"));
+    let Some(home) = home else { return };
+    if !spec.env.contains_key("HOME") {
+        set_env("HOME", home.clone());
+    }
+    // Windows dependencies resolve profile dirs through USERPROFILE and
+    // the AppData roots, which env_clear wipes while launch specs
+    // sandbox only HOME; mirror the effective home onto them so a child
+    // cannot fall back to the real user profile. Spec overlays still
+    // win via apply_env. On Unix those vars are meaningless.
+    if cfg!(windows) {
+        if !spec.env.contains_key("USERPROFILE") {
+            set_env("USERPROFILE", home.clone());
+        }
+        let appdata = std::path::PathBuf::from(&home).join("AppData");
+        if !spec.env.contains_key("APPDATA") {
+            set_env("APPDATA", appdata.join("Roaming").into_os_string());
+        }
+        if !spec.env.contains_key("LOCALAPPDATA") {
+            set_env("LOCALAPPDATA", appdata.join("Local").into_os_string());
+        }
+    }
+}
+
+pub(crate) fn prepare_posix_base_environment(
+    cmd: &mut portable_pty::CommandBuilder,
+    spec: &crate::testkit::driver::LaunchSpec,
+) {
+    cmd.env_clear();
+    cmd.env("SHELL", "");
+    seed_clean_parent_env(spec, |key, value| {
+        cmd.env(key, value);
+    });
+}
+
 /// Applies profile env then launch-spec overlays onto a portable-pty command.
 pub(crate) fn apply_env(
     cmd: &mut portable_pty::CommandBuilder,
@@ -781,6 +934,65 @@ mod tests {
         CanonicalEvent, EventKind, OutputCanon, RowId, RowTier, RunnerRow, Scenario,
         TimingEnvelope, TranscriptMode,
     };
+
+    #[test]
+    fn posix_base_environment_applies_allowlist_and_overlays() {
+        let make_spec = |env| crate::testkit::driver::LaunchSpec {
+            argv: vec!["fixture".to_owned()],
+            cwd: std::path::PathBuf::from("."),
+            env,
+            geometry: Geometry { cols: 80, rows: 24 },
+            profile: CapabilityProfile::Xterm256ColorTruecolor,
+        };
+        let spec = make_spec(std::collections::BTreeMap::from([
+            ("HOME".to_owned(), "sandbox-home".to_owned()),
+            ("PI_TUI_ENV_OVERLAY".to_owned(), "overlay".to_owned()),
+        ]));
+        let mut clean = portable_pty::CommandBuilder::from_argv(vec!["fixture".into()]);
+        clean.env("ANTHROPIC_API_KEY", "ambient-secret");
+        prepare_posix_base_environment(&mut clean, &spec);
+        apply_env(&mut clean, &spec);
+
+        assert_eq!(clean.get_env("ANTHROPIC_API_KEY"), None);
+        for &key in PARENT_ENV_ALLOWLIST {
+            assert_eq!(
+                clean.get_env(key),
+                std::env::var_os(key).as_deref(),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            clean.get_env("HOME"),
+            Some(std::ffi::OsStr::new("sandbox-home"))
+        );
+        assert_eq!(
+            clean.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
+        assert_eq!(
+            clean.get_env("PI_TUI_ENV_OVERLAY"),
+            Some(std::ffi::OsStr::new("overlay"))
+        );
+        assert_eq!(clean.get_env("SHELL"), Some(std::ffi::OsStr::new("")));
+
+        let inherited_spec = make_spec(std::collections::BTreeMap::new());
+        let mut inherited = portable_pty::CommandBuilder::from_argv(vec!["fixture".into()]);
+        inherited.env("ANTHROPIC_API_KEY", "ambient-secret");
+        apply_env(&mut inherited, &inherited_spec);
+        assert_eq!(
+            inherited.get_env("ANTHROPIC_API_KEY"),
+            Some(std::ffi::OsStr::new("ambient-secret"))
+        );
+
+        let parent_home_spec = make_spec(std::collections::BTreeMap::new());
+        let mut parent_home = portable_pty::CommandBuilder::from_argv(vec!["fixture".into()]);
+        prepare_posix_base_environment(&mut parent_home, &parent_home_spec);
+        apply_env(&mut parent_home, &parent_home_spec);
+        assert_eq!(
+            parent_home.get_env("HOME"),
+            std::env::var_os("HOME").as_deref()
+        );
+    }
 
     #[derive(Default)]
     struct FakeDriver {

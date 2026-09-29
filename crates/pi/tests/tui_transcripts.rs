@@ -520,11 +520,11 @@ fn observed_claims(raw: &[u8], saw_snapshot: bool) -> Vec<ClaimClass> {
 fn open_driver(spec: &LaunchSpec) -> Result<HostSession, CorpusError> {
     #[cfg(unix)]
     {
-        Ok(PosixPtyDriver.open(spec)?)
+        Ok(PosixPtyDriver::open_clean(spec)?)
     }
     #[cfg(windows)]
     {
-        Ok(ConPtyDriver.open(spec)?)
+        Ok(ConPtyDriver::open_clean(spec)?)
     }
 }
 

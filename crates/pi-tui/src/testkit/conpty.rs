@@ -11,21 +11,31 @@ use crate::testkit::driver::{
     SettlePolicy, SettledFrame, TerminalDriver, TerminalSnapshot,
 };
 use crate::testkit::session::{
-    SessionIo, apply_env, snapshot_from_raw, viewport_snapshot_from_raw,
+    POST_KILL_GRACE, READER_JOIN_GRACE, SessionIo, apply_env, prepare_posix_base_environment,
+    reap_child, shed_to_reaper, snapshot_from_raw, viewport_snapshot_from_raw,
 };
 
 /// Windows `ConPTY` driver using `portable-pty` 0.9.0 `ConPtySystem`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConPtyDriver;
 
-impl TerminalDriver for ConPtyDriver {
-    type Session = ConPtySession;
-
-    fn kind(&self) -> DriverKind {
-        DriverKind::ConPty
+impl ConPtyDriver {
+    /// Opens a `ConPTY` with the documented clean-environment contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the launch spec is invalid or the PTY cannot be opened.
+    pub fn open_clean(spec: &LaunchSpec) -> Result<ConPtySession, DriverError> {
+        Self::open_with_env(spec, |cmd, spec| {
+            prepare_posix_base_environment(cmd, spec);
+            apply_env(cmd, spec);
+        })
     }
 
-    fn open(&self, spec: &LaunchSpec) -> Result<Self::Session, DriverError> {
+    fn open_with_env(
+        spec: &LaunchSpec,
+        configure_env: impl FnOnce(&mut CommandBuilder, &LaunchSpec),
+    ) -> Result<ConPtySession, DriverError> {
         spec.validate()?;
         let system = ConPtySystem::default();
         let pair = system
@@ -43,7 +53,7 @@ impl TerminalDriver for ConPtyDriver {
         }
         let mut cmd = CommandBuilder::from_argv(argv);
         cmd.cwd(&spec.cwd);
-        apply_env(&mut cmd, spec);
+        configure_env(&mut cmd, spec);
 
         let child = pair
             .slave
@@ -71,7 +81,7 @@ impl TerminalDriver for ConPtyDriver {
             spec.profile,
         );
         Ok(ConPtySession {
-            master: pair.master,
+            master: Some(pair.master),
             child: Some(child),
             io: SessionIo::new(Box::new(shared), pump),
             geometry: spec.geometry,
@@ -79,9 +89,21 @@ impl TerminalDriver for ConPtyDriver {
     }
 }
 
+impl TerminalDriver for ConPtyDriver {
+    type Session = ConPtySession;
+
+    fn kind(&self) -> DriverKind {
+        DriverKind::ConPty
+    }
+
+    fn open(&self, spec: &LaunchSpec) -> Result<Self::Session, DriverError> {
+        Self::open_with_env(spec, apply_env)
+    }
+}
+
 /// Render-capable `ConPTY` session.
 pub struct ConPtySession {
-    master: Box<dyn MasterPty + Send>,
+    master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     io: SessionIo,
     geometry: Geometry,
@@ -115,18 +137,64 @@ impl DriverSession for ConPtySession {
 
     fn close(mut self) -> Result<ExitStatus, DriverError> {
         self.ensure_open()?;
+        // Serve-mode children wait for the Ctrl+D terminator; offer it before
+        // closing the writer so a live child can exit itself instead of eating
+        // SIGKILL at the deadline (mirrors the POSIX close).
+        let _ = self.io.write_all(b"\n\x04");
         self.io.closed = true;
-        // Writer EOF first, then wait for the child, then join the reader.
         self.io.close_writer();
         let mut child = self.child.take().ok_or(DriverError::Closed)?;
-        let wait_result = child.wait().map_err(|err| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let wait_result = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    if let Err(err) = child.kill() {
+                        // Race: the child may have exited between the last
+                        // try_wait and the kill (Windows has no std guarantee
+                        // for kill on an exited process). Reap the winner
+                        // instead of reporting a wait failure.
+                        break match child.try_wait() {
+                            Ok(Some(status)) => Ok(status),
+                            _ => Err(err),
+                        };
+                    }
+                    break match reap_child(&mut child, POST_KILL_GRACE) {
+                        Ok(Some(status)) => Ok(status),
+                        Ok(None) => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "conpty child did not exit after kill",
+                        )),
+                        Err(err) => Err(err),
+                    };
+                }
+                Err(err) => break Err(err),
+            }
+        }
+        .map_err(|err| {
             DriverError::Io(std::io::Error::new(
                 err.kind(),
                 format!("conpty child wait failed: {err}"),
             ))
         });
-        let join_result = self.io.join_readers();
-        let status = wait_result?;
+        // Shed before joining: on a wait failure the reader may never see EOF
+        // either, so returning here lets Drop detach it. The handle moves to
+        // the detached reaper so a late exit is still waited, not zombied.
+        let status = match wait_result {
+            Ok(status) => status,
+            Err(err) => {
+                shed_to_reaper(child);
+                return Err(err);
+            }
+        };
+        let _ = child.kill();
+        // Closing the console terminates any attached descendants, giving the
+        // reader its EOF; the bounded join sheds whatever still lingers.
+        drop(self.master.take());
+        let join_result = self.io.join_readers_bounded(READER_JOIN_GRACE);
         join_result?;
         Ok(status.into())
     }
@@ -137,6 +205,8 @@ impl RenderSession for ConPtySession {
         self.ensure_open()?;
         let geometry = Geometry::new(cols, rows)?;
         self.master
+            .as_ref()
+            .ok_or(DriverError::Closed)?
             .resize(PtySize {
                 rows: geometry.rows,
                 cols: geometry.cols,
@@ -198,9 +268,16 @@ impl Drop for ConPtySession {
             self.io.close_writer();
             if let Some(mut child) = self.child.take() {
                 let _ = child.kill();
-                let _ = child.wait();
+                // Drop cannot report: reap bounded, then shed an unreaped
+                // handle to the detached reaper instead of zombifying it.
+                if !matches!(reap_child(&mut child, POST_KILL_GRACE), Ok(Some(_))) {
+                    shed_to_reaper(child);
+                }
             }
-            let _ = self.io.join_readers();
+            // Closing the console terminates attached descendants, giving the
+            // reader EOF; the bounded join sheds whatever still lingers.
+            drop(self.master.take());
+            let _ = self.io.join_readers_bounded(READER_JOIN_GRACE);
         }
     }
 }

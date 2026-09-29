@@ -17,21 +17,31 @@ use crate::testkit::driver::{
     SettlePolicy, SettledFrame, TerminalDriver, TerminalSnapshot,
 };
 use crate::testkit::session::{
-    SessionIo, apply_env, snapshot_from_raw, viewport_snapshot_from_raw,
+    POST_KILL_GRACE, READER_JOIN_GRACE, SessionIo, apply_env, prepare_posix_base_environment,
+    reap_child, shed_to_reaper, snapshot_from_raw, viewport_snapshot_from_raw,
 };
 
 /// POSIX PTY driver using `portable-pty`'s Unix backend.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PosixPtyDriver;
 
-impl TerminalDriver for PosixPtyDriver {
-    type Session = PosixPtySession;
-
-    fn kind(&self) -> DriverKind {
-        DriverKind::PosixPty
+impl PosixPtyDriver {
+    /// Opens a POSIX PTY with the documented clean-environment contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the launch spec is invalid or the PTY cannot be opened.
+    pub fn open_clean(spec: &LaunchSpec) -> Result<PosixPtySession, DriverError> {
+        Self::open_with_env(spec, |cmd, spec| {
+            prepare_posix_base_environment(cmd, spec);
+            apply_env(cmd, spec);
+        })
     }
 
-    fn open(&self, spec: &LaunchSpec) -> Result<Self::Session, DriverError> {
+    fn open_with_env(
+        spec: &LaunchSpec,
+        configure_env: impl FnOnce(&mut CommandBuilder, &LaunchSpec),
+    ) -> Result<PosixPtySession, DriverError> {
         spec.validate()?;
         let system = UnixPtySystem::default();
         let pair = system
@@ -49,7 +59,7 @@ impl TerminalDriver for PosixPtyDriver {
         }
         let mut cmd = CommandBuilder::from_argv(argv);
         cmd.cwd(&spec.cwd);
-        apply_env(&mut cmd, spec);
+        configure_env(&mut cmd, spec);
 
         disable_pty_echo(pair.master.as_ref())?;
         let child = pair
@@ -91,6 +101,18 @@ impl TerminalDriver for PosixPtyDriver {
             io: SessionIo::new(Box::new(shared), pump),
             geometry: spec.geometry,
         })
+    }
+}
+
+impl TerminalDriver for PosixPtyDriver {
+    type Session = PosixPtySession;
+
+    fn kind(&self) -> DriverKind {
+        DriverKind::PosixPty
+    }
+
+    fn open(&self, spec: &LaunchSpec) -> Result<Self::Session, DriverError> {
+        Self::open_with_env(spec, apply_env)
     }
 }
 
@@ -176,7 +198,15 @@ impl DriverSession for PosixPtySession {
                 }
                 Ok(None) => {
                     self.kill_session();
-                    break child.wait();
+                    let _ = child.kill();
+                    break match reap_child(&mut child, POST_KILL_GRACE) {
+                        Ok(Some(status)) => Ok(status),
+                        Ok(None) => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "posix pty child did not exit after kill",
+                        )),
+                        Err(err) => Err(err),
+                    };
                 }
                 Err(err) => break Err(err),
             }
@@ -187,11 +217,20 @@ impl DriverSession for PosixPtySession {
                 format!("posix pty child wait failed: {err}"),
             ))
         });
-        let join_result = self.io.join_readers();
-        let status = wait_result?;
-        join_result?;
-        // Reap leftover session members (extension host) after pi exits.
+        // Shed before joining: on a wait failure the reader may never see EOF
+        // either, so returning here lets Drop detach it. The handle moves to
+        // the detached reaper so a late exit is still waited, not zombied.
+        let status = match wait_result {
+            Ok(status) => status,
+            Err(err) => {
+                shed_to_reaper(child);
+                return Err(err);
+            }
+        };
         self.kill_session();
+        let _ = child.kill();
+        let join_result = self.io.join_readers_bounded(READER_JOIN_GRACE);
+        join_result?;
         Ok(status.into())
     }
 }
@@ -285,9 +324,14 @@ impl Drop for PosixPtySession {
         }
         self.kill_session();
         if let Some(mut child) = self.child.take() {
-            let _ = child.wait();
+            // Drop cannot report: reap bounded, then shed an unreaped handle
+            // to the detached reaper instead of zombifying it. The bounded
+            // join sheds whatever still lingers on the reader.
+            if !matches!(reap_child(&mut child, POST_KILL_GRACE), Ok(Some(_))) {
+                shed_to_reaper(child);
+            }
+            let _ = self.io.join_readers_bounded(READER_JOIN_GRACE);
         }
-        let _ = self.io.join_readers();
     }
 }
 
