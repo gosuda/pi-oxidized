@@ -71,9 +71,9 @@ struct Report {
     sync_begin: usize,
     sync_end: usize,
     txn_count: Option<u32>,
-    resize_seen: Option<u32>,
     live_paste: Option<u32>,
     live_cursor: Option<u32>,
+    live_resize: Option<u32>,
     live_text: Option<String>,
     cursor_restored: bool,
 }
@@ -289,9 +289,9 @@ impl Harness {
             sync_begin: audit.sync_begin,
             sync_end: audit.sync_end,
             txn_count: parse_sidechannel_u32(raw, b"PI_TUI_TXN_COUNT="),
-            resize_seen: parse_sidechannel_u32(raw, b"PI_TUI_RESIZE="),
             live_paste: parse_sidechannel_u32(raw, b"PI_TUI_LIVE_PASTE="),
             live_cursor: parse_sidechannel_u32(raw, b"PI_TUI_LIVE_CURSOR="),
+            live_resize: parse_sidechannel_u32(raw, b"PI_TUI_LIVE_RESIZE="),
             live_text: parse_sidechannel_text(raw, b"PI_TUI_LIVE_TEXT="),
             // Mode restore is guaranteed on every exit path (guard restore()
             // or Drop): bracketed paste is enabled unconditionally at
@@ -330,6 +330,14 @@ impl Report {
         if BYTE_TRANSPARENT_MASTER {
             assert_eq!(self.clear_2j, 0, "{what}: CSI 2J must never appear");
             assert_eq!(self.clear_3j, 0, "{what}: CSI 3J must never appear");
+            // Balanced sync holds on every exit path, not just success: an
+            // error unwind between the 2026h open and its close leaves the
+            // terminal swallowing everything that follows.
+            assert_eq!(
+                self.sync_begin, self.sync_end,
+                "{what}: synchronized output markers must balance ({}h vs {}l)",
+                self.sync_begin, self.sync_end
+            );
             assert!(
                 self.cursor_restored,
                 "{what}: no cursor-show/restore bytes on exit; tail={}",
@@ -338,7 +346,7 @@ impl Report {
         }
     }
 
-    /// Success-path additions: exit code 0 and a balanced sync envelope.
+    /// Success-path addition: exit code 0.
     fn assert_success_contract(&self, what: &str) {
         self.assert_wire_contract(what);
         assert!(
@@ -347,13 +355,6 @@ impl Report {
             self.exit_code,
             self.tail()
         );
-        if BYTE_TRANSPARENT_MASTER {
-            assert_eq!(
-                self.sync_begin, self.sync_end,
-                "{what}: synchronized output markers must balance ({}h vs {}l)",
-                self.sync_begin, self.sync_end
-            );
-        }
     }
 }
 
@@ -446,26 +447,24 @@ fn adversarial_degenerate_resize_geometry() {
     let mut h = Harness::spawn(&["--serve"]);
     h.wait_input_ready();
 
-    let mark = h.mark();
-    for (cols, rows) in [
-        (0u16, 0u16),
-        (1, 1),
-        (1, 24),
-        (80, 1),
-        (2, 2),
-        (1, 1),
-        (80, 24),
-    ] {
+    for (cols, rows) in [(0u16, 0u16), (1, 1), (1, 24), (80, 1), (2, 2), (1, 1)] {
         h.resize(cols, rows);
         h.pump(Duration::from_millis(60));
     }
+    // Drain earlier storm output, then mark immediately before the final
+    // restore so only the 80x24 reanchor commit can satisfy the repaint
+    // assertion — an earlier wide step must not mask a lost final resize.
+    h.pump(Duration::from_millis(150));
+    let mark = h.mark();
+    h.resize(INITIAL_COLS, INITIAL_ROWS);
+    h.pump(Duration::from_millis(120));
     h.send_ctrl_d();
     let report = h.finish();
 
     report.assert_success_contract("degenerate-resize");
     assert!(
-        report.resize_seen.unwrap_or(0) >= 1,
-        "degenerate-resize: no Resize event consumed during the storm; tail={}",
+        report.live_resize.unwrap_or(0) >= 1,
+        "degenerate-resize: no post-readiness Resize event consumed; tail={}",
         report.tail()
     );
     if BYTE_TRANSPARENT_MASTER {
@@ -475,7 +474,7 @@ fn adversarial_degenerate_resize_geometry() {
         assert!(
             find_subslice(&report.raw[mark..], b"FOOTER").is_some()
                 || find_subslice(&report.raw[mark..], b"STATUS").is_some(),
-            "degenerate-resize: no viewport repaint bytes after the geometry storm; tail={}",
+            "degenerate-resize: no viewport repaint bytes after the final 80x24 restore; tail={}",
             report.tail()
         );
     }
@@ -527,25 +526,24 @@ fn adversarial_giant_multibyte_paste() {
         &live_text[..live_text.len().min(64)]
     );
     if BYTE_TRANSPARENT_MASTER {
-        // Exact-tail and escaped-NFD provenance: POSIX delivers the payload
-        // as one Paste event so the escaped editor delta must end at the
-        // payload's literal end; ConPTY re-synthesizes it as key records and
-        // may drop the embedded controls before the tail arrives.
-        assert!(
-            live_text.ends_with("-GHOST-END"),
-            "giant-paste: payload tail truncated; escaped len={} tail={:?}",
-            live_text.len(),
-            &live_text[live_text.len().saturating_sub(64)..]
-        );
-        // `escape_default` renders the decomposed combining marks as \u{...}.
-        assert!(
-            live_text.contains("e\\u{301}o\\u{308}"),
-            "giant-paste: NFD tail mangled, expected escaped combining marks in {live_text:?}"
+        // Full-delta oracle, not head/tail sampling: replay the fixture's own
+        // normalization chain (paste CRLF -> LF, then control bytes -> space,
+        // then escape_default) and compare the complete editor delta, so any
+        // dropped chunk boundary or mangled byte in the middle fails.
+        let normalized = payload.replace("\r\n", "\n").replace('\r', "\n");
+        let sanitized: String = normalized
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        let expected: String = sanitized.escape_default().collect();
+        assert_eq!(
+            live_text, expected,
+            "giant-paste: editor delta diverged from normalize+sanitize+escape oracle"
         );
     } else {
         assert!(
-            live_text.contains("-GHOST-END"),
-            "giant-paste: payload tail missing on ConPTY, got {live_text:?}"
+            live_text.contains("GHOST-START-") && live_text.contains("-GHOST-END"),
+            "giant-paste: payload bounds missing on ConPTY, got {live_text:?}"
         );
     }
 }
@@ -678,9 +676,11 @@ fn adversarial_resize_mid_paste() {
         live_text.contains("FIRST-HALF-SECOND-HALF"),
         "resize-mid-paste: payload corrupted across the resize, got {live_text:?}"
     );
+    // PI_TUI_LIVE_RESIZE is the post-readiness delta, so the scripted
+    // prelude's 24 resizes cannot mask a mid-paste resize that never landed.
     assert!(
-        report.resize_seen.unwrap_or(0) >= 1,
-        "resize-mid-paste: resize event lost behind the paste"
+        report.live_resize.unwrap_or(0) >= 1,
+        "resize-mid-paste: live resize event lost behind the paste"
     );
 }
 
@@ -721,9 +721,14 @@ fn adversarial_resize_batch_storm_resolves_kernel_geometry() {
     let report = h.finish();
 
     report.assert_success_contract("resize-batch-storm");
-    assert!(
-        report.resize_seen.unwrap_or(0) >= 1,
-        "resize-batch-storm: batch never consumed a Resize event; tail={}",
+    // The batch consumes every resize notification but handle_event runs once
+    // on the last one, so the live delta is exactly one regardless of storm
+    // size.
+    assert_eq!(
+        report.live_resize,
+        Some(1),
+        "resize-batch-storm: batch must account exactly one Resize; got {:?}; tail={}",
+        report.live_resize,
         report.tail()
     );
     if BYTE_TRANSPARENT_MASTER {

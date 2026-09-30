@@ -603,6 +603,7 @@ async fn run_fixture(
         // observed INPUT_READY — never the scripted fallback counts above.
         let paste_baseline = root.paste_count;
         let cursor_baseline = root.cursor_moves;
+        let resize_baseline = root.resize_count;
         let editor_baseline = root.editor.len();
         {
             let mut out = io::stdout();
@@ -639,6 +640,9 @@ async fn run_fixture(
             root.cursor_moves
                 .checked_sub(cursor_baseline)
                 .ok_or_else(|| io::Error::other("live cursor counter decreased"))?,
+            root.resize_count
+                .checked_sub(resize_baseline)
+                .ok_or_else(|| io::Error::other("live resize counter decreased"))?,
             root.editor
                 .get(editor_baseline..)
                 .ok_or_else(|| io::Error::other("live editor text shrank"))?
@@ -659,10 +663,10 @@ async fn run_fixture(
             root.cursor_moves,
             root.resize_count
         );
-        if let Some((live_paste, live_cursor, live_text)) = live {
+        if let Some((live_paste, live_cursor, live_resize, live_text)) = live {
             let _ = write!(
                 summary,
-                "\x1b]999;PI_TUI_LIVE_PASTE={live_paste}\x07\x1b]999;PI_TUI_LIVE_CURSOR={live_cursor}\x07\x1b]999;PI_TUI_LIVE_TEXT={live_text}\x07"
+                "\x1b]999;PI_TUI_LIVE_PASTE={live_paste}\x07\x1b]999;PI_TUI_LIVE_CURSOR={live_cursor}\x07\x1b]999;PI_TUI_LIVE_RESIZE={live_resize}\x07\x1b]999;PI_TUI_LIVE_TEXT={live_text}\x07"
             );
             // Windows CI diagnostic: when neither a paste event nor its payload
             // arrived as keystrokes, publish the bounded escaped trace of every
