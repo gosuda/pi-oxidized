@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
 	"capturedAt": "2026-09-30",
-	"captureHead": "f28055307b6442dcbbf3dade73b21f440e6facf4",
-	"contentSha256": "6921d2fbfdda5009eb531c22c1571656cfbf3d7b417691fdec7f333661e6f347",
+	"captureHead": "02ba5491dcf01e181e1937f7f756a86c686f2ea2",
+	"contentSha256": "721d17d74d29c71c822dd9427251289aa47587e1168ad22cb276619802b974d1",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.98.0",
@@ -4156,7 +4156,7 @@
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/source/unix/parser.rs",
-					"sha256": "e4f3bcaa8c0dcef0209f112d4ef4fbd3e838615a5806ef1e828038c963a0d477"
+					"sha256": "ad8006b018072b055e834ac8bf827d7e960cd3955b6f9b53c2aeb3759e259973"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/source/unix/tty.rs",
