@@ -127,6 +127,27 @@ struct AutocompleteRequest {
     snapshot_col: usize,
     force: bool,
     explicit_tab: bool,
+    /// True once the product has taken the request snapshot for async
+    /// provider resolution via [`autocomplete_dispatch`].
+    dispatched: bool,
+}
+
+/// Snapshot of a started autocomplete request for async provider driving.
+/// The product feeds the provider's result back through
+/// [`Editor::complete_autocomplete_request`].
+pub struct AutocompleteDispatch {
+    /// Correlation id; must round-trip into `complete_autocomplete_request`.
+    pub request_id: u64,
+    /// Force flag captured at request time.
+    pub force: bool,
+    /// Explicit-Tab flag captured at request time.
+    pub explicit_tab: bool,
+    /// Editor buffer snapshot for `AutocompleteProvider::get_suggestions`.
+    pub lines: Vec<String>,
+    /// Cursor line at request time.
+    pub cursor_line: usize,
+    /// Cursor column at request time.
+    pub cursor_col: usize,
 }
 
 #[derive(Clone)]
@@ -368,6 +389,7 @@ impl Editor {
     pub fn autocomplete_due_in_ms(&self) -> Option<u64> {
         self.autocomplete_pending
             .as_ref()
+            .filter(|pending| !pending.dispatched)
             .map(|_| self.autocomplete_debounce_remaining_ms.unwrap_or(0))
     }
 
@@ -464,6 +486,34 @@ impl Editor {
     #[must_use]
     pub fn pending_autocomplete_request_id(&self) -> Option<u64> {
         self.autocomplete_pending.as_ref().map(|p| p.request_id)
+    }
+
+    /// Take the pending request's dispatch snapshot so the product can run
+    /// the provider off the event loop and feed the result into
+    /// [`complete_autocomplete_request`](Self::complete_autocomplete_request).
+    /// Returns `None` when no started request is outstanding or it was
+    /// already dispatched.
+    pub fn autocomplete_dispatch(&mut self) -> Option<AutocompleteDispatch> {
+        let pending = self.autocomplete_pending.as_mut()?;
+        if pending.dispatched || pending.request_id == 0 {
+            return None;
+        }
+        pending.dispatched = true;
+        Some(AutocompleteDispatch {
+            request_id: pending.request_id,
+            force: pending.force,
+            explicit_tab: pending.explicit_tab,
+            lines: self.state.lines.clone(),
+            cursor_line: pending.snapshot_line,
+            cursor_col: pending.snapshot_col,
+        })
+    }
+
+    /// Current autocomplete provider, if installed. Products spawn the
+    /// provider's suggestion future with this `Arc` off the event loop.
+    #[must_use]
+    pub fn autocomplete_provider(&self) -> Option<Arc<dyn AutocompleteProvider>> {
+        self.autocomplete_provider.clone()
     }
 
     // ------------------------------------------------------------------
@@ -770,6 +820,7 @@ impl Editor {
             snapshot_col: self.state.cursor_col,
             force,
             explicit_tab,
+            dispatched: false,
         });
 
         if debounce > 0 {

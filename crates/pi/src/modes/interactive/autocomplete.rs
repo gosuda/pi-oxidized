@@ -64,6 +64,9 @@ impl FsFileLister {
         if query.contains('/') {
             args.push("--full-path".to_owned());
         }
+        // `--` keeps a leading-hyphen query (e.g. `@-foo`) from being
+        // parsed as an option.
+        args.push("--".to_owned());
         if !query.is_empty() {
             args.push(query.to_owned());
         }
@@ -73,6 +76,11 @@ impl FsFileLister {
             .stderr(std::process::Stdio::null())
             .output()
             .ok()?;
+        // A failed `fd` (bad pattern, unreadable root) yields empty stdout;
+        // treat it as unavailable so the std-walk fallback still runs.
+        if !output.status.success() {
+            return None;
+        }
         let entries = String::from_utf8_lossy(&output.stdout)
             .lines()
             .map(|line| FileEntry {
@@ -96,7 +104,8 @@ impl FsFileLister {
                     return;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let is_directory = entry.file_type().is_ok_and(|t| t.is_dir());
+                let is_symlink = entry.file_type().is_ok_and(|t| t.is_symlink());
+                let is_directory = is_dir_entry(&entry);
                 let saved = prefix.len();
                 if !prefix.is_empty() {
                     prefix.push('/');
@@ -107,7 +116,12 @@ impl FsFileLister {
                         path: prefix.clone(),
                         is_directory: true,
                     });
-                    visit(&entry.path(), prefix, entries);
+                    // Symlinked dirs complete as directories but are not
+                    // recursed: a link cycle would spin the walk until the
+                    // entry cap without yielding new paths.
+                    if !is_symlink {
+                        visit(&entry.path(), prefix, entries);
+                    }
                 } else if !is_directory {
                     entries.push(FileEntry {
                         path: prefix.clone(),
@@ -123,6 +137,15 @@ impl FsFileLister {
     }
 }
 
+/// Directory check that follows symlinks: `DirEntry::file_type` reports the
+/// link itself, so a symlink-to-directory needs the target stat.
+fn is_dir_entry(entry: &std::fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(t) => t.is_dir() || (t.is_symlink() && entry.path().is_dir()),
+        Err(_) => false,
+    }
+}
+
 impl FileLister for FsFileLister {
     fn list_dir(&self, dir: &Path) -> Vec<FileEntry> {
         let Ok(read_dir) = std::fs::read_dir(dir) else {
@@ -132,7 +155,7 @@ impl FileLister for FsFileLister {
             .flatten()
             .map(|entry| FileEntry {
                 path: entry.file_name().to_string_lossy().into_owned(),
-                is_directory: entry.file_type().is_ok_and(|t| t.is_dir()),
+                is_directory: is_dir_entry(&entry),
             })
             .collect()
     }

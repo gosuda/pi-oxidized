@@ -56,6 +56,7 @@ use pi_tui::alt_screen::{
 };
 use pi_tui::component::{Component, EventResult, UiEvent};
 use pi_tui::components::editor::{BorderActivity, Editor, EditorOptions};
+use pi_tui::editor_support::{AutocompleteSuggestions, SuggestionOptions};
 use pi_tui::focus::Focusable;
 use pi_tui::keys::{
     ParsedKeyId, encode_key_event, key_matches_parsed, parse_key_id, set_kitty_protocol_active,
@@ -942,6 +943,10 @@ struct InteractiveRoot {
     selector: Option<Box<dyn Component>>,
     dialog_title: Option<Box<dyn Component>>,
     focus: FocusArea,
+    /// Inline viewport height (the terminal-analog frame that extension
+    /// overlay specs resolve against). 0 = unknown; falls back to the
+    /// render area height in tests.
+    viewport_height: u16,
 }
 
 impl InteractiveRoot {
@@ -966,6 +971,7 @@ impl InteractiveRoot {
             selector,
             dialog_title: None,
             focus: view.focus,
+            viewport_height: 0,
         }
     }
 
@@ -1029,6 +1035,7 @@ impl InteractiveRoot {
             selector,
             dialog_title,
             focus: view.focus,
+            viewport_height: 0,
         }
     }
 
@@ -1186,20 +1193,18 @@ fn render_bottom_clipped(
 }
 
 /// Render an overlay component. Extension overlays (with a spec) resolve
-/// against the transcript band so a centered overlay can never paint over
-/// dialog chrome in the dock; native overlays keep the full-frame band.
+/// against `overlay_frame` — the whole viewport, matching the TypeScript
+/// `resolveOverlayLayout(options, h, termWidth, termHeight)` semantics where
+/// percent rows, margins, and anchors are terminal-relative. Native overlays
+/// (no spec) keep the measured band at the render origin.
 fn render_overlay(
     overlay: &mut dyn Component,
     spec: Option<&pi_tui::layout::OverlaySpec>,
     area: Rect,
-    transcript_area: Rect,
+    overlay_frame: Rect,
     buf: &mut Buffer,
 ) {
-    let layout_area = if spec.is_some() {
-        transcript_area
-    } else {
-        area
-    };
+    let layout_area = if spec.is_some() { overlay_frame } else { area };
     let measured = overlay.measure(layout_area.width).min(layout_area.height);
     let rect = overlay_rect(spec, measured, layout_area);
     if rect.height > 0 {
@@ -1292,10 +1297,6 @@ impl Component for InteractiveRoot {
             y = y.saturating_add(height);
         }
 
-        // Everything below this point is the dock (dialog/editor, post
-        // sections). Extension overlays resolve against the transcript band
-        // above it so a centered overlay can never paint over dialog chrome.
-        let transcript_bottom = y;
         let height = middle_height.min(bottom.saturating_sub(y));
         if height > 0 {
             self.render_middle(area, y, height, title_height, buf);
@@ -1316,16 +1317,21 @@ impl Component for InteractiveRoot {
             y = y.saturating_add(height);
         }
         if let Some(overlay) = self.overlay.as_mut() {
+            // Spec'd extension overlays resolve against the whole inline
+            // viewport (`render` only receives the content-height slice), so
+            // a centered overlay lands mid-viewport like the TypeScript
+            // `termHeight`-relative geometry instead of over the dock.
+            let overlay_frame = Rect::new(
+                area.x,
+                area.y,
+                area.width,
+                area.height.max(self.viewport_height),
+            );
             render_overlay(
                 overlay.as_mut(),
                 self.overlay_spec.as_ref(),
                 area,
-                Rect::new(
-                    area.x,
-                    area.y,
-                    area.width,
-                    transcript_bottom.saturating_sub(area.y),
-                ),
+                overlay_frame,
                 buf,
             );
         }
@@ -1544,7 +1550,7 @@ impl Component for FullscreenRoot {
                 overlay.as_mut(),
                 self.overlay_spec.as_ref(),
                 area,
-                self.transcript_area,
+                area,
                 buf,
             );
         }
@@ -1799,6 +1805,10 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     submit_rx: mpsc::UnboundedReceiver<String>,
     /// Sender retained so the editor callback stays valid across rebuilds.
     submit_tx: mpsc::UnboundedSender<String>,
+    /// Autocomplete provider results returning from the blocking pool
+    /// (`request_id`, suggestions, `force`, `explicit_tab`).
+    autocomplete_rx: mpsc::UnboundedReceiver<(u64, Option<AutocompleteSuggestions>, bool, bool)>,
+    autocomplete_tx: mpsc::UnboundedSender<(u64, Option<AutocompleteSuggestions>, bool, bool)>,
     /// Pending selector confirm values.
     select_rx: mpsc::UnboundedReceiver<(super::state::SelectorKind, String)>,
     select_tx: mpsc::UnboundedSender<(super::state::SelectorKind, String)>,
@@ -2328,6 +2338,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let (extension_action_tx, extension_action_rx) = mpsc::unbounded_channel();
         let (session_rebind_tx, session_rebind_rx) = mpsc::unbounded_channel();
         let session_rebind_signal = Arc::new(SessionRebindSignal::new(session_rebind_tx));
+        let (autocomplete_tx, autocomplete_rx) = mpsc::unbounded_channel();
 
         let mut editor = build_initial_editor(options, submit_tx.clone());
         super::autocomplete::refresh_autocomplete(&mut editor, &session);
@@ -2419,6 +2430,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             active_selector_kind: None,
             submit_rx,
             submit_tx,
+            autocomplete_rx,
+            autocomplete_tx,
             requested_screen_mode: None,
             pending_fullscreen_evictions: Vec::new(),
             select_rx,
@@ -2810,10 +2823,20 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 () = tokio::time::sleep(autocomplete_wait) => {
                     self.autocomplete_deadline = None;
                     self.editor.tick_autocomplete_debounce(u64::MAX);
-                    if matches!(
-                        self.editor.poll_autocomplete_now(),
-                        EventResult::Render | EventResult::Consumed
-                    ) && let Err(err) = self.paint_frame()
+                    self.drive_editor_autocomplete();
+                }
+                completion = self.autocomplete_rx.recv() => {
+                    if let Some((request_id, suggestions, force, explicit_tab)) = completion
+                        && matches!(
+                            self.editor.complete_autocomplete_request(
+                                request_id,
+                                suggestions,
+                                force,
+                                explicit_tab,
+                            ),
+                            EventResult::Render | EventResult::Consumed
+                        )
+                        && let Err(err) = self.paint_frame()
                     {
                         self.fail_io(&err);
                     }
@@ -2908,16 +2931,19 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             })
     }
 
-    /// Drive the editor's pending autocomplete request: complete a request
-    /// that is due now, or arm the loop deadline while its debounce is still
-    /// counting down. Returns true when the editor changed and needs a
-    /// repaint.
+    /// Drive the editor's pending autocomplete request: dispatch a due
+    /// request to the blocking pool, or arm the loop deadline while its
+    /// debounce is still counting down. Returns true when the editor
+    /// changed and needs a repaint (never for a dispatch — completions
+    /// re-enter through `autocomplete_rx` and paint there).
     fn drive_editor_autocomplete(&mut self) -> bool {
         match self.editor.autocomplete_due_in_ms() {
-            Some(0) => matches!(
-                self.editor.poll_autocomplete_now(),
-                EventResult::Render | EventResult::Consumed
-            ),
+            Some(0) => {
+                if let Some(dispatch) = self.editor.autocomplete_dispatch() {
+                    self.spawn_autocomplete_call(dispatch);
+                }
+                false
+            }
             Some(ms) => {
                 self.autocomplete_deadline = Some(Instant::now() + Duration::from_millis(ms));
                 false
@@ -2927,6 +2953,35 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 false
             }
         }
+    }
+
+    /// Run a started autocomplete request's provider call off the event
+    /// loop: `fd`/`walk_fs` latency must not stall keys, repaints, or
+    /// shutdown. The result re-enters through `autocomplete_rx`; the
+    /// editor's request-id + buffer-snapshot checks drop stale completions.
+    fn spawn_autocomplete_call(&self, dispatch: pi_tui::components::editor::AutocompleteDispatch) {
+        let Some(provider) = self.editor.autocomplete_provider() else {
+            return;
+        };
+        let tx = self.autocomplete_tx.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let suggestions = handle.block_on(provider.get_suggestions(
+                &dispatch.lines,
+                dispatch.cursor_line,
+                dispatch.cursor_col,
+                SuggestionOptions {
+                    force: dispatch.force,
+                    request_token: dispatch.request_id,
+                },
+            ));
+            let _ = tx.send((
+                dispatch.request_id,
+                suggestions,
+                dispatch.force,
+                dispatch.explicit_tab,
+            ));
+        });
     }
 
     /// Single reset point for the spinner clock.
@@ -7311,14 +7366,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 0,
             )) as Box<dyn Component>
         });
-        InteractiveRoot::build_with_chat(
+        let mut root = InteractiveRoot::build_with_chat(
             &mut self.view,
             editor,
             selector,
             dialog_title,
             prefix,
             tail,
-        )
+        );
+        root.viewport_height = self.tui.viewport_height();
+        root
     }
 
     fn recover_root(&mut self, mut root: InteractiveRoot) {
