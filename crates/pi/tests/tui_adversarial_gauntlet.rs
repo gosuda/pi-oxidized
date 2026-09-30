@@ -15,6 +15,15 @@
 //! reflow under resizes, boundary-width composer text, and
 //! whitespace-only submits.
 //!
+//! A third wave pushes harder on combined vectors and protocol spoofing:
+//! kill-ring/undo/word-motion internals under flood, terminal replies
+//! injected as keystrokes (cursor reports, DA/kitty/XTVersion answers, OSC
+//! replies), SGR mouse and focus-event floods, key aliasing edges
+//! (ctrl+j newline vs ctrl+m submit), a 4 KiB single-line composer,
+//! binary control bytes inside bracketed paste, a queued prompt submitted
+//! from an open paste mid-stream, a selector opened mid-stream, and a
+//! sustained interleaved-everything pressure loop.
+//!
 //! Assertions are liveness/correctness only (no canonical digests): each
 //! scenario must keep the composer responsive, converge the screen to a
 //! sane state, and exit 0. Every settle is predicate-then-quiescence —
@@ -291,6 +300,14 @@ impl ProductRun {
     fn write_input(&mut self, bytes: &[u8]) -> Result<(), AdvError> {
         self.session_mut()?.write(bytes)?;
         Ok(())
+    }
+
+    /// Widen the quiescence deadline for scenarios that legitimately emit
+    //  output for longer than the default policy (e.g. a typed-flood drain).
+    fn settle_budget(&mut self, max: Duration) {
+        if let Ok(policy) = SettlePolicy::new(self.policy.quiet, max) {
+            self.policy = policy;
+        }
     }
 
     fn send_line(&mut self, line: &str) -> Result<(), AdvError> {
@@ -1058,6 +1075,326 @@ fn scenario_whitespace_submit() -> Result<(), AdvError> {
     run.close_assert(scenario)
 }
 
+/// Kill-ring round trip under flood: ctrl+a + ctrl+k kills the line into
+/// the ring, ctrl+y yanks it back, alt+y pops (single entry — may keep or
+/// clear), ctrl+u kills whatever remains, ctrl+y re-yanks. Either pop
+/// semantics restores "ring text": if alt+y kept the line, ctrl+u pushed
+/// it and ctrl+y yanks it; if alt+y cleared the composer, ctrl+u pushed
+/// nothing and ctrl+y yanks the original kill.
+fn scenario_kill_yank() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-kill-yank";
+
+    run.write_input(b"ring text")?;
+    run.write_input(b"\x01")?; // ctrl+a — line start
+    run.write_input(b"\x0b")?; // ctrl+k — kill to end
+    run.write_input(b"\x19")?; // ctrl+y — yank
+    let _ = run.settle_screen(|s| screen_has(s, "ring text"))?;
+    run.write_input(b"\x1by")?; // alt+y — yank pop
+    run.write_input(b"\x15")?; // ctrl+u — kill to start
+    run.write_input(b"\x19")?; // ctrl+y — yank
+    let _ = run.settle_screen(|s| screen_has(s, "ring text"))?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Editor motions under flood: alt+word jumps, home/end, word delete, and
+/// a ctrl+j embedded newline which must insert — not submit — before the
+/// real Enter does.
+fn scenario_editor_motions() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-editor-motions";
+
+    run.write_input(b"foo bar baz")?;
+    run.write_input(b"\x1bb\x1bb")?; // alt+b twice — word left
+    run.write_input(b"\x1bf")?; // alt+f — word right
+    run.write_input(b"\x01")?; // ctrl+a — line start
+    run.write_input(b"\x05")?; // ctrl+e — line end
+    run.write_input(b"\x17")?; // ctrl+w — delete word backward ("baz")
+    run.write_input(b"\x0a")?; // ctrl+j — newline insert, not submit
+    run.write_input(b"line2")?;
+    let _ = run.settle_screen(|s| screen_has(s, "line2"))?;
+    let snapshot = run.settle_screen(|_| true)?;
+    if screen_has(&snapshot, FINAL_MARKER) || screen_has(&snapshot, "esc to cancel") {
+        return Err(AdvError::Assert(format!(
+            "{scenario}: ctrl+j submitted instead of inserting a newline; screen:\n{}",
+            snapshot.lines.join("\n")
+        )));
+    }
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Terminal query replies injected as keystrokes: cursor-position reports,
+/// primary DA, kitty keyboard flags, `XTVersion`, an OSC 11 colour reply, and
+/// a window-op reply. They are answers the terminal would send — the input
+/// layer must consume them without leaking bytes into the composer.
+fn scenario_reply_spoof() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-reply-spoof";
+
+    let replies: &[&[u8]] = &[
+        b"\x1b[1;1R",                        // cursor position report
+        b"\x1b[12;34R",                      // cursor position report, wide
+        b"\x1b[?62;4;22c",                   // primary device attributes
+        b"\x1b[?1u",                         // kitty keyboard flags report
+        b"\x1b[>0;276;0c",                   // XTVersion reply
+        b"\x1b]11;rgb:0101/0202/0303\x1b\\", // OSC 11 reply (ST terminator)
+        b"\x1b[4;24;80t",                    // window-op text-area reply
+    ];
+    for reply in replies {
+        run.write_input(reply)?;
+    }
+    let snapshot = run.settle_screen(|_| true)?;
+    for needle in ["1;1R", "12;34", "62;4", "276", "0101/0202"] {
+        if screen_has(&snapshot, needle) {
+            return Err(AdvError::Assert(format!(
+                "{scenario}: terminal reply bytes leaked to screen ({needle}); screen:\n{}",
+                snapshot.lines.join("\n")
+            )));
+        }
+    }
+    run.settle_ready()?;
+    run.prove_editor_focus(scenario, "spooffocus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// SGR mouse reports and focus in/out events flooded as input. Mouse events
+/// are routed UI events; they must not corrupt the composer or wedge the
+/// frame — and must not leave the app interpreting them as keystrokes.
+fn scenario_mouse_focus_flood() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-mouse-focus";
+
+    let events: &[&[u8]] = &[
+        b"\x1b[<0;10;5M",  // left press
+        b"\x1b[<0;10;5m",  // left release
+        b"\x1b[<32;15;6M", // drag
+        b"\x1b[<32;25;9M",
+        b"\x1b[<35;30;12M", // motion, no button
+        b"\x1b[<64;20;8M",  // wheel up
+        b"\x1b[<65;20;8M",  // wheel down
+        b"\x1b[<3;79;23M",  // right press far corner
+        b"\x1b[<3;79;23m",
+        b"\x1b[I", // focus in
+        b"\x1b[O", // focus out
+        b"\x1b[I",
+    ];
+    for event in events {
+        run.write_input(event)?;
+    }
+    let snapshot = run.settle_screen(|_| true)?;
+    for needle in ["<0;10;5", "<64;20;8", "79;23"] {
+        if screen_has(&snapshot, needle) {
+            return Err(AdvError::Assert(format!(
+                "{scenario}: mouse report leaked to screen ({needle}); screen:\n{}",
+                snapshot.lines.join("\n")
+            )));
+        }
+    }
+    run.settle_ready()?;
+    run.prove_editor_focus(scenario, "mousefocus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// A 4 KiB single-line composer (no newlines): the buffer must scroll,
+/// the cursor stay live, and the whole payload still submit.
+fn scenario_giant_line() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-giant-line";
+
+    // Input-driven paints bypass the coalescer, so a typed flood drains at
+    // roughly 5ms per key (insert + full wrap-map rebuild + repaint): give
+    // quiescence a bigger budget than the default policy.
+    run.settle_budget(Duration::from_secs(120));
+    let line = "g".repeat(4096);
+    for chunk in line.as_bytes().chunks(2048) {
+        run.write_input(chunk)?;
+    }
+    // Quiescence only — the composer scrolled the head out of view.
+    let _ = run.settle_screen(|_| true)?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// NUL and C0 control bytes inside a bracketed paste: they must be
+/// literalized or stripped — never acted on as commands (a stray \x04
+/// mid-paste must not EOF, \x0d must not submit early).
+fn scenario_binary_paste() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-binary-paste";
+
+    run.write_input(b"\x1b[200~")?;
+    run.write_input(b"lead\x00\x01\x02\x0b\x0c\x0e\x1ftail")?;
+    run.write_input(b"\x1b[201~")?;
+    let snapshot = run.settle_screen(|_| true)?;
+    if screen_has(&snapshot, FINAL_MARKER) || screen_has(&snapshot, "esc to cancel") {
+        return Err(AdvError::Assert(format!(
+            "{scenario}: control byte inside paste triggered an early submit; screen:\n{}",
+            snapshot.lines.join("\n")
+        )));
+    }
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// A prompt typed into a paste while a turn streams, then submitted: the
+/// queue must run it after the in-flight turn — two markers total.
+fn scenario_paste_queue() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-paste-queue";
+
+    run.send_line("paste queue turn one")?;
+    // Mid-stream: open a paste, type the follow-up, close, submit.
+    run.write_input(b"\x1b[200~")?;
+    run.write_input(b"paste queue turn two")?;
+    run.write_input(b"\x1b[201~")?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| count_lines_containing(s, FINAL_MARKER) >= 2)?;
+    run.settle_ready()?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// A slash-command selector opened while a turn streams: `/tree` during a
+/// run still dispatches (slash bypasses the queue gate), and the selector
+/// must coexist with — then dismiss back into — the live stream.
+fn scenario_selector_stream() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-selector-stream";
+
+    run.send_line("selector stream turn")?;
+    // Stream is ~450ms (3 x 150ms chunks) — fire /tree straight away so it
+    // opens mid-stream. A tree selector with a submitted turn lists the
+    // live session as its node, so its footer (not "No entries found") is
+    // the open signal.
+    run.write_input(b"/tree")?;
+    run.write_input(KEY_ENTER)?;
+    let snapshot =
+        run.settle_screen(|s| screen_has(s, "esc to cancel") || screen_has(s, FINAL_MARKER))?;
+    if !screen_has(&snapshot, "esc to cancel") {
+        return Err(AdvError::Assert(format!(
+            "{scenario}: /tree selector never opened mid-stream; screen:\n{}",
+            snapshot.lines.join("\n")
+        )));
+    }
+    run.write_input(KEY_ESCAPE)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.settle_ready()?;
+    run.prove_editor_focus(scenario, "ssfocus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Kitchen-sink collision: while a turn streams, resize to a 1x1 floor,
+/// emit focus events, fire SGR mouse reports, open a paste, drop invalid
+/// bytes inside it, close, and restore. The turn must still complete.
+fn scenario_kitchen_sink() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-kitchen-sink";
+
+    run.send_line("kitchen sink turn")?;
+    run.session_mut()?.resize(1, 1)?;
+    run.write_input(b"\x1b[O\x1b[I")?; // focus out/in
+    run.write_input(b"\x1b[<0;1;1M\x1b[<0;1;1m")?; // mouse at corner
+    run.write_input(b"\x1b[200~")?; // open paste
+    run.write_input(b"\xff\xfepaste-in-storm")?; // invalid bytes + text
+    run.write_input(b"\x1b[201~")?; // close paste
+    run.session_mut()?.resize(80, 24)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.settle_ready()?;
+    run.clear_editor()?;
+    run.prove_editor_focus(scenario, "ksfocus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Sustained interleaved pressure: a deterministic mixed stream of
+/// printable keys, cursor keys, backspaces, ctrl chords, focus events and
+/// resizes for 64 rounds. The composer may hold arbitrary text afterward —
+/// liveness and a clean quit are the contract.
+fn scenario_sustained_pressure() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-sustained-pressure";
+
+    let chords: &[&[u8]] = &[
+        b"x",
+        b"y",
+        KEY_LEFT,
+        KEY_RIGHT,
+        KEY_UP,
+        KEY_DOWN,
+        KEY_BACKSPACE,
+        b"\x17",  // ctrl+w
+        b"\x1bb", // alt+b
+        b"\x1bf", // alt+f
+        b"\x1a",  // ctrl+z byte
+        b"\x1b[I",
+        b"\x1b[O", // focus in/out
+        b"\t",     // tab
+        KEY_HOME,
+        KEY_END,
+    ];
+    for round in 0..64 {
+        run.write_input(chords[round % chords.len()])?;
+        if round % 16 == 7 {
+            let cols = 24 + u16::try_from(round % 3).unwrap_or(0) * 40;
+            run.session_mut()?.resize(cols, 8)?;
+        }
+        if round % 16 == 15 {
+            run.session_mut()?.resize(80, 24)?;
+        }
+    }
+    run.write_input(KEY_ESCAPE)?;
+    run.write_input(KEY_ESCAPE)?;
+    let _ = run.settle_screen(|_| true)?;
+    run.clear_editor()?;
+    run.settle_ready()?;
+    run.prove_editor_focus(scenario, "spfocus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Undo flood: type, mash undo (ctrl+-) well past the bottom of history,
+/// then retype and submit — the edit stack must bottom out cleanly rather
+/// than corrupting the buffer.
+fn scenario_undo_flood() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-undo-flood";
+
+    run.write_input(b"und ground")?;
+    for _ in 0..16 {
+        run.write_input(b"\x1f")?; // ctrl+- — undo
+    }
+    run.write_input(b"redo tail")?;
+    let _ = run.settle_screen(|_| true)?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
@@ -1095,6 +1432,17 @@ fn tui_adversarial_gauntlet_hostile_inputs_geometry_and_dialog_storms() {
         ("selector-resize", scenario_selector_resize),
         ("width-edge", scenario_width_edge),
         ("whitespace-submit", scenario_whitespace_submit),
+        ("kill-yank", scenario_kill_yank),
+        ("editor-motions", scenario_editor_motions),
+        ("reply-spoof", scenario_reply_spoof),
+        ("mouse-focus", scenario_mouse_focus_flood),
+        ("giant-line", scenario_giant_line),
+        ("binary-paste", scenario_binary_paste),
+        ("paste-queue", scenario_paste_queue),
+        ("selector-stream", scenario_selector_stream),
+        ("kitchen-sink", scenario_kitchen_sink),
+        ("sustained-pressure", scenario_sustained_pressure),
+        ("undo-flood", scenario_undo_flood),
     ];
     let mut verdicts = Vec::new();
     let mut first_failure: Option<String> = None;

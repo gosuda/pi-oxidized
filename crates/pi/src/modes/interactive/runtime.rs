@@ -4812,22 +4812,21 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             elapsed_secs: 0,
             message: "Aborting…".to_owned(),
         });
-        match tokio::time::timeout(ABORT_SETTLE_BUDGET, self.session.abort()).await {
-            Ok(result) => self.record_err(result),
-            Err(_) => {
-                // The run may still be stopping, so AgentEnd/AgentSettled may
-                // never arrive to clear the status; drop "Aborting…" here or
-                // it ticks forever, and surface the failure where notices
-                // render — `last_error` has no interactive renderer.
-                self.view.status = None;
-                self.record_err(Err(
-                    "abort did not settle; the run may still be stopping".to_owned()
-                ));
-                self.push_notice(
-                    "error",
-                    "abort did not settle; the run may still be stopping".to_owned(),
-                );
-            }
+        if let Ok(result) = tokio::time::timeout(ABORT_SETTLE_BUDGET, self.session.abort()).await {
+            self.record_err(result);
+        } else {
+            // The run may still be stopping, so AgentEnd/AgentSettled may
+            // never arrive to clear the status; drop "Aborting…" here or
+            // it ticks forever, and surface the failure where notices
+            // render — `last_error` has no interactive renderer.
+            self.view.status = None;
+            self.record_err(Err(
+                "abort did not settle; the run may still be stopping".to_owned()
+            ));
+            self.push_notice(
+                "error",
+                "abort did not settle; the run may still be stopping".to_owned(),
+            );
         }
         self.refresh_footer().await;
         ActionOutcome::Repaint
@@ -5131,25 +5130,24 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 tokio::select! {
                     result = &mut prompt => result,
                     _ = &mut abort_rx => {
-                        match tokio::time::timeout(ABORT_SETTLE_BUDGET, abort).await {
-                            Ok(abort_result) => {
-                                let prompt_result = prompt.await;
-                                prompt_result.and(abort_result)
-                            }
-                            Err(_) => {
-                                // `prompt` is the run's only driver; keep
-                                // polling it in a detached task so lifecycle
-                                // cleanup still lands if the provider read
-                                // eventually unblocks. Dropping it here would
-                                // orphan the run flagged streaming forever.
-                                tokio::spawn(async move {
-                                    let _ = prompt.await;
-                                });
-                                Err(
-                                    "abort did not settle; the run may still be stopping"
-                                        .to_owned(),
-                                )
-                            }
+                        if let Ok(abort_result) =
+                            tokio::time::timeout(ABORT_SETTLE_BUDGET, abort).await
+                        {
+                            let prompt_result = prompt.await;
+                            prompt_result.and(abort_result)
+                        } else {
+                            // `prompt` is the run's only driver; keep
+                            // polling it in a detached task so lifecycle
+                            // cleanup still lands if the provider read
+                            // eventually unblocks. Dropping it here would
+                            // orphan the run flagged streaming forever.
+                            tokio::spawn(async move {
+                                let _ = prompt.await;
+                            });
+                            Err(
+                                "abort did not settle; the run may still be stopping"
+                                    .to_owned(),
+                            )
                         }
                     }
                 }
@@ -5201,20 +5199,19 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 tokio::select! {
                     result = &mut execution => result,
                     _ = &mut abort_rx => {
-                        match tokio::time::timeout(ABORT_SETTLE_BUDGET, abort).await {
-                            Ok(abort_result) => {
-                                let execution_result = execution.await;
-                                execution_result.and(abort_result)
-                            }
-                            Err(_) => {
-                                tokio::spawn(async move {
-                                    let _ = execution.await;
-                                });
-                                Err(
-                                    "abort did not settle; the run may still be stopping"
-                                        .to_owned(),
-                                )
-                            }
+                        if let Ok(abort_result) =
+                            tokio::time::timeout(ABORT_SETTLE_BUDGET, abort).await
+                        {
+                            let execution_result = execution.await;
+                            execution_result.and(abort_result)
+                        } else {
+                            tokio::spawn(async move {
+                                let _ = execution.await;
+                            });
+                            Err(
+                                "abort did not settle; the run may still be stopping"
+                                    .to_owned(),
+                            )
                         }
                     }
                 }
