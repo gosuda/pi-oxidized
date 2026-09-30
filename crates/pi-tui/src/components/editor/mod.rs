@@ -27,7 +27,7 @@ use crate::text::{
     is_whitespace_char, slice_by_column, truncate_to_width, truncate_with_marker, visible_width,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::buffer::{Buffer, CellDiffOption};
+use ratatui::buffer::{Buffer, Cell, CellDiffOption};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
@@ -127,6 +127,27 @@ struct AutocompleteRequest {
     snapshot_col: usize,
     force: bool,
     explicit_tab: bool,
+    /// True once the product has taken the request snapshot for async
+    /// provider resolution via [`autocomplete_dispatch`].
+    dispatched: bool,
+}
+
+/// Snapshot of a started autocomplete request for async provider driving.
+/// The product feeds the provider's result back through
+/// [`Editor::complete_autocomplete_request`].
+pub struct AutocompleteDispatch {
+    /// Correlation id; must round-trip into `complete_autocomplete_request`.
+    pub request_id: u64,
+    /// Force flag captured at request time.
+    pub force: bool,
+    /// Explicit-Tab flag captured at request time.
+    pub explicit_tab: bool,
+    /// Editor buffer snapshot for `AutocompleteProvider::get_suggestions`.
+    pub lines: Vec<String>,
+    /// Cursor line at request time.
+    pub cursor_line: usize,
+    /// Cursor column at request time.
+    pub cursor_col: usize,
 }
 
 #[derive(Clone)]
@@ -358,6 +379,20 @@ impl Editor {
         self.history.len()
     }
 
+    /// Milliseconds until a pending autocomplete request should complete:
+    /// `Some(0)` when a request is due now, `Some(ms)` while the debounce is
+    /// still counting down, `None` with no request outstanding. Product event
+    /// loops use this to arm a wake-up that calls
+    /// [`tick_autocomplete_debounce`](Self::tick_autocomplete_debounce) plus
+    /// [`poll_autocomplete_now`](Self::poll_autocomplete_now).
+    #[must_use]
+    pub fn autocomplete_due_in_ms(&self) -> Option<u64> {
+        self.autocomplete_pending
+            .as_ref()
+            .filter(|pending| !pending.dispatched)
+            .map(|_| self.autocomplete_debounce_remaining_ms.unwrap_or(0))
+    }
+
     /// Advance autocomplete debounce by `ms` and fire if due.
     ///
     /// Product event loops call this from their timer tick; unit tests drive it
@@ -451,6 +486,34 @@ impl Editor {
     #[must_use]
     pub fn pending_autocomplete_request_id(&self) -> Option<u64> {
         self.autocomplete_pending.as_ref().map(|p| p.request_id)
+    }
+
+    /// Take the pending request's dispatch snapshot so the product can run
+    /// the provider off the event loop and feed the result into
+    /// [`complete_autocomplete_request`](Self::complete_autocomplete_request).
+    /// Returns `None` when no started request is outstanding or it was
+    /// already dispatched.
+    pub fn autocomplete_dispatch(&mut self) -> Option<AutocompleteDispatch> {
+        let pending = self.autocomplete_pending.as_mut()?;
+        if pending.dispatched || pending.request_id == 0 {
+            return None;
+        }
+        pending.dispatched = true;
+        Some(AutocompleteDispatch {
+            request_id: pending.request_id,
+            force: pending.force,
+            explicit_tab: pending.explicit_tab,
+            lines: self.state.lines.clone(),
+            cursor_line: pending.snapshot_line,
+            cursor_col: pending.snapshot_col,
+        })
+    }
+
+    /// Current autocomplete provider, if installed. Products spawn the
+    /// provider's suggestion future with this `Arc` off the event loop.
+    #[must_use]
+    pub fn autocomplete_provider(&self) -> Option<Arc<dyn AutocompleteProvider>> {
+        self.autocomplete_provider.clone()
     }
 
     // ------------------------------------------------------------------
@@ -757,6 +820,7 @@ impl Editor {
             snapshot_col: self.state.cursor_col,
             force,
             explicit_tab,
+            dispatched: false,
         });
 
         if debounce > 0 {
@@ -2203,6 +2267,10 @@ fn paint_grapheme(
         return right;
     }
     if let Some(cell) = buf.cell_mut(position) {
+        // The buffer persists across frames: a bare `set_style` patches
+        // modifiers (insert/remove only), so a caret's `REVERSED` would
+        // survive after the caret moved on. Converge to the exact style.
+        *cell = Cell::default();
         cell.set_symbol(if grapheme.is_empty() { " " } else { grapheme });
         cell.set_style(style);
     }

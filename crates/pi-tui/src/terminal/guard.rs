@@ -105,6 +105,12 @@ pub struct TerminalGuard<W: Write> {
     restored: bool,
     emergency: Arc<AtomicBool>,
     viewport_bottom_row: u16,
+    /// `Some(bool)` once the startup probe resolves the keyboard protocol;
+    /// `None` while it is unknown. Pushes are optimistic before negotiation,
+    /// but pops must only be emitted when the terminal actually claimed the
+    /// protocol: terminals that ignore `CSI > u` still cannot swallow
+    /// `CSI < u`, so unnegotiated pops paint stray text at exit.
+    kitty_negotiated: Option<bool>,
 }
 
 impl<W: Write> TerminalGuard<W> {
@@ -118,6 +124,7 @@ impl<W: Write> TerminalGuard<W> {
             restored: false,
             emergency: Arc::new(AtomicBool::new(false)),
             viewport_bottom_row: 0,
+            kitty_negotiated: None,
         }
     }
 
@@ -148,6 +155,16 @@ impl<W: Write> TerminalGuard<W> {
         self.viewport_bottom_row = row;
     }
 
+    /// Record the negotiated keyboard protocol after the startup probe.
+    ///
+    /// A `false` verdict suppresses both later pushes (e.g. on `resume`) and
+    /// all pops at restore: the terminal never accepted the enhancement, so
+    /// emitting `CSI < u` would only leak literal `1u`/`u` fragments on
+    /// terminals that cannot swallow the pop sequence.
+    pub fn set_kitty_negotiated(&mut self, negotiated: bool) {
+        self.kitty_negotiated = Some(negotiated);
+    }
+
     /// Activate modes in the mandated order.
     ///
     /// # Errors
@@ -166,7 +183,7 @@ impl<W: Write> TerminalGuard<W> {
         queue!(self.writer, EnableFocusChange)?;
         self.applied.push(RestoreStep::FocusChange);
 
-        if enable_kitty {
+        if enable_kitty && self.kitty_negotiated != Some(false) {
             queue!(
                 self.writer,
                 PushKeyboardEnhancementFlags(KITTY_KEYBOARD_FLAGS)
@@ -476,8 +493,10 @@ impl<W: Write> TerminalGuard<W> {
                     let _ = queue!(self.writer, Show);
                 }
                 RestoreStep::KittyPush => {
-                    let _ = queue!(self.writer, PopKeyboardEnhancementFlags);
-                    let _ = self.writer.write_all(b"\x1b[<u");
+                    if self.kitty_negotiated != Some(false) {
+                        let _ = queue!(self.writer, PopKeyboardEnhancementFlags);
+                        let _ = self.writer.write_all(b"\x1b[<u");
+                    }
                 }
                 RestoreStep::FocusChange => {
                     let _ = queue!(self.writer, DisableFocusChange);
@@ -663,6 +682,53 @@ mod tests {
         assert!(bytes.windows(6).any(|w| w == b"\x1b[?25h"));
         assert!(bytes.windows(8).any(|w| w == b"\x1b[?2004l"));
         Ok(())
+    }
+
+    #[test]
+    fn unnegotiated_kitty_suppresses_pops_at_restore() {
+        // Konsole-class terminals ignore `CSI > u` but render `CSI < u`
+        // fragments literally, so pops must not be emitted once the probe
+        // resolved the keyboard protocol to legacy.
+        let mut guard = TerminalGuard::new(Cursor::new(Vec::new()));
+        guard.applied.push(RestoreStep::KittyPush);
+        guard.set_kitty_negotiated(false);
+
+        guard.restore_modes(false);
+
+        assert!(
+            !guard
+                .writer()
+                .get_ref()
+                .windows(4)
+                .any(|window| window == b"\x1b[<u"),
+            "unnegotiated restore must not emit kitty pops"
+        );
+    }
+
+    #[test]
+    fn unknown_or_negotiated_kitty_still_pops_at_restore() {
+        // Without a probe verdict the pop stays conservative: a terminal that
+        // silently took the `CSI > u` push would otherwise keep enhanced keys.
+        for negotiated in [None, Some(true)] {
+            let mut guard = TerminalGuard::new(Cursor::new(Vec::new()));
+            guard.applied.push(RestoreStep::KittyPush);
+            if let Some(negotiated) = negotiated {
+                guard.set_kitty_negotiated(negotiated);
+            }
+
+            guard.restore_modes(false);
+
+            let pops = guard
+                .writer()
+                .get_ref()
+                .windows(3)
+                .filter(|window| window == b"\x1b[<")
+                .count();
+            assert_eq!(
+                pops, 2,
+                "restore must pop the guard push and the probe push ({negotiated:?})"
+            );
+        }
     }
 
     #[test]
