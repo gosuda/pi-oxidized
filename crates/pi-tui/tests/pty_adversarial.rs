@@ -18,6 +18,10 @@
 //! attack the serve-phase input path with malformed escape soup, mid-stream
 //! probe-reply injection, degenerate geometry, oversized/mangled pastes, key
 //! bursts, unterminated-paste EOF, and resize-batch contract violations.
+//! A second wave pushes on parser invariants harder: nested and orphaned
+//! paste markers, a VEOT byte as paste payload, `u16::MAX` geometry, un-pumped
+//! resize oscillation, unknown CSI forms, SGR mouse/focus floods, CONTROL-key
+//! bursts, empty pastes, and a multibyte char split across writes.
 //! The fixture under test is the real `Tui`/`TerminalInput` pipeline, so every
 //! case asserts the same floor: the child exits inside the hard timeout, the
 //! byte stream keeps the no-clear / balanced-sync / restore-on-exit contract,
@@ -795,6 +799,370 @@ fn adversarial_resize_batch_rejects_foreign_input() {
             )
             .is_some(),
             "resize-batch-contamination: exit 2 without the batch rejection self-report; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// A paste-open marker embedded *inside* an open bracketed paste is payload,
+/// not a nested open: the accumulator only ends on `\x1b[201~`, so the inner
+/// `200~` must survive into the editor delta (its ESC sanitized to a space)
+/// while the paste still counts exactly once.
+#[test]
+fn adversarial_nested_paste_marker_is_literal() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[200~A\x1b[200~B\x1b[201~");
+    h.pump(Duration::from_millis(120));
+    h.send_lossy(b"\x04");
+    let report = h.finish();
+
+    report.assert_success_contract("nested-paste-marker");
+    assert_eq!(
+        report.live_paste,
+        Some(EXPECTED_LIVE_PASTE),
+        "nested-paste-marker: expected {EXPECTED_LIVE_PASTE} live paste(s), got {:?}; tail={}",
+        report.live_paste,
+        report.tail()
+    );
+    if BYTE_TRANSPARENT_MASTER {
+        // The inner 200~ is literal content: sanitize_visible maps its ESC to
+        // a space, so the delta must be `A [200~B` verbatim — a parser that
+        // re-opened or dropped the inner marker diverges here.
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("A [200~B"),
+            "nested-paste-marker: embedded marker not literal; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// A bare `\x1b[201~` with no open paste is an orphan terminator: it must not
+/// conjure a paste event or corrupt the keys that follow it.
+#[test]
+fn adversarial_orphan_paste_terminator() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[201~x");
+    h.pump(Duration::from_millis(120));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("orphan-paste-terminator");
+    assert_eq!(
+        report.live_paste,
+        Some(0),
+        "orphan-paste-terminator: no paste was opened but live_paste={:?}; tail={}",
+        report.live_paste,
+        report.tail()
+    );
+    // The orphan terminator produces no editor bytes; 'x' must decode cleanly.
+    let live_text = report
+        .live_text
+        .as_deref()
+        .unwrap_or_else(|| panic!("orphan-paste-terminator: missing PI_TUI_LIVE_TEXT record"));
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            live_text,
+            "x",
+            "orphan-paste-terminator: stray bytes leaked into the editor; tail={}",
+            report.tail()
+        );
+    } else {
+        assert!(
+            live_text.contains('x'),
+            "orphan-paste-terminator: 'x' lost behind the orphan; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// `\x04` inside an open bracketed paste is literal content, never EOF: the
+/// paste closes, the byte is sanitized to a space, and a real Ctrl+D still
+/// ends the serve cleanly. This pins the wedge case the serve deadline fix
+/// was written for.
+#[test]
+fn adversarial_veot_inside_paste_is_content() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[200~\x04\x1b[201~");
+    h.pump(Duration::from_millis(120));
+    h.send_lossy(b"\x04");
+    let report = h.finish();
+
+    report.assert_success_contract("veot-in-paste");
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_paste,
+            Some(1),
+            "veot-in-paste: VEOT byte eaten instead of pasted; tail={}",
+            report.tail()
+        );
+        // \x04 is a control char -> sanitized to a single space in the delta.
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some(" "),
+            "veot-in-paste: expected sanitized ' ', got {:?}; tail={}",
+            report.live_text,
+            report.tail()
+        );
+    } else {
+        assert_eq!(
+            report.live_paste,
+            Some(0),
+            "veot-in-paste: ConPTY cannot deliver bracketed paste; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// Geometry at the u16 ceiling: `TIOCSWINSZ` accepts 65535x65535 and the
+/// fixture's fixed-height viewport must paint it without a blowup, then
+/// recover a normal 80x24 frame.
+#[test]
+fn adversarial_extreme_geometry() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.resize(u16::MAX, u16::MAX);
+    h.pump(Duration::from_millis(150));
+    h.drain_available();
+    let mark = h.mark();
+    h.resize(INITIAL_COLS, INITIAL_ROWS);
+    h.pump(Duration::from_millis(120));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("extreme-geometry");
+    assert_eq!(
+        report.live_resize,
+        Some(2),
+        "extreme-geometry: expected both resizes delivered, got {:?}; tail={}",
+        report.live_resize,
+        report.tail()
+    );
+    if BYTE_TRANSPARENT_MASTER {
+        assert!(
+            find_subslice(&report.raw[mark..], b"FOOTER").is_some()
+                || find_subslice(&report.raw[mark..], b"STATUS").is_some(),
+            "extreme-geometry: no repaint bytes after restoring 80x24; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// Twenty back-to-back resizes with no drain between writes: the kernel may
+/// collapse them and the fixture's `try_recv` coalescing may merge the rest —
+/// the only contract is that at least one lands and the final 80x24 repaint
+/// happens after the storm.
+#[test]
+fn adversarial_unpumped_resize_oscillation() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    for i in 0..20 {
+        if i % 2 == 0 {
+            h.resize(100, 30);
+        } else {
+            h.resize(40, 10);
+        }
+    }
+    h.pump(Duration::from_millis(200));
+    h.drain_available();
+    let mark = h.mark();
+    h.resize(INITIAL_COLS, INITIAL_ROWS);
+    h.pump(Duration::from_millis(120));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("resize-oscillation");
+    assert!(
+        report.live_resize.unwrap_or(0) >= 1,
+        "resize-oscillation: entire storm evaporated, no Resize handled; tail={}",
+        report.tail()
+    );
+    if BYTE_TRANSPARENT_MASTER {
+        assert!(
+            find_subslice(&report.raw[mark..], b"FOOTER").is_some()
+                || find_subslice(&report.raw[mark..], b"STATUS").is_some(),
+            "resize-oscillation: final 80x24 restore never repainted; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// Unrecognized CSI and DECSET forms (`\x1b[999z`, `\x1b[?9999h`) plus an
+/// orphan `201~` must be ignored without disturbing the keys around them.
+#[test]
+fn adversarial_unknown_csi_and_orphans() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[999z\x1b[?9999h\x1b[201~ok");
+    h.pump(Duration::from_millis(120));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("unknown-csi");
+    assert_eq!(
+        report.live_paste,
+        Some(0),
+        "unknown-csi: orphan terminator opened a paste; tail={}",
+        report.tail()
+    );
+    let live_text = report
+        .live_text
+        .as_deref()
+        .unwrap_or_else(|| panic!("unknown-csi: missing PI_TUI_LIVE_TEXT record"));
+    if BYTE_TRANSPARENT_MASTER {
+        // The malformed sequences must drop without leaving parser residue:
+        // only 'o','k' reach the editor. (Before the vendored `CSI ?` final
+        // fix, the whole write was swallowed — the fixture timed out.)
+        assert_eq!(
+            live_text,
+            "ok",
+            "unknown-csi: malformed-sequence residue in the editor; tail={}",
+            report.tail()
+        );
+    } else {
+        assert!(
+            live_text.contains("ok"),
+            "unknown-csi: trailing keys lost behind malformed sequences; got {live_text:?}; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// SGR mouse press/release pairs and focus in/out events are decoded events,
+/// not bytes — they must land in the Ignored register without leaking into the
+/// editor or the cursor/paste counters.
+#[test]
+fn adversarial_mouse_focus_sgr_flood() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    let mut flood = Vec::new();
+    for _ in 0..5 {
+        flood.extend_from_slice(b"\x1b[<0;10;5M\x1b[<0;10;5m");
+    }
+    for _ in 0..3 {
+        flood.extend_from_slice(b"\x1b[I\x1b[O");
+    }
+    flood.extend_from_slice(b"z");
+    h.send(&flood);
+    h.pump(Duration::from_millis(150));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("mouse-focus-flood");
+    assert_eq!(
+        report.live_paste,
+        Some(0),
+        "mouse-focus-flood: pointer bytes promoted to a paste; tail={}",
+        report.tail()
+    );
+    assert_eq!(
+        report.live_cursor,
+        Some(0),
+        "mouse-focus-flood: pointer bytes moved the cursor; tail={}",
+        report.tail()
+    );
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("z"),
+            "mouse-focus-flood: pointer/focus bytes leaked into the editor; tail={}",
+            report.tail()
+        );
+    } else {
+        assert!(
+            report.live_text.as_deref().is_some_and(|t| t.contains('z')),
+            "mouse-focus-flood: 'z' lost behind the flood; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// CONTROL-modified keys are not printable input: a burst interleaving
+/// ctrl-a/ctrl-b/ctrl-e with plain chars must deliver only the plain chars to
+/// the editor, in order.
+#[test]
+fn adversarial_control_char_burst() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x01a\x02b\x05cd");
+    h.pump(Duration::from_millis(120));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("control-char-burst");
+    assert_eq!(
+        report.live_text.as_deref(),
+        Some("abcd"),
+        "control-char-burst: control keys leaked into the editor; tail={}",
+        report.tail()
+    );
+}
+
+/// An empty bracketed paste is a real paste: the event still counts and
+/// contributes zero editor bytes; the next key decodes normally.
+#[test]
+fn adversarial_empty_paste() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[200~\x1b[201~y");
+    h.pump(Duration::from_millis(120));
+    h.send_lossy(b"\x04");
+    let report = h.finish();
+
+    report.assert_success_contract("empty-paste");
+    assert_eq!(
+        report.live_paste,
+        Some(EXPECTED_LIVE_PASTE),
+        "empty-paste: expected {EXPECTED_LIVE_PASTE} live paste(s), got {:?}; tail={}",
+        report.live_paste,
+        report.tail()
+    );
+    let live_text = report
+        .live_text
+        .as_deref()
+        .unwrap_or_else(|| panic!("empty-paste: missing PI_TUI_LIVE_TEXT record"));
+    assert!(
+        live_text.contains('y'),
+        "empty-paste: 'y' lost after the empty paste; tail={}",
+        report.tail()
+    );
+}
+
+/// A multibyte char split across two master writes must reassemble into a
+/// single decoded char — no replacement char, no drop, no split into two.
+#[test]
+fn adversarial_split_multibyte_char() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(&[0xC3]);
+    h.pump(Duration::from_millis(100));
+    h.send(&[0xA9]);
+    h.pump(Duration::from_millis(120));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("split-multibyte");
+    if BYTE_TRANSPARENT_MASTER {
+        // 'é' escaped: \u{e9}. Anything else (U+FFFD, two chars, empty delta)
+        // means the parser dropped or misframed the split.
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("\\u{e9}"),
+            "split-multibyte: é did not reassemble; got {:?}; tail={}",
+            report.live_text,
             report.tail()
         );
     }
