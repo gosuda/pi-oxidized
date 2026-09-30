@@ -473,9 +473,14 @@ fn adversarial_degenerate_resize_geometry() {
     let report = h.finish();
 
     report.assert_success_contract("degenerate-resize");
-    assert!(
-        report.live_resize.unwrap_or(0) >= 1,
-        "degenerate-resize: no post-readiness Resize event consumed; tail={}",
+    // Each resize is spaced by a pump, so coalescing cannot merge them: every
+    // one of the six degenerate steps plus the final 80x24 restore must be
+    // observed — a >= 1 floor would let intermediate drops pass unnoticed.
+    assert_eq!(
+        report.live_resize,
+        Some(7),
+        "degenerate-resize: expected all 7 spaced resizes consumed, got {:?}; tail={}",
+        report.live_resize,
         report.tail()
     );
     if BYTE_TRANSPARENT_MASTER {
@@ -684,12 +689,24 @@ fn adversarial_resize_mid_paste() {
     );
     let live_text = report
         .live_text
-        .as_ref()
+        .as_deref()
         .unwrap_or_else(|| panic!("resize-mid-paste: missing PI_TUI_LIVE_TEXT record"));
-    assert!(
-        live_text.contains("FIRST-HALF-SECOND-HALF"),
-        "resize-mid-paste: payload corrupted across the resize, got {live_text:?}"
-    );
+    if BYTE_TRANSPARENT_MASTER {
+        // No other post-readiness editor input exists, so the whole delta must
+        // be exactly the split payload — containment would let a parser that
+        // duplicates bytes or leaks the 200~/201~ framing pass.
+        assert_eq!(
+            live_text,
+            "FIRST-HALF-SECOND-HALF",
+            "resize-mid-paste: payload not preserved exactly across the resize; tail={}",
+            report.tail()
+        );
+    } else {
+        assert!(
+            live_text.contains("FIRST-HALF-SECOND-HALF"),
+            "resize-mid-paste: payload corrupted across the resize, got {live_text:?}"
+        );
+    }
     // Two resizes spaced by full pumps must each land as their own event:
     // a lone '>=1' would also pass when only the post-paste restore resize
     // survived, so the mid-paste resize needs its own seat in the count.

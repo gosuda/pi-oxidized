@@ -813,6 +813,16 @@ async fn serve_live_events(
     let mut pending = None;
     let deadline = started + HARD_TIMEOUT;
     loop {
+        // timeout_at polls the wrapped future first, so a continuously-ready
+        // input stream (e.g. a flood of Ignored events that never touches a
+        // deadline-checked commit) could starve it; check the deadline at the
+        // top of every iteration.
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "hard fixture timeout",
+            ));
+        }
         let event = match pending.take() {
             Some(event) => event,
             // Bounded like completed_resize_batch: a wedged input accumulator
