@@ -2731,11 +2731,15 @@ fn cancel_frame(id: FrameId, control_method: &str) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::host::{HostSource, HostSpec};
     use crate::protocol::{ErrorPayload, SlotPlacement, StyledRun, UiSlot, to_payload};
     use std::error::Error;
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use tempfile::tempdir;
 
     type R = Result<(), Box<dyn Error>>;
@@ -3627,6 +3631,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn write_exit_script(dir: &std::path::Path) -> R {
         let script = dir.join("fake-host");
         fs::write(&script, "#!/bin/sh\nexit 0\n")?;
@@ -3636,6 +3641,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn process_death_detected_and_reaped() -> R {
         let dir = tempdir()?;

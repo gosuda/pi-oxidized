@@ -17,7 +17,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::core::config::{
-    CONFIG_DIR_NAME, PathInputOptions, canonicalize_path, is_local_path, resolve_path_with,
+    CONFIG_DIR_NAME, PathInputOptions, canonicalize_path, is_local_path, process_home_dir,
+    resolve_path_with,
 };
 use crate::core::resources::source_info::{SourceOrigin, SourceScope};
 use crate::core::settings::{PackageSource, PackageSourceFilter, Settings, SettingsManager};
@@ -545,7 +546,7 @@ impl<'a> PackagePathResolver<'a> {
             themes: project_base_dir.join("themes"),
         };
 
-        let user_agents_skills_dir = dirs::home_dir()
+        let user_agents_skills_dir = process_home_dir()
             .unwrap_or_else(|| PathBuf::from("/"))
             .join(".agents")
             .join("skills");

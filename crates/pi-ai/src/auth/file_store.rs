@@ -629,6 +629,9 @@ fn create_dir_all_secure(path: &Path) -> Result<(), StoreError> {
     }
 }
 
+// The uniform `Result` signature lets callers `?` the unix path where
+// chmod can fail; the non-unix arm is a deliberate no-op.
+#[cfg_attr(not(unix), expect(clippy::unnecessary_wraps))]
 fn set_owner_secret_mode(path: &Path) -> Result<(), StoreError> {
     #[cfg(unix)]
     {
@@ -647,6 +650,7 @@ fn set_owner_secret_mode(path: &Path) -> Result<(), StoreError> {
     }
 }
 
+#[cfg_attr(not(unix), expect(clippy::unnecessary_wraps))]
 fn set_owner_dir_mode(path: &Path) -> Result<(), StoreError> {
     #[cfg(unix)]
     {

@@ -424,6 +424,7 @@ pub fn create_edit_tool(cwd: impl Into<PathBuf>) -> Arc<dyn AgentTool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::time::Duration;
@@ -845,6 +846,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn readonly_eacces() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;

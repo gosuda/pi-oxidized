@@ -5,3 +5,4 @@ packages/extension-host/dist/
 scripts/verification/fixtures/execution-map/.staging/
 /dist/
 /clone_ref
+.references/

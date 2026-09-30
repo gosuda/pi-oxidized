@@ -1,6 +1,11 @@
 //! Regression: input written after the first frame must paint through the
 //! production `EventStream` parser (issue: post-first-frame paint stall).
 //!
+//! POSIX-PTY lane only: the assertions ride `PosixPtyDriver`'s
+//! byte-transparent master; `ConPTY` re-renders output so the byte-level paste
+//! echoes this file checks cannot be observed through it.
+#![cfg(unix)]
+//!
 //! The startup capability probe once owned stdin past the first frame: a
 //! bracketed paste written as soon as the first frame was observed landed in
 //! the byte-level probe collector and was re-injected through the lossy

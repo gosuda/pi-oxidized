@@ -11887,6 +11887,8 @@ mod tests {
         Ok(())
     }
 
+    // app.suspend defaults to ctrl+z but is unbound on Windows.
+    #[cfg(unix)]
     #[tokio::test]
     async fn step_ui_ctrl_z_requests_suspend() -> Result<(), String> {
         let (mut rt, _log) = try_make_runtime()?;
@@ -11973,15 +11975,25 @@ mod tests {
                 text: "stream".to_owned(),
             })
             .await;
+        let captured_for_wait = captured.clone();
         let shutdown_flag = Arc::clone(&rt.shutdown_flag);
         let shutdown = Arc::clone(&rt.shutdown);
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(75)).await;
+            // Shut down once the stream's Done lands, not on a fixed delay:
+            // Windows tokio timers round each fixture sleep up to the ~15ms
+            // quantum, so a fixed delay can outrun the whole stream.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                if String::from_utf8_lossy(&captured_for_wait.snapshot()).contains("Done") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             shutdown.notify_one();
         });
 
-        let exit = tokio::time::timeout(Duration::from_millis(500), rt.run())
+        let exit = tokio::time::timeout(Duration::from_secs(3), rt.run())
             .await
             .map_err(|_| "runtime blocked on prompt".to_owned())?
             .map_err(|error| format!("runtime failed: {error}"))?;
@@ -15450,6 +15462,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn session_selector_blocks_active_delete_via_symlink_path() -> TestResult {
         let (_kb_guard, mut rt, log) = try_make_g7_runtime()?;

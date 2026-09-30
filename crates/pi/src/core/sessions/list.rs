@@ -469,6 +469,7 @@ mod tests {
 
     fn write_session(path: &Path, id: &str, cwd: &str, messages: &[(&str, &str)]) -> TestResult {
         let mut f = File::create(path)?;
+        let cwd = cwd.replace('\\', "\\\\");
         writeln!(
             f,
             r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2025-01-01T00:00:00.000Z","cwd":"{cwd}"}}"#

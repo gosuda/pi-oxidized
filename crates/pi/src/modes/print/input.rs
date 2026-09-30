@@ -185,8 +185,10 @@ pub async fn process_file_arguments(
                 });
             }
         };
-        if metadata.len() == 0 {
-            // Skip empty files, matching the TypeScript `stat().size === 0` branch.
+        if metadata.is_file() && metadata.len() == 0 {
+            // Skip empty files, matching the TypeScript `stat().size === 0`
+            // branch. Directories report size 0 on Windows but must fall
+            // through to `fs::read` so they surface FileNotReadable.
             continue;
         }
 

@@ -7,7 +7,9 @@
 
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -678,6 +680,7 @@ fn sync_parent_directory(parent: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[expect(clippy::unnecessary_wraps)]
 fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
@@ -734,6 +737,7 @@ fn json_string_key(key: &str) -> String {
 
 fn process_home_path() -> Option<PathBuf> {
     env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .or_else(dirs::home_dir)
 }

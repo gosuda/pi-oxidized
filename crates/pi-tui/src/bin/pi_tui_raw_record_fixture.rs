@@ -203,9 +203,9 @@ mod imp {
         entry.variant == "KeyEvent" && entry.key_down == Some(true) && entry.u_char == Some(0x0004)
     }
 
-    /// Console-side writer: `CONOUT$` under ConPTY, falling back to the
+    /// Console-side writer: `CONOUT$` under `ConPTY`, falling back to the
     /// standard output handle. Writing to `stdout()` proved lossy on the CI
-    /// runner (a spawned child observed zero bytes reaching the ConPTY
+    /// runner (a spawned child observed zero bytes reaching the `ConPTY`
     /// master while console-mode writes succeeded), so the witness channel
     /// opens the real console output device first.
     fn console_writer() -> &'static Mutex<Box<dyn Write + Send>> {
@@ -267,13 +267,72 @@ mod imp {
     }
 
     fn emit_event(event: &Event, prefix: &[u8]) {
-        let json = serde_json::to_string(event).expect("serialize event");
+        // Serialize failure cannot panic: a witness that dies emitting an
+        // error event loses the error itself. Fall back to a marker line so
+        // the parent still sees a structured record.
+        let json = match serde_json::to_string(event) {
+            Ok(json) => json,
+            Err(error) => format!(
+                "{{\"type\":\"serialize_error\",\"error\":\"{}\"}}",
+                error.to_string().replace('"', "'")
+            ),
+        };
         write_osc999_line(prefix, json.as_bytes());
     }
 
     fn emit_ready(arm: &str, active: u32) {
         let body = format!("=1;arm={arm};active={active}");
         write_osc999_line(READY_PREFIX, body.as_bytes());
+    }
+
+    /// One lifecycle stage marker on the evidence channel.
+    fn emit_stage(
+        stage: &str,
+        arm: &str,
+        original: u32,
+        baseline: u32,
+        requested: u32,
+        active: Option<u32>,
+        error: Option<String>,
+    ) {
+        emit_event(
+            &Event::Lifecycle(LifecycleEntry {
+                stage: stage.into(),
+                arm: arm.into(),
+                original,
+                baseline,
+                requested,
+                active,
+                restored: None,
+                error,
+            }),
+            RECORD_PREFIX,
+        );
+    }
+
+    /// Terminal failure: restore the console mode and emit the teardown
+    /// lifecycle plus termination evidence.
+    fn fail_and_finish(
+        arm: &str,
+        original: u32,
+        baseline: u32,
+        requested: u32,
+        guard: &ModeGuard,
+        cause: &str,
+        message: String,
+    ) {
+        emit_lifecycle_and_finish(
+            arm,
+            original,
+            baseline,
+            requested,
+            guard,
+            TerminationEntry {
+                cause: cause.into(),
+                record_count: 0,
+                message: Some(message),
+            },
+        );
     }
 
     fn emit_lifecycle_and_finish(
@@ -340,166 +399,69 @@ mod imp {
         emit_event(&Event::Termination(termination), RECORD_PREFIX);
     }
 
-    pub(crate) fn main() {
-        // Plain-text stage markers: unlike the OSC 999 event channel these
-        // always pass ConPTY untransformed, so the last marker in the
-        // transcript localizes any stall to a single stage.
-        stage("entry");
-        // `--selftest` verifies the binary reaches Rust main and can write
-        // the evidence file outside any PTY. The parent runs it before the
-        // ConPTY arms: an empty exit-0 log pins a broken spawn, while a
-        // missing/empty file after a successful process exit proves the
-        // runner's early-process path never hands control to user code.
-        if std::env::args().any(|arg| arg == "--selftest") {
-            stage("selftest");
-            return;
-        }
-        let arm = std::env::var("PI_TUI_RAW_RECORD_ARM")
-            .unwrap_or_else(|e| panic!("PI_TUI_RAW_RECORD_ARM must be set to A, B, or IDLE: {e}"));
-
-        assert!(
-            matches!(arm.as_str(), "A" | "B" | "IDLE"),
-            "PI_TUI_RAW_RECORD_ARM must be A, B, or IDLE, got {arm}"
-        );
-
-        let deadline_ms: u64 = match std::env::var("PI_TUI_RAW_RECORD_DEADLINE_MS") {
-            Ok(s) => s.parse().unwrap_or_else(|e| {
-                panic!("PI_TUI_RAW_RECORD_DEADLINE_MS {s:?} is not a u64: {e}")
+    /// Reports launch misconfiguration on the witness channel instead of
+    /// panicking, so the parent still receives a structured termination
+    /// record even when the spawn environment is wrong.
+    fn emit_config_error(message: String) {
+        emit_event(
+            &Event::Termination(TerminationEntry {
+                cause: "error".into(),
+                record_count: 0,
+                message: Some(message),
             }),
-            Err(std::env::VarError::NotPresent) => DEFAULT_CHILD_DEADLINE_MS,
-            Err(e) => panic!("PI_TUI_RAW_RECORD_DEADLINE_MS is not readable: {e}"),
-        };
-        let deadline = Duration::from_millis(deadline_ms);
+            RECORD_PREFIX,
+        );
+    }
 
-        stage("in_handle");
-        let in_handle = match Handle::current_in_handle() {
-            Ok(h) => h,
-            Err(e) => {
-                emit_event(
-                    &Event::Termination(TerminationEntry {
-                        cause: "error".into(),
-                        record_count: 0,
-                        message: Some(format!("current_in_handle failed: {e}")),
-                    }),
-                    RECORD_PREFIX,
-                );
-                return;
+    /// `PI_TUI_RAW_RECORD_ARM` selects the input-mode arm (`A`, `B`, `IDLE`).
+    fn resolve_arm() -> Option<String> {
+        match std::env::var("PI_TUI_RAW_RECORD_ARM") {
+            Ok(arm) if matches!(arm.as_str(), "A" | "B" | "IDLE") => Some(arm),
+            result => {
+                emit_config_error(format!(
+                    "PI_TUI_RAW_RECORD_ARM must be set to A, B, or IDLE: {result:?}"
+                ));
+                None
+            }
+        }
+    }
+
+    /// `PI_TUI_RAW_RECORD_DEADLINE_MS` bounds the record loop; absent means
+    /// [`DEFAULT_CHILD_DEADLINE_MS`].
+    fn resolve_deadline() -> Option<Duration> {
+        let raw = match std::env::var("PI_TUI_RAW_RECORD_DEADLINE_MS") {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => {
+                return Some(Duration::from_millis(DEFAULT_CHILD_DEADLINE_MS));
+            }
+            Err(error) => {
+                emit_config_error(format!(
+                    "PI_TUI_RAW_RECORD_DEADLINE_MS is not readable: {error}"
+                ));
+                return None;
             }
         };
-
-        stage("mode_read");
-        let cm = ConsoleMode::from(in_handle.clone());
-        let console = Console::from(in_handle);
-
-        let original = match cm.mode() {
-            Ok(m) => m,
-            Err(e) => {
-                emit_event(
-                    &Event::Termination(TerminationEntry {
-                        cause: "error".into(),
-                        record_count: 0,
-                        message: Some(format!("read original mode failed: {e}")),
-                    }),
-                    RECORD_PREFIX,
-                );
-                return;
+        match raw.parse::<u64>() {
+            Ok(ms) => Some(Duration::from_millis(ms)),
+            Err(error) => {
+                emit_config_error(format!(
+                    "PI_TUI_RAW_RECORD_DEADLINE_MS {raw:?} is not a u64: {error}"
+                ));
+                None
             }
-        };
+        }
+    }
 
-        let baseline = original & !NOT_RAW_MASK;
-        let requested = match arm.as_str() {
-            "B" => baseline | VT_INPUT,
-            _ => baseline,
-        };
-
-        let guard = ModeGuard::new(cm, original);
-
+    /// Polls the console input queue until the Ctrl+D terminator record, an
+    /// error, or the deadline; the returned entry carries the final cause.
+    fn collect_records(console: &Console, deadline: Duration) -> (usize, TerminationEntry) {
+        let started = Instant::now();
+        let mut record_count: usize = 0;
         let mut termination = TerminationEntry {
             cause: "inconclusive".into(),
             record_count: 0,
             message: None,
         };
-
-        // The parent's ConPTY handshake bytes (its DSR answer lands as key
-        // INPUT_RECORDs) must never reach arm evidence: drain whatever the
-        // queue already holds before the mode change, then after READY give
-        // the reply a settle window and drain once more before the read
-        // loop opens.
-        let _ = console.read_console_input();
-
-        stage("set_mode");
-        if let Err(e) = guard.set(requested) {
-            termination.cause = "error".into();
-            termination.message = Some(format!("set_mode({requested:#06x}) failed: {e}"));
-            emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
-            return;
-        }
-
-        let active = match guard.mode() {
-            Ok(m) => m,
-            Err(e) => {
-                termination.cause = "error".into();
-                termination.message = Some(format!("read active mode failed: {e}"));
-                emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
-                return;
-            }
-        };
-
-        stage("setup_emit");
-        emit_event(
-            &Event::Lifecycle(LifecycleEntry {
-                stage: "setup".into(),
-                arm: arm.clone(),
-                original,
-                baseline,
-                requested,
-                active: Some(active),
-                restored: None,
-                error: if active == requested {
-                    None
-                } else {
-                    Some(format!(
-                        "active {active:#06x} != requested {requested:#06x}"
-                    ))
-                },
-            }),
-            RECORD_PREFIX,
-        );
-
-        if active != requested {
-            termination.cause = "inconclusive".into();
-            termination.message = Some(format!(
-                "mode setup mismatch: active {active:#06x} != requested {requested:#06x}"
-            ));
-            emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
-            return;
-        }
-
-        stage("ready_emit");
-        emit_ready(&arm, active);
-        emit_event(
-            &Event::Lifecycle(LifecycleEntry {
-                stage: "ready".into(),
-                arm: arm.clone(),
-                original,
-                baseline,
-                requested,
-                active: Some(active),
-                restored: None,
-                error: None,
-            }),
-            RECORD_PREFIX,
-        );
-
-        // Handshake settle: the parent's DSR answer arrives around READY;
-        // a short wait plus a final drain clears it before evidence starts.
-        stage("drain_handshake");
-        thread::sleep(Duration::from_millis(120));
-        let _ = console.read_console_input();
-
-        stage("read_loop");
-        let started = Instant::now();
-        let mut record_count: usize = 0;
         while started.elapsed() < deadline {
             let count = match console.number_of_console_input_events() {
                 Ok(0) => {
@@ -562,9 +524,147 @@ mod imp {
             ));
         }
         termination.record_count = record_count;
+        (record_count, termination)
+    }
+
+    pub(crate) fn main() {
+        // Plain-text stage markers: unlike the OSC 999 event channel these
+        // always pass ConPTY untransformed, so the last marker in the
+        // transcript localizes any stall to a single stage.
+        stage("entry");
+        // `--selftest` verifies the binary reaches Rust main and can write
+        // the evidence file outside any PTY. The parent runs it before the
+        // ConPTY arms: an empty exit-0 log pins a broken spawn, while a
+        // missing/empty file after a successful process exit proves the
+        // runner's early-process path never hands control to user code.
+        if std::env::args().any(|arg| arg == "--selftest") {
+            stage("selftest");
+            return;
+        }
+        let Some(arm) = resolve_arm() else {
+            return;
+        };
+        let Some(deadline) = resolve_deadline() else {
+            return;
+        };
+        run(&arm, deadline);
+    }
+
+    fn run(arm: &str, deadline: Duration) {
+        stage("in_handle");
+        let in_handle = match Handle::current_in_handle() {
+            Ok(h) => h,
+            Err(e) => {
+                emit_config_error(format!("current_in_handle failed: {e}"));
+                return;
+            }
+        };
+
+        stage("mode_read");
+        let cm = ConsoleMode::from(in_handle.clone());
+        let console = Console::from(in_handle);
+
+        let original = match cm.mode() {
+            Ok(m) => m,
+            Err(e) => {
+                emit_config_error(format!("read original mode failed: {e}"));
+                return;
+            }
+        };
+
+        let baseline = original & !NOT_RAW_MASK;
+        let requested = match arm {
+            "B" => baseline | VT_INPUT,
+            _ => baseline,
+        };
+
+        let guard = ModeGuard::new(cm, original);
+
+        // The parent's ConPTY handshake bytes (its DSR answer lands as key
+        // INPUT_RECORDs) must never reach arm evidence: drain whatever the
+        // queue already holds before the mode change, then after READY give
+        // the reply a settle window and drain once more before the read
+        // loop opens.
+        let _ = console.read_console_input();
+
+        stage("set_mode");
+        if let Err(e) = guard.set(requested) {
+            fail_and_finish(
+                arm,
+                original,
+                baseline,
+                requested,
+                &guard,
+                "error",
+                format!("set_mode({requested:#06x}) failed: {e}"),
+            );
+            return;
+        }
+
+        let active = match guard.mode() {
+            Ok(m) => m,
+            Err(e) => {
+                fail_and_finish(
+                    arm,
+                    original,
+                    baseline,
+                    requested,
+                    &guard,
+                    "error",
+                    format!("read active mode failed: {e}"),
+                );
+                return;
+            }
+        };
+
+        stage("setup_emit");
+        emit_stage(
+            "setup",
+            arm,
+            original,
+            baseline,
+            requested,
+            Some(active),
+            (active != requested)
+                .then(|| format!("active {active:#06x} != requested {requested:#06x}")),
+        );
+
+        if active != requested {
+            fail_and_finish(
+                arm,
+                original,
+                baseline,
+                requested,
+                &guard,
+                "inconclusive",
+                format!("mode setup mismatch: active {active:#06x} != requested {requested:#06x}"),
+            );
+            return;
+        }
+
+        stage("ready_emit");
+        emit_ready(arm, active);
+        emit_stage(
+            "ready",
+            arm,
+            original,
+            baseline,
+            requested,
+            Some(active),
+            None,
+        );
+
+        // Handshake settle: the parent's DSR answer arrives around READY;
+        // a short wait plus a final drain clears it before evidence starts.
+        stage("drain_handshake");
+        thread::sleep(Duration::from_millis(120));
+        let _ = console.read_console_input();
+
+        stage("read_loop");
+        let (_record_count, termination) = collect_records(&console, deadline);
 
         stage("finish");
-        emit_lifecycle_and_finish(&arm, original, baseline, requested, &guard, termination);
+        emit_lifecycle_and_finish(arm, original, baseline, requested, &guard, termination);
         stage("done");
     }
 }

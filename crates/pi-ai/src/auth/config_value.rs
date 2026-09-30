@@ -294,10 +294,14 @@ fn terminate_process_group_and_reap(
     {
         // Upstream 7af2d27dc (#6596): resolve taskkill.exe under %SystemRoot%\System32
         // instead of PATH so a hijacked PATH entry cannot redirect the kill.
-        let taskkill = std::env::var_os("SystemRoot")
-            .map(std::path::PathBuf::from)
-            .map(|root| root.join("System32").join("taskkill.exe"))
-            .unwrap_or_else(|| std::path::PathBuf::from("taskkill.exe"));
+        let taskkill = std::env::var_os("SystemRoot").map_or_else(
+            || std::path::PathBuf::from("taskkill.exe"),
+            |root| {
+                std::path::PathBuf::from(root)
+                    .join("System32")
+                    .join("taskkill.exe")
+            },
+        );
         let status = Command::new(taskkill)
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .stdin(Stdio::null())
@@ -327,9 +331,9 @@ fn execute_with_default_shell(
     let mut shell = {
         #[cfg(windows)]
         {
-            let mut shell = Command::new("cmd");
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let mut shell = Command::new("cmd");
             shell
                 .arg("/C")
                 .arg(command)
@@ -544,21 +548,30 @@ mod tests {
     #[test]
     fn cached_command_execution_runs_once() -> Result<(), String> {
         clear_config_value_cache();
-        // Use a unique marker file path under temp to count executions without
-        // depending on bash-specific features beyond POSIX sh.
-        let marker =
-            std::env::temp_dir().join(format!("pi-ai-config-value-cache-{}", std::process::id()));
+        // A space-free relative marker name counts executions portably:
+        // single quotes are literal under cmd.exe and extra double quotes
+        // inside `cmd /C` corrupt its quote handling.
+        let marker = std::env::current_dir()
+            .map_err(|err| err.to_string())?
+            .join(format!(
+                "pi-ai-config-value-cache-{}.tmp",
+                std::process::id()
+            ));
         let _ = std::fs::remove_file(&marker);
-        let marker_str = marker.to_string_lossy().replace('\'', "");
+        let marker_str = marker
+            .file_name()
+            .ok_or("marker name")?
+            .to_string_lossy()
+            .into_owned();
 
-        let command = format!("!echo run >> '{marker_str}' && echo cached-secret");
+        let command = format!("!echo run >> {marker_str} && echo cached-secret");
         let first = resolve_config_value(&command, None);
         let second = resolve_config_value(&command, None);
         assert_eq!(first.as_deref(), Some("cached-secret"));
         assert_eq!(second.as_deref(), Some("cached-secret"));
 
         let body = std::fs::read_to_string(&marker).map_err(|err| err.to_string())?;
-        let runs = body.lines().filter(|line| *line == "run").count();
+        let runs = body.lines().filter(|line| line.trim() == "run").count();
         assert_eq!(runs, 1, "command must execute once per process cache");
         assert_eq!(command_cache_len(), 1);
         let _ = std::fs::remove_file(&marker);

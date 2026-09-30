@@ -1655,6 +1655,12 @@ impl SessionCwdSource for SessionManager {
 /// wrap in `--…--`.
 #[must_use]
 pub fn encode_cwd_for_session_dir(resolved_cwd: &str) -> String {
+    // A verbatim `\\?\C:\...` cwd canonicalizes the same leaf as `C:\...`;
+    // encoding the prefix literally would leave an illegal `?` in the name.
+    let resolved_cwd = resolved_cwd
+        .strip_prefix(r"\\?\")
+        .or_else(|| resolved_cwd.strip_prefix(r"\\.\"))
+        .unwrap_or(resolved_cwd);
     let stripped = resolved_cwd
         .strip_prefix('/')
         .or_else(|| resolved_cwd.strip_prefix('\\'))
@@ -1849,6 +1855,7 @@ fn sync_parent_directory(parent: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[expect(clippy::unnecessary_wraps)]
 fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
@@ -2342,7 +2349,21 @@ mod tests {
         assert_eq!(encode_cwd_for_session_dir("C:\\Users\\x"), "--C--Users-x--");
         let agent = Path::new("/tmp/agent");
         let dir = default_session_dir_path("/a/b", agent);
-        assert!(dir.ends_with("sessions/--a-b--") || dir.contains("sessions/--a-b--"));
+        // `/a/b` resolves against the current drive root on Windows, so the
+        // encoded leaf is derived instead of hard-coded to `--a-b--`.
+        let leaf = encode_cwd_for_session_dir(&resolve_path("/a/b").to_string_lossy());
+        let dir_path = Path::new(&dir);
+        assert_eq!(
+            dir_path.file_name().map(|name| name.to_string_lossy()),
+            Some(leaf.into())
+        );
+        assert_eq!(
+            dir_path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .map(|name| name.to_string_lossy()),
+            Some("sessions".into())
+        );
     }
 
     #[test]

@@ -335,6 +335,7 @@ async fn restore_stranded_backup(path: &Path) {
     let _ = fs::rename(&backup, path).await;
 }
 
+#[cfg_attr(not(unix), expect(clippy::unused_async))]
 async fn set_private_permissions(path: &Path) -> Result<(), PluginProfileError> {
     #[cfg(unix)]
     {
