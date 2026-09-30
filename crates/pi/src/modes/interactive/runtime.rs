@@ -3359,10 +3359,16 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         // the line and whole buffer several times per event — an O(n²)
         // livelock on a giant single-line flood. The head event still
         // takes the full dispatch below; the queued tail inserts as a
-        // single mutation afterwards.
-        let mut char_tail: Vec<char> = Vec::new();
+        // single mutation afterwards. Batching stays off while an
+        // extension registers terminal-input handlers — the tail must keep
+        // flowing through intercept/rewrite one event at a time.
+        let mut char_tail: Vec<KeyEvent> = Vec::new();
         let mut preserved: Vec<UiEvent> = Vec::new();
         if self.view.focus == FocusArea::Editor
+            && self
+                .extension_runner
+                .as_ref()
+                .is_none_or(|runner| !runner.has_terminal_input_handlers())
             && let UiEvent::Key(key) = &event
             && is_plain_insert_key(key)
         {
@@ -3371,9 +3377,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             while let Ok(next) = self.input.receiver_mut().try_recv() {
                 match next {
                     UiEvent::Key(next_key) if is_plain_insert_key(&next_key) => {
-                        if let KeyCode::Char(c) = next_key.code {
-                            char_tail.push(c);
-                        }
+                        char_tail.push(next_key);
                     }
                     other => {
                         preserved.push(other);
@@ -3418,14 +3422,19 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 && self.active_selector.is_none()
                 && self.editor.get_text().len() == text_len_before + head_len
             {
-                let tail: String = char_tail.into_iter().collect();
+                let tail: String = char_tail
+                    .iter()
+                    .filter_map(|key| match key.code {
+                        KeyCode::Char(c) => Some(c),
+                        _ => None,
+                    })
+                    .collect();
                 self.editor.insert_text_run(&tail);
             } else {
-                for c in char_tail.into_iter().rev() {
-                    self.pending_ui_reinject.push(UiEvent::Key(KeyEvent::new(
-                        KeyCode::Char(c),
-                        KeyModifiers::NONE,
-                    )));
+                // Requeue the original events unchanged so modifiers and
+                // kind survive the fallback path.
+                for key in char_tail.into_iter().rev() {
+                    self.pending_ui_reinject.push(UiEvent::Key(key));
                 }
             }
         }
