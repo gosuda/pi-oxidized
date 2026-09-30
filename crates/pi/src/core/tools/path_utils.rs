@@ -97,7 +97,8 @@ pub(crate) fn resolve_lexically_absolute(path: &Path) -> std::io::Result<PathBuf
 }
 
 fn home_dir_string() -> Result<String, PathResolveError> {
-    let home = dirs::home_dir().ok_or(PathResolveError::HomeDirectoryUnavailable)?;
+    let home = crate::core::config::process_home_dir()
+        .ok_or(PathResolveError::HomeDirectoryUnavailable)?;
     Ok(home.to_string_lossy().into_owned())
 }
 
@@ -372,7 +373,7 @@ mod tests {
 
     #[test]
     fn expand_path_expands_tilde_against_home() -> TestResult {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = crate::core::config::process_home_dir() else {
             // No home directory in this environment: nothing to compare.
             return Ok(());
         };
@@ -389,6 +390,9 @@ mod tests {
         Ok(())
     }
 
+    // Node's `fileURLToPath` only accepts POSIX-style paths on POSIX hosts;
+    // on Windows it requires a drive letter, so the fixtures differ per host.
+    #[cfg(unix)]
     #[test]
     fn expand_path_converts_file_urls() -> TestResult {
         assert_eq!(expand_path("file:///etc/hostname")?, "/etc/hostname");
@@ -396,15 +400,37 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn expand_path_converts_file_urls() -> TestResult {
+        assert_eq!(expand_path("file:///C:/etc/hostname")?, "C:\\etc\\hostname");
+        assert_eq!(expand_path("file:///C:/tmp/my%20file")?, "C:\\tmp\\my file");
+        Ok(())
+    }
+
     #[test]
     fn resolve_to_cwd_joins_relative_and_normalizes() -> TestResult {
-        assert_eq!(resolve_to_cwd("src/./a.rs", "/repo")?, "/repo/src/a.rs");
-        assert_eq!(resolve_to_cwd("../lib", "/repo/pkg")?, "/repo/lib");
-        assert_eq!(resolve_to_cwd("/abs/x", "/repo")?, "/abs/x");
+        // Compare as paths: the result is a host path whose separators follow
+        // the platform.
+        assert_eq!(
+            Path::new(&resolve_to_cwd("src/./a.rs", "/repo")?),
+            Path::new("/repo/src/a.rs")
+        );
+        assert_eq!(
+            Path::new(&resolve_to_cwd("../lib", "/repo/pkg")?),
+            Path::new("/repo/lib")
+        );
+        assert_eq!(
+            Path::new(&resolve_to_cwd("/abs/x", "/repo")?),
+            Path::new("/abs/x")
+        );
         // `..` cannot escape the root.
-        assert_eq!(resolve_to_cwd("../../x", "/")?, "/x");
+        assert_eq!(Path::new(&resolve_to_cwd("../../x", "/")?), Path::new("/x"));
         // Unicode spaces and @ are folded in the input only.
-        assert_eq!(resolve_to_cwd("@my\u{00A0}f", "/repo")?, "/repo/my f");
+        assert_eq!(
+            Path::new(&resolve_to_cwd("@my\u{00A0}f", "/repo")?),
+            Path::new("/repo/my f")
+        );
         Ok(())
     }
 

@@ -1987,6 +1987,7 @@ async fn writer_actor(mut write_rx: mpsc::UnboundedReceiver<WriteMessage>, sink:
 }
 
 /// Spawn SIGTERM (→143) and SIGHUP (→129, unix-only) handlers.
+#[cfg_attr(not(unix), expect(clippy::needless_pass_by_value))]
 fn spawn_signal_handlers(tx: mpsc::Sender<i32>) {
     #[cfg(unix)]
     {

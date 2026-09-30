@@ -571,6 +571,10 @@ fn drive_fixture(exit: &str, sync: bool, capture_width_snapshots: bool) -> Drive
         let _ = child.wait();
     }
     drop(writer);
+    // The output pipe EOFs only when the last console host detaches: hold
+    // the master open past child exit and a conhost that survives its last
+    // client (observed on Server 2022) keeps the reader blocked forever.
+    drop(pair.master);
     let _ = reader_thread.join();
     while let Ok(chunk) = rx.try_recv() {
         raw.extend_from_slice(&chunk);
@@ -1497,6 +1501,9 @@ mod windows_raw_record {
             report.stop_cause = Some("child did not exit before HARD_TIMEOUT".into());
         }
         drop(writer);
+        // Same conhost-outlives-client case as drive_fixture: close the
+        // pseudoconsole so the reader sees EOF before joining it.
+        drop(pair.master);
         let _ = reader_thread.join();
         drain_pending(&rx, &mut raw);
 

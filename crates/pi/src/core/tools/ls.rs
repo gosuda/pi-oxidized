@@ -465,9 +465,9 @@ mod tests {
         let trap = dir.path().join("trap");
         fs::create_dir(&trap)?;
         // Create a dangling symlink that metadata follows and fails to resolve.
-        let dangling = dir.path().join("dangling");
         #[cfg(unix)]
         {
+            let dangling = dir.path().join("dangling");
             std::os::unix::fs::symlink(dir.path().join("missing-target"), &dangling)?;
         }
 
