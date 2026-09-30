@@ -1185,6 +1185,470 @@ fn adversarial_split_multibyte_char() {
     }
 }
 
+/// A UTF-8 lead byte plus one continuation that is then abandoned must not
+/// eat the byte that proves it truncated. `Ctrl+D` after `\xe9\x81` is not a
+/// continuation: without re-feeding the divergence witness the serve
+/// terminator is swallowed and the fixture hangs until the hard timeout.
+#[test]
+fn adversarial_truncated_utf8_then_eof() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(&[0xE9, 0x81]);
+    h.pump(Duration::from_millis(120));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("truncated-utf8-eof");
+    assert_eq!(
+        report.live_paste,
+        Some(0),
+        "truncated-utf8-eof: truncated char opened a paste; tail={}",
+        report.tail()
+    );
+}
+
+/// Same truncation, but the witness byte is `ESC` opening a CSI: the
+/// re-fed `ESC` must start a real escape sequence, not be swallowed with
+/// the bad bytes. Pre-fix the `[999z` tail would type literal `[999z`
+/// into the editor; post-fix only `ok` lands.
+#[test]
+fn adversarial_truncated_utf8_then_csi() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(&[0xE9, 0x81]);
+    h.send(b"\x1b[999z");
+    h.pump(Duration::from_millis(120));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("truncated-utf8-csi");
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "truncated-utf8-csi: sequence residue or re-fed bytes in the editor; got {:?}; tail={}",
+            report.live_text,
+            report.tail()
+        );
+    } else {
+        let live_text = report
+            .live_text
+            .as_deref()
+            .unwrap_or_else(|| panic!("truncated-utf8-csi: missing PI_TUI_LIVE_TEXT record"));
+        assert!(
+            live_text.contains("ok"),
+            "truncated-utf8-csi: trailing keys lost; got {live_text:?}; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// Every UTF-8 invalid class — stray continuation, overlong encoding,
+/// encoded surrogate, and an out-of-range lead — must drop without
+/// surfacing a char or wedging the stream.
+#[test]
+fn adversarial_invalid_utf8_bytes() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(&[0x80]); // stray continuation, invalid start
+    h.send(&[0xC0, 0xAF]); // overlong '/'
+    h.send(&[0xED, 0xA0, 0x80]); // encoded surrogate U+D800
+    h.send(&[0xF8]); // 5-byte lead, invalid start
+    h.pump(Duration::from_millis(120));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("invalid-utf8");
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "invalid-utf8: invalid bytes surfaced as editor text; got {:?}; tail={}",
+            report.live_text,
+            report.tail()
+        );
+    }
+}
+
+/// A CSI that never receives a final byte must not absorb the C0 bytes
+/// that follow it. ECMA-48 executes the control and cancels the sequence;
+/// absorbing instead means `Ctrl+D` is eaten as more parameter bytes and
+/// the serve loop hangs.
+#[test]
+fn adversarial_unterminated_csi_then_eof() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[123456");
+    h.pump(Duration::from_millis(120));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("unterminated-csi-eof");
+    assert_eq!(
+        report.live_paste,
+        Some(0),
+        "unterminated-csi-eof: cancelled sequence opened a paste; tail={}",
+        report.tail()
+    );
+}
+
+/// The cancelling byte inside the aborted CSI is executed on its own, and
+/// the bytes after it resync as ordinary input. `BEL` lands as an Ignored
+/// control key and `ok` reaches the editor whole — pre-fix the `o` was
+/// consumed as the CSI final.
+#[test]
+fn adversarial_c0_aborts_csi() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[12\x07");
+    h.pump(Duration::from_millis(60));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("c0-aborts-csi");
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "c0-aborts-csi: abort boundary leaked or ate editor text; got {:?}; tail={}",
+            report.live_text,
+            report.tail()
+        );
+    }
+}
+
+/// Kernel-reported zero and unit geometries: the PTY layer may reject the
+/// degenerate sizes itself, but any that land must not panic the render
+/// path — the fixture clamps before `note_resize` and must exit cleanly
+/// once geometry recovers.
+#[test]
+fn adversarial_zero_and_unit_geometry() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    for (cols, rows) in [
+        (0u16, 0u16),
+        (0, 10),
+        (10, 0),
+        (1, 1),
+        (INITIAL_COLS, INITIAL_ROWS),
+    ] {
+        h.resize(cols, rows);
+        h.pump(Duration::from_millis(60));
+    }
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("zero-geometry");
+    assert!(
+        report.live_resize.unwrap_or(0) >= 1,
+        "zero-geometry: no resize event survived the degenerate storm; tail={}",
+        report.tail()
+    );
+}
+
+/// Every byte of a paste + tail arrives as its own master write. The
+/// parser must carry sequence state across read boundaries with no
+/// half-parsed event leaking early.
+#[test]
+fn adversarial_byte_drip_feed() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    for &byte in b"\x1b[200~drip-\xc3\xa9\x1b[201~ok" {
+        h.send(&[byte]);
+        h.pump(Duration::from_millis(5));
+    }
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("byte-drip");
+    assert_eq!(
+        report.live_paste,
+        Some(EXPECTED_LIVE_PASTE),
+        "byte-drip: expected {EXPECTED_LIVE_PASTE} live paste(s); tail={}",
+        report.tail()
+    );
+    if BYTE_TRANSPARENT_MASTER {
+        // 'é' escaped: \u{e9}. The drip must not split it or leak markers.
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("drip-\\u{e9}ok"),
+            "byte-drip: drip-fed payload diverged; got {:?}; tail={}",
+            report.live_text,
+            report.tail()
+        );
+    }
+}
+
+/// An OSC 11 reply that arrives *after* the 50ms escape-framing deadline
+/// is a documented leak: the held ESC already expired into an Esc key, so
+/// the reply tail types literal keys. This pins the expiry boundary — a
+/// slow terminal cannot smuggle an infinite candidate.
+#[test]
+fn adversarial_osc11_late_header_leaks_keys() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b");
+    h.pump(Duration::from_millis(80));
+    h.send(b"]11;rgb:1234/1234/1234\x07");
+    h.pump(Duration::from_millis(80));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("osc11-late-header");
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("]11;rgb:1234/1234/1234"),
+            "osc11-late-header: expired-candidate reply did not leak verbatim; got {:?}; tail={}",
+            report.live_text,
+            report.tail()
+        );
+    }
+}
+
+/// `ESC` inside a recognized OSC 11 payload not followed by `\` is
+/// malformed framing: the parser latches a protocol error, and the input
+/// task recovers in-band — drop the stream, clear the latch, recreate —
+/// so decoding resumes with the next bytes instead of wedging or exiting.
+/// The poisoned sequence's bytes are discarded with the error; the keys
+/// sent afterwards must still land.
+#[test]
+fn adversarial_osc11_malformed_framing_recovers() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b]11;AAAA\x1bx");
+    h.pump(Duration::from_millis(150));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("osc11-malformed");
+    if BYTE_TRANSPARENT_MASTER {
+        let live_text = report
+            .live_text
+            .as_deref()
+            .unwrap_or_else(|| panic!("osc11-malformed: missing PI_TUI_LIVE_TEXT record"));
+        assert!(
+            live_text.ends_with("ok"),
+            "osc11-malformed: input after protocol recovery was lost; got {live_text:?}; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// A recognized OSC 11 payload past the 64-byte bound latches the same
+/// protocol error before any terminator can arrive — an unbounded reply
+/// cannot grow the candidate forever — and the same in-band recovery
+/// keeps the input stream live afterwards.
+#[test]
+fn adversarial_osc11_oversized_payload_recovers() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b]11;");
+    h.send(&[b'A'; 100]);
+    h.pump(Duration::from_millis(150));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("osc11-oversized");
+    if BYTE_TRANSPARENT_MASTER {
+        let live_text = report
+            .live_text
+            .as_deref()
+            .unwrap_or_else(|| panic!("osc11-oversized: missing PI_TUI_LIVE_TEXT record"));
+        assert!(
+            live_text.ends_with("ok"),
+            "osc11-oversized: input after payload-limit recovery was lost; got {live_text:?}; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// String sequences the parser does not recognize — OSC 52 clipboard and
+/// APC (kitty graphics header) — diverge from the OSC 11 reply grammar and
+/// decode as their ordinary-key equivalents: `Alt+]`, literal payload
+/// chars, and `Alt+\\`. This pins the leak shape so a silent swallow or a
+/// wedge would be caught.
+#[test]
+fn adversarial_unrecognized_strings_leak_keys() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b]52;c;QUJD\x07");
+    h.send(b"\x1b_X\x1b\\");
+    h.pump(Duration::from_millis(120));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("unrecognized-strings");
+    if BYTE_TRANSPARENT_MASTER {
+        // `Alt+]` and `Alt+_`/`Alt+\\` are Ignored; `BEL` is a control
+        // key. Only the string bodies type text.
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("52;c;QUJDX"),
+            "unrecognized-strings: leaked keys diverged; got {:?}; tail={}",
+            report.live_text,
+            report.tail()
+        );
+    }
+}
+
+/// Every C0 byte except Ctrl+D, sent in one burst: each must decode to a
+/// control key (Ignored by the editor) or an armed-then-expired ESC —
+/// none may surface as editor text or wedge the stream.
+#[test]
+fn adversarial_c0_control_sweep() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    let burst: Vec<u8> = (0x00u8..=0x1f).filter(|b| *b != 0x04).collect();
+    h.send(&burst);
+    h.pump(Duration::from_millis(150));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(80));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("c0-sweep");
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "c0-sweep: control bytes leaked into the editor; got {:?}; tail={}",
+            report.live_text,
+            report.tail()
+        );
+    }
+}
+
+/// REP, DECSCL, and clear-screen CSIs arriving as input are well-formed
+/// but unrecognized replies — each drops at its final byte and the stream
+/// resyncs for the trailing keys.
+#[test]
+fn adversarial_rep_decsc_clears_soup() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[40b\x1b[!p\x1b[2J\x1b[3J");
+    h.pump(Duration::from_millis(120));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("rep-decsc-soup");
+    if BYTE_TRANSPARENT_MASTER {
+        // `CSI !` aborts the moment the unrecognized intermediate arrives,
+        // so its `p` final resyncs as an ordinary key — the other sequences
+        // reach their final byte and drop whole.
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("pok"),
+            "rep-decsc-soup: output-only CSI bytes leaked into the editor; got {:?}; tail={}",
+            report.live_text,
+            report.tail()
+        );
+    }
+}
+
+/// Multi-vector: a paste drip-fed one byte per write while geometry
+/// oscillates underneath it. The paste accumulator, the resize
+/// coalescer, and the editor delta must all stay consistent.
+#[test]
+fn adversarial_resize_during_drip_paste() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    let payload = b"\x1b[200~VECTOR-PASTE-0123456789\x1b[201~ok";
+    for (i, &byte) in payload.iter().enumerate() {
+        h.send(&[byte]);
+        if i % 6 == 0 {
+            h.resize(if i % 12 == 0 { 60 } else { INITIAL_COLS }, INITIAL_ROWS);
+        }
+        h.pump(Duration::from_millis(5));
+    }
+    h.pump(Duration::from_millis(80));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("resize-drip-paste");
+    assert_eq!(
+        report.live_paste,
+        Some(EXPECTED_LIVE_PASTE),
+        "resize-drip-paste: expected {EXPECTED_LIVE_PASTE} live paste(s); tail={}",
+        report.tail()
+    );
+    assert!(
+        report.live_resize.unwrap_or(0) >= 1,
+        "resize-drip-paste: resize storm produced no live resize event; tail={}",
+        report.tail()
+    );
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("VECTOR-PASTE-0123456789ok"),
+            "resize-drip-paste: payload diverged under geometry churn; got {:?}; tail={}",
+            report.live_text,
+            report.tail()
+        );
+    }
+}
+
+/// X10 normal-mouse reports (`ESC [ M` + three raw report bytes) use a
+/// value+32 encoding that legitimately exceeds `0x7e`: the C0-abort must
+/// exempt those bytes or the report is destroyed and its tail leaks as
+/// editor text. A C0 byte is never a valid report byte, so an incomplete
+/// report still aborts and delivers the control key.
+#[test]
+fn adversarial_x10_mouse_raw_report_bytes() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    // A C0 inside an incomplete report still aborts the sequence —
+    // Ctrl+C lands as a key (Ignored), it is not swallowed into the buffer.
+    h.send(b"\x1b[M\x20\x03");
+    h.pump(Duration::from_millis(60));
+    // Complete report: Cb=0x20, Cx=0xc0, Cy=0x61 — the last two must be
+    // report bytes, not editor text (0x61 would land as 'a' if shredded).
+    h.send(b"\x1b[M\x20\xc0a");
+    h.pump(Duration::from_millis(60));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "x10-mouse: report bytes leaked as text; tail={}",
+            report.tail()
+        );
+    }
+    report.assert_success_contract("x10-mouse");
+}
+
 fn parse_sidechannel_u32(raw: &[u8], key: &[u8]) -> Option<u32> {
     let pos = find_subslice(raw, key)?;
     let start = pos + key.len();
