@@ -248,6 +248,22 @@ impl Parser {
             });
             return Route::Done;
         }
+        // ECMA-48: a byte outside the CSI/SS3 alphabet (C0 controls, DEL,
+        // 8-bit) inside a pending sequence executes on its own and cancels
+        // the sequence. Buffering it instead would wedge the stream: a
+        // control byte following an unterminated `ESC [` (e.g. the harness's
+        // Ctrl+D) would be absorbed as more parameter bytes and never reach
+        // the application. Bracketed-paste bodies are exempt — the payload is
+        // byte-opaque until the `201~` terminator.
+        let in_sequence =
+            self.buffer.starts_with(b"\x1b[") || self.buffer.starts_with(b"\x1bO");
+        if in_sequence
+            && !self.buffer.starts_with(b"\x1b[200~")
+            && !(0x20..=0x7e).contains(&byte)
+        {
+            self.buffer.clear();
+            return Route::Buffer(byte, more);
+        }
         self.buffer.push(byte);
         match parse_event(&self.buffer, more) {
             Ok(Some(InternalEvent::ReplyConsumed)) => {
@@ -267,7 +283,22 @@ impl Parser {
                 // Event can't be parsed (not enough parameters, parameter is
                 // not a number, ...). Clear the buffer and continue with
                 // another sequence.
+                //
+                // When the buffered sequence was a UTF-8 multibyte attempt
+                // (lead byte >= 0x80), the byte that made it fail is not part
+                // of the sequence — it is the divergence witness. Re-feed it
+                // so a byte after a truncated char (e.g. Ctrl+D or ESC) is not
+                // swallowed with the bad bytes. len >= 2 keeps a lone invalid
+                // lead byte from re-feeding itself forever.
+                let refeed = if self.buffer.len() >= 2 && self.buffer[0] >= 0x80 {
+                    self.buffer.pop()
+                } else {
+                    None
+                };
                 self.buffer.clear();
+                if let Some(byte) = refeed {
+                    return Route::Buffer(byte, more);
+                }
             }
         }
         Route::Done
