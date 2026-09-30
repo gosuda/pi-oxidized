@@ -45,6 +45,11 @@ const RAW_DIAG_TAIL: usize = 4096;
 /// POSIX masters hand back child bytes verbatim; `ConPTY` re-synthesizes them,
 /// so byte-level audit/restore assertions apply off Windows only.
 const BYTE_TRANSPARENT_MASTER: bool = cfg!(not(windows));
+/// `ConPTY` re-synthesizes master writes as key records: bracketed-paste
+/// markers are dropped and the payload arrives as character presses, so the
+/// live Paste-event witness is POSIX-only (same convention as
+/// `pty_no_flicker`).
+const EXPECTED_LIVE_PASTE: u32 = if cfg!(windows) { 0 } else { 1 };
 
 struct Harness {
     master: Box<dyn portable_pty::MasterPty>,
@@ -377,8 +382,8 @@ fn adversarial_escape_soup_then_valid_paste() {
     report.assert_success_contract("escape-soup");
     assert_eq!(
         report.live_paste,
-        Some(1),
-        "escape-soup: expected exactly one paste after malformed input, got {:?}; tail={}",
+        Some(EXPECTED_LIVE_PASTE),
+        "escape-soup: expected {EXPECTED_LIVE_PASTE} live paste(s) after malformed input, got {:?}; tail={}",
         report.live_paste,
         report.tail()
     );
@@ -413,8 +418,8 @@ fn adversarial_probe_reply_flood_during_serve() {
     report.assert_success_contract("reply-flood");
     assert_eq!(
         report.live_paste,
-        Some(1),
-        "reply-flood: paste after injected replies missing, got {:?}; tail={}",
+        Some(EXPECTED_LIVE_PASTE),
+        "reply-flood: expected {EXPECTED_LIVE_PASTE} live paste(s) after injected replies, got {:?}; tail={}",
         report.live_paste,
         report.tail()
     );
@@ -508,8 +513,8 @@ fn adversarial_giant_multibyte_paste() {
     report.assert_success_contract("giant-paste");
     assert_eq!(
         report.live_paste,
-        Some(1),
-        "giant-paste: expected exactly one paste event for the 48KiB payload, got {:?}; tail={}",
+        Some(EXPECTED_LIVE_PASTE),
+        "giant-paste: expected {EXPECTED_LIVE_PASTE} live paste(s) for the 48KiB payload, got {:?}; tail={}",
         report.live_paste,
         report.tail()
     );
@@ -517,21 +522,32 @@ fn adversarial_giant_multibyte_paste() {
         .live_text
         .unwrap_or_else(|| panic!("giant-paste: missing PI_TUI_LIVE_TEXT record"));
     assert!(
-        live_text.starts_with("GHOST-START-"),
+        live_text.contains("GHOST-START-"),
         "giant-paste: payload head missing, got prefix {:?}",
         &live_text[..live_text.len().min(64)]
     );
-    assert!(
-        live_text.ends_with("-GHOST-END"),
-        "giant-paste: payload tail truncated; escaped len={} tail={:?}",
-        live_text.len(),
-        &live_text[live_text.len().saturating_sub(64)..]
-    );
-    // `escape_default` renders the decomposed combining marks as \u{...}.
-    assert!(
-        live_text.contains("e\\u{301}o\\u{308}"),
-        "giant-paste: NFD tail mangled, expected escaped combining marks in {live_text:?}"
-    );
+    if BYTE_TRANSPARENT_MASTER {
+        // Exact-tail and escaped-NFD provenance: POSIX delivers the payload
+        // as one Paste event so the escaped editor delta must end at the
+        // payload's literal end; ConPTY re-synthesizes it as key records and
+        // may drop the embedded controls before the tail arrives.
+        assert!(
+            live_text.ends_with("-GHOST-END"),
+            "giant-paste: payload tail truncated; escaped len={} tail={:?}",
+            live_text.len(),
+            &live_text[live_text.len().saturating_sub(64)..]
+        );
+        // `escape_default` renders the decomposed combining marks as \u{...}.
+        assert!(
+            live_text.contains("e\\u{301}o\\u{308}"),
+            "giant-paste: NFD tail mangled, expected escaped combining marks in {live_text:?}"
+        );
+    } else {
+        assert!(
+            live_text.contains("-GHOST-END"),
+            "giant-paste: payload tail missing on ConPTY, got {live_text:?}"
+        );
+    }
 }
 
 /// A single write holding hundreds of printable characters interleaved with
@@ -605,6 +621,18 @@ fn adversarial_unterminated_paste_then_eof() {
         report.exit_code.is_some(),
         "unterminated-paste-eof: fixture needed a harness kill instead of self-terminating"
     );
+    if BYTE_TRANSPARENT_MASTER {
+        // The wedged accumulator swallows the EOF stand-in, so the bounded
+        // wait must fire: exit code 2 is the io-error path that proves the
+        // deadline branch executed. A clean exit would mean the timeout was
+        // never exercised.
+        assert_eq!(
+            report.exit_code,
+            Some(2),
+            "unterminated-paste-eof: expected the hard-timeout error exit (2), got {:?}",
+            report.exit_code
+        );
+    }
 }
 
 /// Resize the PTY in the middle of an open bracketed paste. The paste
@@ -628,8 +656,8 @@ fn adversarial_resize_mid_paste() {
     report.assert_success_contract("resize-mid-paste");
     assert_eq!(
         report.live_paste,
-        Some(1),
-        "resize-mid-paste: paste split by the mid-stream resize, got {:?}; tail={}",
+        Some(EXPECTED_LIVE_PASTE),
+        "resize-mid-paste: expected {EXPECTED_LIVE_PASTE} live paste(s) across the resize, got {:?}; tail={}",
         report.live_paste,
         report.tail()
     );
@@ -688,6 +716,16 @@ fn adversarial_resize_batch_storm_resolves_kernel_geometry() {
         "resize-batch-storm: batch never consumed a Resize event; tail={}",
         report.tail()
     );
+    if BYTE_TRANSPARENT_MASTER {
+        // The batch resolves geometry by kernel query, not by whichever
+        // event the coalescing drain happened to see first — the painted
+        // status line is the wire witness that the storm's LAST size won.
+        assert!(
+            find_subslice(&report.raw, b"batch-complete 37x11").is_some(),
+            "resize-batch-storm: kernel-reported geometry diverged from the storm's final 37x11; tail={}",
+            report.tail()
+        );
+    }
 }
 
 /// Same mode, contaminated stream: a plain key between the resize and the
