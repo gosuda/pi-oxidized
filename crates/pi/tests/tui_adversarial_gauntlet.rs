@@ -606,9 +606,7 @@ fn scenario_invalid_input() -> Result<(), AdvError> {
     run.write_input(b"\x1b[200~unclosed paste body\nnext\n")?;
     run.write_input(b" ii9")?;
     run.write_input(b"\x1b[201~")?;
-    let _ = run.settle_screen(|s| {
-        screen_has(s, "unclosed") && screen_has(s, "ii9")
-    })?;
+    let _ = run.settle_screen(|s| screen_has(s, "unclosed") && screen_has(s, "ii9"))?;
     // Submit and prove `ii9` survived inside the delivered paste text.
     run.write_input(KEY_ENTER)?;
     let snapshot = run.settle_screen(|s| screen_has(s, "ii9") && screen_has(s, FINAL_MARKER))?;
