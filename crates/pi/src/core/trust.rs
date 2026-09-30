@@ -744,7 +744,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     type TestResult = Result<(), String>;
 
@@ -1305,9 +1305,19 @@ mod tests {
             handles.push(thread::spawn(move || -> TestResult {
                 let path = root.join(format!("p{index}"));
                 fs::create_dir_all(&path).map_err(|error| error.to_string())?;
-                store
-                    .set(&path, Some(index % 2 == 0))
-                    .map_err(|error| error.to_string())
+                // Eight writers serialize on one lockfile; scheduler jitter can
+                // outlast the 10x20ms acquire budget, so retry transient
+                // contention rather than timing the lock itself.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match store.set(&path, Some(index % 2 == 0)) {
+                        Ok(()) => return Ok(()),
+                        Err(_) if Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
             }));
         }
         let mut worker_error = None;
