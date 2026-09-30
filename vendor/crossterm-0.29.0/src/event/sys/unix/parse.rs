@@ -180,6 +180,13 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
         b'?' => match buffer[buffer.len() - 1] {
             b'u' => return parse_csi_keyboard_enhancement_flags(buffer),
             b'c' => return parse_csi_primary_device_attributes(buffer),
+            // Vendored patch: a CSI final byte other than the recognized `?`
+            // reply terminators completes the sequence; it is well-formed but
+            // unrecognized, so drop it like the other catch-alls instead of
+            // returning None — that would latch the buffer and swallow every
+            // byte that follows (e.g. `CSI ? 9999 h` wedged the stream until
+            // timeout, eating even the harness's Ctrl+D).
+            64..=126 => return Err(could_not_parse_event_error()),
             _ => None,
         },
         b'0'..=b'9' => {

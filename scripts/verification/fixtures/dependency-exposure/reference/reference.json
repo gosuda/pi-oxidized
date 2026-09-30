@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-09-25T20:55:57.239Z",
-	"captureHead": "7427e43dbb2a2776590c32e20b1ee4dc79a6e1fa",
+	"capturedAt": "2026-09-30T13:25:55.418Z",
+	"captureHead": "1f3d38ea859a39acc9b53261eb3d6032824f7d36",
 	"metafile": {
-		"projectionPath": "metafile-projection.3ac3180f354d327a42ce9fef3f599f01d160a7a9950e5fcd8b25e9880ed78030.json",
-		"sha256": "3ac3180f354d327a42ce9fef3f599f01d160a7a9950e5fcd8b25e9880ed78030",
+		"projectionPath": "metafile-projection.67153dd12b2899f868cdc9f396f6f4dfede4d9947d0787495785ebeea8b8939a.json",
+		"sha256": "67153dd12b2899f868cdc9f396f6f4dfede4d9947d0787495785ebeea8b8939a",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -15,12 +15,12 @@
 			"--compile-autoload-tsconfig",
 			"--compile-autoload-package-json",
 			"--target",
-			"bun-linux-x64-baseline",
+			"bun-darwin-arm64",
 			"--outfile",
-			"/tmp/exposure-capture-klOzYu/pi-extension-host",
-			"--metafile=/tmp/exposure-capture-klOzYu/metafile.json"
+			"/var/folders/2j/fwfzfr5x639f8rbmqc9t9ym40000gn/T/exposure-capture-Xwsj1U/pi-extension-host",
+			"--metafile=/var/folders/2j/fwfzfr5x639f8rbmqc9t9ym40000gn/T/exposure-capture-Xwsj1U/metafile.json"
 		],
-		"metafileSha256": "b3d8ae775c0a18bde7573036e675ddf210a76fd66c86b01690ab33f62c538d15"
+		"metafileSha256": "ddee6cc956eb261d7384b12b816772b319d7f2c8fb422f55c395af8f238620ed"
 	},
 	"cargo": {
 		"projectionPath": "cargo-graph-projection.bb5cf5659db2aec137d16f02d4f6d1057e892e8c5bd5ce50776b478f354e7629.json",
@@ -227,7 +227,7 @@
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/sys/unix/parse.rs",
-			"sha256": "8804461072b3af08245e026e684ebc7a39e7e46b6380cb91aaada46f5c774acd"
+			"sha256": "81509a0db2a9e7c9a279713186581e7f18d38aa829c92c0e7c28eb85cb882e07"
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker.rs",
