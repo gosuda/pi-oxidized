@@ -2100,8 +2100,17 @@ impl Editor {
                     );
                 }
             }
-            // Direct cell writer: blank the unpainted tail (reset-buffer
-            // parity) and claim the row span for damage scoping.
+            // Direct cell writer: blank the unpainted prefix and tail
+            // (reset-buffer parity) and claim the row span for damage scoping.
+            // Without this the claimed span could keep stale glyphs from an
+            // earlier painter (e.g. a dismissed selector) in cells the editor
+            // never rewrites, like the padding column.
+            let text_start = area.x.saturating_add(padding_x);
+            for prefix in area.x..text_start.min(right) {
+                if let Some(cell) = buf.cell_mut((prefix, y)) {
+                    cell.reset();
+                }
+            }
             for tail in col_x..right {
                 if let Some(cell) = buf.cell_mut((tail, y)) {
                     cell.reset();

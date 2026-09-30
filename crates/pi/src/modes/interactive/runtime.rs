@@ -230,6 +230,11 @@ pub struct SessionSnapshot {
     pub steering: Vec<String>,
     /// Pending follow-up messages (mirror).
     pub follow_up: Vec<String>,
+    /// Whether a session-level run is in flight (`is_agent_run_active` or the
+    /// agent stream flag). Outlives `activity == Streaming`: stays true through
+    /// the post-stream window (retries, compaction, boundary handlers) so
+    /// submits then still queue instead of hitting the streaming guard blind.
+    pub run_active: bool,
     /// Queue delivery mode for follow-up messages.
     pub follow_up_mode: super::state::QueueMode,
 }
@@ -1127,7 +1132,15 @@ impl InteractiveRoot {
                 super::view::editor_prompt_marker(&text)
             };
             let colored = super::theme::current().fg(color, glyph);
-            // First body row = one past the single top-border row.
+            // First body row = one past the single top-border row. The marker
+            // strip is otherwise unclaimed, so blank it on every other row:
+            // a dismissed overlay can leave stale glyphs in cells nobody owns.
+            for row in area.y..area.y.saturating_add(area.height) {
+                if row == area.y + 1 {
+                    continue;
+                }
+                pi_tui::components::util::paint_line(area.x, row, 2, buf, "");
+            }
             pi_tui::components::util::paint_line(area.x, area.y + 1, 2, buf, &colored);
             let shifted = Rect::new(area.x + 2, area.y, area.width - 2, area.height);
             self.editor.render(shifted, buf);
@@ -1447,6 +1460,15 @@ impl FullscreenRoot {
             let text = self.editor.get_text();
             let (glyph, color) = super::view::editor_prompt_marker(&text);
             let colored = super::theme::current().fg(color, glyph);
+            // The marker strip is unclaimed outside the first body row, so
+            // blank it on every other row: a dismissed overlay can leave
+            // stale glyphs in cells nobody owns.
+            for row in area.y..area.y.saturating_add(area.height) {
+                if row == area.y.saturating_add(1) {
+                    continue;
+                }
+                pi_tui::components::util::paint_line(area.x, row, 2, buf, "");
+            }
             pi_tui::components::util::paint_line(
                 area.x,
                 area.y.saturating_add(1),
@@ -5034,7 +5056,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let snapshot = self.session.snapshot();
         // Always go through prompt so extension-command dispatch and input
         // transforms run before any steering / follow-up queueing.
-        let opts = if snapshot.is_streaming() && !is_slash {
+        let opts = if (snapshot.is_streaming() || snapshot.run_active) && !is_slash {
             PromptOptions {
                 streaming_behavior: Some(if force_follow_up {
                     StreamingBehavior::FollowUp
@@ -5167,6 +5189,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     return false;
                 }
                 let refresh_footer = completion.kind == SessionOperationKind::Bash;
+                if let Err(error) = &completion.result {
+                    // Prompt-path failures (preflight rejects, provider errors)
+                    // otherwise vanish silently: the typed text is already out
+                    // of the composer and `last_error` has no renderer. Bash
+                    // completions carry their own result widget.
+                    let message = error.clone();
+                    self.push_notice("error", format!("prompt failed: {message}"));
+                }
                 self.record_err(completion.result);
                 refresh_footer
             }
@@ -8552,8 +8582,10 @@ impl SessionHost for AgentSessionHost {
             SessionActivity::Idle
         };
         let (steering, follow_up) = session.pending_messages();
+        let run_active = !session.is_idle();
         SessionSnapshot {
             activity,
+            run_active,
             bash_running: session.is_bash_running(),
             thinking_level_label: format!("{thinking:?}").to_lowercase(),
             model_id: model.id.clone(),
