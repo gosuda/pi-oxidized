@@ -76,6 +76,7 @@ struct Report {
     live_resize: Option<u32>,
     live_text: Option<String>,
     cursor_restored: bool,
+    modes_restored: bool,
 }
 
 impl Harness {
@@ -293,12 +294,13 @@ impl Harness {
             live_cursor: parse_sidechannel_u32(raw, b"PI_TUI_LIVE_CURSOR="),
             live_resize: parse_sidechannel_u32(raw, b"PI_TUI_LIVE_RESIZE="),
             live_text: parse_sidechannel_text(raw, b"PI_TUI_LIVE_TEXT="),
-            // Mode restore is guaranteed on every exit path (guard restore()
-            // or Drop): bracketed paste is enabled unconditionally at
-            // activate, so \x1b[?2004l is the always-present witness; cursor
-            // show and the emergency constants cover the other paths.
-            cursor_restored: find_subslice(raw, b"\x1b[?2004l").is_some()
-                || find_subslice(raw, b"\x1b[?25h").is_some()
+            // Activate unconditionally hides the cursor (RestoreStep::
+            // CursorHidden) so every restore emits `?25h` — the emergency
+            // constants embed it too, so it alone is the cursor witness.
+            // `?2004l` proves the mode-disable step landed but can never
+            // substitute for cursor-show.
+            cursor_restored: find_subslice(raw, b"\x1b[?25h").is_some(),
+            modes_restored: find_subslice(raw, b"\x1b[?2004l").is_some()
                 || raw
                     .windows(EMERGENCY_REGULAR_RESTORE_BYTES.len())
                     .any(|window| window == EMERGENCY_REGULAR_RESTORE_BYTES)
@@ -340,7 +342,12 @@ impl Report {
             );
             assert!(
                 self.cursor_restored,
-                "{what}: no cursor-show/restore bytes on exit; tail={}",
+                "{what}: no cursor-show (\\x1b[?25h) bytes on exit; tail={}",
+                self.tail()
+            );
+            assert!(
+                self.modes_restored,
+                "{what}: no mode-restore (\\x1b[?2004l or emergency) bytes on exit; tail={}",
                 self.tail()
             );
         }
