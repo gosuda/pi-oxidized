@@ -1039,7 +1039,10 @@ fn scenario_width_edge() -> Result<(), AdvError> {
     for byte in edge.bytes() {
         run.write_input(&[byte])?;
     }
-    let _ = run.settle_screen(|s| screen_has(s, "eeee"))?;
+    // The é tail paints as separate e + combining-mark cells on POSIX;
+    // transports that drop the marks show a plain e run instead.
+    let _ =
+        run.settle_screen(|s| screen_has(s, "e\u{301}e\u{301}e\u{301}") || screen_has(s, "eeee"))?;
     run.write_input(KEY_ENTER)?;
     let snapshot = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
     if !screen_has(&snapshot, FINAL_MARKER) {
