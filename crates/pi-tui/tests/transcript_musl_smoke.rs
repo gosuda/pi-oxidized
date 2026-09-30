@@ -491,6 +491,15 @@ fn musl_packaging_protocol_lane() -> Result<(), LaneError> {
         header[4] = 2;
         header[54..56].copy_from_slice(&56u16.to_le_bytes());
         header[56..58].copy_from_slice(&1u16.to_le_bytes());
+        // The well-formed header classifies too, so a regression to always
+        // returning None cannot pass unnoticed: its single phdr sits at
+        // offset 0 with p_type = the ELF magic, not PT_INTERP.
+        assert_eq!(
+            elf64_is_static(&header),
+            Some(true),
+            "header without PT_INTERP is static"
+        );
+        assert_eq!(elf64_interp(&header), None, "no PT_INTERP entry");
         let mut truncated = header.clone();
         truncated[54..56].copy_from_slice(&4u16.to_le_bytes());
         assert_eq!(
