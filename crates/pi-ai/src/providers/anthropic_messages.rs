@@ -1978,6 +1978,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let host = address.to_string();
+        let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || -> std::io::Result<()> {
             for _ in 0..16 {
                 let Ok((mut socket, _)) = listener.accept() else {
@@ -1996,6 +1997,7 @@ mod tests {
                 socket.write_all(
                     b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n",
                 )?;
+                let _ = request_seen_tx.send(());
                 // Keep the connection open until the client times out/cancels.
                 let mut sink = [0_u8; 1];
                 let _ = socket.read(&mut sink);
@@ -2025,8 +2027,15 @@ mod tests {
             first,
             Some(Ok(AssistantMessageEvent::Start { .. }))
         ));
-        // Allow the adapter to reach the error-body read, then cancel.
-        tokio::task::yield_now().await;
+        // Wait until the server has written the headers so cancellation
+        // lands during the body read; a single yield can lose the race to
+        // connect, leaving the scripted server parked in `accept` and the
+        // join below deadlocked.
+        tokio::task::spawn_blocking(move || {
+            request_seen_rx.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await?
+        .map_err(|_| "request never reached the scripted server")?;
         cancel.cancel();
 
         let terminal = stream.next().await;
@@ -2036,6 +2045,8 @@ mod tests {
         assert_eq!(reason, ErrorReason::Aborted);
         assert_eq!(error.stop_reason, StopReason::Aborted);
         assert!(stream.next().await.is_none());
+        drop(stream);
+        drop(provider);
         let _ = server.join();
         Ok(())
     }

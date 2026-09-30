@@ -1,5 +1,7 @@
 target/
 node_modules/
+.references/
+*.bun-build
 packages/extension-host/dist/
 .outline/
 scripts/verification/fixtures/execution-map/.staging/

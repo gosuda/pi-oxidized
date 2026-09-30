@@ -441,7 +441,11 @@ mod tests {
         let tool = LsTool::new(dir.path());
         let text = text_of(&run(&tool, &json!({})).await?);
         let lines: Vec<&str> = text.lines().collect();
-        let mut expected = vec!["A.txt", "a.txt", "b.txt", "c.txt"];
+        // Case-insensitive filesystems (default APFS) cannot hold both `A.txt`
+        // and `a.txt`, so sort the entries that actually landed on disk.
+        let mut expected: Vec<String> = fs::read_dir(dir.path())?
+            .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_, std::io::Error>>()?;
         expected.sort_by(|a, b| compare_case_insensitive(a, b));
         assert_eq!(lines, expected);
         Ok(())

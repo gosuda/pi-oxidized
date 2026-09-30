@@ -461,23 +461,37 @@ fn musl_packaging_protocol_lane() -> Result<(), LaneError> {
         .filter(|v| !v.trim().is_empty());
     let Some(row_label) = row_env else {
         // Self-check mode (no lane inputs on this host): the lane still
-        // proves its own fixtures — the ELF detector flags a dynamically
-        // linked host binary as non-static, and the hello ack shape check
-        // rejects malformed acknowledgments.
+        // proves its own fixtures — the ELF detector classifies the host
+        // binary (dynamic ELF → non-static, Mach-O/PE → not-ELF), and the
+        // hello ack shape check rejects malformed acknowledgments.
         let host =
             std::env::current_exe().map_err(|e| LaneError::Io(format!("current_exe: {e}")))?;
         let bytes = fs::read(&host)?;
+        // A real host binary classifies deterministically: dynamically linked
+        // ELF64 toolchains report `Some(false)`; Mach-O/PE hosts are not ELF
+        // and must never report a static (`Some(true)`) classification.
         assert_eq!(
             elf64_is_static(&bytes),
-            Some(false),
-            "host cargo test binary must be dynamically linked"
+            if bytes.starts_with(b"\x7fELF") {
+                Some(false)
+            } else {
+                None
+            },
+            "host cargo test binary must classify as dynamic ELF or non-ELF"
         );
         assert!(!is_hello_ack("{\"id\":1,\"kind\":\"req\"}"));
         assert!(is_hello_ack(
             "{\"id\":1,\"kind\":\"res\",\"method\":\"hello\",\"payload\":{\"protocolVersion\":1,\"compatibilityVersion\":\"0.80.10\"}}"
         ));
-        // Malformed program headers must return None, never panic.
-        let mut truncated = bytes[..64].to_vec();
+        // Malformed program headers must return None, never panic. A
+        // synthetic minimal ELF64 header keeps these axes real on non-ELF
+        // hosts, where the host bytes would already stop at the magic check.
+        let mut header = vec![0u8; 64];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[54..56].copy_from_slice(&56u16.to_le_bytes());
+        header[56..58].copy_from_slice(&1u16.to_le_bytes());
+        let mut truncated = header.clone();
         truncated[54..56].copy_from_slice(&4u16.to_le_bytes());
         assert_eq!(
             elf64_is_static(&truncated),
@@ -485,7 +499,7 @@ fn musl_packaging_protocol_lane() -> Result<(), LaneError> {
             "short phentsize rejected"
         );
         assert_eq!(elf64_interp(&truncated), None, "short phentsize rejected");
-        let mut huge_offset = bytes[..64].to_vec();
+        let mut huge_offset = header;
         huge_offset[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(
             elf64_is_static(&huge_offset),
