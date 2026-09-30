@@ -1127,7 +1127,15 @@ impl InteractiveRoot {
                 super::view::editor_prompt_marker(&text)
             };
             let colored = super::theme::current().fg(color, glyph);
-            // First body row = one past the single top-border row.
+            // First body row = one past the single top-border row. The marker
+            // strip is otherwise unclaimed, so blank it on every other row:
+            // a dismissed overlay can leave stale glyphs in cells nobody owns.
+            for row in area.y..area.y.saturating_add(area.height) {
+                if row == area.y + 1 {
+                    continue;
+                }
+                pi_tui::components::util::paint_line(area.x, row, 2, buf, "");
+            }
             pi_tui::components::util::paint_line(area.x, area.y + 1, 2, buf, &colored);
             let shifted = Rect::new(area.x + 2, area.y, area.width - 2, area.height);
             self.editor.render(shifted, buf);
@@ -1447,6 +1455,15 @@ impl FullscreenRoot {
             let text = self.editor.get_text();
             let (glyph, color) = super::view::editor_prompt_marker(&text);
             let colored = super::theme::current().fg(color, glyph);
+            // The marker strip is unclaimed outside the first body row, so
+            // blank it on every other row: a dismissed overlay can leave
+            // stale glyphs in cells nobody owns.
+            for row in area.y..area.y.saturating_add(area.height) {
+                if row == area.y.saturating_add(1) {
+                    continue;
+                }
+                pi_tui::components::util::paint_line(area.x, row, 2, buf, "");
+            }
             pi_tui::components::util::paint_line(
                 area.x,
                 area.y.saturating_add(1),
