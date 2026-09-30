@@ -305,7 +305,9 @@ fn record_answer(answered: &mut IssuedQueries, reply: &TerminalReply) {
         TerminalReply::CellSize { .. } => answered.answer(QueryKind::CellSize),
         TerminalReply::CursorPosition { .. } => answered.answer(QueryKind::CursorPosition),
         TerminalReply::KeyboardEnhancementFlags(_) => answered.answer(QueryKind::KittyFlags),
-        TerminalReply::PrimaryDeviceAttributes => answered.answer(QueryKind::DeviceAttributes),
+        TerminalReply::PrimaryDeviceAttributes | TerminalReply::SecondaryDeviceAttributes => {
+            answered.answer(QueryKind::DeviceAttributes);
+        }
     }
 }
 
@@ -388,7 +390,12 @@ impl ProbeCollector {
     pub fn record(&mut self, reply: TerminalReply) {
         match &reply {
             TerminalReply::KeyboardEnhancementFlags(_) => self.saw_kitty = true,
-            TerminalReply::PrimaryDeviceAttributes => self.saw_da1 = true,
+            // A secondary (XTVersion) reply carries the same DA-class
+            // signal: the terminal answered a device-attributes query and
+            // did not claim kitty support.
+            TerminalReply::PrimaryDeviceAttributes | TerminalReply::SecondaryDeviceAttributes => {
+                self.saw_da1 = true;
+            }
             TerminalReply::CursorPosition { .. } => self.saw_cursor = true,
             TerminalReply::Osc11(_) | TerminalReply::CellSize { .. } => {}
         }
@@ -418,7 +425,8 @@ impl ProbeCollector {
                 TerminalReply::KeyboardEnhancementFlags(flags) => {
                     caps.set_kitty_keyboard(!flags.is_empty());
                 }
-                TerminalReply::PrimaryDeviceAttributes => {
+                TerminalReply::PrimaryDeviceAttributes
+                | TerminalReply::SecondaryDeviceAttributes => {
                     if !self.saw_kitty {
                         caps.set_kitty_keyboard(false);
                     }

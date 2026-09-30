@@ -189,6 +189,15 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
             64..=126 => return Err(could_not_parse_event_error()),
             _ => None,
         },
+        // Vendored patch: `CSI > ... c` is the secondary device-attributes
+        // reply (XTVersion on xterm-likes). Same dispatch shape as `?`: a
+        // completed final byte resolves or drops the whole sequence — a bare
+        // Err here would split `CSI >` off and replay `params c` as keys.
+        b'>' => match buffer[buffer.len() - 1] {
+            b'c' => return parse_csi_secondary_device_attributes(buffer),
+            64..=126 => return Err(could_not_parse_event_error()),
+            _ => None,
+        },
         b'0'..=b'9' => {
             // Numbered escape code.
             if buffer.len() == 3 {
@@ -335,6 +344,19 @@ fn parse_csi_primary_device_attributes(buffer: &[u8]) -> io::Result<Option<Inter
     // See <https://vt100.net/docs/vt510-rm/DA1.html>
 
     Ok(Some(InternalEvent::PrimaryDeviceAttributes))
+}
+
+/// Vendored patch: `CSI > Pp ; Pv ; Pc c` is the secondary device-attributes
+/// reply — the XTVersion answer terminals send to `CSI > 0 q` (and emit
+/// unasked on xterm-likes). Without recognition the `CSI >` framing was
+/// dropped and `params c` replayed as ordinary keys. Stub like the primary
+/// path: the parameter values stay unparsed.
+/// See <https://vt100.net/docs/vt510-rm/DA2.html>
+fn parse_csi_secondary_device_attributes(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
+    assert!(buffer.starts_with(b"\x1B[>"));
+    assert!(buffer.ends_with(b"c"));
+
+    Ok(Some(InternalEvent::SecondaryDeviceAttributes))
 }
 
 fn parse_modifiers(mask: u8) -> KeyModifiers {

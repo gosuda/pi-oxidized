@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-09-30T15:16:34.692Z",
-	"captureHead": "77014e16dbd00ce0622ac27cff513a3994f595ac",
+	"capturedAt": "2026-09-30T15:42:05.980Z",
+	"captureHead": "47e4897ba67716ad7e9a66e45bc7bc4f8bac752b",
 	"metafile": {
-		"projectionPath": "metafile-projection.2d725e93d2ff84170b11f3d62f6b17419592d012f6429316c9db0883966c08a6.json",
-		"sha256": "2d725e93d2ff84170b11f3d62f6b17419592d012f6429316c9db0883966c08a6",
+		"projectionPath": "metafile-projection.75d225a8e7ffebb2392491de14d8ce2db4dc2bce5b450227075cf2d04300277b.json",
+		"sha256": "75d225a8e7ffebb2392491de14d8ce2db4dc2bce5b450227075cf2d04300277b",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -15,12 +15,12 @@
 			"--compile-autoload-tsconfig",
 			"--compile-autoload-package-json",
 			"--target",
-			"bun-darwin-arm64",
+			"bun-linux-x64-baseline",
 			"--outfile",
-			"/var/folders/2j/fwfzfr5x639f8rbmqc9t9ym40000gn/T/exposure-capture-nbPweA/pi-extension-host",
-			"--metafile=/var/folders/2j/fwfzfr5x639f8rbmqc9t9ym40000gn/T/exposure-capture-nbPweA/metafile.json"
+			"/tmp/exposure-capture-KONDsD/pi-extension-host",
+			"--metafile=/tmp/exposure-capture-KONDsD/metafile.json"
 		],
-		"metafileSha256": "ecafc8f3d334a0216d9dfcb20f759c80c938ac4b656aa2de1556c9135539cd99"
+		"metafileSha256": "df0a29828cc9c174b769db90d9cc2059faa467f970a79c8ba7b279541b31b0cb"
 	},
 	"cargo": {
 		"projectionPath": "cargo-graph-projection.bb5cf5659db2aec137d16f02d4f6d1057e892e8c5bd5ce50776b478f354e7629.json",
@@ -175,7 +175,7 @@
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event.rs",
-			"sha256": "9fe5492083db815cb9f14dbd92a9f8cacbb6e4075fb365376be05b45bf763263"
+			"sha256": "144e1b487fbc6b0d3f1771fd799aeecbb3ac3cc6f4dc931940ad7f4fb9ae3c21"
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/filter.rs",
@@ -183,11 +183,11 @@
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/read.rs",
-			"sha256": "0f75e87ff2375062456001165fc15f80e2a54fe721043bd9d96048167d57b2c2"
+			"sha256": "bef7286eda0d030c40c6cf26a6b1f12f72f56fb27c13cda8243c566932f6e249"
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/reply.rs",
-			"sha256": "172d252936d3a725761cb5fbeff01633e5d272d4ba07b05796dbdb0e02a1381f"
+			"sha256": "fca3833c1cd2958b493ad0d3ebfdc6e1654e22af77dd8ab070e885813ecfedfd"
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/source.rs",
@@ -203,7 +203,7 @@
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/source/unix/parser.rs",
-			"sha256": "01325c512a6a2a81dc847cdfe1e4b9778e4bfddacb84e3d8eba2d75c5ecf01c0"
+			"sha256": "887879e97a26d30e1713e562dc3503be665803b0358eb94cbbdb5ca284589dc2"
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/source/unix/tty.rs",
@@ -227,7 +227,7 @@
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/sys/unix/parse.rs",
-			"sha256": "81509a0db2a9e7c9a279713186581e7f18d38aa829c92c0e7c28eb85cb882e07"
+			"sha256": "ccbd47b1fa3e233ca376ea36b868f7b8773d18f9fe76641200363661cfb84005"
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker.rs",
