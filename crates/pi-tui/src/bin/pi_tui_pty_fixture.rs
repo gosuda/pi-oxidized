@@ -807,16 +807,31 @@ async fn serve_live_events(
     started: Instant,
 ) -> io::Result<()> {
     let mut pending = None;
+    let deadline = started + HARD_TIMEOUT;
     loop {
         let event = match pending.take() {
             Some(event) => event,
-            None => match input.recv().await {
-                Some(event) => {
+            // Bounded like completed_resize_batch: a wedged input accumulator
+            // (e.g. an unterminated bracketed paste that swallows the EOF
+            // stand-in) must not outlive the fixture's hard timeout.
+            None => match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                input.recv(),
+            )
+            .await
+            {
+                Ok(Some(event)) => {
                     #[cfg(windows)]
                     root.record_live_event(&event);
                     event
                 }
-                None => return Ok(()),
+                Ok(None) => return Ok(()),
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "hard fixture timeout",
+                    ));
+                }
             },
         };
 
