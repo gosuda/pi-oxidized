@@ -462,6 +462,12 @@ pub trait SessionHost: Send + Sync + 'static {
         None
     }
 
+    /// Non-builtin slash commands (extension / prompt / skill) for the
+    /// autocomplete catalog.
+    fn slash_commands(&self) -> Vec<crate::core::resources::SlashCommandInfo> {
+        Vec::new()
+    }
+
     /// Initial persisted thinking-block visibility.
     fn hide_thinking_block(&self) -> bool {
         false
@@ -1054,6 +1060,38 @@ impl InteractiveRoot {
         if width >= 2 { width - 2 } else { width }
     }
 
+    fn render_middle(
+        &mut self,
+        area: Rect,
+        y: u16,
+        height: u16,
+        title_height: u16,
+        buf: &mut Buffer,
+    ) {
+        let rendered_title_height = title_height.min(height);
+        if rendered_title_height > 0
+            && let Some(title) = self.dialog_title.as_mut()
+        {
+            title.render(Rect::new(area.x, y, area.width, rendered_title_height), buf);
+        }
+        let body_height = height.saturating_sub(rendered_title_height);
+        if body_height > 0 {
+            let body_area = Rect::new(
+                area.x,
+                y.saturating_add(rendered_title_height),
+                area.width,
+                body_height,
+            );
+            if self.focus == FocusArea::Selector {
+                if let Some(selector) = self.selector.as_mut() {
+                    selector.render(body_area, buf);
+                }
+            } else {
+                self.render_editor_with_marker(body_area, buf);
+            }
+        }
+    }
+
     /// Render the live editor with its prompt marker visible.
     ///
     /// WHY: `build_with_chat` drops the composed editor section and renders the
@@ -1147,6 +1185,28 @@ fn render_bottom_clipped(
     pi_tui::frame::claim_opaque_span(area);
 }
 
+/// Render an overlay component. Extension overlays (with a spec) resolve
+/// against the transcript band so a centered overlay can never paint over
+/// dialog chrome in the dock; native overlays keep the full-frame band.
+fn render_overlay(
+    overlay: &mut dyn Component,
+    spec: Option<&pi_tui::layout::OverlaySpec>,
+    area: Rect,
+    transcript_area: Rect,
+    buf: &mut Buffer,
+) {
+    let layout_area = if spec.is_some() {
+        transcript_area
+    } else {
+        area
+    };
+    let measured = overlay.measure(layout_area.width).min(layout_area.height);
+    let rect = overlay_rect(spec, measured, layout_area);
+    if rect.height > 0 {
+        overlay.render(rect, buf);
+    }
+}
+
 impl Component for InteractiveRoot {
     fn measure(&mut self, width: u16) -> u16 {
         // TUI-G8 floor policy: below 20 columns the render is blanked,
@@ -1232,30 +1292,13 @@ impl Component for InteractiveRoot {
             y = y.saturating_add(height);
         }
 
+        // Everything below this point is the dock (dialog/editor, post
+        // sections). Extension overlays resolve against the transcript band
+        // above it so a centered overlay can never paint over dialog chrome.
+        let transcript_bottom = y;
         let height = middle_height.min(bottom.saturating_sub(y));
         if height > 0 {
-            let rendered_title_height = title_height.min(height);
-            if rendered_title_height > 0
-                && let Some(title) = self.dialog_title.as_mut()
-            {
-                title.render(Rect::new(area.x, y, area.width, rendered_title_height), buf);
-            }
-            let body_height = height.saturating_sub(rendered_title_height);
-            if body_height > 0 {
-                let body_area = Rect::new(
-                    area.x,
-                    y.saturating_add(rendered_title_height),
-                    area.width,
-                    body_height,
-                );
-                if self.focus == FocusArea::Selector {
-                    if let Some(selector) = self.selector.as_mut() {
-                        selector.render(body_area, buf);
-                    }
-                } else {
-                    self.render_editor_with_marker(body_area, buf);
-                }
-            }
+            self.render_middle(area, y, height, title_height, buf);
             y = y.saturating_add(height);
         }
 
@@ -1273,11 +1316,18 @@ impl Component for InteractiveRoot {
             y = y.saturating_add(height);
         }
         if let Some(overlay) = self.overlay.as_mut() {
-            let measured = overlay.measure(area.width).min(area.height);
-            let rect = overlay_rect(self.overlay_spec.as_ref(), measured, area);
-            if rect.height > 0 {
-                overlay.render(rect, buf);
-            }
+            render_overlay(
+                overlay.as_mut(),
+                self.overlay_spec.as_ref(),
+                area,
+                Rect::new(
+                    area.x,
+                    area.y,
+                    area.width,
+                    transcript_bottom.saturating_sub(area.y),
+                ),
+                buf,
+            );
         }
     }
 
@@ -1490,11 +1540,13 @@ impl Component for FullscreenRoot {
         }
 
         if let Some(overlay) = self.overlay.as_mut() {
-            let measured = overlay.measure(area.width);
-            let rect = overlay_rect(self.overlay_spec.as_ref(), measured, area);
-            if rect.height > 0 {
-                overlay.render(rect, buf);
-            }
+            render_overlay(
+                overlay.as_mut(),
+                self.overlay_spec.as_ref(),
+                area,
+                self.transcript_area,
+                buf,
+            );
         }
         if let Some(search) = self.search.as_mut() {
             let rect = transcript_search_rect(self.transcript_area);
@@ -1656,6 +1708,8 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     session_rebind_channel_closed: bool,
     prompt_operations: PromptOperations,
     coalesce_deadline: Option<Instant>,
+    /// Wake-up for a pending debounced editor autocomplete request.
+    autocomplete_deadline: Option<Instant>,
     /// When the current status phase began; `None` while no status is shown.
     /// Tokio's `Instant` so the paused test clock drives `elapsed_secs`.
     spinner_started: Option<tokio::time::Instant>,
@@ -2275,7 +2329,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let (session_rebind_tx, session_rebind_rx) = mpsc::unbounded_channel();
         let session_rebind_signal = Arc::new(SessionRebindSignal::new(session_rebind_tx));
 
-        let editor = build_initial_editor(options, submit_tx.clone());
+        let mut editor = build_initial_editor(options, submit_tx.clone());
+        super::autocomplete::refresh_autocomplete(&mut editor, &session);
         let agent_dir = crate::core::config::get_agent_dir();
         let fullscreen_viewport = FullscreenViewport::new(
             FullscreenOptions {
@@ -2306,6 +2361,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             partial,
             prompt_operations: PromptOperations::new(),
             coalesce_deadline: None,
+            autocomplete_deadline: None,
             spinner_started: None,
             pending_reanchor: None,
             spinner_frame: 0,
@@ -2654,6 +2710,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             }
 
             let coalesce_wait = self.coalesce_wait(Instant::now());
+            let autocomplete_wait = self.autocomplete_wait(Instant::now());
             let (spinner_active, spinner_deadline) = self.arm_spinner_deadline();
             let viewport_deadline_active = self.screen_mode == ScreenMode::Fullscreen
                 && self.fullscreen_viewport.next_deadline().is_some();
@@ -2750,6 +2807,17 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                         }
                     }
                 }
+                () = tokio::time::sleep(autocomplete_wait) => {
+                    self.autocomplete_deadline = None;
+                    self.editor.tick_autocomplete_debounce(u64::MAX);
+                    if matches!(
+                        self.editor.poll_autocomplete_now(),
+                        EventResult::Render | EventResult::Consumed
+                    ) && let Err(err) = self.paint_frame()
+                    {
+                        self.fail_io(&err);
+                    }
+                }
                 extension_result = self.extension_action_rx.recv() => {
                     if let Some(result) = extension_result {
                         self.record_extension_action(result);
@@ -2829,6 +2897,36 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             .map_or(Duration::from_hours(1), |deadline| {
                 deadline.saturating_duration_since(now)
             })
+    }
+
+    /// Time until the autocomplete debounce deadline, or effectively-forever
+    /// when no request is pending.
+    fn autocomplete_wait(&self, now: Instant) -> Duration {
+        self.autocomplete_deadline
+            .map_or(Duration::from_hours(1), |deadline| {
+                deadline.saturating_duration_since(now)
+            })
+    }
+
+    /// Drive the editor's pending autocomplete request: complete a request
+    /// that is due now, or arm the loop deadline while its debounce is still
+    /// counting down. Returns true when the editor changed and needs a
+    /// repaint.
+    fn drive_editor_autocomplete(&mut self) -> bool {
+        match self.editor.autocomplete_due_in_ms() {
+            Some(0) => matches!(
+                self.editor.poll_autocomplete_now(),
+                EventResult::Render | EventResult::Consumed
+            ),
+            Some(ms) => {
+                self.autocomplete_deadline = Some(Instant::now() + Duration::from_millis(ms));
+                false
+            }
+            None => {
+                self.autocomplete_deadline = None;
+                false
+            }
+        }
     }
 
     /// Single reset point for the spinner clock.
@@ -3343,6 +3441,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             needs_immediate_repaint = true;
             self.exited = true;
             self.exit_kind = InteractiveExit::ScreenModeChange;
+        }
+        if self.drive_editor_autocomplete() {
+            needs_immediate_repaint = true;
         }
         if needs_immediate_repaint {
             // Input-driven paints BYPASS the coalescer (per master plan D9).
@@ -6556,6 +6657,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             self.cancel_extension_dialog(DialogEnd::Cancelled).await;
         }
         self.extension_runner = self.session.host_extension_runner();
+        super::autocomplete::refresh_autocomplete(&mut self.editor, &self.session);
         let (registry_changes, shortcuts) =
             subscribe_and_snapshot_shortcuts(self.extension_runner.as_ref());
         self.extension_registry_changes = registry_changes;
@@ -6904,7 +7006,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             let mut messages = std::mem::take(&mut self.view.messages);
             let tail = messages.split_off(prefix_len);
             self.view.messages = messages;
-            self.chat_prefix_cache = Some(extract_chat_component(&self.view));
+            // An empty prefix slice renders the startup hints only when the
+            // chat is genuinely empty; before a last message it stays empty.
+            self.chat_prefix_cache = Some(if self.view.messages.is_empty() && !tail.is_empty() {
+                empty_chat_component()
+            } else {
+                extract_chat_component(&self.view)
+            });
             let mut messages = std::mem::take(&mut self.view.messages);
             messages.extend(tail);
             self.view.messages = messages;
@@ -6916,8 +7024,14 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             let mut messages = std::mem::take(&mut self.view.messages);
             let tail = messages.split_off(prefix_len);
             let prefix = messages;
-            self.view.messages = tail;
-            self.chat_tail_cache = Some(extract_chat_component(&self.view));
+            // No last message means an empty tail; extracting would paint the
+            // empty-state hints a second time below the prefix copy.
+            self.chat_tail_cache = Some(if tail.is_empty() {
+                empty_chat_component()
+            } else {
+                self.view.messages = tail;
+                extract_chat_component(&self.view)
+            });
             let mut tail = std::mem::take(&mut self.view.messages);
             let mut all = prefix;
             all.append(&mut tail);
@@ -8579,6 +8693,10 @@ impl SessionHost for AgentSessionHost {
 
     fn host_extension_runner(&self) -> Option<Arc<ExtensionRuntimeSet>> {
         self.read_session().host_extension_runner()
+    }
+
+    fn slash_commands(&self) -> Vec<crate::core::resources::SlashCommandInfo> {
+        self.read_session().slash_commands()
     }
 
     fn hide_thinking_block(&self) -> bool {

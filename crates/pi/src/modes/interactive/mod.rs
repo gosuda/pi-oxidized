@@ -28,6 +28,7 @@ pub mod theme;
 pub mod tool_renderer;
 pub mod tool_renderers;
 
+mod autocomplete;
 mod state;
 mod view;
 
