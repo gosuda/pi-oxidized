@@ -599,19 +599,25 @@ fn scenario_invalid_input() -> Result<(), AdvError> {
         run.prove_editor_focus(scenario, &format!("ii{index}"))?;
     }
 
-    // An open bracketed paste must capture subsequent keys as paste content:
-    // `ii9` is typed while the paste is unclosed and must NOT appear on the
-    // composer; after `\x1b[201~` closes the paste, liveness returns.
+    // An open bracketed paste buffers subsequent keys as paste content.
+    // Closing it renders the buffer (including `ii9`) into the composer —
+    // the settle waits on that text, so `ii9` visible afterwards proves the
+    // keys were captured into the paste rather than dropped.
     run.write_input(b"\x1b[200~unclosed paste body\nnext\n")?;
     run.write_input(b" ii9")?;
-    let mid_paste = run.settle_screen(|_| true)?;
-    if mid_paste.lines.iter().any(|line| line.contains("ii9")) {
+    run.write_input(b"\x1b[201~")?;
+    let _ = run.settle_screen(|s| {
+        screen_has(s, "unclosed") && screen_has(s, "ii9")
+    })?;
+    // Submit and prove `ii9` survived inside the delivered paste text.
+    run.write_input(KEY_ENTER)?;
+    let snapshot = run.settle_screen(|s| screen_has(s, "ii9") && screen_has(s, FINAL_MARKER))?;
+    if !(screen_has(&snapshot, "ii9") && screen_has(&snapshot, FINAL_MARKER)) {
         return Err(AdvError::Assert(format!(
-            "{scenario}: keys typed inside an open bracketed paste leaked to the composer; screen:\n{}",
-            mid_paste.lines.join("\n")
+            "{scenario}: paste-captured keys lost — `ii9` missing after submit; screen:\n{}",
+            snapshot.lines.join("\n")
         )));
     }
-    run.write_input(b"\x1b[201~")?;
     run.clear_editor()?;
     run.prove_editor_focus(scenario, "ii10")?;
     run.quit_clean()?;
