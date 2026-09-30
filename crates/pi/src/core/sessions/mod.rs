@@ -1657,14 +1657,22 @@ impl SessionCwdSource for SessionManager {
 pub fn encode_cwd_for_session_dir(resolved_cwd: &str) -> String {
     // A verbatim `\\?\C:\...` cwd canonicalizes the same leaf as `C:\...`;
     // encoding the prefix literally would leave an illegal `?` in the name.
-    let resolved_cwd = resolved_cwd
+    // `\\?\UNC\server\share` is the verbatim form of `\\server\share`, so
+    // restore the ordinary UNC spelling rather than leaving `UNC\...`.
+    let resolved_cwd: String = if let Some(rest) = resolved_cwd.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = resolved_cwd
         .strip_prefix(r"\\?\")
         .or_else(|| resolved_cwd.strip_prefix(r"\\.\"))
-        .unwrap_or(resolved_cwd);
-    let stripped = resolved_cwd
+    {
+        rest.to_string()
+    } else {
+        resolved_cwd.to_string()
+    };
+    let stripped = resolved_cwd.as_str()
         .strip_prefix('/')
         .or_else(|| resolved_cwd.strip_prefix('\\'))
-        .unwrap_or(resolved_cwd);
+        .unwrap_or(resolved_cwd.as_str());
     let safe: String = stripped
         .chars()
         .map(|c| {
