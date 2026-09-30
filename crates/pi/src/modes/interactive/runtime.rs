@@ -131,6 +131,12 @@ const SPINNER_TICK: Duration = Duration::from_millis(80);
 /// models stay in use (ports reference `completeProviderAuthentication`).
 const LOGIN_REFRESH_BOUND: Duration = Duration::from_secs(15);
 
+/// Bound on the interactive abort wait. `SessionHost::abort` ends with
+/// `wait_for_idle`, which only resolves once the agent run settles; a turn
+/// parked in an unresponsive provider request can exceed any reasonable
+/// wait, and the event loop must stay responsive meanwhile.
+const ABORT_SETTLE_BUDGET: Duration = Duration::from_secs(5);
+
 /// Bound on the runtime's incoming event channel. Matches the agent crate's
 /// extension-queue capacity so a lagging consumer surfaces backpressure early.
 pub const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -4806,7 +4812,23 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             elapsed_secs: 0,
             message: "Aborting…".to_owned(),
         });
-        self.record_err(self.session.abort().await);
+        match tokio::time::timeout(ABORT_SETTLE_BUDGET, self.session.abort()).await {
+            Ok(result) => self.record_err(result),
+            Err(_) => {
+                // The run may still be stopping, so AgentEnd/AgentSettled may
+                // never arrive to clear the status; drop "Aborting…" here or
+                // it ticks forever, and surface the failure where notices
+                // render — `last_error` has no interactive renderer.
+                self.view.status = None;
+                self.record_err(Err(
+                    "abort did not settle; the run may still be stopping".to_owned()
+                ));
+                self.push_notice(
+                    "error",
+                    "abort did not settle; the run may still be stopping".to_owned(),
+                );
+            }
+        }
         self.refresh_footer().await;
         ActionOutcome::Repaint
     }
@@ -5092,7 +5114,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let (admitted_tx, admitted_rx) = oneshot::channel();
 
         self.prompt_operations.tasks.spawn(async move {
-            let mut prompt = session.prompt(&text, opts);
+            let op_session = Arc::clone(&session);
+            let mut prompt = Box::pin(async move { op_session.prompt(&text, opts).await });
             let first_poll = poll_fn(|cx| {
                 Poll::Ready(match prompt.as_mut().poll(cx) {
                     Poll::Ready(result) => Some(result),
@@ -5108,9 +5131,26 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 tokio::select! {
                     result = &mut prompt => result,
                     _ = &mut abort_rx => {
-                        let abort_result = abort.await;
-                        let prompt_result = prompt.await;
-                        prompt_result.and(abort_result)
+                        match tokio::time::timeout(ABORT_SETTLE_BUDGET, abort).await {
+                            Ok(abort_result) => {
+                                let prompt_result = prompt.await;
+                                prompt_result.and(abort_result)
+                            }
+                            Err(_) => {
+                                // `prompt` is the run's only driver; keep
+                                // polling it in a detached task so lifecycle
+                                // cleanup still lands if the provider read
+                                // eventually unblocks. Dropping it here would
+                                // orphan the run flagged streaming forever.
+                                tokio::spawn(async move {
+                                    let _ = prompt.await;
+                                });
+                                Err(
+                                    "abort did not settle; the run may still be stopping"
+                                        .to_owned(),
+                                )
+                            }
+                        }
                     }
                 }
             };
@@ -5141,7 +5181,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         let (admitted_tx, admitted_rx) = oneshot::channel();
 
         self.prompt_operations.tasks.spawn(async move {
-            let mut execution = session.execute_bash(&command, exclude_from_context);
+            let op_session = Arc::clone(&session);
+            let mut execution = Box::pin(async move {
+                op_session
+                    .execute_bash(&command, exclude_from_context)
+                    .await
+            });
             let first_poll = poll_fn(|cx| {
                 Poll::Ready(match execution.as_mut().poll(cx) {
                     Poll::Ready(result) => Some(result),
@@ -5156,9 +5201,21 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 tokio::select! {
                     result = &mut execution => result,
                     _ = &mut abort_rx => {
-                        let abort_result = abort.await;
-                        let execution_result = execution.await;
-                        execution_result.and(abort_result)
+                        match tokio::time::timeout(ABORT_SETTLE_BUDGET, abort).await {
+                            Ok(abort_result) => {
+                                let execution_result = execution.await;
+                                execution_result.and(abort_result)
+                            }
+                            Err(_) => {
+                                tokio::spawn(async move {
+                                    let _ = execution.await;
+                                });
+                                Err(
+                                    "abort did not settle; the run may still be stopping"
+                                        .to_owned(),
+                                )
+                            }
+                        }
                     }
                 }
             };
@@ -10597,6 +10654,9 @@ mod tests {
         /// Test seam: held by a test to stall `refresh_models` for the
         /// "login completes before refresh" regression.
         refresh_models_gate: Arc<tokio::sync::Mutex<()>>,
+        /// Test seam: held by a test to stall `abort` past the interactive
+        /// settle budget, simulating a turn that never reaches idle.
+        abort_gate: Arc<tokio::sync::Mutex<()>>,
         current_model: std::sync::Mutex<Option<pi_ai::Model>>,
     }
 
@@ -10912,6 +10972,7 @@ mod tests {
             let log = Arc::clone(&self.log);
             Box::pin(async move {
                 *log.aborts.lock().await += 1;
+                let _gate = log.abort_gate.lock().await;
                 log.bash_release.notify_one();
                 Ok(())
             })
@@ -11656,6 +11717,31 @@ mod tests {
         let (mut rt, log) = make_runtime();
         let _ = rt.dispatch_action(ViewAction::Interrupt).await;
         assert_eq!(*log.aborts.lock().await, 1);
+    }
+
+    /// An abort that never settles must not park the event loop: the
+    /// interrupt action gives up after `ABORT_SETTLE_BUDGET` and reports the
+    /// stall instead of freezing every later key event.
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_interrupt_bounds_the_abort_wait() {
+        let (mut rt, log) = make_runtime();
+        let _stall = log.abort_gate.lock().await;
+        let _ = rt.dispatch_action(ViewAction::Interrupt).await;
+        assert_eq!(*log.aborts.lock().await, 1);
+        assert_eq!(
+            rt.last_error.as_deref(),
+            Some("abort did not settle; the run may still be stopping")
+        );
+        // The stuck run may never emit AgentEnd/AgentSettled, so the timeout
+        // itself clears the stale "Aborting…" status and surfaces the failure
+        // as a rendered notice.
+        assert!(rt.view.status.is_none());
+        assert!(rt.view.messages.iter().any(|message| matches!(
+            message,
+            MessageView::Custom(view)
+                if view.custom_type == "error"
+                    && view.text == "abort did not settle; the run may still be stopping"
+        )));
     }
 
     #[tokio::test]
