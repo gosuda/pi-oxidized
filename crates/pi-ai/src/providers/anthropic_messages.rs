@@ -1327,10 +1327,12 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
 
     use super::*;
+    use crate::provider::{OnResponseFn, ProviderError};
     use crate::types::{
         ConstrainedSampling, ConstrainedSamplingConfig, ModelCost, ModelInput, StrictMode,
         TextContent, Tool, ToolChoice, ToolResultMessage, Usage, UserMessage,
     };
+    use futures::future::BoxFuture;
 
     fn model() -> Model {
         Model {
@@ -1978,7 +1980,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let host = address.to_string();
-        let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || -> std::io::Result<()> {
             for _ in 0..16 {
                 let Ok((mut socket, _)) = listener.accept() else {
@@ -1997,7 +1998,6 @@ mod tests {
                 socket.write_all(
                     b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n",
                 )?;
-                let _ = request_seen_tx.send(());
                 // Keep the connection open until the client times out/cancels.
                 let mut sink = [0_u8; 1];
                 let _ = socket.read(&mut sink);
@@ -2012,12 +2012,18 @@ mod tests {
         let cancel = signal.clone();
         let client = Client::new();
         let provider = AnthropicMessages::new(client);
+        let (headers_seen_tx, headers_seen_rx) = std::sync::mpsc::channel::<()>();
+        let on_response: OnResponseFn = Arc::new(move |_, _| {
+            let _ = headers_seen_tx.send(());
+            Box::pin(std::future::ready(Ok(()))) as BoxFuture<'_, Result<(), ProviderError>>
+        });
         let mut stream = provider.stream(
             &model,
             Context::default(),
             StreamOptions {
                 api_key: Some("test-key".to_owned()),
                 signal: Some(signal),
+                on_response: Some(on_response),
                 ..StreamOptions::default()
             },
         );
@@ -2027,15 +2033,16 @@ mod tests {
             first,
             Some(Ok(AssistantMessageEvent::Start { .. }))
         ));
-        // Wait until the server has written the headers so cancellation
-        // lands during the body read; a single yield can lose the race to
-        // connect, leaving the scripted server parked in `accept` and the
-        // join below deadlocked.
+        // `on_response` fires once response headers reach the client, so the
+        // cancellation lands deterministically in `read_error_body`. Waiting
+        // client-side also guarantees a request reached the server: without
+        // that acknowledgment the abort can race the connect, leaving the
+        // scripted server parked in `accept` and the join below deadlocked.
         tokio::task::spawn_blocking(move || {
-            request_seen_rx.recv_timeout(std::time::Duration::from_secs(30))
+            headers_seen_rx.recv_timeout(std::time::Duration::from_secs(30))
         })
         .await?
-        .map_err(|_| "request never reached the scripted server")?;
+        .map_err(|_| "response headers never reached the client")?;
         cancel.cancel();
 
         let terminal = stream.next().await;
