@@ -442,11 +442,17 @@ mod tests {
         let text = text_of(&run(&tool, &json!({})).await?);
         let lines: Vec<&str> = text.lines().collect();
         // Case-insensitive filesystems (default APFS) cannot hold both `A.txt`
-        // and `a.txt`, so sort the entries that actually landed on disk.
+        // and `a.txt`, so sort the entries that actually landed on disk. The
+        // comparator is spelled out rather than calling the function under test
+        // so the expectation stays an independent oracle.
         let mut expected: Vec<String> = fs::read_dir(dir.path())?
             .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
             .collect::<Result<_, std::io::Error>>()?;
-        expected.sort_by(|a, b| compare_case_insensitive(a, b));
+        expected.sort_by(|a, b| {
+            a.to_lowercase()
+                .cmp(&b.to_lowercase())
+                .then_with(|| a.cmp(b))
+        });
         assert_eq!(lines, expected);
         Ok(())
     }

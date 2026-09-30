@@ -1,6 +1,6 @@
 target/
 node_modules/
-.references/
+/.references/
 *.bun-build
 packages/extension-host/dist/
 .outline/
