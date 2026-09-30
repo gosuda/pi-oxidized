@@ -158,6 +158,7 @@ impl InternalEventReader {
                     InternalEvent::CursorPosition(..)
                         | InternalEvent::KeyboardEnhancementFlags(_)
                         | InternalEvent::PrimaryDeviceAttributes
+                        | InternalEvent::SecondaryDeviceAttributes
                 )
             })?;
         self.events.remove(index)

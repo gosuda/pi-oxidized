@@ -1488,6 +1488,11 @@ pub(crate) enum InternalEvent {
     /// Attributes and architectural class of the terminal.
     #[cfg(unix)]
     PrimaryDeviceAttributes,
+    /// Vendored patch: secondary device attributes (`CSI > ... c`, the
+    /// XTVersion reply on xterm-likes). Reply class like the primary form:
+    /// consumed by the reply layer, never surfaced as a key event.
+    #[cfg(unix)]
+    SecondaryDeviceAttributes,
     /// Vendored patch: a sequence consumed by the raw reply layer (its data
     /// went to the typed reply sink). Never queued into the reader, so it
     /// never reaches filters or public events.
