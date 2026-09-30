@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-09-30T15:52:10.147Z",
-	"captureHead": "c5aea62cb6def0e34fb40ce23e5ddaf420e7c1e0",
+	"capturedAt": "2026-09-30T17:27:53.942Z",
+	"captureHead": "f28055307b6442dcbbf3dade73b21f440e6facf4",
 	"metafile": {
-		"projectionPath": "metafile-projection.02e51f3f939efb8ccb61c222f2494b03842699c124e10ed4f997da5eaff81bc8.json",
-		"sha256": "02e51f3f939efb8ccb61c222f2494b03842699c124e10ed4f997da5eaff81bc8",
+		"projectionPath": "metafile-projection.70f83ec895e2d7220d9f9ce861c68e91ac6e36cc33a92adfbae89f914016b3d6.json",
+		"sha256": "70f83ec895e2d7220d9f9ce861c68e91ac6e36cc33a92adfbae89f914016b3d6",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -15,12 +15,12 @@
 			"--compile-autoload-tsconfig",
 			"--compile-autoload-package-json",
 			"--target",
-			"bun-darwin-arm64",
+			"bun-linux-x64-baseline",
 			"--outfile",
-			"/var/folders/2j/fwfzfr5x639f8rbmqc9t9ym40000gn/T/exposure-capture-YVazjX/pi-extension-host",
-			"--metafile=/var/folders/2j/fwfzfr5x639f8rbmqc9t9ym40000gn/T/exposure-capture-YVazjX/metafile.json"
+			"/tmp/exposure-capture-OW24Gk/pi-extension-host",
+			"--metafile=/tmp/exposure-capture-OW24Gk/metafile.json"
 		],
-		"metafileSha256": "22e246a23e5d7ed05ea03775f951012e7a6124a02bc611ff8cb7a52aabc8af95"
+		"metafileSha256": "4fd4f0a19c5540da5e7f6772597d8a0ef8df922f7dced6dc43bc367f94833176"
 	},
 	"cargo": {
 		"projectionPath": "cargo-graph-projection.bb5cf5659db2aec137d16f02d4f6d1057e892e8c5bd5ce50776b478f354e7629.json",
@@ -187,7 +187,7 @@
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/reply.rs",
-			"sha256": "fca3833c1cd2958b493ad0d3ebfdc6e1654e22af77dd8ab070e885813ecfedfd"
+			"sha256": "453fa1bcecc0e27f0f1367cada6f26c2ab1347c1e66c535ebbf91a642c16efa4"
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/source.rs",
@@ -203,7 +203,7 @@
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/source/unix/parser.rs",
-			"sha256": "01325c512a6a2a81dc847cdfe1e4b9778e4bfddacb84e3d8eba2d75c5ecf01c0"
+			"sha256": "e4f3bcaa8c0dcef0209f112d4ef4fbd3e838615a5806ef1e828038c963a0d477"
 		},
 		{
 			"path": "vendor/crossterm-0.29.0/src/event/source/unix/tty.rs",
