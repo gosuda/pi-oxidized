@@ -240,7 +240,11 @@ fn require_prerequisites() -> Result<(), CorpusError> {
 /// so downstream paths stay usable as ordinary drive-rooted paths.
 fn canonical_sandbox_dir(path: PathBuf) -> Result<PathBuf, CorpusError> {
     let canonical = fs::canonicalize(path)?;
-    match canonical.to_string_lossy().strip_prefix(r"\\?\") {
+    let text = canonical.to_string_lossy();
+    if let Some(stripped) = text.strip_prefix(r"\\?\UNC\") {
+        return Ok(PathBuf::from(format!(r"\\{stripped}")));
+    }
+    match text.strip_prefix(r"\\?\") {
         Some(stripped) => Ok(PathBuf::from(stripped)),
         None => Ok(canonical),
     }

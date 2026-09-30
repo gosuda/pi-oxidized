@@ -342,6 +342,24 @@ mod tests {
         dir.to_string_lossy().into_owned()
     }
 
+    /// Asserts `resolved` names `dir.join(disk_name)` and exists.
+    ///
+    /// Byte-equality is too strong: filesystems with normalization-insensitive
+    /// lookup (APFS) resolve the literal query before a variant fallback runs,
+    /// so the returned path may carry the queried spelling while the directory
+    /// entry carries the stored one. NFC comparison checks file identity.
+    #[track_caller]
+    fn assert_resolves_to_entry(resolved: &str, dir: &Path, disk_name: &str) {
+        let expected = dir.join(disk_name);
+        let left: String = resolved.nfc().collect();
+        let right: String = expected.to_string_lossy().nfc().collect();
+        assert_eq!(left, right);
+        assert!(
+            Path::new(resolved).exists(),
+            "resolved path must exist: {resolved}"
+        );
+    }
+
     #[test]
     fn expand_path_folds_unicode_spaces_and_strips_at() -> TestResult {
         assert_eq!(expand_path("my\u{00A0}file.txt")?, "my file.txt");
@@ -355,7 +373,7 @@ mod tests {
 
     #[test]
     fn expand_path_expands_tilde_against_home() -> TestResult {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = crate::core::config::process_home_dir() else {
             // No home directory in this environment: nothing to compare.
             return Ok(());
         };
@@ -447,7 +465,7 @@ mod tests {
         let nfd_name: String = "café.txt".nfd().collect();
         std::fs::write(dir.path().join(&nfd_name), b"data")?;
         let resolved = resolve_read_path("café.txt", &cwd_str(dir.path()))?;
-        assert_eq!(Path::new(&resolved), dir.path().join(&nfd_name).as_path());
+        assert_resolves_to_entry(&resolved, dir.path(), &nfd_name);
         Ok(())
     }
 
@@ -468,7 +486,7 @@ mod tests {
         let nfd_curly: String = "Capture d\u{2019}écran.png".nfd().collect();
         std::fs::write(dir.path().join(&nfd_curly), b"img")?;
         let resolved = resolve_read_path("Capture d'écran.png", &cwd_str(dir.path()))?;
-        assert_eq!(Path::new(&resolved), dir.path().join(&nfd_curly).as_path());
+        assert_resolves_to_entry(&resolved, dir.path(), &nfd_curly);
         Ok(())
     }
 
@@ -481,7 +499,7 @@ mod tests {
         let nfd_name: String = "café 1.2 PM.png".nfd().collect();
         std::fs::write(dir.path().join(&nfd_name), b"img")?;
         let resolved = resolve_read_path("café 1.2 PM.png", &cwd_str(dir.path()))?;
-        assert_eq!(Path::new(&resolved), dir.path().join(&nfd_name).as_path());
+        assert_resolves_to_entry(&resolved, dir.path(), &nfd_name);
         Ok(())
     }
 

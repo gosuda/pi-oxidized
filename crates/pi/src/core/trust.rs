@@ -736,10 +736,7 @@ fn json_string_key(key: &str) -> String {
 }
 
 fn process_home_path() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
+    crate::core::config::process_home_dir()
 }
 
 #[cfg(test)]

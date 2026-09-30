@@ -435,20 +435,24 @@ mod tests {
     #[tokio::test]
     async fn sorts_case_insensitively() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
-        // NTFS is case-insensitive: `a.txt` and `A.txt` cannot coexist on
-        // Windows, so the case-colliding entry is unix-only.
-        #[cfg(unix)]
-        let names = ["b.txt", "A.txt", "c.txt", "a.txt"];
-        #[cfg(not(unix))]
-        let names = ["b.txt", "A.txt", "c.txt"];
-        for name in names {
+        for name in ["b.txt", "A.txt", "c.txt", "a.txt"] {
             fs::write(dir.path().join(name), "x")?;
         }
         let tool = LsTool::new(dir.path());
         let text = text_of(&run(&tool, &json!({})).await?);
         let lines: Vec<&str> = text.lines().collect();
-        let mut expected: Vec<&str> = names.to_vec();
-        expected.sort_by(|a, b| compare_case_insensitive(a, b));
+        // Case-insensitive filesystems (default APFS) cannot hold both `A.txt`
+        // and `a.txt`, so sort the entries that actually landed on disk. The
+        // comparator is spelled out rather than calling the function under test
+        // so the expectation stays an independent oracle.
+        let mut expected: Vec<String> = fs::read_dir(dir.path())?
+            .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_, std::io::Error>>()?;
+        expected.sort_by(|a, b| {
+            a.to_lowercase()
+                .cmp(&b.to_lowercase())
+                .then_with(|| a.cmp(b))
+        });
         assert_eq!(lines, expected);
         Ok(())
     }
