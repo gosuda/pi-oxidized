@@ -22,6 +22,13 @@
 //! paste markers, a VEOT byte as paste payload, `u16::MAX` geometry, un-pumped
 //! resize oscillation, unknown CSI forms, SGR mouse/focus floods, CONTROL-key
 //! bursts, empty pastes, and a multibyte char split across writes.
+//! Later waves push on the edges harder still: truncated/invalid UTF-8,
+//! C0-aborted and unterminated CSI/SS3, byte-at-a-time drip feeds (keys,
+//! paste, X10 mouse reports), OSC 11 framing recovery, DA2/XTVersion and
+//! CPR reply floods, split paste terminators, resizes inside a partial
+//! UTF-8 char, CSI parameter overflow, kitty `CSI u`, SGR colon
+//! sub-parameters, focus bursts, DCS/SOS/PM/APC strings, triple-ESC
+//! desync, and the no-deadline pending-CSI edge.
 //! The fixture under test is the real `Tui`/`TerminalInput` pipeline, so every
 //! case asserts the same floor: the child exits inside the hard timeout, the
 //! byte stream keeps the no-clear / balanced-sync / restore-on-exit contract,
@@ -1647,6 +1654,449 @@ fn adversarial_x10_mouse_raw_report_bytes() {
         );
     }
     report.assert_success_contract("x10-mouse");
+}
+
+// ---- wave 4: probe replies, drip splits, and degenerate framing ----
+
+/// `CSI > Pp;Pv;Pc c` (DA2/XTVersion) replies decode since the vendored
+/// secondary-attributes patch — a well-formed reply mid-serve is consumed,
+/// an unknown `>`-final drops without latching, and a C0 still aborts the
+/// pending `CSI >`.
+#[test]
+fn adversarial_da2_xtversion_final_sweep() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[>2;10;1c"); // well-formed XTVersion reply
+    h.pump(Duration::from_millis(60));
+    h.send(b"\x1b[>c"); // empty-params final
+    h.pump(Duration::from_millis(60));
+    h.send(b"\x1b[>99x"); // unknown '>'-final — drops whole sequence
+    h.pump(Duration::from_millis(60));
+    h.send(b"\x1b[>5\x03"); // C0 aborts a pending CSI >
+    h.pump(Duration::from_millis(60));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("da2-xtversion");
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "da2-xtversion: reply params leaked as keys; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// An X10 mouse report delivered one byte at a time — including the raw
+/// `>0x7e` report bytes the abort guard must not shred mid-accumulation.
+#[test]
+fn adversarial_x10_report_drip_feed() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    for &byte in b"\x1b[M\xff\xff\xff" {
+        h.send(&[byte]);
+        h.pump(Duration::from_millis(30));
+    }
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("x10-drip");
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "x10-drip: report bytes leaked as text; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// The paste terminator `\x1b[201~` split mid-sequence across writes —
+/// `ESC [ 2 0 1` buffered, `~` arriving in the next read must still close
+/// the paste exactly once.
+#[test]
+fn adversarial_paste_terminator_split() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[200~SPLIT-BODY\x1b[201");
+    h.pump(Duration::from_millis(60));
+    h.send(b"~");
+    h.pump(Duration::from_millis(60));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("terminator-split");
+    assert_eq!(
+        report.live_paste,
+        Some(EXPECTED_LIVE_PASTE),
+        "terminator-split: split terminator broke the paste; tail={}",
+        report.tail()
+    );
+    if BYTE_TRANSPARENT_MASTER {
+        let live_text = report.live_text.as_deref().unwrap_or_default();
+        assert!(
+            live_text.contains("SPLIT-BODY") && live_text.ends_with("ok"),
+            "terminator-split: payload/text diverged; got {live_text:?}; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// A SIGWINCH between a UTF-8 lead byte and its continuation: the
+/// incomplete char must not be dropped or merged with the resize event.
+#[test]
+fn adversarial_resize_inside_utf8_char() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(&[0xc3]); // é lead byte
+    h.resize(97, 31);
+    h.pump(Duration::from_millis(60));
+    h.send(&[0xa9]); // continuation
+    h.pump(Duration::from_millis(60));
+    h.resize(INITIAL_COLS, INITIAL_ROWS);
+    h.pump(Duration::from_millis(60));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("resize-inside-utf8");
+    assert!(
+        report.live_resize.is_some_and(|n| n >= 1),
+        "resize-inside-utf8: resize lost behind the partial char; tail={}",
+        report.tail()
+    );
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("\\u{e9}ok"),
+            "resize-inside-utf8: char corrupted by resize; got {:?}; tail={}",
+            report.live_text,
+            report.tail()
+        );
+    }
+}
+
+/// Parameter fields far past integer range — `~` finals that overflow
+/// any accumulation must drop or clamp, never panic or latch.
+#[test]
+fn adversarial_csi_param_overflow() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    for seq in [
+        b"\x1b[999999999999999999999999999999~".as_slice(),
+        b"\x1b[18446744073709551616;1~".as_slice(),
+        b"\x1b[-1~-0~+1~".as_slice(),
+        b"\x1b[;;;;;;~".as_slice(),
+    ] {
+        h.send(seq);
+        h.pump(Duration::from_millis(40));
+    }
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("csi-param-overflow");
+    if BYTE_TRANSPARENT_MASTER {
+        // `+`/`-` are CSI intermediate bytes (0x20..=0x2f): `\x1b[-` aborts
+        // at len 3 and its tail leaks as ordinary keys, and the all-`;`
+        // sequence leaks on its abort too. The huge-`~`-param sequences
+        // drop cleanly. Pin the exact leak so drift is loud.
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("1~-0~+1~;;;;;~ok"),
+            "csi-param-overflow: leak shape diverged; got {:?}; tail={}",
+            report.live_text,
+            report.tail()
+        );
+    }
+}
+
+/// Kitty keyboard `CSI u` encodings — Unicode codepoint, modifier, and
+/// event-type subfields the fixture doesn't implement must resolve or
+/// drop, never latch or leak.
+#[test]
+fn adversarial_kitty_csi_u() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    for seq in [
+        b"\x1b[57358u".as_slice(),         // caps-lock codepoint
+        b"\x1b[13;5u".as_slice(),          // ctrl+enter
+        b"\x1b[97;1:3u".as_slice(),        // 'a' release event
+        b"\x1b[57441;5;57399u".as_slice(), // shifted f-key w/ text
+    ] {
+        h.send(seq);
+        h.pump(Duration::from_millis(40));
+    }
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("kitty-csi-u");
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "kitty-csi-u: params leaked as keys; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// A flood of cursor-position replies (`ESC [ r ; c R`) — the shape a
+/// CPR-querying terminal or a pasted transcript might inject mid-serve.
+#[test]
+fn adversarial_cpr_reply_flood() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    for row in 1..=64u32 {
+        h.send(format!("\x1b[{row};{row}R").as_bytes());
+    }
+    h.pump(Duration::from_millis(120));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("cpr-flood");
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "cpr-flood: report params leaked as keys; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// Focus-gained/lost bursts — `ESC [ I` / `ESC [ O` alternating: every
+/// one decodes as a `FocusEvent` the fixture ignores, and the trailing
+/// text still lands.
+#[test]
+fn adversarial_focus_event_burst() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    let mut flood = Vec::new();
+    for _ in 0..32 {
+        flood.extend_from_slice(b"\x1b[I\x1b[O");
+    }
+    h.send(&flood);
+    h.pump(Duration::from_millis(120));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("focus-burst");
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "focus-burst: focus bytes leaked as keys; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// SGR mouse reports whose coordinates overflow `u16` fields.
+#[test]
+fn adversarial_sgr_mouse_coord_overflow() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[<0;99999;99999M");
+    h.pump(Duration::from_millis(40));
+    h.send(b"\x1b[<65;0;0m");
+    h.pump(Duration::from_millis(40));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("sgr-mouse-overflow");
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "sgr-mouse-overflow: coords leaked as keys; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// A pending `ESC [` has NO completion deadline in the vendored parser:
+/// the final byte resolves the CSI whenever it arrives. Pin it — a lone
+/// `ESC [` followed 300ms later by `A` is one arrow-up, never a literal
+/// 'a' (and a C0 aborts the wait, per the wave-3 fix).
+#[test]
+fn adversarial_pending_csi_no_deadline() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[");
+    h.pump(Duration::from_millis(300));
+    h.send(b"A"); // completes to arrow-up despite the gap
+    h.pump(Duration::from_millis(60));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("pending-csi-no-deadline");
+    if BYTE_TRANSPARENT_MASTER {
+        assert!(
+            report.live_cursor.is_some_and(|n| n >= 1),
+            "pending-csi-no-deadline: late final did not complete the CSI; tail={}",
+            report.tail()
+        );
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "pending-csi-no-deadline: 'A' leaked as text; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// All three input vectors in one unpumped flight: text, paste-open,
+/// resize, paste payload, paste-close, text — ordering across paths.
+#[test]
+fn adversarial_interleaved_trinary_flight() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"A\x1b[200~FLIGHT-");
+    h.resize(120, 40);
+    h.send(b"BODY\x1b[201~B");
+    h.pump(Duration::from_millis(120));
+    h.resize(INITIAL_COLS, INITIAL_ROWS);
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("trinary-flight");
+    assert_eq!(
+        report.live_paste,
+        Some(EXPECTED_LIVE_PASTE),
+        "trinary-flight: paste lost across the resize; tail={}",
+        report.tail()
+    );
+    assert!(
+        report.live_resize.is_some_and(|n| n >= 1),
+        "trinary-flight: resize lost mid-paste; tail={}",
+        report.tail()
+    );
+    if BYTE_TRANSPARENT_MASTER {
+        let live_text = report.live_text.as_deref().unwrap_or_default();
+        assert!(
+            live_text.contains("FLIGHT-BODY") && live_text.ends_with("Bok"),
+            "trinary-flight: text/paste diverged; got {live_text:?}; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// Raw DCS / SOS / PM string bodies — unrecognized string framing leaks
+/// payload bytes as keys. Pin the suffix so drift is loud, and require
+/// the serve loop to still decode the trailing keys.
+#[test]
+fn adversarial_dcs_sos_pm_strings() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    for seq in [
+        b"\x1bP>|payload\x1b\\".as_slice(),  // DCS XTVersion-shaped body
+        b"\x1bXsoc-string\x1b\\".as_slice(), // SOS
+        b"\x1b^pm-string\x1b\\".as_slice(),  // PM
+        b"\x1b_apc-string\x1b\\".as_slice(), // APC
+    ] {
+        h.send(seq);
+        h.pump(Duration::from_millis(40));
+    }
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("dcs-sos-pm");
+    if BYTE_TRANSPARENT_MASTER {
+        let live_text = report.live_text.as_deref().unwrap_or_default();
+        assert!(
+            live_text.ends_with("ok"),
+            "dcs-sos-pm: trailing keys lost; got {live_text:?}; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// SGR colon sub-parameter forms (`4:2`, `38:2:r:g:b`) — colon bytes are
+/// not CSI-legal params in the vendored grammar; pin that the sequence
+/// drops or resolves without leaking digits as keys.
+#[test]
+fn adversarial_sgr_colon_subparams() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[4:2m\x1b[38:2:255:0:0m\x1b[1;31m");
+    h.pump(Duration::from_millis(60));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("sgr-colon");
+    if BYTE_TRANSPARENT_MASTER {
+        let live_text = report.live_text.as_deref().unwrap_or_default();
+        assert!(
+            live_text.ends_with("ok"),
+            "sgr-colon: trailing keys lost; got {live_text:?}; tail={}",
+            report.tail()
+        );
+    }
+}
+
+/// `\x1b\x1b\x1bA` — triple-ESC desync: each ESC resolves/aborts in turn
+/// and 'A' lands as an Alt-modified key or a plain char; pin the real
+/// behavior so a framing drift is loud.
+#[test]
+fn adversarial_triple_esc_desync() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b\x1b\x1bA");
+    h.pump(Duration::from_millis(200));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    report.assert_success_contract("triple-esc");
+    if BYTE_TRANSPARENT_MASTER {
+        let live_text = report.live_text.as_deref().unwrap_or_default();
+        assert!(
+            live_text.ends_with("ok"),
+            "triple-esc: trailing keys lost; got {live_text:?}; tail={}",
+            report.tail()
+        );
+    }
 }
 
 fn parse_sidechannel_u32(raw: &[u8], key: &[u8]) -> Option<u32> {
