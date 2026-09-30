@@ -338,6 +338,20 @@ impl ProductRun {
         Ok(())
     }
 
+    /// Settle until a *newly emitted* [`FINAL_MARKER`] arrives: the screen
+    /// snapshot can hold a stale marker from an earlier turn, so marker waits
+    /// inside submit loops must be anchored on the pending output boundary.
+    fn settle_final_output(&mut self) -> Result<TerminalSnapshot, AdvError> {
+        let marker = FINAL_MARKER.as_bytes();
+        let policy = self.policy;
+        self.session_mut()?
+            .read_settled_frame(&policy, |bytes| {
+                bytes.windows(marker.len()).any(|window| window == marker)
+            })
+            .map(|frame| frame.snapshot)
+            .map_err(AdvError::from)
+    }
+
     /// Type `text` one byte per write and settle until it shows on screen.
     fn type_slowly(&mut self, text: &str) -> Result<(), AdvError> {
         for byte in text.bytes() {
@@ -1426,6 +1440,14 @@ fn scenario_command_injection() -> Result<(), AdvError> {
     ] {
         run.write_input(seq)?;
     }
+    // A >64-byte generic OSC is unsolicited noise: the reply layer consumes
+    // it through its terminator without latching, so the key bytes riding in
+    // the same burst still reach the composer.
+    let mut oversized_osc = b"\x1b]52;c;".to_vec();
+    oversized_osc.extend_from_slice(&[b'x'; 80]);
+    oversized_osc.extend_from_slice(b"\x07 osc52ok");
+    run.write_input(&oversized_osc)?;
+    let _ = run.settle_screen(|s| screen_has(s, "osc52ok"))?;
     run.clear_editor()?;
     let snapshot = run.settle_screen(ready_screen)?;
     if snapshot.lines.iter().any(|line| line.contains("1049")) {
@@ -1607,19 +1629,51 @@ fn scenario_history_pressure() -> Result<(), AdvError> {
     for i in 0..10 {
         run.write_input(format!("hist-{i}").as_bytes())?;
         run.write_input(KEY_ENTER)?;
-        let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+        // The marker wait must anchor on newly emitted output — the screen
+        // still shows the previous turn's identical marker, which would let
+        // this settle pass while the new turn is still streaming.
+        let _ = run.settle_final_output()?;
     }
+    // Older-recall clamps at the oldest entry (hist-0).
     for _ in 0..15 {
         run.write_input(KEY_UP)?;
     }
+    let _ = run
+        .settle_screen(|s| {
+            s.lines
+                .iter()
+                .any(|line| line.contains(PROMPT_GLYPH) && line.contains("hist-0"))
+        })
+        .map_err(|e| AdvError::Assert(format!("oldest-recall: {e}")))?;
+    // Newer-recall past the newest entry restores the (empty) live draft.
     for _ in 0..15 {
         run.write_input(KEY_DOWN)?;
     }
+    let _ = run
+        .settle_screen(|s| {
+            s.lines
+                .iter()
+                .filter(|line| line.contains(PROMPT_GLYPH))
+                .all(|line| !line.contains("hist-"))
+        })
+        .map_err(|e| AdvError::Assert(format!("draft-restore: {e}")))?;
     for _ in 0..12 {
         run.write_input(KEY_UP)?;
     }
+    // The deepest recall (oldest entry) must be sitting on the prompt before
+    // the submit re-runs it.
+    let _ = run
+        .settle_screen(|s| {
+            s.lines
+                .iter()
+                .any(|line| line.contains(PROMPT_GLYPH) && line.contains("hist-0"))
+        })
+        .map_err(|e| AdvError::Assert(format!("recall-before-submit: {e}")))?;
+    // Submit the recalled oldest entry and wait on the fresh output boundary:
+    // the previous turn's identical marker is still on screen, so a screen
+    // snapshot could satisfy a marker predicate before this turn emits.
     run.write_input(KEY_ENTER)?;
-    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    let _ = run.settle_final_output()?;
     run.settle_ready()?;
     run.prove_editor_focus(scenario, "histok")?;
     run.quit_clean()?;
