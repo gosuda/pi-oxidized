@@ -623,14 +623,24 @@ fn adversarial_unterminated_paste_then_eof() {
     );
     if BYTE_TRANSPARENT_MASTER {
         // The wedged accumulator swallows the EOF stand-in, so the bounded
-        // wait must fire: exit code 2 is the io-error path that proves the
-        // deadline branch executed. A clean exit would mean the timeout was
-        // never exercised.
+        // wait must fire: exit code 2 is the io-error path. The code alone
+        // cannot distinguish the deadline from an unrelated I/O failure —
+        // main maps every io::Error to 2 — so pair it with the stderr
+        // self-report, which names the TimedOut branch specifically.
         assert_eq!(
             report.exit_code,
             Some(2),
             "unterminated-paste-eof: expected the hard-timeout error exit (2), got {:?}",
             report.exit_code
+        );
+        assert!(
+            find_subslice(
+                &report.raw,
+                b"pi_tui_pty_fixture error: hard fixture timeout"
+            )
+            .is_some(),
+            "unterminated-paste-eof: exit 2 without the timeout self-report; tail={}",
+            report.tail()
         );
     }
 }
