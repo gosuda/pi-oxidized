@@ -1669,7 +1669,8 @@ pub fn encode_cwd_for_session_dir(resolved_cwd: &str) -> String {
     } else {
         resolved_cwd.to_string()
     };
-    let stripped = resolved_cwd.as_str()
+    let stripped = resolved_cwd
+        .as_str()
         .strip_prefix('/')
         .or_else(|| resolved_cwd.strip_prefix('\\'))
         .unwrap_or(resolved_cwd.as_str());
