@@ -11,12 +11,14 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+#[cfg(unix)]
 use std::time::Duration;
 
 use futures::future::BoxFuture;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
+#[cfg(unix)]
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::process::Child;
@@ -27,32 +29,42 @@ use uuid::Uuid;
 
 use pi_agent::service::value::{JsObject, JsString, JsonValue, parse_json, stringify_json};
 
+use super::process::encode_control_line;
+#[cfg(unix)]
 use super::process::{
-    InternalProcessRole, InternalProcessSpawnOptions, MAX_CONTROL_LINE_BYTES, encode_control_line,
+    InternalProcessRole, InternalProcessSpawnOptions, MAX_CONTROL_LINE_BYTES,
     spawn_internal_process, terminate_internal_process,
 };
 
 /// Version of the coordinator control protocol.
 pub const COORDINATOR_PROTOCOL_VERSION: u32 = 3;
 
+#[cfg(unix)]
 const COORDINATOR_START_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(unix)]
 const COORDINATOR_RETRY: Duration = Duration::from_millis(10);
+#[cfg(unix)]
 const EMPTY_STARTUP_GRACE: Duration = Duration::from_secs(30);
+#[cfg(unix)]
 const EMPTY_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 /// Maximum number of frames queued for one control connection.
+#[cfg(unix)]
 const MAX_QUEUED_CONTROL_FRAMES: usize = 256;
 /// Maximum queued frame bytes per control connection.  This matches the
 /// wire's own line bound, so any control line the protocol accepts can still
 /// be queued, while a reader that stops draining cannot accumulate frames
 /// without end.
+#[cfg(unix)]
 const MAX_QUEUED_CONTROL_BYTES: usize = MAX_CONTROL_LINE_BYTES;
 /// Maximum write requests queued for the coordinator socket while the single
 /// writer task drains it. A caller beyond the bound is refused instead of
 /// accumulating encoded frames while the socket is stalled.
+#[cfg(unix)]
 const MAX_QUEUED_SERVER_WRITES: usize = 256;
 /// Maximum events queued for the single coordinator loop. Control-connection
 /// readers await admission, so a client that submits control lines faster
 /// than the loop consumes them waits instead of growing memory without end.
+#[cfg(unix)]
 const MAX_QUEUED_PROCESS_EVENTS: usize = 1024;
 
 /// Messages delivered by the coordinator to a registered server.
@@ -250,6 +262,7 @@ fn payload_field(value: &JsonValue) -> Option<JsonValue> {
     clippy::float_cmp,
     reason = "exact wire protocol version discriminant comparison"
 )]
+#[cfg(unix)]
 fn protocol_is_supported(value: &JsonValue) -> bool {
     object_field(value, "protocol")
         .and_then(JsonValue::as_f64)
@@ -307,7 +320,15 @@ fn parse_coordinator_message(value: &JsonValue) -> Result<CoordinatorMessage, St
 }
 
 struct WriteRequest {
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "drained only by the unix writer loop")
+    )]
     bytes: Vec<u8>,
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "drained only by the unix writer loop")
+    )]
     result: oneshot::Sender<Result<(), String>>,
 }
 #[expect(
@@ -317,6 +338,7 @@ struct WriteRequest {
 struct ConnectionState {
     sender: Option<mpsc::Sender<WriteRequest>>,
     reader_task: Option<JoinHandle<()>>,
+    #[cfg(unix)]
     attempt_id: u64,
     registration: Option<oneshot::Sender<Result<(), String>>>,
     listeners: BTreeMap<u64, Arc<dyn Fn(CoordinatorConnectionEvent) + Send + Sync>>,
@@ -337,7 +359,9 @@ pub struct CoordinatorConnection {
 
 struct CoordinatorConnectionInner {
     control_path: PathBuf,
+    #[cfg(unix)]
     endpoint: PathBuf,
+    #[cfg(unix)]
     server_connection_id: String,
     state: Mutex<ConnectionState>,
     replaced: Arc<Notify>,
@@ -355,11 +379,14 @@ impl CoordinatorConnection {
         Self {
             inner: Arc::new(CoordinatorConnectionInner {
                 control_path: options.control_path,
+                #[cfg(unix)]
                 endpoint: options.endpoint,
+                #[cfg(unix)]
                 server_connection_id: server_connection_id.clone(),
                 state: Mutex::new(ConnectionState {
                     sender: None,
                     reader_task: None,
+                    #[cfg(unix)]
                     attempt_id: 0,
                     registration: None,
                     listeners: BTreeMap::new(),
@@ -432,6 +459,10 @@ impl CoordinatorConnection {
     /// Returns [`CoordinatorError::Closed`] if the connection is closed,
     /// [`CoordinatorError::Protocol`] if registration is rejected, or
     /// [`CoordinatorError::Unsupported`] on non-Unix platforms.
+    #[cfg_attr(
+        not(unix),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     pub async fn connect(&self) -> Result<(), CoordinatorError> {
         #[cfg(unix)]
         {
@@ -533,6 +564,7 @@ impl CoordinatorConnection {
             .map_err(CoordinatorError::Protocol)
     }
 
+    #[cfg(unix)]
     fn emit(&self, event: &CoordinatorConnectionEvent) {
         let listeners = lock(&self.inner.state)
             .listeners
@@ -544,6 +576,7 @@ impl CoordinatorConnection {
         }
     }
 
+    #[cfg(unix)]
     fn mark_replaced(&self, attempt_id: u64) {
         let should_notify = {
             let mut state = lock(&self.inner.state);
@@ -559,6 +592,7 @@ impl CoordinatorConnection {
         }
     }
 
+    #[cfg(unix)]
     fn disconnected(&self, error: impl Into<String>, attempt_id: u64, cancel: &CancellationToken) {
         let (registration, current, should_notify) = {
             let mut state = lock(&self.inner.state);
@@ -586,6 +620,7 @@ impl CoordinatorConnection {
         }
     }
 
+    #[cfg(unix)]
     fn handle_message(&self, value: &JsonValue, attempt_id: u64, cancel: &CancellationToken) {
         let message = match parse_coordinator_message(value) {
             Ok(message) => message,
@@ -894,6 +929,7 @@ pub struct CoordinatorStartupLease {
 impl CoordinatorStartupLease {
     /// Closes the probe connection.
     pub fn close(self) {
+        #[cfg(unix)]
         drop(self);
     }
 }
@@ -956,6 +992,7 @@ impl Drop for CoordinatorChildGuard {
 /// Returns [`CoordinatorError::ProcessExited`] if the coordinator exits during startup,
 /// [`CoordinatorError::StartupTimeout`] if it does not become reachable in time,
 /// or [`CoordinatorError::Unsupported`] on non-Unix platforms.
+#[cfg_attr(not(unix), allow(clippy::unused_async))]
 pub async fn ensure_coordinator(
     public_path: impl AsRef<Path>,
     control_path: impl AsRef<Path>,
@@ -1064,6 +1101,7 @@ impl Drop for CoordinatorRunningGuard {
 /// Returns [`CoordinatorError::Protocol`] if the coordinator is already running,
 /// [`CoordinatorError::Io`] if socket setup fails,
 /// or [`CoordinatorError::Unsupported`] on non-Unix platforms.
+#[cfg_attr(not(unix), allow(clippy::unused_async))]
 pub async fn run_coordinator_process(args: &[String]) -> Result<(), CoordinatorError> {
     #[cfg(unix)]
     {
@@ -1886,6 +1924,7 @@ async fn cleanup_socket(path: &Path) -> Result<(), CoordinatorError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
     #[test]

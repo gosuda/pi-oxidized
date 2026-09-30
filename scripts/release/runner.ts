@@ -6,7 +6,7 @@
  * in fakes without forking subprocesses or touching the real filesystem.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
 	chmod,
 	copyFile,
@@ -350,14 +350,33 @@ export function safeJoinPath(base: string, target: string): string {
 }
 
 /**
- * Prefix tar argv with `--force-local` on Windows only. bsdtar reads
- * `C:\...` as remote host `C:` ("Cannot connect"); the flag pins local
- * interpretation. GNU tar accepts it, but bsdtar's long-option set differs
- * by release (macOS rejects it), and only Windows has drive letters, so
- * every other platform runs the plain argv it always ran.
+ * Normalize tar argv for the tar flavor resolved on Windows. Both GNU tar
+ * and bsdtar read `C:\...` as remote host `C:` ("Cannot connect"); the
+ * local interpretation differs:
+ *
+ * - GNU tar takes `--force-local` to pin local file access.
+ * - bsdtar — including the System32 tar Windows ships — rejects that flag
+ *   outright but opens `C:/...` (forward slashes) locally.
+ *
+ * The binary is probed once; every other platform runs the plain argv.
  */
 export function tarArgs(...args: string[]): string[] {
-	return process.platform === "win32" ? ["--force-local", ...args] : args;
+	if (process.platform !== "win32") {
+		return args;
+	}
+	if (resolvedTarIsGnu()) {
+		return ["--force-local", ...args];
+	}
+	return args.map((arg) => arg.replaceAll("\\", "/"));
+}
+
+let gnuTarCache: boolean | undefined;
+
+function resolvedTarIsGnu(): boolean {
+	gnuTarCache ??= String(
+		spawnSync("tar", ["--version"], { encoding: "utf8" }).stdout ?? "",
+	).includes("GNU tar");
+	return gnuTarCache;
 }
 
 /**

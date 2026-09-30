@@ -27,7 +27,7 @@
 //! lands here.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
@@ -191,17 +191,31 @@ fn drive_static_frame_fixture() -> HashMap<String, String> {
         .master
         .try_clone_reader()
         .unwrap_or_else(|err| panic!("pty reader: {err}"));
+    let mut probe_writer = pair
+        .master
+        .take_writer()
+        .unwrap_or_else(|err| panic!("pty writer: {err}"));
 
-    // No probe reply needed — the simplified fixture does not use the Tui
-    // pipeline and does not read stdin.
-
+    // ConPTY answers its own cursor-position probe (\x1b[6n) from the input
+    // side and holds the child's output until the reply arrives, so the
+    // reader thread must write the reply back like the testkit's probe
+    // responder does.
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let reader_thread = thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        // A read can split the 4-byte query across boundaries, so the match
+        // window carries the last three bytes of the previous chunk.
+        let mut carry = Vec::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    carry.extend_from_slice(&buf[..n]);
+                    if carry.windows(4).any(|w| w == b"\x1b[6n") {
+                        let _ = probe_writer.write_all(b"\x1b[1;1R");
+                        let _ = probe_writer.flush();
+                    }
+                    carry = carry.split_off(carry.len().saturating_sub(3));
                     if tx.send(buf[..n].to_vec()).is_err() {
                         break;
                     }
@@ -227,12 +241,17 @@ fn drive_static_frame_fixture() -> HashMap<String, String> {
         }
     }
 
-    // Drain any remaining data from the channel.
+    // The output pipe EOFs only when the last console host detaches: a conhost
+    // that survives its last client keeps the reader blocked forever while
+    // the master is still open.
+    drop(pair.master);
+    let _ = reader_thread.join();
+    // Drain after the join: the reader can deliver final chunks after the last
+    // pre-close read, and its sender hangs up only when the thread ends.
     let mut raw = Vec::new();
-    while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(500)) {
+    while let Ok(chunk) = rx.try_recv() {
         raw.extend_from_slice(&chunk);
     }
-    let _ = reader_thread.join();
 
     // Parse EVIDENCE markers from the raw output. Use `find` instead of
     // `strip_prefix` because the PTY may echo bytes that concatenate with

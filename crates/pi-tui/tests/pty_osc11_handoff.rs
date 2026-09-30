@@ -301,6 +301,10 @@ fn drive_with_active_writer() -> Vec<u8> {
     }
     let _ = child.wait();
 
+    // The output pipe EOFs only when the last console host detaches: a
+    // conhost that survives its last client keeps the reader blocked forever
+    // while the master is still open.
+    drop(pair.master);
     let _ = reader_thread.join();
 
     while let Ok(chunk) = rx.try_recv() {
@@ -403,6 +407,10 @@ fn drive_scenario(phase0: &[u8], phase1: &[u8], answer_requery: bool) -> Vec<u8>
     }
     let _ = child.wait();
 
+    // The output pipe EOFs only when the last console host detaches: a
+    // conhost that survives its last client keeps the reader blocked forever
+    // while the master is still open.
+    drop(pair.master);
     let _ = reader_thread.join();
 
     while let Ok(chunk) = rx.try_recv() {

@@ -148,7 +148,9 @@ describe("writeTarGz determinism", () => {
 			const stderr = (proc.stderr?.toString("utf8") ?? "").slice(0, 300);
 			throw new Error(`tar exited ${proc.exitCode}: ${stderr}`);
 		}
-		const out = (proc.stdout?.toString("utf8") ?? "").trim().split("\n");
+		// Host tar line endings follow the platform: GNU tar emits \n, the
+		// System32 bsdtar Windows ships emits \r\n.
+		const out = (proc.stdout?.toString("utf8") ?? "").trim().split(/\r?\n/);
 		expect(out).toEqual(["alpha", "zeta"]);
 	});
 });

@@ -386,6 +386,10 @@ fn drive_fixture(exit: &str, sync: bool) -> GrillReport {
         let _ = child.wait();
     }
     drop(writer);
+    // The output pipe EOFs only when the last console host detaches: a conhost
+    // that survives its last client keeps the reader blocked forever while
+    // the master is still open.
+    drop(pair.master);
     let _ = reader_thread.join();
     while let Ok(chunk) = rx.try_recv() {
         raw.extend_from_slice(&chunk);

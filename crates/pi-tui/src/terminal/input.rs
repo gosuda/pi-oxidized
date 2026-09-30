@@ -374,6 +374,10 @@ mod tests {
         Ok(())
     }
 
+    // The reply protocol-error latch exists only in the vendored unix reader:
+    // on Windows `is_protocol_error` returns false for every error, so the
+    // in-task recovery path this test exercises is unreachable there.
+    #[cfg(unix)]
     #[tokio::test]
     async fn protocol_error_recovers_in_task_and_keeps_stream_live() -> io::Result<()> {
         // Use crossterm's real latched-error message shape. The injected

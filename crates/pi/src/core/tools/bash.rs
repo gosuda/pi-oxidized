@@ -801,9 +801,9 @@ fn resolve_shell_config(custom: Option<&Path>) -> Result<ShellConfig, ToolError>
         if let Some(path) = find_on_path("bash.exe") {
             return Ok(bash_shell_config(path));
         }
-        return Err(ToolError::new(
+        Err(ToolError::new(
             "No bash shell found. Options:\n  1. Install Git for Windows: https://git-scm.com/download/win\n  2. Add your bash to PATH (Cygwin, MSYS2, etc.)\n  3. Set shellPath in settings.json".to_owned(),
-        ));
+        ))
     }
 
     #[cfg(not(windows))]
@@ -904,7 +904,6 @@ fn spawn_shell_command(
 
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
@@ -1522,7 +1521,7 @@ mod tests {
             .execute(
                 "1",
                 json_map(json!({
-                    "command": "python3 - <<'PY'\nimport sys,time\nfor i in range(20):\n    sys.stdout.write(f'line-{i}\\n')\n    sys.stdout.flush()\n    time.sleep(0.02)\nPY"
+                    "command": "for i in $(seq 0 19); do printf 'line-%s\\n' \"$i\"; sleep 0.02; done"
                 }))?,
                 CancellationToken::new(),
                 updates,
@@ -1542,7 +1541,7 @@ mod tests {
             .execute(
                 "1",
                 json_map(json!({
-                    "command": "python3 - <<'PY'\nfor i in range(2100):\n    print(f'L{i}')\nPY"
+                    "command": "seq 0 2099 | sed 's/^/L/'"
                 }))?,
                 CancellationToken::new(),
                 ToolUpdates::noop(),
@@ -1585,7 +1584,7 @@ mod tests {
                 "1",
                 json_map(json!({
                     "command": format!(
-                        "python3 - <<'PY'\nprint('x'*{})\nPY",
+                        "head -c {} /dev/zero | tr '\\0' 'x'; printf '\\n'",
                         DEFAULT_MAX_BYTES + 100
                     )
                 }))?,

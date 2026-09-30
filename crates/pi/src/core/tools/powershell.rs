@@ -23,12 +23,14 @@ const MAX_CAPTURE_BYTES: usize = 50 * 1024;
 /// Bound on the post-exit pipe drain; mirrors the Bash tool's finalize window.
 const DRAIN_WINDOW: Duration = Duration::from_millis(200);
 
+/// Deserialized `command` argument for the PowerShell tool.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct PowerShellToolInput {
     /// PowerShell command to execute.
     pub command: String,
 }
 
+/// Windows-native shell tool: executes PowerShell and returns captured output.
 #[derive(Clone, Debug)]
 pub struct PowerShellTool {
     cwd: PathBuf,
@@ -37,6 +39,7 @@ pub struct PowerShellTool {
 }
 
 impl PowerShellTool {
+    /// Builds the tool bound to `cwd`.
     #[must_use]
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
@@ -92,7 +95,7 @@ impl AgentTool for PowerShellTool {
                 return Err(ToolError::new("Operation cancelled"));
             }
             let input = Self::parse_input(&args)?;
-            let mut child = spawn_powershell(cwd, input.command)?;
+            let mut child = spawn_powershell(cwd, &input.command)?;
             let stdout = child
                 .stdout
                 .take()
@@ -157,7 +160,7 @@ impl AgentTool for PowerShellTool {
     }
 }
 
-fn spawn_powershell(cwd: PathBuf, command: String) -> Result<tokio::process::Child, ToolError> {
+fn spawn_powershell(cwd: PathBuf, command: &str) -> Result<tokio::process::Child, ToolError> {
     Command::new("powershell.exe")
         .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
         .arg(format!(
