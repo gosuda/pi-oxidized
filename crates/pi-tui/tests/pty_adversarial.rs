@@ -1915,9 +1915,13 @@ fn adversarial_focus_event_burst() {
     }
 }
 
-/// SGR mouse reports whose coordinates overflow `u16` fields.
+/// Mouse reports with out-of-range coordinates: SGR params past `u16`,
+/// SGR coordinate 0, and an X10 report byte of 0x20 — the coordinate-0
+/// values used to `u16`-underflow inside the vendored parsers, panicking
+/// the input task (the panic hook's emergency restore is what the extra
+/// `?2026l` on the wire was). All must clamp or drop, never panic.
 #[test]
-fn adversarial_sgr_mouse_coord_overflow() {
+fn adversarial_mouse_coord_overflow() {
     let mut h = Harness::spawn(&["--serve"]);
     h.wait_input_ready();
 
@@ -1925,17 +1929,19 @@ fn adversarial_sgr_mouse_coord_overflow() {
     h.pump(Duration::from_millis(40));
     h.send(b"\x1b[<65;0;0m");
     h.pump(Duration::from_millis(40));
+    h.send(b"\x1b[M\x20\x20\x20");
+    h.pump(Duration::from_millis(40));
     h.send(b"ok");
     h.pump(Duration::from_millis(60));
     h.send_ctrl_d();
 
     let report = h.finish();
-    report.assert_success_contract("sgr-mouse-overflow");
+    report.assert_success_contract("mouse-coord-overflow");
     if BYTE_TRANSPARENT_MASTER {
         assert_eq!(
             report.live_text.as_deref(),
             Some("ok"),
-            "sgr-mouse-overflow: coords leaked as keys; tail={}",
+            "mouse-coord-overflow: coords leaked as keys; tail={}",
             report.tail()
         );
     }
