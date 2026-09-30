@@ -437,6 +437,8 @@ describe("SBOM staged capture root authority", () => {
 		expect(content.npm.surfaces).toHaveLength(3);
 	});
 
+	// The ~8 fixture iterations spawn git and cargo per iteration; Windows
+	// spawn costs push the total past the 5s default under load.
 	test("rejects missing, duplicate, or malformed release authorities", () => {
 		const root = makeMinimalRoot();
 		writeFileSync(resolve(root, "scripts/release/runtime.ts"), `export const BUN_RUNTIME_VERSION = 1.3.14;\n`);
@@ -487,7 +489,7 @@ describe("SBOM staged capture root authority", () => {
 			`export const RUST_TARGETS = [] as const;\n`,
 		);
 		expect(() => captureContent(rootEmptyTargets)).toThrow(/RUST_TARGETS is empty/);
-	});
+	}, 30_000);
 });
 
 describe("SBOM staged capture modes", () => {

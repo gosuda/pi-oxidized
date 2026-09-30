@@ -43,10 +43,10 @@ pub(super) struct EndpointPlan {
 #[derive(Clone, Copy)]
 pub(super) enum GenerationBuildPolicy {
     BestEffortStart,
-    // Only the RequireAll* build-policy tests construct this variant.
+    // Only the unix-gated RequireAll* build-policy test constructs this variant.
     #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "constructed only by the RequireAll* tests")
+        any(not(test), not(unix)),
+        expect(dead_code, reason = "constructed only by the unix RequireAll* test")
     )]
     RequireAllEndpointStarts,
 }

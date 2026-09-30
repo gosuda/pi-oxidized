@@ -27,7 +27,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(any(not(windows), test))]
+use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 use filetime::{FileTime, set_file_mtime};
 use same_file::Handle;
@@ -490,6 +492,7 @@ fn is_already_exists(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::AlreadyExists
 }
 
+#[cfg(not(windows))]
 fn is_lock_stale(meta: &fs::Metadata, stale: Duration) -> bool {
     let Ok(mtime) = meta.modified() else {
         // Unreadable mtime: treat as live so we do not steal blindly.

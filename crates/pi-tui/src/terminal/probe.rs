@@ -186,7 +186,10 @@ pub fn detect_terminal_theme(osc_dark: Option<bool>, colorfgbg: Option<&str>) ->
 ///
 /// Returns [`io::Error`] when writing or flushing the probe batch fails.
 pub fn probe_write_batch<W: Write>(output: &mut W) -> io::Result<Option<IssuedQueries>> {
-    if !io::stdin().is_terminal() {
+    // The reply decode path exists only in the vendored unix reader: on
+    // Windows the replies arrive as ordinary console key events, so issuing
+    // the batch would leak reply bytes into the editor as literal text.
+    if cfg!(not(unix)) || !io::stdin().is_terminal() {
         return Ok(None);
     }
 
@@ -326,7 +329,9 @@ fn record_answer(answered: &mut IssuedQueries, reply: &TerminalReply) {
 /// Returns [`io::Error`] when writing or flushing the query fails or the
 /// reader latches a protocol error.
 pub fn probe_background<W: Write>(output: &mut W) -> io::Result<Option<bool>> {
-    if !io::stdin().is_terminal() {
+    // Same constraint as the startup batch: a Windows console hands reply
+    // bytes to the application as key events instead of consuming them.
+    if cfg!(not(unix)) || !io::stdin().is_terminal() {
         return Ok(None);
     }
 

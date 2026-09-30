@@ -662,7 +662,14 @@ pub fn get_share_viewer_url_with(gist_id: &str, base_override: Option<&str>) -> 
     format!("{base}#{gist_id}")
 }
 
-fn process_home_dir() -> Option<PathBuf> {
+pub(crate) fn process_home_dir() -> Option<PathBuf> {
+    // Node `os.homedir` reads %USERPROFILE% on Windows, while `dirs::home_dir`
+    // bypasses the environment via SHGetFolderPath; check the env first so
+    // home resolution matches upstream and stays sandboxable.
+    #[cfg(windows)]
+    if let Some(profile) = env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(profile));
+    }
     dirs::home_dir()
 }
 

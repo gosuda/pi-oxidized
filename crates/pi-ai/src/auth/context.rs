@@ -167,8 +167,13 @@ impl AuthContext for MapAuthContext {
 
     fn file_exists<'a>(&'a self, path: &'a str) -> BoxFuture<'a, bool> {
         Box::pin(async move {
-            let resolved = self.expand_path(path);
-            self.existing_files.get(&resolved).copied().unwrap_or(false)
+            // Compare as paths: `~` expansion joins through PathBuf, whose
+            // separators follow the platform while recorded keys do not.
+            let resolved = Path::new(&self.expand_path(path)).to_path_buf();
+            self.existing_files
+                .iter()
+                .find(|(key, _)| Path::new(key.as_str()) == resolved)
+                .is_some_and(|(_, exists)| *exists)
         })
     }
 }

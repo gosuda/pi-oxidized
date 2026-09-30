@@ -236,6 +236,20 @@ fn require_prerequisites() -> Result<(), CorpusError> {
     Ok(())
 }
 
+/// `fs::canonicalize` without the `\\?\` verbatim prefix Windows returns,
+/// so downstream paths stay usable as ordinary drive-rooted paths.
+fn canonical_sandbox_dir(path: PathBuf) -> Result<PathBuf, CorpusError> {
+    let canonical = fs::canonicalize(path)?;
+    let text = canonical.to_string_lossy();
+    if let Some(stripped) = text.strip_prefix(r"\\?\UNC\") {
+        return Ok(PathBuf::from(format!(r"\\{stripped}")));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(stripped) => Ok(PathBuf::from(stripped)),
+        None => Ok(canonical),
+    }
+}
+
 fn create_sandbox() -> Result<Sandbox, CorpusError> {
     let root = TempDir::new()?;
     let home_dir = root.path().join("home");
@@ -245,6 +259,13 @@ fn create_sandbox() -> Result<Sandbox, CorpusError> {
     for directory in [&home_dir, &agent_dir, &session_dir, &work_dir] {
         fs::create_dir_all(directory)?;
     }
+    // TempDir paths may carry 8.3 short names (ADMINI~1) while the product
+    // canonicalizes to the long name; keep both sides on the canonical form
+    // so the normalization context matches the emitted bytes.
+    let home_dir = canonical_sandbox_dir(home_dir)?;
+    let agent_dir = canonical_sandbox_dir(agent_dir)?;
+    let session_dir = canonical_sandbox_dir(session_dir)?;
+    let work_dir = canonical_sandbox_dir(work_dir)?;
     Ok(Sandbox {
         _root: root,
         home_dir,
@@ -302,6 +323,14 @@ fn launch_env(
         "HOME".to_owned(),
         sandbox.home_dir.to_string_lossy().into_owned(),
     );
+    // dirs::home_dir resolves %USERPROFILE% on Windows and ignores HOME, so
+    // the sandbox has to pin both to keep writes out of the real profile.
+    if cfg!(windows) {
+        env.insert(
+            "USERPROFILE".to_owned(),
+            sandbox.home_dir.to_string_lossy().into_owned(),
+        );
+    }
     env.insert("PI_OFFLINE".to_owned(), "1".to_owned());
     env.insert(
         "PI_EXTENSION_HOST".to_owned(),
@@ -348,7 +377,12 @@ fn launch_env(
     };
 
     let context = NormalizationContext {
-        home: Some(sandbox.home_dir.as_os_str().as_encoded_bytes().to_vec()),
+        // The home replacement must cover every user-profile path the raw
+        // transcript can carry: argv and the conhost window title embed the
+        // product path under the real profile, and the sandbox temp tree
+        // lives under it as well.
+        home: std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .map(|home| home.as_encoded_bytes().to_vec()),
         cwd: Some(sandbox.work_dir.as_os_str().as_encoded_bytes().to_vec()),
     };
     Ok(LaunchEnv {

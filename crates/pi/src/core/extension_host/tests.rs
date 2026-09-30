@@ -1797,6 +1797,10 @@ async fn shutdown_is_idempotent() -> R {
 // ===========================================================================
 
 /// Workspace-relative path to the compiled JS host artifact.
+///
+/// Only unix legs build the `bun --compile` fixture host in CI, so every
+/// `real_host_*` test below is unix-gated with it.
+#[cfg(unix)]
 fn real_host_path() -> std::result::Result<std::path::PathBuf, BoxErr> {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest
@@ -1815,6 +1819,7 @@ fn real_host_path() -> std::result::Result<std::path::PathBuf, BoxErr> {
 /// payload itself is an empty snapshot), plus the specialized hook shapes
 /// that the host maps from `extensions.load`'s `extensionPaths` (the fixtures
 /// register handlers).
+#[cfg(unix)]
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn real_host_lifecycle_and_dispatch() -> R {
@@ -1828,8 +1833,8 @@ async fn real_host_lifecycle_and_dispatch() -> R {
         host_path.display()
     );
 
-    let spec = HostSpec {
-        source: HostSource::Env(host_path.clone()),
+    let spec = pi_ext::host::HostSpec {
+        source: pi_ext::host::HostSource::Env(host_path.clone()),
         program: host_path,
         args: vec!["--cwd".to_owned(), ".".to_owned()],
     };
@@ -2053,6 +2058,7 @@ async fn real_host_lifecycle_and_dispatch() -> R {
 /// marker bug: a real extension must observe the CLI-applied flag value inside
 ///
 /// Fails on pre-lifecycle HEAD with an empty log (no emission at bind time).
+#[cfg(unix)]
 #[tokio::test]
 async fn real_host_bind_emits_session_start_with_cli_flag_before_discovery() -> R {
     use futures::stream::StreamExt;
@@ -2645,6 +2651,7 @@ async fn push_session_and_ui_state_send_mirror_events() -> R {
 /// `session_start` hook observes real session state (the pre-bind session
 /// name), never the host defaults. The second half proves the reverse
 /// direction: a bridged `pi.setSessionName` command mutates the real session.
+#[cfg(unix)]
 #[tokio::test]
 async fn real_host_session_start_observes_initial_snapshot_and_commands_mutate() -> R {
     use futures::stream::StreamExt;

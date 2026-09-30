@@ -1152,6 +1152,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     #[expect(
         clippy::expect_used,
