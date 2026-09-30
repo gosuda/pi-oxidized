@@ -75,6 +75,9 @@ pub enum TerminalReply {
     KeyboardEnhancementFlags(KeyboardEnhancementFlags),
     /// Primary device attributes (`CSI ? ... c`).
     PrimaryDeviceAttributes,
+    /// Vendored patch: secondary device attributes (`CSI > ... c`), the
+    /// XTVersion reply on xterm-likes.
+    SecondaryDeviceAttributes,
 }
 
 static REPLY_QUEUE: LazyLock<Mutex<VecDeque<TerminalReply>>> =
@@ -184,6 +187,9 @@ pub fn poll_reply(timeout: Option<Duration>) -> io::Result<Option<TerminalReply>
                 InternalEvent::PrimaryDeviceAttributes => {
                     return Ok(Some(TerminalReply::PrimaryDeviceAttributes));
                 }
+                InternalEvent::SecondaryDeviceAttributes => {
+                    return Ok(Some(TerminalReply::SecondaryDeviceAttributes));
+                }
                 // Ordinary input stays queued for the sole event stream.
                 other => reader.queue_event(other),
             },
@@ -216,6 +222,7 @@ fn internal_event_to_reply(internal: InternalEvent) -> TerminalReply {
             TerminalReply::KeyboardEnhancementFlags(flags)
         }
         InternalEvent::PrimaryDeviceAttributes => TerminalReply::PrimaryDeviceAttributes,
+        InternalEvent::SecondaryDeviceAttributes => TerminalReply::SecondaryDeviceAttributes,
         InternalEvent::Event(_) | InternalEvent::ReplyConsumed => {
             unreachable!("only reply-class internal events reach this mapping")
         }
