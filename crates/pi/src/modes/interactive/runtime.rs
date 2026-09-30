@@ -4814,9 +4814,20 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         });
         match tokio::time::timeout(ABORT_SETTLE_BUDGET, self.session.abort()).await {
             Ok(result) => self.record_err(result),
-            Err(_) => self.record_err(Err(
-                "abort did not settle; the run may still be stopping".to_owned()
-            )),
+            Err(_) => {
+                // The run may still be stopping, so AgentEnd/AgentSettled may
+                // never arrive to clear the status; drop "Aborting…" here or
+                // it ticks forever, and surface the failure where notices
+                // render — `last_error` has no interactive renderer.
+                self.view.status = None;
+                self.record_err(Err(
+                    "abort did not settle; the run may still be stopping".to_owned()
+                ));
+                self.push_notice(
+                    "error",
+                    "abort did not settle; the run may still be stopping".to_owned(),
+                );
+            }
         }
         self.refresh_footer().await;
         ActionOutcome::Repaint
@@ -11721,6 +11732,16 @@ mod tests {
             rt.last_error.as_deref(),
             Some("abort did not settle; the run may still be stopping")
         );
+        // The stuck run may never emit AgentEnd/AgentSettled, so the timeout
+        // itself clears the stale "Aborting…" status and surfaces the failure
+        // as a rendered notice.
+        assert!(rt.view.status.is_none());
+        assert!(rt.view.messages.iter().any(|message| matches!(
+            message,
+            MessageView::Custom(view)
+                if view.custom_type == "error"
+                    && view.text == "abort did not settle; the run may still be stopping"
+        )));
     }
 
     #[tokio::test]
