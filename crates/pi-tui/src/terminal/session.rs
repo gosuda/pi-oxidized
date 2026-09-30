@@ -121,7 +121,10 @@ impl<W: Write> TerminalSession<W> {
         self.probe_yield.store(true, Ordering::Relaxed);
         match self.probe_task.take() {
             Some(handle) => match handle.await {
-                Ok(Ok(joined)) => Ok(joined),
+                Ok(Ok(joined)) => {
+                    self.guard.set_kitty_negotiated(joined.0.kitty_keyboard());
+                    Ok(joined)
+                }
                 Ok(Err(error)) => {
                     // Defined recovery on a latched reply protocol error:
                     // clear the latch so a session retry starts healthy; the

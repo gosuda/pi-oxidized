@@ -480,6 +480,7 @@ impl Component for Input {
                 area.x.saturating_add(u16::try_from(i).unwrap_or(u16::MAX)),
                 y,
             )) {
+                *cell = ratatui::buffer::Cell::default();
                 cell.set_symbol(&s);
             }
             col += 1;
@@ -506,6 +507,9 @@ impl Component for Input {
                     .saturating_add(u16::try_from(col).unwrap_or(u16::MAX)),
                 y,
             )) {
+                // Persistent buffer: converge the cell to the exact style
+                // (a `REVERSED` left by the caret must not survive it).
+                *cell = ratatui::buffer::Cell::default();
                 cell.set_symbol(if is_cursor && cursor_byte >= line.len() {
                     " "
                 } else {
@@ -535,6 +539,7 @@ impl Component for Input {
                 y,
             ))
         {
+            *cell = ratatui::buffer::Cell::default();
             cell.set_symbol(" ");
             cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
         }

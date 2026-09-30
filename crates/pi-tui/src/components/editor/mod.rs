@@ -27,7 +27,7 @@ use crate::text::{
     is_whitespace_char, slice_by_column, truncate_to_width, truncate_with_marker, visible_width,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::buffer::{Buffer, CellDiffOption};
+use ratatui::buffer::{Buffer, Cell, CellDiffOption};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
@@ -356,6 +356,19 @@ impl Editor {
     #[must_use]
     pub fn history_len(&self) -> usize {
         self.history.len()
+    }
+
+    /// Milliseconds until a pending autocomplete request should complete:
+    /// `Some(0)` when a request is due now, `Some(ms)` while the debounce is
+    /// still counting down, `None` with no request outstanding. Product event
+    /// loops use this to arm a wake-up that calls
+    /// [`tick_autocomplete_debounce`](Self::tick_autocomplete_debounce) plus
+    /// [`poll_autocomplete_now`](Self::poll_autocomplete_now).
+    #[must_use]
+    pub fn autocomplete_due_in_ms(&self) -> Option<u64> {
+        self.autocomplete_pending
+            .as_ref()
+            .map(|_| self.autocomplete_debounce_remaining_ms.unwrap_or(0))
     }
 
     /// Advance autocomplete debounce by `ms` and fire if due.
@@ -2203,6 +2216,10 @@ fn paint_grapheme(
         return right;
     }
     if let Some(cell) = buf.cell_mut(position) {
+        // The buffer persists across frames: a bare `set_style` patches
+        // modifiers (insert/remove only), so a caret's `REVERSED` would
+        // survive after the caret moved on. Converge to the exact style.
+        *cell = Cell::default();
         cell.set_symbol(if grapheme.is_empty() { " " } else { grapheme });
         cell.set_style(style);
     }

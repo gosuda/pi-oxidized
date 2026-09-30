@@ -529,21 +529,24 @@ fn replay_derived(derived: &DerivedLine, line: &str, x: u16, y: u16, buf: &mut B
 /// terminal-paint Design B): when the cell already holds the incoming
 /// content, both writes are value-identical no-ops and are skipped;
 /// otherwise the column is recorded as changed and the original writes
-/// run. `set_style` patches (Some fields, modifier insert/remove), so the
-/// patch is evaluated field-wise to decide `changed` — an unchanged cell
-/// keeps byte-identical state, and every recorded column provably differs
-/// from the pre-paint (snapshot-equal) buffer content.
+/// run. The cell must converge to the exact target state: `set_style` is a
+/// patch (modifier insert/remove, `Some`-field writes) and the in-place
+/// buffer persists across frames, so a stale `REVERSED` or color from an
+/// earlier painter would survive a `None`-field or modifier-free style
+/// forever. Styles recorded here are complete (no `sub_modifier` in play),
+/// so `None` fields mean `Reset` and the modifier set is `add_modifier`.
 fn apply_sym(cell: &mut Cell, y: u16, cx: u16, symbol: &str, style: Style) {
-    let mut changed = cell.symbol() != symbol;
-    changed |= style.fg.is_some_and(|c| cell.fg != c);
-    changed |= style.bg.is_some_and(|c| cell.bg != c);
-    changed |= style
-        .underline_color
-        .is_some_and(|c| cell.underline_color != c);
-    changed |= cell.modifier & style.add_modifier != style.add_modifier;
-    changed |= cell.modifier & style.sub_modifier != Modifier::empty();
+    #[allow(deprecated)]
+    let changed = cell.symbol() != symbol
+        || cell.fg != style.fg.unwrap_or(Color::Reset)
+        || cell.bg != style.bg.unwrap_or(Color::Reset)
+        || cell.underline_color != style.underline_color.unwrap_or(Color::Reset)
+        || cell.modifier != style.add_modifier
+        || cell.diff_option != CellDiffOption::None
+        || cell.skip;
     if changed {
         crate::frame::record_change(y, cx);
+        *cell = Cell::default();
         cell.set_symbol(symbol);
         cell.set_style(style);
     }

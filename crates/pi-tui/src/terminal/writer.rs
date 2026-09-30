@@ -13,6 +13,7 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthChar;
 
 use crate::component::Component;
 use crate::frame::{FrameAnnotations, RawRegion, RowClaim, RowClaims, with_annotations};
@@ -314,7 +315,10 @@ impl<W: Write> Tui<W> {
             state,
             screen_mode: ScreenMode::Regular,
             saved_inline_state: None,
-            force_full_rows: false,
+            // The emitted-state snapshot starts blank while the real screen
+            // may hold prior text; the first frame must emit every cell,
+            // blanks included, or old characters show through the paint.
+            force_full_rows: true,
             coalescer: Coalescer::new(),
             write_count: 0,
             scratch_claims: Vec::new(),
@@ -854,6 +858,13 @@ impl<W: Write> Tui<W> {
         blocks: Vec<SettledBlock>,
         root: &mut dyn Component,
     ) -> io::Result<()> {
+        // `insert_before` slides the viewport toward the screen bottom and
+        // clamps there; mirror that clamp or `viewport_top` drifts off-screen.
+        let max_top = self
+            .state
+            .size
+            .height
+            .saturating_sub(self.state.viewport_height);
         for block in blocks {
             match block {
                 SettledBlock::Lines(lines) => {
@@ -865,7 +876,8 @@ impl<W: Write> Tui<W> {
                     self.terminal.insert_before(height, |buf| {
                         render_lines(buf, &lines_for_draw);
                     })?;
-                    self.state.viewport_top = self.state.viewport_top.saturating_add(height);
+                    self.state.viewport_top =
+                        self.state.viewport_top.saturating_add(height).min(max_top);
                 }
                 SettledBlock::Raw {
                     rows,
@@ -890,7 +902,8 @@ impl<W: Write> Tui<W> {
                         if let Some(id) = kitty_id {
                             self.state.live_kitty_ids.insert(id);
                         }
-                        self.state.viewport_top = self.state.viewport_top.saturating_add(rows);
+                        self.state.viewport_top =
+                            self.state.viewport_top.saturating_add(rows).min(max_top);
                     } else {
                         let height = u16::try_from(fallback.len()).unwrap_or(u16::MAX);
                         if height > 0 {
@@ -899,7 +912,7 @@ impl<W: Write> Tui<W> {
                                 render_lines(buf, &fallback_draw);
                             })?;
                             self.state.viewport_top =
-                                self.state.viewport_top.saturating_add(height);
+                                self.state.viewport_top.saturating_add(height).min(max_top);
                         }
                     }
                 }
@@ -914,7 +927,7 @@ impl<W: Write> Tui<W> {
 
     fn commit_reanchor(
         &mut self,
-        _cause: ReanchorCause,
+        cause: ReanchorCause,
         root: &mut dyn Component,
     ) -> io::Result<()> {
         root.invalidate();
@@ -934,12 +947,28 @@ impl<W: Write> Tui<W> {
             .min(self.state.size.height)
             .max(1);
         self.state.viewport_height = height;
-        self.state.viewport_top = self.state.size.height.saturating_sub(height);
+        let max_top = self.state.size.height.saturating_sub(height);
+        let old_top = self.state.viewport_top;
+        // A resize re-anchor normalizes the viewport to the bottom anchor.
+        // Other causes exist to force a full repaint over damage the diff
+        // cannot see (dismissed overlays, resume artifacts): moving the
+        // anchor there would strand those rows above the viewport,
+        // permanently on screen — keep the current anchor when it fits.
+        self.state.viewport_top = if matches!(cause, ReanchorCause::Resize) {
+            max_top
+        } else {
+            old_top.min(max_top)
+        };
         self.state.cursor = Position {
             x: 0,
             y: self.state.bottom_row(),
         };
         let mut payload_prefix = Vec::new();
+        // Rows a downward viewport move abandons keep their paint; erase
+        // them in the same transaction or they linger as residue.
+        for row in old_top..self.state.viewport_top {
+            encode_full_row_prefix(&mut payload_prefix, row);
+        }
         for id in &self.state.live_kitty_ids {
             payload_prefix.extend_from_slice(&kitty_delete_id(*id));
         }
@@ -1299,6 +1328,30 @@ fn sync_snapshot_cell(prev: &mut [Cell], next: &[Cell], j: usize) {
     }
 }
 
+/// Under forced emission, may a blank default cell be left for the row's
+/// EL2 erase? Forced rows are erased before drawing, so emitting a blank
+/// cell is redundant — and after a symbol that can occupy more terminal
+/// cells than its buffer width (combining marks, ZWJ/VS16 printed as their
+/// own cells by some emulators), contiguous prints land one column right
+/// of the buffer's model until a gap forces a cursor move. Contiguity is
+/// read from the update stream: a cell that does not immediately follow
+/// the last emit gets a cursor move and resyncs the drift.
+fn forced_blank_skip(
+    out: &[(u16, u16, Cell)],
+    x: u16,
+    y: u16,
+    uncertain_cursor: &mut bool,
+    current: &Cell,
+) -> bool {
+    if !out
+        .last()
+        .is_some_and(|&(px, py, _)| py == y && px.saturating_add(1) == x)
+    {
+        *uncertain_cursor = false;
+    }
+    *uncertain_cursor && *current == Cell::default()
+}
+
 /// Drain a pending wide-grapheme trailing run: emit the first cell whose
 /// symbol changed on screen (or every visited cell on a forced pass) and
 /// sync the rest into the snapshot. Returns the re-armed run when emission
@@ -1372,6 +1425,8 @@ fn push_row_diff(
     let mut pos = from.min(to);
     // Pending trailing cells after a wide character: `(next index, end, force)`.
     let mut trailing: Option<(usize, usize, bool)> = None;
+    // Whether the emitted cursor may sit right of the buffer's model.
+    let mut uncertain_cursor = false;
     while pos < to || trailing.is_some() {
         if let Some((next_index, end, trailing_force)) = trailing.take() {
             let (rearmed, resume) =
@@ -1418,6 +1473,10 @@ fn push_row_diff(
                 }
             }
             CellDiffOption::None | CellDiffOption::AlwaysUpdate => {
+                if force && forced_blank_skip(out, x, y, &mut uncertain_cursor, current) {
+                    sync_snapshot_cell(prev, next, i);
+                    continue;
+                }
                 let cell_width = current.cell_width() as usize;
                 if !force
                     && matches!(current.diff_option, CellDiffOption::None)
@@ -1451,6 +1510,10 @@ fn push_row_diff(
                     trailing = Some((i + 1, i + prev_width, true));
                 }
                 out.push((x, y, current.clone()));
+                uncertain_cursor |= current
+                    .symbol()
+                    .chars()
+                    .any(|c| c.width().unwrap_or(0) != 1);
                 sync_snapshot_cell(prev, next, i);
             }
         }

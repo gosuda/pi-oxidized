@@ -186,6 +186,8 @@ pub fn write_link(
             }
             let x = area.x.saturating_add(col);
             if let Some(cell) = buf.cell_mut((x, area.y)) {
+                // Persistent buffer: converge the cell to the exact style.
+                *cell = ratatui::buffer::Cell::default();
                 cell.set_symbol(grapheme);
                 cell.set_style(style);
                 // Ratatui 0.30: hyperlink via set_underline_color is style-only;
