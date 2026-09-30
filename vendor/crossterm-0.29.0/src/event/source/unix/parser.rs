@@ -257,8 +257,13 @@ impl Parser {
         // byte-opaque until the `201~` terminator.
         let in_sequence =
             self.buffer.starts_with(b"\x1b[") || self.buffer.starts_with(b"\x1bO");
+        // X10 normal-mouse reports (`ESC [ M`) carry three raw report
+        // bytes that are value+32 and can legitimately exceed 0x7e;
+        // exempting only those bytes keeps C0 aborts live (a report byte
+        // is never below 0x20).
         if in_sequence
             && !self.buffer.starts_with(b"\x1b[200~")
+            && !(self.buffer.starts_with(b"\x1b[M") && byte > 0x7e)
             && !(0x20..=0x7e).contains(&byte)
         {
             self.buffer.clear();

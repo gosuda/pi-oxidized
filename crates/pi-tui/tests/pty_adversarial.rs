@@ -1615,6 +1615,40 @@ fn adversarial_resize_during_drip_paste() {
     }
 }
 
+/// X10 normal-mouse reports (`ESC [ M` + three raw report bytes) use a
+/// value+32 encoding that legitimately exceeds `0x7e`: the C0-abort must
+/// exempt those bytes or the report is destroyed and its tail leaks as
+/// editor text. A C0 byte is never a valid report byte, so an incomplete
+/// report still aborts and delivers the control key.
+#[test]
+fn adversarial_x10_mouse_raw_report_bytes() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    // A C0 inside an incomplete report still aborts the sequence —
+    // Ctrl+C lands as a key (Ignored), it is not swallowed into the buffer.
+    h.send(b"\x1b[M\x20\x03");
+    h.pump(Duration::from_millis(60));
+    // Complete report: Cb=0x20, Cx=0xc0, Cy=0x61 — the last two must be
+    // report bytes, not editor text (0x61 would land as 'a' if shredded).
+    h.send(b"\x1b[M\x20\xc0a");
+    h.pump(Duration::from_millis(60));
+    h.send(b"ok");
+    h.pump(Duration::from_millis(60));
+    h.send_ctrl_d();
+
+    let report = h.finish();
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            report.live_text.as_deref(),
+            Some("ok"),
+            "x10-mouse: report bytes leaked as text; tail={}",
+            report.tail()
+        );
+    }
+    report.assert_success_contract("x10-mouse");
+}
+
 fn parse_sidechannel_u32(raw: &[u8], key: &[u8]) -> Option<u32> {
     let pos = find_subslice(raw, key)?;
     let start = pos + key.len();

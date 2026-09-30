@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
 	"capturedAt": "2026-09-30",
-	"captureHead": "24d12eabd4fa1dd72792fac731c9a841365ad73b",
-	"contentSha256": "e07be27b1923f4f35f9573d32a724cd6d81af1ed325710cd8dc7db3a6f90c83e",
+	"captureHead": "6c6cb5e336d2c27d25c5ed29fbd9d068a80db794",
+	"contentSha256": "cd28c4c4d0bcfe307e32f6b96309f613526ed089c92193f936bb9a53ff16c071",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.98.0",
@@ -4156,7 +4156,7 @@
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/source/unix/parser.rs",
-					"sha256": "5b39f6bc7226d5b06b942042ff1c7eb45a56bd45bb53a08ca2051d6ac6c7d9ff"
+					"sha256": "01325c512a6a2a81dc847cdfe1e4b9778e4bfddacb84e3d8eba2d75c5ecf01c0"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/source/unix/tty.rs",
@@ -7370,7 +7370,7 @@
 	"stagedInputProvenance": {
 		"schema": "pi.deps.staged-inputs.v1",
 		"mode": "staged",
-		"baseHead": "24d12eabd4fa1dd72792fac731c9a841365ad73b",
+		"baseHead": "6c6cb5e336d2c27d25c5ed29fbd9d068a80db794",
 		"objectFormat": "sha1",
 		"pathspecs": [
 			".cargo/config",
@@ -7608,7 +7608,7 @@
 			{
 				"path": "vendor/crossterm-0.29.0/src/event/source/unix/parser.rs",
 				"mode": "100644",
-				"blob": "367b339b9a3a9bf21d392cfbae8cc443c7b2f9ba"
+				"blob": "2927eeb2d2a3d8662c876a5d9c759d753b8e4ed8"
 			},
 			{
 				"path": "vendor/crossterm-0.29.0/src/event/source/unix/tty.rs",
