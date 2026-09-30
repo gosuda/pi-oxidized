@@ -1327,10 +1327,12 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
 
     use super::*;
+    use crate::provider::{OnResponseFn, ProviderError};
     use crate::types::{
         ConstrainedSampling, ConstrainedSamplingConfig, ModelCost, ModelInput, StrictMode,
         TextContent, Tool, ToolChoice, ToolResultMessage, Usage, UserMessage,
     };
+    use futures::future::BoxFuture;
 
     fn model() -> Model {
         Model {
@@ -2010,12 +2012,18 @@ mod tests {
         let cancel = signal.clone();
         let client = Client::new();
         let provider = AnthropicMessages::new(client);
+        let (headers_seen_tx, headers_seen_rx) = std::sync::mpsc::channel::<()>();
+        let on_response: OnResponseFn = Arc::new(move |_, _| {
+            let _ = headers_seen_tx.send(());
+            Box::pin(std::future::ready(Ok(()))) as BoxFuture<'_, Result<(), ProviderError>>
+        });
         let mut stream = provider.stream(
             &model,
             Context::default(),
             StreamOptions {
                 api_key: Some("test-key".to_owned()),
                 signal: Some(signal),
+                on_response: Some(on_response),
                 ..StreamOptions::default()
             },
         );
@@ -2025,8 +2033,16 @@ mod tests {
             first,
             Some(Ok(AssistantMessageEvent::Start { .. }))
         ));
-        // Allow the adapter to reach the error-body read, then cancel.
-        tokio::task::yield_now().await;
+        // `on_response` fires once response headers reach the client, so the
+        // cancellation lands deterministically in `read_error_body`. Waiting
+        // client-side also guarantees a request reached the server: without
+        // that acknowledgment the abort can race the connect, leaving the
+        // scripted server parked in `accept` and the join below deadlocked.
+        tokio::task::spawn_blocking(move || {
+            headers_seen_rx.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await?
+        .map_err(|_| "response headers never reached the client")?;
         cancel.cancel();
 
         let terminal = stream.next().await;
@@ -2036,6 +2052,8 @@ mod tests {
         assert_eq!(reason, ErrorReason::Aborted);
         assert_eq!(error.stop_reason, StopReason::Aborted);
         assert!(stream.next().await.is_none());
+        drop(stream);
+        drop(provider);
         let _ = server.join();
         Ok(())
     }

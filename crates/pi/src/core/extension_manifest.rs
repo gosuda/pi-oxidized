@@ -633,7 +633,10 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    // Apple filesystems require valid UTF-8 names: creating the 0xFF
+    // directory fails with EILSEQ, so the canonicalized-non-UTF-8 scenario
+    // cannot be staged there.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     #[test]
     fn manifest_rejects_non_utf8_canonical_entry() -> TestResult {
         use std::ffi::OsString;
