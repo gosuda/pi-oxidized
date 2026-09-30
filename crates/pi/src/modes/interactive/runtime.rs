@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures::future::{BoxFuture, poll_fn};
 use pi_ai::auth::types::AuthSelectOption;
 use pi_ai::auth::{
@@ -834,6 +835,21 @@ fn parse_slash_command(text: &str) -> Option<(&str, &str)> {
         None => Some((rest, "")),
     }
 }
+
+/// Whether a key event inserts one printable character — the same shape
+/// `Editor::handle_printable_key` accepts (`Char` with no control/alt/super
+/// modifier; shift stays allowed so capitals batch too). Used to collapse a
+/// queued flood of raw key events (conhost paste) into one tail batch.
+fn is_plain_insert_key(event: &KeyEvent) -> bool {
+    matches!(
+        event.kind,
+        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+    ) && matches!(event.code, KeyCode::Char(_))
+        && !event.modifiers.contains(KeyModifiers::CONTROL)
+        && !event.modifiers.contains(KeyModifiers::ALT)
+        && !event.modifiers.contains(KeyModifiers::SUPER)
+}
+
 /// Parse a thinking-level wire value, accepting the case-insensitive command
 /// spelling used by `/thinking`.
 fn parse_thinking_level(value: &str) -> Option<pi_ai::ModelThinkingLevel> {
@@ -3337,6 +3353,44 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         if self.handle_fullscreen_event(&event).await? {
             return Ok(());
         }
+        // Collapse a backed-up run of plain printable key events into one
+        // tail batch. conhost has no bracketed paste, so Edit→Paste
+        // arrives as ~100K raw INPUT_RECORDs and per-char insertion clones
+        // the line and whole buffer several times per event — an O(n²)
+        // livelock on a giant single-line flood. The head event still
+        // takes the full dispatch below; the queued tail inserts as a
+        // single mutation afterwards.
+        let mut char_tail: Vec<char> = Vec::new();
+        let mut preserved: Vec<UiEvent> = Vec::new();
+        if self.view.focus == FocusArea::Editor
+            && let UiEvent::Key(key) = &event
+            && is_plain_insert_key(key)
+        {
+            // Stop at the first non-char event: chars queued behind it must
+            // not jump ahead of it.
+            while let Ok(next) = self.input.receiver_mut().try_recv() {
+                match next {
+                    UiEvent::Key(next_key) if is_plain_insert_key(&next_key) => {
+                        if let KeyCode::Char(c) = next_key.code {
+                            char_tail.push(c);
+                        }
+                    }
+                    other => {
+                        preserved.push(other);
+                        break;
+                    }
+                }
+            }
+        }
+        // Reinject preserves arrival order: the loop pops from the back.
+        for preserved_event in preserved.into_iter().rev() {
+            self.pending_ui_reinject.push(preserved_event);
+        }
+        let text_len_before = if char_tail.is_empty() {
+            0
+        } else {
+            self.editor.get_text().len()
+        };
         // Swap the editor (and active selector) into a throwaway-built
         // InteractiveRoot so we can route the event, then recover both.
         let saved_editor = std::mem::replace(&mut self.editor, Editor::with_defaults());
@@ -3347,6 +3401,34 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         // Re-attach on_submit after the swap (Editor does not preserve it
         // through with_defaults temporary).
         self.ensure_editor_on_submit();
+        // Insert the collected tail as one run when the head event really
+        // inserted its character into a still-editor-focused buffer. A
+        // head that did something else (a jump target, a consumed binding)
+        // returns the tail to the queue so each char takes the normal
+        // path on a later turn.
+        if !char_tail.is_empty() {
+            let head_len = match &event {
+                UiEvent::Key(KeyEvent {
+                    code: KeyCode::Char(c),
+                    ..
+                }) => c.len_utf8(),
+                _ => 0,
+            };
+            if self.view.focus == FocusArea::Editor
+                && self.active_selector.is_none()
+                && self.editor.get_text().len() == text_len_before + head_len
+            {
+                let tail: String = char_tail.into_iter().collect();
+                self.editor.insert_text_run(&tail);
+            } else {
+                for c in char_tail.into_iter().rev() {
+                    self.pending_ui_reinject.push(UiEvent::Key(KeyEvent::new(
+                        KeyCode::Char(c),
+                        KeyModifiers::NONE,
+                    )));
+                }
+            }
+        }
 
         // Refresh view.editor.text from the live buffer so the mapper sees
         // the freshest value.
@@ -11839,20 +11921,22 @@ mod tests {
         assert!(rt.view.status.is_none());
     }
 
-    /// A queued input flood (a conhost Edit→Paste blob arrives as ~100K raw
-    /// key events) must not run a full paint per event: backed-up input defers
-    /// to the coalescer while a lone keystroke still commits immediately.
+    /// A queued flood of plain key events (a conhost Edit→Paste blob arrives
+    /// as ~100K raw `INPUT_RECORD`s) must insert as one batched mutation — the
+    /// head char dispatches normally, the queued tail collapses into a single
+    /// `insert_text_run`, and the frame commits once for the whole batch.
     #[tokio::test]
-    async fn backed_up_input_defers_paint_to_the_coalescer() -> TestResult {
+    async fn backed_up_chars_insert_as_one_batch() -> TestResult {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let (mut rt, _log, tx, sink) = try_make_runtime_with_channel()?;
-        // Queue one event so the input channel reports non-empty.
-        tx.send(UiEvent::Key(KeyEvent::new(
-            KeyCode::Char('b'),
-            KeyModifiers::NONE,
-        )))
-        .map_err(|e| format!("send failed: {e}"))?;
+        for c in ['b', 'c', 'd'] {
+            tx.send(UiEvent::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )))
+            .map_err(|e| format!("send failed: {e}"))?;
+        }
         let baseline = sink.snapshot().len();
 
         rt.step_ui(UiEvent::Key(KeyEvent::new(
@@ -11861,22 +11945,63 @@ mod tests {
         )))
         .await
         .map_err(|e| format!("key step failed: {e}"))?;
-        // The insert lands but no frame commits while input is backed up.
-        assert_eq!(rt.editor.get_text(), "a");
-        assert!(rt.coalesce_deadline.is_some());
-        assert_eq!(sink.snapshot().len(), baseline);
+        // The whole queued run landed in one pass; the channel is drained so
+        // the batch paints immediately rather than deferring.
+        assert_eq!(rt.editor.get_text(), "abcd");
+        assert!(sink.snapshot().len() > baseline);
+        Ok(())
+    }
 
-        // Drain the queued event (the run loop pulls it next turn), then the
-        // next keystroke on an empty queue paints on the same turn.
-        let _ = rt.input.receiver_mut().try_recv();
+    /// A queued non-char event behind a char must not batch — it reinjects in
+    /// arrival order so it still dispatches on the next loop turn, and the
+    /// backed-up state still defers the paint to the coalescer.
+    #[tokio::test]
+    async fn backed_up_non_char_reinjects_in_order_and_defers_paint() -> TestResult {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (mut rt, _log, tx, sink) = try_make_runtime_with_channel()?;
+        // 'b' batches with the head; Left and 'c' behind it must reinject and
+        // process after the batch, in order.
+        for event in [
+            UiEvent::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+            UiEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            UiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+        ] {
+            tx.send(event).map_err(|e| format!("send failed: {e}"))?;
+        }
+        let baseline = sink.snapshot().len();
+
         rt.step_ui(UiEvent::Key(KeyEvent::new(
-            KeyCode::Char('c'),
+            KeyCode::Char('a'),
             KeyModifiers::NONE,
         )))
         .await
         .map_err(|e| format!("key step failed: {e}"))?;
-        assert_eq!(rt.editor.get_text(), "ac");
-        assert!(sink.snapshot().len() > baseline);
+        // 'ab' landed; Left reinjected (the batch stops at the first
+        // non-char) and 'c' is still queued, so the frame defers.
+        assert_eq!(rt.editor.get_text(), "ab");
+        assert_eq!(rt.pending_ui_reinject.len(), 1);
+        assert!(rt.coalesce_deadline.is_some());
+        assert_eq!(sink.snapshot().len(), baseline);
+
+        // The reinjected Left replays first and moves the cursor back one
+        // column; 'c' then processes from the channel and lands before 'b'.
+        let left = rt
+            .pending_ui_reinject
+            .pop()
+            .ok_or("missing reinjected Left")?;
+        rt.step_ui(left)
+            .await
+            .map_err(|e| format!("left step failed: {e}"))?;
+        let c = rt
+            .input
+            .receiver_mut()
+            .try_recv()
+            .map_err(|e| format!("queued 'c' missing: {e}"))?;
+        rt.step_ui(c)
+            .await
+            .map_err(|e| format!("c step failed: {e}"))?;
+        assert_eq!(rt.editor.get_text(), "acb");
         Ok(())
     }
 

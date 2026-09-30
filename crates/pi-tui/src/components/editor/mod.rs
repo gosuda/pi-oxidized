@@ -321,6 +321,32 @@ impl Editor {
         self.insert_text_at_cursor_internal(text);
     }
 
+    /// Insert a run of plain characters as one mutation.
+    ///
+    /// Terminals without bracketed paste (Windows conhost Edit→Paste)
+    /// deliver a pasted blob as raw key events; routing each char through
+    /// `insert_character` costs an O(line) clone plus an O(line)
+    /// `emit_change` per char — quadratic on a giant single-line burst.
+    /// This collapses the run into a single `insert_str` and one
+    /// `emit_change`. Undo treats the whole run as one atomic unit (same
+    /// as `insert_text_at_cursor`); an open autocomplete refreshes once
+    /// against the final text, and no fresh trigger runs mid-run.
+    pub fn insert_text_run(&mut self, run: &str) {
+        if run.is_empty() {
+            return;
+        }
+        self.history.exit_browsing();
+        self.push_undo_snapshot();
+        self.last_action = Some(LastAction::TypeWord);
+        let col = self.state.cursor_col.min(self.state.current_line().len());
+        self.state.lines[self.state.cursor_line].insert_str(col, run);
+        self.set_cursor_col(col + run.len());
+        self.emit_change();
+        if self.autocomplete_state.is_some() {
+            self.update_autocomplete();
+        }
+    }
+
     /// Add submitted text to history.
     pub fn add_to_history(&mut self, text: &str) {
         self.history.add(text);
@@ -2519,6 +2545,17 @@ mod tests {
         ed.handle_event(&UiEvent::Key(press(KeyCode::Enter)));
         assert_eq!(ed.get_text(), "\n");
         assert_eq!(ed.get_cursor(), (1, 0));
+    }
+
+    #[test]
+    fn text_run_inserts_at_cursor_and_undoes_atomically() {
+        let mut ed = Editor::with_defaults();
+        ed.handle_event(&UiEvent::Key(press(KeyCode::Char('a'))));
+        ed.insert_text_run("bcd");
+        assert_eq!(ed.get_text(), "abcd");
+        assert_eq!(ed.get_cursor(), (0, 4));
+        ed.undo();
+        assert_eq!(ed.get_text(), "a");
     }
 
     #[test]
