@@ -593,11 +593,13 @@ fn adversarial_key_burst() {
     let typed_chars: String = (0..384usize)
         .map(|i| char::from(alphabet[i % alphabet.len()]))
         .collect();
-    assert!(
-        live_text.contains(&typed_chars),
-        "key-burst: typed text diverged from input; live_text len={}, expected {} chars",
-        live_text.len(),
-        typed_chars.len()
+    // Exact equality, not containment: every sent char is printable ASCII so
+    // the escaped editor delta must be the burst verbatim — a phantom prefix,
+    // suffix, or duplicated run is as much a parser regression as a dropped
+    // key.
+    assert_eq!(
+        live_text, typed_chars,
+        "key-burst: editor delta diverged from the sent burst"
     );
     assert_eq!(
         report.live_paste,
@@ -678,16 +680,21 @@ fn adversarial_resize_mid_paste() {
     );
     let live_text = report
         .live_text
+        .as_ref()
         .unwrap_or_else(|| panic!("resize-mid-paste: missing PI_TUI_LIVE_TEXT record"));
     assert!(
         live_text.contains("FIRST-HALF-SECOND-HALF"),
         "resize-mid-paste: payload corrupted across the resize, got {live_text:?}"
     );
-    // PI_TUI_LIVE_RESIZE is the post-readiness delta, so the scripted
-    // prelude's 24 resizes cannot mask a mid-paste resize that never landed.
-    assert!(
-        report.live_resize.unwrap_or(0) >= 1,
-        "resize-mid-paste: live resize event lost behind the paste"
+    // Two resizes spaced by full pumps must each land as their own event:
+    // a lone '>=1' would also pass when only the post-paste restore resize
+    // survived, so the mid-paste resize needs its own seat in the count.
+    assert_eq!(
+        report.live_resize,
+        Some(2),
+        "resize-mid-paste: expected both resizes delivered, got {:?}; tail={}",
+        report.live_resize,
+        report.tail()
     );
 }
 
@@ -771,6 +778,26 @@ fn adversarial_resize_batch_rejects_foreign_input() {
         "resize-batch-contamination: foreign input was silently accepted (exit 0); tail={}",
         report.tail()
     );
+    if BYTE_TRANSPARENT_MASTER {
+        // Any nonzero exit would pass the check above — including the 20s
+        // hard timeout if 'x' never arrived — so pin the rejection branch by
+        // its stderr self-report and the io-error exit code.
+        assert_eq!(
+            report.exit_code,
+            Some(2),
+            "resize-batch-contamination: expected the io-error exit (2), got {:?}",
+            report.exit_code
+        );
+        assert!(
+            find_subslice(
+                &report.raw,
+                b"pi_tui_pty_fixture error: unexpected input in resize batch"
+            )
+            .is_some(),
+            "resize-batch-contamination: exit 2 without the batch rejection self-report; tail={}",
+            report.tail()
+        );
+    }
 }
 
 fn parse_sidechannel_u32(raw: &[u8], key: &[u8]) -> Option<u32> {
