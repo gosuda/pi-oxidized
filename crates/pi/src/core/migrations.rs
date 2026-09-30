@@ -386,13 +386,14 @@ pub fn migrate_tools_to_bin_in(agent_dir: &Path, bin_dir: &Path) {
         let target = bin_dir.join(name);
         if entry_exists(&target) {
             // FlushFileBuffers rejects read-only handles on Windows, so the
-            // durability check needs a write-mode open (no truncation).
+            // durability check opens write-mode there; on Unix a managed tool
+            // can legitimately be 0555 and a write open would fail outright.
+            #[cfg(unix)]
+            let durable = File::open(&target);
+            #[cfg(not(unix))]
+            let durable = std::fs::OpenOptions::new().write(true).open(&target);
             if is_regular_file(&target)
-                && std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&target)
-                    .and_then(|file| file.sync_all())
-                    .is_ok()
+                && durable.and_then(|file| file.sync_all()).is_ok()
                 && fs::remove_file(&source).is_ok()
             {
                 let _ = sync_parent(&source);
