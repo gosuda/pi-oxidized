@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
 	"capturedAt": "2026-09-30",
-	"captureHead": "6c6cb5e336d2c27d25c5ed29fbd9d068a80db794",
-	"contentSha256": "cd28c4c4d0bcfe307e32f6b96309f613526ed089c92193f936bb9a53ff16c071",
+	"captureHead": "24ec4c57412105af264ee522b643d3b7c383ca57",
+	"contentSha256": "2d3c85bcdad8dc2c16ede6890f59ee55ce7e861625ebc398e812e42370b9c82f",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.98.0",
@@ -4128,7 +4128,7 @@
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event.rs",
-					"sha256": "9fe5492083db815cb9f14dbd92a9f8cacbb6e4075fb365376be05b45bf763263"
+					"sha256": "144e1b487fbc6b0d3f1771fd799aeecbb3ac3cc6f4dc931940ad7f4fb9ae3c21"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/filter.rs",
@@ -4136,11 +4136,11 @@
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/read.rs",
-					"sha256": "0f75e87ff2375062456001165fc15f80e2a54fe721043bd9d96048167d57b2c2"
+					"sha256": "bef7286eda0d030c40c6cf26a6b1f12f72f56fb27c13cda8243c566932f6e249"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/reply.rs",
-					"sha256": "172d252936d3a725761cb5fbeff01633e5d272d4ba07b05796dbdb0e02a1381f"
+					"sha256": "fca3833c1cd2958b493ad0d3ebfdc6e1654e22af77dd8ab070e885813ecfedfd"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/source.rs",
@@ -4180,7 +4180,7 @@
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/sys/unix/parse.rs",
-					"sha256": "81509a0db2a9e7c9a279713186581e7f18d38aa829c92c0e7c28eb85cb882e07"
+					"sha256": "ccbd47b1fa3e233ca376ea36b868f7b8773d18f9fe76641200363661cfb84005"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker.rs",
@@ -7370,7 +7370,7 @@
 	"stagedInputProvenance": {
 		"schema": "pi.deps.staged-inputs.v1",
 		"mode": "staged",
-		"baseHead": "6c6cb5e336d2c27d25c5ed29fbd9d068a80db794",
+		"baseHead": "24ec4c57412105af264ee522b643d3b7c383ca57",
 		"objectFormat": "sha1",
 		"pathspecs": [
 			".cargo/config",
@@ -7573,7 +7573,7 @@
 			{
 				"path": "vendor/crossterm-0.29.0/src/event.rs",
 				"mode": "100644",
-				"blob": "0df62d9d7c7a8d151d30b8e5508529d97932a73f"
+				"blob": "77fae44679868ee2dd99107fe4c112ef8b0314bf"
 			},
 			{
 				"path": "vendor/crossterm-0.29.0/src/event/filter.rs",
@@ -7583,12 +7583,12 @@
 			{
 				"path": "vendor/crossterm-0.29.0/src/event/read.rs",
 				"mode": "100644",
-				"blob": "827c59b28304d62291de2abd9edda57d401b561f"
+				"blob": "64c1f4d8775b246a48fe04100814388d5bc73069"
 			},
 			{
 				"path": "vendor/crossterm-0.29.0/src/event/reply.rs",
 				"mode": "100644",
-				"blob": "235ad022542ba9ac3387e12c48a00f021f3d1569"
+				"blob": "00293ba68f50430bd2c8067469da4ffeeefcf4d4"
 			},
 			{
 				"path": "vendor/crossterm-0.29.0/src/event/source.rs",
@@ -7638,7 +7638,7 @@
 			{
 				"path": "vendor/crossterm-0.29.0/src/event/sys/unix/parse.rs",
 				"mode": "100644",
-				"blob": "3c4e827cb81c8ff4d46cce80368e3856c28aba39"
+				"blob": "41d5e1a013e3cf7e42b4eb02403b7cdc1c131493"
 			},
 			{
 				"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker.rs",
