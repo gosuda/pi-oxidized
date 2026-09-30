@@ -9,6 +9,12 @@
 //! ctrl+d/quit races. The autocomplete flood also exercises the off-loop
 //! provider path end to end.
 //!
+//! A second wave drives multi-vector collisions: queued steer chains, an
+//! open paste under a resize storm, Esc aborts mid-stream, a ~40 KiB paste,
+//! UTF-8 split across write boundaries, nested paste markers, selector
+//! reflow under resizes, boundary-width composer text, and
+//! whitespace-only submits.
+//!
 //! Assertions are liveness/correctness only (no canonical digests): each
 //! scenario must keep the composer responsive, converge the screen to a
 //! sane state, and exit 0. Every settle is predicate-then-quiescence —
@@ -819,6 +825,239 @@ fn scenario_quit_race() -> Result<(), AdvError> {
     run.close_assert(scenario)
 }
 
+/// Steer chain: three submits back-to-back — turn one in flight (~450 ms),
+/// turns two and three must queue rather than wedge or drop.
+fn scenario_steer_chain() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-steer-chain";
+
+    run.send_line("steer chain one")?;
+    run.send_line("steer chain two")?;
+    run.send_line("steer chain three")?;
+    let snapshot = run.settle_screen(|s| count_lines_containing(s, FINAL_MARKER) >= 3)?;
+    if count_lines_containing(&snapshot, FINAL_MARKER) < 3 {
+        return Err(AdvError::Assert(format!(
+            "{scenario}: only {} of 3 chained turns completed; screen:\n{}",
+            count_lines_containing(&snapshot, FINAL_MARKER),
+            snapshot.lines.join("\n")
+        )));
+    }
+    run.prove_editor_focus(scenario, "steerfocus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Bracketed paste colliding with a resize storm while the paste is still
+/// open — mid-paste reflows must not corrupt the capture or wedge the
+/// composer.
+fn scenario_paste_resize_collision() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-paste-resize";
+
+    run.write_input(b"\x1b[200~collision alpha\n")?;
+    run.session_mut()?
+        .resize_storm(&[(31, 9), (120, 40), (17, 5), (80, 24)])?;
+    run.write_input(b"collision beta\n")?;
+    run.write_input(b"\x1b[201~")?;
+    let _ =
+        run.settle_screen(|s| screen_has(s, "collision alpha") && screen_has(s, "collision beta"))?;
+    run.write_input(KEY_ENTER)?;
+    let snapshot = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    if !screen_has(&snapshot, FINAL_MARKER) {
+        return Err(AdvError::Assert(format!(
+            "{scenario}: pasted turn never streamed; screen:\n{}",
+            snapshot.lines.join("\n")
+        )));
+    }
+    run.prove_editor_focus(scenario, "collidefocus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Esc mid-stream: the in-flight turn aborts, the UI settles back to idle,
+/// and a fresh turn streams normally afterwards.
+fn scenario_interrupt_stream() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-interrupt-stream";
+
+    run.send_line("interrupt me mid stream")?;
+    // Lands inside the ~450 ms stream window: Interrupt aborts the turn.
+    run.write_input(KEY_ESCAPE)?;
+    run.settle_ready()?;
+
+    run.send_line("post interrupt turn")?;
+    let snapshot = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    if !screen_has(&snapshot, FINAL_MARKER) {
+        return Err(AdvError::Assert(format!(
+            "{scenario}: post-interrupt turn never streamed; screen:\n{}",
+            snapshot.lines.join("\n")
+        )));
+    }
+    run.prove_editor_focus(scenario, "intrfocus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// A ~40 KiB paste delivered in chunks — large-paste capture must not
+/// truncate the buffer or wedge the composer.
+fn scenario_huge_paste() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-huge-paste";
+
+    let mut payload = String::new();
+    for line in 0..300 {
+        let _ = writeln!(payload, "huge {line:03} {}", "🦀🌊🚀".repeat(8));
+    }
+    let bytes = payload.as_bytes();
+    let chunk = bytes.len() / 4 + 1;
+    run.write_input(b"\x1b[200~")?;
+    for part in bytes.chunks(chunk) {
+        run.write_input(part)?;
+    }
+    run.write_input(b"\x1b[201~")?;
+    // A multi-line paste renders as a `[paste #N` chip in the composer.
+    let _ = run.settle_screen(|s| screen_has(s, "[paste #"))?;
+    run.write_input(KEY_ENTER)?;
+    let snapshot = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    if !screen_has(&snapshot, FINAL_MARKER) {
+        return Err(AdvError::Assert(format!(
+            "{scenario}: huge-paste turn never streamed; screen:\n{}",
+            snapshot.lines.join("\n")
+        )));
+    }
+    run.prove_editor_focus(scenario, "hugefocus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Multi-byte UTF-8 split across individual writes — the input parser must
+/// buffer partial sequences instead of dropping or mojibake-ing them.
+fn scenario_split_utf8() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-split-utf8";
+
+    // 🦀 (F0 9F A6 80) and 🔥 (F0 9F 94 A5), one byte per write with ASCII
+    // interleaved — each write is a separate PTY read boundary.
+    for byte in "🦀".as_bytes() {
+        run.write_input(&[*byte])?;
+    }
+    run.write_input(b" ")?;
+    for byte in "🔥".as_bytes() {
+        run.write_input(&[*byte])?;
+    }
+    let _ = run.settle_screen(|s| screen_has(s, "🦀") && screen_has(s, "🔥"))?;
+    run.clear_editor()?;
+    run.prove_editor_focus(scenario, "utf8focus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// A paste body containing a literal `\x1b[200~` — the inner marker is paste
+/// data, not a re-arm of the paste state machine.
+fn scenario_nested_paste_marker() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-nested-paste-marker";
+
+    run.write_input(b"\x1b[200~outerA\x1b[200~outerB\x1b[201~")?;
+    let snapshot = run.settle_screen(|s| screen_has(s, "outerA"))?;
+    if !screen_has(&snapshot, "outerA") {
+        return Err(AdvError::Assert(format!(
+            "{scenario}: paste body missing after nested marker; screen:\n{}",
+            snapshot.lines.join("\n")
+        )));
+    }
+    // Whatever the parser did with the inner marker, typing must still work.
+    run.clear_editor()?;
+    run.prove_editor_focus(scenario, "nestedfocus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Selector dialog under a resize storm — the dialog must reflow, Esc must
+/// dismiss it, and the composer row must come back clean.
+fn scenario_selector_resize() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-selector-resize";
+
+    run.send_line("/tree")?;
+    let _ = run.settle_screen(|s| screen_has(s, "No entries found"))?;
+    run.session_mut()?
+        .resize_storm(&[(19, 4), (120, 40), (1, 1), (80, 24)])?;
+    run.write_input(KEY_ESCAPE)?;
+    run.settle_ready()?;
+    let snapshot = run.settle_screen(|s| s.lines.iter().any(|line| line.contains(PROMPT_GLYPH)))?;
+    let ghost = snapshot
+        .lines
+        .iter()
+        .any(|line| line.trim().contains("No entries found") && line.contains(PROMPT_GLYPH));
+    if ghost {
+        return Err(AdvError::Assert(format!(
+            "{scenario}: selector residue survived into the composer row; screen:\n{}",
+            snapshot.lines.join("\n")
+        )));
+    }
+    run.prove_editor_focus(scenario, "selresize")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Composer text at the column boundary: wide CJK + emoji + combining marks
+/// exactly filling the row — wrap must not clip or smear cells.
+fn scenario_width_edge() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-width-edge";
+
+    // 39 wide chars (78 cells) + 2 ASCII = exactly 80 columns; then a long
+    // combining-mark run pushes past the edge. The composer scrolls the
+    // overflow out of view, so the settled screen can only show the tail.
+    let edge = format!("{}ab{}", "\u{754c}".repeat(39), "e\u{301}".repeat(10));
+    for byte in edge.bytes() {
+        run.write_input(&[byte])?;
+    }
+    let _ = run.settle_screen(|s| screen_has(s, "eeee"))?;
+    run.write_input(KEY_ENTER)?;
+    let snapshot = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    if !screen_has(&snapshot, FINAL_MARKER) {
+        return Err(AdvError::Assert(format!(
+            "{scenario}: boundary-width turn never streamed; screen:\n{}",
+            snapshot.lines.join("\n")
+        )));
+    }
+    run.prove_editor_focus(scenario, "edgefocus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// A whitespace-only submit must not spawn an empty turn — the composer
+/// clears (or stays) and no agent run starts.
+fn scenario_whitespace_submit() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-whitespace-submit";
+
+    run.write_input(b"    ")?;
+    run.write_input(KEY_ENTER)?;
+    let snapshot = run.settle_screen(ready_screen)?;
+    if screen_has(&snapshot, FINAL_MARKER) || screen_has(&snapshot, "esc to cancel") {
+        return Err(AdvError::Assert(format!(
+            "{scenario}: whitespace submit spawned an agent turn; screen:\n{}",
+            snapshot.lines.join("\n")
+        )));
+    }
+    run.clear_editor()?;
+    run.prove_editor_focus(scenario, "wsfocus")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
@@ -833,6 +1072,7 @@ fn tui_adversarial_gauntlet_hostile_inputs_geometry_and_dialog_storms() {
         eprintln!("tui_adversarial_gauntlet skipped (PI_ADVERSARIAL_SKIP)");
         return;
     }
+    let only: Option<String> = std::env::var("PI_GAUNTLET_ONLY").ok();
     let scenarios: &[(&str, fn() -> Result<(), AdvError>)] = &[
         ("paste-storm", scenario_paste_storm),
         ("resize-storm", scenario_resize_storm),
@@ -846,10 +1086,22 @@ fn tui_adversarial_gauntlet_hostile_inputs_geometry_and_dialog_storms() {
         ("autocomplete-flood", scenario_autocomplete_flood),
         ("ctrl-mash", scenario_ctrl_mash),
         ("quit-race", scenario_quit_race),
+        ("steer-chain", scenario_steer_chain),
+        ("paste-resize", scenario_paste_resize_collision),
+        ("interrupt-stream", scenario_interrupt_stream),
+        ("huge-paste", scenario_huge_paste),
+        ("split-utf8", scenario_split_utf8),
+        ("nested-paste-marker", scenario_nested_paste_marker),
+        ("selector-resize", scenario_selector_resize),
+        ("width-edge", scenario_width_edge),
+        ("whitespace-submit", scenario_whitespace_submit),
     ];
     let mut verdicts = Vec::new();
     let mut first_failure: Option<String> = None;
     for (name, scenario) in scenarios {
+        if only.as_deref().is_some_and(|filter| filter != *name) {
+            continue;
+        }
         let started = Instant::now();
         match scenario() {
             Ok(()) => {
