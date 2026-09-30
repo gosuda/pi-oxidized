@@ -264,7 +264,7 @@ fn open_session(spec: &LaunchSpec) -> Result<HostSession, AdvError> {
     }
     #[cfg(windows)]
     {
-        Ok(pi_tui::testkit::conpty::ConPtyDriver::open_clean(spec)?)
+        Ok(ConPtyDriver::open_clean(spec)?)
     }
 }
 
