@@ -129,9 +129,10 @@ fn target_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target")
 }
 
-fn require_prerequisites() -> Result<(), AdvError> {
-    let _ = pi_binary()?;
-    let host = workspace_root()?
+/// Built extension-host binary — `PI_EXTENSION_HOST` must name an existing
+/// file, so this shares the platform-aware name with the prerequisite check.
+fn extension_host_path() -> Result<PathBuf, AdvError> {
+    Ok(workspace_root()?
         .join("packages")
         .join("extension-host")
         .join("dist")
@@ -139,7 +140,12 @@ fn require_prerequisites() -> Result<(), AdvError> {
             "pi-extension-host.exe"
         } else {
             "pi-extension-host"
-        });
+        }))
+}
+
+fn require_prerequisites() -> Result<(), AdvError> {
+    let _ = pi_binary()?;
+    let host = extension_host_path()?;
     if !host.is_file() {
         return Err(AdvError::Prerequisite(format!(
             "extension host missing at {} (build: bun run --cwd packages/extension-host build)",
@@ -208,14 +214,16 @@ fn launch_spec(sandbox: &Sandbox) -> Result<LaunchSpec, AdvError> {
     env.insert("PI_OFFLINE".to_owned(), "1".to_owned());
     env.insert(
         "PI_EXTENSION_HOST".to_owned(),
-        workspace_root()?
-            .join("packages/extension-host/dist/pi-extension-host")
-            .to_string_lossy()
-            .into_owned(),
+        extension_host_path()?.to_string_lossy().into_owned(),
     );
     env.insert("PI_VERIFICATION_MODE".to_owned(), "text".to_owned());
     env.insert("PI_VERIFICATION_CHUNK_COUNT".to_owned(), "3".to_owned());
-    env.insert("PI_VERIFICATION_CHUNK_DELAY_MS".to_owned(), "0".to_owned());
+    // Nonzero chunk delay keeps a turn mid-stream for ~450 ms so resize and
+    // back-to-back submit scenarios exercise genuine streaming concurrency.
+    env.insert(
+        "PI_VERIFICATION_CHUNK_DELAY_MS".to_owned(),
+        "150".to_owned(),
+    );
     env.insert(
         "PI_VERIFICATION_FINAL_MARKER".to_owned(),
         FINAL_MARKER.to_owned(),
@@ -496,6 +504,9 @@ fn scenario_tiny_geometry() -> Result<(), AdvError> {
 
     for (cols, rows) in [(1, 1), (19, 4), (80, 1), (2, 24), (80, 24)] {
         run.session_mut()?.resize(cols, rows)?;
+        // Settle per geometry: SIGWINCH notifications coalesce, so without an
+        // intervening read the product may only ever observe the last size.
+        let _ = run.settle_screen(|_| true)?;
     }
     run.settle_ready()?;
     run.prove_editor_focus(scenario, "tinyfocus")?;
@@ -709,6 +720,9 @@ fn scenario_rapid_submit() -> Result<(), AdvError> {
     let _ = &sandbox;
     let scenario = "adversarial-rapid-submit";
 
+    // Back-to-back sends: the ~450 ms stream keeps turn one in flight while
+    // turn two submits, so the second message must queue (steer) rather than
+    // race a fresh prompt — never dropped, never wedged.
     run.send_line("rapid turn one")?;
     run.send_line("rapid turn two")?;
     let snapshot = run.settle_screen(|s| count_lines_containing(s, FINAL_MARKER) >= 2)?;
