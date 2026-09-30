@@ -1484,11 +1484,12 @@ fn adversarial_osc11_oversized_payload_recovers() {
     }
 }
 
-/// String sequences the parser does not recognize — OSC 52 clipboard and
-/// APC (kitty graphics header) — diverge from the OSC 11 reply grammar and
-/// decode as their ordinary-key equivalents: `Alt+]`, literal payload
-/// chars, and `Alt+\\`. This pins the leak shape so a silent swallow or a
-/// wedge would be caught.
+/// OSC 52 (clipboard write) matches the `ESC ] <digits> ;` reply grammar and
+/// is consumed by the reply layer — its payload and BEL terminator can never
+/// decode as keys (a leaked `\x07` once opened the external editor). APC
+/// (kitty graphics header) is outside the reply grammar and still diverges
+/// to ordinary keys. This pins the split so a silent swallow of the wrong
+/// bytes, or a wedge, would be caught.
 #[test]
 fn adversarial_unrecognized_strings_leak_keys() {
     let mut h = Harness::spawn(&["--serve"]);
@@ -1502,11 +1503,11 @@ fn adversarial_unrecognized_strings_leak_keys() {
 
     report.assert_success_contract("unrecognized-strings");
     if BYTE_TRANSPARENT_MASTER {
-        // `Alt+]` and `Alt+_`/`Alt+\\` are Ignored; `BEL` is a control
-        // key. Only the string bodies type text.
+        // The OSC 52 reply is consumed whole. Of the APC bytes, `Alt+_`
+        // and `Alt+\\` are Ignored; only the `X` body types text.
         assert_eq!(
             report.live_text.as_deref(),
-            Some("52;c;QUJDX"),
+            Some("X"),
             "unrecognized-strings: leaked keys diverged; got {:?}; tail={}",
             report.live_text,
             report.tail()

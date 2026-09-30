@@ -11,8 +11,8 @@
 //! internal reader's event queues.
 //!
 //! Everything here is bounded: the reply sink holds at most
-//! `REPLY_QUEUE_CAPACITY` replies (oldest dropped first) and each OSC 11
-//! payload is bounded by [`OSC11_REPLY_PAYLOAD_LIMIT`], so replies nobody
+//! `REPLY_QUEUE_CAPACITY` replies (oldest dropped first) and each OSC
+//! payload is bounded by [`OSC_REPLY_PAYLOAD_LIMIT`], so replies nobody
 //! observes cannot grow memory.
 //!
 //! [`poll_reply`] is the ONE collection path: it drives the same persistent
@@ -37,9 +37,9 @@ use crate::event::timeout::PollTimeout;
 use crate::event::InternalEvent;
 use crate::event::KeyboardEnhancementFlags;
 
-/// Byte limit for one OSC 11 reply payload, shared by every consumer of the
+/// Byte limit for one OSC reply payload, shared by every consumer of the
 /// reply grammar so all sides agree on when a sequence stops being a reply.
-pub const OSC11_REPLY_PAYLOAD_LIMIT: usize = 64;
+pub const OSC_REPLY_PAYLOAD_LIMIT: usize = 64;
 
 /// Maximum queued replies. Beyond this the oldest reply is dropped, keeping
 /// memory bounded when no one drains.
@@ -55,6 +55,11 @@ const REPLY_QUEUE_CAPACITY: usize = 16;
 pub enum TerminalReply {
     /// OSC 11 background-color payload (without OSC/ST framing).
     Osc11(String),
+    /// Any other OSC reply (`ESC ] <digits> ; <content>`) de-framed:
+    /// selector and content joined exactly as received (e.g. `52;c;aGk=`).
+    /// Consumed by the reply layer so its bytes can never replay as keys —
+    /// a BEL terminator becoming Ctrl+G once opened the external editor.
+    Osc(String),
     /// Cell size in pixels: `CSI 4 ; height ; width t` (text-area) or
     /// `CSI 6 ; height ; width t` (cell) reply forms.
     CellSize {
@@ -105,6 +110,11 @@ fn push_reply(reply: TerminalReply) {
 /// Store one completed OSC 11 reply payload.
 pub(crate) fn push_osc_11_reply(payload: String) {
     push_reply(TerminalReply::Osc11(payload));
+}
+
+/// Store one completed non-11 OSC reply's de-framed content.
+pub(crate) fn push_osc_reply(content: String) {
+    push_reply(TerminalReply::Osc(content));
 }
 
 /// Store one completed cell-size reply.
