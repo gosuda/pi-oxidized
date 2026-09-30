@@ -75,6 +75,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::core::agent_session::bash::BashResult;
 use crate::core::agent_session::events::AgentSessionEvent;
 use crate::core::agent_session::extension_runner::ExtensionRunner;
 use crate::core::agent_session::prompt::{PromptOptions, StreamingBehavior};
@@ -614,12 +615,15 @@ pub trait SessionHost: Send + Sync + 'static {
     fn get_config_entries(&self) -> BoxFuture<'_, Result<Vec<super::state::SettingsRow>, String>>;
 
     /// Execute a bash command (the runtime passes the typed command minus the
-    /// `!` / `!!` prefix).
+    /// `!` / `!!` prefix). Process-level failures (non-zero exit, abort)
+    /// still arrive as `Ok` — the `BashResult` carries `exit_code`/`cancelled`
+    /// — so the runtime can render the execution widget; `Err` is reserved
+    /// for session-level failures (e.g. persistence).
     fn execute_bash(
         &self,
         command: &str,
         exclude_from_context: bool,
-    ) -> BoxFuture<'_, Result<(), String>>;
+    ) -> BoxFuture<'_, Result<BashResult, String>>;
 
     /// Start a new session (replacement pipeline). `Ok(Cancelled)` when a
     /// `before_switch` extension hook cancels the replacement.
@@ -1947,6 +1951,11 @@ struct PromptCompletion {
     epoch: u64,
     kind: SessionOperationKind,
     result: Result<(), String>,
+    /// The command plus its `BashResult` when a bash op actually ran; rendered
+    /// as the bash-execution widget on completion. `None` for prompt ops and
+    /// for bash ops that never produced a result (session error, detached
+    /// abort).
+    bash: Option<(String, BashResult)>,
 }
 
 /// Runtime-owned session tasks plus their per-session abort signals.
@@ -3529,8 +3538,17 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             needs_immediate_repaint = true;
         }
         if needs_immediate_repaint {
-            // Input-driven paints BYPASS the coalescer (per master plan D9).
-            self.paint_frame()?;
+            // Input-driven paints BYPASS the coalescer (per master plan D9) —
+            // but only while input isn't backed up. A queued flood (a conhost
+            // Edit→Paste blob arrives as ~100K raw key events) repaints the
+            // full composer once per event, an O(input²) wall-clock livelock.
+            // Backed-up bursts route through the coalescer and collapse to one
+            // paint per window; a lone keystroke still commits on this turn.
+            if self.pending_ui_reinject.is_empty() && self.input.receiver_mut().is_empty() {
+                self.paint_frame()?;
+            } else {
+                self.arm_coalescer();
+            }
         }
         Ok(())
     }
@@ -4814,6 +4832,13 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         });
         if let Ok(result) = tokio::time::timeout(ABORT_SETTLE_BUDGET, self.session.abort()).await {
             self.record_err(result);
+            // A settling abort that produces no further status event
+            // (idle interrupt, bash-op abort) leaves "Aborting…" ticking
+            // forever; clear it when nothing is streaming. An active run
+            // owns the status and refreshes it through its own lifecycle.
+            if !self.view.streaming {
+                self.view.status = None;
+            }
         } else {
             // The run may still be stopping, so AgentEnd/AgentSettled may
             // never arrive to clear the status; drop "Aborting…" here or
@@ -5157,6 +5182,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 epoch,
                 kind: SessionOperationKind::Prompt,
                 result,
+                bash: None,
             }
         });
         self.prompt_operations.aborts.insert(id, abort_tx);
@@ -5180,6 +5206,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
 
         self.prompt_operations.tasks.spawn(async move {
             let op_session = Arc::clone(&session);
+            let command_label = command.clone();
             let mut execution = Box::pin(async move {
                 op_session
                     .execute_bash(&command, exclude_from_context)
@@ -5193,24 +5220,40 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             })
             .await;
             let _ = admitted_tx.send(());
-            let result = if let Some(result) = first_poll {
-                result
+            let (result, bash) = if let Some(result) = first_poll {
+                match result {
+                    Ok(report) => (Ok(()), Some((command_label.clone(), report))),
+                    Err(error) => (Err(error), None),
+                }
             } else {
                 tokio::select! {
-                    result = &mut execution => result,
+                    result = &mut execution => {
+                        match result {
+                            Ok(report) => (Ok(()), Some((command_label.clone(), report))),
+                            Err(error) => (Err(error), None),
+                        }
+                    }
                     _ = &mut abort_rx => {
                         if let Ok(abort_result) =
                             tokio::time::timeout(ABORT_SETTLE_BUDGET, abort).await
                         {
                             let execution_result = execution.await;
-                            execution_result.and(abort_result)
+                            match execution_result {
+                                Ok(report) => {
+                                    (abort_result, Some((command_label, report)))
+                                }
+                                Err(error) => (Err(error), None),
+                            }
                         } else {
                             tokio::spawn(async move {
                                 let _ = execution.await;
                             });
-                            Err(
-                                "abort did not settle; the run may still be stopping"
-                                    .to_owned(),
+                            (
+                                Err(
+                                    "abort did not settle; the run may still be stopping"
+                                        .to_owned(),
+                                ),
+                                None,
                             )
                         }
                     }
@@ -5221,6 +5264,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 epoch,
                 kind: SessionOperationKind::Bash,
                 result,
+                bash,
             }
         });
         self.prompt_operations.aborts.insert(id, abort_tx);
@@ -5243,13 +5287,33 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                     return false;
                 }
                 let refresh_footer = completion.kind == SessionOperationKind::Bash;
+                if let Some((command, report)) = completion.bash {
+                    // The bash message is persisted without an entry_appended
+                    // event (TypeScript parity), so the completion itself must
+                    // project the execution widget or the output never shows.
+                    self.view
+                        .messages
+                        .push(MessageView::Bash(super::messages::BashMessageView {
+                            command,
+                            output: report.output,
+                            expanded: false,
+                            exit_code: report.exit_code,
+                            cancelled: report.cancelled,
+                            truncated: report.truncated,
+                            full_output_path: report.full_output_path,
+                        }));
+                    self.chat_dirty = true;
+                    self.fullscreen_document_dirty = true;
+                }
                 if let Err(error) = &completion.result {
                     // Prompt-path failures (preflight rejects, provider errors)
                     // otherwise vanish silently: the typed text is already out
                     // of the composer and `last_error` has no renderer. Bash
                     // completions carry their own result widget.
-                    let message = error.clone();
-                    self.push_notice("error", format!("prompt failed: {message}"));
+                    if !error.is_empty() {
+                        let message = error.clone();
+                        self.push_notice("error", format!("prompt failed: {message}"));
+                    }
                 }
                 self.record_err(completion.result);
                 refresh_footer
@@ -9331,7 +9395,7 @@ impl SessionHost for AgentSessionHost {
         &self,
         command: &str,
         exclude_from_context: bool,
-    ) -> BoxFuture<'_, Result<(), String>> {
+    ) -> BoxFuture<'_, Result<BashResult, String>> {
         let session = self.read_session();
         let command = command.to_owned();
         Box::pin(async move {
@@ -9339,11 +9403,25 @@ impl SessionHost for AgentSessionHost {
                 exclude_from_context,
                 ..ExecuteBashOptions::default()
             };
-            session
-                .execute_bash(command.as_str(), None::<fn(&str)>, opts)
+            match session
+                .execute_bash(command.as_str(), None::<fn(&str)>, opts.clone())
                 .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            {
+                Ok(result) => Ok(result),
+                // Process-level failure (non-zero exit, abort, timeout): the
+                // result still renders as the bash-execution widget, so record
+                // the attempt like a success and surface it as Ok.
+                Err(crate::core::agent_session::bash::BashExecError::Execution {
+                    result, ..
+                }) => {
+                    session
+                        .record_bash_result(command.as_str(), result.clone(), &opts)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(result)
+                }
+                Err(error) => Err(error.to_string()),
+            }
         })
     }
 
@@ -11028,17 +11106,27 @@ mod tests {
             })
         }
 
-        fn execute_bash(&self, command: &str, exclude: bool) -> BoxFuture<'_, Result<(), String>> {
+        fn execute_bash(
+            &self,
+            command: &str,
+            exclude: bool,
+        ) -> BoxFuture<'_, Result<BashResult, String>> {
             let log = Arc::clone(&self.log);
             let owned = command.to_owned();
             Box::pin(async move {
                 let should_wait = owned == "hang";
-                log.bashes.lock().await.push((owned, exclude));
+                log.bashes.lock().await.push((owned.clone(), exclude));
                 if should_wait {
                     log.bash_started.notify_one();
                     log.bash_release.notified().await;
                 }
-                Ok(())
+                Ok(BashResult {
+                    output: format!("output for {owned}"),
+                    exit_code: Some(0),
+                    cancelled: false,
+                    truncated: false,
+                    full_output_path: None,
+                })
             })
         }
 
@@ -11741,6 +11829,57 @@ mod tests {
         )));
     }
 
+    /// A settled abort on an idle runtime produces no further status event,
+    /// so the "Aborting…" status set up-front must not tick forever.
+    #[tokio::test]
+    async fn dispatch_interrupt_clears_aborting_status_on_settle() {
+        let (mut rt, log) = make_runtime();
+        let _ = rt.dispatch_action(ViewAction::Interrupt).await;
+        assert_eq!(*log.aborts.lock().await, 1);
+        assert!(rt.view.status.is_none());
+    }
+
+    /// A queued input flood (a conhost Edit→Paste blob arrives as ~100K raw
+    /// key events) must not run a full paint per event: backed-up input defers
+    /// to the coalescer while a lone keystroke still commits immediately.
+    #[tokio::test]
+    async fn backed_up_input_defers_paint_to_the_coalescer() -> TestResult {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (mut rt, _log, tx, sink) = try_make_runtime_with_channel()?;
+        // Queue one event so the input channel reports non-empty.
+        tx.send(UiEvent::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        )))
+        .map_err(|e| format!("send failed: {e}"))?;
+        let baseline = sink.snapshot().len();
+
+        rt.step_ui(UiEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .map_err(|e| format!("key step failed: {e}"))?;
+        // The insert lands but no frame commits while input is backed up.
+        assert_eq!(rt.editor.get_text(), "a");
+        assert!(rt.coalesce_deadline.is_some());
+        assert_eq!(sink.snapshot().len(), baseline);
+
+        // Drain the queued event (the run loop pulls it next turn), then the
+        // next keystroke on an empty queue paints on the same turn.
+        let _ = rt.input.receiver_mut().try_recv();
+        rt.step_ui(UiEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .map_err(|e| format!("key step failed: {e}"))?;
+        assert_eq!(rt.editor.get_text(), "ac");
+        assert!(sink.snapshot().len() > baseline);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn dispatch_compact_passes_through() {
         let (mut rt, log) = make_runtime();
@@ -11766,6 +11905,36 @@ mod tests {
             .await;
         let bashes = log.bashes.lock().await.clone();
         assert_eq!(bashes, vec![("ls".to_owned(), true)]);
+    }
+
+    /// Bash results persist without an `entry_appended` event, so the op
+    /// completion itself must project the execution widget — before this,
+    /// `!cmd` output never rendered on a normal exit.
+    #[tokio::test]
+    async fn dispatch_bash_renders_result_widget() -> TestResult {
+        let (mut rt, _log) = make_runtime();
+        let _ = rt
+            .dispatch_action(ViewAction::SubmitBash {
+                command: "echo hi".to_owned(),
+                exclude_from_context: false,
+            })
+            .await;
+        let completion = tokio::time::timeout(
+            Duration::from_secs(1),
+            rt.prompt_operations.tasks.join_next(),
+        )
+        .await
+        .map_err(|_| "bash operation did not finish".to_owned())?
+        .ok_or_else(|| "bash operation task was missing".to_owned())?;
+        assert!(rt.handle_prompt_completion(completion));
+        assert!(rt.view.messages.iter().any(|message| matches!(
+            message,
+            MessageView::Bash(view)
+                if view.command == "echo hi"
+                    && view.output == "output for echo hi"
+                    && view.exit_code == Some(0)
+        )));
+        Ok(())
     }
 
     #[tokio::test]
