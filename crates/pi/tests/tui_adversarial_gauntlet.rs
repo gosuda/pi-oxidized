@@ -1063,9 +1063,7 @@ fn scenario_width_edge() -> Result<(), AdvError> {
     // as separate cells show an "e\u{301}" run, and transports that drop
     // the marks show a plain "eeee" run.
     let _ = run.settle_screen(|s| {
-        screen_has(s, "abe")
-            || screen_has(s, "e\u{301}e\u{301}e\u{301}")
-            || screen_has(s, "eeee")
+        screen_has(s, "abe") || screen_has(s, "e\u{301}e\u{301}e\u{301}") || screen_has(s, "eeee")
     })?;
     run.write_input(KEY_ENTER)?;
     let snapshot = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
