@@ -1814,6 +1814,18 @@ pub struct InteractiveRuntime<W: Write, S: SessionHost> {
     /// while rapid highlight changes coalesce into one update.
     theme_push_pending: bool,
     pending_ui_reinject: Vec<UiEvent>,
+    /// Plain-insert `KeyEvent`s collected into the pending char burst.
+    /// They materialize via one `insert_text_run` per flush — on the first
+    /// non-char event or the next coalesced paint — so a sustained input
+    /// flood (conhost paste) costs O(1) per event instead of the
+    /// O(buffer) dispatch tail.
+    pending_char_burst: Vec<KeyEvent>,
+    /// Whether the previously handled event inserted a plain char — a
+    /// dispatched head or a burst append. While true a following plain
+    /// char joins `pending_char_burst` without dispatching; while false
+    /// it takes the full path so jump targets, bindings, and autocomplete
+    /// keys all apply.
+    char_insert_streak: bool,
     extension_runner: Option<Arc<ExtensionRuntimeSet>>,
     extension_events: Option<tokio::sync::broadcast::Receiver<ExtensionUiEvent>>,
     extension_requests: Option<mpsc::Receiver<HostUiRequest>>,
@@ -2446,6 +2458,8 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             true_color: options.caps.true_color,
             theme_generation: 0,
             pending_ui_reinject: options.pending_ui_events.iter().rev().cloned().collect(),
+            pending_char_burst: Vec::new(),
+            char_insert_streak: false,
             extension_runner,
             extension_events,
             extension_requests,
@@ -2868,6 +2882,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
                 () = tokio::time::sleep(coalesce_wait) => {
                     if self.coalesce_deadline.is_some() {
                         self.coalesce_deadline = None;
+                        self.flush_char_burst();
                         if let Err(err) = self.paint_frame() {
                             self.fail_io(&err);
                         }
@@ -3353,27 +3368,71 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         if self.handle_fullscreen_event(&event).await? {
             return Ok(());
         }
-        // Collapse a backed-up run of plain printable key events into one
-        // tail batch. conhost has no bracketed paste, so Edit→Paste
-        // arrives as ~100K raw INPUT_RECORDs and per-char insertion clones
-        // the line and whole buffer several times per event — an O(n²)
-        // livelock on a giant single-line flood. The head event still
-        // takes the full dispatch below; the queued tail inserts as a
-        // single mutation afterwards.
-        let mut char_tail: Vec<char> = Vec::new();
-        let mut preserved: Vec<UiEvent> = Vec::new();
-        if self.view.focus == FocusArea::Editor
-            && let UiEvent::Key(key) = &event
-            && is_plain_insert_key(key)
-        {
-            // Stop at the first non-char event: chars queued behind it must
-            // not jump ahead of it.
+        // Collapse backed-up runs of plain printable key events into the
+        // pending char burst. conhost has no bracketed paste, so
+        // Edit→Paste arrives as ~100K raw INPUT_RECORDs and the per-event
+        // dispatch tail clones the buffer several times per event — an
+        // O(n²) livelock on a giant single-line flood. Burst members
+        // append without dispatching and materialize in one
+        // `insert_text_run` on flush, keeping the per-event cost O(1)
+        // even when the feed arrives slower than we can drain (conhost
+        // injects ~1–3K events/s, so the channel never backs up far
+        // enough for a per-call batch to collapse it). Batching stays
+        // off while an extension registers terminal-input handlers —
+        // the queued tail must keep flowing through intercept/rewrite
+        // one event at a time.
+        let burst_guard = self.view.focus == FocusArea::Editor
+            && self.active_selector.is_none()
+            && self
+                .extension_runner
+                .as_ref()
+                .is_none_or(|runner| !runner.has_terminal_input_handlers());
+        let head_char = if burst_guard {
+            match &event {
+                UiEvent::Key(key) if is_plain_insert_key(key) => match key.code {
+                    KeyCode::Char(c) => Some(c),
+                    _ => None,
+                },
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if head_char.is_some() && self.char_insert_streak {
+            // Burst member: skip the whole dispatch tail.
+            if let UiEvent::Key(key) = event {
+                self.pending_char_burst.push(key);
+            }
+            // Stop at the first non-char event: chars queued behind it
+            // must not jump ahead of it.
             while let Ok(next) = self.input.receiver_mut().try_recv() {
                 match next {
                     UiEvent::Key(next_key) if is_plain_insert_key(&next_key) => {
-                        if let KeyCode::Char(c) = next_key.code {
-                            char_tail.push(c);
-                        }
+                        self.pending_char_burst.push(next_key);
+                    }
+                    other => {
+                        self.pending_ui_reinject.push(other);
+                        break;
+                    }
+                }
+            }
+            self.arm_coalescer();
+            return Ok(());
+        }
+        // A non-member materializes the pending run first so the burst
+        // inserts before anything this event does (a submit must carry
+        // the pasted text).
+        self.flush_char_burst();
+        let mut char_tail: Vec<KeyEvent> = Vec::new();
+        let mut preserved: Vec<UiEvent> = Vec::new();
+        if let UiEvent::Key(key) = &event
+            && head_char.is_some()
+            && is_plain_insert_key(key)
+        {
+            while let Ok(next) = self.input.receiver_mut().try_recv() {
+                match next {
+                    UiEvent::Key(next_key) if is_plain_insert_key(&next_key) => {
+                        char_tail.push(next_key);
                     }
                     other => {
                         preserved.push(other);
@@ -3386,7 +3445,7 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         for preserved_event in preserved.into_iter().rev() {
             self.pending_ui_reinject.push(preserved_event);
         }
-        let text_len_before = if char_tail.is_empty() {
+        let text_len_before = if head_char.is_none() {
             0
         } else {
             self.editor.get_text().len()
@@ -3407,25 +3466,21 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         // returns the tail to the queue so each char takes the normal
         // path on a later turn.
         if !char_tail.is_empty() {
-            let head_len = match &event {
-                UiEvent::Key(KeyEvent {
-                    code: KeyCode::Char(c),
-                    ..
-                }) => c.len_utf8(),
-                _ => 0,
-            };
             if self.view.focus == FocusArea::Editor
                 && self.active_selector.is_none()
-                && self.editor.get_text().len() == text_len_before + head_len
+                && self.editor.get_text().len()
+                    == text_len_before + head_char.map_or(0, char::len_utf8)
             {
-                let tail: String = char_tail.into_iter().collect();
-                self.editor.insert_text_run(&tail);
+                // Queue the tail into the pending burst: it materializes
+                // in one `insert_text_run` on the next flush, and later
+                // plain chars append as burst members.
+                self.pending_char_burst.extend(char_tail);
+                self.arm_coalescer();
             } else {
-                for c in char_tail.into_iter().rev() {
-                    self.pending_ui_reinject.push(UiEvent::Key(KeyEvent::new(
-                        KeyCode::Char(c),
-                        KeyModifiers::NONE,
-                    )));
+                // Requeue the original events unchanged so modifiers and
+                // kind survive the fallback path.
+                for key in char_tail.into_iter().rev() {
+                    self.pending_ui_reinject.push(UiEvent::Key(key));
                 }
             }
         }
@@ -3439,6 +3494,11 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         self.view.editor.text.clone_from(&live_text);
         let (_line, col) = self.editor.get_cursor();
         self.view.editor.cursor = col;
+        // The streak continues only while plain chars actually insert: a
+        // head consumed by a binding (jump target, autocomplete accept,
+        // a rebind) ends it so the next char dispatches fully again.
+        self.char_insert_streak = head_char.is_some()
+            && live_text.len() == text_len_before + head_char.map_or(0, char::len_utf8);
 
         // Drain editor on_submit notifications first (plain Enter).
         let mut actions: Vec<ViewAction> = Vec::new();
@@ -3626,7 +3686,12 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
             // full composer once per event, an O(input²) wall-clock livelock.
             // Backed-up bursts route through the coalescer and collapse to one
             // paint per window; a lone keystroke still commits on this turn.
-            if self.pending_ui_reinject.is_empty() && self.input.receiver_mut().is_empty() {
+            // A pending char burst counts as backed up too — its chars
+            // materialize on the flush that precedes the coalesced paint.
+            if self.pending_ui_reinject.is_empty()
+                && self.pending_char_burst.is_empty()
+                && self.input.receiver_mut().is_empty()
+            {
                 self.paint_frame()?;
             } else {
                 self.arm_coalescer();
@@ -7621,6 +7686,46 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
     fn arm_coalescer(&mut self) {
         if self.coalesce_deadline.is_none() {
             self.coalesce_deadline = Some(Instant::now() + BACKGROUND_COALESCE_WINDOW);
+        }
+    }
+
+    /// Materialize queued plain-insert chars into the editor — one
+    /// `insert_text_run` for the whole run — or, when the context that
+    /// allowed batching is gone, requeue the original events unchanged
+    /// so each takes the normal path. Ends the insert streak either
+    /// way: the next plain char dispatches fresh.
+    fn flush_char_burst(&mut self) {
+        self.char_insert_streak = false;
+        if self.pending_char_burst.is_empty() {
+            return;
+        }
+        let events = std::mem::take(&mut self.pending_char_burst);
+        if self.view.focus == FocusArea::Editor
+            && self.active_selector.is_none()
+            && self
+                .extension_runner
+                .as_ref()
+                .is_none_or(|runner| !runner.has_terminal_input_handlers())
+        {
+            let text: String = events
+                .iter()
+                .filter_map(|key| match key.code {
+                    KeyCode::Char(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            self.editor.insert_text_run(&text);
+            // Keep the view mirror coherent for the next dispatch and
+            // paint — a flush can run on the coalescer tick, outside
+            // `handle_ui_event`'s own refresh tail.
+            let live_text = self.editor.get_text();
+            self.view.editor.text.clone_from(&live_text);
+            let (_line, col) = self.editor.get_cursor();
+            self.view.editor.cursor = col;
+        } else {
+            for key in events.into_iter().rev() {
+                self.pending_ui_reinject.push(UiEvent::Key(key));
+            }
         }
     }
 
@@ -11925,9 +12030,9 @@ mod tests {
     }
 
     /// A queued flood of plain key events (a conhost Edit→Paste blob arrives
-    /// as ~100K raw `INPUT_RECORD`s) must insert as one batched mutation — the
-    /// head char dispatches normally, the queued tail collapses into a single
-    /// `insert_text_run`, and the frame commits once for the whole batch.
+    /// as ~100K raw `INPUT_RECORD`s) collapses into the pending burst: the
+    /// head char dispatches normally, the queued tail waits for the flush,
+    /// and the frame commits once for the whole batch.
     #[tokio::test]
     async fn backed_up_chars_insert_as_one_batch() -> TestResult {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -11948,10 +12053,66 @@ mod tests {
         )))
         .await
         .map_err(|e| format!("key step failed: {e}"))?;
-        // The whole queued run landed in one pass; the channel is drained so
-        // the batch paints immediately rather than deferring.
+        // Only the head inserted immediately; the tail is queued in the
+        // pending burst with a coalesced flush armed.
+        assert_eq!(rt.editor.get_text(), "a");
+        assert_eq!(rt.pending_char_burst.len(), 3);
+        assert!(rt.coalesce_deadline.is_some());
+        assert_eq!(sink.snapshot().len(), baseline);
+
+        // The flush materializes the whole run in one mutation.
+        rt.flush_char_burst();
         assert_eq!(rt.editor.get_text(), "abcd");
-        assert!(sink.snapshot().len() > baseline);
+        assert!(rt.pending_char_burst.is_empty());
+        Ok(())
+    }
+
+    /// Burst members keep arriving slower than one drain pass (conhost
+    /// feeds ~1-3K events/s while the channel never backs up), so a flood
+    /// must stay collapsed across calls: each plain char appends O(1)
+    /// instead of paying the O(buffer) dispatch tail, and the first
+    /// non-char event flushes the whole run before dispatching.
+    #[tokio::test]
+    async fn insert_streak_members_burst_without_dispatch() -> TestResult {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (mut rt, _log, _tx, sink) = try_make_runtime_with_channel()?;
+        // Head 'a' inserts through the full path and opens the streak.
+        rt.step_ui(UiEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .map_err(|e| format!("key step failed: {e}"))?;
+        assert_eq!(rt.editor.get_text(), "a");
+        assert!(rt.char_insert_streak);
+
+        // 'b' and 'c' arrive one call apart — each appends to the pending
+        // burst without touching the editor or painting.
+        let baseline = sink.snapshot().len();
+        for c in ['b', 'c'] {
+            rt.step_ui(UiEvent::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .map_err(|e| format!("key step failed: {e}"))?;
+            assert_eq!(rt.editor.get_text(), "a");
+        }
+        assert_eq!(rt.pending_char_burst.len(), 2);
+        assert_eq!(sink.snapshot().len(), baseline);
+
+        // The first non-char event flushes the run, then dispatches: Left
+        // moves the cursor back over 'c'.
+        rt.step_ui(UiEvent::Key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .map_err(|e| format!("left step failed: {e}"))?;
+        assert_eq!(rt.editor.get_text(), "abc");
+        assert!(rt.pending_char_burst.is_empty());
+        assert!(!rt.char_insert_streak);
         Ok(())
     }
 
@@ -11980,15 +12141,18 @@ mod tests {
         )))
         .await
         .map_err(|e| format!("key step failed: {e}"))?;
-        // 'ab' landed; Left reinjected (the batch stops at the first
-        // non-char) and 'c' is still queued, so the frame defers.
-        assert_eq!(rt.editor.get_text(), "ab");
+        // 'a' landed; 'b' is queued in the pending burst; Left reinjected
+        // (the batch stops at the first non-char) and 'c' is still queued,
+        // so the frame defers.
+        assert_eq!(rt.editor.get_text(), "a");
+        assert_eq!(rt.pending_char_burst.len(), 1);
         assert_eq!(rt.pending_ui_reinject.len(), 1);
         assert!(rt.coalesce_deadline.is_some());
         assert_eq!(sink.snapshot().len(), baseline);
 
-        // The reinjected Left replays first and moves the cursor back one
-        // column; 'c' then processes from the channel and lands before 'b'.
+        // The reinjected Left flushes 'b' first, then moves the cursor
+        // back one column; 'c' then processes from the channel and lands
+        // before 'b'.
         let left = rt
             .pending_ui_reinject
             .pop()
@@ -11996,6 +12160,7 @@ mod tests {
         rt.step_ui(left)
             .await
             .map_err(|e| format!("left step failed: {e}"))?;
+        assert_eq!(rt.editor.get_text(), "ab");
         let c = rt
             .input
             .receiver_mut()

@@ -1058,9 +1058,15 @@ fn scenario_width_edge() -> Result<(), AdvError> {
     for byte in edge.bytes() {
         run.write_input(&[byte])?;
     }
-    // The emulator keeps U+0301 inside the cell text ("ééé"), so the
-    // contiguous marker for a landed combining tail is "abe", not "eeee".
-    let _ = run.settle_screen(|s| screen_has(s, "abe"))?;
+    // The landed combining tail renders one of three ways depending on the
+    // cell path: marks absorbed into the base cells show "abe", marks kept
+    // as separate cells show an "e\u{301}" run, and transports that drop
+    // the marks show a plain "eeee" run.
+    let _ = run.settle_screen(|s| {
+        screen_has(s, "abe")
+            || screen_has(s, "e\u{301}e\u{301}e\u{301}")
+            || screen_has(s, "eeee")
+    })?;
     run.write_input(KEY_ENTER)?;
     let snapshot = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
     if !screen_has(&snapshot, FINAL_MARKER) {

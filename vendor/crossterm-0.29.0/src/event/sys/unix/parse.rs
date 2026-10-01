@@ -762,9 +762,10 @@ pub(crate) fn parse_csi_normal_mouse(buffer: &[u8]) -> io::Result<Option<Interna
 
     // See http://www.xfree86.org/current/ctlseqs.html#Mouse%20Tracking
     // The upper left character position on the terminal is denoted as 1,1.
-    // Subtract 1 to keep it synced with cursor
-    let cx = u16::from(buffer[4].saturating_sub(32)) - 1;
-    let cy = u16::from(buffer[5].saturating_sub(32)) - 1;
+    // Subtract 1 to keep it synced with cursor; saturate: a report byte of
+    // 0x20 (coordinate 0) must clamp, not underflow-panic on a hostile byte.
+    let cx = u16::from(buffer[4].saturating_sub(32)).saturating_sub(1);
+    let cy = u16::from(buffer[5].saturating_sub(32)).saturating_sub(1);
 
     Ok(Some(InternalEvent::Event(Event::Mouse(MouseEvent {
         kind,
@@ -792,9 +793,10 @@ pub(crate) fn parse_csi_sgr_mouse(buffer: &[u8]) -> io::Result<Option<InternalEv
 
     // See http://www.xfree86.org/current/ctlseqs.html#Mouse%20Tracking
     // The upper left character position on the terminal is denoted as 1,1.
-    // Subtract 1 to keep it synced with cursor
-    let cx = next_parsed::<u16>(&mut split)? - 1;
-    let cy = next_parsed::<u16>(&mut split)? - 1;
+    // Subtract 1 to keep it synced with cursor; saturate: coordinate 0 is
+    // protocol-invalid but must clamp, not underflow-panic on hostile input.
+    let cx = next_parsed::<u16>(&mut split)?.saturating_sub(1);
+    let cy = next_parsed::<u16>(&mut split)?.saturating_sub(1);
 
     // When button 3 in Cb is used to represent mouse release, you can't tell which button was
     // released. SGR mode solves this by having the sequence end with a lowercase m if it's a
