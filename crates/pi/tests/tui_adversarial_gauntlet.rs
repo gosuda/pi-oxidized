@@ -2110,6 +2110,12 @@ fn scenario_abort_recall() -> Result<(), AdvError> {
 
     run.send_line("abortable anchor")?;
     run.write_input(KEY_ESCAPE)?; // lands inside the ~450 ms stream window
+    // The abort must actually have fired: a cancelled turn renders
+    // `stream cancelled` in the transcript, so this wait fails if Esc
+    // missed the stream window and the turn ran to completion instead.
+    let _ = run
+        .settle_screen(|s| screen_has(s, "stream cancelled"))
+        .map_err(|e| AdvError::Assert(format!("abort-fired: {e}")))?;
     run.settle_ready()?;
     run.write_input(KEY_UP)?;
     let _ = run
@@ -2226,8 +2232,9 @@ fn scenario_slash_torture() -> Result<(), AdvError> {
     // selector's own open signal.
     let _ =
         run.settle_screen(|s| screen_has(s, "esc to cancel") || screen_has(s, "Nova 2 Lite"))?;
-    // The argument becomes the selector's filter, where the first Esc only
-    // clears the filter text; keep dismissing until the footer is gone.
+    // The model selector is navigation-only (arguments do not filter, and a
+    // single Esc closes it); keep dismissing until the footer is gone in
+    // case a selector variant keeps extra layers open.
     for _ in 0..4 {
         run.write_input(KEY_ESCAPE)?;
         let snapshot = run.settle_screen(|_| true)?;
