@@ -1698,8 +1698,10 @@ impl Editor {
         if kb.matches(event, "tui.input.tab") {
             // A refresh for newer text may still be in flight; splicing an
             // item computed for older text would corrupt the composer.
+            // Drop the menu and request completions for the text as typed.
             if self.autocomplete_items_stale() {
                 self.cancel_autocomplete();
+                self.handle_tab_completion();
             } else if self.apply_selected_completion() {
                 self.cancel_autocomplete();
             }
