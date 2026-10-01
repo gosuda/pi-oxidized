@@ -367,6 +367,25 @@ impl ProductRun {
             .map_err(AdvError::from)
     }
 
+    /// Settle until `expected` occurrences of [`FINAL_MARKER`] have arrived in
+    /// one pending output batch: rendered-screen marker counts can satisfy
+    /// early while a queued turn is still streaming, and old markers scroll
+    /// off the viewport.
+    fn settle_final_outputs(&mut self, expected: usize) -> Result<TerminalSnapshot, AdvError> {
+        let marker = FINAL_MARKER.as_bytes();
+        let policy = self.policy;
+        self.session_mut()?
+            .read_settled_frame(&policy, |bytes| {
+                bytes
+                    .windows(marker.len())
+                    .filter(|window| *window == marker)
+                    .count()
+                    >= expected
+            })
+            .map(|frame| frame.snapshot)
+            .map_err(AdvError::from)
+    }
+
     /// Type `text` one byte per write and settle until it shows on screen.
     fn type_slowly(&mut self, text: &str) -> Result<(), AdvError> {
         for byte in text.bytes() {
@@ -2056,8 +2075,10 @@ fn scenario_steer_drain_order() -> Result<(), AdvError> {
     for tag in ["q-aaa", "q-bbb", "q-ccc"] {
         run.send_line(tag)?;
     }
+    // Wait for all four turns' markers on the raw output boundary — rendered
+    // screen counts can satisfy while the last queued turn still streams.
     let snapshot = run
-        .settle_screen(|s| count_lines_containing(s, FINAL_MARKER) >= 3)
+        .settle_final_outputs(4)
         .map_err(|e| AdvError::Assert(format!("drain: {e}")))?;
     // The oldest turn echoes can scroll off the snapshot; only the echoes
     // still on screen need checking, and they must appear in submit order.
@@ -2065,7 +2086,10 @@ fn scenario_steer_drain_order() -> Result<(), AdvError> {
         .iter()
         .filter_map(|tag| snapshot.lines.iter().position(|line| line.contains(tag)))
         .collect();
-    if positions.len() < 2 || positions.windows(2).any(|w| w[0] >= w[1]) {
+    if positions.len() < 2
+        || !screen_has(&snapshot, "q-ccc")
+        || positions.windows(2).any(|w| w[0] >= w[1])
+    {
         return Err(AdvError::Assert(format!(
             "{scenario}: queued turns echoed missing/out of order {positions:?}; screen:\n{}",
             snapshot.lines.join("\n")
@@ -2189,10 +2213,12 @@ fn scenario_slash_torture() -> Result<(), AdvError> {
     let _ = &sandbox;
     let scenario = "adversarial-slash-torture";
 
+    // Unknown and bare slashes route through as prompt turns — each must
+    // produce a fresh marker, not just match the boot-ready screen.
     run.send_line("/definitelynotacommand")?;
-    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER) || ready_screen(s))?;
+    let _ = run.settle_final_output()?;
     run.send_line("/")?;
-    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER) || ready_screen(s))?;
+    let _ = run.settle_final_output()?;
     run.send_line("/model zzz-no-such-model")?;
     // The previous turn's marker is still on screen, so a marker predicate
     // would pass while the selector is still opening — and the Esc below
