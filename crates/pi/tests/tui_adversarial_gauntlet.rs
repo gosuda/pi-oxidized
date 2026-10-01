@@ -2249,6 +2249,37 @@ fn scenario_slash_torture() -> Result<(), AdvError> {
     run.close_assert(scenario)
 }
 
+/// A completion menu must never splice items computed for older text: open
+/// the `/` menu, then type `model` and Enter in one burst so Enter lands
+/// while the refresh request is still in flight. The literal `/model` must
+/// run — the model selector opens — never a stale-apply splice like
+/// `/modesettings` (the regression this guards).
+fn scenario_autocomplete_stale_apply() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-autocomplete-stale-apply";
+
+    run.write_input(b"/")?;
+    // Wait for the slash menu itself before racing the refresh request.
+    let _ = run
+        .settle_screen(|s| screen_has(s, "settings"))
+        .map_err(|e| AdvError::Assert(format!("slash-menu-open: {e}")))?;
+    run.write_input(b"model\r")?;
+    let _ = run
+        .settle_screen(|s| screen_has(s, "esc to cancel") || screen_has(s, "Nova 2 Lite"))
+        .map_err(|e| AdvError::Assert(format!("literal-submit: {e}")))?;
+    for _ in 0..4 {
+        run.write_input(KEY_ESCAPE)?;
+        let snapshot = run.settle_screen(|_| true)?;
+        if !screen_has(&snapshot, "esc to cancel") {
+            break;
+        }
+    }
+    run.prove_editor_focus(scenario, "acok")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
@@ -2323,6 +2354,10 @@ fn tui_adversarial_gauntlet_hostile_inputs_geometry_and_dialog_storms() {
         ("utf8-boundary-paste", scenario_utf8_boundary_paste),
         ("resize-mid-history", scenario_resize_mid_history),
         ("slash-torture", scenario_slash_torture),
+        (
+            "autocomplete-stale-apply",
+            scenario_autocomplete_stale_apply,
+        ),
     ];
     let mut verdicts = Vec::new();
     let mut first_failure: Option<String> = None;

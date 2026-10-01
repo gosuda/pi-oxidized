@@ -187,6 +187,9 @@ pub struct Editor {
     autocomplete_prefix: String,
     autocomplete_items: Vec<AutocompleteItem>,
     autocomplete_selected: usize,
+    /// Buffer/cursor snapshot the displayed `autocomplete_items` were
+    /// computed for; a diverging composer means the menu is stale.
+    autocomplete_items_snapshot: Option<(String, usize, usize)>,
     autocomplete_max_visible: usize,
     autocomplete_start_token: u64,
     autocomplete_request_id: u64,
@@ -246,6 +249,7 @@ impl Editor {
             autocomplete_prefix: String::new(),
             autocomplete_items: Vec::new(),
             autocomplete_selected: 0,
+            autocomplete_items_snapshot: None,
             autocomplete_max_visible: max_visible,
             autocomplete_start_token: 0,
             autocomplete_request_id: 0,
@@ -914,10 +918,27 @@ impl Editor {
     ) {
         self.autocomplete_prefix.clone_from(&suggestions.prefix);
         self.autocomplete_items = suggestions.items;
+        // `complete_autocomplete_request` only calls here when the composer
+        // still matches the request snapshot, so the current buffer is what
+        // these items were computed for.
+        self.autocomplete_items_snapshot = Some((
+            self.get_text(),
+            self.state.cursor_line,
+            self.state.cursor_col,
+        ));
         let best =
             best_autocomplete_match_index(&self.autocomplete_items, &self.autocomplete_prefix);
         self.autocomplete_selected = if best >= 0 { best.cast_unsigned() } else { 0 };
         self.autocomplete_state = Some(state);
+    }
+
+    /// True when the composer has diverged from the buffer the displayed
+    /// items were computed for — applying one would splice stale text.
+    fn autocomplete_items_stale(&self) -> bool {
+        let Some((text, line, col)) = &self.autocomplete_items_snapshot else {
+            return true;
+        };
+        self.get_text() != *text || self.state.cursor_line != *line || self.state.cursor_col != *col
     }
 
     fn cancel_autocomplete_request(&mut self) {
@@ -930,6 +951,7 @@ impl Editor {
         self.cancel_autocomplete_request();
         self.autocomplete_state = None;
         self.autocomplete_items.clear();
+        self.autocomplete_items_snapshot = None;
         self.autocomplete_prefix.clear();
         self.autocomplete_selected = 0;
     }
@@ -1674,12 +1696,24 @@ impl Editor {
             return Some(EventResult::Render);
         }
         if kb.matches(event, "tui.input.tab") {
-            if self.apply_selected_completion() {
+            // A refresh for newer text may still be in flight; splicing an
+            // item computed for older text would corrupt the composer.
+            if self.autocomplete_items_stale() {
+                self.cancel_autocomplete();
+            } else if self.apply_selected_completion() {
                 self.cancel_autocomplete();
             }
             return Some(EventResult::Render);
         }
         if kb.matches(event, "tui.select.confirm") {
+            if self.autocomplete_items_stale() {
+                // Same staleness refusal, but confirm means "submit": drop
+                // the menu and fall through so the literal composer text is
+                // submitted — e.g. fast `/model`+Enter must not splice a
+                // stale item into `/modesettings`.
+                self.cancel_autocomplete();
+                return None;
+            }
             let slash = self.autocomplete_prefix.starts_with('/');
             if self.apply_selected_completion() {
                 self.cancel_autocomplete();
@@ -2936,6 +2970,39 @@ mod tests {
         );
         assert_ne!(editor.get_cursor(), before);
         Ok(())
+    }
+
+    /// A confirm while the refresh for newer text is still in flight must
+    /// submit the literal composer text, never splice a stale item into it
+    /// (the `/model`+Enter → `/modesettings` defect).
+    #[test]
+    fn stale_autocomplete_confirm_submits_literal_text() {
+        let submitted = Arc::new(Mutex::new(None));
+        let submitted2 = submitted.clone();
+        let mut ed = Editor::with_defaults();
+        ed.on_submit = Some(Box::new(move |t| {
+            *submitted2
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(t);
+        }));
+        open_test_autocomplete(&mut ed);
+        assert!(ed.autocomplete_state.is_some());
+
+        for ch in "/model".chars() {
+            ed.handle_event(&UiEvent::Key(press(KeyCode::Char(ch))));
+        }
+        assert_eq!(ed.get_text(), "/model");
+        assert!(ed.autocomplete_state.is_some());
+        assert!(ed.autocomplete_items_stale());
+
+        ed.handle_event(&UiEvent::Key(press(KeyCode::Enter)));
+        assert_eq!(
+            *submitted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some("/model".to_owned())
+        );
+        assert!(ed.autocomplete_state.is_none());
     }
 
     #[test]
