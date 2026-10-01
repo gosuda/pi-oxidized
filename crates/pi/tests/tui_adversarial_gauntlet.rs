@@ -24,6 +24,21 @@
 //! from an open paste mid-stream, a selector opened mid-stream, and a
 //! sustained interleaved-everything pressure loop.
 //!
+//! A fourth wave pushes terminal-protocol edges: command injection (OSC,
+//! DECRQSS, sync-output sequences as input), pre-boot/post-quit byte races,
+//! u16 geometry boundaries, pathological grapheme clusters, wide-char wrap
+//! sweeps, X10 mouse frames, prompt-history recall pressure, replies spliced
+//! mid-word, unclosed pastes, C0 byte bombs, alt+alpha floods, max-line
+//! composers, and a deterministically shuffled interleave.
+//!
+//! A fifth wave pushes past the protocol edge into product semantics: DEC
+//! state commands and graphics protocols (sixel, kitty, iTerm2) as input,
+//! hostile escapes inside bracketed paste, kitty/modifyOtherKeys key-event
+//! soups, multi-line and mixed-kind history recall, steer-queue drain
+//! ordering, abort-then-recall chains, invisible format characters, UTF-8
+//! splits across paste boundaries, history browsing under resize storms,
+//! and slash-command edge cases.
+//!
 //! Assertions are liveness/correctness only (no canonical digests): each
 //! scenario must keep the composer responsive, converge the screen to a
 //! sane state, and exit 0. Every settle is predicate-then-quiescence —
@@ -1834,6 +1849,373 @@ fn scenario_interleaved_bits() -> Result<(), AdvError> {
     run.close_assert(scenario)
 }
 
+/// DEC/private control functions arriving as INPUT bytes: save/restore
+/// cursor, scroll regions, insert/delete line+char, origin/autowrap modes,
+/// DECALN, and a full RIS reset. These are escape candidates in the input
+/// parser — the app must consume them as input events without letting them
+/// reach the real terminal or wedge the composer. `ESC[2M` also collides
+/// with X10 mouse framing, so the follow-up text is written only after all
+/// sequences are on the wire.
+fn scenario_dec_state_injection() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-dec-state-injection";
+
+    for seq in [
+        b"\x1b7".as_slice(),      // DECSC — save cursor
+        b"\x1b8".as_slice(),      // DECRC — restore cursor
+        b"\x1b[1;10r".as_slice(), // DECSTBM — scroll region
+        b"\x1b[L".as_slice(),     // IL — insert line
+        b"\x1b[2M".as_slice(),    // DL — delete lines (X10 mouse shape)
+        b"\x1b[@".as_slice(),     // ICH — insert char
+        b"\x1b[3P".as_slice(),    // DCH — delete chars
+        b"\x1b[?6h".as_slice(),   // DECOM — origin mode
+        b"\x1b[?7h".as_slice(),   // DECAWM — autowrap on
+        b"\x1b[?7l".as_slice(),   // DECAWM — autowrap off
+        b"\x1b#8".as_slice(),     // DECALN — screen alignment pattern
+        b"\x1bc".as_slice(),      // RIS — full reset
+    ] {
+        run.write_input(seq)?;
+    }
+    run.write_input(b"dec tail")?;
+    let _ = run.settle_screen(|_| true)?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.prove_editor_focus(scenario, "decok")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Graphics-content protocols arriving as INPUT bytes: sixel DCS, a DECRQSS
+/// reply, kitty `ESC_G` graphics, an iTerm2 inline image, and an APC string.
+/// Unparsed sequences diverge to key input per the terminal contract — the
+/// composer stays live and a submit still streams.
+fn scenario_graphics_injection() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-graphics-injection";
+
+    for seq in [
+        b"\x1bPq#0;2;0;0;0~~\x1b\\".as_slice(),          // DCS sixel
+        b"\x1bP$q\"s\x1b\\".as_slice(),                  // DECRQSS
+        b"\x1b_Ga=T,f=32,s=2,v=2;QUJD\x1b\\".as_slice(), // kitty graphics
+        b"\x1b]1337;File=inline=1:QUJD\x07".as_slice(),  // iTerm2 image
+        b"\x1b_Gnotagraphicspayload\x1b\\".as_slice(),   // APC-shaped
+    ] {
+        run.write_input(seq)?;
+    }
+    run.write_input(b"gfx tail")?;
+    let _ = run.settle_screen(|_| true)?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.prove_editor_focus(scenario, "gfxok")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// A bracketed paste whose payload is hostile escape soup: cursor keys,
+/// synchronised-output mode, an OSC 52 clipboard write, and a scroll-region
+/// set. Bytes inside `ESC[200~`/`ESC[201~` are literal paste content — none
+/// of it may act as key input — and the paste submits as one turn.
+fn scenario_paste_escape_soup() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-paste-escape-soup";
+
+    let mut paste = b"\x1b[200~soup".to_vec();
+    paste.extend_from_slice(b" \x1b[A \x1b[?2026h \x1b]52;c;QUJD\x07 \x1b[1;5r end");
+    paste.extend_from_slice(b"\x1b[201~");
+    run.write_input(&paste)?;
+    let _ = run.settle_screen(|s| screen_has(s, "soup"))?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.prove_editor_focus(scenario, "soupok")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Extended key-protocol events spliced into a typed word: kitty `CSI u`
+/// press/release forms (including a release event type and a modified Enter),
+/// a modifyOtherKeys `CSI 27;...~` form, and a DECRQM reply. Whatever the
+/// parser maps or drops, the composer must stay coherent and submit.
+fn scenario_key_protocol_soup() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-key-protocol-soup";
+
+    run.write_input(b"proto")?;
+    for seq in [
+        b"\x1b[117u".as_slice(),      // kitty 'u' key
+        b"\x1b[117;1:3u".as_slice(),  // kitty 'u' release event
+        b"\x1b[97;5u".as_slice(),     // kitty ctrl+'a'
+        b"\x1b[27;5;117~".as_slice(), // modifyOtherKeys ctrl+u
+        b"\x1b[?2027;3$y".as_slice(), // DECRQM report
+        b"\x1b[4;2t".as_slice(),      // window-op report
+    ] {
+        run.write_input(seq)?;
+    }
+    run.write_input(b"col")?;
+    let _ = run.settle_screen(|_| true)?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.prove_editor_focus(scenario, "keyok")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// A multi-line prompt (Ctrl+J newline inside one submission) is stored as a
+/// single history entry: Up must recall the whole entry onto the composer and
+/// re-running it must stream a fresh turn.
+fn scenario_history_multiline() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-history-multiline";
+
+    run.write_input(b"multi anchor one")?;
+    run.write_input(b"\x0a")?; // ctrl+j — newline inside the entry
+    run.write_input(b"multi anchor two")?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_final_output()?;
+
+    run.write_input(KEY_UP)?;
+    let _ = run
+        .settle_screen(|s| {
+            s.lines
+                .iter()
+                .any(|line| line.contains(PROMPT_GLYPH) && line.contains("multi anchor one"))
+        })
+        .map_err(|e| AdvError::Assert(format!("multiline-recall: {e}")))?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_final_output()?;
+    run.settle_ready()?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Mixed submission kinds land in one ordered history: plain prompts and a
+/// slash command. The Up walk must replay them newest→oldest, clamp at the
+/// oldest entry, and Down must walk back toward the live draft.
+fn scenario_history_mixed() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-history-mixed";
+
+    run.send_line("mixed alpha")?;
+    let _ = run.settle_final_output()?;
+    run.send_line("/model")?;
+    let _ = run.settle_screen(|s| screen_has(s, "Nova 2 Lite"))?;
+    run.write_input(KEY_ESCAPE)?;
+    run.settle_ready()?;
+    run.send_line("mixed omega")?;
+    let _ = run.settle_final_output()?;
+
+    // History order is newest-first: omega, /model, alpha.
+    let expected: &[&str] = &["mixed omega", "/model", "mixed alpha"];
+    for (step, needle) in expected.iter().enumerate() {
+        run.write_input(KEY_UP)?;
+        run.settle_screen(|s| {
+            s.lines
+                .iter()
+                .any(|line| line.contains(PROMPT_GLYPH) && line.contains(needle))
+        })
+        .map_err(|e| AdvError::Assert(format!("recall-{step}-{needle}: {e}")))?;
+    }
+    // Clamped at the oldest entry: one more Up must not move.
+    run.write_input(KEY_UP)?;
+    run.settle_screen(|s| {
+        s.lines
+            .iter()
+            .any(|line| line.contains(PROMPT_GLYPH) && line.contains("mixed alpha"))
+    })
+    .map_err(|e| AdvError::Assert(format!("oldest-clamp: {e}")))?;
+    // Back down one step returns the slash command.
+    run.write_input(KEY_DOWN)?;
+    run.settle_screen(|s| {
+        s.lines
+            .iter()
+            .any(|line| line.contains(PROMPT_GLYPH) && line.contains("/model"))
+    })
+    .map_err(|e| AdvError::Assert(format!("walk-back: {e}")))?;
+
+    run.write_input(KEY_ESCAPE)?;
+    run.clear_editor()?;
+    run.settle_ready()?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Three submits fired into one stream window all queue, then drain as
+/// turns in submission order: the transcript must echo `q-aaa`, `q-bbb`,
+/// `q-ccc` strictly in order, and every queued turn must stream.
+fn scenario_steer_drain_order() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-steer-drain-order";
+
+    run.send_line("drain base")?;
+    for tag in ["q-aaa", "q-bbb", "q-ccc"] {
+        run.send_line(tag)?;
+    }
+    let snapshot = run
+        .settle_screen(|s| count_lines_containing(s, FINAL_MARKER) >= 3)
+        .map_err(|e| AdvError::Assert(format!("drain: {e}")))?;
+    // The oldest turn echoes can scroll off the snapshot; only the echoes
+    // still on screen need checking, and they must appear in submit order.
+    let positions: Vec<usize> = ["q-aaa", "q-bbb", "q-ccc"]
+        .iter()
+        .filter_map(|tag| snapshot.lines.iter().position(|line| line.contains(tag)))
+        .collect();
+    if positions.len() < 2 || positions.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(AdvError::Assert(format!(
+            "{scenario}: queued turns echoed missing/out of order {positions:?}; screen:\n{}",
+            snapshot.lines.join("\n")
+        )));
+    }
+    run.settle_ready()?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Esc aborts a mid-stream turn, then Up recalls the aborted prompt from
+/// history and Enter re-runs it to a streamed turn. Abort must not strand
+/// the prompt out of history or leave the composer dead.
+fn scenario_abort_recall() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-abort-recall";
+
+    run.send_line("abortable anchor")?;
+    run.write_input(KEY_ESCAPE)?; // lands inside the ~450 ms stream window
+    run.settle_ready()?;
+    run.write_input(KEY_UP)?;
+    let _ = run
+        .settle_screen(|s| {
+            s.lines
+                .iter()
+                .any(|line| line.contains(PROMPT_GLYPH) && line.contains("abortable anchor"))
+        })
+        .map_err(|e| AdvError::Assert(format!("abort-recall: {e}")))?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_final_output()?;
+    run.settle_ready()?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Zero-width and formatting codepoints in the composer: ZWSP/ZWNJ/ZWJ,
+/// bidi marks, soft hyphen, word joiner, BOM, variation selectors, and tag
+/// characters. They must not corrupt the input buffer, the render, or the
+/// submit path.
+fn scenario_format_chars() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-format-chars";
+
+    let soup = "a\u{200b}\u{200c}\u{200d}\u{200e}\u{200f}\u{ad}\u{2060}\u{feff}\u{fe0e}\u{fe0f}\u{e0001}\u{e007f}z";
+    run.write_input(soup.as_bytes())?;
+    let _ = run.settle_screen(|s| {
+        s.lines
+            .iter()
+            .any(|line| line.contains(PROMPT_GLYPH) && line.contains('z'))
+    })?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.prove_editor_focus(scenario, "fmtok")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// A bracketed paste whose UTF-8 codepoint is split across `write()`
+/// boundaries AND whose close marker lands in the later write: the parser
+/// must hold the partial sequence and the paste must close coherently.
+fn scenario_utf8_boundary_paste() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-utf8-boundary-paste";
+
+    let mut first = b"\x1b[200~boundary ".to_vec();
+    first.extend_from_slice(&[0xF0, 0x9F]); // first half of 🦀
+    run.write_input(&first)?;
+    let mut second = vec![0xA6_u8, 0x80]; // second half
+    second.extend_from_slice(b" tail");
+    second.extend_from_slice(b"\x1b[201~");
+    run.write_input(&second)?;
+    let _ = run.settle_screen(|s| screen_has(s, "🦀"))?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.prove_editor_focus(scenario, "utf8ok")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// History recall pinned in the composer while a resize storm churns: the
+/// recalled entry must survive every geometry and still submit as a turn.
+fn scenario_resize_mid_history() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-resize-mid-history";
+
+    run.send_line("resize recall anchor")?;
+    let _ = run.settle_final_output()?;
+    run.write_input(KEY_UP)?;
+    let _ = run
+        .settle_screen(|s| {
+            s.lines
+                .iter()
+                .any(|line| line.contains(PROMPT_GLYPH) && line.contains("resize recall anchor"))
+        })
+        .map_err(|e| AdvError::Assert(format!("recall-before-storm: {e}")))?;
+    run.session_mut()?
+        .resize_storm(&[(120, 40), (24, 8), (40, 12), (80, 24)])?;
+    let _ = run
+        .settle_screen(|s| {
+            s.lines
+                .iter()
+                .any(|line| line.contains(PROMPT_GLYPH) && line.contains("resize recall anchor"))
+        })
+        .map_err(|e| AdvError::Assert(format!("recall-after-storm: {e}")))?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_final_output()?;
+    run.settle_ready()?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Slash-command torture: an unknown command routes through as a prompt
+/// turn, a bare `/` submits without panic, and a selector opened with a
+/// nonsense argument still dismisses cleanly.
+fn scenario_slash_torture() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-slash-torture";
+
+    run.send_line("/definitelynotacommand")?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER) || ready_screen(s))?;
+    run.send_line("/")?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER) || ready_screen(s))?;
+    run.send_line("/model zzz-no-such-model")?;
+    // The previous turn's marker is still on screen, so a marker predicate
+    // would pass while the selector is still opening — and the Esc below
+    // would land on the editor instead of dismissing it. Wait for the
+    // selector's own open signal.
+    let _ =
+        run.settle_screen(|s| screen_has(s, "esc to cancel") || screen_has(s, "Nova 2 Lite"))?;
+    // The argument becomes the selector's filter, where the first Esc only
+    // clears the filter text; keep dismissing until the footer is gone.
+    for _ in 0..4 {
+        run.write_input(KEY_ESCAPE)?;
+        let snapshot = run.settle_screen(|_| true)?;
+        if !screen_has(&snapshot, "esc to cancel") {
+            break;
+        }
+    }
+    run.clear_editor()?;
+    run.settle_ready()?;
+    run.prove_editor_focus(scenario, "slashok")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
@@ -1896,6 +2278,18 @@ fn tui_adversarial_gauntlet_hostile_inputs_geometry_and_dialog_storms() {
         ("alt-alpha-flood", scenario_alt_alpha_flood),
         ("composer-max-lines", scenario_composer_max_lines),
         ("interleaved-bits", scenario_interleaved_bits),
+        ("dec-state-injection", scenario_dec_state_injection),
+        ("graphics-injection", scenario_graphics_injection),
+        ("paste-escape-soup", scenario_paste_escape_soup),
+        ("key-protocol-soup", scenario_key_protocol_soup),
+        ("history-multiline", scenario_history_multiline),
+        ("history-mixed", scenario_history_mixed),
+        ("steer-drain-order", scenario_steer_drain_order),
+        ("abort-recall", scenario_abort_recall),
+        ("format-chars", scenario_format_chars),
+        ("utf8-boundary-paste", scenario_utf8_boundary_paste),
+        ("resize-mid-history", scenario_resize_mid_history),
+        ("slash-torture", scenario_slash_torture),
     ];
     let mut verdicts = Vec::new();
     let mut first_failure: Option<String> = None;
