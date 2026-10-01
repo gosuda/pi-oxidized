@@ -5226,6 +5226,9 @@ impl<W: Write, S: SessionHost> InteractiveRuntime<W, S> {
         if trimmed.is_empty() {
             return ActionOutcome::None;
         }
+        // Record every real submission — prompt, slash command, or `!` bash —
+        // so the editor's Up/Down history recall has entries to navigate.
+        self.editor.add_to_history(&trimmed);
         if let Some((name, args)) = parse_slash_command(&trimmed)
             && let Some(outcome) = self.dispatch_builtin_command(name, args).await
         {

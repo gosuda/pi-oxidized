@@ -338,6 +338,20 @@ impl ProductRun {
         Ok(())
     }
 
+    /// Settle until a *newly emitted* [`FINAL_MARKER`] arrives: the screen
+    /// snapshot can hold a stale marker from an earlier turn, so marker waits
+    /// inside submit loops must be anchored on the pending output boundary.
+    fn settle_final_output(&mut self) -> Result<TerminalSnapshot, AdvError> {
+        let marker = FINAL_MARKER.as_bytes();
+        let policy = self.policy;
+        self.session_mut()?
+            .read_settled_frame(&policy, |bytes| {
+                bytes.windows(marker.len()).any(|window| window == marker)
+            })
+            .map(|frame| frame.snapshot)
+            .map_err(AdvError::from)
+    }
+
     /// Type `text` one byte per write and settle until it shows on screen.
     fn type_slowly(&mut self, text: &str) -> Result<(), AdvError> {
         for byte in text.bytes() {
@@ -348,11 +362,14 @@ impl ProductRun {
         Ok(())
     }
 
-    /// Empty the composer by backspacing generously, then settle ready.
+    /// Empty the composer by killing in both directions, then settle ready.
     fn clear_editor(&mut self) -> Result<(), AdvError> {
-        for _ in 0..64 {
-            self.write_input(KEY_BACKSPACE)?;
-        }
+        // ctrl+k (deleteToLineEnd) covers text right of a mid-line cursor,
+        // ctrl+u (deleteToLineStart) the left side however long it is, and
+        // the backspace joins the line above so the next pair drains it too.
+        // Fixed 64 backspaces could neither clear giant single lines nor
+        // reach text past a moved cursor.
+        self.write_input(&[0x0b, 0x15, 0x7f].repeat(40))?;
         self.settle_ready()
     }
 
@@ -613,8 +630,10 @@ fn scenario_invalid_input() -> Result<(), AdvError> {
         b"\x01\x02\x05\x0b", // C0 controls (ctrl+a/b/e/k)
         b"\x1b",             // lone ESC
         b"\x1b[999~",        // malformed CSI
-        b"\x1b]8;;http://x", // unterminated OSC ...
-        b"\x1b\\",           // ... closed by ST (a bare \x07 here is ctrl+g → external editor)
+        // `ESC ] <digits> ;` opens reply-framing payload mode (the real
+        // terminal contract), so the ST close must ride in the same burst —
+        // a probe between open and close has its own bytes eaten as payload.
+        b"\x1b]8;;http://x\x1b\\",
     ];
     for (index, burst) in bursts.iter().enumerate() {
         run.write_input(burst)?;
@@ -1039,10 +1058,13 @@ fn scenario_width_edge() -> Result<(), AdvError> {
     for byte in edge.bytes() {
         run.write_input(&[byte])?;
     }
-    // The é tail paints as separate e + combining-mark cells on POSIX;
-    // transports that drop the marks show a plain e run instead.
-    let _ =
-        run.settle_screen(|s| screen_has(s, "e\u{301}e\u{301}e\u{301}") || screen_has(s, "eeee"))?;
+    // The landed combining tail renders one of three ways depending on the
+    // cell path: marks absorbed into the base cells show "abe", marks kept
+    // as separate cells show an "e\u{301}" run, and transports that drop
+    // the marks show a plain "eeee" run.
+    let _ = run.settle_screen(|s| {
+        screen_has(s, "abe") || screen_has(s, "e\u{301}e\u{301}e\u{301}") || screen_has(s, "eeee")
+    })?;
     run.write_input(KEY_ENTER)?;
     let snapshot = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
     if !screen_has(&snapshot, FINAL_MARKER) {
@@ -1398,6 +1420,420 @@ fn scenario_undo_flood() -> Result<(), AdvError> {
     run.close_assert(scenario)
 }
 
+/// Terminal mode commands arriving on the INPUT wire: alt-screen, bracketed
+/// paste enable, synchronized output, insert mode, OSC 52 clipboard set,
+/// erase/display and cursor-home sequences. These are output-direction
+/// commands — as input they must parse as keys or be dropped, never execute
+/// or corrupt the frame.
+fn scenario_command_injection() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-command-injection";
+
+    for seq in [
+        b"\x1b[?1049h".as_slice(),        // DECSET alt screen
+        b"\x1b[?2004h".as_slice(),        // DECSET bracketed paste
+        b"\x1b[?2026h".as_slice(),        // synchronized output mode
+        b"\x1b[4;2h".as_slice(),          // insert/replace mode set
+        b"\x1b]52;c;aGk=\x07".as_slice(), // OSC 52 clipboard write
+        b"\x1b[2J".as_slice(),            // erase display
+        b"\x1b[H".as_slice(),             // cursor home (parses as Home key)
+        b"\x1b[?25h".as_slice(),          // show cursor
+        b"\x1b[!p".as_slice(),            // soft reset
+        b"\x1bc".as_slice(),              // RIS full reset
+    ] {
+        run.write_input(seq)?;
+    }
+    // A >64-byte generic OSC is unsolicited noise: the reply layer consumes
+    // it through its terminator without latching, so the key bytes riding in
+    // the same burst still reach the composer.
+    let mut oversized_osc = b"\x1b]52;c;".to_vec();
+    oversized_osc.extend_from_slice(&[b'x'; 80]);
+    oversized_osc.extend_from_slice(b"\x07 osc52ok");
+    run.write_input(&oversized_osc)?;
+    let _ = run.settle_screen(|s| screen_has(s, "osc52ok"))?;
+    run.clear_editor()?;
+    let snapshot = run.settle_screen(ready_screen)?;
+    if snapshot.lines.iter().any(|line| line.contains("1049")) {
+        return Err(AdvError::Assert(format!(
+            "alt-screen command leaked onto the screen: {snapshot:?}"
+        )));
+    }
+    run.prove_editor_focus(scenario, "cmdinj")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Input racing the boot sequence: a full prompt written immediately after
+/// the child spawns, before the TUI finishes probing and painting. Whatever
+/// survives the race must not corrupt the session — a clean turn still runs.
+fn scenario_preboot_input() -> Result<(), AdvError> {
+    let sandbox = create_sandbox()?;
+    let spec = launch_spec(&sandbox)?;
+    let mut run = ProductRun::open(&spec)?;
+    let scenario = "adversarial-preboot-input";
+
+    run.write_input(b"preboot probe\r")?;
+    run.settle_ready()?;
+    run.clear_editor()?;
+    run.write_input(b"preboot-ok")?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Bytes written after /quit races the exit path. Writes fail once the child
+/// dies — the contract is a clean exit 0, not that the writes land.
+fn scenario_post_quit_bytes() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-post-quit-bytes";
+
+    run.write_input(b"/quit")?;
+    run.write_input(KEY_ENTER)?;
+    for _ in 0..8 {
+        if run.write_input(b"post-exit bytes\r\n").is_err() {
+            break;
+        }
+    }
+    run.close_assert(scenario)
+}
+
+/// Geometry at `u16` boundaries: 0x0, 1x1, `u16::MAX` on each axis and both.
+/// The kernel accepts absurd winsizes; the compositor must clamp rather than
+/// allocate-or-crash on 65535x65535. Driver-level ioctl rejection is tolerated
+/// — the product contract is that it never wedges or panics.
+fn scenario_extreme_geometry() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-extreme-geometry";
+
+    let _ = run.session_mut()?.resize(0, 0);
+    let _ = run.settle_screen(|_| true)?;
+    let _ = run.session_mut()?.resize(1, 1);
+    let _ = run.settle_screen(|_| true)?;
+    let _ = run.session_mut()?.resize(u16::MAX, 1);
+    let _ = run.session_mut()?.resize(1, u16::MAX);
+    let _ = run.settle_screen(|_| true)?;
+    let _ = run.session_mut()?.resize(u16::MAX, u16::MAX);
+    let _ = run.settle_screen(|_| true)?;
+    run.session_mut()?.resize(80, 24)?;
+    run.settle_ready()?;
+    run.prove_editor_focus(scenario, "geommax")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Pathological grapheme clusters: a 25-member ZWJ emoji chain, 100 combining
+/// marks on one base, tag characters, a 50-variation-selector run, a regional
+/// indicator run, and an unassigned codepoint. Cursor math and the submit
+/// path must handle all of them.
+fn scenario_grapheme_torture() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-grapheme-torture";
+    run.settle_budget(Duration::from_secs(90));
+
+    let mut torture = String::new();
+    for _ in 0..25 {
+        torture.push_str("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}\u{200d}");
+    }
+    torture.push('a');
+    for _ in 0..100 {
+        torture.push('\u{301}');
+    }
+    for cp in 0xe0001_u32..=0xe0050_u32 {
+        if let Some(c) = char::from_u32(cp) {
+            torture.push(c);
+        }
+    }
+    torture.push('\u{25a0}');
+    for _ in 0..50 {
+        torture.push('\u{fe0f}');
+    }
+    for cp in 0x1f1e6_u32..=0x1f1fb_u32 {
+        if let Some(c) = char::from_u32(cp) {
+            torture.push(c);
+        }
+    }
+    torture.push('\u{378}');
+    for chunk in torture.as_bytes().chunks(512) {
+        run.write_input(chunk)?;
+    }
+    let _ = run.settle_screen(|_| true)?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Double-width characters straddling the exact right edge at several
+/// geometries: (cols-1) ASCII cells then a CJK wide char lands split across
+/// the boundary. Wrap math must not loop, overlap or drop the char.
+fn scenario_wide_edge_sweep() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-wide-edge-sweep";
+
+    for cols in [80_u16, 100, 160] {
+        run.session_mut()?.resize(cols, 24)?;
+        run.clear_editor()?;
+        let line = "a".repeat(usize::from(cols - 1)) + "界";
+        run.write_input(line.as_bytes())?;
+        let _ = run.settle_screen(|_| true)?;
+    }
+    run.session_mut()?.resize(80, 24)?;
+    run.clear_editor()?;
+    run.settle_ready()?;
+    run.prove_editor_focus(scenario, "widesweep")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Legacy X10 mouse reports (CSI M + 3 raw offset bytes) including high-bit
+/// coordinates, plus DECRQM mode reports. Reply/report bytes must not leak
+/// into the composer or transcript.
+fn scenario_x10_mouse() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-x10-mouse";
+
+    for report in [
+        b"\x1b[M \x25\x2a".as_slice(),    // left press at (5,10)
+        b"\x1b[M#\x30\x35".as_slice(),    // release at (16,21)
+        b"\x1b[M\x20\x84\x85".as_slice(), // high-bit coords (100,101)
+        b"\x1b[?9;1$y".as_slice(),        // DECRQM X10 mouse report
+        b"\x1b[?1006;2$y".as_slice(),     // DECRQM SGR mouse report
+    ] {
+        run.write_input(report)?;
+    }
+    let snapshot = run.settle_screen(ready_screen)?;
+    if snapshot
+        .lines
+        .iter()
+        .any(|line| line.contains('M') && (line.contains("%*") || line.contains("#05")))
+    {
+        return Err(AdvError::Assert(format!(
+            "x10 mouse report bytes leaked onto the screen: {snapshot:?}"
+        )));
+    }
+    run.prove_editor_focus(scenario, "x10ok")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// History stack boundaries: submit ten distinct prompts, then Up/Down churn
+/// past both ends of the stack and re-submit a recalled entry.
+fn scenario_history_pressure() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-history-pressure";
+
+    for i in 0..10 {
+        run.write_input(format!("hist-{i}").as_bytes())?;
+        run.write_input(KEY_ENTER)?;
+        // The marker wait must anchor on newly emitted output — the screen
+        // still shows the previous turn's identical marker, which would let
+        // this settle pass while the new turn is still streaming.
+        let _ = run.settle_final_output()?;
+    }
+    // Older-recall clamps at the oldest entry (hist-0).
+    for _ in 0..15 {
+        run.write_input(KEY_UP)?;
+    }
+    let _ = run
+        .settle_screen(|s| {
+            s.lines
+                .iter()
+                .any(|line| line.contains(PROMPT_GLYPH) && line.contains("hist-0"))
+        })
+        .map_err(|e| AdvError::Assert(format!("oldest-recall: {e}")))?;
+    // Newer-recall past the newest entry restores the (empty) live draft.
+    for _ in 0..15 {
+        run.write_input(KEY_DOWN)?;
+    }
+    let _ = run
+        .settle_screen(|s| {
+            s.lines
+                .iter()
+                .filter(|line| line.contains(PROMPT_GLYPH))
+                .all(|line| !line.contains("hist-"))
+        })
+        .map_err(|e| AdvError::Assert(format!("draft-restore: {e}")))?;
+    for _ in 0..12 {
+        run.write_input(KEY_UP)?;
+    }
+    // The deepest recall (oldest entry) must be sitting on the prompt before
+    // the submit re-runs it.
+    let _ = run
+        .settle_screen(|s| {
+            s.lines
+                .iter()
+                .any(|line| line.contains(PROMPT_GLYPH) && line.contains("hist-0"))
+        })
+        .map_err(|e| AdvError::Assert(format!("recall-before-submit: {e}")))?;
+    // Submit the recalled oldest entry and wait on the fresh output boundary:
+    // the previous turn's identical marker is still on screen, so a screen
+    // snapshot could satisfy a marker predicate before this turn emits.
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_final_output()?;
+    run.settle_ready()?;
+    run.prove_editor_focus(scenario, "histok")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Terminal replies spliced inside a typed word: cursor-position and DA1
+/// replies between "hel" and "lo world". The reply layer must consume them —
+/// the submitted message must read "hello world" intact.
+fn scenario_reply_midword() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-reply-midword";
+
+    run.write_input(b"hel")?;
+    run.write_input(b"\x1b[12;1R")?;
+    run.write_input(b"lo")?;
+    run.write_input(b"\x1b[?62;4c")?;
+    run.write_input(b" world")?;
+    let _ = run.settle_screen(|s| screen_has(s, "hello world"))?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// A bracketed paste left open across other keys: everything until the close
+/// marker is paste content, including arrows and Enter. Closing late must
+/// produce one coherent paste chip that submits normally.
+fn scenario_unclosed_paste() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-unclosed-paste";
+
+    // Only large pastes render as `[paste #N` chips (>10 lines or >1000
+    // chars); a small single-line paste lands inline instead.
+    run.write_input(b"\x1b[200~dangling paste payload")?;
+    run.write_input(KEY_DOWN)?; // swallowed as literal paste bytes
+    run.write_input(b"still inside the paste\n")?;
+    run.write_input(b"more\n".repeat(10).as_slice())?;
+    run.write_input(b"\x1b[201~")?;
+    let _ = run.settle_screen(|s| screen_has(s, "[paste #1"))?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// One 96 KiB bracketed paste delivered in 8 KiB writes: the paste becomes a
+/// single chip and the session stays responsive enough to submit it.
+fn scenario_byte_bomb() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-byte-bomb";
+
+    run.write_input(b"\x1b[200~")?;
+    let payload = "0123456789abcdef".repeat(6 * 1024); // 96 KiB
+    for chunk in payload.as_bytes().chunks(8192) {
+        run.write_input(chunk)?;
+    }
+    run.write_input(b"\x1b[201~")?;
+    let _ = run.settle_screen(|s| screen_has(s, "[paste #1"))?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Alt+letter for the full alphabet in one flood: word-motion bindings vs
+/// unbound chords must all resolve without corrupting the frame.
+fn scenario_alt_alpha_flood() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-alt-alpha-flood";
+
+    run.write_input(b"alpha base text")?;
+    for c in b'a'..=b'z' {
+        run.write_input(&[0x1b, c])?;
+    }
+    let _ = run.settle_screen(|_| true)?;
+    run.clear_editor()?;
+    run.settle_ready()?;
+    run.prove_editor_focus(scenario, "altok")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// Composer pushed to its height cap: embedded newlines (or wrapped text if
+/// ctrl+j is unbound) grow it until it clamps, then it must still submit.
+fn scenario_composer_max_lines() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-composer-max-lines";
+
+    for line in 0..18 {
+        run.write_input(format!("line-{line:02}").as_bytes())?;
+        run.write_input(b"\x0a")?; // ctrl+j — newline or no-op
+    }
+    let _ = run.settle_screen(|_| true)?;
+    run.write_input(KEY_ENTER)?;
+    let _ = run.settle_screen(|s| screen_has(s, FINAL_MARKER))?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
+/// A deterministically shuffled mega-stream: paste chunks, terminal replies,
+/// X10 mouse, C1 bytes, invalid UTF-8, cursor keys and text all interleaved
+/// in a single burst, followed by resize churn.
+fn scenario_interleaved_bits() -> Result<(), AdvError> {
+    let (sandbox, mut run) = boot()?;
+    let _ = &sandbox;
+    let scenario = "adversarial-interleaved-bits";
+
+    let mut chunks: Vec<Vec<u8>> = vec![
+        // The paste must be complete inside one chunk: an open bracketed
+        // paste swallows every later byte (including /quit) until its close,
+        // so a shuffle separating open from close would never let the
+        // session exit.
+        b"\x1b[200~interleaved paste\x1b[201~".to_vec(),
+        b"\x1b[12;34R".to_vec(),
+        b"\x1b[?62;4c".to_vec(),
+        b"abc".to_vec(),
+        b"\x1b[M %$".to_vec(),
+        vec![0xff, 0x00],
+        b"\x1b[I".to_vec(),
+        KEY_LEFT.to_vec(),
+        b"def".to_vec(),
+        vec![0x9b], // 8-bit CSI
+        b"ghi".to_vec(),
+        b"\x1b[?25h".to_vec(),
+        KEY_UP.to_vec(),
+        b"jkl".to_vec(),
+        b"\x1b[4;24;80t".to_vec(),
+    ];
+    // Deterministic LCG shuffle (seed fixed for reproducibility).
+    let mut state: u64 = 0x9e37_79b9;
+    for i in (1..chunks.len()).rev() {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let j = usize::try_from(state >> 33).unwrap_or(0) % (i + 1);
+        chunks.swap(i, j);
+    }
+    for chunk in &chunks {
+        run.write_input(chunk)?;
+    }
+    for (cols, rows) in [(120_u16, 30_u16), (60, 20), (80, 24)] {
+        run.session_mut()?.resize(cols, rows)?;
+    }
+    run.clear_editor()?;
+    run.settle_ready()?;
+    run.prove_editor_focus(scenario, "bitsok")?;
+    run.quit_clean()?;
+    run.close_assert(scenario)
+}
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
@@ -1446,6 +1882,20 @@ fn tui_adversarial_gauntlet_hostile_inputs_geometry_and_dialog_storms() {
         ("kitchen-sink", scenario_kitchen_sink),
         ("sustained-pressure", scenario_sustained_pressure),
         ("undo-flood", scenario_undo_flood),
+        ("command-injection", scenario_command_injection),
+        ("preboot-input", scenario_preboot_input),
+        ("post-quit-bytes", scenario_post_quit_bytes),
+        ("extreme-geometry", scenario_extreme_geometry),
+        ("grapheme-torture", scenario_grapheme_torture),
+        ("wide-edge-sweep", scenario_wide_edge_sweep),
+        ("x10-mouse", scenario_x10_mouse),
+        ("history-pressure", scenario_history_pressure),
+        ("reply-midword", scenario_reply_midword),
+        ("unclosed-paste", scenario_unclosed_paste),
+        ("byte-bomb", scenario_byte_bomb),
+        ("alt-alpha-flood", scenario_alt_alpha_flood),
+        ("composer-max-lines", scenario_composer_max_lines),
+        ("interleaved-bits", scenario_interleaved_bits),
     ];
     let mut verdicts = Vec::new();
     let mut first_failure: Option<String> = None;

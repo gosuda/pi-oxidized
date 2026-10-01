@@ -809,9 +809,16 @@ pub(crate) fn viewport_snapshot_from_raw(raw: &[u8], geometry: Geometry) -> Term
     build_snapshot(raw, geometry, true)
 }
 
+/// Largest screen dimension the snapshot emulator mirrors. Emulator memory
+/// stays bounded even when a scenario resizes the real PTY to an absurd
+/// winsize (e.g. `u16::MAX²` — 4 billion cells would OOM the harness): text
+/// assertions never address cells beyond this bound, and the product under
+/// test still sees the true geometry through the real PTY ioctl.
+const MAX_EMULATOR_DIM: usize = 1024;
+
 fn build_snapshot(raw: &[u8], geometry: Geometry, viewport_only: bool) -> TerminalSnapshot {
-    let cols = usize::from(geometry.cols.max(1));
-    let rows = usize::from(geometry.rows.max(1));
+    let cols = usize::from(geometry.cols.max(1)).min(MAX_EMULATOR_DIM);
+    let rows = usize::from(geometry.rows.max(1)).min(MAX_EMULATOR_DIM);
     let mut vt = Vt::builder()
         .size(cols, rows)
         .scrollback_limit(10_000)

@@ -11,26 +11,31 @@
 //! ## Escape framing contract (approved 50 ms policy)
 //!
 //! A lone `ESC` is ambiguous: it may open any ordinary key sequence, or the
-//! `ESC ] 1 1 ;` header of an OSC 11 background-color reply. The parser holds
-//! such a *candidate* under an absolute deadline of [`ESCAPE_FRAMING_DEADLINE`],
-//! measured from the first `ESC` byte and never reset by later bytes:
+//! `ESC ] <digits> ;` header of an OSC reply (e.g. the OSC 11 background-color
+//! query). The parser holds such a *candidate* under an absolute deadline of
+//! [`ESCAPE_FRAMING_DEADLINE`], measured from the first `ESC` byte and never
+//! reset by later bytes:
 //!
-//! * Before the full `ESC ] 1 1 ;` header is recognized, a candidate that
+//! * Before the full `ESC ] <digits> ;` header is recognized, a candidate that
 //!   diverges from the reply grammar resolves immediately, and an expired
 //!   candidate resolves at the deadline, into the exact ordinary key sequence
 //!   decoded by the existing `parse_event` decoder — each held byte decoded
 //!   exactly once (`ESC` → `Esc`, `ESC ]` → `Alt+]`, longer held prefixes
-//!   additionally decode their `1`/`;` suffix bytes as ordinary keys).
+//!   additionally decode their selector digits as ordinary keys).
 //! * Once the full header is recognized, the framing deadline is removed:
 //!   payload and split `ST` fragments remain protocol state across arbitrary
 //!   idle gaps, consumer timeouts, and ownership handoffs.
-//! * A recognized-but-malformed or oversized reply (an `ESC` inside the
-//!   payload not followed by `\`, or more than
-//!   [`crate::event::reply::OSC11_REPLY_PAYLOAD_LIMIT`] payload bytes before
-//!   a terminator) latches an explicit [`io::Error`] on the parser: polls
+//! * A recognized-but-malformed reply (an `ESC` inside the payload not
+//!   followed by `\`) latches an explicit [`io::Error`] on the parser: polls
 //!   fail with it, no payload byte is ever replayed as keys, and the latched
 //!   state persists until [`Parser::recover`] is called (defined session
 //!   recovery).
+//! * Payload size is bounded differently per selector: the app-solicited
+//!   selector-`11` reply latches the same explicit error past
+//!   [`crate::event::reply::OSC_REPLY_PAYLOAD_LIMIT`] bytes, while a generic
+//!   OSC keeps consuming through its terminator without storing or
+//!   reporting — its unsolicited overflow must not discard the ordinary
+//!   input that shares the read.
 use crate::event::InternalEvent;
 use crate::event::sys::unix::parse::parse_event;
 use std::collections::VecDeque;
@@ -41,8 +46,8 @@ use std::time::{Duration, Instant};
 /// from the first `ESC` byte. Explicitly not reset by later candidate bytes.
 pub(crate) const ESCAPE_FRAMING_DEADLINE: Duration = Duration::from_millis(50);
 
-/// Length of the full OSC 11 reply header `ESC ] 1 1 ;`.
-const OSC11_HEADER_LEN: usize = 5;
+/// Upper bound on OSC selector digits inside `ESC ] <digits> ;` headers.
+const OSC_SELECTOR_DIGITS_LIMIT: usize = 6;
 
 /// Latched-error message prefix; `crate::event::reply::is_protocol_error`
 /// recognizes it so application layers can distinguish reply framing
@@ -50,9 +55,9 @@ const OSC11_HEADER_LEN: usize = 5;
 pub(crate) const PROTOCOL_ERROR_PREFIX: &str = "crossterm reply protocol error: ";
 
 const MALFORMED_FRAMING_MSG: &str =
-    "crossterm reply protocol error: malformed OSC 11 reply framing (unterminated ST)";
+    "crossterm reply protocol error: malformed OSC reply framing (unterminated ST)";
 const OVERSIZED_PAYLOAD_MSG: &str =
-    "crossterm reply protocol error: OSC 11 reply payload exceeded the 64-byte limit";
+    "crossterm reply protocol error: OSC reply payload exceeded the 64-byte limit";
 
 /// The persistent byte parser. See the module documentation for the framing
 /// contract.
@@ -71,12 +76,18 @@ pub(crate) struct Parser {
 /// One in-flight escape-framing candidate.
 #[derive(Debug)]
 struct Candidate {
-    /// Held bytes: `ESC`, or `ESC ] 1 1 ;` plus the reply payload.
+    /// Held bytes: `ESC`, or `ESC ] <digits> ;` plus the reply payload.
     bytes: Vec<u8>,
     /// `Some` while the candidate is ambiguous (header incomplete); `None`
-    /// once the full OSC 11 header is recognized — payload framing has no
+    /// once the full OSC header is recognized — payload framing has no
     /// deadline and waits for its terminator across arbitrary timeouts.
     deadline: Option<Instant>,
+    /// Payload overflow on a generic (non-11) OSC: bytes stop being stored
+    /// and no reply is pushed, but framing is still consumed through the
+    /// terminator so following input is never eaten. Selector-11 replies
+    /// keep the strict payload-limit latch instead — that reply is
+    /// app-solicited, so a malformed contract must stay loud.
+    oversized: bool,
 }
 
 /// Where a re-fed byte must be processed next.
@@ -156,7 +167,7 @@ impl Parser {
         }
 
         // Header phase: the candidate is ambiguous between an ordinary key
-        // sequence and the OSC 11 reply header.
+        // sequence and the OSC reply header.
         if candidate.bytes.len() == 1 {
             if byte == b']' {
                 candidate.bytes.push(byte);
@@ -170,18 +181,21 @@ impl Parser {
             return Route::Buffer(byte, more);
         }
 
-        let expected = match candidate.bytes.len() {
-            2 => b'1',
-            3 => b'1',
-            _ => b';',
-        };
-        if byte == expected {
+        // Selector phase: `ESC ]` plus ASCII digits, completed by `;`.
+        // Any other byte diverges from the reply grammar and resolves the
+        // held bytes as the exact ordinary key sequence.
+        let selector_len = candidate.bytes.len() - 2;
+        if byte.is_ascii_digit() && selector_len < OSC_SELECTOR_DIGITS_LIMIT {
             candidate.bytes.push(byte);
-            if byte == b';' {
-                // Full `ESC ] 1 1 ;` header recognized: the framing deadline
-                // is cancelled; payload fragments are protocol from here on.
-                candidate.deadline = None;
-            }
+            self.candidate = Some(candidate);
+            return Route::Done;
+        }
+        if byte == b';' && selector_len >= 1 {
+            candidate.bytes.push(byte);
+            // Full `ESC ] <digits> ;` header recognized: the framing
+            // deadline is cancelled; payload fragments are protocol from
+            // here on.
+            candidate.deadline = None;
             self.candidate = Some(candidate);
             return Route::Done;
         }
@@ -201,8 +215,9 @@ impl Parser {
         if candidate.bytes.last() == Some(&0x1b) {
             if byte == b'\\' {
                 candidate.bytes.pop();
-                let payload = payload_of(&candidate.bytes);
-                crate::event::reply::push_osc_11_reply(payload);
+                if !candidate.oversized {
+                    push_osc_reply(&candidate.bytes);
+                }
                 return Route::Done;
             }
             // ESC followed by anything but the ST final byte is recognized
@@ -213,8 +228,9 @@ impl Parser {
         // Terminators complete regardless of the payload limit: framing is
         // checked before the bound.
         if byte == 0x07 {
-            let payload = payload_of(&candidate.bytes);
-            crate::event::reply::push_osc_11_reply(payload);
+            if !candidate.oversized {
+                push_osc_reply(&candidate.bytes);
+            }
             return Route::Done;
         }
         if byte == 0x1b {
@@ -223,12 +239,25 @@ impl Parser {
             self.candidate = Some(candidate);
             return Route::Done;
         }
-        if candidate.bytes.len() - OSC11_HEADER_LEN
-            >= crate::event::reply::OSC11_REPLY_PAYLOAD_LIMIT
+        if candidate.oversized {
+            // Overflow already recorded: consume without storing.
+            self.candidate = Some(candidate);
+            return Route::Done;
+        }
+        if candidate.bytes.len() - osc_header_len(&candidate.bytes)
+            >= crate::event::reply::OSC_REPLY_PAYLOAD_LIMIT
         {
-            // The next byte would exceed the payload bound: recognized
-            // framing that grew past its limit is an explicit error.
-            self.protocol_error = Some(OVERSIZED_PAYLOAD_MSG);
+            // The next byte would exceed the payload bound. An app-solicited
+            // selector-11 reply over its contract is an explicit error; a
+            // generic OSC is unsolicited, so it is consumed to its
+            // terminator and dropped instead — latching here would discard
+            // ordinary input riding in the same read.
+            if &candidate.bytes[2..osc_header_len(&candidate.bytes) - 1] == b"11" {
+                self.protocol_error = Some(OVERSIZED_PAYLOAD_MSG);
+                return Route::Done;
+            }
+            candidate.oversized = true;
+            self.candidate = Some(candidate);
             return Route::Done;
         }
         candidate.bytes.push(byte);
@@ -245,6 +274,7 @@ impl Parser {
             self.candidate = Some(Candidate {
                 bytes: vec![0x1b],
                 deadline: Some(now + ESCAPE_FRAMING_DEADLINE),
+                oversized: false,
             });
             return Route::Done;
         }
@@ -391,8 +421,24 @@ pub(crate) fn min_duration(a: Option<Duration>, b: Option<Duration>) -> Option<D
     }
 }
 
-fn payload_of(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(&bytes[OSC11_HEADER_LEN..]).into_owned()
+/// Byte length of the `ESC ] <digits> ;` header inside a payload candidate.
+fn osc_header_len(bytes: &[u8]) -> usize {
+    bytes.iter().position(|&b| b == b';').map_or(5, |pos| pos + 1)
+}
+
+/// Push a completed OSC reply to the typed sink, classified by selector:
+/// `11` keeps its dedicated variant; every other selector lands in the
+/// generic OSC form carrying the full de-framed content.
+fn push_osc_reply(bytes: &[u8]) {
+    let header_len = osc_header_len(bytes);
+    let selector = &bytes[2..header_len - 1];
+    let payload = String::from_utf8_lossy(&bytes[header_len..]).into_owned();
+    if selector == b"11" {
+        crate::event::reply::push_osc_11_reply(payload);
+    } else {
+        let content = String::from_utf8_lossy(&bytes[2..]).into_owned();
+        crate::event::reply::push_osc_reply(content);
+    }
 }
 
 impl Iterator for Parser {
@@ -507,10 +553,11 @@ mod tests {
         let mut parser = Parser::default();
         let t0 = base();
         parser.advance(b"\x1b]", false, t0);
-        // `2` diverges from the OSC 11 grammar: immediate resolution, no 50ms.
-        parser.advance(b"2", false, t0 + Duration::from_millis(1));
+        // `x` diverges from the OSC reply grammar (selectors are digits):
+        // immediate resolution, no 50ms.
+        parser.advance(b"x", false, t0 + Duration::from_millis(1));
         let codes: Vec<KeyCode> = events(&mut parser).iter().map(key_code).collect();
-        assert_eq!(codes, vec![KeyCode::Char(']'), KeyCode::Char('2')]);
+        assert_eq!(codes, vec![KeyCode::Char(']'), KeyCode::Char('x')]);
         // The candidate is gone; no late deadline keys can appear.
         assert!(parser.deadline_leftover(t0 + Duration::from_millis(1)).is_none());
         assert!(!parser.expire_due(t0 + Duration::from_secs(60)));
@@ -658,6 +705,32 @@ mod tests {
             }
             assert!(events(&mut parser).is_empty());
         }
+    }
+
+    #[test]
+    fn oversized_generic_osc_is_consumed_without_latching_following_input() {
+        let _guard = lock_test_globals();
+        let _ = drain_replies();
+        let mut parser = Parser::default();
+        let t0 = base();
+        // A 65-byte OSC 52 payload followed by an ordinary key in the same
+        // read: the oversized unsolicited reply is consumed through its BEL
+        // terminator and dropped — it must neither latch the parser nor eat
+        // the `z` riding behind it.
+        let mut chunk = b"\x1b]52;c;".to_vec();
+        chunk.extend_from_slice(&[b'x'; 65]);
+        chunk.extend_from_slice(b"\x07z");
+        parser.advance(&chunk, false, t0);
+        assert!(
+            parser.protocol_error().is_none(),
+            "generic OSC overflow must not latch the parser"
+        );
+        assert!(
+            drain_replies().is_empty(),
+            "oversized generic OSC is dropped, not reported"
+        );
+        let codes: Vec<KeyCode> = events(&mut parser).iter().map(key_code).collect();
+        assert_eq!(codes, vec![KeyCode::Char('z')]);
     }
 
     #[test]

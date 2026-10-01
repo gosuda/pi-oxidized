@@ -308,6 +308,7 @@ fn record_answer(answered: &mut IssuedQueries, reply: &TerminalReply) {
         TerminalReply::PrimaryDeviceAttributes | TerminalReply::SecondaryDeviceAttributes => {
             answered.answer(QueryKind::DeviceAttributes);
         }
+        TerminalReply::Osc(_) => {}
     }
 }
 
@@ -397,7 +398,7 @@ impl ProbeCollector {
                 self.saw_da1 = true;
             }
             TerminalReply::CursorPosition { .. } => self.saw_cursor = true,
-            TerminalReply::Osc11(_) | TerminalReply::CellSize { .. } => {}
+            TerminalReply::Osc11(_) | TerminalReply::Osc(_) | TerminalReply::CellSize { .. } => {}
         }
         self.replies.push(reply);
     }
@@ -440,6 +441,7 @@ impl ProbeCollector {
                 TerminalReply::CursorPosition { column, row } => {
                     cursor = Some((*column, *row));
                 }
+                TerminalReply::Osc(_) => {}
             }
         }
         cursor
