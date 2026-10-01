@@ -1,8 +1,8 @@
 {
 	"schema": "pi.deps.sbom.v1",
 	"capturedAt": "2026-09-30",
-	"captureHead": "24ec4c57412105af264ee522b643d3b7c383ca57",
-	"contentSha256": "2d3c85bcdad8dc2c16ede6890f59ee55ce7e861625ebc398e812e42370b9c82f",
+	"captureHead": "63574855131e6d280a05942c59bd469ef7f77924",
+	"contentSha256": "a169f334388e475c9c59f678e25e74178a68454f865224477561384833c8c3d1",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.98.0",
@@ -4180,7 +4180,7 @@
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/sys/unix/parse.rs",
-					"sha256": "ccbd47b1fa3e233ca376ea36b868f7b8773d18f9fe76641200363661cfb84005"
+					"sha256": "f953c26b2188c78917124bffb84fc77974d470fa1b526705076a009bc2d3bb1a"
 				},
 				{
 					"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker.rs",
@@ -7370,7 +7370,7 @@
 	"stagedInputProvenance": {
 		"schema": "pi.deps.staged-inputs.v1",
 		"mode": "staged",
-		"baseHead": "24ec4c57412105af264ee522b643d3b7c383ca57",
+		"baseHead": "63574855131e6d280a05942c59bd469ef7f77924",
 		"objectFormat": "sha1",
 		"pathspecs": [
 			".cargo/config",
@@ -7638,7 +7638,7 @@
 			{
 				"path": "vendor/crossterm-0.29.0/src/event/sys/unix/parse.rs",
 				"mode": "100644",
-				"blob": "41d5e1a013e3cf7e42b4eb02403b7cdc1c131493"
+				"blob": "38d99d2b70cb3dddc982eee28fc0e6924913bbec"
 			},
 			{
 				"path": "vendor/crossterm-0.29.0/src/event/sys/unix/waker.rs",
