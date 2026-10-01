@@ -177,7 +177,7 @@ enum Surface {
     Rail(Rail),
     Markdown(Markdown),
     Input(Input),
-    Editor(Editor),
+    Editor(Box<Editor>),
 }
 
 struct GauntletRoot {
@@ -278,7 +278,7 @@ impl GauntletRoot {
                 let mut editor = Editor::with_defaults();
                 editor.set_terminal_rows(24);
                 editor.focused = true;
-                Surface::Editor(editor)
+                Surface::Editor(Box::new(editor))
             }
             Phase::PasteVerbatim(_) | Phase::PasteAtomic => {
                 if let Surface::Editor(_) = self.surface {
@@ -287,7 +287,7 @@ impl GauntletRoot {
                 let mut editor = Editor::with_defaults();
                 editor.set_terminal_rows(24);
                 editor.focused = true;
-                Surface::Editor(editor)
+                Surface::Editor(Box::new(editor))
             }
             Phase::Done => Surface::None,
         };
