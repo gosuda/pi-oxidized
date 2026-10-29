@@ -100,6 +100,51 @@ pub(crate) fn parse_event(
             Event::Key(KeyCode::Enter.into()),
         ))),
         b'\t' => Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Tab.into())))),
+        // Vendored patch: C1 controls. 0x9b is the C1 CSI introducer and is
+        // consumed to a final byte (0x40-0x7e) exactly like the `ESC [`
+        // form; 0x8f is C1 SS3 and consumes one payload byte; 0x90 / 0x98 /
+        // 0x9d / 0x9e / 0x9f open control strings (DCS, SOS, OSC, PM, APC)
+        // consumed to a string terminator (0x9c, `ESC \`, or BEL); a bare
+        // 0x9c is a stray ST. All of these used to fall into
+        // `parse_utf8_char`, which rejected only the lead byte — the
+        // payload tail then decoded as typed keys (`\x9b61;1R` leaked
+        // "61;1R", `\x90P\x9c` leaked "P").
+        b'\x9b' => {
+            let last_byte = buffer[buffer.len() - 1];
+            if buffer.len() > 1 && (64..=126).contains(&last_byte) {
+                // Complete C1 CSI: well-formed but unrecognized — drop it.
+                // `ReplyConsumed`, not `Err`: on Err the parser re-feeds
+                // the final byte of a >=0x80-lead buffer as a divergence
+                // witness, which would replay it as a key.
+                Ok(Some(InternalEvent::ReplyConsumed))
+            } else if buffer.len() > 1 && !(0x20..=0x3f).contains(&last_byte) {
+                // A byte outside the CSI alphabet aborts the sequence;
+                // Err lets the parser re-feed that byte as real input.
+                Err(could_not_parse_event_error())
+            } else {
+                Ok(None)
+            }
+        }
+        b'\x8f' => {
+            let last_byte = buffer[buffer.len() - 1];
+            if buffer.len() > 1 && !(0x20..=0x7e).contains(&last_byte) {
+                // Abort on a byte outside the SS3 alphabet; Err re-feeds
+                // it so e.g. a C0 still lands as a key.
+                Err(could_not_parse_event_error())
+            } else if buffer.len() > 1 {
+                Ok(Some(InternalEvent::ReplyConsumed))
+            } else {
+                Ok(None)
+            }
+        }
+        0x90 | 0x98 | 0x9d | 0x9e | 0x9f => {
+            if c1_string_terminated(buffer) {
+                Ok(Some(InternalEvent::ReplyConsumed))
+            } else {
+                Ok(None)
+            }
+        }
+        b'\x9c' => Err(could_not_parse_event_error()),
         b'\x7F' => Ok(Some(InternalEvent::Event(Event::Key(
             KeyCode::Backspace.into(),
         )))),
@@ -123,6 +168,21 @@ pub(crate) fn parse_event(
                 .map(InternalEvent::Event)
         }),
     }
+}
+
+/// Whether a C1-introduced control string (`0x90`/`0x98`/`0x9d`/`0x9e`/
+/// `0x9f` at `buffer[0]`) has reached its terminator: C1 ST (`0x9c`), the
+/// two-byte `ESC \` ST, or BEL.
+fn c1_string_terminated(buffer: &[u8]) -> bool {
+    let mut index = 1;
+    while index < buffer.len() {
+        match buffer[index] {
+            0x07 | 0x9c => return true,
+            0x1b if buffer.get(index + 1) == Some(&b'\\') => return true,
+            _ => index += 1,
+        }
+    }
+    false
 }
 
 // converts KeyCode to KeyEvent (adds shift modifier in case of uppercase characters)
@@ -223,6 +283,18 @@ pub(crate) fn parse_csi(buffer: &[u8]) -> io::Result<Option<InternalEvent>> {
                     }
                 }
             }
+        }
+        // Vendored patch: any other parameter (`=`, `:`) or intermediate
+        // (`!`–`/`) lead still belongs to the same CSI — it completes when a
+        // final byte (0x40-0x7e) arrives and the whole sequence then drops.
+        // Erring on the lead byte replayed the tail as typed keys
+        // (`CSI = 1;2 c` leaked "1;2c", `CSI ! p` leaked "p").
+        0x20..=0x3f => {
+            let last_byte = buffer[buffer.len() - 1];
+            if (64..=126).contains(&last_byte) {
+                return Err(could_not_parse_event_error());
+            }
+            None
         }
         _ => return Err(could_not_parse_event_error()),
     };
@@ -921,7 +993,6 @@ pub(crate) fn parse_utf8_char(buffer: &[u8]) -> io::Result<Option<char>> {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

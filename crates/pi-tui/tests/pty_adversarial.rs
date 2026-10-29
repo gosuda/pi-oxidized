@@ -1567,12 +1567,12 @@ fn adversarial_rep_decsc_clears_soup() {
 
     report.assert_success_contract("rep-decsc-soup");
     if BYTE_TRANSPARENT_MASTER {
-        // `CSI !` aborts the moment the unrecognized intermediate arrives,
-        // so its `p` final resyncs as an ordinary key — the other sequences
-        // reach their final byte and drop whole.
+        // Intermediate- and parameter-led CSIs are consumed through their
+        // final byte like upstream, so `CSI ! p` drops whole with the
+        // output-only sequences — only the typed keys remain.
         assert_eq!(
             report.live_text.as_deref(),
-            Some("pok"),
+            Some("ok"),
             "rep-decsc-soup: output-only CSI bytes leaked into the editor; got {:?}; tail={}",
             report.live_text,
             report.tail()
@@ -1812,13 +1812,14 @@ fn adversarial_csi_param_overflow() {
     let report = h.finish();
     report.assert_success_contract("csi-param-overflow");
     if BYTE_TRANSPARENT_MASTER {
-        // `+`/`-` are CSI intermediate bytes (0x20..=0x2f): `\x1b[-` aborts
-        // at len 3 and its tail leaks as ordinary keys, and the all-`;`
-        // sequence leaks on its abort too. The huge-`~`-param sequences
-        // drop cleanly. Pin the exact leak so drift is loud.
+        // `+`/`-` are CSI intermediate bytes (0x20..=0x2f): `\x1b[-1~` is
+        // now consumed to its `~` final like upstream, leaving only the
+        // trailing plain bytes `-0~+1~`; the all-`;` sequence still leaks
+        // on its abort. The huge-`~`-param sequences drop cleanly. Pin the
+        // exact leak so drift is loud.
         assert_eq!(
             report.live_text.as_deref(),
-            Some("1~-0~+1~;;;;;~ok"),
+            Some("-0~+1~;;;;;~ok"),
             "csi-param-overflow: leak shape diverged; got {:?}; tail={}",
             report.live_text,
             report.tail()
@@ -2117,6 +2118,49 @@ fn parse_sidechannel_u32(raw: &[u8], key: &[u8]) -> Option<u32> {
         return None;
     }
     std::str::from_utf8(&raw[start..end]).ok()?.parse().ok()
+}
+
+/// CSI sequences whose lead byte the parser does not dispatch on
+/// (`\x1b[=…` tertiary-DA style, `\x1b[!` intermediate-led) and C1
+/// sequences (`0x9b` CSI, `0x90`/`0x9d` control strings, `0x8f` SS3)
+/// are still complete terminal sequences: the parser must consume them
+/// to their final byte or string terminator. Dropping only the
+/// introducer replays the payload tail as typed keys.
+#[test]
+fn adversarial_private_lead_and_c1_sequences() {
+    let mut h = Harness::spawn(&["--serve"]);
+    h.wait_input_ready();
+
+    h.send(b"\x1b[=1;2c\x1b[!p\x9b61;1R\x90Payload\x9c\x8fZok");
+    h.pump(Duration::from_millis(120));
+    h.send_ctrl_d();
+    let report = h.finish();
+
+    report.assert_success_contract("private-lead-c1");
+    assert_eq!(
+        report.live_paste,
+        Some(0),
+        "private-lead-c1: sequence payload opened a paste; tail={}",
+        report.tail()
+    );
+    let live_text = report
+        .live_text
+        .as_deref()
+        .unwrap_or_else(|| panic!("private-lead-c1: missing PI_TUI_LIVE_TEXT record"));
+    if BYTE_TRANSPARENT_MASTER {
+        assert_eq!(
+            live_text,
+            "ok",
+            "private-lead-c1: sequence payload leaked into the editor; tail={}",
+            report.tail()
+        );
+    } else {
+        assert!(
+            live_text.contains("ok"),
+            "private-lead-c1: trailing keys lost behind sequences; got {live_text:?}; tail={}",
+            report.tail()
+        );
+    }
 }
 
 fn parse_sidechannel_text(raw: &[u8], key: &[u8]) -> Option<String> {
