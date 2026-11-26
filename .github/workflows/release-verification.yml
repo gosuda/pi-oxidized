@@ -77,9 +77,9 @@ jobs:
         run: |
           test "$(git -C .references/pi rev-parse HEAD)" = "95fbc04997eaee961eb673fa7923e9220609ebd5" # historical witness: native root literal
 
-      # REL-T4: aarch64 legs run natively (depot-ubuntu-24.04-arm-4) — no QEMU, no
-      # cross-compiler. The verification fails loudly if the runner is not a
-      # native arm64 image or if a qemu-aarch64 binfmt handler is registered.
+      # REL-T4: aarch64 artifacts execute on native Depot ARM64 runners.
+      # Candidate B may cross-compile musl; execution never uses QEMU.
+      # The gate rejects a non-native image or registered qemu-aarch64 handler.
       - name: Verify native arm64 runner
         if: startsWith(matrix.target, 'aarch64-')
         shell: bash

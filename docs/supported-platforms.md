@@ -93,15 +93,16 @@ musl smoke-lane row (`crates/pi-tui/tests/transcript_musl_smoke.rs:57`;
   `crates/pi-tui/src/testkit/transcript.rs:103`).
 - Host-native execution: the two musl rows — `release-x86_64-linux-musl`,
   `release-aarch64-linux-musl` — run natively on `depot-ubuntu-24.04-4` /
-  `depot-ubuntu-24.04-arm-4` under the native-image gate — no cross-compilation, no QEMU
-  (`workflow:83-99`) — and the musl transcript lane executes the archive's artifacts
-  through the provisioned loader (`workflow:571-593`).
+  `depot-ubuntu-24.04-arm-4` under the native-image gate, without QEMU
+  (`workflow:83-99`). Candidate A builds with musl-gcc; if it fails on aarch64,
+  the pinned cargo-zigbuild fallback cross-compiles the musl target
+  (`workflow:293-374`). The musl transcript lane executes the archive's artifacts
+  on that native runner through the provisioned loader (`workflow:571-593`).
 - Static-link: the archive's `pi` must show zero `NEEDED` entries and a static `ldd`
   verdict, else the leg fails (`workflow:491-504`).
 - Unpack/integrity: every archive is extracted and smoked from its own bytes
   (`scripts/package-release.ts:318-336,382-462`), and the CI archive-integrity gate
-  reconciles the extracted file set, the archive member set, and the `release.json`
-  manifest set (`workflow:564-568,606-625`).
+  compares the extracted file set with the `release.json` manifest set (`workflow:564-568,606-625`).
 - Two-mode JSONL protocol smokes: the compiled-sidecar `hello` handshake and the
   bundled `pi-extension-host.js`-under-`bun` `hello` handshake both run from the same
   unpacked archive (`scripts/package-release.ts:202-254,429-456`; the musl smoke-lane
@@ -149,10 +150,10 @@ musl smoke-lane row (`crates/pi-tui/tests/transcript_musl_smoke.rs:57`;
   `<archiveDir>/docs/` of every archive, and a release without it fails staging rather
   than shipping doc-less (`scripts/package-release.ts:275`;
   `scripts/release/stage.ts:89-94,188-192`).
-- Per-file digest coverage: the CI gate requires the unpacked file set, the archive
-  member set, and the manifest set to be equal — `release.json` must be present as an
-  archive member but is excluded from set equality because it cannot carry its own
-  digest — and re-derives every member's sha256 and size against the manifest
+- Per-file digest coverage: the CI gate extracts each archive and requires the
+  extracted file set to equal the manifest set, excluding `release.json` because
+  it cannot carry its own digest. It re-derives every manifest file's sha256 and
+  size from the extracted bytes
   (`workflow:564-568,606-625`).
 - Checksum sidecar format is `<lowercase-hex-sha256>  <archive-name>\n`
   (`scripts/release/archive.ts:592-594`), computed from the finalized archive bytes
@@ -273,7 +274,8 @@ musl smoke-lane row (`crates/pi-tui/tests/transcript_musl_smoke.rs:57`;
    `bun-linux-x64-musl-baseline.zip`, `bun-linux-aarch64.zip`,
    `bun-linux-aarch64-musl.zip`, `bun-darwin-x64-baseline.zip`,
    `bun-darwin-aarch64.zip`, `bun-windows-x64-baseline.zip`.
-3. Move the workflow's `bun-version:` step to the same version (`workflow:132-138`).
+3. Update both the workflow's `bun-version:` and the Intel `bun-download-url`
+   to the same Bun version (`workflow:132-138`).
 4. Re-pin the Alpine userland: `MUSL_APT_VERSION` and `ALPINE_GCC_RUNTIME_VERSION` in
    the workflow env block (`workflow:16-19`; currently musl `1.2.4-2`, minirootfs
    `3.24.1`, `libstdc++`/`libgcc` `15.2.0-r5`), the per-arch minirootfs asset + sha256

@@ -554,6 +554,9 @@ describe("release tier matrix 0.2.0 (REL-T5)", () => {
 			const witness = witnesses[row.id];
 			if (witness === undefined) throw new Error(`no CI witness pinned for ${row.id}`);
 			expect(text).toContain(witness);
+			if (row.id === "release-x86_64-darwin") {
+				expect(text).toContain("Rosetta on Apple Silicon");
+			}
 		}
 	});
 
@@ -582,13 +585,16 @@ describe("release tier matrix 0.2.0 (REL-T5)", () => {
 		expect(row?.rationale).toContain("musl-gcc");
 	});
 
-	test("aarch64 rationales claim native depot-ubuntu-24.04-arm-4 execution, never the cross-compile fallback", () => {
+	test("aarch64 rationales distinguish native execution from the musl compiler fallback", () => {
 		for (const id of ["release-aarch64-linux", "release-aarch64-linux-musl"]) {
 			const row = matrix.rows.find((r) => r.id === id);
 			expect(row?.rationale).toContain("depot-ubuntu-24.04-arm-4");
-			expect(row?.rationale).toContain("no cross-compilation");
+			if (id === "release-aarch64-linux") {
+				expect(row?.rationale).toContain("no cross-compilation");
+			} else {
+				expect(row?.rationale).toContain("cargo-zigbuild fallback cross-compiles");
+			}
 			expect(row?.rationale).toContain("no QEMU");
-			expect(row?.rationale ?? "").not.toContain("Cross-compiling aarch64");
 		}
 	});
 });

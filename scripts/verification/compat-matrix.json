@@ -534,7 +534,7 @@
 			"excluded": true,
 			"commands": [],
 			"evidence": "aarch64-linux-musl packaging/protocol lane is not run on the x86_64 linux dev host; CI witness is the native musl leg on depot-ubuntu-24.04-arm-4 (musl-gcc build, static-link/interpreter/archive-integrity gates, transcript_musl_smoke packaging/protocol lane) — no PTY/render/synchronized-output/no-clear claims",
-			"rationale": "Executed natively on the depot-ubuntu-24.04-arm-4 runner: the arm64 kernel runs the aarch64 musl artifacts under the provisioned Alpine arm64 userland (ld-musl-aarch64.so.1), with no cross-compilation and no QEMU — the native-image gate verifies uname -m and RUNNER_ARCH and rejects any registered qemu-aarch64 binfmt handler. The x86_64 dev host provides neither arm64 execution nor an aarch64 musl userland, so the leg is excluded locally.",
+			"rationale": "Artifacts execute natively on the depot-ubuntu-24.04-arm-4 runner: the arm64 kernel runs the aarch64 musl artifacts under the provisioned Alpine arm64 userland (ld-musl-aarch64.so.1), with no QEMU. Candidate A builds with musl-gcc; if it fails, the pinned cargo-zigbuild fallback cross-compiles the musl target on the same runner. The native-image gate verifies uname -m and RUNNER_ARCH and rejects any registered qemu-aarch64 binfmt handler. The x86_64 dev host provides neither arm64 execution nor an aarch64 musl userland, so the leg is excluded locally.",
 			"citation": "scripts/release/targets.ts RUST_TARGETS includes aarch64-unknown-linux-musl; release-verification.yml maps aarch64-unknown-linux-musl to depot-ubuntu-24.04-arm-4 with the Alpine minirootfs arm64 userland (ld-musl-aarch64.so.1)"
 		},
 		{
