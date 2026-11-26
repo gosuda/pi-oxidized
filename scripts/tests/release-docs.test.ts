@@ -147,14 +147,14 @@ function runGenerator(scriptPath: string): { status: number; stdout: string; std
 
 /** Extract the CI matrix target list from the release-verification workflow. */
 function extractCiMatrixTargets(workflow: string): string[] {
-	const targets: string[] = [];
-	for (const line of workflow.split(/\r?\n/)) {
-		const match = /^\s+-\s+target:\s+(.+?)\s*$/.exec(line);
-		if (match !== null) {
-			targets.push(match[1]!);
-		}
+	// The scheduled/tag matrix is the complete release contract. PRs select
+	// only its Linux row to avoid repeating native packaging for every edit.
+	const fullMatrix = /fromJSON\([^]*?&& '(\[[^\n]+?\])' \|\|/.exec(workflow);
+	if (fullMatrix === null) {
+		throw new Error("Complete scheduled/tag release matrix is missing");
 	}
-	return targets;
+	const rows: readonly { readonly target: string }[] = JSON.parse(fullMatrix[1]!);
+	return rows.map(({ target }) => target);
 }
 
 const bytes = (text: string) => new TextEncoder().encode(text);
@@ -655,3 +655,4 @@ describe("DOC-E: extension compatibility narrative cites frames.jsonl", () => {
 		expect(RELEASE_DOC).toContain("frames.jsonl");
 	});
 });
+
