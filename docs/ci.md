@@ -11,7 +11,8 @@ Every runner is Depot. Linux uses Ubuntu 24.04; Windows retains the pinned
 The Intel macOS row uses x64 Rust, Bun and Node on Apple Silicon through
 Rosetta and records that execution mode. It is not a physical Intel Mac
 validation. ARM64 rows retain their fail-closed native-host and no-QEMU checks.
-All seven artifact formats, both determinism passes, archive and interaction
+All seven artifact targets, both determinism passes, archive and interaction
 checks, Windows ConPTY evidence, signature verification and fork attestation
-guards remain. Attested packaging does not restore the shared Rust cache;
+guards remain. Attested packaging does not restore the shared Rust cache or cached Bun
+executables; Intel Node setup also disables automatic package-manager caching.
 Depot cache storage does not provide GitHub's branch isolation.

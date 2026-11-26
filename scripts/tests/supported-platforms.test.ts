@@ -82,7 +82,7 @@ describe("supported-platforms document (REL-T9)", () => {
 		}
 	});
 
-	test("document maps each of the seven triples to its native-runner leg", () => {
+	test("document maps each of the seven triples to its runner and execution mode", () => {
 		for (const triple of [
 			"x86_64-unknown-linux-gnu",
 			"x86_64-unknown-linux-musl",
@@ -94,12 +94,13 @@ describe("supported-platforms document (REL-T9)", () => {
 		]) {
 			expect(doc.includes(`\`${triple}\``)).toBe(true);
 		}
+		expect(doc).toContain("through Rosetta on Apple Silicon");
+		expect(doc).toContain("without a physical Intel Mac");
 		for (const runner of [
-			"ubuntu-latest",
-			"ubuntu-24.04-arm",
-			"macos-15-intel",
-			"macos-15",
-			"windows-2025",
+			"depot-ubuntu-24.04-4",
+			"depot-ubuntu-24.04-arm-4",
+			"depot-macos-latest",
+			"depot-windows-2025-4",
 		]) {
 			expect(doc.includes(runner)).toBe(true);
 		}
@@ -111,7 +112,7 @@ describe("supported-platforms document (REL-T9)", () => {
 			"BUN_RUNTIME_VERSION",
 			"RELEASE_MANIFEST_SCHEMA",
 			"SOURCE_DATE_EPOCH=1735689600",
-			"windows-2025",
+			"depot-windows-2025-4",
 			"15.2.0-r5",
 			"1.2.4-2",
 			"3.24.1",

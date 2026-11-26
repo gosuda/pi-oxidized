@@ -543,11 +543,11 @@ describe("release tier matrix 0.2.0 (REL-T5)", () => {
 
 	test("every excluded release row names its actual CI witness runner", () => {
 		const witnesses: Record<string, string> = {
-			"release-aarch64-linux": "ubuntu-24.04-arm",
-			"release-aarch64-linux-musl": "ubuntu-24.04-arm",
-			"release-aarch64-darwin": "macos-15",
-			"release-x86_64-darwin": "macos-15-intel",
-			"release-x86_64-windows": "windows-2025",
+			"release-aarch64-linux": "depot-ubuntu-24.04-arm-4",
+			"release-aarch64-linux-musl": "depot-ubuntu-24.04-arm-4",
+			"release-aarch64-darwin": "depot-macos-latest",
+			"release-x86_64-darwin": "depot-macos-latest",
+			"release-x86_64-windows": "depot-windows-2025-4",
 		};
 		for (const row of excludedReleaseRows) {
 			const text = `${row.evidence} ${row.rationale ?? ""} ${row.citation ?? ""}`;
@@ -582,10 +582,10 @@ describe("release tier matrix 0.2.0 (REL-T5)", () => {
 		expect(row?.rationale).toContain("musl-gcc");
 	});
 
-	test("aarch64 rationales claim native ubuntu-24.04-arm execution, never the cross-compile fallback", () => {
+	test("aarch64 rationales claim native depot-ubuntu-24.04-arm-4 execution, never the cross-compile fallback", () => {
 		for (const id of ["release-aarch64-linux", "release-aarch64-linux-musl"]) {
 			const row = matrix.rows.find((r) => r.id === id);
-			expect(row?.rationale).toContain("ubuntu-24.04-arm");
+			expect(row?.rationale).toContain("depot-ubuntu-24.04-arm-4");
 			expect(row?.rationale).toContain("no cross-compilation");
 			expect(row?.rationale).toContain("no QEMU");
 			expect(row?.rationale ?? "").not.toContain("Cross-compiling aarch64");
