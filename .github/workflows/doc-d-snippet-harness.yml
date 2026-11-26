@@ -1,10 +1,10 @@
 name: DOC-D Snippet Harness
 
 on:
-  push:
-    branches: ["main", "feat/ver-align-canonical-pin"]
   pull_request:
     branches: ["main"]
+  merge_group:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,7 +16,7 @@ env:
 jobs:
   snippet-harness:
     name: Fenced snippet compile + import resolution
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04-4
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -60,20 +60,6 @@ jobs:
       - name: Run snippet harness tests
         run: bun test scripts/verification/snippet-harness.test.ts
 
-  rust-doctests:
-    name: cargo test --doc (all five crates)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-        with:
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
-
       - name: cargo test --doc for all five crates
         run: |
           for crate in pi-ai pi-agent pi-ext pi-tui pi; do
@@ -81,3 +67,7 @@ jobs:
             cargo test --doc -p "$crate"
             echo "::endgroup::"
           done
+
+concurrency:
+  group: snippets-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true

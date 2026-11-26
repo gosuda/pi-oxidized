@@ -16,7 +16,7 @@ env:
 jobs:
   x86_64-native:
     name: Native x86_64 candidate A
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04-4
     timeout-minutes: 45
     env:
       RUST_TARGET: x86_64-unknown-linux-musl
@@ -402,7 +402,7 @@ jobs:
 
   aarch64-native:
     name: Native aarch64 candidates A then B
-    runs-on: ubuntu-24.04-arm
+    runs-on: depot-ubuntu-24.04-arm-4
     timeout-minutes: 60
     env:
       RUST_TARGET: aarch64-unknown-linux-musl
@@ -836,3 +836,4 @@ jobs:
           path: target/rel-r1-bakeoff/aarch64
           if-no-files-found: error
           overwrite: true
+
