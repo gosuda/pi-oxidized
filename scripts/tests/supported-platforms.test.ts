@@ -92,6 +92,21 @@ describe("supported-platforms document (REL-T9)", () => {
 			"aarch64-apple-darwin": "depot-macos-latest",
 			"x86_64-pc-windows-msvc": "depot-windows-2025-4",
 		};
+		const workflow = readFileSync(
+			join(repoRoot, ".github/workflows/release-verification.yml"),
+			"utf8",
+		);
+		const fullMatrix = /fromJSON\([^]*?&& '(\[[^\n]+?\])' \|\|/.exec(workflow);
+		if (fullMatrix?.[1] === undefined) {
+			throw new Error("Complete scheduled/tag release matrix is missing");
+		}
+		const rows: readonly { readonly target: string; readonly os: string }[] = JSON.parse(
+			fullMatrix[1],
+		);
+		expect(rows.map(({ target }) => target).sort()).toEqual(Object.keys(runners).sort());
+		for (const { target, os } of rows) {
+			expect(os).toBe(runners[target]);
+		}
 		for (const [triple, runner] of Object.entries(runners)) {
 			const row = doc.split("\n").find((line) => line.startsWith(`| \`${triple}\` |`));
 			expect(row).toBeDefined();
