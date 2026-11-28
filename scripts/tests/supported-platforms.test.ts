@@ -105,7 +105,9 @@ describe("supported-platforms document (REL-T9)", () => {
 		);
 		expect(rows.map(({ target }) => target).sort()).toEqual(Object.keys(runners).sort());
 		for (const { target, os } of rows) {
-			expect(os).toBe(runners[target]);
+			const expected = runners[target];
+			expect(expected).toBeDefined();
+			expect(os).toBe(expected ?? "");
 		}
 		for (const [triple, runner] of Object.entries(runners)) {
 			const row = doc.split("\n").find((line) => line.startsWith(`| \`${triple}\` |`));
