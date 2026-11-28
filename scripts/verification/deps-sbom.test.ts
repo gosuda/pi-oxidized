@@ -355,7 +355,7 @@ describe("SBOM content structure", () => {
 			"aws-config@1.11.0",
 			"aws-sdk-bedrockruntime@1.142.0",
 			"google-cloud-auth@1.16.0",
-			"tokio@1.53.1",
+			"tokio@1.53.3",
 			"uuid@1.26.0",
 			"base64@0.23.1",
 			"serde-saphyr@1.1.0",

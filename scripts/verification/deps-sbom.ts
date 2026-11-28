@@ -476,17 +476,27 @@ function workflowPins(root: string): { rust: string; bun: string } {
 		resolve(root, ".github/workflows/release-verification.yml"),
 		"utf8",
 	);
-	const rust = text.match(/toolchain:\s*(\S+)/);
+	// The primary Rust setup is leg-conditional (a matrix expression), so a
+	// first-match scrape records `${{` instead of a pin. The SBOM anchors on
+	// the first unconditional literal pin, which is what every leg resolves
+	// to on the SBOM lane.
+	const matches = [...text.matchAll(/^[ \t]*toolchain:\s*(\S+)/gm)].map((match) => match[1]);
+	if (matches.length === 0) {
+		throw new Error("release-verification.yml: toolchain pin not found");
+	}
+	const rust = matches.find((pin) => pin !== undefined && !pin.startsWith("$"));
+	if (rust === undefined) {
+		throw new Error("release-verification.yml: no literal toolchain pin (matrix expressions cannot anchor the SBOM)");
+	}
 	const bun = text.match(/bun-version:\s*(\S+)/);
-	if (rust === null || bun === null) {
-		throw new Error("release-verification.yml: toolchain/bun-version pins not found");
+	if (bun === null) {
+		throw new Error("release-verification.yml: bun-version pin not found");
 	}
-	const rustPin = rust[1];
 	const bunPin = bun[1];
-	if (rustPin === undefined || bunPin === undefined) {
-		throw new Error("release-verification.yml: toolchain/bun-version pins did not capture a value");
+	if (bunPin === undefined) {
+		throw new Error("release-verification.yml: bun-version pin did not capture a value");
 	}
-	return { rust: rustPin, bun: bunPin };
+	return { rust, bun: bunPin };
 }
 
 export function toolchainChannel(root: string): string {
