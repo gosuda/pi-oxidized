@@ -1940,7 +1940,7 @@ export async function captureReference(
 			metafileSha256: sha256Text(`${JSON.stringify(canonicalizeJson(metafile), null, "\t")}\n`),
 			inputs,
 		};
-		const metafileProjectionText = `${JSON.stringify(metafileProjection, null, "\t")}\n`;
+		const metafileProjectionText = `${JSON.stringify(canonicalizeJson(metafileProjection), null, "\t")}\n`;
 
 		// 4. cargo metadata for the pre-change graph.
 		const cargoRaw = spawnSync("cargo", [...CARGO_METADATA_ARGV], {
