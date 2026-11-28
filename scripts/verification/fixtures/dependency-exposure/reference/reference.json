@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-11-28T15:50:25.301Z",
-	"captureHead": "18d76835219491ebabf283ec977b0e5cc620fa18",
+	"capturedAt": "2026-11-28T15:52:52.411Z",
+	"captureHead": "65cd2374983fd0ae40f074dd3135689330551f8e",
 	"metafile": {
-		"projectionPath": "metafile-projection.819976aacf6fd5daf06aeebe29c53af3c24f76c0957b61c9c02e450be3338041.json",
-		"sha256": "819976aacf6fd5daf06aeebe29c53af3c24f76c0957b61c9c02e450be3338041",
+		"projectionPath": "metafile-projection.b1dcee8ef28313e690e5a3d26330165ef8efe56d30a83032a141510d490070cc.json",
+		"sha256": "b1dcee8ef28313e690e5a3d26330165ef8efe56d30a83032a141510d490070cc",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -20,7 +20,7 @@
 			"<exposure-capture-staging>/pi-extension-host",
 			"--metafile=<exposure-capture-staging>/metafile.json"
 		],
-		"metafileSha256": "6fbe2caa8ce4918de14c4f636dffbaf782c259f556b409453ea3cca8009d3ad0"
+		"metafileSha256": "18c973323841d228f4bf42064bf83cd605bae7b809f39aaebc69d31cc084c2e8"
 	},
 	"cargo": {
 		"projectionPath": "cargo-graph-projection.578bd3d9f1d42e399c005a74508ee758504b086cd1edf80f845e80d68c82765a.json",
