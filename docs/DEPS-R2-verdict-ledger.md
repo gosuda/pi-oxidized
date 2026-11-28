@@ -35,7 +35,7 @@ entry is an audit failure at DEPS-D1.
 |---|---|---|---|---|
 | a8896826f4b0 | 2026-09-05 | npm:typebox | S | E1:fail E2:fail E3:pass E4:pass |
 | a8896826f4b0 | 2026-09-05 | npm:@types/bun | E | E1:pass E2:pass E3:pass E4:pass |
-| a8896826f4b0 | 2026-09-05 | tool:bun-runtime | S | E1:fail E2:fail E3:fail E4:fail |
+| a8896826f4b0 | 2026-09-05 | tool:bun-runtime | S | E1:pass E2:fail E3:fail E4:fail |
 | 13c44baca218 | 2026-11-28 | crate:tokio | S | E1:fail E2:pass E3:fail E4:pass |
 
 ## Records

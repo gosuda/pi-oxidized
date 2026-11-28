@@ -102,7 +102,7 @@ No member crossed a bin boundary; no member dropped or was added. npm `jiti`
   Neither version is yanked. Gates run on the remediation: `cargo deny
   check` (advisories ok), `cargo clippy --workspace --all-targets
   --locked -- -D warnings` (exit 0), `cargo test --workspace
-  --all-targets`, `bun test scripts`, `bun run verify:sbom`
+  --all-targets --locked`, `bun test scripts`, `bun run verify:sbom`
   (DEPENDENCY_SBOM_OK), `bun run verify:dependency-exposure self-check`
   (DEPENDENCY_EXPOSURE_OK); full per-commit evidence in the lane report.
 - The deny.toml tripwire (`unused-ignored-advisory = "deny"`,
