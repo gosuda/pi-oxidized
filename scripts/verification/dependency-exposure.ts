@@ -1869,14 +1869,20 @@ export async function captureReference(
 		// consumer that reasons over argv shape keeps working.
 		const recordedArgv = argv.map((token) => token.split(buildScratch).join(STAGING_DIR_PLACEHOLDER));
 		const metafilePath = join(buildScratch, "metafile.json");
-
 		// 3. Run the authority bun build once, on the trusted tree.
 		const hostDir = join(root, HOST_PACKAGE_DIR);
+
 		const build = spawnSync("bun", argv, { cwd: hostDir, encoding: "utf8", timeout: 10 * 60_000 });
 		if (build.status !== 0) {
 			throw new ExposureError(`bun build (authority argv) failed: ${(build.stderr ?? "").slice(0, 800)}`);
 		}
-		const metafileText = readFileSync(metafilePath, "utf8");
+		const rawMetafileText = readFileSync(metafilePath, "utf8");
+		// The bundler records the absolute outfile path, which lives under the
+		// machine-local scratch. Normalize it to the same placeholder as argv
+		// before parsing and hashing, or two captures can never agree on the
+		// metafile digest. Input keys are repo-absolute source paths and never
+		// contain the scratch dir, so per-input hashes are untouched.
+		const metafileText = rawMetafileText.split(buildScratch).join(STAGING_DIR_PLACEHOLDER);
 		const metafile = parseJson(metafileText, "metafile.json");
 		const inputsRaw = metafile["inputs"];
 		const inputsRecord = asRecord(inputsRaw, "metafile inputs");
