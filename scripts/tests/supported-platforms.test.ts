@@ -82,27 +82,45 @@ describe("supported-platforms document (REL-T9)", () => {
 		}
 	});
 
-	test("document maps each of the seven triples to its native-runner leg", () => {
-		for (const triple of [
-			"x86_64-unknown-linux-gnu",
-			"x86_64-unknown-linux-musl",
-			"aarch64-unknown-linux-gnu",
-			"aarch64-unknown-linux-musl",
-			"x86_64-apple-darwin",
-			"aarch64-apple-darwin",
-			"x86_64-pc-windows-msvc",
-		]) {
-			expect(doc.includes(`\`${triple}\``)).toBe(true);
+	test("document maps each of the seven triples to its runner and execution mode", () => {
+		const runners: Readonly<Record<string, string>> = {
+			"x86_64-unknown-linux-gnu": "depot-ubuntu-24.04-4",
+			"x86_64-unknown-linux-musl": "depot-ubuntu-24.04-4",
+			"aarch64-unknown-linux-gnu": "depot-ubuntu-24.04-arm-4",
+			"aarch64-unknown-linux-musl": "depot-ubuntu-24.04-arm-4",
+			"x86_64-apple-darwin": "depot-macos-latest",
+			"aarch64-apple-darwin": "depot-macos-latest",
+			"x86_64-pc-windows-msvc": "depot-windows-2025-4",
+		};
+		const workflow = readFileSync(
+			join(repoRoot, ".github/workflows/release-verification.yml"),
+			"utf8",
+		);
+		const fullMatrix = /fromJSON\([^]*?&& '(\[[^\n]+?\])' \|\|/.exec(workflow);
+		if (fullMatrix?.[1] === undefined) {
+			throw new Error("Complete scheduled/tag release matrix is missing");
 		}
-		for (const runner of [
-			"ubuntu-latest",
-			"ubuntu-24.04-arm",
-			"macos-15-intel",
-			"macos-15",
-			"windows-2025",
-		]) {
-			expect(doc.includes(runner)).toBe(true);
+		const rows: readonly { readonly target: string; readonly os: string }[] = JSON.parse(
+			fullMatrix[1],
+		);
+		expect(rows.map(({ target }) => target).sort()).toEqual(Object.keys(runners).sort());
+		for (const { target, os } of rows) {
+			const expected = runners[target];
+			expect(expected).toBeDefined();
+			expect(os).toBe(expected ?? "");
 		}
+		for (const [triple, runner] of Object.entries(runners)) {
+			const row = doc.split("\n").find((line) => line.startsWith(`| \`${triple}\` |`));
+			expect(row).toBeDefined();
+			const runnerCell = row?.split("|")[2] ?? "";
+			expect(runnerCell).toContain(`\`${runner}\``);
+			if (triple === "x86_64-apple-darwin") {
+				expect(runnerCell).toContain("through Rosetta on Apple Silicon");
+			} else {
+				expect(runnerCell).not.toContain("Rosetta");
+			}
+		}
+		expect(doc).toContain("without a physical Intel Mac");
 	});
 
 	test("document records the release authorities and dated pins it narrates", () => {
@@ -111,7 +129,6 @@ describe("supported-platforms document (REL-T9)", () => {
 			"BUN_RUNTIME_VERSION",
 			"RELEASE_MANIFEST_SCHEMA",
 			"SOURCE_DATE_EPOCH=1735689600",
-			"windows-2025",
 			"15.2.0-r5",
 			"1.2.4-2",
 			"3.24.1",

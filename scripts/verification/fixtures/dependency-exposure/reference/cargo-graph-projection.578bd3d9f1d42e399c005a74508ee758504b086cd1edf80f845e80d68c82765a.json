@@ -1250,13 +1250,6 @@
 		},
 		{
 			"from": "aws-smithy-http",
-			"to": "pin-utils",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "aws-smithy-http",
 			"to": "tracing",
 			"kinds": [
 				"normal"
@@ -1509,20 +1502,6 @@
 		},
 		{
 			"from": "aws-smithy-runtime",
-			"to": "http",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "aws-smithy-runtime",
-			"to": "http-body",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "aws-smithy-runtime",
 			"to": "http-body",
 			"kinds": [
 				"normal"
@@ -1538,13 +1517,6 @@
 		{
 			"from": "aws-smithy-runtime",
 			"to": "pin-project-lite",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "aws-smithy-runtime",
-			"to": "pin-utils",
 			"kinds": [
 				"normal"
 			]
@@ -1587,13 +1559,6 @@
 		{
 			"from": "aws-smithy-runtime-api",
 			"to": "bytes",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "aws-smithy-runtime-api",
-			"to": "http",
 			"kinds": [
 				"normal"
 			]
@@ -1676,6 +1641,27 @@
 			]
 		},
 		{
+			"from": "aws-smithy-schema",
+			"to": "aws-smithy-runtime-api",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-schema",
+			"to": "aws-smithy-types",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
+			"from": "aws-smithy-schema",
+			"to": "http",
+			"kinds": [
+				"normal"
+			]
+		},
+		{
 			"from": "aws-smithy-types",
 			"to": "base64-simd",
 			"kinds": [
@@ -1712,20 +1698,6 @@
 		},
 		{
 			"from": "aws-smithy-types",
-			"to": "http",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "aws-smithy-types",
-			"to": "http-body",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "aws-smithy-types",
 			"to": "http-body",
 			"kinds": [
 				"normal"
@@ -1747,21 +1719,7 @@
 		},
 		{
 			"from": "aws-smithy-types",
-			"to": "num-integer",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "aws-smithy-types",
 			"to": "pin-project-lite",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "aws-smithy-types",
-			"to": "pin-utils",
 			"kinds": [
 				"normal"
 			]
@@ -3797,27 +3755,6 @@
 			]
 		},
 		{
-			"from": "http-body",
-			"to": "pin-project-lite",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "http-body",
-			"to": "bytes",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "http-body",
-			"to": "http",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
 			"from": "http-body-util",
 			"to": "bytes",
 			"kinds": [
@@ -5297,13 +5234,6 @@
 		{
 			"from": "num-derive",
 			"to": "syn",
-			"kinds": [
-				"normal"
-			]
-		},
-		{
-			"from": "num-integer",
-			"to": "num-traits",
 			"kinds": [
 				"normal"
 			]

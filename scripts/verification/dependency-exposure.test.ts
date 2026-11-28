@@ -20,6 +20,7 @@ import {
 	CANONICAL_REFERENCE_DIR,
 	ExposureError,
 	REPO_ROOT,
+	STAGING_DIR_PLACEHOLDER,
 	captureReference,
 	e1Cargo,
 	e1Npm,
@@ -843,7 +844,7 @@ function ownedOutDir(label: string): string {
 	return dir;
 }
 
-/** The directory a capture's recorded `--metafile=` argument points into (its unique build scratch). */
+/** The staging dir recorded in a capture's `--metafile=` argument (a fixed placeholder, not the unique build scratch). */
 function capturedMetafileDir(manifest: ReferenceManifest): string {
 	const token = manifest.metafile.argv.find((arg) => arg.startsWith("--metafile="));
 	if (token === undefined) throw new Error("captured argv lacks --metafile");
@@ -1178,10 +1179,10 @@ describe("captureReference real producer captures (plan cases 14-19)", () => {
 
 	// Case 15: repeated same-process captures use fresh authority exports —
 	// transitive (names.ts, reached only through targets.ts) and top-level
-	// (targets.ts, host.ts) — and every run gets a unique build scratch whose
-	// real path is recorded in the captured argv.
+	// (targets.ts, host.ts) — while every run records the same fixed staging
+	// placeholder, never its unique build scratch.
 	test(
-		"repeated same-process captures see fresh top-level and transitive authority exports with unique scratch",
+		"repeated same-process captures see fresh top-level and transitive authority exports with stable scratch",
 		async () => {
 			const repo = newExposureRepo("fresh");
 			const first = await captureReference(repo, ownedOutDir("fresh-1"), { inputMode: "staged" });
@@ -1207,31 +1208,32 @@ describe("captureReference real producer captures (plan cases 14-19)", () => {
 			expect(fourth.metafile.argv).toContain("--minify");
 
 			const scratchDirs = [first, second, third, fourth].map(capturedMetafileDir);
-			expect(new Set(scratchDirs).size).toBe(4);
+			expect(new Set(scratchDirs)).toEqual(new Set([STAGING_DIR_PLACEHOLDER]));
 		},
 		PRODUCER_TIMEOUT_MS,
 	);
 
-	// Case 15 (publication): two captures into one outDir never share a
-	// metafile.json scratch path, while identical cargo-projection bytes share
-	// one immutable name through the no-replace link + byte-check path.
+	// Case 15 (publication): two captures into one outDir record the same fixed
+	// staging placeholder, so the metafile projection collides on one immutable
+	// name exactly like the cargo projection does — the second install of each
+	// takes the existing-file byte-check path instead of overwriting.
 	test(
-		"two captures into one outDir share identical immutable projection bytes and never share metafile scratch",
+		"two captures into one outDir share identical immutable projection bytes including metafile scratch",
 		async () => {
 			const repo = newExposureRepo("shared");
 			const out = ownedOutDir("shared-out");
 			const a = await captureReference(repo, out, { inputMode: "staged" });
 			const b = await captureReference(repo, out, { inputMode: "staged" });
-			// Unique build scratch per run, recorded in the real argv.
-			expect(capturedMetafileDir(a)).not.toBe(capturedMetafileDir(b));
+			// Both runs record the fixed staging placeholder, so both the cargo
+			// and the metafile projection collide on identical bytes and hash
+			// names.
+			expect(capturedMetafileDir(a)).toBe(capturedMetafileDir(b));
+			expect(capturedMetafileDir(a)).toBe(STAGING_DIR_PLACEHOLDER);
 			// The cargo projection has no run-specific content: identical bytes,
 			// identical hash name — the second install takes the existing-file
 			// byte-check path instead of overwriting.
 			expect(a.cargo.projectionPath).toBe(b.cargo.projectionPath);
-			// The metafile projection embeds the run-specific argv, so the two
-			// runs can never collide on one name.
-			expect(a.metafile.projectionPath).not.toBe(b.metafile.projectionPath);
-			// Whichever manifest won the rename, the selected bundle is complete.
+			expect(a.metafile.projectionPath).toBe(b.metafile.projectionPath);
 			const loaded = loadReferenceBundle(out);
 			expect([a.capturedAt, b.capturedAt]).toContain(loaded.manifest.capturedAt);
 		},
@@ -1532,7 +1534,9 @@ describe("captureReference real producer captures (plan cases 14-19)", () => {
 			addSecondFixtureCrate(repo);
 			const current = await captureReference(repo, out, { inputMode: "staged" });
 			expect(current.cargo.projectionPath).not.toBe(old.cargo.projectionPath);
-			expect(current.metafile.projectionPath).not.toBe(old.metafile.projectionPath);
+			// The crate only changes the cargo graph: no metafile input moved,
+			// so the metafile projection collides on identical bytes by design.
+			expect(current.metafile.projectionPath).toBe(old.metafile.projectionPath);
 
 			// The old generation's selected bytes are retained in place.
 			expect(sha256FileAt(join(out, old.metafile.projectionPath))).toBe(old.metafile.sha256);
