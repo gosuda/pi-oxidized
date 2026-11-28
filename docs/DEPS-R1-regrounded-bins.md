@@ -43,7 +43,7 @@ any 0.x minor step, any major step, toolchain channel → **X**.
 | aws-config | 1.9.0 | 1.11.0 | 1.11.0 | M (unchanged) |
 | aws-sdk-bedrockruntime | 1.136.0 | 1.142.0 | 1.142.0 | M (unchanged) |
 | google-cloud-auth | 1.14.0 | 1.15.0 | **1.16.0** | **M (re-targeted; 1.15→1.16 is a same-major minor)** |
-| tokio | 1.52.4 | 1.53.1 | 1.53.1 | M (unchanged) |
+| tokio | 1.52.4 | 1.53.1 | **1.53.3** | **M (re-targeted; 1.53.1→1.53.3 is a same-major patch inside the binned 1.53 line, RUSTSEC-2026-0386)** |
 | uuid | 1.24.0 | 1.25.0 | **1.26.0** | **M (re-targeted; 1.25→1.26 is a same-major minor)** |
 | @types/bun (npm) | 1.3.9 | 1.4.0 | 1.4.0 | M (unchanged) |
 | typebox (npm) | 1.1.38 | 1.3.19 | 1.3.19 | M (unchanged) |
@@ -68,8 +68,11 @@ so the EXT-26 musl legs stay provisionable on the re-grounded toolchain.
 
 **Moved-member ledger:** exactly two members moved since 2026-08-26 —
 `google-cloud-auth` 1.15.0→1.16.0 and `uuid` 1.25.0→1.26.0 — both same-major
-minor steps, both re-binned to (remain in) Bin M with re-dated targets. No
-member crossed a bin boundary; no member dropped or was added. npm `jiti`
+minor steps, both re-binned to (remain in) Bin M with re-dated targets. A
+third member moved on 2026-11-28: `tokio` 1.53.1→1.53.3, a same-major patch
+inside the binned 1.53 line diverted out-of-band by RUSTSEC-2026-0386
+(remediation commit `3f39dcb`), remaining in Bin M with a re-dated target.
+No member crossed a bin boundary; no member dropped or was added. npm `jiti`
 2.7.0 (direct runtime pin, not a bin member) is already at latest.
 
 ## 2. Yank and advisory state (zero diversions)

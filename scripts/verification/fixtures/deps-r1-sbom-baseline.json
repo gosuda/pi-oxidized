@@ -1,12 +1,12 @@
 {
 	"schema": "pi.deps.sbom.v1",
 	"capturedAt": "2026-11-28",
-	"captureHead": "3f39dcb31638a59475e4b27a74ade58a96375e4a",
-	"contentSha256": "a1fe53f3027d23c2a296003faedaf8053bc4b3ceaef5899e2a52f7743401d75b",
+	"captureHead": "481841d2630350878fbdcee0800025d7e2b7bc28",
+	"contentSha256": "143746080e6d41d5367f0657f628c8d6de913c582b8aacf5da0045fa5f64983f",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.98.0",
-			"ciRustToolchain": "${{",
+			"ciRustToolchain": "1.98.0",
 			"packages": [
 				{
 					"name": "adler2",
