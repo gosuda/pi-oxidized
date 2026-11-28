@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-11-28T13:07:24.990Z",
-	"captureHead": "67e17f29fc12746f75e00d567c88824e80308ea2",
+	"capturedAt": "2026-11-28T15:50:25.301Z",
+	"captureHead": "18d76835219491ebabf283ec977b0e5cc620fa18",
 	"metafile": {
-		"projectionPath": "metafile-projection.ecb5e4f134e1309fffc0064860157423c52d490c6fe4e08b9730762b9c2c4fb5.json",
-		"sha256": "ecb5e4f134e1309fffc0064860157423c52d490c6fe4e08b9730762b9c2c4fb5",
+		"projectionPath": "metafile-projection.819976aacf6fd5daf06aeebe29c53af3c24f76c0957b61c9c02e450be3338041.json",
+		"sha256": "819976aacf6fd5daf06aeebe29c53af3c24f76c0957b61c9c02e450be3338041",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -17,10 +17,10 @@
 			"--target",
 			"bun-linux-x64-baseline",
 			"--outfile",
-			"/home/alpha/repos-devtool/.outline/scratch/tmp-ci-piox/exposure-capture-dHD0SC/pi-extension-host",
-			"--metafile=/home/alpha/repos-devtool/.outline/scratch/tmp-ci-piox/exposure-capture-dHD0SC/metafile.json"
+			"<exposure-capture-staging>/pi-extension-host",
+			"--metafile=<exposure-capture-staging>/metafile.json"
 		],
-		"metafileSha256": "29ad9d1aca68ca225ba0d2b0ff51bc2df59796ff74f67685b375000c84812ba7"
+		"metafileSha256": "6fbe2caa8ce4918de14c4f636dffbaf782c259f556b409453ea3cca8009d3ad0"
 	},
 	"cargo": {
 		"projectionPath": "cargo-graph-projection.578bd3d9f1d42e399c005a74508ee758504b086cd1edf80f845e80d68c82765a.json",
