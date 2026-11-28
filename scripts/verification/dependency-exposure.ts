@@ -115,6 +115,8 @@ export const CANONICAL_REFERENCE_DIR = join(
 	REPO_ROOT,
 	"scripts/verification/fixtures/dependency-exposure/reference",
 );
+/** Placeholder recorded for the machine-local build scratch in captured argv. */
+export const STAGING_DIR_PLACEHOLDER = "<exposure-capture-staging>";
 /** cargo metadata argv captured and replayed for the Rust dep graph. */
 export const CARGO_METADATA_ARGV = [
 	"metadata",
@@ -132,6 +134,23 @@ const EMIT_TOKENS = new Set(["build", "--compile", "--outfile", "--outdir", "--r
 const NON_DEV_FIELDS = ["dependencies", "optionalDependencies", "peerDependencies"] as const;
 const DEP_FIELDS = [...NON_DEV_FIELDS, "devDependencies"] as const;
 const SHA256_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Recursively key-sorted copy of a JSON value. The bundler emits metafile
+ * object keys in discovery order, which varies run to run for identical
+ * input sets; hashing the canonical form keeps the recorded digest stable.
+ */
+function canonicalizeJson(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalizeJson);
+	if (value !== null && typeof value === "object") {
+		const sorted: Record<string, unknown> = {};
+		for (const key of Object.keys(value).sort()) {
+			sorted[key] = canonicalizeJson((value as Record<string, unknown>)[key]);
+		}
+		return sorted;
+	}
+	return value;
+}
 
 export class ExposureError extends Error {
 	constructor(message: string) {
@@ -1860,15 +1879,27 @@ export async function captureReference(
 
 	try {
 		const { argv } = captureBuildArgv(root, triple, buildScratch);
+		// The build runs with the real machine-local scratch, but the recorded
+		// argv stores a fixed placeholder: absolute scratch paths would otherwise
+		// pin the author's checkout into the reference and break cross-machine
+		// byte identity. Structure (flags, entry, target) is untouched, so every
+		// consumer that reasons over argv shape keeps working.
+		const recordedArgv = argv.map((token) => token.split(buildScratch).join(STAGING_DIR_PLACEHOLDER));
 		const metafilePath = join(buildScratch, "metafile.json");
-
 		// 3. Run the authority bun build once, on the trusted tree.
 		const hostDir = join(root, HOST_PACKAGE_DIR);
+
 		const build = spawnSync("bun", argv, { cwd: hostDir, encoding: "utf8", timeout: 10 * 60_000 });
 		if (build.status !== 0) {
 			throw new ExposureError(`bun build (authority argv) failed: ${(build.stderr ?? "").slice(0, 800)}`);
 		}
-		const metafileText = readFileSync(metafilePath, "utf8");
+		const rawMetafileText = readFileSync(metafilePath, "utf8");
+		// The bundler records the absolute outfile path, which lives under the
+		// machine-local scratch. Normalize it to the same placeholder as argv
+		// before parsing and hashing, or two captures can never agree on the
+		// metafile digest. Input keys are repo-absolute source paths and never
+		// contain the scratch dir, so per-input hashes are untouched.
+		const metafileText = rawMetafileText.split(buildScratch).join(STAGING_DIR_PLACEHOLDER);
 		const metafile = parseJson(metafileText, "metafile.json");
 		const inputsRaw = metafile["inputs"];
 		const inputsRecord = asRecord(inputsRaw, "metafile inputs");
@@ -1905,11 +1936,11 @@ export async function captureReference(
 			schema: METAFILE_PROJECTION_SCHEMA,
 			entry: "./src/main.ts",
 			hostDirRel: HOST_PACKAGE_DIR,
-			argv,
-			metafileSha256: sha256Text(metafileText),
+			argv: recordedArgv,
+			metafileSha256: sha256Text(`${JSON.stringify(canonicalizeJson(metafile), null, "\t")}\n`),
 			inputs,
 		};
-		const metafileProjectionText = `${JSON.stringify(metafileProjection, null, "\t")}\n`;
+		const metafileProjectionText = `${JSON.stringify(canonicalizeJson(metafileProjection), null, "\t")}\n`;
 
 		// 4. cargo metadata for the pre-change graph.
 		const cargoRaw = spawnSync("cargo", [...CARGO_METADATA_ARGV], {
@@ -1977,7 +2008,7 @@ export async function captureReference(
 				sha256: metaSha,
 				entry: "./src/main.ts",
 				hostDirRel: HOST_PACKAGE_DIR,
-				argv,
+				argv: recordedArgv,
 				metafileSha256: metafileProjection.metafileSha256,
 			},
 			cargo: {
