@@ -1,12 +1,12 @@
 {
 	"schema": "pi.deps.sbom.v1",
-	"capturedAt": "2026-10-01",
-	"captureHead": "6188be832b7bb2ce83bda32293d4a07908e58c8e",
-	"contentSha256": "a25ae60e9d4256f2059a0e23027b4e7e07ea499da89ac56746dc21132c295745",
+	"capturedAt": "2026-11-28",
+	"captureHead": "3f39dcb31638a59475e4b27a74ade58a96375e4a",
+	"contentSha256": "a1fe53f3027d23c2a296003faedaf8053bc4b3ceaef5899e2a52f7743401d75b",
 	"content": {
 		"rust": {
 			"toolchainChannel": "1.98.0",
-			"ciRustToolchain": "1.98.0",
+			"ciRustToolchain": "${{",
 			"packages": [
 				{
 					"name": "adler2",
@@ -218,7 +218,7 @@
 				},
 				{
 					"name": "aws-smithy-async",
-					"version": "1.3.0",
+					"version": "1.3.1",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -226,7 +226,7 @@
 				},
 				{
 					"name": "aws-smithy-eventstream",
-					"version": "0.61.2",
+					"version": "0.61.6",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -234,7 +234,7 @@
 				},
 				{
 					"name": "aws-smithy-http",
-					"version": "0.64.0",
+					"version": "0.64.2",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -242,7 +242,7 @@
 				},
 				{
 					"name": "aws-smithy-http-client",
-					"version": "1.4.0",
+					"version": "1.5.3",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -274,7 +274,7 @@
 				},
 				{
 					"name": "aws-smithy-runtime",
-					"version": "1.14.0",
+					"version": "1.16.1",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -282,7 +282,7 @@
 				},
 				{
 					"name": "aws-smithy-runtime-api",
-					"version": "1.15.0",
+					"version": "1.22.1",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -290,7 +290,7 @@
 				},
 				{
 					"name": "aws-smithy-runtime-api-macros",
-					"version": "1.1.0",
+					"version": "1.2.0",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -305,8 +305,16 @@
 					"devOnly": false
 				},
 				{
+					"name": "aws-smithy-schema",
+					"version": "1.2.0",
+					"license": "Apache-2.0",
+					"source": "registry",
+					"direct": false,
+					"devOnly": false
+				},
+				{
 					"name": "aws-smithy-types",
-					"version": "1.6.2",
+					"version": "1.9.5",
 					"license": "Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -738,7 +746,7 @@
 				},
 				{
 					"name": "ctutils",
-					"version": "0.4.2",
+					"version": "0.4.4",
 					"license": "Apache-2.0 OR MIT",
 					"source": "registry",
 					"direct": false,
@@ -1082,7 +1090,7 @@
 				},
 				{
 					"name": "form_urlencoded",
-					"version": "1.2.2",
+					"version": "1.2.3",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -1316,14 +1324,6 @@
 					"name": "http",
 					"version": "1.4.2",
 					"license": "MIT OR Apache-2.0",
-					"source": "registry",
-					"direct": false,
-					"devOnly": false
-				},
-				{
-					"name": "http-body",
-					"version": "0.4.6",
-					"license": "MIT",
 					"source": "registry",
 					"direct": false,
 					"devOnly": false
@@ -1722,7 +1722,7 @@
 				},
 				{
 					"name": "libsqlite3-sys",
-					"version": "0.38.2",
+					"version": "0.39.0",
 					"license": "MIT",
 					"source": "registry",
 					"direct": false,
@@ -1923,14 +1923,6 @@
 				{
 					"name": "num-derive",
 					"version": "0.4.2",
-					"license": "MIT OR Apache-2.0",
-					"source": "registry",
-					"direct": false,
-					"devOnly": false
-				},
-				{
-					"name": "num-integer",
-					"version": "0.1.46",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": false,
@@ -2185,14 +2177,6 @@
 					"devOnly": false
 				},
 				{
-					"name": "pin-utils",
-					"version": "0.1.0",
-					"license": "MIT OR Apache-2.0",
-					"source": "registry",
-					"direct": false,
-					"devOnly": false
-				},
-				{
 					"name": "pkg-config",
 					"version": "0.3.33",
 					"license": "MIT OR Apache-2.0",
@@ -2274,7 +2258,7 @@
 				},
 				{
 					"name": "pulldown-cmark",
-					"version": "0.13.4",
+					"version": "0.13.6",
 					"license": "MIT",
 					"source": "registry",
 					"direct": true,
@@ -2570,7 +2554,7 @@
 				},
 				{
 					"name": "rusqlite",
-					"version": "0.40.2",
+					"version": "0.41.0",
 					"license": "MIT",
 					"source": "registry",
 					"direct": true,
@@ -2594,7 +2578,7 @@
 				},
 				{
 					"name": "rustix",
-					"version": "1.1.4",
+					"version": "1.1.6",
 					"license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
 					"source": "registry",
 					"direct": true,
@@ -2602,7 +2586,7 @@
 				},
 				{
 					"name": "rustls",
-					"version": "0.23.45",
+					"version": "0.23.46",
 					"license": "Apache-2.0 OR ISC OR MIT",
 					"source": "registry",
 					"direct": false,
@@ -2642,7 +2626,7 @@
 				},
 				{
 					"name": "rustls-webpki",
-					"version": "0.103.15",
+					"version": "0.103.16",
 					"license": "ISC",
 					"source": "registry",
 					"direct": false,
@@ -3234,7 +3218,7 @@
 				},
 				{
 					"name": "tokio",
-					"version": "1.53.1",
+					"version": "1.53.3",
 					"license": "MIT",
 					"source": "registry",
 					"direct": true,
@@ -3458,7 +3442,7 @@
 				},
 				{
 					"name": "url",
-					"version": "2.5.8",
+					"version": "2.5.9",
 					"license": "MIT OR Apache-2.0",
 					"source": "registry",
 					"direct": true,
@@ -3658,7 +3642,7 @@
 				},
 				{
 					"name": "webpki-roots",
-					"version": "1.0.8",
+					"version": "1.0.10",
 					"license": "CDLA-Permissive-2.0",
 					"source": "registry",
 					"direct": false,
@@ -4034,24 +4018,24 @@
 				},
 				{
 					"name": "zstd",
-					"version": "0.13.3",
-					"license": "MIT",
+					"version": "0.13.4",
+					"license": "BSD-3-Clause",
 					"source": "registry",
 					"direct": true,
 					"devOnly": false
 				},
 				{
 					"name": "zstd-safe",
-					"version": "7.2.4",
-					"license": "MIT OR Apache-2.0",
+					"version": "7.4.2",
+					"license": "BSD-3-Clause",
 					"source": "registry",
 					"direct": false,
 					"devOnly": false
 				},
 				{
 					"name": "zstd-sys",
-					"version": "2.0.16+zstd.1.5.7",
-					"license": "MIT/Apache-2.0",
+					"version": "2.2.0+zstd.1.6.0",
+					"license": "BSD-3-Clause AND BSD-2-Clause",
 					"source": "registry",
 					"direct": false,
 					"devOnly": false

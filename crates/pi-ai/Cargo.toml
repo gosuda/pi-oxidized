@@ -25,17 +25,17 @@ serde_json = "=1.0.151"
 sha2 = { version = "=0.11.0", default-features = false }
 tempfile = "=3.27.0"
 thiserror = "=2.0.20"
-tokio = { version = "=1.53.1", default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
+tokio = { version = "=1.53.3", default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-util = { version = "=0.7.19", default-features = false, features = ["rt"] }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 uuid = { version = "=1.26.0", default-features = false, features = ["v4"] }
-zstd = { version = "=0.13.3", default-features = false }
+zstd = { version = "=0.13.4", default-features = false }
 
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "=0.31.3", default-features = false, features = ["signal"] }
 [dev-dependencies]
-tokio = { version = "=1.53.1", default-features = false, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.53.3", default-features = false, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [[bin]]
 name = "pi-ai"
