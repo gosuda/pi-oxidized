@@ -135,6 +135,23 @@ const NON_DEV_FIELDS = ["dependencies", "optionalDependencies", "peerDependencie
 const DEP_FIELDS = [...NON_DEV_FIELDS, "devDependencies"] as const;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 
+/**
+ * Recursively key-sorted copy of a JSON value. The bundler emits metafile
+ * object keys in discovery order, which varies run to run for identical
+ * input sets; hashing the canonical form keeps the recorded digest stable.
+ */
+function canonicalizeJson(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalizeJson);
+	if (value !== null && typeof value === "object") {
+		const sorted: Record<string, unknown> = {};
+		for (const key of Object.keys(value).sort()) {
+			sorted[key] = canonicalizeJson((value as Record<string, unknown>)[key]);
+		}
+		return sorted;
+	}
+	return value;
+}
+
 export class ExposureError extends Error {
 	constructor(message: string) {
 		super(message);
@@ -1920,7 +1937,7 @@ export async function captureReference(
 			entry: "./src/main.ts",
 			hostDirRel: HOST_PACKAGE_DIR,
 			argv: recordedArgv,
-			metafileSha256: sha256Text(metafileText),
+			metafileSha256: sha256Text(`${JSON.stringify(canonicalizeJson(metafile), null, "\t")}\n`),
 			inputs,
 		};
 		const metafileProjectionText = `${JSON.stringify(metafileProjection, null, "\t")}\n`;
