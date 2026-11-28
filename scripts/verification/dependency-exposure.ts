@@ -115,6 +115,8 @@ export const CANONICAL_REFERENCE_DIR = join(
 	REPO_ROOT,
 	"scripts/verification/fixtures/dependency-exposure/reference",
 );
+/** Placeholder recorded for the machine-local build scratch in captured argv. */
+export const STAGING_DIR_PLACEHOLDER = "<exposure-capture-staging>";
 /** cargo metadata argv captured and replayed for the Rust dep graph. */
 export const CARGO_METADATA_ARGV = [
 	"metadata",
@@ -1860,6 +1862,12 @@ export async function captureReference(
 
 	try {
 		const { argv } = captureBuildArgv(root, triple, buildScratch);
+		// The build runs with the real machine-local scratch, but the recorded
+		// argv stores a fixed placeholder: absolute scratch paths would otherwise
+		// pin the author's checkout into the reference and break cross-machine
+		// byte identity. Structure (flags, entry, target) is untouched, so every
+		// consumer that reasons over argv shape keeps working.
+		const recordedArgv = argv.map((token) => token.split(buildScratch).join(STAGING_DIR_PLACEHOLDER));
 		const metafilePath = join(buildScratch, "metafile.json");
 
 		// 3. Run the authority bun build once, on the trusted tree.
@@ -1905,7 +1913,7 @@ export async function captureReference(
 			schema: METAFILE_PROJECTION_SCHEMA,
 			entry: "./src/main.ts",
 			hostDirRel: HOST_PACKAGE_DIR,
-			argv,
+			argv: recordedArgv,
 			metafileSha256: sha256Text(metafileText),
 			inputs,
 		};
@@ -1977,7 +1985,7 @@ export async function captureReference(
 				sha256: metaSha,
 				entry: "./src/main.ts",
 				hostDirRel: HOST_PACKAGE_DIR,
-				argv,
+				argv: recordedArgv,
 				metafileSha256: metafileProjection.metafileSha256,
 			},
 			cargo: {

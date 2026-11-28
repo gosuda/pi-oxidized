@@ -20,6 +20,7 @@ import {
 	loadSnapshot,
 	toolchainChannel,
 	verifySnapshot,
+	workflowPins,
 } from "./deps-sbom.ts";
 import type { SbomContent } from "./deps-sbom.ts";
 import { readVendorSourcePins } from "./vendor-provenance.ts";
@@ -384,6 +385,73 @@ describe("SBOM content structure", () => {
 		}
 		expect(content.rust.toolchainChannel).toBe(content.rust.ciRustToolchain);
 		expect(content.tools.bunRuntimeVersion).toBe(content.tools.ciBunVersion);
+	});
+});
+
+describe("workflow toolchain pin unanimity", () => {
+	function workflowRoot(workflow: string): string {
+		const root = freshTestRoot("workflow-pins");
+		mkdirSync(join(root, ".github/workflows"), { recursive: true });
+		writeFileSync(join(root, ".github/workflows/release-verification.yml"), workflow);
+		return root;
+	}
+
+	test("a second job with a different literal fails closed", () => {
+		const root = workflowRoot(
+			[
+				"jobs:",
+				"  release-verification:",
+				"    steps:",
+				"      - name: Set up Rust",
+				"        with:",
+				"          toolchain: 1.98.0",
+				"          bun-version: 1.3.14",
+				"  compatibility:",
+				"    steps:",
+				"      - name: Set up Rust",
+				"        with:",
+				"          toolchain: 1.99.0",
+				"",
+			].join("\n"),
+		);
+		expect(() => workflowPins(root)).toThrow(/toolchain pins disagree/);
+	});
+
+	test("matching literals across jobs anchor the shared value", () => {
+		const root = workflowRoot(
+			[
+				"jobs:",
+				"  release-verification:",
+				"    steps:",
+				"      - name: Set up Rust",
+				"        with:",
+				"          toolchain: ${{ matrix.target == 'x' && '1.98.0-x' || '1.98.0' }}",
+				"          bun-version: 1.3.14",
+				"  compatibility:",
+				"    steps:",
+				"      - name: Set up Rust",
+				"        with:",
+				"          toolchain: 1.98.0",
+				"",
+			].join("\n"),
+		);
+		expect(workflowPins(root)).toEqual({ rust: "1.98.0", bun: "1.3.14" });
+	});
+
+	test("a matrix-only workflow fails closed", () => {
+		const root = workflowRoot(
+			[
+				"jobs:",
+				"  release-verification:",
+				"    steps:",
+				"      - name: Set up Rust",
+				"        with:",
+				"          toolchain: ${{ matrix.target == 'x' && '1.98.0-x' || '1.98.0' }}",
+				"          bun-version: 1.3.14",
+				"",
+			].join("\n"),
+		);
+		expect(() => workflowPins(root)).toThrow(/no literal toolchain pin/);
 	});
 });
 

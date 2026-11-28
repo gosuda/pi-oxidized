@@ -471,22 +471,25 @@ function readRustTargets(root: string): readonly string[] {
 	return targets;
 }
 
-function workflowPins(root: string): { rust: string; bun: string } {
+export function workflowPins(root: string): { rust: string; bun: string } {
 	const text = readFileSync(
 		resolve(root, ".github/workflows/release-verification.yml"),
 		"utf8",
 	);
 	// The primary Rust setup is leg-conditional (a matrix expression), so a
-	// first-match scrape records `${{` instead of a pin. The SBOM anchors on
-	// the first unconditional literal pin, which is what every leg resolves
-	// to on the SBOM lane.
-	const matches = [...text.matchAll(/^[ \t]*toolchain:\s*(\S+)/gm)].map((match) => match[1]);
-	if (matches.length === 0) {
-		throw new Error("release-verification.yml: toolchain pin not found");
-	}
-	const rust = matches.find((pin) => pin !== undefined && !pin.startsWith("$"));
-	if (rust === undefined) {
+	// first-match scrape records `${{` instead of a pin. A literal in another
+	// job must not silently win over the SBOM lane either: every literal pin
+	// has to resolve to one value or the scrape fails closed.
+	const literals = [...text.matchAll(/^[ \t]*toolchain:\s*(\S+)/gm)]
+		.map((match) => match[1])
+		.filter((pin) => pin !== undefined && !pin.startsWith("$"));
+	const distinct = [...new Set(literals)];
+	if (distinct.length === 0) {
 		throw new Error("release-verification.yml: no literal toolchain pin (matrix expressions cannot anchor the SBOM)");
+	}
+	const rust = distinct[0];
+	if (distinct.length > 1 || rust === undefined) {
+		throw new Error(`release-verification.yml: toolchain pins disagree (${distinct.join(", ")})`);
 	}
 	const bun = text.match(/bun-version:\s*(\S+)/);
 	if (bun === null) {
