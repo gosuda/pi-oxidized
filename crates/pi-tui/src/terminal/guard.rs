@@ -630,6 +630,16 @@ pub fn write_emergency_restore_bytes<W: Write>(writer: &mut W) -> io::Result<()>
 }
 
 #[cfg(test)]
+pub(crate) mod alternate_screen_latch {
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    static HELD: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn hold() -> MutexGuard<'static, ()> {
+        HELD.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
@@ -637,7 +647,6 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     static PANIC_HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
-    static ALTERNATE_SCREEN_LATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn guard_script_restores_in_reverse() {
@@ -869,9 +878,7 @@ mod tests {
 
     #[test]
     fn fullscreen_activation_failure_reports_primary_and_rollback() -> io::Result<()> {
-        let _lock = ALTERNATE_SCREEN_LATCH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _latch = super::alternate_screen_latch::hold();
         // Budget 13 accepts exactly CSI ?1049h (8) + CSI ?7l (5); the third
         // activation write (CSI ?1000h) fails, and every later write fails.
         let mut guard = TerminalGuard::new(LatchingFailureWriter {
@@ -928,9 +935,7 @@ mod tests {
 
     #[test]
     fn leave_fullscreen_retains_failed_steps_and_reports_regular() {
-        let _lock = ALTERNATE_SCREEN_LATCH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _latch = super::alternate_screen_latch::hold();
         // Activation order: alternate screen, then autowrap, then SGR mouse.
         // Budget 15 lets the first two restore writes (SGR mouse 8,
         // autowrap 5) succeed, then fails the alternate-screen restore (8)
@@ -980,9 +985,7 @@ mod tests {
 
     #[test]
     fn failed_leave_reentry_reapplies_missing_fullscreen_steps() -> io::Result<()> {
-        let _lock = ALTERNATE_SCREEN_LATCH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _latch = super::alternate_screen_latch::hold();
         let mut guard = TerminalGuard::new(LatchingFailureWriter {
             bytes: Vec::new(),
             attempted: Vec::new(),
@@ -1022,9 +1025,7 @@ mod tests {
 
     #[test]
     fn leave_fullscreen_clears_alternate_screen_latch_only_after_flush() -> io::Result<()> {
-        let _lock = ALTERNATE_SCREEN_LATCH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _latch = super::alternate_screen_latch::hold();
         // A successful leave must clear the process-global latch so a later
         // panic in regular mode does not emit CSI ? 1049 l into a screen this
         // process no longer owns.
@@ -1064,9 +1065,7 @@ mod tests {
 
     #[test]
     fn restored_fullscreen_guard_rejects_reentry() {
-        let _lock = ALTERNATE_SCREEN_LATCH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _latch = super::alternate_screen_latch::hold();
         let mut guard = TerminalGuard::new(Cursor::new(Vec::new()));
         guard.screen_mode = ScreenMode::Fullscreen;
 
@@ -1094,9 +1093,7 @@ mod tests {
 
     #[test]
     fn failed_resume_reentry_keeps_fullscreen_desired_for_retry() -> io::Result<()> {
-        let _lock = ALTERNATE_SCREEN_LATCH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _latch = super::alternate_screen_latch::hold();
         // Resume order: the seeded RawMode step lets fullscreen entry skip
         // real raw-mode activation (enable_raw_mode needs a tty). Budget 13
         // accepts exactly CSI ?1049h (8) + CSI ?7l (5); the third entry write

@@ -367,6 +367,7 @@ mod tests {
     )]
     #[test]
     fn failed_resume_rolls_back_mode_and_reports_resume_error() {
+        let _latch = crate::terminal::guard::alternate_screen_latch::hold();
         let mut guard = TerminalGuard::new(RecordingWriter(Vec::new()));
         let error = finish_screen_mode_transaction(
             &mut guard,
@@ -386,6 +387,7 @@ mod tests {
     )]
     #[test]
     fn failed_resume_rollback_failure_reports_both_errors() {
+        let _latch = crate::terminal::guard::alternate_screen_latch::hold();
         // previous_mode Fullscreen makes the rollback re-enter fullscreen,
         // which FailingWriter deterministically fails on and off a tty.
         let mut guard = TerminalGuard::new(FailingWriter);
@@ -408,6 +410,7 @@ mod tests {
     )]
     #[test]
     fn lifecycle_failure_wins_over_resume_error() {
+        let _latch = crate::terminal::guard::alternate_screen_latch::hold();
         let mut guard = TerminalGuard::new(RecordingWriter(Vec::new()));
         let error = finish_screen_mode_transaction(
             &mut guard,
@@ -426,6 +429,7 @@ mod tests {
     )]
     #[test]
     fn unchanged_mode_reports_resume_error_without_rollback() {
+        let _latch = crate::terminal::guard::alternate_screen_latch::hold();
         // A failing writer proves the rollback is not attempted: attempting
         // it would append the "failed to restore" composition.
         let mut guard = TerminalGuard::new(FailingWriter);
@@ -446,6 +450,7 @@ mod tests {
     )]
     #[test]
     fn successful_transaction_reports_size() {
+        let _latch = crate::terminal::guard::alternate_screen_latch::hold();
         let mut guard = TerminalGuard::new(RecordingWriter(Vec::new()));
         let size = finish_screen_mode_transaction(
             &mut guard,
@@ -499,8 +504,13 @@ mod tests {
         clippy::expect_used,
         reason = "live PTY test asserts terminal transaction errors via expect"
     )]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the test runs on a current-thread runtime and the latch lock only serializes against the other test threads"
+    )]
     #[tokio::test]
     async fn failed_resume_after_mode_switch_restores_previous_mode() {
+        let _latch = crate::terminal::guard::alternate_screen_latch::hold();
         // Gate on the ioctls this test performs: raw mode needs a controlling
         // terminal (`size()` alone also succeeds headless through the tput
         // fallback). Probe and restore immediately; the guard below owns raw
