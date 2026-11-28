@@ -1,10 +1,10 @@
 {
 	"schema": "pi.deps.exposure-reference.v1",
-	"capturedAt": "2026-10-01T00:30:33.696Z",
-	"captureHead": "6188be832b7bb2ce83bda32293d4a07908e58c8e",
+	"capturedAt": "2026-11-28T16:00:08.703Z",
+	"captureHead": "ccfc2c08e8875c6855cf86990ab79bf27ae571cd",
 	"metafile": {
-		"projectionPath": "metafile-projection.a22226891d9c4f8efca850f8b8a0a751cf0cce1fcec3ad4eea2a5d3c1a2eea20.json",
-		"sha256": "a22226891d9c4f8efca850f8b8a0a751cf0cce1fcec3ad4eea2a5d3c1a2eea20",
+		"projectionPath": "metafile-projection.5e972f18716bd12fae346e06770e80cc32a91d7fad05aee3f6701f377e4c6f51.json",
+		"sha256": "5e972f18716bd12fae346e06770e80cc32a91d7fad05aee3f6701f377e4c6f51",
 		"entry": "./src/main.ts",
 		"hostDirRel": "packages/extension-host",
 		"argv": [
@@ -17,14 +17,14 @@
 			"--target",
 			"bun-linux-x64-baseline",
 			"--outfile",
-			"/tmp/exposure-capture-LU34Ot/pi-extension-host",
-			"--metafile=/tmp/exposure-capture-LU34Ot/metafile.json"
+			"<exposure-capture-staging>/pi-extension-host",
+			"--metafile=<exposure-capture-staging>/metafile.json"
 		],
-		"metafileSha256": "b752d411d06fada7781bef2699deecfa7994378a8e8bd398c1621e881625a062"
+		"metafileSha256": "8d82b43dd95d61788e905c2f697b0b701872a36e3d5a743cb083c08cf4aa5db9"
 	},
 	"cargo": {
-		"projectionPath": "cargo-graph-projection.bb5cf5659db2aec137d16f02d4f6d1057e892e8c5bd5ce50776b478f354e7629.json",
-		"sha256": "bb5cf5659db2aec137d16f02d4f6d1057e892e8c5bd5ce50776b478f354e7629",
+		"projectionPath": "cargo-graph-projection.578bd3d9f1d42e399c005a74508ee758504b086cd1edf80f845e80d68c82765a.json",
+		"sha256": "578bd3d9f1d42e399c005a74508ee758504b086cd1edf80f845e80d68c82765a",
 		"argv": [
 			"metadata",
 			"--format-version",
@@ -93,7 +93,7 @@
 	"cargoFiles": [
 		{
 			"path": "Cargo.lock",
-			"sha256": "1c4939a4eaaab66fa7159762ee7baae8d81e68ab16a6e3bdb85312464b4c9fb3"
+			"sha256": "a741f799c6ac0631ba00b2978c106e50f6e9a6589b6cb522eb1ad4d61debd71a"
 		},
 		{
 			"path": "Cargo.toml",
@@ -101,23 +101,23 @@
 		},
 		{
 			"path": "crates/pi-agent/Cargo.toml",
-			"sha256": "aa8ffddbbff06140fd78f869b8e8f3a586f74f14e7df7cf89a57cc3eac41d244"
+			"sha256": "c36b019491720218a88f59a551b84f96a8cc29622f5647a46477524fcc3ec115"
 		},
 		{
 			"path": "crates/pi-ai/Cargo.toml",
-			"sha256": "dc420843a2cefb7f801ea28c25b5cb7e51ce1bbc92f1efba765318cc32e66a86"
+			"sha256": "6da339d1c2d6e7548d7e5c2de028a33b4cbe70109dbb34572e39032fb3b70e68"
 		},
 		{
 			"path": "crates/pi-ext/Cargo.toml",
-			"sha256": "4515986c59c57c6db45e5fe19e1758ed1dc129c2231a03c64b655ef8f380f890"
+			"sha256": "7d4774bceef2567b34d86a25300d791c0971ce0f9194652ec78da6595284b9a7"
 		},
 		{
 			"path": "crates/pi-tui/Cargo.toml",
-			"sha256": "3b93d7345e53f7cf7d2edbf47642819508351b98c26520f99554e81025a9a28f"
+			"sha256": "12459cbc04c6284b65225c1357e09487390af06402bbeac6c31a0a43cf516cec"
 		},
 		{
 			"path": "crates/pi/Cargo.toml",
-			"sha256": "dd49393d540c32c077f8316a2ef065b58926d6b4f6aeb4812c87d66655e6b540"
+			"sha256": "483801a3d6def1d6ac4205c913fc0dc083bb9f1bc587f670ca826ae2964e88c5"
 		}
 	],
 	"vendorFiles": [

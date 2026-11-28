@@ -43,7 +43,7 @@ any 0.x minor step, any major step, toolchain channel → **X**.
 | aws-config | 1.9.0 | 1.11.0 | 1.11.0 | M (unchanged) |
 | aws-sdk-bedrockruntime | 1.136.0 | 1.142.0 | 1.142.0 | M (unchanged) |
 | google-cloud-auth | 1.14.0 | 1.15.0 | **1.16.0** | **M (re-targeted; 1.15→1.16 is a same-major minor)** |
-| tokio | 1.52.4 | 1.53.1 | 1.53.1 | M (unchanged) |
+| tokio | 1.52.4 | 1.53.1 | **1.53.3** | **M (re-targeted; 1.53.1→1.53.3 is a same-major patch inside the binned 1.53 line, RUSTSEC-2026-0386)** |
 | uuid | 1.24.0 | 1.25.0 | **1.26.0** | **M (re-targeted; 1.25→1.26 is a same-major minor)** |
 | @types/bun (npm) | 1.3.9 | 1.4.0 | 1.4.0 | M (unchanged) |
 | typebox (npm) | 1.1.38 | 1.3.19 | 1.3.19 | M (unchanged) |
@@ -66,13 +66,17 @@ any 0.x minor step, any major step, toolchain channel → **X**.
 (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`: `available = true`),
 so the EXT-26 musl legs stay provisionable on the re-grounded toolchain.
 
-**Moved-member ledger:** exactly two members moved since 2026-08-26 —
-`google-cloud-auth` 1.15.0→1.16.0 and `uuid` 1.25.0→1.26.0 — both same-major
-minor steps, both re-binned to (remain in) Bin M with re-dated targets. No
-member crossed a bin boundary; no member dropped or was added. npm `jiti`
+**Moved-member ledger (August re-grounding):** two members moved since
+2026-08-26 — `google-cloud-auth` 1.15.0→1.16.0 and `uuid` 1.25.0→1.26.0 —
+both same-major minor steps, both re-binned to (remain in) Bin M with
+re-dated targets. A third member moved on 2026-11-28: `tokio` 1.53.1→1.53.3,
+a same-major patch inside the binned 1.53 line diverted out-of-band by
+RUSTSEC-2026-0386 (remediation commit `3f39dcb`), remaining in Bin M with a
+re-dated target.
+No member crossed a bin boundary; no member dropped or was added. npm `jiti`
 2.7.0 (direct runtime pin, not a bin member) is already at latest.
 
-## 2. Yank and advisory state (zero diversions)
+## 2. Yank and advisory state (August: zero diversions; November diversion recorded below)
 
 - **Yanked versions:** none. Every scheduled target version is `yanked = false`
   on crates.io (per-version check, not the crate summary); npm has no yank
@@ -81,11 +85,26 @@ member crossed a bin boundary; no member dropped or was added. npm `jiti`
   **from** version (20 queries) and the **to** version (20 queries) of every
   scheduled member returned 0 vulnerabilities each — including the two
   re-targeted members' new targets (`google-cloud-auth@1.16.0`, `uuid@1.26.0`).
-- **Diversion ledger:** empty. No member diverts to the DEPS-R2 out-of-band
-  CVE/yank path; there is no Class S/E divergence verdict to record. The two
-  syntect-transitive deny.toml ignores (RUSTSEC-2025-0141, RUSTSEC-2024-0320)
-  are out of bin scope and remain governed by DEPS-R3; the scheduled member
-  set does not touch them.
+- **Diversion ledger (August snapshot):** empty. No member diverted to the
+  DEPS-R2 out-of-band CVE/yank path; there is no Class S/E divergence verdict
+  to record. The two syntect-transitive deny.toml ignores
+  (RUSTSEC-2025-0141, RUSTSEC-2024-0320) are out of bin scope and remain
+  governed by DEPS-R3; the scheduled member set does not touch them.
+- **Diversion ledger (November addendum, 2026-11-28):** `tokio` 1.53.1→1.53.3
+  diverted out of band by RUSTSEC-2026-0386 (remediation commit `3f39dcb`).
+  Verdict ledger row `| 13c44baca218 | 2026-11-28 | crate:tokio | S |
+  E1:fail E2:pass E3:fail E4:pass |` with its record entry. The syntect
+  ignores above stay out of bin scope under DEPS-R3.
+- **Out-of-band tokio advisory state (2026-11-28; not part of the August
+  snapshot above):** OSV queries for the scheduled pair return 1
+  vulnerability for `tokio@1.53.1` (RUSTSEC-2026-0386, `AsyncFd::new` and
+  related constructors violate I/O safety) and 0 for `tokio@1.53.3`.
+  Neither version is yanked. Gates run on the remediation: `cargo deny
+  check` (advisories ok), `cargo clippy --workspace --all-targets
+  --locked -- -D warnings` (exit 0), `cargo test --workspace
+  --all-targets`, `bun test scripts`, `bun run verify:sbom`
+  (DEPENDENCY_SBOM_OK), `bun run verify:dependency-exposure self-check`
+  (DEPENDENCY_EXPOSURE_OK); full per-commit evidence in the lane report.
 - The deny.toml tripwire (`unused-ignored-advisory = "deny"`,
   `yanked = "deny"`) re-proves both facts mechanically at every epoch
   post-audit (`cargo deny check`), so this section is re-verified — not
